@@ -220,6 +220,15 @@ function handle_worker_control(state::ServerState, ws)
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "inspect_path_response"
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                elseif t == "open_session_failed"
+                    # Worker couldn't spawn the agent (e.g. binary missing).
+                    # `sid` is the pending RPC key (not `request_id`); pre-emptively
+                    # fail the open_session call so the UI's busy banner clears
+                    # immediately instead of waiting 30s for the WS handoff.
+                    sid    = String(get(cmd, "sid", ""))
+                    reason = String(get(cmd, "reason", "open_session failed"))
+                    deliver_rpc_response!(state, sid,
+                        Dict{String,Any}("error" => reason))
                 end
             catch e
                 @warn "Worker control frame error" exception=e

@@ -78,6 +78,7 @@ function Bonito.jsrender(session::Bonito.Session, c::ProjectCard)
         DOM.div(
             DOM.div(
                 DOM.div(DOM.span(p.name; class = "bt-card-name"),
+                        agent_pill(p.agent_type),
                         badge, backup_pill(p);
                         class = "bt-card-title"),
                 DOM.div(

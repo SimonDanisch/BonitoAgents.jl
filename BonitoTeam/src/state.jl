@@ -68,11 +68,17 @@ mutable struct ProjectInfo
     # to retype it. Cleared (and persisted as nothing) once the prompt has
     # been delivered, so a session restart doesn't re-fire.
     auto_prompt::Union{String,Nothing}
+    # Which ACP agent serves this project's chat. Currently "claude" (default,
+    # backward-compatible with pre-Gemini projects.json files) or "gemini".
+    # The choice is fixed at import time and persisted to projects.json; all
+    # subsequent sessions (resume / new) use it. Resolved into a spawn spec
+    # via `BonitoWorker.agent_spec(...)`.
+    agent_type::String
 end
 
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing, nothing, nothing)
+                nothing, nothing, :unsynced, nothing, nothing, nothing, "claude")
 
 """
     ServerState
@@ -310,7 +316,8 @@ function save_projects!(s::ServerState)
                  "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
                  "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
                  "resume_session_id" => p.resume_session_id,
-                 "auto_prompt"   => p.auto_prompt)
+                 "auto_prompt"   => p.auto_prompt,
+                 "agent_type"    => p.agent_type)
             for p in values(s.projects[])]
     atomic_write_json(projects_file(s), data)
 end
@@ -338,6 +345,8 @@ function load_projects!(s::ServerState)
             ap = get(d, "auto_prompt", nothing)
             p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
                                        nothing : String(ap)
+            at = String(get(d, "agent_type", "claude"))
+            p.agent_type = isempty(at) ? "claude" : at
             s.projects[][p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e

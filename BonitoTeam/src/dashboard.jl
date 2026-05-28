@@ -61,6 +61,7 @@ Create a new project on the named worker. Steps:
 """
 function create_project!(state::ServerState, name::String, src_path::String,
                           worker_name::String;
+                          agent_type::AbstractString = "claude",
                           progress = nothing)
     haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty")
@@ -98,6 +99,7 @@ function create_project!(state::ServerState, name::String, src_path::String,
     sync_dir_to_worker!(state, worker_name, server_path, worker_path; on_progress = progress)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
+    p.agent_type = String(agent_type)
     lock(state.lock) do
         state.projects[][id] = p
         save_projects!(state)
@@ -150,6 +152,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
                                       name::String = basename(rstrip(worker_path, '/')),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
+                                      agent_type::String = "claude",
                                       on_collision::Symbol = :detect,
                                       start_session::Bool = true,
                                       progress = nothing)
@@ -216,6 +219,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     p.resume_session_id = resume_session_id
+    p.agent_type        = agent_type
     lock(state.lock) do
         state.projects[][id] = p
     end
@@ -349,7 +353,8 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo;
     # instead of session/new for imported claude sessions.
     transport = WorkerTransport(state, w.worker_id, p.worker_path;
                                  mcp_servers       = mcp,
-                                 resume_session_id = p.resume_session_id)
+                                 resume_session_id = p.resume_session_id,
+                                 agent_type        = p.agent_type)
 
     # Ensure server_path exists so BonitoBook (which reads files from cwd to
     # render the chat notebook + tools) doesn't crash on a never-synced
@@ -761,6 +766,24 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-pill-syncing",
         "background" => "rgba(59,130,246,0.12)", "color" => "#1d4ed8",
         "gap" => "6px"),
+
+    # Agent pill — shown next to the project name in the sidebar's ProjectCard
+    # and in the chat header. Generic neutral style is the fallback for any
+    # agent_type not explicitly themed below (future agents get a usable pill
+    # without code changes; their label still reads from AGENT_REGISTRY).
+    CSS(".bt-pill-agent",
+        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text-muted)",
+        "font-size" => "10px",
+        "letter-spacing" => "0.04em",
+        "text-transform" => "uppercase",
+        "font-weight" => "600",
+        "padding" => "1px 7px"),
+    CSS(".bt-pill-agent-claude",
+        # Anthropic-flavored warm orange.
+        "background" => "rgba(217,119,87,0.14)", "color" => "#b45309"),
+    CSS(".bt-pill-agent-gemini",
+        # Google-flavored blue.
+        "background" => "rgba(59,130,246,0.14)", "color" => "#1d4ed8"),
 
     # ── Buttons ──────────────────────────────────────────────────────────────
     CSS(".bt-btn",
@@ -1761,9 +1784,11 @@ function dashboard_dom(state::ServerState;
         isempty(sel) && return
         np_name[] = basename(rstrip(sel, '/'))
     end
-    np_worker = Observable("")
-    gh_url    = Observable("")
-    gh_worker = Observable("")
+    np_worker     = Observable("")
+    np_agent_type = Observable("claude")    # set by the New-project "Agent" <select>
+    gh_url        = Observable("")
+    gh_worker     = Observable("")
+    gh_agent_type = Observable("claude")    # set by the From-GitHub "Agent" <select>
 
     # ── Sync-to-server click handler ─────────────────────────────────────────
     # Fired by the project card's "Sync to server" / "Re-sync" button. The
@@ -1850,10 +1875,12 @@ function dashboard_dom(state::ServerState;
                 p = create_project!(state, nm,
                                  String(strip(np_picker.selected[])),
                                  String(strip(np_worker[]));
+                                 agent_type = String(strip(np_agent_type[])),
                                  progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 which_form[] = :none
                 np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
+                np_agent_type[] = "claude"
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to create project: $e"
@@ -1896,10 +1923,12 @@ function dashboard_dom(state::ServerState;
             try
                 p = create_project_from_github!(state, url;
                     worker_name = worker_name,
+                    agent_type  = String(strip(gh_agent_type[])),
                     progress    = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[]  = ""
                 which_form[] = :none
                 gh_url[]     = ""
+                gh_agent_type[] = "claude"
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to open from GitHub: $(sprint(showerror, e))"
@@ -1966,6 +1995,7 @@ function dashboard_dom(state::ServerState;
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
                         resume_session_id::Union{Nothing,String} = nothing,
+                        agent_type::String = "claude",
                         on_collision::Symbol = :detect)
         proj_name = name !== nothing ? name :
             let n = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
@@ -1980,6 +2010,7 @@ function dashboard_dom(state::ServerState;
                 p = create_project_from_worker!(state, w_name, path;
                     name = proj_name,
                     resume_session_id = resume_session_id,
+                    agent_type = agent_type,
                     on_collision = on_collision,
                     progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[]      = ""
@@ -2012,11 +2043,19 @@ function dashboard_dom(state::ServerState;
         sid_raw = get(payload, "session_id", nothing)
         resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
                                 nothing : String(sid_raw)
+        # Discovered Claude sessions (the Resume button in the discover panel)
+        # never set this field — they implicitly use agent_type="claude" since
+        # we don't scan Gemini history yet. New-project / From-GitHub forms
+        # do set it from their radio chooser.
+        at_raw = get(payload, "agent_type", nothing)
+        agent_type = (at_raw === nothing || isempty(String(at_raw))) ?
+                          "claude" : String(at_raw)
         import_path[] = Dict{String,Any}()    # reset so the same path can re-fire
         is_busy_idle(busy[]) || return
         w_name = discover_state[]
         isempty(w_name) && return
-        do_import(w_name, path; resume_session_id = resume_session_id)
+        do_import(w_name, path; resume_session_id = resume_session_id,
+                  agent_type = agent_type)
     end
 
     # session_row + discover_panel are now rendered inside WorkerCard
@@ -2028,6 +2067,20 @@ function dashboard_dom(state::ServerState;
         type = "text", placeholder = ph,
         value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
         oninput = js"event => $(obs).notify(event.target.value)")
+
+    # Agent-chooser <select> shared between the New-project and From-GitHub
+    # forms. The order is fixed (Claude first, then Gemini) so the dropdown's
+    # visible default matches the Observable's default — otherwise the user
+    # would see "Gemini" highlighted but submit "claude" (Dict iteration is
+    # hash-order, not insertion-order). `value = obs` is the same Bonito
+    # reactive binding `text_input` uses: when the Observable changes (e.g.
+    # reset after submit), the DOM <select>'s selected option follows.
+    agent_options_order = ("claude", "gemini")
+    agent_select(obs) = DOM.select(
+        (DOM.option(BonitoWorker.AGENT_REGISTRY[t].display_name; value = t)
+         for t in agent_options_order)...;
+        value = obs,
+        onchange = js"event => $(obs).notify(event.target.value)")
 
     new_proj_form() = DOM.div(
         DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
@@ -2046,6 +2099,8 @@ function dashboard_dom(state::ServerState;
             # (stable UUID, the dict key into state.workers).
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
             onchange = js"event => $(np_worker).notify(event.target.value)"),
+        DOM.label("Agent"),
+        agent_select(np_agent_type),
         # Form action row — the global progress card is the visual feedback
         # for the in-flight submit; click handlers guard against double-fire.
         DOM.div(np_cancel, np_submit, class = "bt-form-actions"),
@@ -2063,6 +2118,8 @@ function dashboard_dom(state::ServerState;
         DOM.select(
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
+        DOM.label("Agent"),
+        agent_select(gh_agent_type),
         DOM.div(gh_cancel, gh_submit, class = "bt-form-actions"),
         class = "bt-form")
 

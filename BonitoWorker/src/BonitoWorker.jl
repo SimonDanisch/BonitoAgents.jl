@@ -251,7 +251,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             cmd = JSON.parse(String(frame))
             t = get(cmd, "type", "")
             if t == "open_session"
-                @async handle_open_session(server_url, secret, agent_bin, cmd)
+                @async handle_open_session(ws, server_url, secret, agent_bin, cmd)
             elseif t == "open_transfer"
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
@@ -272,28 +272,68 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
     end
 end
 
-# Per-session WS handler
-function handle_open_session(server_url::String, secret::String, agent_bin::String,
-                              cmd::AbstractDict)
+# Per-session WS handler. `agent_bin` is the default agent binary discovered at
+# worker startup; it's only used when the server's open_session frame doesn't
+# pin a specific agent_type (legacy frames from old server builds).
+#
+# `control_ws` is the worker's persistent control WebSocket — passed in so we
+# can send an `open_session_failed` notification frame back to the server if
+# the agent binary is missing (server-side `take_pending!` unblocks immediately
+# instead of waiting 30s for a dial-back that'll never come).
+function handle_open_session(control_ws, server_url::String, secret::String,
+                              agent_bin::String, cmd::AbstractDict)
     sid           = String(get(cmd, "sid", ""))
     cwd           = String(get(cmd, "cwd", pwd()))
     env_overrides = Dict{String,String}(get(cmd, "env", Dict{String,String}()))
+    agent_type    = String(get(cmd, "agent_type", "claude"))
     isempty(sid) && (@error "open_session missing sid"; return)
 
     isdir(cwd) || try mkpath(cwd) catch end
 
+    spec = agent_spec(agent_type)
+    bin  = haskey(cmd, "agent_type") ? find_agent_bin(agent_type) : agent_bin
+
+    # Fast-fail check: if the resolved binary is neither an absolute file nor
+    # something `which` could find, the spawn will fail. Tell the server now
+    # so the UI's busy banner clears in milliseconds, not 30 seconds.
+    if !isfile(bin) && which_executable(bin) === nothing
+        reason = "agent '$(agent_type)' not available on this worker: " *
+                 "'$(bin)' is not on PATH. " *
+                 "Install $(spec.display_name) CLI on the worker " *
+                 "(`$(spec.binary)` binary required)."
+        @error "BonitoWorker: $(reason)" sid agent=agent_type
+        try
+            WebSockets.send(control_ws, JSON.json(Dict(
+                "type"   => "open_session_failed",
+                "sid"    => sid,
+                "reason" => reason,
+            )))
+        catch e
+            @warn "BonitoWorker: failed to send open_session_failed" exception=e
+        end
+        return
+    end
+
     env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
-                Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
-                     "CLAUDE_MAX_TURNS"       => "100"),
+                spec.env,
                 env_overrides)
 
     proc = try
-        open(Cmd(`$agent_bin`; env, dir = cwd), "r+")
+        open(Cmd(`$bin $(spec.args)`; env, dir = cwd), "r+")
     catch e
-        @error "BonitoWorker: failed to spawn agent" exception=e cwd
+        @error "BonitoWorker: failed to spawn agent" exception=e cwd agent=agent_type bin
+        try
+            WebSockets.send(control_ws, JSON.json(Dict(
+                "type"   => "open_session_failed",
+                "sid"    => sid,
+                "reason" => "spawn of '$(bin)' failed: $(sprint(showerror, e))",
+            )))
+        catch e2
+            @warn "BonitoWorker: failed to send open_session_failed" exception=e2
+        end
         return
     end
-    @info "BonitoWorker: ACP session started" sid cwd pid=getpid()
+    @info "BonitoWorker: ACP session started" sid cwd agent=agent_type pid=getpid()
 
     acp_url = ws_url(server_url, "/worker-acp")
     try
@@ -953,12 +993,50 @@ else
     which_executable(name) = Sys.which(name)
 end
 
-function find_agent_bin()
-    explicit = get(ENV, "CLAUDE_AGENT_ACP", "")
+# ── Agent registry ────────────────────────────────────────────────────────────
+# One spec per supported ACP agent. The server's `open_session` control frame
+# carries an `agent_type` string; the worker looks the spec up here and spawns
+# `binary args...` with `env` merged into the inherited environment.
+#
+# NOTE: a near-identical registry exists in `AgentClientProtocol.find_agent_bin`
+# (used by `LocalTransport` in the dev rig / tests). Keep both in sync until we
+# move the registry into a shared location.
+struct AgentSpec
+    agent_type   :: String
+    display_name :: String
+    binary       :: String              # PATH name (or absolute) to look up
+    args         :: Vector{String}      # CLI args, e.g. ["--acp", "--approval-mode=yolo"]
+    env          :: Dict{String,String} # extra env vars at spawn time
+    env_override :: String              # name of env var that overrides `binary` (e.g. CLAUDE_AGENT_ACP)
+end
+
+const AGENT_REGISTRY = Dict{String,AgentSpec}(
+    "claude" => AgentSpec(
+        "claude", "Claude",
+        "claude-agent-acp", String[],
+        Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
+             "CLAUDE_MAX_TURNS"       => "100"),
+        "CLAUDE_AGENT_ACP"),
+    "gemini" => AgentSpec(
+        "gemini", "Gemini",
+        # `gemini --acp` starts Gemini CLI in stdio ACP mode (see
+        # google-gemini/gemini-cli `packages/cli/src/config/config.ts`). The
+        # `--approval-mode=yolo` flag mirrors Claude's bypassPermissions UX.
+        "gemini", ["--acp", "--approval-mode=yolo"],
+        Dict{String,String}(),
+        "GEMINI_BIN"),
+)
+
+agent_spec(t::AbstractString) =
+    get(AGENT_REGISTRY, String(t), AGENT_REGISTRY["claude"])
+
+function find_agent_bin(agent_type::AbstractString = "claude")
+    spec = agent_spec(agent_type)
+    explicit = get(ENV, spec.env_override, "")
     !isempty(explicit) && return explicit
-    bin = which_executable("claude-agent-acp")
+    bin = which_executable(spec.binary)
     bin !== nothing && return bin
-    return "claude-agent-acp"
+    return spec.binary    # let the OS raise a clear error at spawn time
 end
 
 end # module BonitoWorker

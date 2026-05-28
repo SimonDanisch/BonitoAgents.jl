@@ -95,6 +95,7 @@ immediately reachable at `/p/<id>`.
 function create_project_from_github!(state::ServerState, url::AbstractString;
                                        worker_name::AbstractString,
                                        name::Union{String,Nothing} = nothing,
+                                       agent_type::AbstractString = "claude",
                                        progress = nothing)
     haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     ref = parse_github_url(url)
@@ -140,6 +141,7 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
 
     p = ProjectInfo(id, proj_name, worker_name, server_path, worker_path, now(UTC))
     p.auto_prompt = auto_prompt
+    p.agent_type  = String(agent_type)
     lock(state.lock) do
         state.projects[][id] = p
         save_projects!(state)

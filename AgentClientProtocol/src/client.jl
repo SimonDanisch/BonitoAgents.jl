@@ -67,45 +67,79 @@ function on_request(h::FSRequestHandler, method::AbstractString, params)
     return nothing
 end
 
-# Discover the agent binary: env var → PATH → node_modules search.
-function find_agent_bin()
-    explicit = get(ENV, "CLAUDE_AGENT_ACP", "")
+# ── Agent registry ────────────────────────────────────────────────────────────
+# Mirror of `BonitoWorker.AGENT_REGISTRY`. Kept in lockstep until we extract a
+# shared spec module; touching one without the other is a bug.
+struct AgentSpec
+    agent_type   :: String
+    display_name :: String
+    binary       :: String
+    args         :: Vector{String}
+    env          :: Dict{String,String}
+    env_override :: String
+end
+
+const AGENT_REGISTRY = Dict{String,AgentSpec}(
+    "claude" => AgentSpec(
+        "claude", "Claude",
+        "claude-agent-acp", String[],
+        Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
+             "CLAUDE_MAX_TURNS"       => "100"),
+        "CLAUDE_AGENT_ACP"),
+    "gemini" => AgentSpec(
+        "gemini", "Gemini",
+        "gemini", ["--acp", "--approval-mode=yolo"],
+        Dict{String,String}(),
+        "GEMINI_BIN"),
+)
+
+agent_spec(t::AbstractString) =
+    get(AGENT_REGISTRY, String(t), AGENT_REGISTRY["claude"])
+
+# Discover the agent binary for `agent_type`: env override → PATH → (Claude
+# only) node_modules walk. Other agents fall back to the literal binary name
+# so the OS raises a clear error at spawn time.
+function find_agent_bin(agent_type::AbstractString = "claude")
+    spec = agent_spec(agent_type)
+    explicit = get(ENV, spec.env_override, "")
     !isempty(explicit) && return explicit
 
-    global_bin = Sys.which("claude-agent-acp")
+    global_bin = Sys.which(spec.binary)
     global_bin !== nothing && return global_bin
 
-    # Walk up from this source file; check both direct node_modules and
-    # sibling subdirectory node_modules (e.g. dev/Bonito/node_modules).
-    dir = @__DIR__
-    for _ in 1:8
-        bin = joinpath(dir, "node_modules", ".bin", "claude-agent-acp")
-        isfile(bin) && return bin
-        # Check one level of subdirectories (covers dev/*/node_modules pattern)
-        for sub in readdir(dir; join=true)
-            isdir(sub) || continue
-            bin = joinpath(sub, "node_modules", ".bin", "claude-agent-acp")
+    if String(agent_type) == "claude"
+        # Walk up from this source file; check both direct node_modules and
+        # sibling subdirectory node_modules (e.g. dev/Bonito/node_modules).
+        dir = @__DIR__
+        for _ in 1:8
+            bin = joinpath(dir, "node_modules", ".bin", spec.binary)
             isfile(bin) && return bin
+            for sub in readdir(dir; join=true)
+                isdir(sub) || continue
+                bin = joinpath(sub, "node_modules", ".bin", spec.binary)
+                isfile(bin) && return bin
+            end
+            dir = dirname(dir)
         end
-        dir = dirname(dir)
     end
-    return "claude-agent-acp"  # let OS raise a clear error at spawn time
+    return spec.binary    # let OS raise a clear error at spawn time
 end
 
 function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
                 mcp_servers::Vector{MCPServer} = MCPServer[],
                 agent_env::Dict{String,String} = Dict{String,String}(),
-                agent_bin::String = find_agent_bin())
+                agent_type::AbstractString = "claude",
+                agent_bin::String = find_agent_bin(agent_type))
+    spec = agent_spec(agent_type)
 
-    isfile(agent_bin) || error("claude-agent-acp not found at: $agent_bin\n" *
-                               "Set CLAUDE_AGENT_ACP env var or pass agent_bin=.")
+    isfile(agent_bin) || error("$(spec.binary) not found at: $agent_bin\n" *
+                               "Set $(spec.env_override) env var or pass agent_bin=.")
 
     env = merge(Dict(k => v for (k,v) in ENV),
-                Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
-                     "CLAUDE_MAX_TURNS"        => "100"),
+                spec.env,
                 agent_env)
 
-    proc = open(Cmd(`$agent_bin`; env, dir=cwd), "r+")
+    proc = open(Cmd(`$agent_bin $(spec.args)`; env, dir=cwd), "r+")
     conn = Connection(proc, handler)
 
     send_request(conn, "initialize", Dict(

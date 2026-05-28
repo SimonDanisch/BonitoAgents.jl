@@ -1420,6 +1420,30 @@ end
 # mutation surface, single locked entry.
 
 # ── DOM building (split into header / messages / input / banner) ──────────
+# Small UI pill labelling which ACP agent backs this session/project. The
+# label and per-agent colors come from `BonitoWorker.AGENT_REGISTRY`; agents
+# not in the registry fall through to the generic muted `bt-pill-agent` style
+# so a future third agent gets a neutral pill without any UI changes.
+function agent_pill(agent_type::AbstractString)
+    t = String(agent_type)
+    label = haskey(BonitoWorker.AGENT_REGISTRY, t) ?
+                BonitoWorker.AGENT_REGISTRY[t].display_name :
+                isempty(t) ? "agent" : t
+    DOM.span(label;
+             class = "bt-pill bt-pill-agent bt-pill-agent-$(t)",
+             title = "Powered by $label",
+             style = Styles("margin-left" => "6px"))
+end
+
+# Convenience wrapper that looks up the project from state and renders the
+# pill for its agent_type, or an empty span if the project isn't (yet)
+# registered. Used by the chat header.
+function agent_pill_for_project(state, project_id::AbstractString)
+    p = get(state.projects[], String(project_id), nothing)
+    p === nothing && return DOM.span()
+    agent_pill(p.agent_type)
+end
+
 function chat_header(model::ChatModel)
     state = model.state
     project_id = model.project_id
@@ -1448,6 +1472,7 @@ function chat_header(model::ChatModel)
             status_dot,
             DOM.div(
                 DOM.span(basename(rstrip(cwd, '/')); title=cwd),
+                agent_pill_for_project(state, project_id),
                 class="bt-header-title"),
             sync_button;
             class="bt-header-row");

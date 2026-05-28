@@ -35,20 +35,26 @@ abstract type ChatTransport <: ACP.Transport end
 mutable struct LocalTransport <: ChatTransport
     cwd          :: String
     mcp_servers  :: Vector{ACP.MCPServer}
+    agent_type   :: String                # "claude" | "gemini"
     agent_bin    :: String
+    agent_args   :: Vector{String}        # CLI args from the agent registry
     agent_env    :: Dict{String,String}
     # Lazily populated by start_session (set to the spawned process'
     # subprocess transport so send/recv/close can delegate).
     inner        :: Ref{Union{ACP.SubprocessTransport,Nothing}}
 end
 
-LocalTransport(cwd::AbstractString;
-               mcp_servers = ACP.MCPServer[],
-               agent_bin   = ACP.find_agent_bin(),
-               agent_env   = Dict{String,String}()) =
+function LocalTransport(cwd::AbstractString;
+                        mcp_servers = ACP.MCPServer[],
+                        agent_type::AbstractString = "claude",
+                        agent_bin   = ACP.find_agent_bin(agent_type),
+                        agent_env   = Dict{String,String}())
+    spec = ACP.agent_spec(agent_type)
     LocalTransport(String(cwd), collect(ACP.MCPServer, mcp_servers),
-                    String(agent_bin), agent_env,
+                    String(agent_type), String(agent_bin), copy(spec.args),
+                    merge(copy(spec.env), agent_env),
                     Ref{Union{ACP.SubprocessTransport,Nothing}}(nothing))
+end
 
 ACP.send(t::LocalTransport, line::AbstractString) = ACP.send(t.inner[], line)
 ACP.recv(t::LocalTransport)                       = ACP.recv(t.inner[])
@@ -63,6 +69,7 @@ mutable struct WorkerTransport <: ChatTransport
     worker_path        :: String
     mcp_servers        :: Vector{ACP.MCPServer}
     resume_session_id  :: Union{String,Nothing}
+    agent_type         :: String         # "claude" | "gemini"; threaded into open_session frame
     # Set by start_session once the worker dials back the ACP WS.
     ws                 :: Ref{Any}
 end
@@ -70,10 +77,12 @@ end
 WorkerTransport(state::ServerState, worker_id::AbstractString,
                 worker_path::AbstractString;
                 mcp_servers = ACP.MCPServer[],
-                resume_session_id::Union{String,Nothing} = nothing) =
+                resume_session_id::Union{String,Nothing} = nothing,
+                agent_type::AbstractString = "claude") =
     WorkerTransport(state, String(worker_id), String(worker_path),
                      collect(ACP.MCPServer, mcp_servers),
-                     resume_session_id, Ref{Any}(nothing))
+                     resume_session_id, String(agent_type),
+                     Ref{Any}(nothing))
 
 function ACP.send(t::WorkerTransport, line::AbstractString)
     HTTP.WebSockets.send(t.ws[], rstrip(line, '\n'))
@@ -151,14 +160,13 @@ mcp_list_payload(mcp_servers) =
           "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
      for s in mcp_servers]
 
-# 1. Local: spawn claude-agent-acp, then drive initialize + session/new.
+# 1. Local: spawn the configured agent (claude-agent-acp or gemini), then
+#    drive initialize + session/new. Agent-specific env vars come via
+#    `t.agent_env` (populated from the spec at LocalTransport-constructor time).
 function start_session(t::LocalTransport, handler::ACP.Handler)
-    isfile(t.agent_bin) || error("claude-agent-acp not found at: $(t.agent_bin)")
-    env = merge(Dict(k => v for (k,v) in ENV),
-                Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
-                     "CLAUDE_MAX_TURNS"        => "100"),
-                t.agent_env)
-    proc = open(Cmd(`$(t.agent_bin)`; env, dir = t.cwd), "r+")
+    isfile(t.agent_bin) || error("$(t.agent_type) agent binary not found at: $(t.agent_bin)")
+    env = merge(Dict(k => v for (k,v) in ENV), t.agent_env)
+    proc = open(Cmd(`$(t.agent_bin) $(t.agent_args)`; env, dir = t.cwd), "r+")
     t.inner[] = ACP.SubprocessTransport(proc)
 
     conn = ACP.Connection(t, handler)
@@ -195,14 +203,23 @@ function start_session(t::WorkerTransport, handler::ACP.Handler)
         "type"       => "open_session",
         "sid"        => sid,
         "project_id" => project_id,
+        "agent_type" => t.agent_type,
         "cwd"        => t.worker_path,
         "env"        => Dict{String,String}(),
         "mcpServers" => mcp_list,
     ))
 
-    # Bounded wait for the worker's /worker-acp upgrade.
-    t.ws[] = take_pending!(t.state, ch, sid, 30.0,
+    # Bounded wait for the worker's /worker-acp upgrade. If the worker
+    # pre-empted with an `open_session_failed` control frame, the channel
+    # carries `{"error" => reason}` instead of the WS — raise immediately so
+    # the UI surfaces a clear error in milliseconds instead of the 30s
+    # timeout path.
+    result = take_pending!(t.state, ch, sid, 30.0,
                           "open_session on '$(t.worker_id)'")
+    if result isa AbstractDict && haskey(result, "error")
+        error("open_session on '$(t.worker_id)' failed: $(result["error"])")
+    end
+    t.ws[] = result
 
     conn = ACP.Connection(t, handler)
     ACP.send_request(conn, "initialize", Dict(
