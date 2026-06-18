@@ -1623,14 +1623,6 @@ const ChatStyles = Bonito.Styles(
         CSS("from", "transform" => "rotate(0deg)"),
         CSS("to", "transform" => "rotate(360deg)")),
 
-    # Placeholder shown in a file editor panel while its content is fetched from
-    # the worker (open_file!). Centers the spinner + "Opening <file>…" so the
-    # click has immediate feedback during a slow remote transfer.
-    CSS(".bt-file-loading",
-        "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "justify-content" => "center", "height" => "100%",
-        "color" => "var(--bt-text-faint)", "font-size" => "13px"),
-
     # ── Responsive ───────────────────────────────────────────────────────────
     CSS("@media (max-width: 480px)",
         # Tighter padding on very small screens

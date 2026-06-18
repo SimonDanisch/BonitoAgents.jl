@@ -50,15 +50,6 @@ try
     @testset "BonitoAgents file open (UI-only)" begin
         TK.new_chat(server; cwd = CWD, title = "Files")
 
-        @testset "clicking shows a panel IMMEDIATELY (loading placeholder)" begin
-            # The panel + placeholder must appear synchronously — before the
-            # fetch finishes — so the click always has feedback. Reserving the
-            # id here is also what dedupes re-clicks during a slow fetch.
-            TK.eval_js(server, open_file("hello.jl"))
-            @test TK.wait_for(server, "panel appears at once",
-                "!!document.querySelector('$(panel_sel("hello.jl"))')"; timeout = 4) == true
-        end
-
         @testset "opening a file shows ONE editor panel with the right file" begin
             TK.eval_js(server, open_file("hello.jl"))
             @test TK.wait_for(server, "hello.jl editor panel",
@@ -72,6 +63,10 @@ try
             @test TK.wait_for(server, "editor value loaded",
                 "(document.querySelector('$(panel_sel("hello.jl")) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('hi from hello')"; timeout = 12) == true
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel("hello.jl"))').length") == 1
+            # The editor must actually FILL the panel — regression guard for the
+            # 1px-high collapse when the panel wrapper doesn't carry height down.
+            @test TK.wait_for(server, "editor has real height",
+                "(document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor-body')?.offsetHeight || 0) > 200"; timeout = 10) == true
         end
 
         @testset "rapid repeated opens of one path make exactly ONE panel" begin
@@ -128,6 +123,16 @@ try
             TK.eval_js(server, "document.querySelector('.bt-tool-title.bt-path-link').click()")
             @test TK.wait_for(server, "click opened the hello.jl editor",
                 "!!document.querySelector('$(panel_sel(joinpath(CWD, "hello.jl")))') || !!document.querySelector('$(panel_sel("hello.jl"))')"; timeout = 12) == true
+        end
+
+        @testset "clicking Home activates + relabels the chat tab" begin
+            # With a file tab open, the chat panel's tab reads "Chat"; clicking
+            # Home must bring that panel to the front AND rename its tab "Home".
+            TK.eval_js(server, open_file("second.jl"))   # ensure a 2nd tab exists
+            TK.wait_for(server, "two tabs", "document.querySelectorAll('.bw-tab-label').length >= 2"; timeout = 8)
+            TK.to_dashboard(server)
+            @test TK.wait_for(server, "Home tab active",
+                "(document.querySelector('.bw-tab.bw-active .bw-tab-label')?.textContent || '') === 'Home'"; timeout = 6) == true
         end
     end
 finally

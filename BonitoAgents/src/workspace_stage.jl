@@ -33,6 +33,18 @@ function install_workspace!(session::Bonito.Session,
                    style = Bonito.Styles("min-height" => "0"))
     pane.workspace[] = ws
 
+    # The chat panel doubles as the Home/dashboard view (current_view == ""). A
+    # sidebar click (Home or a project) must (1) bring this panel to the front —
+    # the user may have a file/app tab active — and (2) relabel its tab so "Home"
+    # reads as Home, not a stale "Chat". `Panel.label` is an Observable, so the
+    # tab updates live.
+    relabel_chat_panel!() = (chat_panel.label[] = isempty(current_view[]) ? "Home" : "Chat")
+    relabel_chat_panel!()
+    on(session, current_view) do _
+        relabel_chat_panel!()
+        activate_panel!(ws, "chat")
+    end
+
     # The floating "app" panel's mount: detached `bt_show_app` embeds are moved
     # in (and back out) by the controller below. Rebuilt each detach (the panel
     # is removed on close), so the `#bt-app-mount` id always resolves to the
@@ -150,9 +162,15 @@ const WorkspaceStageStyles = Bonito.Styles(
     Bonito.CSS(".bt-main > .bt-main-views",
         "flex" => "1 1 auto", "width" => "100%", "min-width" => "0", "min-height" => "0"),
     # Keep the dashboard's stacked sections at a comfortable centered width even
-    # though the panel now fills edge-to-edge.
-    Bonito.CSS(".bt-stage .bt-dash > *",
-        "max-width" => "1080px", "margin-left" => "auto", "margin-right" => "auto"),
+    # though the panel now fills edge-to-edge. `.bt-stats` is targeted directly
+    # too: it's a `map(...)` (reactive), so Bonito wraps it in an inline
+    # `bonito-fragment` that ignores `max-width` — without this it escapes the
+    # `> *` cap and stretches full-width while every other section stays at 1080.
+    Bonito.CSS(".bt-stage .bt-dash > *, .bt-stage .bt-dash .bt-stats",
+        "max-width" => "1080px", "margin-left" => "auto", "margin-right" => "auto",
+        # border-box so a section's own padding (e.g. .bt-stats) counts INSIDE the
+        # 1080 cap — otherwise padded sections render ~32px wider than the rest.
+        "box-sizing" => "border-box"),
 
     # ── Detachable app embed (bt_show_app) ───────────────────────────────────
     Bonito.CSS(".bt-embed-frame",

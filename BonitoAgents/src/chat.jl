@@ -4716,23 +4716,16 @@ function open_file!(pane::PlotPane, model::ChatModel, path::AbstractString)
         BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
         return nothing
     end
-    # Add the panel SYNCHRONOUSLY with a loading placeholder, THEN fetch + fill.
-    # The fetch blocks for the worker transfer — seconds when the file lives on a
-    # remote worker — so doing it before adding the panel meant a click produced
-    # NO feedback until it finished, and impatient re-clicks (the panel id not yet
-    # reserved) each kicked off another transfer. Reserving the id now makes a
-    # second click hit the `any(...)` guard above and just activate this panel.
-    content = Observable{Any}(DOM.div(
-        DOM.div(; class = "bt-spinner"),
-        DOM.span("Opening $(basename(path))…");
-        class = "bt-file-loading"))
-    BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id,
-        DOM.div(content; class = "bt-file-panel");
-        label = basename(path), closable = true))
+    # Fetch (worker transfer — can take seconds) off the event task, then add the
+    # editor as the panel's DIRECT content. NOT via a placeholder + reactive
+    # `DOM.div(Observable)` swap: that inserts auto-height `bonito-fragment`
+    # wrappers between the panel and `.bt-file-editor`, breaking its `height:100%`
+    # chain (Monaco collapses to ~1px). `add_panel!` dedupes by id, so racing
+    # re-clicks still land one panel.
     Base.errormonitor(@async begin
         elem = file_panel_content(model, path)
-        # The user may have closed the tab while we fetched — don't resurrect it.
-        any(p -> p.id == id, ws.panels[]) && (content[] = elem)
+        BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
+            label = basename(path), closable = true))
     end)
     return nothing
 end
