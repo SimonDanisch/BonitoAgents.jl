@@ -133,9 +133,11 @@ jobs:
           - chat_features
           - embedded_app
           - scroll_persist
+          - streaming_flood
           - errors
           - lens
           - file_open
+          - dashboard_layout
           - tool_rendering
           - todo_taskbar
           - worker_lifecycle

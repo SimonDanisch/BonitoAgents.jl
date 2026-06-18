@@ -41,15 +41,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every platform ships the SAME format: a relocatable, UNSIGNED .tar.gz
+        # (no macOS notarization / Windows MSIX signing). The bundle carries the
+        # right launcher per OS (.sh on unix, .bat on Windows) + an install
+        # script; users extract and run.
         include:
           - runner: macos-latest
             os: macos
             arch: aarch64
-            bundle: dmg
+            bundle: tarball
           - runner: macos-13
             os: macos
             arch: x86_64
-            bundle: dmg
+            bundle: tarball
           - runner: ubuntu-latest
             os: linux
             arch: x86_64
@@ -63,7 +67,7 @@ jobs:
           - runner: windows-latest
             os: windows
             arch: x86_64
-            bundle: msix
+            bundle: tarball
 
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +89,7 @@ jobs:
           ${{ matrix.xvfb && 'xvfb-run -s ''-screen 0 1024x768x24''' || '' }}
           julia --project=BonitoAgentsApp/meta -m AppBundler build BonitoAgentsApp
           --build-dir=build --target-arch=${{ matrix.arch }}
+          --target-os=${{ matrix.os }}
           --target-bundle=${{ matrix.bundle }}
 
       - uses: actions/upload-artifact@v4
@@ -122,10 +127,16 @@ jobs:
           fi
 
           find artifacts/ -type f | while read -r file; do
-            # Prefix the platform (taken from the artifact dir name) so the
-            # five bundles don't collide on the release.
-            platform="$(basename "$(dirname "$file")")"
-            name="${platform}-$(basename "$file")"
+            # Stable, version-free asset names: bonitoagents-<os>-<arch>.<ext>
+            # (the artifact dir is already `bonitoagents-<os>-<arch>`). This keeps
+            # `/releases/latest/download/<asset>` URLs permanent, so install.sh
+            # never has to know the version.
+            platform="$(basename "$(dirname "$file")")"   # bonitoagents-<os>-<arch>
+            case "$file" in
+              *.tar.gz) ext=".tar.gz" ;;
+              *)        ext=".${file##*.}" ;;
+            esac
+            name="${platform}${ext}"
             echo "Uploading: $file as $name"
             cp "$file" "/tmp/$name"
             gh release upload "$TAG_NAME" "/tmp/$name" --clobber

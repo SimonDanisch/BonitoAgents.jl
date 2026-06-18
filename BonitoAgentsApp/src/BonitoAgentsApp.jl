@@ -10,7 +10,7 @@ import Bonito
 using BonitoAgents
 using BonitoWorker
 using ElectronCall
-using HTTP
+import Downloads
 using URIs: URI
 using Random: randstring
 using PrecompileTools: @setup_workload, @compile_workload
@@ -397,17 +397,35 @@ end
                 state_dir     = mkpath(joinpath(dir, "state")),
                 working_dir   = mkpath(joinpath(dir, "working")))
             url = "http://127.0.0.1:$(state.srv.port)"
-            # Connection:close avoids a lingering keep-alive reader task that
-            # would stall the precompile serializer.
-            HTTP.get(url, ["Connection" => "close"])
-            # Close sessions the GET created — compiles the teardown paths too.
+            # Fetch the dashboard via Downloads (libcurl), NOT HTTP/Reseau: the
+            # HTTP client spins up Reseau's global event loop, whose timer is
+            # still alive when the precompile image is serialized ("waiting for
+            # IO to finish" — a leaked uv handle). libcurl keeps its handles
+            # internal and releases them when the download returns, so the
+            # render path still precompiles (fast first paint) without leaking.
+            # `grace = 0`: the default Downloader keeps its libcurl event loop
+            # alive for 30s after the last request via a Timer — which would be
+            # the lingering handle. grace=0 tears it down immediately.
+            try
+                Downloads.download(url, devnull;
+                                   headers = ["Connection" => "close"],
+                                   downloader = Downloads.Downloader(; grace = 0))
+            catch e
+                @debug "precompile workload: dashboard fetch failed" exception = e
+            end
+            # Close the sessions the render created (compiles teardown paths too),
+            # then the server — which stops its accept loop AND its 1-Hz cleanup
+            # task (whose `sleep(1)` would otherwise be a lingering timer).
             for (_, v) in state.srv.routes.table
                 v isa Bonito.App && !isnothing(v.session[]) && close(v.session[])
             end
             close(state.srv)
         end
-        # Signal Bonito's per-server cleanup tasks to stop and clear globals.
+        # Stop Bonito's global cleanup machinery + clear server globals, then run
+        # finalizers and yield so no background task / libuv handle survives into
+        # the precompile image.
         Bonito.cleanup_globals()
+        GC.gc()
         yield()
     end
 end
