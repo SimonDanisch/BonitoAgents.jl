@@ -153,26 +153,47 @@ next_out(t::MockTransport) = JSON.parse(take!(t.outbox))
         @test take!(r2) isa ACP.ConnectionClosed
     end
 
-    # ── A7: drop-oldest delivery never blocks the dispatcher ─────────────────
-    # Fill the active-updates channel past its bound while the consumer is
-    # absent; deliver_update! must keep returning (dropping oldest) rather than
-    # blocking forever.
-    @testset "A7 deliver_update! drop-oldest never blocks" begin
-        ch = Channel{ACP.SessionUpdate}(4)
+    # ── A7: deliver_update! backpressures and never DROPS a distinct update ───
+    # These are DISTINCT updates for DIFFERENT messages (unlike push_snapshot!'s
+    # same-object snapshots). Dropping the oldest used to discard a tool's
+    # terminal `tool_call_update`, so that tool's per-message `updates` channel
+    # never closed and the consumer's `for snap in m.updates` deadlocked — on any
+    # turn streaming more than `BUF` updates (a flood of tool calls). It must now
+    # block (backpressure) until the consumer drains, losing nothing.
+    @testset "A7 deliver_update! backpressures, never drops" begin
+        t = MockTransport(); conn = ACP.Connection(t)
         mk(i) = ACP.UnknownUpdate("u$i", Dict{String,Any}())
-        done = Channel{Bool}(1)
-        @async begin
+
+        # Flood 1000 distinct updates through a 4-slot channel while a consumer
+        # drains: with backpressure EVERY update arrives (no silent loss).
+        ch = Channel{ACP.SessionUpdate}(4)
+        prod = @async begin
             for i in 1:1000
-                ACP.deliver_update!(ch, mk(i))
+                ACP.deliver_update!(conn, ch, mk(i))
             end
-            put!(done, true)
+            close(ch)
         end
-        # Without drop-oldest this @async would block at slot 5 forever.
-        @test take!(done) == true
-        @test Base.n_avail(ch) <= 4         # never exceeded the bound
+        got = ACP.SessionUpdate[]
+        for u in ch
+            push!(got, u)
+        end
+        @test length(got) == 1000                     # nothing dropped
+        @test [u.session_update for u in got] == ["u$i" for i in 1:1000]   # in order
+        @test timedwait(() -> istaskdone(prod), 5.0) === :ok
+
+        # Cancel in flight: deliver_update! must NOT block on a full channel, so
+        # the single dispatcher stays free to reach the turn's `cancelled`
+        # response sitting behind the backlog.
+        full = Channel{ACP.SessionUpdate}(2)
+        put!(full, mk(1)); put!(full, mk(2))          # full, no consumer
+        @atomic conn.cancelling = true
+        cancel_task = @async ACP.deliver_update!(conn, full, mk(3))
+        @test timedwait(() -> istaskdone(cancel_task), 2.0) === :ok
+
         # Closed channel is a no-op, not an error.
-        close(ch)
-        @test ACP.deliver_update!(ch, mk(1)) === nothing
+        closed = Channel{ACP.SessionUpdate}(1); close(closed)
+        @test ACP.deliver_update!(conn, closed, mk(1)) === nothing
+        close(conn)
     end
 
     # ── A7 (tool updates): push_snapshot! drop-oldest never blocks ───────────

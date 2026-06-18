@@ -271,14 +271,24 @@ function register_turn!(conn::Connection, id::Int,
     return nothing
 end
 
-# Deliver one streamed update WITHOUT ever blocking the dispatcher (A7). If the
-# consumer abandoned its channel, a plain `put!` into a full 256-slot buffer
-# would wedge the single dispatcher task forever (it could never reach the
-# turn's `cancelled`/`end_turn` response sitting behind the backlog). Only the
-# latest snapshot matters to a live UI, so on a full buffer we drop the oldest
-# queued update and enqueue the new one. A closed channel (consumer gone) is a
-# no-op.
-function deliver_update!(ch::Channel{SessionUpdate}, update::SessionUpdate)
+# Deliver one streamed update to the active turn's stream, applying BACKPRESSURE
+# when the consumer falls behind (a flood of tool calls / a heavy token stream).
+#
+# We must NOT drop here. Unlike `push_snapshot!` — whose queued entries are all
+# the SAME mutated `ToolCall` object, so only the latest matters and dropping is
+# safe — these are DISTINCT `SessionUpdate`s for DIFFERENT messages. Dropping the
+# oldest loses, e.g., a tool's terminal `tool_call_update`, so that tool's
+# per-message `updates` channel never closes and the consumer's
+# `for snap in m.updates` blocks FOREVER: a hard deadlock that wedges the whole
+# turn (reproducibly, on any turn streaming more than ~`BUF` updates). Blocking
+# the dispatcher is safe for liveness — the consumer always drains eventually, so
+# space always frees.
+#
+# The one case the old drop-oldest was protecting (A7: keep the dispatcher free
+# to reach a `cancelled` response behind a backlog) is handled by bailing the
+# moment `cancelling` flips: the call site already stops delivering once
+# cancelling and the consumer fast-discards, so a parked put! can't wedge cancel.
+function deliver_update!(conn::Connection, ch::Channel{SessionUpdate}, update::SessionUpdate)
     while true
         lock(ch)
         try
@@ -290,13 +300,11 @@ function deliver_update!(ch::Channel{SessionUpdate}, update::SessionUpdate)
         finally
             unlock(ch)
         end
-        # Buffer full: drop the oldest so we never block the dispatcher.
-        try
-            take!(ch)
-        catch e
-            e isa InvalidStateException && return nothing
-            rethrow()
-        end
+        # Full: wait for the consumer to take one (backpressure, no data loss).
+        # A cancel in flight means we stop rendering this turn anyway — return so
+        # the dispatcher stays free to reach the turn's `cancelled` response.
+        (@atomic conn.cancelling) && return nothing
+        sleep(0.001)
     end
 end
 
@@ -462,7 +470,7 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
                 isempty(conn.active_turns) ? nothing : last(first(conn.active_turns))
             end
             if ch !== nothing && !(@atomic conn.cancelling)
-                deliver_update!(ch, update)
+                deliver_update!(conn, ch, update)
             end
         end
         # Other notifications silently ignored.
