@@ -366,6 +366,7 @@ class BonitoChat {
         this._onPanMove = onPanMove;
         this._onPanUp = onPanUp;
         this._onScroll = ()=>{
+            if (this.container.clientHeight === 0) return;
             const userDriven = this._scrollbarDrag || this._pendingUserScroll || performance.now() - this._lastUserInputT < 400;
             this._pendingUserScroll = false;
             const atBot = this.atBottom();
@@ -382,6 +383,7 @@ class BonitoChat {
         });
         this._containerRO = new ResizeObserver(()=>{
             if (this.destroyed) return;
+            if (this.container.clientHeight === 0) return;
             this._sizeTail();
             if (this.followMode) this._queueScrollToBottom();
         });

@@ -615,6 +615,15 @@ class BonitoChat {
         this._onPanUp   = onPanUp;
 
         this._onScroll = () => {
+            // A scroll event on a zero-height container carries no user intent:
+            // hiding the pane (display:none on a chat switch) collapses
+            // scrollTop to 0 and fires this handler. `atBottom()` is then
+            // trivially true (0 - 0 - 0 < AT_BOTTOM_PX), so a switch made
+            // within 400ms of a real scroll (still "userDriven") would flip
+            // followMode back to true and chase the pane to the bottom on the
+            // next onShown — the user's read position lost. Ignore it: the pane
+            // has no viewport, so there is nothing to classify.
+            if (this.container.clientHeight === 0) return;
             const userDriven = this._scrollbarDrag ||
                 this._pendingUserScroll ||
                 (performance.now() - this._lastUserInputT) < 400;
@@ -649,6 +658,9 @@ class BonitoChat {
         // chase pinned to the bottom across every frame of the grow.
         this._containerRO = new ResizeObserver(() => {
             if (this.destroyed) return;
+            // A zero-height (hidden) container has nothing to chase — and the
+            // re-show / restore is owned by onShown(), so don't fight it here.
+            if (this.container.clientHeight === 0) return;
             this._sizeTail();
             if (this.followMode) this._queueScrollToBottom();
         });
