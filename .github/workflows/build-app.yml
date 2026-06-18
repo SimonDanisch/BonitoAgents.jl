@@ -64,11 +64,25 @@ jobs:
 
       - uses: julia-actions/cache@v2
 
+      # Don't eagerly precompile during instantiate — it's wasted twice over:
+      # (1) the meta env's auto-precompile of Conda/PyCall FAILS here because
+      #     `Pkg.build()` (which creates the conda env) hasn't run yet; they only
+      #     compile cleanly afterwards, so the first pass is thrown away.
+      # (2) the app stack compiled into ~/.julia is never used — `AppBundler
+      #     build` recompiles it into the bundle's own depot.
+      # With auto-precompile off, AppBundler compiles lazily when `-m AppBundler`
+      # loads it (after the conda build), and the app compiles once, in the
+      # bundle. JULIA_PKG_PRECOMPILE_AUTO is scoped to the instantiate steps so
+      # the build's own pkgimg compile is unaffected.
       - name: Instantiate AppBundler (meta env)
         run: julia --project=BonitoAgentsApp/meta -e 'using Pkg; Pkg.instantiate(); Pkg.build()'
+        env:
+          JULIA_PKG_PRECOMPILE_AUTO: '0'
 
       - name: Instantiate app project
         run: julia --project=BonitoAgentsApp -e 'using Pkg; Pkg.instantiate()'
+        env:
+          JULIA_PKG_PRECOMPILE_AUTO: '0'
 
       - name: Build bundle
         run: >
