@@ -1169,7 +1169,7 @@ function unified_app(state::ServerState)
         # The whole stage is the Workspace: the chat/dashboard is the "chat"
         # panel; opened files and detached `bt_show_app` embeds become more
         # panels the user can tab / split / float (VSCode-style).
-        stage, controller_js, _ =
+        stage, glue_js, _ =
             install_workspace!(session, view, current_view, pane, main_panel)
         shell = DOM.div(
             # MarkdownCSS FIRST: it's the base sheet our styles override.
@@ -1189,7 +1189,7 @@ function unified_app(state::ServerState)
         # Wire the bt_show_app detach controller once the shell is in the DOM:
         # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all
         # descendants of the shell, guaranteed present by onload.
-        Bonito.onload(session, shell, controller_js)
+        Bonito.onload(session, shell, glue_js)
         # Favicon (SVG + PNG fallback) — injected into <head> on load.
         favicon_onload(session, shell)
         shell

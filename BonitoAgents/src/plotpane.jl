@@ -14,25 +14,29 @@
 #     panel whose content is a Monaco `FileEditor`. The Workspace renders the
 #     editor ONCE and only ever *moves* its node, so cursor/scroll/unsaved edits
 #     survive every tab switch, split, and float.
-#   • The app panel: `bt_show_app` embeds live inline in their chat bubble. The
-#     ⤢ button routes a `DetachAppCommand` → `pane.detach_app`; the workspace
-#     controller (workspace.jl) moves the embed DOM (via `Bonito.move_dom_node`,
-#     which keeps its WebSocket state alive) into a floating "app" panel and back.
+#   • App panels: `bt_show_app` embeds live inline in their chat bubble. The ⤢
+#     button routes a `DetachAppCommand` → `pane.detach_app`; each detached embed
+#     becomes its OWN BonitoWidgets panel whose content ADOPTS the live embed
+#     node (`Bonito.move_dom_node`, which keeps its WebSocket state alive). From
+#     there BonitoWidgets owns the move/dock/float/split entirely in JS (it moves
+#     panel content by identity) — no shared mount, no Julia controller. Closing
+#     the panel moves the embed back to its bubble.
 
 struct PlotPane
     # Set to the BonitoWidgets.Workspace once `install_workspace!` builds it.
     # Untyped (Ref{Any}) so plotpane.jl needn't depend on BonitoWidgets ordering.
     workspace  :: Base.RefValue{Any}
-    # `bt_show_app` embed actions. detach_app: a tool_id pulse → float the embed.
-    # restore_app: a tool_id pulse → embed back to its bubble + drop the panel.
+    # `bt_show_app` detach: a tool_id pulse → float (or focus) that embed's panel.
     detach_app  :: Observable{String}
-    restore_app :: Observable{String}
 end
 
-PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""), Observable(""))
+PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""))
 
 file_tab_id(path::AbstractString) = "file:" * String(path)
-const APP_PANEL_ID = "app"
+# Per-embed panel id. One panel per detached `bt_show_app`, keyed by its tool id
+# — so several apps can be detached at once, each its own tab/float, and a
+# re-detach just focuses the existing one.
+app_panel_id(tool_id::AbstractString) = "app:" * String(tool_id)
 
 # ── Tool-body wrapper helper ─────────────────────────────────────────────────
 # Wrap a `RemoteAppPlaceholder` (or any rendered app body) in the slot/embed

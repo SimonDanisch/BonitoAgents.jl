@@ -1,21 +1,21 @@
 # ── Workspace stage ──────────────────────────────────────────────────────────
 # The window's main area (everything right of the sidebar) is a single
 # BonitoWidgets.Workspace. The chat/dashboard is the non-closable "chat" panel;
-# files open as closable panels; a detached `bt_show_app` embed becomes a
-# floating "app" panel. The user tabs / splits / floats them VSCode-style.
+# files open as closable panels; each detached `bt_show_app` embed becomes its
+# own closable panel. The user tabs / splits / floats them VSCode-style.
 #
-# `install_workspace!` builds the Workspace + the embed-detach controller and
-# returns `(stage_dom, controller_js, pane)`. The chat content is built BEFORE
-# this (it needs the `pane` handle) and handed in as the "chat" panel.
+# `install_workspace!` builds the Workspace + the embed restore-on-close glue and
+# returns `(stage_dom, glue_js, pane)`. The chat content is built BEFORE this (it
+# needs the `pane` handle) and handed in as the "chat" panel.
 
 using BonitoWidgets: Workspace, Panel, float_panel!, activate_panel!
 
 """
     install_workspace!(session, state, current_view, pane, chat_content)
-        -> (stage_dom, controller_js, pane)
+        -> (stage_dom, glue_js, pane)
 
 Build the window's [`Workspace`](@ref BonitoWidgets.Workspace): the `chat_content`
-as the non-closable "chat" panel, plus the embed-detach controller. Sets
+as the non-closable "chat" panel, plus the embed restore-on-close glue. Sets
 `pane.workspace[]` so chat code (`open_file!`, `pane.detach_app`) can drive it.
 """
 function install_workspace!(session::Bonito.Session,
@@ -45,80 +45,85 @@ function install_workspace!(session::Bonito.Session,
         activate_panel!(ws, "chat")
     end
 
-    # The floating "app" panel's mount: detached `bt_show_app` embeds are moved
-    # in (and back out) by the controller below. Rebuilt each detach (the panel
-    # is removed on close), so the `#bt-app-mount` id always resolves to the
-    # current one.
-    app_content() = DOM.div(
-        DOM.div(""; id = "bt-app-mount", class = "bt-app-mount");
-        class = "bt-app-frame")
+    # A detached app's panel content: an empty frame the embed is moved INTO by
+    # the glue below once the panel mounts. (A `Bonito.onload` on the content
+    # doesn't fire reliably through the workspace's parking-pool shipping path,
+    # so the adopt is driven from the shell-level `detach_app` handler instead.)
+    # Rendered once by BonitoWidgets and thereafter relocated by identity
+    # (dock/float/split/tab), so the live sub-session rides along untouched.
+    app_adopt_content(_tid) = DOM.div(; class = "bt-app-frame")
 
-    # Detach: float an "app" panel (or focus the existing one). The controller's
-    # `detachApp.on` then moves the embed DOM into the panel's mount.
+    # Detach: each `bt_show_app` embed becomes its OWN floating panel whose
+    # content ADOPTS the live embed node (see `app_adopt_content`). A re-detach
+    # just focuses the existing panel. Once the panel exists, BonitoWidgets owns
+    # every move (dock / float / split / tab) — it relocates panel content by
+    # identity, in JS, with no Julia round-trip — so there is no shared mount and
+    # no controller racing the workspace re-render (the old `#bt-app-mount` +
+    # `getElementById` design, which could resolve a stale node and silently drop
+    # the move, leaving the embed inline and the panel blank).
     on(session, pane.detach_app) do tid
         isempty(tid) && return
         w = pane.workspace[]
         w === nothing && return
-        if any(p -> p.id == APP_PANEL_ID, w.panels[])
-            activate_panel!(w, APP_PANEL_ID)
+        pid = app_panel_id(tid)
+        if any(p -> p.id == pid, w.panels[])
+            activate_panel!(w, pid)
         else
-            float_panel!(w, Panel(APP_PANEL_ID, app_content(); label = "App", closable = true);
+            float_panel!(w, Panel(pid, app_adopt_content(tid); label = "App", closable = true);
                          x = 120, y = 80, width = 560, height = 420)
         end
     end
 
-    # The controller owns the embed DOM moves. An Observable notified from JS
-    # runs its JS subscribers synchronously BEFORE the Julia round-trip, so for
-    # the close path (workspace `closed` → auto-remove the panel in Julia) the
-    # embed is moved back to its bubble first, then the empty mount is pruned.
-    controller_js = js"""
+    # The two bridges between chat DOM and workspace DOM, both keyed by tool id
+    # and scoped to ONE per-app panel (`app:<tid>`) — no shared mount, no
+    # first-in-tree `getElementById`:
+    #   • ADOPT (on detach): once `float_panel!` has mounted the panel, move the
+    #     live embed node into its `.bt-app-frame`. The panel arrives a round-trip
+    #     after `detach_app` fires, so we rAF-retry until its frame exists.
+    #   • RESTORE (on close): `ws.closed` is notified from JS, so this runs
+    #     synchronously BEFORE Julia's `remove_panel!` prunes the node — grab the
+    #     embed now and move it back to its bubble slot.
+    # Embeds/slots are resolved through the chat's node cache (`toolSlot`), which
+    # finds them even on a bubble the virtual scroll currently holds detached.
+    glue_js = js"""
     (shell) => {
-        const detachApp  = $(pane.detach_app);
-        const restoreApp = $(pane.restore_app);
-        const wsClosed   = $(ws.closed);
-        const moveNode = (n, parent) => {
+        const detachApp = $(pane.detach_app);
+        const closedObs = $(ws.closed);
+        const esc = (s) => (window.CSS ? CSS.escape(s) : s);
+        const move = (n, p) => { if (!n || !p) return;
             if (window.Bonito && window.Bonito.Sessions && window.Bonito.Sessions.move_dom_node)
-                window.Bonito.Sessions.move_dom_node(n, parent, null);
-            else parent.appendChild(n);
-        };
-        const mountEl = () => document.getElementById('bt-app-mount');
-
-        function restoreEmbed(toolId) {
-            if (!toolId) return;
-            const slot  = document.getElementById('bt-slot-'  + toolId);
-            const embed = document.getElementById('bt-embed-' + toolId);
-            if (embed && slot) { moveNode(embed, slot); delete slot.dataset.detached; }
-            const m = mountEl();
-            if (m && m.dataset.toolId === toolId) delete m.dataset.toolId;
-        }
-        function detachInto(toolId) {
-            if (!toolId) return;
-            let tries = 40;
+                window.Bonito.Sessions.move_dom_node(n, p, null);
+            else p.appendChild(n); };
+        function adopt(tid) {
+            if (!tid) return;
+            let tries = 90;
             const step = () => {
-                const mount = mountEl();
-                if (!mount) { if (tries-- > 0) requestAnimationFrame(step); return; }
-                const prev = mount.dataset.toolId;
-                if (prev && prev !== toolId) restoreEmbed(prev);
-                const embed = document.getElementById('bt-embed-' + toolId);
-                if (embed) {
-                    moveNode(embed, mount);
-                    mount.dataset.toolId = toolId;
-                    const slot = document.getElementById('bt-slot-' + toolId);
-                    if (slot) slot.dataset.detached = '1';
-                }
+                const panel = shell.querySelector('.bw-ws-panel[data-panel-id="app:' + esc(tid) + '"]');
+                const frame = panel && panel.querySelector('.bt-app-frame');
+                if (!frame) { if (tries-- > 0) requestAnimationFrame(step); return; }
+                if (frame.querySelector('.bt-embed')) return;          // already adopted
+                $(ChatLib).then(lib => {
+                    const body  = lib.toolSlot(tid);
+                    const embed = body && body.querySelector('.bt-embed');
+                    const slot  = body && body.querySelector('.bt-slot');
+                    if (embed) { move(embed, frame); if (slot) slot.dataset.detached = '1'; }
+                });
             };
             step();
         }
-
-        detachApp.on(detachInto);
-        if (detachApp.value) detachInto(detachApp.value);
-        restoreApp.on(restoreEmbed);
-        // Closing the app panel (its × on a tab or float) restores the embed
-        // before Julia prunes the now-empty mount.
-        wsClosed.on((id) => {
-            if (id !== $(APP_PANEL_ID)) return;
-            const m = mountEl();
-            if (m && m.dataset.toolId) restoreEmbed(m.dataset.toolId);
+        detachApp.on(adopt);
+        if (detachApp.value) adopt(detachApp.value);
+        closedObs.on((pid) => {
+            if (typeof pid !== 'string' || pid.indexOf('app:') !== 0) return;
+            const tid = pid.slice(4);
+            const panel = shell.querySelector('.bw-ws-panel[data-panel-id="' + esc(pid) + '"]');
+            const embed = panel && panel.querySelector('.bt-embed');   // grab NOW (sync)
+            if (!embed) return;
+            $(ChatLib).then(lib => {
+                const body = lib.toolSlot(tid);
+                const slot = body && body.querySelector('.bt-slot');
+                if (slot) { move(embed, slot); delete slot.dataset.detached; }
+            });
         });
     }
     """
@@ -142,7 +147,7 @@ function install_workspace!(session::Bonito.Session,
         font       = "'Inter', system-ui, -apple-system, sans-serif",
     )
     stage = DOM.div(ws_theme, ws; class = "bt-stage")
-    return (stage, controller_js, pane)
+    return (stage, glue_js, pane)
 end
 
 const WorkspaceStageStyles = Bonito.Styles(
@@ -186,9 +191,12 @@ const WorkspaceStageStyles = Bonito.Styles(
     # panel; reveal the placeholder in the now-empty inline spot.
     Bonito.CSS(".bt-embed-frame:has(.bt-slot[data-detached]) .bt-detach-placeholder",
         "display" => "inline"),
+    # A detached app's panel content: the frame fills the panel and scrolls; the
+    # adopted embed (moved in by `app_adopt_content`) fills the frame.
     Bonito.CSS(".bt-app-frame",
         "width" => "100%", "height" => "100%",
-        "display" => "flex", "flex-direction" => "column", "min-height" => "0"),
-    Bonito.CSS(".bt-app-mount",
-        "flex" => "1 1 0", "min-height" => "0", "overflow" => "auto"),
+        "display" => "flex", "flex-direction" => "column",
+        "min-height" => "0", "overflow" => "auto"),
+    Bonito.CSS(".bt-app-frame > .bt-embed",
+        "flex" => "1 1 0", "min-height" => "0", "width" => "100%"),
 )

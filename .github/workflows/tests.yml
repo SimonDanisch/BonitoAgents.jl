@@ -132,6 +132,7 @@ jobs:
           - workflows
           - chat_features
           - embedded_app
+          - app_detach
           - scroll_persist
           - streaming_flood
           - errors
