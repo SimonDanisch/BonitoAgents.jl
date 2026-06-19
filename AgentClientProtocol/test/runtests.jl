@@ -1,340 +1,330 @@
 using AgentClientProtocol
 using Test
-using JSON
 
 const ACP = AgentClientProtocol
 
-# ── Mock transport ──────────────────────────────────────────────────────────
-# A channel-backed Transport: `send` captures the client's outgoing JSON lines
-# (so the test can inspect ids / reply to them) and `recv` blocks on an inbox
-# the test feeds. No subprocess, no node, no claude-agent-acp.
-mutable struct MockTransport <: ACP.Transport
-    inbox     :: Channel{String}      # test → client (frames the client reads)
-    outbox    :: Channel{String}      # client → test (frames the client wrote)
-    closed    :: Bool
-    eof       :: Bool                 # when true, recv returns "" and reports EOF
-end
-MockTransport() = MockTransport(Channel{String}(Inf), Channel{String}(Inf), false, false)
+# ── Real-subprocess mock agent ────────────────────────────────────────────────
+# The ONLY fake here is a real-spawned mock AGENT process: a tiny Julia script
+# that speaks ACP JSON-RPC over stdio (test/mocks/acp_mock_agent.jl). There is
+# NO fake Transport — every testset drives the genuine `ACP.SubprocessTransport`
+# / `ACP.Connection` (real reader_loop/dispatcher) and the mock's behavior is
+# selected per-test via the `ACP_MOCK_SCENARIO` env var. See the script for the
+# scenario list.
+const MOCK_AGENT = joinpath(@__DIR__, "mocks", "acp_mock_agent.jl")
+const JULIA_BIN  = Base.julia_cmd()[1]
 
-ACP.send(t::MockTransport, line::AbstractString) = (put!(t.outbox, String(line)); nothing)
-function ACP.recv(t::MockTransport)
-    t.eof && return ""
-    try
-        return take!(t.inbox)
-    catch
-        return ""
+# Spawn the mock under a scenario and wrap it in a real Connection. `n` is an
+# integer knob a scenario reads (e.g. flood count). The caller MUST `close(conn)`
+# in a `finally` — that closes stdin, SIGTERMs, then SIGKILLs the subprocess, so
+# nothing leaks.
+function spawn_mock(scenario::AbstractString; n::Integer = 0,
+                    handler::ACP.Handler = ACP.DiscardHandler())
+    env = merge(Dict(k => v for (k, v) in ENV),
+                Dict("ACP_MOCK_SCENARIO" => scenario,
+                     "ACP_MOCK_N"        => string(n)))
+    proc = open(Cmd(`$JULIA_BIN --startup-file=no $MOCK_AGENT`; env), "r+")
+    conn = ACP.Connection(proc, handler)
+    return proc, conn
+end
+
+# Run the standard ACP setup handshake over a fresh Connection (initialize +
+# session/new), returning the sessionId. Bounded timeout so a misbehaving mock
+# can never hang the suite.
+function do_setup(conn; timeout = 10.0)
+    ACP.send_request(conn, "initialize",
+                     Dict("protocolVersion" => 1), timeout)
+    res = ACP.send_request(conn, "session/new",
+                           Dict("cwd" => pwd(), "mcpServers" => []), timeout)
+    return res["sessionId"]
+end
+
+# Collect the text of agent_message_chunk updates from a turn's update stream.
+function drain_text(ch)
+    texts = String[]
+    for u in ch
+        u isa ACP.AgentMessageChunk && u.content isa ACP.TextContent &&
+            push!(texts, u.content.text)
     end
+    return texts
 end
-ACP.transport_eof(t::MockTransport) = t.eof || t.closed
-function Base.close(t::MockTransport)
-    t.closed = true
-    t.eof = true
-    isopen(t.inbox) && close(t.inbox)
-    return nothing
-end
-
-# Feed a JSON-RPC response frame for request `id` into the client.
-push_response!(t::MockTransport, id, result) =
-    put!(t.inbox, JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "result" => result)))
-
-# Read the next outgoing frame the client wrote (the request it just sent).
-next_out(t::MockTransport) = JSON.parse(take!(t.outbox))
 
 @testset "AgentClientProtocol stability" begin
 
     # ── A1: concurrent register/respond never drops a pending entry ──────────
-    # Many tasks each fire a send_request concurrently; a responder task replies
-    # to every id it sees. With the lock around pending, every caller gets its
-    # reply; an unlocked dict would drop entries under contention → take! hangs.
+    # Many tasks each fire a send_request concurrently against a REAL agent that
+    # echoes every id; with the lock around `pending`, every caller gets its
+    # reply (an unlocked dict would drop entries under contention → take! hangs).
     @testset "A1 concurrent register/respond loses nothing" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        N = 200
-        # Responder: for each outgoing request, echo a response with the same id.
-        responder = @async begin
-            for _ in 1:N
-                msg = next_out(t)
-                push_response!(t, msg["id"], Dict("ok" => msg["id"]))
+        proc, conn = spawn_mock("echo_requests")
+        try
+            N = 200
+            results = Vector{Any}(undef, N)
+            @sync for i in 1:N
+                @async begin
+                    r = ACP.send_request(conn, "ping", Dict("n" => i))
+                    results[i] = r["ok"]
+                end
             end
+            @test sort(Int.(results)) == collect(0:N-1)   # ids 0..N-1, none lost
+        finally
+            close(conn)
         end
-        results = Vector{Any}(undef, N)
-        @sync for i in 1:N
-            @async begin
-                r = ACP.send_request(conn, "ping", Dict("n" => i))
-                results[i] = r["ok"]
-            end
-        end
-        wait(responder)
-        @test sort(Int.(results)) == collect(0:N-1)   # ids 0..N-1, none lost
-        close(conn)
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
     # ── A2: requests after teardown throw ConnectionClosed, never hang ───────
     @testset "A2 send_request after close throws ConnectionClosed" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        close(conn)
-        # Give the dispatcher's finally a moment to flip `closed` under the lock.
-        for _ in 1:100
-            conn.closed && break
-            sleep(0.01)
+        proc, conn = spawn_mock("setup_then_idle")
+        try
+            do_setup(conn)
+            close(conn)
+            @test timedwait(() -> conn.closed, 2.0) === :ok
+            @test_throws ACP.ConnectionClosed ACP.send_request(conn, "ping", Dict())
+            @test_throws ACP.ConnectionClosed ACP.request_updates(conn, "session/load", Dict())
+        finally
+            close(conn)
         end
-        @test conn.closed
-        @test_throws ACP.ConnectionClosed ACP.send_request(conn, "ping", Dict())
-        @test_throws ACP.ConnectionClosed ACP.request_updates(conn, "session/load", Dict())
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
     # ── A2/teardown: a pending request in flight is failed with ConnectionClosed
     @testset "A2 in-flight request fails with ConnectionClosed on teardown" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        fut = @async ACP.send_request(conn, "ping", Dict())
-        _ = next_out(t)            # ensure it registered + sent
-        close(conn)
-        # `fetch` on a failed Task wraps the cause in TaskFailedException;
-        # unwrap to assert the in-flight request was failed with ConnectionClosed.
-        cause = try
-            fetch(fut); nothing
-        catch e
-            e isa TaskFailedException ? e.task.exception : e
+        # The agent completes setup, then SWALLOWS further requests (never
+        # answers). A `ping` left in flight must be failed by teardown.
+        proc, conn = spawn_mock("setup_then_swallow")
+        try
+            do_setup(conn)
+            fut = @async ACP.send_request(conn, "ping", Dict())
+            sleep(0.2)          # ensure it registered + the frame went out
+            close(conn)
+            cause = try
+                fetch(fut); nothing
+            catch e
+                e isa TaskFailedException ? e.task.exception : e
+            end
+            @test cause isa ACP.ConnectionClosed
+        finally
+            close(conn)
         end
-        @test cause isa ACP.ConnectionClosed
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
-    # ── A8: a second concurrent turn errors instead of orphaning the first ───
-    # ── Concurrent turns: the handoff contract ────────────────────────────────
+    # ── A8: concurrent turns route updates oldest-first + handoff on response ──
     # claude-agent-acp supports a second `session/prompt` while one runs
-    # (steering; also the only release for a turn the SDK holds open for a
-    # background shell). Updates must route to the OLDEST unresolved prompt;
-    # a prompt's response closes ITS stream and updates flow to the next.
+    # (steering). Updates route to the OLDEST unresolved prompt; a prompt's
+    # response closes ITS stream and updates flow to the next. The mock streams
+    # one chunk for turn 1, resolves turn 1, streams one chunk for turn 2,
+    # resolves turn 2 — all over the real wire.
     @testset "concurrent turns route updates oldest-first, handoff on response" begin
-        upd(text) = put!(t.inbox, JSON.json(Dict(
-            "jsonrpc" => "2.0", "method" => "session/update",
-            "params" => Dict("sessionId" => "s", "update" => Dict(
-                "sessionUpdate" => "agent_message_chunk",
-                "content" => Dict("type" => "text", "text" => text))))))
-        drain_text(ch) = begin
-            texts = String[]
-            for u in ch
-                u isa ACP.AgentMessageChunk && u.content isa ACP.TextContent &&
-                    push!(texts, u.content.text)
-            end
-            texts
+        proc, conn = spawn_mock("concurrent_turns")
+        try
+            do_setup(conn)
+            u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
+            u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
+
+            # Drain both streams concurrently: each closes when ITS response lands.
+            t1 = @async drain_text(u1)
+            t2 = @async drain_text(u2)
+            @test timedwait(() -> istaskdone(t1) && istaskdone(t2), 10.0) === :ok
+            @test fetch(t1) == ["for-turn-1"]            # u1 closed by id1's response
+            @test fetch(t2) == ["for-turn-2"]            # turn 1 gone → routed to 2
+            @test take!(r1)["stopReason"] == "end_turn"
+            @test take!(r2)["stopReason"] == "end_turn"
+            @test isempty(conn.active_turns)
+        finally
+            close(conn)
         end
-
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
-        id1 = next_out(t)["id"]
-        u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())   # mid-turn: allowed
-        id2 = next_out(t)["id"]
-
-        upd("for-turn-1")                       # both turns open → oldest (1)
-        push_response!(t, id1, Dict("stopReason" => "end_turn"))   # handoff
-        upd("for-turn-2")                       # turn 1 gone → routes to 2
-        push_response!(t, id2, Dict("stopReason" => "end_turn"))
-
-        @test drain_text(u1) == ["for-turn-1"]  # u1 closed by id1's response
-        @test take!(r1)["stopReason"] == "end_turn"
-        @test drain_text(u2) == ["for-turn-2"]
-        @test take!(r2)["stopReason"] == "end_turn"
-        @test isempty(conn.active_turns)
-        close(conn)
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
     @testset "teardown closes every in-flight turn" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
-        u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
-        close(conn)
-        @test timedwait(() -> !isopen(u1) && !isopen(u2), 5.0) === :ok
-        @test take!(r1) isa ACP.ConnectionClosed
-        @test take!(r2) isa ACP.ConnectionClosed
+        # The mock opens (reads) both prompts but never resolves them; teardown
+        # must close both update streams and fail both responses.
+        proc, conn = spawn_mock("two_turns_hang")
+        try
+            do_setup(conn)
+            u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
+            u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
+            sleep(0.1)
+            close(conn)
+            @test timedwait(() -> !isopen(u1) && !isopen(u2), 5.0) === :ok
+            @test take!(r1) isa ACP.ConnectionClosed
+            @test take!(r2) isa ACP.ConnectionClosed
+        finally
+            close(conn)
+        end
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
-    # ── A7: deliver_update! backpressures and never DROPS a distinct update ───
-    # These are DISTINCT updates for DIFFERENT messages (unlike push_snapshot!'s
-    # same-object snapshots). Dropping the oldest used to discard a tool's
-    # terminal `tool_call_update`, so that tool's per-message `updates` channel
-    # never closed and the consumer's `for snap in m.updates` deadlocked — on any
-    # turn streaming more than `BUF` updates (a flood of tool calls). It must now
-    # block (backpressure) until the consumer drains, losing nothing.
-    @testset "A7 deliver_update! backpressures, never drops" begin
-        t = MockTransport(); conn = ACP.Connection(t)
+    # ── A7: the update stream backpressures and never DROPS a distinct update ──
+    # The mock floods 1000 DISTINCT text chunks ("u1".."u1000") through the turn
+    # over the real wire while a consumer drains. Dropping any used to discard a
+    # message and deadlock its consumer; with backpressure EVERY chunk arrives,
+    # in order, none lost.
+    @testset "A7 update stream backpressures, never drops" begin
+        proc, conn = spawn_mock("flood_text"; n = 1000)
+        try
+            do_setup(conn)
+            u, r = ACP.request_updates(conn, "session/prompt", Dict())
+            cons = @async drain_text(u)
+            @test timedwait(() -> istaskdone(cons), 30.0) === :ok
+            got = fetch(cons)
+            @test length(got) == 1000                            # nothing dropped
+            @test got == ["u$i" for i in 1:1000]                 # in order
+            @test take!(r)["stopReason"] == "end_turn"
+        finally
+            close(conn)
+        end
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
+
+        # deliver_update! robustness unit-checks (no transport involved — these
+        # construct bare channels to assert the two non-flood invariants):
+        #   * a cancel in flight must NOT block on a full channel, so the single
+        #     dispatcher stays free to reach the turn's `cancelled` response;
+        #   * a closed channel is a no-op, not an error.
         mk(i) = ACP.UnknownUpdate("u$i", Dict{String,Any}())
-
-        # Flood 1000 distinct updates through a 4-slot channel while a consumer
-        # drains: with backpressure EVERY update arrives (no silent loss).
-        ch = Channel{ACP.SessionUpdate}(4)
-        prod = @async begin
-            for i in 1:1000
-                ACP.deliver_update!(conn, ch, mk(i))
-            end
-            close(ch)
-        end
-        got = ACP.SessionUpdate[]
-        for u in ch
-            push!(got, u)
-        end
-        @test length(got) == 1000                     # nothing dropped
-        @test [u.session_update for u in got] == ["u$i" for i in 1:1000]   # in order
-        @test timedwait(() -> istaskdone(prod), 5.0) === :ok
-
-        # Cancel in flight: deliver_update! must NOT block on a full channel, so
-        # the single dispatcher stays free to reach the turn's `cancelled`
-        # response sitting behind the backlog.
         full = Channel{ACP.SessionUpdate}(2)
         put!(full, mk(1)); put!(full, mk(2))          # full, no consumer
         @atomic conn.cancelling = true
         cancel_task = @async ACP.deliver_update!(conn, full, mk(3))
         @test timedwait(() -> istaskdone(cancel_task), 2.0) === :ok
 
-        # Closed channel is a no-op, not an error.
         closed = Channel{ACP.SessionUpdate}(1); close(closed)
         @test ACP.deliver_update!(conn, closed, mk(1)) === nothing
-        close(conn)
     end
 
-    # ── A7 (tool updates): push_snapshot! drop-oldest never blocks ───────────
-    @testset "A7 push_snapshot! drop-oldest never blocks" begin
-        ch = Channel{ACP.ToolCall}(2)
-        tc = ACP.GenericTool("id1", "execute", "t", "in_progress", ACP.ToolContent[])
-        done = Channel{Bool}(1)
-        @async begin
-            for _ in 1:500
-                ACP.push_snapshot!(ch, tc)
+    # ── A7: tool-call snapshots — drop-oldest / latest-wins / never wedge ─────
+    # BEHAVIORAL rewrite (no white-box `Base.n_avail`): the mock opens ONE tool
+    # then floods N `tool_call_update`s mutating that SAME tool, ending with a
+    # terminal `completed`. The real `prompt!` consumer coalesces these onto one
+    # ToolCall whose per-message `updates` is the drop-oldest snapshot channel.
+    # A deliberately SLOW consumer must (a) never wedge, and (b) still observe the
+    # LATEST snapshot (status == "completed") — latest-wins, no block, no deadlock.
+    @testset "A7 tool snapshots: drop-oldest, latest-wins, never wedge" begin
+        handler = ACP.FSRequestHandler(pwd())
+        proc, conn = spawn_mock("flood_snapshots"; n = 2000, handler)
+        try
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+            messages = ACP.prompt!(client, "go")
+
+            final_status = Ref{String}("")
+            tools_seen   = Ref(0)
+            cons = @async for m in messages
+                if m isa ACP.ToolCall
+                    tools_seen[] += 1
+                    last_status = m.status
+                    for snap in m.updates
+                        last_status = snap.status
+                        sleep(0.0005)        # slow consumer → producer must drop-oldest
+                    end
+                    final_status[] = last_status
+                end
             end
-            put!(done, true)
+            @test timedwait(() -> istaskdone(cons), 30.0) === :ok   # never wedged
+            @test tools_seen[] == 1
+            @test final_status[] == "completed"                     # latest-wins
+        finally
+            close(conn)
         end
-        @test take!(done) == true
-        @test Base.n_avail(ch) <= 2
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
     # ── A4: a stray blank line does NOT tear the connection down ─────────────
+    # The mock emits blank lines around its frames; the real reader_loop must
+    # skip them (not treat "" as EOF) and still deliver the response.
     @testset "A4 blank line is skipped, not treated as EOF" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        put!(t.inbox, "")                     # stray blank line (not EOF)
-        # Now a real request still works: register + reply.
-        fut = @async ACP.send_request(conn, "ping", Dict())
-        msg = next_out(t)
-        push_response!(t, msg["id"], Dict("ok" => true))
-        @test fetch(fut)["ok"] == true
-        @test !conn.closed                    # blank line didn't tear us down
-        close(conn)
-    end
-
-    # ── A4b: a dead transport must NOT hot-spin reader_loop ───────────────────
-    # Regression for the `stop_session!` → 100% CPU livelock: when a transport's
-    # `recv` returns "" *without blocking* (a closed WS) and `transport_eof` is
-    # true, reader_loop must break promptly — not `continue` forever. And even a
-    # transport that (wrongly) reports eof=false must not STARVE the scheduler:
-    # reader_loop runs on a sticky `@async` task, so a non-yielding skip loop
-    # would monopolize thread 1 and freeze every other server task.
-    @testset "A4b dead transport terminates reader_loop without starving" begin
-        # recv returns "" immediately; reports EOF → loop must end.
-        struct DeadEOF <: ACP.Transport end
-        ACP.recv(::DeadEOF) = ""
-        ACP.send(::DeadEOF, ::AbstractString) = nothing
-        Base.close(::DeadEOF) = nothing
-        ACP.transport_eof(::DeadEOF) = true
-
-        conn = ACP.Connection(DeadEOF())
-        t0 = time()
-        while !istaskdone(conn.reader_task) && time() - t0 < 2.0; sleep(0.005); end
-        @test istaskdone(conn.reader_task)    # broke out — no hot-spin
-
-        # recv "" immediately, eof=false (the bug's default): loop keeps going,
-        # but the `yield()` in the skip path keeps the scheduler live.
-        struct DeadNoEOF <: ACP.Transport end
-        ACP.recv(::DeadNoEOF) = ""
-        ACP.send(::DeadNoEOF, ::AbstractString) = nothing
-        Base.close(::DeadNoEOF) = nothing
-        # no transport_eof → default false
-
-        conn2 = ACP.Connection(DeadNoEOF())
-        counter = Ref(0)
-        @async (for _ in 1:200; counter[] += 1; yield(); end)
-        sleep(0.2)
-        @test counter[] == 200                # concurrent task NOT starved
-        conn2.closed = true                   # stop the spinning loop
-        t1 = time()
-        while !istaskdone(conn2.reader_task) && time() - t1 < 2.0; sleep(0.005); end
-        @test istaskdone(conn2.reader_task)
-    end
-
-    # ── A3: setup failure closes the transport (no leaked process) ───────────
-    # We exercise the Client setup path's contract via a Connection over a mock
-    # transport: when a setup RPC errors, the caller closes the connection,
-    # which closes the transport. (Client() itself can't be tested without a
-    # binary, but it wraps exactly this in try/catch → close(conn) + rethrow.)
-    @testset "A3 setup RPC error closes the connection/transport" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        # Reply to the first request with a JSON-RPC error.
-        responder = @async begin
-            msg = next_out(t)
-            put!(t.inbox, JSON.json(Dict("jsonrpc" => "2.0", "id" => msg["id"],
-                "error" => Dict("code" => -32000, "message" => "boom"))))
+        proc, conn = spawn_mock("blank_line_then_answer")
+        try
+            r = ACP.send_request(conn, "ping", Dict(), 5.0)
+            @test r["ok"] == true
+            @test !conn.closed                    # blank lines didn't tear us down
+        finally
+            close(conn)
         end
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
+    end
+
+    # ── A4b: a dead transport must terminate reader_loop, not hot-spin ────────
+    # Over a REAL killed subprocess: SIGKILL the mock → its stdout hits EOF →
+    # SubprocessTransport reports EOF → reader_loop breaks promptly and the
+    # dispatcher drains. No livelock, scheduler not starved.
+    @testset "A4b dead subprocess terminates reader_loop" begin
+        proc, conn = spawn_mock("setup_then_idle")
+        try
+            do_setup(conn)
+            @test process_running(proc)
+            kill(proc, Base.SIGKILL)              # real subprocess death → EOF
+            @test timedwait(() -> istaskdone(conn.reader_task), 5.0) === :ok
+            @test timedwait(() -> istaskdone(conn.dispatcher_task), 5.0) === :ok
+        finally
+            close(conn)
+        end
+    end
+
+    # ── A3: a setup RPC error closes the connection (no leaked process) ───────
+    # The mock returns a JSON-RPC error to `initialize`; `send_request` raises,
+    # the caller closes the connection, and the subprocess is reaped. This is
+    # exactly the path `Client()` wraps in try/catch → close(conn) + rethrow.
+    @testset "A3 setup RPC error closes the connection/transport" begin
+        proc, conn = spawn_mock("setup_error")
         threw = false
         try
-            ACP.send_request(conn, "initialize", Dict())
-        catch
+            ACP.send_request(conn, "initialize", Dict(), 5.0)
+        catch e
             threw = true
-            close(conn)               # mirrors Client()'s catch → close(conn)
+            close(conn)                           # mirrors Client()'s catch
         end
-        wait(responder)
         @test threw
-        @test t.closed                # transport torn down, process would be reaped
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok   # reaped
+        close(conn)
     end
 
     # ── A3 (timeout): a wedged setup RPC times out instead of hanging ────────
     @testset "A3 setup RPC times out on a silent agent" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        # Never reply. The timeout variant must raise ConnectionClosed.
-        @test_throws ACP.ConnectionClosed ACP.send_request(conn, "initialize", Dict(), 0.2)
-        close(conn)
+        proc, conn = spawn_mock("silent")
+        try
+            # The mock NEVER answers initialize. The timeout variant must raise
+            # ConnectionClosed within the bounded window.
+            @test_throws ACP.ConnectionClosed ACP.send_request(conn, "initialize", Dict(), 0.3)
+        finally
+            close(conn)
+        end
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
     # ── A8: cancel! is a no-op when idle (no active turn) ────────────────────
     @testset "A8 cancel is a no-op when idle" begin
-        t = MockTransport()
-        conn = ACP.Connection(t)
-        client = ACP.Client(conn, "sess-1", pwd())
-        ACP.cancel!(client)
-        @test !(@atomic conn.cancelling)      # not latched → next turn renders
-        @test !isready(t.outbox)              # no session/cancel sent
-        close(conn)
+        proc, conn = spawn_mock("setup_then_idle")
+        try
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+            ACP.cancel!(client)
+            @test !(@atomic conn.cancelling)      # not latched → next turn renders
+        finally
+            close(conn)
+        end
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
     # ── Regression: a long resumed history with an un-terminated tool must not
-    # deadlock replay collection. A message the agent leaves open mid-stream,
-    # followed by more than `BUF` further messages, used to wedge the sequential
-    # drain: the open message blocked the `out` consumer → the feeder backed up
-    # on the bounded `out` → the dispatcher could never deliver the session/load
-    # response behind the backlog → "restoring the conversation…" forever.
-    # Concurrent per-message draining + close(TurnState) at stream end fixes it.
+    # deadlock replay collection. Over the real wire: on `session/load` the mock
+    # streams an un-terminated tool ("open", pending, never completed) followed
+    # by > BUF further completed tools, then resolves the load. Concurrent
+    # per-message draining + close(TurnState) at stream end means the open tool
+    # can't wedge the >BUF history collection.
     @testset "replay survives an un-terminated tool in a >BUF history" begin
-        tc(id, status) = ACP.parse_session_update(Dict(
-            "sessionUpdate" => "tool_call", "toolCallId" => id,
-            "title" => "t", "kind" => "other", "status" => status))
-        updates  = Channel{ACP.SessionUpdate}(ACP.BUF)
-        response = Channel{Any}(1)
-        feeder = @async begin
-            put!(updates, tc("open", "pending"))          # never terminated
-            for i in 1:(ACP.BUF + 50)                     # > BUF: the deadlock trigger
-                put!(updates, tc("t$i", "completed"))
-            end
-            close(updates)
-            put!(response, Dict{String,Any}())            # the session/load response
+        proc, conn = spawn_mock("replay_history"; n = ACP.BUF + 50)
+        try
+            do_setup(conn)
+            res = @async ACP.replay_history(conn,
+                Dict("sessionId" => "s", "cwd" => pwd(), "mcpServers" => []))
+            @test timedwait(() -> istaskdone(res), 25.0) === :ok      # must NOT hang
+            msgs, _ = fetch(res)
+            @test length(msgs) == ACP.BUF + 51            # open tool + every follower
+        finally
+            close(conn)
         end
-        res = @async ACP.collect_replayed_updates(updates, response)
-        @test timedwait(() -> istaskdone(res), 20.0) == :ok   # must NOT hang
-        msgs, _ = fetch(res)
-        @test length(msgs) == ACP.BUF + 51                # open tool + every follower
-        wait(feeder)
+        @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 end
