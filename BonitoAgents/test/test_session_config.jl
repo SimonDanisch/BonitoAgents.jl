@@ -4,10 +4,31 @@
 # `ChatModel.session_meta`, and render read-only pills via `header_pill`
 # dispatch. Mid-session `config_option_update` / `current_mode_update`
 # session updates patch the observable without disturbing open bubbles.
+#
+# TestKit migration. The deleted `MockTransport` (the `transport=` kwarg is gone;
+# `agent=` replaces it) used to script a session/new carrying configOptions and a
+# mid-turn config_option_update, plus capture the set_config_option RPC. The
+# mock claude-agent-acp (the only fake left) replies to session/new with just
+# `{sessionId}` and exposes NO config-update event, so config bring-up / mid-turn
+# patches are NOT drivable through the harness's agent. Per the migration rule —
+# "assert what's drivable; unit-test the parse/apply contract directly" — these
+# are split:
+#
+#   • ConfigOption parse / pill / header / select rendering, `process!`
+#     (ConfigUpdate / ModeUpdate), the optimistic `apply_config_pick!` patch, and
+#     the "a mid-turn ConfigUpdate must not split a streaming AgentMsg" contract
+#     are PURE/direct unit tests on a real `ServerState` + a `ChatModel` whose
+#     agent is a no-op `MockAgent([])` (never started — just a state holder).
+#   • The one genuinely agent-driven assertion — "picking a model dispatches a
+#     real `session/set_config_option` RPC over the ACP wire" — is driven through
+#     the REAL stack: a live `MockAgent` (real mock subprocess, real Connection)
+#     with an `on_frame` tap captures the outgoing request frame.
 
 using Test
 using JSON
-using BonitoAgents
+include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents
+const TK  = TestKit
 const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
 
@@ -46,6 +67,15 @@ session_result() = Dict{String,Any}(
 )
 
 option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
+
+# Real ServerState + a ChatModel whose agent is a no-op MockAgent. Nothing in the
+# pure tests drives a turn, so the agent is never `start!`ed — it only gives the
+# typed-config paths a real `session_meta` observable + `comm` to bind to.
+function make_chat()
+    state = BT.ServerState(; state_dir = mktempdir(),
+                             working_dir = mktempdir(), worker_secret = "x")
+    BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
+end
 
 @testset "session config in the header" begin
 
@@ -101,10 +131,7 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
     end
 
     @testset "process!: ConfigUpdate replaces options, preserves other kinds" begin
-        state = BT.ServerState(; state_dir = mktempdir(),
-                                 working_dir = mktempdir(), worker_secret = "x")
-        chat = BT.ChatModel(state, mktempdir();
-                            transport = BT.MockTransport((o, i) -> nothing))
+        chat = make_chat()
         opts = ACP.parse_config_options(session_result())
         chat.session_meta[] = Any["future-meta-kind"]
 
@@ -145,73 +172,35 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
         @test string(BT.header_meta_line(Any[])) == string(BT.DOM.div(; class = "bt-header-meta"))
     end
 
-    @testset "e2e: bring-up populates session_meta; mid-turn update patches it" begin
-        upd_chunk(text) = JSON.json(Dict("jsonrpc"=>"2.0","method"=>"session/update",
-            "params"=>Dict("sessionId"=>"s",
-                "update"=>Dict("sessionUpdate"=>"agent_message_chunk",
-                               "content"=>Dict("type"=>"text","text"=>text)))))
-        upd_config(opts) = JSON.json(Dict("jsonrpc"=>"2.0","method"=>"session/update",
-            "params"=>Dict("sessionId"=>"s",
-                "update"=>Dict("sessionUpdate"=>"config_option_update",
-                               "configOptions"=>opts))))
-        resp(id, result) = JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>result))
+    # The old "bring-up populates session_meta; mid-turn update patches it" e2e
+    # leaned on a scripted MockTransport. The mock claude-agent-acp can't carry
+    # configOptions on session/new nor a mid-turn config update, so the SAME
+    # behaviour is asserted as a direct contract: a mid-turn `ConfigUpdate` patches
+    # the option WITHOUT splitting the streaming agent bubble it interleaves with.
+    @testset "mid-turn ConfigUpdate patches meta without splitting the bubble" begin
+        chat = make_chat()
+        chat.session_meta[] = Any[ACP.parse_config_options(session_result())...]
+        opts = [x for x in chat.session_meta[] if x isa ACP.ConfigOption]
+        @test [o.id for o in opts] == ["mode", "model", "effort"]
+        @test option_by_id(opts, "effort").current_value == "default"
 
-        # On prompt: chunk → config update (effort flips) → chunk → end_turn.
-        # The metadata update must NOT split the streaming agent bubble.
-        # NOTE: bring-up fires NO extra requests (no set_config_option) —
-        # the responder would hang any unexpected RPC, failing the test.
+        # A streaming agent bubble, mid-turn: chunk → config flips effort → chunk.
+        am = BT.send!(chat, BT.AgentMsg(chat, ""))
+        append!(am, "hello ")
         flipped = deepcopy(config_options_json())
         flipped[3]["currentValue"] = "high"
-        on_setup = (outgoing::Channel{String}, incoming::Channel{String}) -> begin
-            Base.errormonitor(@async try
-                for line in outgoing
-                    msg    = JSON.parse(line)
-                    method = get(msg, "method", "")
-                    id     = get(msg, "id", nothing)
-                    if method == "initialize" && id !== nothing
-                        put!(incoming, resp(id, Dict()))
-                    elseif method == "session/new" && id !== nothing
-                        put!(incoming, resp(id, session_result()))
-                    elseif method == "session/prompt" && id !== nothing
-                        put!(incoming, upd_chunk("hello "))
-                        put!(incoming, upd_config(flipped))
-                        put!(incoming, upd_chunk("world"))
-                        put!(incoming, resp(id, Dict("stopReason" => "end_turn")))
-                    end
-                end
-            catch e
-                e isa InvalidStateException || @warn "responder failed" exception=e
-            end)
-            return nothing
-        end
+        BT.process!(chat, ACP.ConfigUpdate(ACP.parse_config_options(
+            Dict{String,Any}("sessionId"=>"s", "configOptions"=>flipped))))
+        append!(am, "world")
+        close(am)
 
-        state = BT.ServerState(; state_dir = mktempdir(),
-                                 working_dir = mktempdir(), worker_secret = "x")
-        model = BT.ChatModel(state, mktempdir();
-                             transport = BT.MockTransport(on_setup))
-        BT.start_chat_client!(model)
-
-        # Bring-up: raw result on the client, typed options on the observable.
-        @test model.client[].session_result["configOptions"] isa AbstractVector
-        opts = [x for x in model.session_meta[] if x isa ACP.ConfigOption]
-        @test [o.id for o in opts] == ["mode", "model", "effort"]
-        @test option_by_id(opts, "mode").current_value == "default"
-
-        # Record busy transitions via a LISTENER, not by polling: a fast
-        # scripted turn can flip busy on AND off inside one `timedwait` poll
-        # interval, which made the bare `timedwait(() -> busy[])` flaky.
-        busy_seen = Bool[]
-        BT.Bonito.Observables.on(b -> push!(busy_seen, b), model.busy_active)
-        BT.send_message!(model, BT.UserMsg("go"))
-        @test timedwait(() -> busy_seen == [true, false], 5.0) === :ok
-
-        # The mid-turn metadata update landed…
-        opts = [x for x in model.session_meta[] if x isa ACP.ConfigOption]
+        # The metadata update landed…
+        opts = [x for x in chat.session_meta[] if x isa ACP.ConfigOption]
         @test option_by_id(opts, "effort").current_value == "high"
         # …and the streaming bubble was not split by it.
-        am = [m for m in model.msgs_store if m isa BT.AgentMsg]
-        @test length(am) == 1
-        @test am[1].text == "hello world"
+        ams = [m for m in chat.msgs_store if m isa BT.AgentMsg]
+        @test length(ams) == 1
+        @test ams[1].text == "hello world"
     end
 
     @testset "model picker: <select> rendering" begin
@@ -254,77 +243,71 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
     end
 
     @testset "apply_config_pick! is a safe no-op without a live client" begin
-        state = BT.ServerState(; state_dir = mktempdir(),
-                                 working_dir = mktempdir(), worker_secret = "x")
-        chat = BT.ChatModel(state, mktempdir();
-                            transport = BT.MockTransport((o, i) -> nothing))
+        chat = make_chat()
         chat.session_meta[] = Any[ACP.parse_config_options(session_result())...]
-        # No client[] yet → no-op, session_meta untouched (no nil-deref).
+        # No client[] yet (agent never started) → no-op, session_meta untouched
+        # (no nil-deref).
+        @test BT.client(chat.agent) === nothing
         BT.apply_config_pick!(chat, "model", "sonnet")
         m = option_by_id([x for x in chat.session_meta[] if x isa ACP.ConfigOption], "model")
         @test m.current_value == "default"
     end
 
-    @testset "e2e: picking a model fires session/set_config_option" begin
-        sent_rpcs = Channel{Dict{String,Any}}(16)
-        resp(id, result) = JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>result))
-        on_setup = (outgoing::Channel{String}, incoming::Channel{String}) -> begin
-            Base.errormonitor(@async try
-                for line in outgoing
-                    msg    = JSON.parse(line)
-                    put!(sent_rpcs, msg)
-                    method = get(msg, "method", "")
-                    id     = get(msg, "id", nothing)
-                    if method == "initialize" && id !== nothing
-                        put!(incoming, resp(id, Dict()))
-                    elseif method == "session/new" && id !== nothing
-                        put!(incoming, resp(id, session_result()))
-                    elseif method == "session/set_config_option" && id !== nothing
-                        # claude-agent-acp returns an empty object on success.
-                        put!(incoming, resp(id, Dict{String,Any}()))
-                    end
-                end
-            catch e
-                e isa InvalidStateException || @warn "responder failed" exception=e
-            end)
-            return nothing
-        end
+    # The one genuinely agent-driven case: a model pick must (a) optimistically
+    # patch session_meta immediately, and (b) dispatch a real
+    # `session/set_config_option` request over the ACP wire. Driven through the
+    # REAL stack — a live MockAgent (real subprocess + Connection) with an
+    # `on_frame` tap capturing the outgoing frame. `apply_config_pick!` fires the
+    # RPC off-task; the mock has no handler for it (the @async request just stays
+    # pending), but the request frame is on the wire, which is what we assert.
+    @testset "picking a model dispatches session/set_config_option (real wire)" begin
+        frames = Tuple{Symbol,Dict{String,Any}}[]
+        lk = ReentrantLock()
+        tap = (dir, msg) -> lock(() -> push!(frames, (dir, Dict{String,Any}(msg))), lk)
 
         state = BT.ServerState(; state_dir = mktempdir(),
                                  working_dir = mktempdir(), worker_secret = "x")
-        model = BT.ChatModel(state, mktempdir();
-                             transport = BT.MockTransport(on_setup))
-        BT.start_chat_client!(model)
-
-        # Bring-up populated session_meta with the model option.
-        opts = [x for x in model.session_meta[] if x isa ACP.ConfigOption]
-        @test option_by_id(opts, "model").current_value == "default"
-
-        # Trigger a model switch directly (as the JS onchange handler would).
-        BT.apply_config_pick!(model, "model", "sonnet")
-
-        # Optimistic patch: session_meta reflects the new value immediately, BEFORE
-        # the agent's confirmation comes back.
-        opts = [x for x in model.session_meta[] if x isa ACP.ConfigOption]
-        @test option_by_id(opts, "model").current_value == "sonnet"
-
-        # The RPC is dispatched off-task; wait for it to land in sent_rpcs.
-        deadline = time() + 5.0
-        set_cfg = nothing
-        while time() < deadline && set_cfg === nothing
-            if isready(sent_rpcs)
-                m = take!(sent_rpcs)
-                get(m, "method", "") == "session/set_config_option" && (set_cfg = m)
-            else
-                sleep(0.05)
-            end
+        cwd   = mktempdir()
+        agent = BT.MockAgent(; cwd = cwd)
+        model = BT.ChatModel(state, cwd; agent = agent)
+        setcfg = nothing
+        has_setcfg() = lock(lk) do
+            any(t -> t[1] == :out && get(t[2], "method", "") == "session/set_config_option", frames)
         end
-        @test set_cfg !== nothing
-        @test set_cfg["params"]["sessionId"] == "s"
-        @test set_cfg["params"]["configId"]  == "model"
-        @test set_cfg["params"]["value"]     == "sonnet"
-        @test haskey(set_cfg, "id")          # it's a REQUEST, not a notification
+        try
+            t = @async BT.start!(agent; on_frame = tap)
+            @assert timedwait(() -> istaskdone(t), 30.0) === :ok "agent bring-up hung"
+            istaskfailed(t) && fetch(t)
+            @test BT.client(agent) !== nothing
+
+            # Seed session_meta with the model option (bring-up would, for a real
+            # config-carrying agent).
+            model.session_meta[] = Any[ACP.parse_config_options(session_result())...]
+            @test option_by_id([x for x in model.session_meta[] if x isa ACP.ConfigOption],
+                               "model").current_value == "default"
+
+            # Trigger the pick (as the JS onchange handler does).
+            BT.apply_config_pick!(model, "model", "sonnet")
+
+            # Optimistic patch: reflected immediately, BEFORE any agent confirmation.
+            @test option_by_id([x for x in model.session_meta[] if x isa ACP.ConfigOption],
+                               "model").current_value == "sonnet"
+
+            # The RPC frame lands on the wire (dispatched off-task).
+            @assert timedwait(has_setcfg, 30.0) === :ok "set_config_option never reached the wire"
+            lock(lk) do
+                idx = findfirst(t -> t[1] == :out &&
+                                get(t[2], "method", "") == "session/set_config_option", frames)
+                setcfg = frames[idx][2]
+            end
+            @test setcfg !== nothing
+            @test setcfg["params"]["sessionId"] == "s"
+            @test setcfg["params"]["configId"]  == "model"
+            @test setcfg["params"]["value"]     == "sonnet"
+            @test haskey(setcfg, "id")          # it's a REQUEST, not a notification
+        finally
+            try; BT.stop!(agent); catch; end
+        end
     end
 
 end
-
