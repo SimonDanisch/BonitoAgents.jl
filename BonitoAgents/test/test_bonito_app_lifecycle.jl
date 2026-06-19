@@ -15,6 +15,14 @@
 #     even after `b.app_id` was set. The result snap must reach the generic
 #     loop AND its tool_update must carry expand=true.
 
+# TestKit migration. This is a pure component/logic test of the `BonitoAppMsg`
+# lifecycle: header-expand dispatch (`auto_expand_body` / `augment_header!`) and
+# the snap-emission path through `process_update!`. Nothing drives an agent turn
+# or touches a transport — the deleted `MockTransport` is replaced by a no-op
+# `MockAgent([])` (a pure state holder so the `ChatModel` ctor can bind); the
+# tool snaps are constructed directly and pushed through the call's `updates`
+# channel, exactly as the wire parser would.
+
 using Test
 using Bonito
 import BonitoAgents
@@ -22,14 +30,14 @@ import AgentClientProtocol as Acp
 const BT  = BonitoAgents
 const ACP = Acp
 
-# A bare ChatModel hooked to a ServerState; transport is a stub. Each test
-# captures emits by overriding chat_emit on this chat instance.
+# A bare ChatModel hooked to a ServerState; its agent is a no-op MockAgent (no
+# turn is ever driven here). Each test captures emits by listening on the
+# chat's `comm` Observable that `chat_emit` writes to.
 function fresh_chat()
     state = BT.ServerState(; state_dir = mktempdir(),
                               working_dir = mktempdir(),
                               worker_secret = "x")
-    BT.ChatModel(state, mktempdir();
-                  transport = BT.MockTransport((o, i) -> nothing))
+    BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
 end
 
 # Drive a fresh MCP-shaped ToolCall through `process_update!` and return the
