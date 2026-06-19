@@ -17,17 +17,36 @@
 #   • No `BG_POLL_INTERVAL` global constant — the 1 s sleep is inline
 #     in `background_poll_loop`. The cadence is a property of the
 #     poller task, not server config.
+#
+# MIGRATION NOTE: the old fixtures built a `ChatModel(...; transport =
+# MockTransport((o,i)->nothing))` purely as a no-op state holder — those
+# fake transports are deleted. The poller's lifecycle (spawn / idempotent /
+# per-chat isolation / nil-poll robustness / no-global-constant) is
+# AGENT-FREE: it walks `msgs_store` and never drives a turn. So those stay
+# direct unit tests, swapping the no-op `MockTransport` for `MockAgent([])`
+# (a real agent type used only as an inert state holder — never started, so
+# no subprocess is spawned).
+#
+# The one genuinely agent-driven invariant — "a real chat ALWAYS gets a
+# poller, spawned in start_chat_client!, idempotent on the live model, and
+# robust to a nil poll" — is verified end-to-end through the TestKit harness
+# (real dev_server + worker + ACP + Electron), asserting against the live
+# model's poller in `BG_POLLERS` reached via `s.h.state`.
 
 using Test
-using BonitoAgents
+include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents
+const TK  = TestKit
 const BT  = BonitoAgents
-const ACP = BonitoAgents.AgentClientProtocol
+using .TestKit: text, end_turn
 
 newstate() = BT.ServerState(; state_dir   = mktempdir(),
                               working_dir = mktempdir(),
                               worker_secret = "x")
 
-@testset "background-output poller lifecycle" begin
+# ── Pure unit tests: poller-task lifecycle over a bare ChatModel ─────────────
+
+@testset "background-output poller lifecycle (unit)" begin
 
     # ── No global cadence constant ──────────────────────────────────────
     # Earlier design had `BG_POLL_INTERVAL = 1.0` at module scope. The
@@ -39,22 +58,17 @@ newstate() = BT.ServerState(; state_dir   = mktempdir(),
         @test !isdefined(BT, :BG_POLL_INTERVAL)
     end
 
-    # ── Per-chat task: spawned in start_chat_client! ────────────────────
-    @testset "start_chat_client! spawns a poller task for this chat" begin
+    # ── Per-chat task: start_background_poller! spawns one ───────────────
+    @testset "start_background_poller! spawns a poller task for this chat" begin
         state = newstate()
-        model = BT.ChatModel(state, mktempdir();
-                             transport = BT.MockTransport((o, i) -> nothing))
+        model = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
         @test !haskey(BT.BG_POLLERS, model)
-
-        # Direct call — we don't go through start_chat_client! here
-        # because the MockTransport responder is a no-op and would block
-        # the bring-up on `initialize`. The poller's spawn is the part
-        # we want to assert anyway.
         BT.start_background_poller!(state, model)
         @test haskey(BT.BG_POLLERS, model)
         t = BT.BG_POLLERS[model]
         @test t isa Task
         @test !istaskdone(t)
+        close(model)
     end
 
     # ── Idempotent: second call doesn't spawn a duplicate ───────────────
@@ -64,27 +78,26 @@ newstate() = BT.ServerState(; state_dir   = mktempdir(),
     # first over the same msgs_store.
     @testset "second start_background_poller! is a no-op" begin
         state = newstate()
-        model = BT.ChatModel(state, mktempdir();
-                             transport = BT.MockTransport((o, i) -> nothing))
+        model = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
         BT.start_background_poller!(state, model)
         t1 = BT.BG_POLLERS[model]
         BT.start_background_poller!(state, model)
         t2 = BT.BG_POLLERS[model]
         @test t1 === t2
+        close(model)
     end
 
     # ── Per-chat isolation: two chats get two tasks ─────────────────────
     @testset "each ChatModel gets its own poller task" begin
         state = newstate()
-        ma = BT.ChatModel(state, mktempdir();
-                          transport = BT.MockTransport((o, i) -> nothing))
-        mb = BT.ChatModel(state, mktempdir();
-                          transport = BT.MockTransport((o, i) -> nothing))
+        ma = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
+        mb = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
         BT.start_background_poller!(state, ma)
         BT.start_background_poller!(state, mb)
         @test BT.BG_POLLERS[ma] !== BT.BG_POLLERS[mb]
         @test !istaskdone(BT.BG_POLLERS[ma])
         @test !istaskdone(BT.BG_POLLERS[mb])
+        close(ma); close(mb)
     end
 
     # ── Cadence smoke-test: the loop actually ticks ─────────────────────
@@ -98,8 +111,7 @@ newstate() = BT.ServerState(; state_dir   = mktempdir(),
     # filter + the `r === nothing` branch.
     @testset "loop is robust to a missing worker (nil poll result)" begin
         state = newstate()
-        model = BT.ChatModel(state, mktempdir();
-                             transport = BT.MockTransport((o, i) -> nothing))
+        model = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
         # Synthetic bg bash, no project_id ⇒ poll returns nothing each tick.
         bash = BT.BashToolMsg(
             "bash-test", "execute", "Bash", "completed", "running…",
@@ -112,6 +124,55 @@ newstate() = BT.ServerState(; state_dir   = mktempdir(),
         sleep(2.5)  # two ticks of margin
         @test haskey(BT.BG_POLLERS, model)
         @test !istaskdone(BT.BG_POLLERS[model])
+        close(model)
     end
 
+end
+
+# ── DOM/state e2e: a real chat always gets a live, idempotent poller ─────────
+# The agent-driven invariant: opening a real chat through the full stack runs
+# `start_chat_client!`, which spawns the poller. We assert against the LIVE
+# model's poller (reached via `s.h.state` → `BG_POLLERS`), prove the re-call
+# idempotency on that same live model, then inject a synthetic background
+# `BashToolMsg` into the live store (no real worker for that path ⇒ nil poll
+# each tick) and confirm the poller rides it out without dying.
+@testset "real chat: poller spawned in start_chat_client!, idempotent, nil-poll robust (e2e)" begin
+    s = TK.dev_server(; agent = msg -> [text("ok"), end_turn()])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        model = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
+        sh = BT.shared(model)
+
+        # Opening the chat already ran start_chat_client! → the poller exists,
+        # keyed by the SHARED model, and is alive.
+        @test haskey(BT.BG_POLLERS, sh)
+        t = BT.BG_POLLERS[sh]
+        @test t isa Task
+        @test !istaskdone(t)
+
+        # Idempotent on the live model: a restart-style re-call finds the live
+        # task and no-ops (same task object, no duplicate racing the store).
+        BT.start_background_poller!(s.h.state, model)
+        @test BT.BG_POLLERS[sh] === t
+
+        # Inject a synthetic background bash into the LIVE store. Its poll path
+        # short-circuits (the file doesn't exist / the tail returns nil), so the
+        # loop exercises its `r === nothing` branch every tick. The poller must
+        # survive that — not crash and self-evict from BG_POLLERS.
+        bash = BT.BashToolMsg(
+            "bash-e2e", "execute", "Bash", "completed", "running…",
+            time(), nothing, "echo hi", true,
+            "/tmp/never-exists-e2e.log", 0, true, "", sh)
+        lock(sh.lock) do; push!(sh.msgs_store, bash); end
+        sleep(2.5)  # a couple of ticks over the nil-poll branch
+        @test haskey(BT.BG_POLLERS, sh)
+        @test BT.BG_POLLERS[sh] === t
+        @test !istaskdone(t)
+
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
+    finally
+        close(s)
+    end
 end
