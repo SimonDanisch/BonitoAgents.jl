@@ -544,9 +544,12 @@ function reader_loop(conn::Connection)
         end
     catch e
         # EOFError / IOError = subprocess or socket EOF; InvalidStateException =
-        # a channel-based transport (MockTransport) closed under us. All three
-        # are clean teardown signals, not failures.
-        if !(e isa EOFError || e isa Base.IOError || e isa InvalidStateException)
+        # a channel-based transport closed under us. And `conn.closed` means WE
+        # initiated the teardown (close(conn)), so ANY reader error here — incl. a
+        # WebSocket 1006 abnormal-close as the socket drops — is expected teardown,
+        # not a failure. Only warn when the connection was supposed to be live (a
+        # genuine crash: protocol error / unexpected drop while open).
+        if !conn.closed && !(e isa EOFError || e isa Base.IOError || e isa InvalidStateException)
             @warn "ACP reader failed" exception=e
         end
     finally
