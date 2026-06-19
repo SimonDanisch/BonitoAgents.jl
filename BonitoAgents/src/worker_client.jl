@@ -8,7 +8,7 @@
 #                   sending commands like "open_session" / "open_transfer".
 #   /worker-acp   → per-session WS. Worker dials this in response to an
 #                   "open_session" command and identifies the WS by sid; we
-#                   pair it with a Channel that `start_session(::WorkerTransport)` is
+#                   pair it with a Channel that `start!(::WorkerAgent)` is
 #                   blocked on.
 #   /transfer-ws  → directional librsync transfer; worker dials this in
 #                   response to an "open_transfer" command; pairs the WS

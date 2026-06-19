@@ -62,7 +62,7 @@ mutable struct ProjectInfo
     last_sync_at::Union{DateTime,Nothing}
     # Set when the project was imported from an existing claude-agent-acp
     # session — the .jsonl basename in ~/.claude/projects/<encoded>/ on the
-    # worker. start_session(::WorkerTransport) uses session/load with this ID to bring
+    # worker. `start!(::WorkerAgent)` uses session/load with this ID to bring
     # the conversation history back to where claude left off; nothing → fresh
     # session/new. Persisted so server restarts still resume.
     resume_session_id::Union{String,Nothing}

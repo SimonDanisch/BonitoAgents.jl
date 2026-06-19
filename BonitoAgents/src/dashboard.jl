@@ -54,7 +54,7 @@ Create a new project on the named worker. Steps:
 1. Seed `<server_working_dir>/<name>` from the picked source folder (if not
    already there).
 2. Mirror to `<worker.projects_root>/<name>` (via rsync — local or ssh).
-3. Build the project's ChatModel (its `WorkerTransport` asks the worker over
+3. Build the project's ChatModel (its `WorkerAgent` asks the worker over
    its control WS to spawn an ACP session and dial back) and cache it in
    `state.chat_models[id]` so `unified_main` can render it when the user
    selects this project in the sidebar.
@@ -382,12 +382,12 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
                                        args = w.mcp_args,
                                        env  = eval_dialback_env(state, p.id))]
 
-    # The transport carries everything start_session needs — including the
+    # The agent carries everything start! needs — including the
     # `resume_session_id` so the worker bring-up path uses session/load
     # instead of session/new for imported claude sessions.
-    transport = WorkerTransport(state, w.worker_id, p.worker_path;
-                                 mcp_servers       = mcp,
-                                 resume_session_id = p.resume_session_id)
+    agent = WorkerAgent(state, w.worker_id, p.worker_path;
+                        mcp               = mcp,
+                        resume_session_id = p.resume_session_id)
 
     # Ensure server_path exists so BonitoBook (which reads files from cwd to
     # render the chat notebook + tools) doesn't crash on a never-synced
@@ -398,7 +398,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     model = ChatModel(state, p.server_path;
                        project_id  = p.id,
                        mcp_servers = mcp,
-                       transport   = transport)
+                       agent       = agent)
     start_chat_client!(model)        # also caches into state.chat_models
     fire_auto_prompt!(model)
     return model
@@ -414,7 +414,7 @@ sync!(state::ServerState, p::ProjectInfo; progress = nothing) =
 """
     stop_session!(state, p)
 
-Tear down the active ACP session for `p`: close the WorkerTransport (the
+Tear down the active ACP session for `p`: `stop!` the WorkerAgent (the
 worker sees the WS drop and reaps the claude subprocess), evict the
 ChatModel from `state.chat_models`, and release the project lock. Safe to
 call when no session is active — it just no-ops.
@@ -433,16 +433,13 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     # than erroring on a torn-down client mid-turn.
     if model !== nothing
         close(model)
-        # Tear down the ACP CONNECTION, not the bare transport. `close(client)`
+        # Tear down the agent's ACP CONNECTION. `stop!(agent)` → `close(client)`
         # → `close(conn)` sets `conn.closed = true` BEFORE closing the socket, so
-        # the reader loop exits on its `while !conn.closed` guard. Closing only
-        # the transport (the old code here) left `conn.closed == false`; the
-        # worker WS's `recv` then returns "" on close without unblocking the
-        # guard, spinning the reader loop at 100% CPU and starving every other
-        # server task. This mirrors the restart path's `close(old_client)`. Fall
-        # back to the transport only if the client never came up.
-        client = model.client[]
-        client === nothing ? close(model.transport) : close(client)
+        # the reader loop exits on its `while !conn.closed` guard (a plain
+        # transport close would leave `conn.closed == false` and spin the reader
+        # at 100% CPU). `stop!` is idempotent + total: a never-started agent just
+        # no-ops. This mirrors the restart path's `stop!(model.agent)`.
+        stop!(model.agent)
         notify_chats!(state)   # drop from the active-chats sidebar
     end
     release_project!(state, p)

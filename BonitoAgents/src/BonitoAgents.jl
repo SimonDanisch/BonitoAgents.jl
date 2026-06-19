@@ -42,7 +42,8 @@ bonito_asset(parts::AbstractString...) =
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("progress.jl")         # notify_progress / format_progress_string — shared by sync + import
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
-include("transport.jl")        # ChatTransport + LocalTransport / WorkerTransport / MockTransport
+include("transport.jl")        # ChatTransport + WorkerTransport (worker WS line I/O)
+include("agents.jl")           # AgentProvider + BinAgent (Claude/MiMo/OpenCode/Mock) + WorkerAgent
 include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
@@ -61,7 +62,8 @@ include("server.jl")           # serve()
 include("dev.jl")              # dev_server() — self-contained dev rig
 
 export serve, dev_server
-export AgentProvider, ClaudeCode, MiMoCode, OpenCode, MockCode
-export provider_label, provider_icon, find_provider_bin, provider_args, switch_provider!
+export AgentProvider, BinAgent, WorkerAgent
+export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent
+export start!, stop!, client, switch_provider!
 
 end # module BonitoAgents
