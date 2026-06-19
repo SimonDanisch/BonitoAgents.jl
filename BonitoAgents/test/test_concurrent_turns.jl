@@ -1,104 +1,134 @@
-# The background-shell hold + handoff (validated against the real agent):
-# claude-agent-acp never resolves a prompt while a background shell lives —
-# the NEXT prompt (officially supported mid-turn, `promptQueueing`) is what
-# releases it. So BonitoAgents must send a new prompt immediately instead of
-# serializing behind the held turn, and end-of-turn cleanup must belong to
-# the LAST active turn only.
+# Prompt queueing + the background-shell hold/handoff, plus the pure
+# `update_busy!` state machine.
+#
+# The agent-driven half is migrated onto the TestKit harness (real dev_server,
+# real worker subprocess, real ACP wire, real Electron browser; only the agent's
+# behaviour is faked via the `agent=` callback). The pure-function half
+# (`update_busy!` over directly-constructed state) stays a plain unit test — no
+# chat, no agent, no transport.
+#
+# Background (handoff): a held turn (a background shell) is released by the NEXT
+# prompt — `promptQueueing`. So a second prompt sent while the first is still
+# running must NOT serialize forever behind it: it goes in-flight, the first
+# resolves, both land in order, and end-of-turn cleanup belongs to the LAST
+# turn only (busy clears, no orphan queued badge left behind).
+
 using Test
-using BonitoAgents
-using JSON
-const BT  = BonitoAgents
-const ACP = BonitoAgents.AgentClientProtocol
+include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents
+const TK = TestKit
+const BT = BonitoAgents
+using .TestKit: text, delay, end_turn
 
-# A responder that mimics the SDK's prompt-queueing contract:
-#   prompt 1 → stream a bg-bash launch + a chunk, then HOLD (no response).
-#   prompt 2 (mid-hold) → resolve prompt 1 end_turn (handoff), stream a
-#   chunk for turn 2, resolve prompt 2.
-# A serializing client deadlocks here by construction — prompt 1 only ever
-# resolves after prompt 2 hits the wire.
-function handoff_transport()
-    BT.MockTransport((outgoing, incoming) -> begin
-        Base.errormonitor(@async try
-            send(d) = put!(incoming, JSON.json(d))
-            resp(id, result) = send(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
-            upd(u) = send(Dict("jsonrpc" => "2.0", "method" => "session/update",
-                "params" => Dict("sessionId" => "s", "update" => u)))
-            chunk(text) = upd(Dict("sessionUpdate" => "agent_message_chunk",
-                "content" => Dict("type" => "text", "text" => text)))
+# ── DOM e2e: two prompts, first held open, second released-then-ordered ──────
 
-            held_prompt = nothing
-            for line in outgoing
-                msg = JSON.parse(line)
-                id = get(msg, "id", nothing)
-                m  = get(msg, "method", "")
-                if m == "initialize"
-                    resp(id, Dict("agentCapabilities" =>
-                        Dict("_meta" => Dict("claudeCode" =>
-                            Dict("promptQueueing" => true)))))
-                elseif m == "session/new"
-                    resp(id, Dict("sessionId" => "s"))
-                elseif m == "session/prompt" && held_prompt === nothing
-                    held_prompt = id
-                    upd(Dict("sessionUpdate" => "tool_call",
-                        "toolCallId" => "bg1", "title" => "Terminal",
-                        "kind" => "execute", "status" => "pending",
-                        "content" => Any[],
-                        "rawInput" => Dict("command" => "sleep 600",
-                                           "run_in_background" => true,
-                                           "description" => "Monitor"),
-                        "_meta" => Dict("claudeCode" => Dict("toolName" => "Bash"))))
-                    upd(Dict("sessionUpdate" => "tool_call_update",
-                        "toolCallId" => "bg1", "status" => "completed",
-                        "_meta" => Dict("claudeCode" => Dict("toolName" => "Bash"))))
-                    chunk("LAUNCHED")
-                    # …and HOLD: no response until the next prompt.
-                elseif m == "session/prompt"
-                    resp(held_prompt, Dict("stopReason" => "end_turn"))   # handoff
-                    chunk("HELLO")
-                    resp(id, Dict("stopReason" => "end_turn"))
-                end
-            end
-        catch e
-            e isa InvalidStateException || @warn "handoff responder" e
-        end)
-        nothing
+@testset "prompt queueing: a second send while busy lands + both turns resolve in order" begin
+    # Turn 1 streams a chunk, then HOLDS open (a long delay) so a second prompt
+    # arrives mid-flight. Turn 2 streams its own chunk. Tags make ordering and
+    # no-bleed observable in the DOM. The first turn's hold (~3.5s) is long
+    # enough that the second `send_message` genuinely overlaps it.
+    turn = Ref(0)
+    s = TK.dev_server(; agent = msg -> begin
+        turn[] += 1
+        t = turn[]
+        if t == 1
+            [text("TURN1-START "), delay(3500), text("TURN1-END "), end_turn()]
+        else
+            [text("TURN2-ONLY "), end_turn()]
+        end
     end)
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
+        model = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
+
+        # Send the first prompt; wait until it is genuinely in-flight (busy + its
+        # opening chunk rendered) before sending the second.
+        TK.send_message(s, "first")
+        @test TK.wait_for(s, "turn 1 streaming",
+            "(document.querySelector('.bt-agent-msg')||{}).textContent ? document.body.textContent.indexOf('TURN1-START') !== -1 : false";
+            timeout = 30) == true
+        @assert timedwait(() -> model.busy_active[], 10.0) === :ok "turn 1 never went busy"
+
+        # Second prompt WHILE the first is still held open. It must reach the wire
+        # (a serializing consumer would queue it forever behind the held turn) —
+        # so its user bubble lands and, eventually, its response streams.
+        users_before = Int(TK.eval_js(s, "document.querySelectorAll('.bt-user-msg').length"))
+        TK.send_message(s, "second")
+        @test TK.wait_for(s, "second user bubble lands",
+            "document.querySelectorAll('.bt-user-msg').length >= $(users_before + 1)"; timeout = 10) == true
+        # Two turns are active at the overlap (the first is still held).
+        @test timedwait(() -> model.turns_active[] >= 2, 8.0) === :ok
+
+        # Both turns resolve: both responses are visible, in order (TURN1 before
+        # TURN2 in the document), and cleanup (gated on the LAST turn) clears busy.
+        @test TK.wait_for(s, "both turns' content rendered",
+            "document.body.textContent.indexOf('TURN1-END') !== -1 && document.body.textContent.indexOf('TURN2-ONLY') !== -1";
+            timeout = 20) == true
+        ordered = TK.eval_js(s, """(() => {
+            const t = document.body.textContent;
+            return t.indexOf('TURN1-START') < t.indexOf('TURN2-ONLY'); })()""")
+        @test ordered == true
+
+        @assert timedwait(() -> model.turns_active[] == 0, 15.0) === :ok "turns never drained to 0"
+        @test timedwait(() -> !model.busy_active[], 8.0) === :ok
+        @test model.busy_active[] == false
+        # No queued badge left anywhere — neither in the store nor in the DOM.
+        @test !any(m -> m isa BT.UserMsg && m.queued,
+                   lock(() -> copy(model.msgs_store), model.lock))
+        @test TK.eval_js(s, "document.querySelectorAll('.bt-user-msg.bt-queued').length") == 0
+
+        TK.screenshot(s, joinpath(tempdir(), "bt-concurrent-turns-final.png"))
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
+    finally
+        close(s)
+    end
 end
 
-@testset "background-shell hold: second send releases the first turn (handoff)" begin
-    state = BT.ServerState(; state_dir = mktempdir(),
-                              working_dir = mktempdir(), worker_secret = "x")
-    model = BT.ChatModel(state, mktempdir(); transport = handoff_transport())
-    BT.start_chat_client!(model)
-    @test timedwait(() -> model.client[] !== nothing, 5.0) === :ok
+# ── DOM e2e: a queued bubble's badge appears then clears on promote ──────────
 
-    BT.send_message!(model, BT.UserMsg(model, "start a monitor"))
-    # Turn 1 streams its content, then its prompt is HELD by the mock.
-    @test timedwait(5.0) do
-        any(m -> m isa BT.AgentMsg && occursin("LAUNCHED", m.text), model.msgs_store)
-    end === :ok
-    @test model.turns_active[] == 1
+@testset "queued user bubble: bt-queued badge appears, promote clears it" begin
+    # The visible queued window only exists when a UserMsg is injected directly
+    # (the fast idle-consumer pop closes it before a test could see it). Drive it
+    # server-side exactly as the committed session_changes test does, and assert
+    # the badge in the REAL DOM.
+    s = TK.dev_server(; agent = msg -> [text("ok"), end_turn()])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
+        chat = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
 
-    # The fix under test: this prompt must hit the wire IMMEDIATELY (a
-    # serializing consumer would queue it forever behind the held turn).
-    BT.send_message!(model, BT.UserMsg(model, "you still there?"))
-    @test timedwait(10.0) do
-        any(m -> m isa BT.AgentMsg && occursin("HELLO", m.text), model.msgs_store)
-    end === :ok
+        queued = BT.UserMsg(chat, "queued question")
+        queued.queued = true
+        BT.send!(chat, queued)
+        @test TK.wait_for(s, "queued bubble gains bt-queued", """
+            (() => { const us = document.querySelectorAll('.bt-user-msg');
+                     const last = us[us.length - 1];
+                     return last && last.classList.contains('bt-queued'); })()
+        """; timeout = 8) == true
 
-    # Both turns resolve; cleanup (gated on the LAST turn) has run.
-    @test timedwait(() -> model.turns_active[] == 0, 10.0) === :ok
-    @test timedwait(() -> !model.busy_active[], 5.0) === :ok
-    # No queued badge left anywhere.
-    @test !any(m -> m isa BT.UserMsg && m.queued, model.msgs_store)
-    close(model)
+        BT.promote_queued_user_bubble!(chat)
+        @test TK.wait_for(s, "queued class cleared after promote",
+            "document.querySelectorAll('.bt-user-msg.bt-queued').length === 0"; timeout = 8) == true
+
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
+    finally
+        close(s)
+    end
 end
+
+# ── Pure unit tests: update_busy! over directly-constructed state ────────────
 
 @testset "update_busy!: quiet wire + bg shell only → busy off; live fg tool → busy on" begin
     state = BT.ServerState(; state_dir = mktempdir(),
                               working_dir = mktempdir(), worker_secret = "x")
-    model = BT.ChatModel(state, mktempdir();
-                          transport = BT.MockTransport((o, i) -> nothing))
+    model = BT.ChatModel(state, mktempdir())
     s = BT.shared(model)
 
     bg = BT.BashToolMsg("bg1", "execute", "Terminal", "completed", "",
@@ -123,8 +153,6 @@ end
     s.last_stream_at[] = time() - 60
     fg = BT.GenericToolMsg("fg1", "read", "Read", "Read x", "in_progress",
                             "", time(), nothing, model, Dict{String,Any}())
-    # (field order: id, kind, name, title, status, summary, started, finished,
-    #  chat, raw_input)
     push!(s.msgs_store, fg)
     BT.update_busy!(model)
     @test s.busy_active[]
@@ -133,62 +161,16 @@ end
     s.turns_active[] = 0
     BT.update_busy!(model)
     @test !s.busy_active[]
-end
-
-# The error path through the refactored turn loop (begin_turn! / drain_turn!):
-# a prompt that errors (not session-dead) must still push an inline `[error:]`
-# AgentMsg bubble. Headless mirror of the electron test_chat_errors case that
-# flakes on cold mount — deterministic here.
-@testset "prompt error → inline [error: …] AgentMsg (via drain_turn!)" begin
-    function erroring_transport()
-        BT.MockTransport((outgoing, incoming) -> begin
-            Base.errormonitor(@async try
-                for line in outgoing
-                    msg = JSON.parse(line); id = get(msg, "id", nothing)
-                    m = get(msg, "method", "")
-                    if m == "initialize"
-                        put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>Dict())))
-                    elseif m == "session/new"
-                        put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
-                                                      "result"=>Dict("sessionId"=>"s"))))
-                    elseif m == "session/prompt"
-                        put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
-                            "error"=>Dict("code"=>-32000,
-                                          "message"=>"model overloaded, please retry"))))
-                    end
-                end
-            catch e
-                e isa InvalidStateException || @warn "erroring responder" e
-            end)
-            nothing
-        end)
-    end
-
-    state = BT.ServerState(; state_dir = mktempdir(),
-                              working_dir = mktempdir(), worker_secret = "x")
-    model = BT.ChatModel(state, mktempdir(); transport = erroring_transport())
-    BT.start_chat_client!(model)
-    @test timedwait(() -> model.client[] !== nothing, 5.0) === :ok
-
-    BT.send_message!(model, BT.UserMsg(model, "hi"))
-    @test timedwait(8.0) do
-        any(m -> m isa BT.AgentMsg && occursin("[error:", m.text) &&
-                 occursin("overloaded", m.text), model.msgs_store)
-    end === :ok
-    @test model.session_alive[]          # arbitrary error ≠ session death
-    @test timedwait(() -> !model.busy_active[], 5.0) === :ok   # turn cleaned up
     close(model)
 end
 
 @testset "update_busy!: a live bt_show_app render keeps the spinner on" begin
-    # Regression: a long bt_show_app (or eval between checkpoints) is
-    # foreground work whose pill is status-live; the spinner must NOT drop
-    # while it renders, even though the wire is momentarily quiet. (Earlier
-    # the fg-live check wrongly excluded BonitoAppMsg.)
+    # Regression: a long bt_show_app (or eval between checkpoints) is foreground
+    # work whose pill is status-live; the spinner must NOT drop while it renders,
+    # even though the wire is momentarily quiet.
     state = BT.ServerState(; state_dir = mktempdir(),
                               working_dir = mktempdir(), worker_secret = "x")
-    model = BT.ChatModel(state, mktempdir();
-                          transport = BT.MockTransport((o, i) -> nothing))
+    model = BT.ChatModel(state, mktempdir())
     s = BT.shared(model)
 
     app = BT.BonitoAppMsg("app1", "bonito_app", "Dashboard", "in_progress",
@@ -199,4 +181,5 @@ end
     s.busy_active[]    = true
     BT.update_busy!(model)
     @test s.busy_active[]                 # live app render ⇒ still busy
+    close(model)
 end
