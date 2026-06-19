@@ -50,7 +50,7 @@ const BT = BonitoAgents
             h.state.projects[][pid] = BT.ProjectInfo(pid, "kill", wid, dir, dir, now(UTC))
             model = BT.ChatModel(h.state, mktempdir();
                                  project_id = pid,
-                                 transport = BT.MockTransport((o, i) -> nothing))
+                                 agent = BT.MockAgent([]))   # never-started holder
 
             t = BT.BashToolMsg("bgk", "execute", "monitor", "completed", "",
                                time(), nothing, "sleep 120", "Monitor", true,

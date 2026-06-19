@@ -1,17 +1,28 @@
-# Real E2E for the popup + plotpane dock chain that wasn't covered by the
-# headless tests this session. Boots `dev_server` (real worker + BonitoMCP +
-# eval bridge), registers a live `bonito_app` tool bubble via the real
-# `bt_show_app` MCP handler (no claude needed — host-side direct call), opens
-# the unified shell in a real Electron browser, then exercises:
+# Real E2E for the detach + dock chain of a live `bt_show_app` embed. Boots
+# `dev_server` (real worker + BonitoMCP + eval bridge), registers a live
+# `bonito_app` tool bubble via the real `bt_show_app` MCP handler (no claude
+# needed — host-side direct call), opens the unified shell in a real Electron
+# browser, then exercises the REAL detach/dock path against the current
+# BonitoWidgets Workspace contract:
 #
-#   * the "↗ Detach" button on the tool body → embed migrates into the
-#     `#bt-popup-mount` slot, FloatingWindow becomes visible
-#   * `window._btPopup.dock()` → embed migrates into `#bt-plotpane-mount`,
-#     `#bt-plotpane-dropzone` gains `.bt-plotpane-visible`, FW hides again
+#   * the ⤢ Detach button on the tool header → the embed migrates into its OWN
+#     floating Workspace panel (`.bw-ws-panel[data-panel-id="app:<tid>"]` inside
+#     a `.bw-float`), its live `.bt-app-frame` adopting the embed node.
+#   * the float's dock button (`.bw-float-dock`) → the panel docks into the
+#     group as a tab; the float disappears.
+#   * VSCode-style coexistence: opening a FILE adds a second panel/tab; the app
+#     embed's live DOM (`#dock_app_root`) survives the whole time.
+#   * closing the app tab (`.bw-tab-close`) → the embed restores to its bubble
+#     slot (`bt-slot-<tid>`), `data-detached` cleared, the worker app still live.
 #
-# This is exactly the dock flow my session-changes batch didn't cover, because
-# the resize-handle test had to fake `bt-plotpane-visible` (no real embed
-# available). Here the toggle happens for real.
+# MIGRATION NOTE: the old version drove a now-deleted `MockTransport` and
+# asserted against an obsolete popup/plotpane DOM (`#bt-popup-mount`,
+# `.bn-floating-window`, `#bt-plotpane-dropzone`, `.bt-plotpane-visible`,
+# `.bt-pp-tab`, drag-to-dock) — that PopupController/plotpane layer was replaced
+# by the BonitoWidgets `Workspace` (verified: zero of those selectors remain in
+# src/). The ChatModel is a never-started `MockAgent([])` holder (no turn is
+# driven; the app arrives via `show_remote_app_for_project!`). Every assertion
+# below was confirmed against the live current DOM before being committed.
 const BONITO = "/sim/Programmieren/ClaudeExperiments/dev/Bonito"
 include(joinpath(BONITO, "test", "ElectronTests.jl"))
 TestWindow(args...; options=Dict{String,Any}("show"=>false,"focusOnWebView"=>false)) =
@@ -73,12 +84,12 @@ Bonito.App(s -> Bonito.DOM.div("popup-dock test"; id = "dock_app_root"))
         @test timedwait(() -> haskey(BT.EVAL_WORKERS, pid), 30.0) === :ok
 
         # 4. Build a ChatModel + pre-register it so the sidebar/navigation
-        #    skips the ACP bring-up path. Mock transport — we don't need a
-        #    live agent, only the chat shell + the live bonito_app embed.
+        #    skips the ACP bring-up path. A never-started MockAgent holder — we
+        #    don't drive a turn, only the chat shell + the live bonito_app embed.
         chat_dir = mktempdir()
         model = BT.ChatModel(h.state, chat_dir;
                               project_id = pid,
-                              transport  = BT.MockTransport((o, i) -> nothing))
+                              agent      = BT.MockAgent([]))
         lock(h.state.lock) do; h.state.chat_models[pid] = model; end
         BT.notify_chats!(h.state)
 
@@ -126,92 +137,77 @@ Bonito.App(s -> Bonito.DOM.div("popup-dock test"; id = "dock_app_root"))
         # 9. Detach — the REAL user path: ⤢ on the tool header. The click is
         #    wired in the chat module's createNode (not the tool-body
         #    subsession), routes comm → DetachAppCommand → pane.detach_app →
-        #    PopupController.detach.
+        #    `float_panel!` (workspace_stage.jl): the embed becomes its OWN
+        #    floating Workspace panel and the live embed node is ADOPTED into
+        #    that panel's `.bt-app-frame`.
+        # `appSel()` resolves the floating/docked app panel by its data-panel-id
+        # ("app:<tid>") — JSON.stringify runs browser-side on the id literal.
+        appSel = js"(() => document.querySelector('.bw-ws-panel[data-panel-id=' + JSON.stringify('app:' + $(appid)) + ']'))"
         electron_evaljs(win, js"document.querySelector('.bt-tool-msg .bt-tool-detach').click()")
-        @test poll_js(win, js"document.getElementById('bt-embed-' + $(appid)) && document.getElementById('bt-embed-' + $(appid)).parentElement.id", "bt-popup-mount")
-        @test poll_js(win, js"getComputedStyle(document.querySelector('.bn-floating-window')).display !== 'none' ? 'y':'n'", "y")
-        # Plotpane should still be collapsed.
-        @test electron_evaljs(win, js"document.getElementById('bt-plotpane-dropzone').classList.contains('bt-plotpane-visible')") == false
-
-        # 10. Dock to plotpane — the REAL gesture: drag the floating window's
-        #     title bar into the dock zone (the region right of .bt-main).
-        #     The controller's drag-to-dock listens on document; the move/up
-        #     pair is gesture-scoped.
-        electron_evaljs(win, js"""(() => {
-            const tb = document.querySelector('.bn-fw-title');
-            const main  = document.querySelector('.bt-main');
-            const stage = document.querySelector('.bt-stage');
-            const sr = stage.getBoundingClientRect(), mr = main.getBoundingClientRect();
-            const x = (mr.right + sr.right) / 2, y = (sr.top + sr.bottom) / 2;
-            const opts = (cx, cy) => ({ bubbles: true, clientX: cx, clientY: cy });
-            tb.dispatchEvent(new PointerEvent('pointerdown', opts(mr.right - 40, sr.top + 20)));
-            document.dispatchEvent(new PointerEvent('pointermove', opts(x, y)));
-            document.dispatchEvent(new PointerEvent('pointerup', opts(x, y)));
-            return true;
-        })()""")
-        @test poll_js(win, js"document.getElementById('bt-embed-' + $(appid)).parentElement.id", "bt-plotpane-app")
-        @test poll_js(win, js"document.getElementById('bt-plotpane-dropzone').classList.contains('bt-plotpane-visible')", true)
-        @test poll_js(win, js"getComputedStyle(document.querySelector('.bn-floating-window')).display === 'none' ? 'y':'n'", "y")
-        # The docked app is a TAB.
+        # The app panel exists and is floating (its content is inside a .bw-float).
+        @test poll_js(win, js"""(() => { const p = ($(appSel))(); return (p && p.closest('.bw-float')) ? 'y':'n'; })()""", "y")
+        # The live embed node was moved into the panel's frame (not its bubble slot).
         @test poll_js(win, js"""(() => {
-            const t = document.querySelector('.bt-pp-tab-active .bt-pp-tab-label');
-            return t ? t.textContent.slice(0, 5) : 'none';
-        })()""", "App ·")
+            const p = ($(appSel))(); const frame = p && p.querySelector('.bt-app-frame');
+            return frame && frame.querySelector('#bt-embed-' + $(appid)) ? 'y':'n'; })()""", "y")
+        # The embed's own DOM is alive in the float.
+        @test poll_js(win, js"document.querySelector('#dock_app_root') ? 'y':'n'", "y")
+        # The inline slot is marked detached (its placeholder shows in the bubble).
+        @test poll_js(win, js"""(() => { const s = document.getElementById('bt-slot-' + $(appid));
+            return s && s.dataset.detached ? 'y':'n'; })()""", "y")
+
+        # 10. Dock the float into the group — the REAL gesture: the float's dock
+        #     button (`.bw-float-dock`). The panel joins the docked group as a
+        #     tab; the float disappears; the embed rides along untouched.
+        electron_evaljs(win, js"document.querySelector('.bw-float .bw-float-dock').click()")
+        @test poll_js(win, js"document.querySelectorAll('.bw-float').length", 0)
+        @test poll_js(win, js"""(() => { const p = ($(appSel))(); return (p && !p.closest('.bw-float')) ? 'y':'n'; })()""", "y")
+        @test poll_js(win, js"document.querySelector('#dock_app_root') ? 'y':'n'", "y")
+        # The docked app is a TAB labelled "App".
+        @test poll_js(win, js"""(() => {
+            const t = [...document.querySelectorAll('.bw-tab')].find(t => (t.textContent||'').indexOf('App') !== -1);
+            return t ? 'y':'n'; })()""", "y")
 
         # 10b. VSCode-style coexistence: open a FILE while the app is docked —
-        #      both live as tabs; switching preserves the app embed's DOM.
-        # Under the chat model's cwd — that's the server mirror open_file!
-        # resolves relative paths against.
+        #      both live as tabs; switching preserves the app embed's DOM. Under
+        #      the chat model's cwd — that's the mirror open_file! resolves
+        #      relative paths against.
         write(joinpath(chat_dir, "notes.md"), "# hello tabs\n")
         electron_evaljs(win, js"""(() => {
             document.querySelector('.bt-messages').__bt_chat.comm.notify(
                 { type: 'edit_file', path: 'notes.md' });
             return true;
         })()""")
-        @test poll_js(win, js"document.querySelectorAll('.bt-pp-tab').length", 2)
-        # The file tab activated; the app embed is hidden but ALIVE.
+        # A second (file) panel joins; the app panel stays present and its embed
+        # stays ALIVE.
+        @test poll_js(win, js"document.querySelectorAll('.bw-tab').length", 3)  # chat + app + notes.md
         @test poll_js(win, js"""(() => {
-            const t = document.querySelector('.bt-pp-tab-active .bt-pp-tab-label');
-            return t ? t.textContent : 'none';
-        })()""", "notes.md")
-        @test electron_evaljs(win,
-            js"document.querySelector('#dock_app_root') !== null") == true
-        @test poll_js(win, js"""(() => {
-            const f = document.querySelector('.bt-pp-tabcontent .bt-file-editor');
-            return f && f.offsetParent !== null ? 'y' : 'n';
-        })()""", "y")
-        # Click back to the app tab → embed visible again, file hidden.
+            const t = [...document.querySelectorAll('.bw-tab')].find(t => (t.textContent||'').indexOf('notes.md') !== -1);
+            return t ? 'y':'n'; })()""", "y")
+        @test electron_evaljs(win, js"document.querySelector('#dock_app_root') !== null") == true
+        # Click back to the app tab → it activates; the embed stays alive.
         electron_evaljs(win, js"""(() => {
-            const tabs = [...document.querySelectorAll('.bt-pp-tab')];
-            tabs.find(t => t.textContent.indexOf('App ·') !== -1).click();
-            return true;
-        })()""")
+            const t = [...document.querySelectorAll('.bw-tab')].find(t => (t.textContent||'').indexOf('App') !== -1);
+            if (t) t.click(); return true; })()""")
         @test poll_js(win, js"""(() => {
-            const app = document.getElementById('bt-plotpane-app');
-            return app && app.style.display !== 'none' &&
-                   document.querySelector('#dock_app_root') ? 'y' : 'n';
-        })()""", "y")
-        # Close the file tab → app tab stays active, pane stays open.
-        electron_evaljs(win, js"""(() => {
-            const tabs = [...document.querySelectorAll('.bt-pp-tab')];
-            tabs.find(t => t.textContent.indexOf('notes.md') !== -1)
-                .querySelector('.bt-pp-tab-close').click();
-            return true;
-        })()""")
-        @test poll_js(win, js"document.querySelectorAll('.bt-pp-tab').length", 1)
-        @test poll_js(win, js"document.getElementById('bt-plotpane-dropzone').classList.contains('bt-plotpane-visible')", true)
+            const t = [...document.querySelectorAll('.bw-tab')].find(t => (t.textContent||'').indexOf('App') !== -1);
+            return (t && t.classList.contains('bw-active') && document.querySelector('#dock_app_root')) ? 'y':'n'; })()""", "y")
 
-        # 11. Undock via the pane's ⤡ button (plain DOM onclick → observable
-        #     → controller): embed back to the floating window.
+        # 11. Close the app tab (`.bw-tab-close`) → RESTORE: the embed moves back
+        #     to its bubble slot (`bt-slot-<tid>`), `data-detached` cleared, and
+        #     the worker app is still live (its DOM survived the round trip).
         electron_evaljs(win, js"""(() => {
-            const b = [...document.querySelectorAll('.bt-pp-btn')]
-                .find(x => x.textContent === '⤡');
-            b.click();
-            return true;
-        })()""")
-        @test poll_js(win, js"document.getElementById('bt-embed-' + $(appid)).parentElement.id", "bt-popup-mount")
-        @test poll_js(win, js"getComputedStyle(document.querySelector('.bn-floating-window')).display !== 'none' ? 'y':'n'", "y")
-        println("✓ Detach + dock E2E: bubble → popup (⤢ click) → plotpane (drag-to-dock) → popup (⤡), bt-plotpane-visible toggles")
+            const t = [...document.querySelectorAll('.bw-tab')].find(t => (t.textContent||'').indexOf('App') !== -1);
+            const x = t && t.querySelector('.bw-tab-close'); if (x) x.click(); return true; })()""")
+        @test poll_js(win, js"""(() => (($(appSel))() ? 'present':'gone'))()""", "gone")
+        @test poll_js(win, js"""(() => { const e = document.getElementById('bt-embed-' + $(appid));
+            return e && e.parentElement.id === 'bt-slot-' + $(appid) ? 'y':'n'; })()""", "y")
+        @test poll_js(win, js"""(() => { const s = document.getElementById('bt-slot-' + $(appid));
+            return s && !s.dataset.detached ? 'y':'n'; })()""", "y")
+        @test poll_js(win, js"document.querySelector('#dock_app_root') ? 'y':'n'", "y")
+
+        println("✓ Detach + dock E2E: bubble → float (⤢) → docked tab (.bw-float-dock) → " *
+                "file coexistence → restore-to-slot (tab close); embed alive throughout")
 
     finally
         for k in ("BONITOAGENTS_SERVER_URL", "BONITOAGENTS_SECRET", "BONITOAGENTS_PROJECT_ID")
