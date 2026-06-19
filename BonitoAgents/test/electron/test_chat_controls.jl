@@ -1,120 +1,98 @@
-# Tier 2d — non-input chat controls.
+# Non-input chat controls, migrated onto the TestKit harness (real dev_server,
+# real worker subprocess, real ACP wire, real Electron browser; only the agent's
+# behaviour is faked, via the `agent=` callback).
 #
-#   - Stop button cancels an in-flight prompt
-#   - Sync button (the one we just fixed) actually fires its handler — no
-#     `Bonito.notify_observable is not a function` JS error
-#   - Session-ended banner appears when session_alive flips false
-#   - Restart button on the banner restores session_alive to true
-isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
+#   - Stop button cancels an in-flight prompt (the click reaches Julia as a
+#     CancelCommand without a JS error, and history is preserved).
+#   - Sync button actually fires its handler — no `notify_observable is not a
+#     function` JS error — and its label changes away from "Sync".
+#   - Restart button flips to the dead/pulse state when session_alive goes
+#     false, and recovers (session_alive back to true) when clicked.
 
-state = TH.make_state(; n_workers = 1, n_projects = 1)
+using Test
+include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents
+const TK = TestKit
+using .TestKit: text, delay, end_turn
 
-# A long-running stream so the stop test has time to interrupt: 10 chunks at
-# 0.3s each = 3s of streaming.
-slow_script = [(0.3, TH.agent_chunk_update("chunk$i ")) for i in 1:10]
+@testset "chat controls — stop / sync / restart" begin
+    # A long-running turn: emit some text, then hold the turn open for ~3s via
+    # `delay`, so the stop button is meaningful (the prompt is in-flight while we
+    # click it). The mock honours cancel by simply running to completion (the
+    # dispatcher stream is fire-and-forget), so after stop the stream drains and
+    # the agent bubble stays in history.
+    s = TK.dev_server(; agent = msg -> [
+        text("streaming "),
+        delay(3000),
+        text("done"),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
 
-let proj = state.projects[]["p-1"]
-    model = BonitoAgents.ChatModel(state, proj.server_path;
-                                  project_id     = proj.id,
-                                  transport = TH.mock_transport(; scripted = slow_script))
-    BonitoAgents.start_chat_client!(model)
-end
+        model = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
 
-ctx = TH.open_window(state)
+        # ── Stop button cancels an in-flight prompt ─────────────────────────
+        TK.send_message(s, "go")
+        # Streaming actually started: the agent bubble landed.
+        TK.wait_for(s, "agent bubble appears",
+            "document.querySelectorAll('.bt-agent-msg').length >= 1"; timeout = 10)
+        # The turn is genuinely in-flight (the `delay` holds it open ~3s).
+        @assert timedwait(() -> model.busy_active[], 5.0) === :ok "turn never went busy"
 
-results = Pair{String,Bool}[]
-record(name, ok) = push!(results, name => ok)
+        errs_before = length(TK.eval_js(s, "window.__errs || []"))
+        # The stop button is always in the DOM; the delegated capture-phase
+        # handler posts `{type:'cancel'}` → CancelCommand on the Julia side.
+        TK.click(s, ".bt-stop-btn")
+        sleep(0.5)
+        # The stop click must reach Julia cleanly — no JS error (this is where a
+        # broken cancel wiring would throw in the renderer).
+        @test length(TK.eval_js(s, "window.__errs || []")) == errs_before
+        # Cancel doesn't wipe history: the agent bubble is still present.
+        @test TK.eval_js(s, "document.querySelectorAll('.bt-agent-msg').length") >= 1
 
-try
-    p1_idx = TH.eval_js(ctx, """
-        (() => {
-            const items = document.querySelectorAll('.bt-side-item .bt-side-name');
-            for (let i = 0; i < items.length; i++)
-                if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
-            return -1;
-        })()
-    """)
-    TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
-    @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "chat didn't mount"
-    local model = state.chat_models["p-1"]
+        # Drain the rest of the stream so later sections don't race with it.
+        @assert timedwait(() -> !model.busy_active[], 10.0) === :ok "turn never finished"
 
-    TH.section("Stop button cancels an in-flight prompt") do
-        TH.type_into(ctx, ".bt-text-input", "go")
-        TH.dom_click(ctx, ".bt-send-btn")
-        # Wait for streaming to actually start (first chunk lands).
-        @assert TH.wait_for(ctx,
-            "document.querySelectorAll('.bt-agent-msg').length >= 1"; timeout = 3.0) "no agent bubble"
+        # ── Sync button fires its handler (no notify_observable JS error) ────
+        errs_before_sync = length(TK.eval_js(s, "window.__errs || []"))
+        TK.click(s, ".bt-header-sync")
+        # No new JS errors after the sync click (the regression this guards).
+        sleep(0.5)
+        @test length(TK.eval_js(s, "window.__errs || []")) == errs_before_sync
+        # The label changes away from "Sync" (it moves through "starting…" /
+        # progress / "✓ synced …" against the real worker).
+        TK.wait_for(s, "sync label changed",
+            "(document.querySelector('.bt-header-sync').innerText || '').trim() !== 'Sync'";
+            timeout = 15)
 
-        # Hit stop. The mock cancel is fire-and-forget (notification, not
-        # request), so the streamer keeps emitting until completion — but
-        # AgentClientProtocol.cancel! does send the notification. We assert
-        # *something* happens: either the request completes faster than 10
-        # chunks (the mock would normally take 3s) OR busy clears.
-        before_chunks = TH.eval_js(ctx, "document.querySelectorAll('.bt-agent-msg')[0].innerText.length")
-        TH.dom_click(ctx, ".bt-stop-btn")
-        sleep(0.3)
-        record("stop click did not throw a JS error",
-               @TH.test_eq length(TH.js_errors(ctx)) 0)
-        # The cancel notification reaches the mock; we just verify the call
-        # didn't crash (real workers respond to the cancel by ending the turn).
-        record("agent bubble still present (cancel doesn't wipe history)",
-               @TH.test_true TH.dom_exists(ctx, ".bt-agent-msg"))
-        # Drain remaining stream so subsequent sections don't race with it.
-        sleep(3.0)
-    end
+        # ── Restart button: dead/pulse on session_alive=false, recovers on click
+        @test TK.eval_js(s,
+            "document.querySelector('.bt-header-restart-dead') === null") == true
 
-    TH.section("Sync button click — no JS errors (the fix we made today)") do
-        # Click and assert nothing throws. The sync handler will fail on the
-        # backend (no real worker), but the click must reach Julia cleanly.
-        before_errs = length(TH.js_errors(ctx))
-        TH.dom_click(ctx, ".bt-header-sync")
-        sleep(0.4)
-        after_errs = length(TH.js_errors(ctx))
-        record("no new JS errors after sync click",
-               @TH.test_eq after_errs before_errs)
-        # The sync_status observable starts at "" (button reads "Sync"); on
-        # click it should change to "starting…" or an error string. Either way
-        # it's not "Sync" anymore.
-        btn_text = TH.eval_js(ctx, "document.querySelector('.bt-header-sync').innerText")
-        record("sync button text changed from 'Sync'",
-               @TH.test_true btn_text != "Sync")
-    end
-
-    TH.section("Dead-session pulse on the restart button + Restart works") do
-        # The permanent header restart button starts in the healthy state.
-        record("restart button healthy initially",
-               @TH.test_true !TH.dom_exists(ctx, ".bt-header-restart-dead"))
-
-        # Flip session_alive from Julia → button gains the dead/pulse class.
+        # Flip session_alive from Julia → the button gains the dead/pulse class.
         model.session_alive[] = false
         model.last_error[]    = "test-induced disconnect"
-        record("restart button flips to dead/pulse after session_alive=false",
-               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-header-restart-dead') !== null";
-                                         timeout = 3.0))
+        TK.wait_for(s, "restart button flips to dead/pulse",
+            "document.querySelector('.bt-header-restart-dead') !== null"; timeout = 5)
 
         # Click the (now-pulsing) restart button. The handler calls
-        # `restart_chat_session!` which rebuilds the client via the mock
-        # factory and sets session_alive back to true.
-        TH.eval_js(ctx, """
-            const btn = document.querySelector('.bt-header-restart-dead');
-            if (btn) btn.click();
-        """)
-        record("restart button returns to healthy after restart",
-               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-header-restart-dead') === null";
-                                         timeout = 5.0))
-        record("session_alive observable is true again",
-               @TH.test_eq model.session_alive[] true)
+        # restart_chat_session! which rebuilds the client and sets session_alive
+        # back to true.
+        TK.click(s, ".bt-header-restart-dead")
+        TK.wait_for(s, "restart button returns to healthy",
+            "document.querySelector('.bt-header-restart-dead') === null"; timeout = 30)
+        @test model.session_alive[] == true
+
+        TK.screenshot(s, joinpath(tempdir(), "bt-chat-controls-final.png"))
+
+        # No JS errors fired across the whole run.
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
+    finally
+        close(s)
     end
-
-    TH.section("No JS errors") do
-        errs = TH.js_errors(ctx)
-        record("zero JS errors", @TH.test_true (length(errs) == 0))
-        isempty(errs) || @info "JS errors:" errs
-    end
-
-    TH.emit_screenshot(ctx; label = "tier 2d — controls")
-
-finally
-    TH.report!("Tier 2d — chat controls", results)
-    TH.shutdown(ctx)
 end
