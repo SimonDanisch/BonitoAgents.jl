@@ -429,11 +429,22 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     # `close(model)` (T4) closes `user_messages`, ending the `run_chat!` consumer
     # AND the 1 Hz background poller — without it both leak forever, keeping the
     # ChatModel alive via the `BG_POLLERS` IdDict. Close the model BEFORE the
-    # transport so the consumer's `for … in user_messages` exits cleanly rather
+    # client so the consumer's `for … in user_messages` exits cleanly rather
     # than erroring on a torn-down client mid-turn.
-    model === nothing || close(model)
-    model === nothing || close(model.transport)
-    model === nothing || notify_chats!(state)   # drop from the active-chats sidebar
+    if model !== nothing
+        close(model)
+        # Tear down the ACP CONNECTION, not the bare transport. `close(client)`
+        # → `close(conn)` sets `conn.closed = true` BEFORE closing the socket, so
+        # the reader loop exits on its `while !conn.closed` guard. Closing only
+        # the transport (the old code here) left `conn.closed == false`; the
+        # worker WS's `recv` then returns "" on close without unblocking the
+        # guard, spinning the reader loop at 100% CPU and starving every other
+        # server task. This mirrors the restart path's `close(old_client)`. Fall
+        # back to the transport only if the client never came up.
+        client = model.client[]
+        client === nothing ? close(model.transport) : close(client)
+        notify_chats!(state)   # drop from the active-chats sidebar
+    end
     release_project!(state, p)
     # The reaped claude subprocess takes its MCP server + eval worker with it, so
     # the eval bridge's worker session is gone — tear the bridge down explicitly

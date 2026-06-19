@@ -107,6 +107,10 @@ include("test_thinking.jl")
 # locking, chat-teardown leak, lock coverage. Pure Julia — no Electron/worker.
 include("test_stability.jl")
 
+# Dead-transport EOF contract: stop_session! → close(transport) must let the ACP
+# reader_loop break instead of hot-spinning (the 100% CPU close-chat livelock).
+include("test_transport_eof.jl")
+
 include("test_sidebar_open_chats.jl")
 
 include("test_queued_messages.jl")

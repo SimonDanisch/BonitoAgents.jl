@@ -179,6 +179,11 @@ ACP.send(t::LocalTransport, line::AbstractString) = ACP.send(t.inner[], line)
 ACP.recv(t::LocalTransport)                       = ACP.recv(t.inner[])
 Base.close(t::LocalTransport) =
     (t.inner[] === nothing || close(t.inner[]); nothing)
+# Delegate EOF to the inner subprocess so `reader_loop` breaks when the agent
+# process exits instead of hot-spinning on `recv`→"" (see WorkerTransport note).
+# Not-yet-started (`inner === nothing`) yields no frames → EOF.
+ACP.transport_eof(t::LocalTransport) =
+    (t.inner[] === nothing || ACP.transport_eof(t.inner[]))
 
 # ── 2. Worker over WebSocket ────────────────────────────────────────────────
 
@@ -232,10 +237,27 @@ function ACP.recv(t::WorkerTransport)
     try
         return String(HTTP.WebSockets.receive(ws))
     catch e
-        (e isa Base.IOError || e isa HTTP.WebSockets.WebSocketError) && return ""
+        # `recv`'s contract: return "" on a CLEAN end-of-stream, throw on a real
+        # failure. A clean WS close (normal / going-away) is EOF → "". Everything
+        # else propagates: an IOError (peer reset) is teardown the reader loop
+        # already treats as benign, and an ABNORMAL close (protocol error / 1011,
+        # `isok` false) is a genuine fault the reader loop should log — NOT mask
+        # as a clean disconnect. The old `IOError || WebSocketError → ""` blanket
+        # swallowed both, hiding a crashed worker behind a tidy EOF.
+        e isa HTTP.WebSockets.WebSocketError && HTTP.WebSockets.isok(e) && return ""
         rethrow(e)
     end
 end
+
+# `recv` returns "" both for a dead ws (isclosed) AND, in principle, for an empty
+# frame. The ACP `reader_loop` uses `transport_eof` to tell the two apart: without
+# this method it falls to `transport_eof(::Transport) = false`, so when the worker
+# WS closes (e.g. `stop_session!` → `close(transport)`) `recv` returns "" with no
+# block, `reader_loop` `continue`s, and the loop hot-spins at 100% CPU on its
+# (sticky, thread-1) task — starving every other server `@async` handler. A closed
+# or never-dialed ws yields no more frames, so it IS EOF.
+ACP.transport_eof(t::WorkerTransport) =
+    (ws = t.ws[]; ws === nothing || HTTP.WebSockets.isclosed(ws))
 
 function Base.close(t::WorkerTransport)
     ws = t.ws[]
@@ -338,9 +360,18 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
                 provider_env,
                 t.agent_env)
     proc = open(Cmd(`$(t.agent_bin) $(provider_args(t.provider))`; env, dir = t.cwd), "r+")
-    t.inner[] = ACP.SubprocessTransport(proc)
+    inner = ACP.SubprocessTransport(proc)
+    t.inner[] = inner
 
-    conn = ACP.Connection(t, handler; on_frame)
+    # Bind the connection to THIS subprocess, not the reusable `t` wrapper. A
+    # restart reuses the same `LocalTransport` and swaps `t.inner[]` to a fresh
+    # proc; if the connection wrapped `t`, a stale prior reader_loop's
+    # `finally → close(conn.transport)` would `close(t.inner[])` — i.e. kill the
+    # NEWLY-spawned proc out from under this bring-up ("ACP connection closed",
+    # or on the old code a 100% CPU reader spin). Wrapping `inner` directly means
+    # each reader owns and tears down only its own subprocess (the SubprocessTransport
+    # analog of WebSocketHandler's `is_current_socket` stale-loop guard).
+    conn = ACP.Connection(inner, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict(

@@ -523,6 +523,13 @@ function reader_loop(conn::Connection)
                 # connection down on a real EOF; otherwise skip and keep reading
                 # (A4) so one blank line can't kill a live session.
                 transport_eof(conn.transport) && break
+                # Defense-in-depth: if a transport's `recv` returns "" WITHOUT
+                # blocking and its `transport_eof` is (wrongly) false, this skip
+                # path is a hot loop. `reader_loop` runs on a sticky `@async`
+                # task, so without a yield it would monopolize thread 1 and
+                # livelock the whole process (every other server `@async` handler
+                # starves). The yield turns that into a recoverable busy loop.
+                yield()
                 continue
             end
             local msg

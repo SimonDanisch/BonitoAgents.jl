@@ -225,6 +225,45 @@ next_out(t::MockTransport) = JSON.parse(take!(t.outbox))
         close(conn)
     end
 
+    # ── A4b: a dead transport must NOT hot-spin reader_loop ───────────────────
+    # Regression for the `stop_session!` → 100% CPU livelock: when a transport's
+    # `recv` returns "" *without blocking* (a closed WS) and `transport_eof` is
+    # true, reader_loop must break promptly — not `continue` forever. And even a
+    # transport that (wrongly) reports eof=false must not STARVE the scheduler:
+    # reader_loop runs on a sticky `@async` task, so a non-yielding skip loop
+    # would monopolize thread 1 and freeze every other server task.
+    @testset "A4b dead transport terminates reader_loop without starving" begin
+        # recv returns "" immediately; reports EOF → loop must end.
+        struct DeadEOF <: ACP.Transport end
+        ACP.recv(::DeadEOF) = ""
+        ACP.send(::DeadEOF, ::AbstractString) = nothing
+        Base.close(::DeadEOF) = nothing
+        ACP.transport_eof(::DeadEOF) = true
+
+        conn = ACP.Connection(DeadEOF())
+        t0 = time()
+        while !istaskdone(conn.reader_task) && time() - t0 < 2.0; sleep(0.005); end
+        @test istaskdone(conn.reader_task)    # broke out — no hot-spin
+
+        # recv "" immediately, eof=false (the bug's default): loop keeps going,
+        # but the `yield()` in the skip path keeps the scheduler live.
+        struct DeadNoEOF <: ACP.Transport end
+        ACP.recv(::DeadNoEOF) = ""
+        ACP.send(::DeadNoEOF, ::AbstractString) = nothing
+        Base.close(::DeadNoEOF) = nothing
+        # no transport_eof → default false
+
+        conn2 = ACP.Connection(DeadNoEOF())
+        counter = Ref(0)
+        @async (for _ in 1:200; counter[] += 1; yield(); end)
+        sleep(0.2)
+        @test counter[] == 200                # concurrent task NOT starved
+        conn2.closed = true                   # stop the spinning loop
+        t1 = time()
+        while !istaskdone(conn2.reader_task) && time() - t1 < 2.0; sleep(0.005); end
+        @test istaskdone(conn2.reader_task)
+    end
+
     # ── A3: setup failure closes the transport (no leaked process) ───────────
     # We exercise the Client setup path's contract via a Connection over a mock
     # transport: when a setup RPC errors, the caller closes the connection,

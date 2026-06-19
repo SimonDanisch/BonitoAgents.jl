@@ -211,6 +211,36 @@ end
         end
     end
 
+    # ── 6b. Rapid re-bring-up must not clobber the freshly-spawned proc ──────
+    # `model.transport` (a LocalTransport) is REUSED across restarts; each
+    # `start_session` swaps `t.inner[]` to a fresh subprocess. The ACP Connection
+    # must bind to THAT subprocess, not the shared `t` — otherwise a stale prior
+    # reader_loop's `finally → close(conn.transport)` closes `t.inner[]`, i.e.
+    # kills the NEW proc mid-bring-up. Symptom: an "ACP connection closed" thrown
+    # from the `initialize` RPC (and, before `transport_eof(::LocalTransport)`, a
+    # 100% CPU reader spin / hang). We drive close+re-bring-up back-to-back with
+    # NO settle gap — the maximal-pressure version of the race the stress loop
+    # above hits only intermittently — and assert every bring-up succeeds.
+    @testset "rapid re-bring-up does not clobber the new subprocess" begin
+        state = newstate()
+        model = BT.ChatModel(state, mktempdir(); transport = mock_local_transport("normal"))
+        BT.start_chat_client!(model)
+        for i in 1:12
+            old = model.client[]
+            old === nothing || close(old)
+            # No yield between teardown and re-bring-up: slams the race window.
+            err = nothing
+            try
+                BT.start_chat_client!(model)
+            catch e
+                err = e
+            end
+            @test err === nothing                         # no "ACP connection closed"
+            @test model.client[] !== nothing
+            @test model.client[].conn.closed == false     # live, usable session
+        end
+    end
+
     # ── 7. Stress: restarts interleaved with prompts + cancels ──────────
     # The randomized timing test. For each iteration we either send a
     # prompt, fire a restart, or send a cancel. After the loop, sweep
