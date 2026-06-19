@@ -59,7 +59,19 @@ transport_eof(::Transport) = false
 # guard against the throw conditions, so no try/catch is needed.
 function Base.close(t::SubprocessTransport)
     isopen(t.proc.in) && close(t.proc.in)
-    process_running(t.proc) && kill(t.proc)
+    if process_running(t.proc)
+        kill(t.proc)   # SIGTERM: lets a well-behaved agent exit + reap its children
+        # Escalate to SIGKILL if it doesn't die. An agent that ignores SIGTERM (or
+        # a child parked in `sleep`/mid-JIT) would otherwise leak — and keep its
+        # stdout open, parking the reader loop forever (turns_active never settles).
+        # Detached so `close` stays non-blocking; a well-behaved child has already
+        # exited well before the grace window.
+        Base.errormonitor(@async begin
+            if timedwait(() -> !process_running(t.proc), 2.0) !== :ok
+                process_running(t.proc) && kill(t.proc, Base.SIGKILL)
+            end
+        end)
+    end
     return nothing
 end
 
