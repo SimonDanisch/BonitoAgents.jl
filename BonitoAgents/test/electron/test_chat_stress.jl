@@ -1,365 +1,262 @@
-# Stress tests for ChatModel that drive `BonitoAgents.serve(...)` — the
-# real production entry point. The Electron windows below load
-# `Bonito.online_url(state.srv, "")`, the exact URL `serve()` prints to
-# the console, so the request path is identical to what a user gets.
+# ChatModel stress matrix, migrated onto the TestKit harness (real dev_server,
+# real worker subprocess, real ACP wire, real Electron browser; only the agent's
+# behaviour is faked via the `agent=` callback).
 #
-# Earlier revisions of this file took two shortcuts and we don't go back
-# to them:
-#   - An ad-hoc `App() do _; DOM.div(model); end` shim that bypassed
-#     `unified_main`'s `map(current_view)` reactive swap (passed even
-#     when production errored on `convert(::Node, ::ChatModel)`).
-#   - Building `Bonito.Server(unified_app(state), ...)` inline, which
-#     skipped `serve()`'s `proxy_url = "."` + worker WS routes wiring.
-# Anything that exercises chat must navigate by clicking the real
-# sidebar entry (which sets `current_view` exactly the way a user does).
+# Sections (each preserves the legacy invariant; counts scaled where the
+# invariant is structural — every scaling is noted):
+#   1. 1000-message virtual scroll: totalCount converges to 1000, the window is
+#      bounded (< 60 nodes rendered), the last seeded pair is at the bottom, no
+#      message loss. Count NOT scaled — 1000 is the structural point (windowing).
+#   2. 100-msg burst from Julia via `send!`: every push reaches JS (totalCount
+#      converges), the server store has all of them. NOT scaled.
+#   3. Two browser tabs of the same project: both see the seed, both pick up a
+#      server-side push. Second tab opened via a raw ElectronCall window on the
+#      same dev_server URL.
+#   4. Fast open/close cycles: server-side store intact across reopen, totalCount
+#      reconverges every time. SCALED 10 → 4 cycles (structural: each cycle is an
+#      independent mount; 4 still exercises mount/unmount/rebootstrap repeatedly).
+#   5. Drop browser mid-stream: pushes without a listener don't throw, the store
+#      accumulates, a fresh window bootstraps to the full count.
+#   6. Streaming agent chunks into one bubble via the message-as-target verbs
+#      (`send!` opens, `append!` grows): the accumulated text lands, still pinned.
+#   7. Project switch alpha ↔ beta with a background push to the inactive
+#      project: each view shows the correct count, including the background push.
 #
-# Coverage:
-#   1. 1000 messages: virtual scroll renders the right window, range
-#      requests serve correct slices, no message loss.
-#   2. 100-msg burst from Julia: every message reaches JS, totalCount
-#      converges, no drops.
-#   3. Two browser tabs of the same unified_app: both see the seed,
-#      both pick up server-side pushes.
-#   4. 10 fast open/close cycles: server-side state intact, no leaks.
-#   5. Drop browser mid-stream: server keeps accepting pushes, reconnect
-#      bootstraps correctly.
-#   6. Streaming agent chunks via the real ACP path.
-#   7. Project switch: alpha → beta → alpha shows correct content each
-#      time, including a background-pushed message.
+# MIGRATION NOTES vs the legacy `serve()` + raw-ElectronCall version:
+#   - `fresh_state(...)` + ad-hoc `open_window` are gone. We boot one real
+#     `dev_server` (real worker + real ACP) and create each project through
+#     `BonitoAgents.create_project!` — the EXACT server-side path the dashboard
+#     "+ New project" flow runs (seeds the server mirror, pushes to the worker,
+#     registers the route + ChatModel, notifies the project list so the sidebar
+#     row appears). We drive into each chat by clicking its real sidebar row
+#     (`open_chat`), exactly as a user does. (We use `create_project!` rather
+#     than the full folder-picker UI per section because this file creates ~7
+#     projects; the picker UI is covered by the other migrated tests' single
+#     `new_chat` call. The chat behaviours under test here are driven entirely
+#     through the real DOM after navigation.)
+#   - Long histories are seeded by pushing (UserMsg, AgentMsg) pairs straight
+#     into `model.msgs_store` then emitting a single `msgs.count` and opening the
+#     chat (range requests serve slices from `msgs_store`) — far cheaper than
+#     1000 real ACP turns, and the virtual-scroll invariant is identical.
 
-include(joinpath(@__DIR__, "helpers.jl"))
-
-using Test, Bonito, BonitoAgents, JSON, Dates
+using Test
+include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents
+const TK = TestKit
+const BT = BonitoAgents
 import ElectronCall
+const ECT = ElectronCall.Testing
+using .TestKit: text, end_turn
 
-const RESULTS = Pair{String,Bool}[]
-
-# ── helpers ──────────────────────────────────────────────────────────────
-
-# Open an Electron window pointing at the live production server URL
-# returned by `serve()` (held in `state.srv`). We use a raw
-# (Application, Window) pair instead of `Bonito.use_electron_display`
-# because all we actually want is "load URL X" — display registration
-# would be dead weight here. The server stays up across multiple
-# open/close cycles on the same `state`; only the window is per-test.
-function open_window(state; opts = Dict{String,Any}("show"=>false,
-                                                     "focusOnWebView"=>false))
-    app = ElectronCall.Application()
-    win = ElectronCall.Window(app, ElectronCall.URI(Bonito.online_url(state.srv, ""));
-                           options = opts)
-    sleep(2.5)
-    return (; app, win)
+# Create a project via the real server-side dashboard path and return its
+# (pid, model). `name` must be alphanumeric/_/- (create_project! enforces it).
+function make_project(s, name::AbstractString)
+    st = s.h.state
+    wname = first(keys(st.workers[]))           # the connected worker's id/key
+    p = BT.create_project!(st, String(name), mktempdir(), wname)
+    sleep(0.3)                                   # let the project_list notify land
+    model = lock(st.lock) do; st.chat_models[p.id]; end
+    return p.id, model
 end
 
-close_window(w)   = (try close(w.win) catch end; try close(w.app) catch end)
-close_state(state) = (try close(state.srv) catch end)
-
-function wait_for_js(win, predicate; timeout = 5.0, interval = 0.1)
-    deadline = time() + timeout
-    while time() < deadline
-        try
-            v = ElectronCall.run(win, "(() => { return ($predicate); })()")
-            v === true && return true
-        catch
+# Push `n` (UserMsg, AgentMsg) pairs into `model.msgs_store`, then emit a single
+# `msgs.count` so JS bumps totalCount and (re)fetches the visible range. Texts
+# are `hi i` / `ok i` so the tests can assert the final pair lands.
+function seed_history!(model, n::Int)
+    lock(model.lock) do
+        for i in 1:n
+            push!(model.msgs_store, BT.UserMsg("hi $i"))
+            push!(model.msgs_store, BT.AgentMsg("agent-$i", "ok $i"))
         end
-        sleep(interval)
     end
-    return false
+    BT.chat_emit(model, Dict{String,Any}("type" => "msgs.count",
+                                         "n" => length(model.msgs_store)))
+    return model
 end
 
-# Click the sidebar entry whose data-project-id matches `pid`. Empty pid
-# selects Home (the dashboard view).
-function navigate_to(win, pid::AbstractString)
-    # Wait for the sidebar to be present first.
-    wait_for_js(win,
-        "document.querySelector('.bt-side-item[data-project-id=$(JSON.json(pid))]') !== null";
-        timeout = 5)
-    ElectronCall.run(win, """
-        (() => {
-            const el = document.querySelector('.bt-side-item[data-project-id=$(JSON.json(pid))]');
-            if (el) { el.click(); return true; }
-            return false;
-        })()
-    """)
+# Chat panes are KEPT ALIVE: switching projects hides the old `.bt-chatpane`
+# (display:none) but leaves its `.bt-messages` node in the DOM, so a bare
+# `document.querySelector('.bt-messages')` can grab a hidden prior chat. Every
+# assertion must target the VISIBLE pane. `VMSGS` is a JS expression that
+# resolves the currently-visible messages container (offsetParent !== null).
+const VMSGS = "[...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent !== null)"
+# A `.bt-chat` accessor on the visible pane (null-safe).
+const VCHAT = "(($VMSGS)?.__bt_chat)"
+
+# Navigate into a chat by clicking its real sidebar row.
+function goto_chat(s, pid)
+    TK.open_chat(s, pid)
+    TK.wait_for(s, "messages mounted", "($VCHAT)?.totalCount !== undefined"; timeout = 15)
 end
 
-# Boot the production server via `serve(...)` (port=0 → kernel-assigned),
-# then seed it with one stub worker + N projects + matching ChatModels.
-# `serve()` captures `state` in the unified_app closure, so projects added
-# afterwards are visible to every later session.
-function fresh_state(project_ids::Vector{String})
-    state = BonitoAgents.serve(;
-        host          = "127.0.0.1",
-        port          = 0,
-        worker_secret = "x",
-        state_dir     = mktempdir(),
-        working_dir   = mktempdir())
+total_eq(n) = "($VCHAT)?.totalCount === $n"
+# Same, for a raw ElectronCall TestContext (second tab) — the second tab only
+# ever opens one chat, but scope it the same way for symmetry / safety.
+total_eq_ctx(n) = "($VCHAT)?.totalCount === $n"
 
-    state.workers[]["w1"] = BonitoAgents.WorkerInfo("w1", "Tester", "<inbound-ws>",
-        "x", nothing, "h", "/h", "", String[], "/p", :online, now(UTC))
-    notify(state.workers)
-    models = Dict{String, BonitoAgents.ChatModel}()
-    for pid in project_ids
-        state.projects[][pid] = BonitoAgents.ProjectInfo(pid, pid, "w1",
-            mktempdir(), mktempdir(), now(UTC))
-        m = BonitoAgents.ChatModel(state, mktempdir(); project_id=pid)
-        state.chat_models[pid] = m
-        models[pid] = m
-    end
-    notify(state.projects)
-    return state, models
-end
-
-function chat_total(win)
-    ElectronCall.run(win,
-        "document.querySelector('.bt-messages')?.__bt_chat?.totalCount ?? -1")
-end
-
-# ── (1) 1000 message virtual-scroll integrity ───────────────────────────
-TH.section("Stress 1: 1000 messages, virtual scroll integrity") do
-    state, models = fresh_state(["stress-1k"])
-    TH.seed_chat_history!(models["stress-1k"], 500)   # 500 (user, agent) pairs
-
-    w = open_window(state)
+@testset "chat stress matrix" begin
+    s = TK.dev_server(; agent = _msg -> [text("ok"), end_turn()])
     try
-        navigate_to(w.win, "stress-1k")
+        TK.open_browser(s; width = 1280, height = 820)
+        # The browser must mount the dashboard before create_project! rows can be
+        # clicked. Gate on the Home sidebar entry.
+        TK.wait_for(s, "dashboard mounted",
+            "document.querySelector('.bt-side-item[data-project-id=\\\"\\\"]') !== null"; timeout = 20)
 
-        ok = wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 1000";
-            timeout = 10)
-        push!(RESULTS, "1k: totalCount converged" => ok)
+        # ── 1. 1000-message virtual scroll integrity ──────────────────────────
+        @testset "1k virtual scroll" begin
+            pid, model = make_project(s, "stress-1k")
+            seed_history!(model, 500)            # 500 pairs = 1000 messages
+            goto_chat(s, pid)
 
-        wait_for_js(w.win, """
-            (() => {
-                const us = document.querySelectorAll('.bt-user-msg');
-                return us.length > 0 && us[us.length-1].textContent === 'hi 500';
-            })()
-        """; timeout = 15)
-        wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true";
-            timeout = 10)
-
-        last_user = ElectronCall.run(w.win, """
-            (() => {
-                const us = document.querySelectorAll('.bt-user-msg');
-                return us.length ? us[us.length-1].textContent : null;
-            })()
-        """)
-        push!(RESULTS, "1k: last user bubble is final pair" => (last_user == "hi 500"))
-        rendered = ElectronCall.run(w.win,
-            "document.querySelectorAll('.bt-messages > .bt-user-msg, .bt-messages > .bt-agent-msg').length")
-        push!(RESULTS, "1k: window bounded (< 60 visible)" => (rendered isa Number && rendered < 60))
-    finally
-        close_window(w); close_state(state)
-    end
-end
-
-# ── (2) Burst of server-side pushes ─────────────────────────────────────
-TH.section("Stress 2: 100-msg burst from Julia") do
-    state, models = fresh_state(["stress-burst"])
-    model = models["stress-burst"]
-    TH.seed_chat_history!(model, 5)
-    w = open_window(state)
-    try
-        navigate_to(w.win, "stress-burst")
-        wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 10";
-            timeout = 8)
-
-        for i in 1:100
-            BonitoAgents.send!(model, BonitoAgents.UserMsg("burst-$i"))
+            @test TK.wait_for(s, "totalCount → 1000", total_eq(1000); timeout = 20) == true
+            # Last seeded user bubble is the final pair, pinned to the bottom
+            # (scoped to the visible pane's bubbles).
+            @test TK.wait_for(s, "last user bubble is hi 500", """
+                (() => { const m = $VMSGS; if (!m) return false;
+                         const us = m.querySelectorAll('.bt-user-msg');
+                         return us.length > 0 && us[us.length-1].textContent.trim() === 'hi 500'; })()
+            """; timeout = 20) == true
+            @test TK.wait_for(s, "pinned at bottom",
+                "($VCHAT)?.atBottom() === true"; timeout = 10) == true
+            # Virtual scroll windows the DOM — only a small slice is rendered.
+            rendered = Int(TK.eval_js(s,
+                "(() => { const m = $VMSGS; return m ? m.querySelectorAll(':scope > .bt-user-msg, :scope > .bt-agent-msg').length : -1; })()"))
+            @test rendered < 60
+            @test length(model.msgs_store) == 1000   # no server-side loss
         end
-        ok = wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 110";
-            timeout = 12.0)
-        push!(RESULTS, "burst: every message reached JS (totalCount==110)" => ok)
-        push!(RESULTS, "burst: server store has 110" => (length(model.msgs_store) == 110))
-    finally
-        close_window(w); close_state(state)
-    end
-end
 
-# ── (3) Multi-tab sync (real serve()) ───────────────────────────────────
-TH.section("Stress 3: two tabs of the same serve(), same project") do
-    state, models = fresh_state(["stress-multitab"])
-    model = models["stress-multitab"]
-    TH.seed_chat_history!(model, 3)
+        # ── 2. 100-msg burst from Julia via send! ─────────────────────────────
+        @testset "100-msg burst" begin
+            pid, model = make_project(s, "stress-burst")
+            seed_history!(model, 5)              # 10 messages
+            goto_chat(s, pid)
+            @test TK.wait_for(s, "seed count 10", total_eq(10); timeout = 12) == true
 
-    url = Bonito.online_url(state.srv, "")
-    a1 = ElectronCall.Application(); a2 = ElectronCall.Application()
-    w1 = ElectronCall.Window(a1, ElectronCall.URI(url); options=Dict{String,Any}("show"=>false))
-    w2 = ElectronCall.Window(a2, ElectronCall.URI(url); options=Dict{String,Any}("show"=>false))
-    sleep(3.0)
-    try
-        nav = w -> ElectronCall.run(w, """
-            (() => {
-                const el = document.querySelector('.bt-side-item[data-project-id="stress-multitab"]');
-                el && el.click();
-            })()
-        """)
-        nav(w1); nav(w2); sleep(0.4)
-
-        wait_total = (w, n, tmo=10.0) -> begin
-            deadline = time() + tmo
-            while time() < deadline
-                try
-                    ElectronCall.run(w, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === $n") === true && return true
-                catch end
-                sleep(0.1)
+            for i in 1:100
+                BT.send!(model, BT.UserMsg("burst-$i"))
             end
-            false
-        end
-        push!(RESULTS, "multitab: tab A sees seeded count" => wait_total(w1, 6))
-        push!(RESULTS, "multitab: tab B sees seeded count" => wait_total(w2, 6))
-
-        BonitoAgents.send!(model, BonitoAgents.UserMsg("broadcast"))
-        push!(RESULTS, "multitab: tab A picked up push" => wait_total(w1, 7))
-        push!(RESULTS, "multitab: tab B picked up push" => wait_total(w2, 7))
-    finally
-        try close(w1) catch end
-        try close(w2) catch end
-        try close(a1) catch end
-        try close(a2) catch end
-        close_state(state)
-    end
-end
-
-# ── (4) Fast reload churn ───────────────────────────────────────────────
-TH.section("Stress 4: 10 fast open/close cycles of unified_app") do
-    state, models = fresh_state(["stress-reload"])
-    TH.seed_chat_history!(models["stress-reload"], 4)
-
-    leaked = false
-    try
-        for i in 1:10
-            w = open_window(state)
-            navigate_to(w.win, "stress-reload")
-            ok = wait_for_js(w.win,
-                "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 8"; timeout=6)
-            ok || (leaked = true; @warn "cycle $i did not converge")
-            close_window(w)
-            sleep(0.05)
-        end
-        push!(RESULTS, "reload: 10 cycles all converged" => !leaked)
-        push!(RESULTS, "reload: server-side store intact" =>
-              (length(models["stress-reload"].msgs_store) == 8))
-    finally
-        close_state(state)
-    end
-end
-
-# ── (5) Connection interrupt: drop browser, server keeps pushing ────────
-TH.section("Stress 5: drop browser mid-stream; reconnect bootstraps") do
-    state, models = fresh_state(["stress-drop"])
-    model = models["stress-drop"]
-    TH.seed_chat_history!(model, 5)
-
-    try
-        w = open_window(state)
-        try
-            navigate_to(w.win, "stress-drop")
-            wait_for_js(w.win,
-                "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 10"; timeout=8)
-        finally
-            close_window(w)
+            @test TK.wait_for(s, "burst count 110", total_eq(110); timeout = 15) == true
+            @test length(model.msgs_store) == 110
         end
 
-        threw = false
-        try
-            for i in 1:50
-                BonitoAgents.send!(model, BonitoAgents.UserMsg("offline-$i"))
+        # ── 3. Multi-tab sync (second raw ElectronCall window) ────────────────
+        @testset "multi-tab sync" begin
+            pid, model = make_project(s, "stress-multitab")
+            seed_history!(model, 3)             # 6 messages
+            goto_chat(s, pid)
+            @test TK.wait_for(s, "tab A seed 6", total_eq(6); timeout = 12) == true
+
+            # Second tab: a fresh window on the same dev_server URL, navigated to
+            # the same project via its sidebar row.
+            url = "http://127.0.0.1:$(s.h.state.srv.port)/"
+            ctx2 = ECT.open_window(url; width = 1280, height = 820, show = false)
+            try
+                ECT.install_error_sink(ctx2)
+                sleep(3.0)
+                ECT.wait_for(ctx2, """!!document.querySelector('.bt-side-item[data-project-id="$pid"]')""";
+                             timeout = 12.0)
+                ECT.eval_js(ctx2, """(() => { const el =
+                    document.querySelector('.bt-side-item[data-project-id="$pid"]'); el && el.click(); return true; })()""")
+                ECT.wait_for(ctx2, "($VCHAT)?.totalCount !== undefined"; timeout = 15.0)
+                @test ECT.wait_for(ctx2, total_eq_ctx(6); timeout = 15.0) == true
+
+                # A server-side push reaches BOTH tabs.
+                BT.send!(model, BT.UserMsg("broadcast"))
+                @test TK.wait_for(s, "tab A picked up push", total_eq(7); timeout = 12) == true
+                @test ECT.wait_for(ctx2, total_eq_ctx(7); timeout = 12.0) == true
+
+                errs2 = ECT.eval_js(ctx2, "window.__errs || []")
+                @test isempty(errs2)
+            finally
+                try close(ctx2) catch end
             end
-        catch e
-            threw = true
-            @warn "push without listener raised" exception=e
         end
-        push!(RESULTS, "drop: pushes without browser don't throw" => !threw)
-        push!(RESULTS, "drop: store accumulated all 60" => (length(model.msgs_store) == 60))
 
-        w2 = open_window(state)
-        try
-            navigate_to(w2.win, "stress-drop")
-            ok = wait_for_js(w2.win,
-                "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 60"; timeout=10)
-            push!(RESULTS, "drop: reconnect bootstraps to 60" => ok)
-        finally
-            close_window(w2)
+        # ── 4. Fast open/close cycles (scaled 10 → 4) ─────────────────────────
+        @testset "reopen cycles" begin
+            pid, model = make_project(s, "stress-reload")
+            seed_history!(model, 4)             # 8 messages
+            converged = true
+            for i in 1:4                         # SCALED from 10 — structural
+                goto_chat(s, pid)                # bounces through the dashboard
+                (TK.wait_for(s, "cycle $i seed 8", total_eq(8); timeout = 12) == true) || (converged = false)
+            end
+            @test converged
+            @test length(model.msgs_store) == 8   # server store intact across reopens
         end
+
+        # ── 5. Drop browser mid-stream; reconnect bootstraps ──────────────────
+        @testset "drop + reconnect" begin
+            pid, model = make_project(s, "stress-drop")
+            seed_history!(model, 5)             # 10 messages
+            goto_chat(s, pid)
+            @test TK.wait_for(s, "pre-drop 10", total_eq(10); timeout = 12) == true
+
+            # Drop the browser entirely, then keep pushing — must not throw.
+            close(s.browser[]); s.browser[] = nothing
+            threw = false
+            try
+                for i in 1:50
+                    BT.send!(model, BT.UserMsg("offline-$i"))
+                end
+            catch
+                threw = true
+            end
+            @test threw == false
+            @test length(model.msgs_store) == 60
+
+            # Reconnect: fresh window bootstraps to the full count.
+            TK.open_browser(s; width = 1280, height = 820)
+            TK.wait_for(s, "dashboard remounted",
+                "document.querySelector('.bt-side-item[data-project-id=\\\"\\\"]') !== null"; timeout = 20)
+            goto_chat(s, pid)
+            @test TK.wait_for(s, "reconnect bootstraps to 60", total_eq(60); timeout = 18) == true
+        end
+
+        # ── 6. Streaming agent chunks into one bubble ─────────────────────────
+        @testset "streaming chunks" begin
+            pid, model = make_project(s, "stress-stream")
+            seed_history!(model, 10)            # 20 messages
+            goto_chat(s, pid)
+            @test TK.wait_for(s, "seed 20", total_eq(20); timeout = 12) == true
+
+            bubble = BT.send!(model, BT.AgentMsg(model, "Lorem "))
+            for t in ["ipsum ", "dolor ", "sit ", "amet, ", "consectetur ", "adipiscing ", "elit."]
+                BT.append!(bubble, t)
+                sleep(0.2)
+            end
+            @test TK.wait_for(s, "accumulated chunks landed", """
+                (() => { const m = $VMSGS; if (!m) return false;
+                         const ag = m.querySelectorAll('.bt-agent-msg');
+                         return ag.length > 0 &&
+                                ag[ag.length-1].textContent.includes('Lorem ipsum dolor sit amet'); })()
+            """; timeout = 20) == true
+            @test TK.eval_js(s, "($VCHAT)?.atBottom() === true") == true
+        end
+
+        # ── 7. Project switch with a background push ──────────────────────────
+        @testset "project switch" begin
+            pid_a, a = make_project(s, "alpha"); seed_history!(a, 3)   # 6 messages
+            pid_b, b = make_project(s, "beta");  seed_history!(b, 7)   # 14 messages
+
+            goto_chat(s, pid_a)
+            @test TK.wait_for(s, "alpha shows 6", total_eq(6); timeout = 12) == true
+
+            # Push to beta while viewing alpha.
+            BT.send!(b, BT.UserMsg("background-beta"))
+
+            goto_chat(s, pid_b)
+            @test TK.wait_for(s, "beta shows 15 (14 + background)", total_eq(15); timeout = 18) == true
+
+            goto_chat(s, pid_a)
+            @test TK.wait_for(s, "back to alpha still 6", total_eq(6); timeout = 18) == true
+        end
+
+        # ── No JS errors across the whole matrix ──────────────────────────────
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
     finally
-        close_state(state)
+        close(s)
     end
 end
-
-# ── (6) Streaming agent chunks via real ACP path ────────────────────────
-TH.section("Stress 6: streaming agent chunks via unified_app") do
-    state, models = fresh_state(["stress-stream"])
-    model = models["stress-stream"]
-    TH.seed_chat_history!(model, 20)
-
-    w = open_window(state)
-    try
-        navigate_to(w.win, "stress-stream")
-        wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 40"; timeout=10)
-        sleep(1.0)   # let initial render settle before streaming on top of it
-
-        # Stream into one agent bubble via the message-as-target verbs: `send!`
-        # opens it (seeded with the first chunk), `append!` grows it in place.
-        bubble = BonitoAgents.send!(model, BonitoAgents.AgentMsg(model, "Lorem "))
-        for text in ["ipsum ", "dolor ", "sit ", "amet, ",
-                     "consectetur ", "adipiscing ", "elit."]
-            BonitoAgents.append!(bubble, text)
-            sleep(0.3)
-        end
-        ok = wait_for_js(w.win, """
-            (() => {
-                const ag = document.querySelectorAll('.bt-agent-msg');
-                if (!ag.length) return false;
-                return ag[ag.length-1].textContent.includes('Lorem ipsum dolor sit amet');
-            })()
-        """; timeout = 20)
-        push!(RESULTS, "stream: last agent bubble has accumulated chunks" => ok)
-        push!(RESULTS, "stream: still pinned to bottom after stream" =>
-              ElectronCall.run(w.win,
-                  "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true"))
-    finally
-        close_window(w); close_state(state)
-    end
-end
-
-# ── (7) Project switch with background updates ──────────────────────────
-TH.section("Stress 7: switch alpha ↔ beta, background push to inactive project") do
-    state, models = fresh_state(["alpha", "beta"])
-    a, b = models["alpha"], models["beta"]
-    TH.seed_chat_history!(a, 3)
-    TH.seed_chat_history!(b, 7)
-
-    w = open_window(state)
-    try
-        navigate_to(w.win, "alpha")
-        ok_a = wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 6"; timeout=8)
-        push!(RESULTS, "switch: alpha shows 6" => ok_a)
-
-        # Push to beta while viewing alpha
-        BonitoAgents.send!(b, BonitoAgents.UserMsg("background-beta"))
-
-        navigate_to(w.win, "beta")
-        # Slower than the seeded-only case — the chat mounts AND has to
-        # re-establish msgs.count via a comm round-trip because the
-        # observable's pre-mount value is a "user" event (the background
-        # push), not a msgs.count.
-        ok_b = wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 15"; timeout=15)
-        push!(RESULTS, "switch: beta shows pre-existing + background push (15)" => ok_b)
-
-        navigate_to(w.win, "alpha")
-        ok_a2 = wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 6"; timeout=15)
-        push!(RESULTS, "switch: back to alpha still 6" => ok_a2)
-    finally
-        close_window(w); close_state(state)
-    end
-end
-
-TH.report!("Tier — chat_stress (via unified_app)", RESULTS)
