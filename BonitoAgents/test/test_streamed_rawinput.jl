@@ -1,208 +1,235 @@
-# Streamed tool input — regression for the REAL claude-agent-acp wire shapes
-# (captured from a live session log, chats/<pid>/acp.jsonl):
+# Streamed tool input — migrated onto the TestKit harness (real dev_server, real
+# worker subprocess, real ACP wire, real Electron browser; only the agent's
+# behaviour is faked via the `agent=` callback).
 #
-#   tool_call          status=pending   rawInput={}            ← arguments NOT yet known
-#   tool_call_update   status=ABSENT    rawInput={code,...}    ← arguments arrive, eval still running
-#   tool_call_update   status=completed rawInput=ABSENT        ← result
+# Real claude-agent-acp ships tool arguments on a later tool_call_update, so a
+# tool's input "streams in":
 #
-# Pre-fix, the empty initial rawInput was snapshotted into the ToolMsg and
-# never refreshed: no live code preview / ⏱ / ⊗ for real evals, and the ✎
-# editor button on claude's Read/Edit tools resolved the DISPLAY TITLE
-# ("Read CONVENTIONS.md") as a file path — a button that silently did
-# nothing. These tests drive the full MockTransport → ACP parse → ChatModel
-# pipeline with those exact frames and assert the comm events the browser
-# renders from.
+#   tool_call          status=pending   rawInput={}          ← arguments NOT yet known
+#   tool_call_update   status=running   rawInput={code,...}  ← arguments arrive, still running
+#   tool_call_update   status=completed                      ← result
+#
+# Pre-fix, the empty initial rawInput was snapshotted into the ToolMsg and never
+# refreshed: no live code preview / ⏱ / ⊗ for real evals, and the ✎ editor
+# button on Read/Edit resolved the DISPLAY TITLE ("Read hello.jl") as a path —
+# a button that silently did nothing.
+#
+# The old test scripted these through a deleted MockTransport and asserted the
+# raw comm events. This is genuinely agent-driven, so it's now a DOM e2e: the
+# agent callback opens each tool with `complete=false` carrying the streamed
+# `raw_input`, HOLDS it live with a `delay`, then completes it with
+# `tool_update` — the exact pending → in-flight → completed sequence. (`TK.tool`
+# exposes no rawInput field; we merge a `"raw_input"=>Dict(...)` key into the
+# event Dict so the mock forwards it as the ACP `rawInput`, and the chat derives
+# the eval preview / path-link / taskbar flag from it exactly as in production.)
+#
+# `editable_path_from` / `mcp_path_hint` are pure (no agent), so they ALSO get a
+# direct unit test of the key contract: the ✎ resolves from rawInput.file_path,
+# NOT from the display title.
 
 using Test
-using JSON
-using BonitoAgents
+include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents
+const TK  = TestKit
 const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
-const obs_on = BT.Bonito.Observables.on
+using .TestKit: tool, tool_update, text, text_block, delay, end_turn
 
-# JSON-RPC responder streaming `updates` (raw wire dicts) on session/prompt.
-function streaming_transport(updates::Vector)
-    notif(u) = JSON.json(Dict("jsonrpc" => "2.0", "method" => "session/update",
-        "params" => Dict("sessionId" => "s", "update" => u)))
-    resp(id, result) = JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
-    on_setup = (outgoing::Channel{String}, incoming::Channel{String}) -> begin
-        Base.errormonitor(@async try
-            for line in outgoing
-                msg    = JSON.parse(line)
-                method = get(msg, "method", "")
-                id     = get(msg, "id", nothing)
-                if method == "initialize" && id !== nothing
-                    put!(incoming, resp(id, Dict()))
-                elseif method == "session/new" && id !== nothing
-                    put!(incoming, resp(id, Dict("sessionId" => "s")))
-                elseif method == "session/prompt" && id !== nothing
-                    for u in updates
-                        put!(incoming, notif(u))
-                        # Pace the stream: ACP snapshots alias ONE mutable
-                        # ToolCall, so back-to-back updates let a later
-                        # status overwrite what the consumer reads from an
-                        # earlier snap. Real agents have seconds between
-                        # these frames.
-                        sleep(0.3)
-                    end
-                    put!(incoming, resp(id, Dict("stopReason" => "end_turn")))
-                end
-            end
-        catch e
-            e isa InvalidStateException || @warn "responder failed" exception = e
-        end)
-        return nothing
-    end
-    return BT.MockTransport(on_setup)
-end
+const EVALNAME = "mcp__btworker__bt_julia_eval"
 
-function run_turn_collect(updates::Vector; cwd::AbstractString = mktempdir())
-    state = BT.ServerState(; state_dir = mktempdir(),
-                              working_dir = mktempdir(), worker_secret = "x")
-    model = BT.ChatModel(state, cwd; transport = streaming_transport(updates))
-    events = Dict{String,Any}[]
-    lk = ReentrantLock()
-    obs_on(d -> lock(() -> push!(events, copy(d)), lk), model.comm)
-    busy_seen = Bool[]
-    obs_on(b -> push!(busy_seen, b), model.busy_active)
-    BT.start_chat_client!(model)
-    BT.send_message!(model, BT.UserMsg("go"))
-    @assert timedwait(() -> busy_seen == [true, false], 10.0) === :ok "turn never finished"
-    return model, events
-end
+# `TK.tool` exposes no rawInput parameter (claude usually sends it on a later
+# update, not the opening header). Merge it into the event Dict so the mock's
+# generic `tool` handler forwards it as the ACP `rawInput`.
+with_raw(ev::AbstractDict, raw::AbstractDict) = merge(ev, Dict("raw_input" => raw))
 
-# Exact wire shapes from the captured log (toolName rides _meta.claudeCode).
-meta(name) = Dict("claudeCode" => Dict("toolName" => name))
-text_block(t) = Dict("type" => "content",
-                     "content" => Dict("type" => "text", "text" => t))
+# ── Pure unit: the ✎ derivation resolves rawInput.file_path, NOT the title ───
+@testset "editable_path_from resolves rawInput.file_path, not the display title" begin
+    # The exact derivation the ✎ click handler runs: a header dict carrying the
+    # tool's path_hint (from rawInput.file_path) yields the REAL path, while the
+    # display title "Read hello.jl" alone must NOT be treated as a path.
+    @test BT.mcp_path_hint(Dict{String,Any}("file_path" => "/abs/hello.jl")) == "/abs/hello.jl"
+    @test BT.mcp_path_hint(Dict{String,Any}("code" => "1+1")) === nothing
 
-@testset "streamed rawInput (real claude-agent-acp shapes)" begin
+    hd = Dict{String,Any}("kind" => "read", "title" => "Read hello.jl",
+                          "path_hint" => "/abs/hello.jl")
+    @test BT.editable_path_from(hd, Any[]) == "/abs/hello.jl"
 
-@testset "bt_julia_eval: code/⏱/⊗ arrive on the in-flight update" begin
-    evalname = "mcp__btworker__bt_julia_eval"
-    updates = [
-        # 1. announcement: NO arguments yet
-        Dict("sessionUpdate" => "tool_call", "toolCallId" => "ev1",
-             "kind" => "other", "title" => evalname, "status" => "pending",
-             "_meta" => meta(evalname), "rawInput" => Dict(), "content" => []),
-        # 2. arguments land; eval still running (NO status field)
-        Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "ev1",
-             "title" => evalname, "_meta" => meta(evalname),
-             "rawInput" => Dict("code" => "sleep(2); 40 + 2", "timeout" => 60,
-                                 "env_path" => "/tmp/p"),
-             "content" => []),
-        # 3. result
-        Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "ev1",
-             "status" => "completed",
-             "content" => [text_block("```julia\nsleep(2); 40 + 2\n```\n42")]),
-    ]
-    model, events = run_turn_collect(updates)
-
-    tool_events = [e for e in events
-                   if get(e, "type", "") in ("tool", "tool_update") &&
-                      get(e, "id", "") == "ev1"]
-    @test !isempty(tool_events)
-
-    # The initial header CAN'T have the code (the wire didn't either)…
-    first_ev = tool_events[1]
-    @test !haskey(first_ev, "code")
-
-    # …but an update BEFORE terminal status must carry code + ⏱ + ⊗.
-    live_with_code = [e for e in tool_events
-                      if get(e, "type", "") == "tool_update" &&
-                         haskey(e, "code") &&
-                         !(get(e, "status", "") in ("completed", "failed"))]
-    @test !isempty(live_with_code)
-    e = live_with_code[1]
-    @test e["code"] == "sleep(2); 40 + 2"
-    @test e["timeout_s"] == "60s"
-    @test e["stoppable"] === true
-
-    # The ToolMsg's raw_input was refreshed from the late update.
-    msg = only(m for m in model.msgs_store if m isa BT.MCPToolMsg)
-    @test msg.raw_input["code"] == "sleep(2); 40 + 2"
-    @test BT.tool_path_hint(msg) === nothing   # no path args on an eval
-end
-
-@testset "Bash: late command/description/run_in_background reach the pill" begin
-    script = "for i in \$(seq 1 900); do date; sleep 2; done"
-    updates = [
-        # announcement: NO arguments yet (streamed input)
-        Dict("sessionUpdate" => "tool_call", "toolCallId" => "sh1",
-             "kind" => "execute", "title" => "Bash", "status" => "pending",
-             "_meta" => meta("Bash"), "rawInput" => Dict(), "content" => []),
-        # arguments land while the shell runs: a background monitor loop
-        Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "sh1",
-             "_meta" => meta("Bash"),
-             "rawInput" => Dict("command" => script,
-                                 "description" => "Monitor system load",
-                                 "run_in_background" => true),
-             "content" => []),
-        Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "sh1",
-             "status" => "completed",
-             "content" => [text_block("monitor started")]),
-    ]
-    model, events = run_turn_collect(updates)
-
-    msg = only(m for m in model.msgs_store if m isa BT.BashToolMsg)
-    @test msg.command == script
-    @test msg.description == "Monitor system load"
-    @test msg.is_background
-
-    # The pill shows the human description, not the raw script; the script
-    # rides as the header tooltip; the taskbar flag flips on.
-    ups = [e for e in events
-           if get(e, "type", "") == "tool_update" && get(e, "id", "") == "sh1"]
-    @test any(e -> get(e, "title", "") == "Monitor system load", ups)
-    @test any(e -> get(e, "command", "") == script, ups)
-    @test any(e -> get(e, "taskbar", false) === true, ups)
-    @test any(e -> get(e, "background", false) === true, ups)
-end
-
-@testset "Read: ✎ resolves rawInput.file_path, NOT the display title" begin
-    cwd = mktempdir()
-    fpath = joinpath(cwd, "hello.jl")
-    write(fpath, "greet() = 1\n")
-    updates = [
-        Dict("sessionUpdate" => "tool_call", "toolCallId" => "rd1",
-             "kind" => "read", "title" => "Read File", "status" => "pending",
-             "_meta" => meta("Read"), "rawInput" => Dict(), "content" => []),
-        Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "rd1",
-             "kind" => "read", "title" => "Read hello.jl",
-             "_meta" => meta("Read"),
-             "rawInput" => Dict("file_path" => fpath), "content" => []),
-        Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "rd1",
-             "status" => "completed",
-             "content" => [text_block("greet() = 1\n")]),
-    ]
-    model, events = run_turn_collect(updates; cwd)
-
-    # An update flagged the pill editable.
-    editable_evs = [e for e in events
-                    if get(e, "type", "") == "tool_update" &&
-                       get(e, "id", "") == "rd1" && get(e, "editable", false) === true]
-    @test !isempty(editable_evs)
-
-    # The ToolMsg carries the REAL path (display title is NOT a path).
-    msg = only(m for m in model.msgs_store if m isa BT.GenericToolMsg)
-    @test msg.title == "Read hello.jl"
-    @test BT.tool_path_hint(msg) == fpath
-
-    # The same derivation the ✎ click handler runs resolves the real file —
-    # pre-fix it produced the garbage path "Read hello.jl".
-    content = BT.tool_content_for_render(msg, model.chat_dir)
-    hd = Dict{String,Any}("kind" => msg.kind, "title" => msg.title)
-    hint = BT.tool_path_hint(msg)
-    hint === nothing || (hd["path_hint"] = hint)
-    @test BT.editable_path_from(hd, content) == fpath
-
-    # Persisted for history reload: the hint survives without the in-RAM msg.
-    @test BT.stored_path_hint(model.chat_dir, "rd1") == fpath
-
-    # And a display title alone (no hint) must NOT produce a path.
+    # No hint → the display title is NOT a path (pre-fix bug: it produced the
+    # garbage path "Read hello.jl").
     @test BT.editable_path_from(
-        Dict{String,Any}("kind" => "read", "title" => "Read hello.jl"),
-        content) === nothing
+        Dict{String,Any}("kind" => "read", "title" => "Read hello.jl"), Any[]) === nothing
 end
 
+# ── DOM e2e: bt_julia_eval streamed code/⏱/⊗ + Read path-link + bg Bash ──────
+@testset "streamed rawInput — eval extras + Read path-link" begin
+    # The Read tool's rawInput.file_path needs the live project's worker_path,
+    # known only after new_chat — so the chat comes up with a benign agent, then
+    # `s.agent_fn[]` is swapped to the real scenario (the dispatcher uses
+    # invokelatest, so the swap takes effect on the next prompt).
+    s = TK.dev_server()
+    try
+        TK.open_browser(s; width = 1280, height = 900)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
+
+        # Real project paths: write hello.jl into the server mirror, point the
+        # Read tool's rawInput.file_path at the WORKER-side absolute path.
+        proj  = lock(s.h.state.lock) do; s.h.state.projects[][pid]; end
+        fpath = joinpath(proj.worker_path, "hello.jl")
+        write(joinpath(proj.server_path, "hello.jl"), "greet() = println(\"hi\")\n")
+
+        s.agent_fn[] = function (_msg)
+            eval_raw = Dict("code" => "sleep(2); 40 + 2", "timeout" => 60,
+                            "env_path" => "/tmp/p")
+            Any[
+                # 1. eval: open live with streamed code/timeout, hold, complete.
+                with_raw(tool(; kind = "execute", title = EVALNAME, tool_name = EVALNAME,
+                                id = "ev1", open_status = "in_progress", complete = false),
+                         eval_raw),
+                delay(4000),
+                tool_update("ev1"; status = "completed",
+                            content = [text_block("```julia\nsleep(2); 40 + 2\n```\n42")]),
+                # 2. Read: open live with streamed file_path, hold, complete.
+                with_raw(tool(; kind = "read", title = "Read hello.jl", tool_name = "Read",
+                                id = "rd1", open_status = "in_progress", complete = false),
+                         Dict{String,Any}("file_path" => fpath)),
+                delay(4000),
+                tool_update("rd1"; status = "completed",
+                            content = [text_block("greet() = println(\"hi\")\n")]),
+                end_turn(),
+            ]
+        end
+
+        TK.send_message(s, "go")
+
+        # ── eval: extras appear on the in-flight tool, gone on completion ────
+        @test TK.wait_for(s, "eval pill arrives", """
+            [...document.querySelectorAll('.bt-tool-title')]
+                .some(t => (t.innerText||'').indexOf('bt_julia_eval') !== -1)
+        """; timeout = 15) == true
+        # Live code preview shows the streamed code while running.
+        @test TK.wait_for(s, "live code preview appears", """
+            (() => { const pv = document.querySelector('.bt-eval-preview pre');
+                     return pv && (pv.innerText||'').indexOf('sleep(2)') !== -1; })()
+        """; timeout = 8) == true
+        # ⏱ timeout badge inserted (60 from the streamed rawInput).
+        @test TK.wait_for(s, "timeout badge shows 60", """
+            (() => { const b = document.querySelector('.bt-tool-timeout');
+                     return b && (b.innerText||'').indexOf('60') !== -1; })()
+        """; timeout = 5) == true
+        # ⊗ stop button inserted while live.
+        @test TK.eval_js(s, "document.querySelector('.bt-tool-stop') !== null") == true
+        # The pill is live while the preview shows.
+        @test TK.eval_js(s, """
+            (() => { const n = [...document.querySelectorAll('.bt-tool-msg')]
+                       .find(x => x.querySelector('.bt-tool-body[data-tool-id="ev1"]'));
+                     return n && n.classList.contains('bt-tool-live'); })()
+        """) == true
+        # On completion the preview is removed and the status flips.
+        @test TK.wait_for(s, "preview removed on completion", """
+            (() => { const n = [...document.querySelectorAll('.bt-tool-msg')]
+                       .find(x => x.querySelector('.bt-tool-body[data-tool-id="ev1"]'));
+                     const st = n && n.querySelector('.bt-tool-status');
+                     return st && st.textContent === 'completed' &&
+                            document.querySelector('.bt-eval-preview') === null; })()
+        """; timeout = 12) == true
+
+        # ── read: title becomes a path-link carrying the REAL streamed path ──
+        @test TK.wait_for(s, "title becomes a path-link with the REAL path", """
+            (() => { const n = [...document.querySelectorAll('.bt-tool-msg')]
+                       .find(x => x.querySelector('.bt-tool-body[data-tool-id="rd1"]'));
+                     const t = n && n.querySelector('.bt-tool-title.bt-path-link');
+                     return t != null && t.dataset.path === $(repr(fpath)); })()
+        """; timeout = 12) == true
+        # Click the title path-link → opens the editable Monaco editor on the
+        # server mirror of the streamed worker path (NOT the display title).
+        TK.eval_js(s, """
+            (() => { const n = [...document.querySelectorAll('.bt-tool-msg')]
+                       .find(x => x.querySelector('.bt-tool-body[data-tool-id="rd1"]'));
+                     const t = n && n.querySelector('.bt-tool-title.bt-path-link');
+                     if (t) t.click(); return true; })()
+        """)
+        @test TK.wait_for(s, "path-link click opens editable Monaco",
+            "document.querySelector('.bt-file-editor .monaco-editor') !== null";
+            timeout = 15) == true
+        @test TK.eval_js(s, """
+            (() => { const p = document.querySelector('.bt-file-editor-path');
+                     return p != null && (p.innerText||'').endsWith('/hello.jl'); })()
+        """) == true
+        @test TK.wait_for(s, "editor shows the file content",
+            "(document.querySelector('.bt-file-editor').innerText||'').indexOf('greet') !== -1";
+            timeout = 8) == true
+
+        # ── live-state check on the parsed ToolMsg: raw_input was refreshed ──
+        chat = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
+        @assert timedwait(() -> !chat.busy_active[], 25.0) === :ok "turn never settled"
+        msgs = lock(() -> copy(chat.msgs_store), chat.lock)
+        ev = only(m for m in msgs if m isa BT.MCPToolMsg && m.id == "ev1")
+        @test ev.raw_input["code"] == "sleep(2); 40 + 2"
+        @test BT.tool_path_hint(ev) === nothing            # no path args on an eval
+        rd = only(m for m in msgs if m isa BT.GenericToolMsg && m.id == "rd1")
+        @test rd.title == "Read hello.jl"
+        @test BT.tool_path_hint(rd) == fpath               # ✎ resolves the REAL path
+        @test BT.stored_path_hint(chat.chat_dir, "rd1") == fpath   # persisted for reload
+
+        TK.screenshot(s, joinpath(tempdir(), "bt-streamed-rawinput-eval-read.png"))
+        @test isempty(TK.eval_js(s, "window.__errs || []"))
+    finally
+        close(s)
+    end
+end
+
+# ── DOM e2e: a background Bash's late command/description/run_in_background ───
+# A separate turn (own server) so the editor panel opened by the Read scenario
+# above can't interfere. The streamed rawInput arrives on the OPEN frame; the
+# pill title shows the human DESCRIPTION (not the raw script) and a background
+# bash pins to the taskbar as a non-todo slot.
+@testset "streamed rawInput — background Bash command/description/flag" begin
+    bg_script = "for i in \$(seq 1 900); do date; sleep 2; done"
+    s = TK.dev_server(; agent = msg -> Any[
+        with_raw(tool(; kind = "execute", title = "Bash", tool_name = "Bash",
+                        id = "sh1", open_status = "in_progress", complete = false),
+                 Dict{String,Any}("command" => bg_script,
+                                   "description" => "Monitor system load",
+                                   "run_in_background" => true)),
+        delay(2500),
+        tool_update("sh1"; status = "completed",
+                    content = [text_block("monitor started")]),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
+
+        TK.send_message(s, "go")
+
+        # Pill title shows the human description, not the raw script.
+        @test TK.wait_for(s, "bg bash pill shows the description", """
+            [...document.querySelectorAll('.bt-tool-title')]
+                .some(t => (t.innerText||'').indexOf('Monitor system load') !== -1)
+        """; timeout = 20) == true
+        # A background bash pins to the taskbar as a non-todo slot.
+        @test TK.wait_for(s, "background bash pins to the taskbar", """
+            [...document.querySelectorAll('.bt-taskbar-slot')]
+                .some(el => !el.classList.contains('bt-taskbar-todo'))
+        """; timeout = 10) == true
+
+        # The parsed BashToolMsg carries the streamed command + description + flag.
+        chat = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
+        @test timedwait(() -> any(m -> m isa BT.BashToolMsg && m.id == "sh1",
+                                  lock(() -> copy(chat.msgs_store), chat.lock)), 15.0) === :ok
+        sh = only(m for m in lock(() -> copy(chat.msgs_store), chat.lock)
+                  if m isa BT.BashToolMsg && m.id == "sh1")
+        @test sh.command == bg_script
+        @test sh.description == "Monitor system load"
+        @test sh.is_background
+
+        TK.screenshot(s, joinpath(tempdir(), "bt-streamed-rawinput-bash.png"))
+        @test isempty(TK.eval_js(s, "window.__errs || []"))
+    finally
+        close(s)
+    end
 end

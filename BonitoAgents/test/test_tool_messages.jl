@@ -1,27 +1,38 @@
-# Headless coverage for the typed-tool family added in baf4fba + the TodoWrite
-# consolidation fix in 5396e6c + the background-task / stop affordance in
-# 0bcfdd2 / 97e2d61.
+# Typed-tool family + TodoWrite consolidation + background-task / stop affordance.
 #
-# Three concerns:
+# Split per the TestKit migration: the pure typed-dispatch / `build_tool_msg` /
+# `is_live` / `is_taskbar_item` / `tool_header_dict` / `tool_key` / TodoList
+# lifecycle / `request_tool_stop!` functions are genuinely agent-free — they map
+# an ACP wire value (or a directly-constructed `ToolMsg`) to a typed BonitoAgents
+# message and assert its fields. Those stay DIRECT unit tests, built against a
+# real `ServerState` + a `ChatModel` whose `agent` is a no-op `MockAgent` (the
+# deleted `MockTransport`/`transport=` scaffolding is gone; nothing here drives a
+# turn, so no transport is needed at all).
 #
-#   1. ACP wire → typed `ToolCall` subtype (`BashCall` / `TodoWriteCall` /
-#      `TaskCall` / `MCPCall` / `GenericTool`) — `parse_session_update` reads
-#      `_meta.claudeCode.toolName` + `rawInput` and dispatches.
-#   2. BonitoAgents build dispatch (`build_tool_msg`) — typed ACP value ↦ typed
-#      BonitoAgents `ToolMsg` subtype, carrying tool-specific fields
-#      (`is_background`, `tool_name`, `task_name`).
-#   3. `is_live` / `is_taskbar_item` + `tool_header_dict["taskbar"]` flag —
-#      background bash & subagent Task get a taskbar slot; one-shot tools
-#      don't.
-#   4. TodoWrite absorption — single bubble per logical todo list, even
-#      across turns, until the entries reach all-done.
-#   5. `request_tool_stop!` dispatch — synthetic user message queued for
-#      background bash/task, silent no-op for everything else.
+# Two things that used to be asserted via internal state are now DOM e2e on the
+# TestKit harness instead:
+#   * "the agent emits a tool / a todo list → it renders + the taskbar updates"
+#     — driven through the real stack with `TK.tool` / `TK.todo`.
+#   * the turn-scoped cancel gate (a stale `{type:'cancel', seq}` must not kill a
+#     later turn; the current-seq one does) — the old wire-recording transport is
+#     deleted, so we drive the REAL `CancelCommand` through a live in-flight turn
+#     and assert via busy state.
+#
+# Concerns covered as pure units:
+#   1. ACP wire → typed `ToolCall` subtype (parse_session_update + build_tool_call)
+#   2. BonitoAgents build dispatch (build_tool_msg)
+#   3. is_live / is_taskbar_item + tool_header_dict["taskbar"]
+#   4. TodoWrite absorption (single bubble per logical list)
+#   5. request_tool_stop! dispatch (StopToolCommand)
+#   6. tool_key + filter-key persistence
 
 using Test
-using BonitoAgents
+include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents
+const TK  = TestKit
 const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
+using .TestKit: text, tool, todo, delay, text_block, end_turn
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -43,13 +54,13 @@ function tool_call_params(id::String, name::String, raw_input::AbstractDict;
     )
 end
 
-# Build a chat model attached to a real ServerState + mock transport so the
-# `Base.close(::TodoListMsg)` persist path runs against a real ChatSession.
+# Real ServerState + a ChatModel whose agent is a no-op MockAgent. None of the
+# pure tests drive a turn, so this never spawns a subprocess — it just gives the
+# typed-message constructors / persist paths a real ChatSession to bind to.
 function make_chat()
     state = BT.ServerState(; state_dir = mktempdir(),
                               working_dir = mktempdir(), worker_secret = "x")
-    BT.ChatModel(state, mktempdir();
-                  transport = BT.MockTransport((o, i) -> nothing))
+    BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
 end
 
 # Convenience: build a PlanEntry vector.
@@ -179,40 +190,43 @@ end
 
 @testset "BonitoAgents build_tool_msg dispatch" begin
     chat = make_chat()
+    try
+        # BashCall background → BashToolMsg(is_background=true)
+        bash_bg = ACP.BashCall("b1", "execute", "sleep 10", "in_progress",
+                               ACP.ToolContent[], Channel{ACP.ToolCall}(1),
+                               "sleep 10", true, nothing)
+        m_bash = BT.build_tool_msg(chat, bash_bg)
+        @test m_bash isa BT.BashToolMsg
+        @test m_bash.command == "sleep 10"
+        @test m_bash.is_background == true
 
-    # BashCall background → BashToolMsg(is_background=true)
-    bash_bg = ACP.BashCall("b1", "execute", "sleep 10", "in_progress",
-                           ACP.ToolContent[], Channel{ACP.ToolCall}(1),
-                           "sleep 10", true, nothing)
-    m_bash = BT.build_tool_msg(chat, bash_bg)
-    @test m_bash isa BT.BashToolMsg
-    @test m_bash.command == "sleep 10"
-    @test m_bash.is_background == true
+        # TaskCall → TaskToolMsg
+        task = ACP.TaskCall("t1", "other", "research", "in_progress",
+                            ACP.ToolContent[], Channel{ACP.ToolCall}(1),
+                            "research", "Investigate", true, "researcher")
+        m_task = BT.build_tool_msg(chat, task)
+        @test m_task isa BT.TaskToolMsg
+        @test m_task.is_background == true
+        @test m_task.task_name == "researcher"
 
-    # TaskCall → TaskToolMsg
-    task = ACP.TaskCall("t1", "other", "research", "in_progress",
-                        ACP.ToolContent[], Channel{ACP.ToolCall}(1),
-                        "research", "Investigate", true, "researcher")
-    m_task = BT.build_tool_msg(chat, task)
-    @test m_task isa BT.TaskToolMsg
-    @test m_task.is_background == true
-    @test m_task.task_name == "researcher"
-
-    # MCPCall → MCPToolMsg (server + bare tool_name)
-    mcp = ACP.MCPCall("m1", "other", "mcp__btworker__bt_julia_eval", "completed",
-                      ACP.ToolContent[], Channel{ACP.ToolCall}(1),
-                      "btworker", "bt_julia_eval", Dict{String,Any}("code" => "1"))
-    m_mcp = BT.build_tool_msg(chat, mcp)
-    @test m_mcp isa BT.MCPToolMsg
-    @test m_mcp.server == "btworker"
-    @test m_mcp.tool_name == "bt_julia_eval"
-
-    # GenericTool → GenericToolMsg
-    gen = ACP.GenericTool("g1", "read", "cat foo.txt", "completed",
+        # MCPCall → MCPToolMsg (server + bare tool_name)
+        mcp = ACP.MCPCall("m1", "other", "mcp__btworker__bt_julia_eval", "completed",
                           ACP.ToolContent[], Channel{ACP.ToolCall}(1),
-                          "Read", Dict{String,Any}())
-    m_gen = BT.build_tool_msg(chat, gen)
-    @test m_gen isa BT.GenericToolMsg
+                          "btworker", "bt_julia_eval", Dict{String,Any}("code" => "1"))
+        m_mcp = BT.build_tool_msg(chat, mcp)
+        @test m_mcp isa BT.MCPToolMsg
+        @test m_mcp.server == "btworker"
+        @test m_mcp.tool_name == "bt_julia_eval"
+
+        # GenericTool → GenericToolMsg
+        gen = ACP.GenericTool("g1", "read", "cat foo.txt", "completed",
+                              ACP.ToolContent[], Channel{ACP.ToolCall}(1),
+                              "Read", Dict{String,Any}())
+        m_gen = BT.build_tool_msg(chat, gen)
+        @test m_gen isa BT.GenericToolMsg
+    finally
+        close(chat)
+    end
 end
 
 # ── 3. is_live / is_taskbar_item + tool_header_dict["taskbar"] ────────────
@@ -280,6 +294,7 @@ end
         @test chat.live_todo[] === nothing
         @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 0
         @test pinned_todo(chat) === nothing
+        close(chat)
     end
 
     @testset "a live list pins to the taskbar — no chat message" begin
@@ -291,6 +306,7 @@ end
         pin = pinned_todo(chat)
         @test pin !== nothing
         @test pin.entries == [("A", "pending"), ("B", "pending")]
+        close(chat)
     end
 
     @testset "subsequent plans mutate the SAME live list + pin" begin
@@ -305,6 +321,7 @@ end
         pin = pinned_todo(chat)
         @test pin.id == first_id
         @test pin.entries == [("A", "completed"), ("B", "in_progress")]
+        close(chat)
     end
 
     @testset "all-done finalizes: pin drops, history bubble appears" begin
@@ -320,6 +337,7 @@ end
         @test length(todos) == 1
         @test todos[1].id == live_id
         @test todos[1].finished_at !== nothing
+        close(chat)
     end
 
     @testset "redundant all-done re-send is DROPPED (no duplicate bubble)" begin
@@ -333,6 +351,7 @@ end
         BT.process!(chat, plan(mkentries([("A", "completed")])))
         @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 1
         @test chat.live_todo[] === nothing
+        close(chat)
     end
 
     @testset "a DIFFERENT all-done list still lands once" begin
@@ -340,6 +359,7 @@ end
         BT.process!(chat, plan(mkentries([("A", "completed")])))
         BT.process!(chat, plan(mkentries([("X", "completed")])))
         @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 2
+        close(chat)
     end
 
     @testset "zombie: finalize_todo! moves an unfinished list to history" begin
@@ -354,68 +374,8 @@ end
         todos = filter(m -> m isa BT.TodoListMsg, chat.msgs_store)
         @test length(todos) == 1
         @test [e.status for e in todos[1].entries] == ["completed", "pending"]
+        close(chat)
     end
-end
-
-# ── Turn-scoped cancel ──────────────────────────────────────────────────────
-# A stop-click echoes the turn sequence it was AIMED at; a stale click
-# (buffered while its turn finished) must not cancel the next turn. Observed
-# live: three consecutive fresh prompts each murdered within one frame by
-# stop-clicks meant for earlier turns.
-@testset "CancelCommand is scoped to its turn" begin
-    using JSON: JSON
-
-    # Transport that records outgoing frames and answers the handshake.
-    function recording_transport(sent::Vector{String})
-        BT.MockTransport((outgoing, incoming) -> begin
-            Base.errormonitor(@async try
-                for line in outgoing
-                    push!(sent, line)
-                    msg = JSON.parse(line)
-                    id = get(msg, "id", nothing)
-                    m  = get(msg, "method", "")
-                    if m == "initialize"
-                        put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>Dict())))
-                    elseif m == "session/new"
-                        put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
-                                                      "result"=>Dict("sessionId"=>"s"))))
-                    end
-                end
-            catch e
-                e isa InvalidStateException || @warn "responder" e
-            end)
-            nothing
-        end)
-    end
-    cancels(sent) = count(l -> occursin("session/cancel", l), sent)
-
-    sent = String[]
-    state = BT.ServerState(; state_dir = mktempdir(),
-                              working_dir = mktempdir(), worker_secret = "x")
-    model = BT.ChatModel(state, mktempdir(); transport = recording_transport(sent))
-    BT.start_chat_client!(model)
-    @test timedwait(() -> model.client[] !== nothing, 5.0) === :ok
-
-    # Pretend turn 7 is running (cancel! itself no-ops without an active
-    # turn, so we only verify the seq gate in front of it).
-    model.turn_seq[] = 7
-
-    # Stale: aimed at turn 3 → dropped BEFORE reaching the client.
-    BT.handle_command!(model, nothing, BT.CancelCommand(3))
-    @test cancels(sent) == 0
-
-    # Unscoped (legacy) and current-turn cancels pass the gate; without an
-    # active prompt the ACP client then no-ops, so still nothing on the
-    # wire — the gate is what we are testing, the A8 idle-guard is already
-    # covered in the ACP suite.
-    BT.handle_command!(model, nothing, BT.CancelCommand(7))
-    BT.handle_command!(model, nothing, BT.CancelCommand())
-    @test cancels(sent) == 0
-
-    @test BT.parse_chat_command(Dict{String,Any}("type"=>"cancel","seq"=>5)) ==
-          BT.CancelCommand(5)
-    @test BT.parse_chat_command(Dict{String,Any}("type"=>"cancel")) ==
-          BT.CancelCommand(-1)
 end
 
 # ── 5. Stop-tool dispatch ─────────────────────────────────────────────────
@@ -441,6 +401,7 @@ end
         @test !t.bg_running                       # finalized
         @test t.status == "completed"
         @test !BT.is_pinned(chat, "b1")           # pin dropped
+        close(chat)
     end
 
     @testset "non-background bash → silent no-op" begin
@@ -451,6 +412,7 @@ end
         BT.handle_command!(chat, nothing, BT.StopToolCommand("b2"))
         @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))
         @test t.status == "in_progress"           # untouched
+        close(chat)
     end
 
     @testset "background TaskToolMsg → finalized directly, NO chat message" begin
@@ -462,6 +424,7 @@ end
 
         @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))
         @test !BT.is_live(t)                       # closed → terminal
+        close(chat)
     end
 
     @testset "generic / MCP tools → silent no-op" begin
@@ -471,12 +434,14 @@ end
         push!(chat.msgs_store, m)
         BT.handle_command!(chat, nothing, BT.StopToolCommand("m1"))
         @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))
+        close(chat)
     end
 
     @testset "unknown tool id → silent no-op" begin
         chat = make_chat()
         BT.handle_command!(chat, nothing, BT.StopToolCommand("nonexistent"))
         @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))
+        close(chat)
     end
 
     @testset "parse_bg_output_path strips trailing sentence punctuation" begin
@@ -499,9 +464,16 @@ end
         # Missing id → UnknownCommand (silent no-op).
         @test BT.parse_chat_command(Dict("type" => "stop_tool")) isa BT.UnknownCommand
     end
+
+    @testset "parse_chat_command extracts CancelCommand with/without seq" begin
+        @test BT.parse_chat_command(Dict{String,Any}("type"=>"cancel","seq"=>5)) ==
+              BT.CancelCommand(5)
+        @test BT.parse_chat_command(Dict{String,Any}("type"=>"cancel")) ==
+              BT.CancelCommand(-1)
+    end
 end
 
-# ── Per-tool filter keys (toolbar show/hide is keyed on the ACP tool name) ──
+# ── 6. Per-tool filter keys (toolbar show/hide is keyed on the ACP tool name) ──
 @testset "per-tool filter keys" begin
 
     @testset "tool_key dispatch" begin
@@ -573,4 +545,110 @@ end
         @test BT.tool_key(t) == "read"    # kind fallback
     end
 
+end
+
+# ── DOM e2e: an agent-emitted tool + todo render and update the taskbar ──────
+# The "agent emits X → the user sees X" half, driven through the REAL stack:
+# the agent callback emits a generic tool pill and a (live, then all-done) todo
+# list, and we assert the rendered DOM + the taskbar pin.
+@testset "agent-emitted tool + todo render + taskbar (DOM)" begin
+    # Turn 1: a completed tool pill + a LIVE todo list, held open with a delay so
+    # the live pin is observable; then the list completes (all-done) and the pin
+    # drops while a history bubble lands.
+    s = TK.dev_server(; agent = msg -> [
+        tool(; id = "tool-x", kind = "read", title = "Read notes.txt",
+               status = "completed", content = [text_block("file contents")]),
+        todo([(content = "first step",  status = "in_progress"),
+              (content = "second step", status = "pending")]),
+        delay(2500),
+        todo([(content = "first step",  status = "completed"),
+              (content = "second step", status = "completed")]),
+        text("done"),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
+        chat = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
+
+        TK.send_message(s, "do the steps")
+
+        # The tool pill renders.
+        @test TK.wait_for(s, "tool pill arrives",
+            "document.querySelectorAll('.bt-tool-msg').length >= 1"; timeout = 30) == true
+        @test TK.wait_for(s, "tool title shows the file", """
+            [...document.querySelectorAll('.bt-tool-title')]
+                .some(t => (t.innerText||'').indexOf('notes.txt') !== -1)
+        """; timeout = 8) == true
+
+        # While the list is live (held by the delay) it pins to the taskbar as a
+        # todo slot (`.bt-taskbar-slot.bt-taskbar-todo`).
+        @test TK.wait_for(s, "live todo pins to taskbar",
+            "document.querySelectorAll('.bt-taskbar-slot.bt-taskbar-todo').length >= 1"; timeout = 15) == true
+        @test timedwait(() -> chat.live_todo[] !== nothing, 10.0) === :ok
+
+        # After all-done the live pin drops and the turn settles.
+        @assert timedwait(() -> !chat.busy_active[], 20.0) === :ok "turn never settled"
+        @test timedwait(() -> chat.live_todo[] === nothing, 10.0) === :ok
+        @test TK.wait_for(s, "taskbar todo pin cleared",
+            "document.querySelectorAll('.bt-taskbar-slot.bt-taskbar-todo').length === 0"; timeout = 10) == true
+
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
+    finally
+        close(s)
+    end
+end
+
+# ── DOM e2e: the turn-scoped cancel gate ─────────────────────────────────────
+# The deleted MockTransport let the old test record `session/cancel` frames off
+# the wire. With it gone we drive the REAL CancelCommand through a live in-flight
+# turn: a STALE-seq cancel (aimed at a turn that already ended) must NOT stop the
+# current turn, while a CURRENT-seq cancel does. We fire each by notifying the
+# chat's `comm` exactly as the JS stop button would (`{type:'cancel', seq}`), and
+# observe `busy_active` rather than a now-deleted wire recorder.
+@testset "cancel is scoped to its turn (DOM)" begin
+    # The turn streams an opening chunk then HOLDS open (~5s) so we have a window
+    # to fire the stale + current cancels against a genuinely busy turn.
+    s = TK.dev_server(; agent = msg -> [text("HOLDING "), delay(5000),
+                                        text("RESUMED "), end_turn()])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
+        model = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
+
+        TK.send_message(s, "hold then I cancel")
+        @test TK.wait_for(s, "turn streaming",
+            "document.body.textContent.indexOf('HOLDING') !== -1"; timeout = 20) == true
+        @assert timedwait(() -> model.busy_active[], 8.0) === :ok "turn never went busy"
+
+        cur_seq = model.turn_seq[]
+        @test cur_seq >= 0
+
+        # STALE cancel: aimed at a turn that already ended (seq-1). It must be
+        # dropped before reaching the wire — the turn stays busy.
+        TK.eval_js(s, """
+            (() => { const c = document.querySelector('.bt-messages').__bt_chat;
+                     c.comm.notify({type:'cancel', seq: $(cur_seq - 1)}); return true; })()""")
+        sleep(0.8)
+        @test model.busy_active[] == true        # stale cancel ignored
+        @test model.session_alive[] == true
+
+        # CURRENT cancel: aimed at the live turn — honored, busy clears fast,
+        # session stays alive (graceful cancel, no force-close).
+        TK.eval_js(s, """
+            (() => { const c = document.querySelector('.bt-messages').__bt_chat;
+                     c.comm.notify({type:'cancel', seq: $(cur_seq)}); return true; })()""")
+        @test timedwait(() -> !model.busy_active[], 8.0) === :ok
+        @test model.session_alive[] == true
+
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
+    finally
+        close(s)
+    end
 end
