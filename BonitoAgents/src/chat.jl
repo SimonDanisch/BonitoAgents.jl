@@ -3974,8 +3974,12 @@ function switch_provider!(model::ChatModel, new_kind::Type{<:BinAgent})
         old.kind = new_kind
         old.resume_session_id = nothing
     else
-        # Local agent: build a fresh instance of the new kind, carrying over the
-        # chat's context. `start_chat_client!` installs the handler before start!.
+        # Local agent: a switch builds a FRESH instance of the new kind, so the
+        # old agent is orphaned — `restart_chat_session!` below `stop!`s the NEW
+        # `model.agent`, never `old`. Tear the old session down explicitly first or
+        # its subprocess leaks. `stop!` is idempotent + total; its config fields
+        # (`cwd`/`handler`) stay readable afterward.
+        stop!(old)
         s.agent = new_agent(new_kind;
             cwd = agent_cwd(old),
             handler = old.handler,
