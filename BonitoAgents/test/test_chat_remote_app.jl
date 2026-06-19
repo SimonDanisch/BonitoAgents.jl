@@ -1,23 +1,40 @@
-# End-to-end: a live interactive worker app appears as a bubble IN THE CHAT,
-# rendered by the real ChatModel, driven through a real Electron browser. The app
-# lives in a dial-back eval worker (the production path: the worker dials the dev
-# server and the Bonito protocol is piped RAW over that socket — no Malt on the
-# frame path) and is added to the chat via `show_remote_app_for_project!`.
-const BONITO = "/sim/Programmieren/ClaudeExperiments/dev/Bonito"
-include(joinpath(BONITO, "test", "ElectronTests.jl"))
-TestWindow(args...; options=Dict{String,Any}("show"=>false,"focusOnWebView"=>false)) =
-    Bonito.EWindow(args...; app=get_test_app(), options=options)
-electron_evaljs(window, js) = run(window, sprint(show, js))
+# End-to-end (TestKit): a live interactive worker app appears as a bubble IN THE
+# CHAT, rendered by the real ChatModel and driven through a real Electron browser.
+#
+# Migration. The old version hand-built an Electron window, a bare ChatModel over
+# a `MockTransport`, and wired the dial-back manually. Fake transports are gone;
+# instead this drives the WHOLE production stack through the TestKit harness — a
+# real `dev_server` + worker + ACP wire, with only the agent's behaviour faked.
+# The agent emits a single `bt_show_app(DEMO)` event, which the dispatcher runs
+# through real `BonitoMCP.julia_show_app_handler`: a Malt eval worker dials back
+# over `/eval-ws` (raw Bonito frames, no Malt on the frame path), the app is
+# registered + prerendered, and the chat embeds it as a `BonitoAppMsg` bubble.
+#
+# Asserted in the REAL DOM:
+#   1. the embedded app renders (its `#result` span mounts, showing the initial
+#      DOUBLED value "0"), and
+#   2. a remote Observable round-trips to the DOM: `COUNT.notify(7)` in the
+#      browser → the worker's `on(COUNT)` sets `DOUBLED[] = 14` → that relays
+#      back through the bridge and the `#result` span updates to "14"; the
+#      separate worker PROCESS is confirmed to have seen `COUNT[] == 7`.
+#
+# Modeled on test_bt_show_app_e2e.jl (TestKit embed) + test_real_e2e.jl (remote
+# Observable round-trip + worker introspection via BonitoMCP's own Malt link).
 
-using Test
-import BonitoAgents, BonitoMCP
-const BT = BonitoAgents
+using Test, JSON
+include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
+import .TestKit, BonitoAgents, BonitoMCP
+const TK   = TestKit
+const BT   = BonitoAgents
 const Malt = BonitoAgents.Malt
-import Bonito
-using Bonito: DOM, @js_str
+using .TestKit: bt_show_app, text, end_turn
+
+# env_path for the eval worker. The root project has the working Bonito the dev
+# test stack uses (an empty tmp Project.toml would have no registered Bonito and
+# Pkg.instantiate is off-limits per CLAUDE.md).
 const ROOT = "/sim/Programmieren/ClaudeExperiments"
 
-# Worker introspection goes through BonitoMCP's own Malt link (the dial-back
+# Worker introspection goes through BonitoMCP's OWN Malt link (the dial-back
 # carries raw Bonito frames, not Malt; the EvalBridge holds no worker handle).
 function root_worker()
     for s in values(BonitoMCP.manager().sessions)
@@ -26,14 +43,11 @@ function root_worker()
     error("no live ROOT eval worker")
 end
 
-function poll_js(win, js, want; timeout=40)
-    t = time() + timeout; local v
-    while time() < t; v = electron_evaljs(win, js); v == want && return true; sleep(0.1); end
-    @info "poll timed out" js=string(js) last=v want; false
-end
-
-# `show_remote_app!` ships this source to the worker (register control), where it's
-# `include_string`-d to an App. The COUNT/DOUBLED globals let the test read worker state.
+# The app source bt_show_app evaluates (its last value is a `Bonito.App`). The
+# COUNT/DOUBLED globals let the test read + drive worker state across the bridge:
+# COUNT is driven from JS, the worker doubles it into DOUBLED, which renders into
+# `#result`. The `onjs` taps register both observables in the browser's global
+# namespace so `lookup_global_object` can find them.
 const DEMO = """
 using Bonito
 global COUNT = Bonito.Observable(0); global DOUBLED = Bonito.Observable(0)
@@ -46,46 +60,60 @@ end
 """
 
 @testset "live worker app in the chat (real browser)" begin
-    h = BT.dev_server()
-    win = nothing
+    # Fresh eval worker: a worker from a previous test has `__BT_DIALED` true
+    # against an OLD dev_server's WS that's long gone, so it won't dial THIS
+    # dev_server's `/eval-ws` without a restart.
+    BonitoMCP.restart!(BonitoMCP.manager(), ROOT)
+
+    s = TK.dev_server(; agent = msg -> [
+        text("Here's the live counter app."),
+        bt_show_app(DEMO; env_path = ROOT, id = "ta-remote-1"),
+        text("Drive it with COUNT."),
+    ])
     try
-        pid = "chat-" * string(rand(UInt16))
-        for (k,v) in BT.eval_dialback_env(h.state, pid); ENV[k] = v; end
-        ENV["BONITOAGENTS_SERVER_URL"] = Bonito.online_url(h.state.srv, "")
-        BonitoMCP.restart!(BonitoMCP.manager(), ROOT)
-        # Establish the dial-back bridge: a trivial bt_show_app makes the worker dial.
-        @test BonitoMCP.julia_show_app_handler(
-            Dict("code"=>"using Bonito; Bonito.App(s->Bonito.DOM.div(\"dial\"))", "env_path"=>ROOT))["isError"] == false
-        @test timedwait(()->haskey(BT.EVAL_WORKERS, pid), 30.0) === :ok
+        TK.open_browser(s; width = 1280, height = 880)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
 
-        # The real ChatModel, served BY THE DEV SERVER so the embed's init `.bin`
-        # resolves against the same asset_host the bridge registered it on.
-        model = BT.ChatModel(h.state, mktempdir(); project_id=pid, transport=BT.MockTransport((o,i)->nothing))
-        Bonito.route!(h.state.srv, "/chat-test" => Bonito.App(session -> DOM.div(model)))
-        win = TestWindow()
-        ElectronCall.load(win.window, URI("http://127.0.0.1:$(h.state.srv.port)/chat-test"))
-        @test poll_js(win, js"document.body ? 'yes':'no'", "yes")
+        TK.send_message(s, "please show me the live counter app")
 
-        # Add the live app to the chat AFTER the browser is connected → a bonito_app
-        # ToolMsg bubble → auto-expand → ToolRenderCommand → embed.
-        BT.show_remote_app_for_project!(model, DEMO)
-        @test poll_js(win, js"document.querySelector('#result') ? 'yes':'no'", "yes")
-        @test electron_evaljs(win, js"document.querySelector('#result').textContent") == "0"
+        # The bt_show_app chain spins up a Malt worker, registers an app, dials a
+        # fresh WS back, embeds it. Heavier than bt_eval — give it 90s cold.
+        TK.wait_for(s, "BonitoAppMsg completed",
+            """document.querySelector('.bt-tool-msg .bt-tool-status')?.textContent === 'completed'""";
+            timeout = 90)
+        # The eval worker dialed OUR dev_server's /eval-ws and is driveable.
+        @test timedwait(() -> haskey(BT.EVAL_WORKERS, pid), 30.0) === :ok
 
-        # The proxied namespace prefix is on the embed's wrapper; build COUNT's key.
-        prefix = electron_evaljs(win, js"document.querySelector('[data-bonito-remote]')?.getAttribute('data-bonito-remote') || ''")
+        # (1) the embedded app rendered: its #result span is in the DOM and shows
+        # the initial DOUBLED value "0". Auto-expand mounts the body once app_id
+        # lands; give it a beat.
+        @test TK.wait_for(s, "embed #result rendered",
+            "!!document.querySelector('#result')"; timeout = 30) == true
+        @test TK.wait_for(s, "#result shows initial 0",
+            "document.querySelector('#result').textContent === '0'"; timeout = 10) == true
+
+        # (2) remote Observable round-trip. The embed's wrapper carries the bridge
+        # namespace prefix on `data-bonito-remote`; COUNT's global key is
+        # "$prefix/$(COUNT.id)". Notifying it from JS drives the worker's
+        # on(COUNT) → DOUBLED = 14, which relays back to the DOM.
+        prefix = TK.eval_js(s,
+            "document.querySelector('[data-bonito-remote]')?.getAttribute('data-bonito-remote') || ''")
         @test !isempty(prefix)
-        count_id = Malt.remote_eval_fetch(root_worker(), :(COUNT.id))
+        count_id  = Malt.remote_eval_fetch(root_worker(), :(COUNT.id))
         count_key = "$prefix/$count_id"
 
-        electron_evaljs(win, js"Bonito.lookup_global_object($(count_key)).notify(7)")
-        @test poll_js(win, js"document.querySelector('#result').textContent", "14")
-        @test Malt.remote_eval_fetch(root_worker(), :(COUNT[])) == 7
-        println("✓ live worker app renders + drives as a real ChatModel bubble in a browser")
+        TK.eval_js(s, "Bonito.lookup_global_object($(JSON.json(count_key))).notify(7); true")
+        @test TK.wait_for(s, "#result round-trips to 14",
+            "document.querySelector('#result').textContent === '14'"; timeout = 15) == true
+        # The separate worker PROCESS actually saw the new value.
+        @test timedwait(() -> Malt.remote_eval_fetch(root_worker(), :(COUNT[])) == 7, 10.0) === :ok
+
+        TK.screenshot(s, joinpath(tempdir(), "bt-chat-remote-app.png"))
+        errs = TK.eval_js(s, "window.__errs || []")
+        @test isempty(errs)
     finally
-        for k in ("BONITOAGENTS_SERVER_URL","BONITOAGENTS_SECRET","BONITOAGENTS_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
-        win === nothing || (try; close(win.window); catch; end)
-        try; close(h); catch; end
+        close(s)
     end
 end
-nothing

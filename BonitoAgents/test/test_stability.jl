@@ -3,9 +3,14 @@
 # bug can't silently come back. UI-only races (where the only observable is in
 # the browser) are asserted at the server-side seam the fix touches.
 #
-# These are headless: no real worker subprocess, no browser. Where a finding is
-# about a worker RPC we drive the `pending_rpcs` table directly; where it's about
-# the chat consumer/poller we use a `MockTransport`.
+# These are headless: no browser. Where a finding is about a worker RPC we drive
+# the `pending_rpcs` table directly; where it's about the chat consumer/poller
+# (T4) we bring up a REAL local agent — a `MockAgent(; cwd)` (the spawned mock
+# claude-agent-acp, scenario "normal") answers initialize + session/new + every
+# prompt exactly like the deleted `MockTransport` responder did, but over the
+# real `start!` path (real subprocess, real ACP wire). For state-only tests that
+# never `start!` (T1(b) cache lookup, T8 cache-lock hammer) an un-started
+# `MockAgent([])` is just a no-op ChatModel holder — no subprocess, no client.
 
 using Test
 using JSON
@@ -17,33 +22,6 @@ const ACP = BonitoAgents.AgentClientProtocol
 stab_newstate() = BT.ServerState(; state_dir   = mktempdir(),
                                    working_dir = mktempdir(),
                                    worker_secret = "x")
-
-# A MockTransport whose responder answers initialize + session/new and finishes
-# every prompt cleanly. Enough for a real `start_chat_client!` bring-up (consumer
-# + poller) without a worker.
-function stab_normal_transport()
-    resp(id, result) = JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>result))
-    on_setup = (outgoing::Channel{String}, incoming::Channel{String}) -> begin
-        Base.errormonitor(@async try
-            for line in outgoing
-                msg    = JSON.parse(line)
-                method = get(msg, "method", "")
-                id     = get(msg, "id", nothing)
-                if method == "initialize" && id !== nothing
-                    put!(incoming, resp(id, Dict()))
-                elseif method == "session/new" && id !== nothing
-                    put!(incoming, resp(id, Dict("sessionId" => "s")))
-                elseif method == "session/prompt" && id !== nothing
-                    put!(incoming, resp(id, Dict("stopReason" => "end_turn")))
-                end
-            end
-        catch e
-            e isa InvalidStateException || @warn "stab responder failed" exception=e
-        end)
-        return nothing
-    end
-    return BT.MockTransport(on_setup)
-end
 
 @testset "stability review (T1–T22)" begin
 
@@ -89,7 +67,8 @@ end
         @test !haskey(BT.SESSION_INFLIGHT, p.id)        # entry cleared
 
         # (b) Now the model is cached → no bring-up, returns the cached model.
-        cached = BT.ChatModel(state, mktempdir(); transport = stab_normal_transport())
+        # Never started, so an un-started MockAgent is enough as the cache entry.
+        cached = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
         BT.lock(state.lock) do
             state.chat_models[p.id] = cached
         end
@@ -154,7 +133,11 @@ end
     # ── T4: closing a ChatModel stops the consumer + poller ─────────────────
     @testset "T4 close(::ChatModel) ends consumer + background poller" begin
         state = stab_newstate()
-        model = BT.ChatModel(state, mktempdir(); transport = stab_normal_transport())
+        cwd   = mktempdir()
+        # A REAL local agent (spawned mock claude-agent-acp): start_chat_client!
+        # spawns the subprocess, handshakes over the real ACP wire, then arms the
+        # consumer + bg poller — exactly the path this regression guards.
+        model = BT.ChatModel(state, cwd; agent = BT.MockAgent(; cwd = cwd))
         BT.start_chat_client!(model)
         consumer = model.consumer_task[]
         @test consumer isa Task
@@ -174,6 +157,9 @@ end
             () -> !BT.lock(() -> haskey(BT.BG_POLLERS, model), BT.BG_POLLERS_GC_LOCK),
             5.0) === :ok
         close(model)   # idempotent
+        # close(model) only closes the user-message queue; the agent owns a real
+        # subprocess now, so tear it down explicitly to avoid leaking a process.
+        BT.stop!(model.agent)
     end
 
     # ── T6: safe_notify! survives a throwing (stale) listener ───────────────
@@ -219,7 +205,9 @@ end
     # returns a stored value.
     @testset "T8 tool_content_cache concurrent access is safe" begin
         state = stab_newstate()
-        model = BT.ChatModel(state, mktempdir(); transport = stab_normal_transport())
+        # Cache-lock hammer only — the chat is never started, so an un-started
+        # MockAgent is enough; no subprocess is spawned.
+        model = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
         tasks = Task[]
         for i in 1:100
             push!(tasks, @async BT.cache_tool_content!(model, "tool$(i % 7)",
