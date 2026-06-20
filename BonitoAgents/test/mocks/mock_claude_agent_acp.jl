@@ -25,15 +25,6 @@
 #   hang_in_tool        — one tool_call (status=pending) then never
 #                         respond. Tests that the orphan sweep flips the
 #                         tool to "failed" on restart.
-#   plan_hang           — one `plan` SessionUpdate (in_progress + pending
-#                         entry) then never respond. Drives a LIVE todo
-#                         (on `live_todo`/taskbar, NOT msgs_store) so the
-#                         restart orphan sweep's `finalize_todo!` is tested.
-#                         (The legacy `todo_hang` tool_call path is inert —
-#                         the chat reports todos only via `plan` updates.)
-#   bg_bash_hang        — a backgrounded Bash (run_in_background) tool_call
-#                         then hang. Restart must leave the bg bubble intact
-#                         (the worker owns the shell, not the ACP session).
 #   crash               — exit(1) immediately after `session/prompt`
 #                         (simulates an agent that died mid-turn). The
 #                         reader-loop's EOF surfaces as session_alive=false.
@@ -41,16 +32,8 @@
 #                         test prove the cancel-then-restart escalation
 #                         works against an uncooperative agent.
 #
-# Stdin EOF → exit(0). The transport's close(); `kill` cycle relies on this:
-# closing stdin makes us drop out of the dispatcher loop cleanly.
-#
-# NB (hang scenarios + teardown): a hang scenario blocks `handle_prompt` on the
-# MAIN task, so it never returns to read stdin; teardown then falls to the
-# transport's SIGTERM. A Julia child blocked mid-`sleep`/mid-JIT does NOT
-# reliably reap on SIGTERM (only SIGKILL) — see the migration note in
-# test_restart_real_transport.jl. The per-scenario chat-state assertions there
-# don't depend on the OS reap; the suite force-reaps any stragglers in its
-# `finally`.
+# Stdin EOF → exit(0). The `LocalTransport` close(); `kill` cycle relies on
+# this: closing stdin makes us drop out of the dispatcher loop cleanly.
 
 using JSON, Sockets
 
@@ -249,21 +232,6 @@ function handle_prompt(prompt_id, scenario::AbstractString)
             i += 1
             agent_chunk("loop$i ")
             pause()
-        end
-    elseif scenario == "plan_hang"
-        # Emit a `plan` SessionUpdate with one in_progress + one pending entry,
-        # then hang. Real claude-agent-acp reports todos EXCLUSIVELY as `plan`
-        # updates (the TodoWrite tool_call path is inert on the chat side), so
-        # this is the architecturally-correct way to drive a LIVE todo. The plan
-        # lives on `shared(chat).live_todo` + the taskbar (NOT msgs_store) while
-        # live; the restart orphan sweep must `finalize_todo!` it — finished_at
-        # stamped, live_todo cleared, the (now-finalized) bubble appended to
-        # msgs_store + persisted, the taskbar slot dropped.
-        upd("plan", Dict("entries" => [
-            Dict("content" => "Step 1", "priority" => "high", "status" => "in_progress"),
-            Dict("content" => "Step 2", "priority" => "high", "status" => "pending")]))
-        while true
-            sleep(1.0)
         end
     elseif scenario == "dispatcher"
         # Ask the parent test process what to emit for this prompt. The

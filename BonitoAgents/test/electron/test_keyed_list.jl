@@ -1,143 +1,179 @@
-# KeyedList: fine-grained list manager — a PURE Bonito component test.
+# Tier 2o — KeyedList: fine-grained list manager.
 #
-# This test never used a fake transport (no agent, no ChatModel, no ACP): it
-# mounts a minimal Bonito App exposing a `KeyedList` against a Julia-side
-# Observable and asserts the contract directly in a real Electron DOM. So it
-# stays a standalone component test (NOT on the TestKit chat harness — there's
-# no chat involved), just made self-contained: its own Electron display, its own
-# JS-eval/poll helpers, `@testset`/`@test`, a `window.__errs` sink, and a
-# `try/finally close(disp)`.
-#
-# Contract under test: widgets that survive a list update keep their DOM node
-# (identity preserved across diffs), and only the diff's inserts/removes/moves
-# are applied. The identity property is the whole point of the abstraction — lose
-# it and we'd be no better off than `map(items) do _; render_all() end`.
+# Verifies the contract: widgets that survive a list update keep their
+# DOM node (identity preserved across diffs), and only the diff's
+# inserts/removes/moves are applied. The widget identity test is the
+# point of the whole abstraction — if we lose it we'd be no better off
+# than `map(items) do _; render_all() end`.
+isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
-using Test
 using Bonito, JSON
-import ElectronCall
 
-# Detect the live X socket so the headless Electron window can render (the same
-# plumbing TestKit.ensure_display! does; this file doesn't use the chat harness).
-if isempty(get(ENV, "DISPLAY", ""))
-    socks = filter(s -> startswith(s, "X"), readdir("/tmp/.X11-unix"))
-    isempty(socks) || (ENV["DISPLAY"] = ":" * first(sort(socks; rev = true))[2:end])
-end
-
-# Minimal widget: a paragraph with one Observable<String> binding. Stable
-# per-instance identity (mutable struct + Observable field → object-id hash →
-# unchanged across rebuilds when the same instance is reused).
+# Minimal widget: a paragraph with one Observable<String> binding.
+# Stable per-instance identity (mutable struct + Observable field → hash
+# is based on objectids → unchanged across rebuilds when the same value
+# is reused).
 mutable struct LabelCard
-    id    :: String
-    label :: Observable{String}
+    id     :: String
+    label  :: Observable{String}
 end
 
 function Bonito.jsrender(session::Bonito.Session, c::LabelCard)
-    # Encode the test id into the class — Bonito/Hyperscript kwargs can't
-    # natively express `data-test-id`. A class selector is enough for the test.
-    Bonito.jsrender(session, Bonito.DOM.div(c.label; class = "kl-card kl-id-$(c.id)"))
+    # Encode test-id into the class — Bonito/Hyperscript kwargs can't
+    # natively express `data-test-id` (underscore→dash conversion
+    # produces `data-_test-_id`, not what we want). The class-based
+    # selector is enough for tests; the abstraction itself doesn't
+    # require any DOM markers.
+    Bonito.jsrender(session,
+        Bonito.DOM.div(c.label;
+            class = "kl-card kl-id-$(c.id)"))
 end
 
-@testset "KeyedList — widget identity preserved across list diffs" begin
-    items_obs = Observable(LabelCard[])
-    cards = Dict{String, LabelCard}()
-    make_card(id, label) = get!(() -> LabelCard(id, Observable(label)), cards, id)
+# Mount a minimal Bonito App that exposes a KeyedList against a Julia-
+# side Observable we can mutate from the test.
+items_obs = Observable(LabelCard[])
+const cards = Dict{String, LabelCard}()
+make_card(id, label) = get!(cards, id) do
+    LabelCard(id, Observable(label))
+end
 
-    app = Bonito.App() do session
-        Bonito.DOM.div(Bonito.KeyedList(items_obs);
-            id = "kl-container",
-            style = Bonito.Styles("display" => "flex", "flex-direction" => "column"))
+app = Bonito.App() do session
+    Bonito.DOM.div(
+        Bonito.KeyedList(items_obs);
+        id = "kl-container",
+        style = Bonito.Styles("display" => "flex",
+                               "flex-direction" => "column"))
+end
+
+disp = Bonito.use_electron_display(;
+    devtools = false,
+    options  = Dict{String,Any}("show" => false, "width" => 800, "height" => 600),
+    electron_args = ["--ozone-platform=x11"])
+display(disp, app)
+sleep(0.6)
+ctx = (; disp = disp, app = app, session = app.session[], state = nothing)
+run(disp.window, """
+    window.__errs = [];
+    window.addEventListener('error', e => window.__errs.push(String(e.message)));
+""")
+
+results = Pair{String,Bool}[]
+record(name, ok) = push!(results, name => ok)
+
+# Helper: how the list looks in the DOM right now. Pull the id from the
+# class list ("kl-id-<id>") since we're encoding it there.
+dom_ids() = TH.eval_js(ctx, """
+    Array.from(document.querySelectorAll('.kl-card')).map(el => {
+        const m = Array.from(el.classList).find(c => c.startsWith('kl-id-'));
+        return m ? m.slice('kl-id-'.length) : null;
+    })
+""")
+
+# Helper: stable-node test. Tag a node with a JS property; if the same
+# node is reused across a diff, the tag survives.
+tag_node!(id::String, tag::String) = TH.eval_js(ctx, """(() => {
+    const el = document.querySelector('.kl-id-$id');
+    if (el) el.__test_tag = $(JSON.json(tag));
+    return !!el;
+})()""")
+read_tag(id::String) = TH.eval_js(ctx, """(() => {
+    const el = document.querySelector('.kl-id-$id');
+    return el ? (el.__test_tag || null) : null;
+})()""")
+
+try
+    # ── 1. Initial mount ─────────────────────────────────────────────────
+    TH.section("Initial mount with three items") do
+        items_obs[] = [make_card("a", "Alpha"),
+                       make_card("b", "Bravo"),
+                       make_card("c", "Charlie")]
+        record("three cards land in order",
+               @TH.test_true TH.wait_for(ctx,
+                   "document.querySelectorAll('.kl-card').length === 3";
+                   timeout = 3.0))
+        record("DOM order is a,b,c", @TH.test_eq dom_ids() ["a", "b", "c"])
     end
 
-    disp = Bonito.use_electron_display(;
-        devtools = false,
-        options  = Dict{String,Any}("show" => false, "width" => 800, "height" => 600),
-        electron_args = ["--ozone-platform=x11"])
-    try
-        display(disp, app)
-        sleep(0.8)
-        run(disp.window, """
-            window.__errs = [];
-            window.addEventListener('error', e => window.__errs.push(String(e.message)));
-        """)
-
-        evjs(code::AbstractString) = run(disp.window, code)
-        # Hard-deadline poll: a true hang fails here rather than wedging the suite.
-        function wait_js(predicate::AbstractString; timeout::Real = 3.0, interval::Real = 0.05)
-            deadline = time() + timeout
-            while time() < deadline
-                try
-                    evjs("(() => { return ($predicate); })()") === true && return true
-                catch; end
-                sleep(interval)
-            end
-            return false
-        end
-
-        # How the list looks in the DOM right now — id pulled from "kl-id-<id>".
-        dom_ids() = evjs("""
-            Array.from(document.querySelectorAll('.kl-card')).map(el => {
-                const m = Array.from(el.classList).find(c => c.startsWith('kl-id-'));
-                return m ? m.slice('kl-id-'.length) : null; })
-        """)
-        # Stable-node test: tag a node with a JS property; if the same node is
-        # reused across a diff, the tag survives.
-        tag_node!(id, tag) = evjs("""(() => {
-            const el = document.querySelector('.kl-id-$id');
-            if (el) el.__test_tag = $(JSON.json(tag)); return !!el; })()""")
-        read_tag(id) = evjs("""(() => {
-            const el = document.querySelector('.kl-id-$id');
-            return el ? (el.__test_tag || null) : null; })()""")
-
-        # ── 1. Initial mount with three items ───────────────────────────────
-        items_obs[] = [make_card("a", "Alpha"), make_card("b", "Bravo"), make_card("c", "Charlie")]
-        @test wait_js("document.querySelectorAll('.kl-card').length === 3"; timeout = 3.0)
-        @test dom_ids() == ["a", "b", "c"]
-
-        # ── 2. Mutating a widget Observable doesn't remount the node ─────────
-        @test tag_node!("b", "TAG-B") == true
+    # ── 2. Identity preserved when label changes ────────────────────────
+    TH.section("Mutating widget Observable doesn't remount the node") do
+        record("tag stuck on 'b'", @TH.test_eq tag_node!("b", "TAG-B") true)
         cards["b"].label[] = "Bravo (edited)"
         sleep(0.4)
-        @test read_tag("b") == "TAG-B"
-        @test occursin("edited", String(evjs("document.querySelector('.kl-id-b').innerText")))
+        record("'b' tag survives label update",
+               @TH.test_eq read_tag("b") "TAG-B")
+        text = TH.eval_js(ctx, """document.querySelector('.kl-id-b').innerText""")
+        record("'b' text reflects new label",
+               @TH.test_true occursin("edited", String(text)))
+    end
 
-        # ── 3. Append: only the new card mounts ─────────────────────────────
-        items_obs[] = [cards["a"], cards["b"], cards["c"], make_card("d", "Delta")]
-        @test wait_js("document.querySelectorAll('.kl-card').length === 4"; timeout = 2.0)
-        @test dom_ids() == ["a", "b", "c", "d"]
-        @test read_tag("b") == "TAG-B"     # not remounted
+    # ── 3. Append a new item ─────────────────────────────────────────────
+    TH.section("Append: only the new card mounts") do
+        items_obs[] = [cards["a"], cards["b"], cards["c"],
+                       make_card("d", "Delta")]
+        record("four cards present",
+               @TH.test_true TH.wait_for(ctx,
+                   "document.querySelectorAll('.kl-card').length === 4";
+                   timeout = 2.0))
+        record("order a,b,c,d", @TH.test_eq dom_ids() ["a","b","c","d"])
+        record("'b' tag still there (not remounted)",
+               @TH.test_eq read_tag("b") "TAG-B")
+    end
 
-        # ── 4. Remove middle: surviving cards keep identity ─────────────────
+    # ── 4. Remove middle item ────────────────────────────────────────────
+    TH.section("Remove middle: surviving cards keep identity") do
         items_obs[] = [cards["a"], cards["c"], cards["d"]]
-        @test wait_js("document.querySelectorAll('.kl-card').length === 3"; timeout = 2.0)
-        @test dom_ids() == ["a", "c", "d"]
-        @test read_tag("b") === nothing    # b was removed
+        record("three cards remain",
+               @TH.test_true TH.wait_for(ctx,
+                   "document.querySelectorAll('.kl-card').length === 3";
+                   timeout = 2.0))
+        record("order a,c,d", @TH.test_eq dom_ids() ["a","c","d"])
+        record("'b' tag is gone (b was removed)",
+               @TH.test_eq read_tag("b") nothing)
+    end
 
-        # ── 5. Reorder without changing membership ──────────────────────────
+    # ── 5. Reorder without changing membership ──────────────────────────
+    TH.section("Reorder: every card retains identity") do
+        # Tag a and d before the move so we can detect remount.
         tag_node!("a", "TAG-A")
         tag_node!("d", "TAG-D")
         items_obs[] = [cards["d"], cards["a"], cards["c"]]
         sleep(0.5)
-        @test dom_ids() == ["d", "a", "c"]
-        @test read_tag("a") == "TAG-A"     # survived reorder
-        @test read_tag("d") == "TAG-D"     # survived reorder
+        record("DOM order matches", @TH.test_eq dom_ids() ["d","a","c"])
+        record("'a' tag survived reorder", @TH.test_eq read_tag("a") "TAG-A")
+        record("'d' tag survived reorder", @TH.test_eq read_tag("d") "TAG-D")
+    end
 
-        # ── 6. Mixed diff: insert + remove + reorder in one update ──────────
+    # ── 6. Insert at position + remove + reorder in one diff ────────────
+    TH.section("Mixed diff: insert + remove + reorder") do
         items_obs[] = [make_card("e", "Echo"), cards["a"], cards["d"]]
         sleep(0.5)
-        @test read_tag("a") == "TAG-A"
-        @test read_tag("d") == "TAG-D"
-        @test read_tag("c") === nothing    # c is gone
-        @test read_tag("e") === nothing    # e is new (no tag)
-        @test dom_ids() == ["e", "a", "d"]
-
-        # ── 7. Clear list ───────────────────────────────────────────────────
-        items_obs[] = LabelCard[]
-        @test wait_js("document.querySelectorAll('.kl-card').length === 0"; timeout = 2.0)
-
-        # ── 8. No JS errors across the whole exercise ───────────────────────
-        @test isempty(evjs("window.__errs || []"))
-    finally
-        try close(disp) catch end
+        record("'a' and 'd' still tagged after mixed diff",
+               @TH.test_true (read_tag("a") == "TAG-A" &&
+                               read_tag("d") == "TAG-D"))
+        record("'c' is gone", @TH.test_eq read_tag("c") nothing)
+        record("'e' is new (no tag)", @TH.test_eq read_tag("e") nothing)
+        record("DOM order e,a,d", @TH.test_eq dom_ids() ["e","a","d"])
     end
+
+    # ── 7. Clear list ────────────────────────────────────────────────────
+    TH.section("Clear list") do
+        items_obs[] = LabelCard[]
+        record("no cards in DOM",
+               @TH.test_true TH.wait_for(ctx,
+                   "document.querySelectorAll('.kl-card').length === 0";
+                   timeout = 2.0))
+    end
+
+    # ── 8. No JS errors ─────────────────────────────────────────────────
+    TH.section("No JS errors during the exercise") do
+        errs = TH.js_errors(ctx)
+        record("zero JS errors", @TH.test_eq length(errs) 0)
+        isempty(errs) || @info "JS errors:" errs
+    end
+
+    TH.emit_screenshot(ctx; label = "keyed-list final")
+
+finally
+    TH.report!("Tier 2o — KeyedList", results)
+    try close(disp) catch end
 end

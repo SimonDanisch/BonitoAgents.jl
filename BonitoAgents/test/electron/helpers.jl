@@ -71,13 +71,141 @@ function make_state(; n_projects::Int = 0, n_workers::Int = 0)
     return state
 end
 
-# ── Mock ACP transport — REMOVED ──────────────────────────────────────────────
-# `mock_transport` (built the now-DELETED `BonitoAgents.MockTransport`) and its
-# update-builder helpers (`agent_chunk_update`/`thought_chunk_update`/`tool_call_update`/
-# `tool_update`/`tool_text`/`tool_diff`/`plan_update`) were deleted with the
-# first-class-agent migration: every electron + non-electron test now drives a real
-# `MockAgent` subprocess (behaviour via `BT_MOCK_ACP_SCENARIO`) instead of a scripted
-# in-memory transport. Nothing in the test tree referenced these in code anymore.
+# ── Mock ACP transport ────────────────────────────────────────────────────────
+
+"""
+    mock_transport(; scripted = [], prompt_error = nothing) -> BonitoAgents.MockTransport
+
+Build a `BonitoAgents.MockTransport` for `ChatModel(...; transport=...)`.
+The transport carries an `on_setup(out, in)` closure that spawns the
+loopback responder against its (outgoing, incoming) channel pair —
+auto-responding to `initialize`, `session/new`, `session/prompt`, and
+`session/cancel`.
+
+`scripted` is a vector of `(delay_seconds, update_dict)` tuples. After a
+`session/prompt` request lands, the responder emits each update in order
+through the transport's incoming channel (which the ACP reader_loop
+hands to `update_handler`), then completes the prompt request. Use this
+to simulate streaming agent / thought / tool events without a real
+claude subprocess.
+
+`prompt_error` (if set) makes the responder reply to `session/prompt`
+with a JSON-RPC error instead — exercises send_prompt_async!'s
+banner-vs-inline-bubble error split.
+"""
+function mock_transport(; scripted::Vector = Tuple{Float64,Dict}[],
+                          prompt_error::Union{AbstractString,Nothing} = nothing)
+    on_setup = function(outgoing::Channel{String}, incoming::Channel{String})
+        Base.errormonitor(@async try
+            for line in outgoing
+                msg = JSON.parse(line)
+                method = get(msg, "method", "")
+                id     = get(msg, "id", nothing)
+
+                if method == "initialize" && id !== nothing
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                   "result"=>Dict())))
+                elseif method == "session/new" && id !== nothing
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                   "result"=>Dict("sessionId"=>"mock-sess-1"))))
+                elseif method == "session/prompt" && id !== nothing
+                    @async try
+                        for (delay, upd) in scripted
+                            delay > 0 && sleep(delay)
+                            put!(incoming, JSON.json(Dict(
+                                "jsonrpc" => "2.0",
+                                "method"  => "session/update",
+                                "params"  => Dict("sessionId" => "mock-sess-1",
+                                                   "update"    => upd))))
+                        end
+                        if prompt_error === nothing
+                            put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                           "result"=>Dict("stopReason"=>"end_turn"))))
+                        else
+                            put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                "error"=>Dict("code"=>-32000, "message"=>String(prompt_error)))))
+                        end
+                    catch e
+                        @warn "mock prompt streamer failed" exception=e
+                    end
+                elseif id !== nothing
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                   "result"=>nothing)))
+                end
+                # Notifications (no id) — `session/cancel` etc. — just drop.
+            end
+        catch e
+            e isa InvalidStateException || @warn "mock responder failed" exception=e
+        end)
+        return nothing
+    end
+    return BonitoAgents.MockTransport(on_setup)
+end
+
+# Helper: build the four update payloads we care about. Shape mirrors what
+# claude-agent-acp emits, so `parse_session_update` in AgentClientProtocol
+# accepts them unchanged.
+agent_chunk_update(text) = Dict(
+    "sessionUpdate" => "agent_message_chunk",
+    "content" => Dict("type" => "text", "text" => text))
+
+thought_chunk_update(text) = Dict(
+    "sessionUpdate" => "agent_thought_chunk",
+    "content" => Dict("type" => "text", "text" => text))
+
+# Initial tool announcement (sessionUpdate=tool_call). Despite its
+# `tool_call_update` name (kept for backwards compat with existing tests),
+# this produces the FIRST event for a given toolCallId. Use `tool_update`
+# below for the partial-update follow-ups.
+function tool_call_update(; id="t1", kind="execute", title="ls", status="completed",
+                            content=[], tool_name=nothing, raw_input=nothing)
+    d = Dict{String,Any}(
+        "sessionUpdate" => "tool_call",
+        "toolCallId" => id, "kind" => kind, "title" => title, "status" => status,
+        "content" => content)
+    tool_name === nothing ||
+        (d["_meta"] = Dict("claudeCode" => Dict("toolName" => tool_name)))
+    raw_input === nothing || (d["rawInput"] = raw_input)
+    return d
+end
+
+# Partial update for an already-emitted toolCallId — re-renders the header
+# in place. Pass only the fields you want to change. `tool_name`/`raw_input`
+# mirror real claude-agent-acp behavior: tool input STREAMS, so the
+# arguments usually ride one of these updates, not the initial tool_call.
+function tool_update(; id, kind=nothing, title=nothing, status=nothing,
+                       content=nothing, tool_name=nothing, raw_input=nothing)
+    d = Dict{String,Any}(
+        "sessionUpdate" => "tool_call_update",
+        "toolCallId"    => id)
+    kind    === nothing || (d["kind"]    = kind)
+    title   === nothing || (d["title"]   = title)
+    status  === nothing || (d["status"]  = status)
+    content === nothing || (d["content"] = content)
+    tool_name === nothing ||
+        (d["_meta"] = Dict("claudeCode" => Dict("toolName" => tool_name)))
+    raw_input === nothing || (d["rawInput"] = raw_input)
+    return d
+end
+
+# Wrap a text block in the ACP envelope expected by parse_tool_content_item.
+tool_text(text::AbstractString) = Dict(
+    "type" => "content",
+    "content" => Dict("type" => "text", "text" => text))
+
+# Wrap a diff in the ACP envelope. Used to test the `edit` tool kind which
+# renders DiffEditor stacks instead of plain text.
+tool_diff(; path, old_text, new_text) = Dict(
+    "type"    => "diff",
+    "path"    => path,
+    "oldText" => old_text,
+    "newText" => new_text)
+
+plan_update(entries::Vector) = Dict(
+    "sessionUpdate" => "plan",
+    "entries" => [Dict("content"=>e.content, "status"=>e.status,
+                        "priority"=>get(e, :priority, "medium"))
+                   for e in entries])
 
 # ── Electron window lifecycle ─────────────────────────────────────────────────
 

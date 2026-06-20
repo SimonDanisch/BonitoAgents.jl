@@ -1,26 +1,15 @@
-# Rendering-contract tests for the 2026-06 UX batch.
+# Rendering-contract tests for the 2026-06 UX batch:
 #
-# Migration note: every assertion in this file is on a PURE function — a wire
-# dict builder, a header-flag computation, a label/path/svg helper, or a
-# permission/elicitation REQUEST HANDLER reading the chat's real `comm`
-# Observable. None of them drives an agent turn or needs a transport, so they all
-# stay DIRECT unit tests (per the rule: a genuinely agent-free function is tested
-# directly, no fixture). The only migration is the test fixture: `make_chat_x`
-# now binds a no-op `MockAgent` instead of the deleted `MockTransport` — the
-# `ChatModel(state, cwd; transport=…)` kwarg is gone; `agent=` replaces it.
-#
-# (The card/preview *DOM rendering* under a live agent would be a TestKit e2e,
-# but the mock-agent DSL / harness exposes no permission/elicitation trigger
-# event, and extending the harness is out of this batch's scope. What the
-# original test actually asserted — the comm event SHAPE and the request
-# resolution — is a pure handler contract, kept verbatim below.)
-#
-#   1. TodoListMsg → wire dict (the JS plan bubble + taskbar feed off this).
-#   2. Background BashToolMsg → header dict + bg-streaming summary/finalize wire.
-#   3. bt_julia_eval extras: code preview / timeout badge / ⊗ stop affordance.
-#   4. ✎ editor affordance (editable_path_from) for Read / bt_show text files.
-#   5. Permission/question requests: handle_permission_request /
-#      handle_elicitation_request emit the wire event and resolve with the click.
+#   1. TodoListMsg → wire dict (the JS plan bubble + taskbar feed off this):
+#      html rows, live flag, "n/m done" summary, plan_update shape.
+#   2. Background BashToolMsg → header dict: taskbar slot + background flag,
+#      and the bg-streaming summary/finalize wire events.
+#   3. bt_julia_eval extras: live code preview (`code`), the timeout badge
+#      (`timeout_s`), the ⊗ stop affordance (`stoppable`) — and that
+#      bt_julia_interrupt itself is NOT stoppable.
+#   4. ✎ editor affordance (`editable`) for Read / bt_show text files.
+#   5. Permission/question requests: handle_permission_request emits the
+#      `permission` wire event and resolves with the clicked option.
 #   6. Small helpers: eval_timeout_label, permission_question_text,
 #      compact_sync_label, identicon_svg.
 
@@ -31,12 +20,11 @@ const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
 const obs_on = Bonito.Observables.on
 
-# Real ServerState + a ChatModel with a no-op MockAgent. Nothing here drives a
-# turn; the agent only exists so the model has a real `comm` to broadcast on.
 function make_chat_x()
     state = BT.ServerState(; state_dir = mktempdir(),
                               working_dir = mktempdir(), worker_secret = "x")
-    BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
+    BT.ChatModel(state, mktempdir();
+                  transport = BT.MockTransport((o, i) -> nothing))
 end
 
 mkentries_x(pairs::Vector) =
@@ -205,9 +193,6 @@ end
 end
 
 # ── 5. Permission / question round-trip ─────────────────────────────────────
-# handle_permission_request is a pure request handler: it broadcasts a card on
-# the chat's real `comm` and blocks until the matching PermissionAnswerCommand
-# resolves it. No agent / turn involved, so it's a direct unit test.
 @testset "permission request → card event → answer resolves" begin
     chat = make_chat_x()
     events = Dict{String,Any}[]

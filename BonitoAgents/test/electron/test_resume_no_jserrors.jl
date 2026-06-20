@@ -1,181 +1,259 @@
-# Resume / project-list re-render regression — migrated onto the TestKit harness
-# (real dev_server, real worker subprocess, real ACP wire, real Electron browser;
-# only the agent's behaviour is faked via the `agent=` callback).
+# End-to-end regression for the Key-N-not-found / null-Observable race
+# the user hit when clicking "Resume" on a discovered claude session.
 #
-# This is heavily a "NO JS errors" test. It guards the Key-N-not-found /
-# null-Observable race the user hit when a second project landed: adding a
-# project re-renders the project_list, which closes the OLD project_card
-# subsession (it held `current_view` via an interpolated onclick). Without the
-# Bonito root-session-counts-as-reference fix, the next sidebar click
-# dereferenced a freed Observable → `Cannot read properties of null (reading
-# 'notify')` / `Key N not found` console spam, and nav silently broke.
+# Real stack (no mocks):
+#   - BonitoAgents.serve()                 (production URL)
+#   - BonitoWorker.connect_and_serve()    (real /worker-ws handshake)
+#   - Electron BrowserWindow at the served URL
+#   - Chromium console-message + renderer-side patch capture
 #
-# What it checks (mirrors the legacy intent on the REAL UI):
-#   1. Dashboard's Home sidebar entry renders.
-#   2. After creating a project, its sidebar row appears in the DOM.
-#   3. Creating a SECOND project (the re-render that fired the bug) keeps BOTH
-#      sidebar rows present (the project_list re-render that closed the old
-#      project_card subsession).
-#   4. Clicking each project's sidebar row navigates (chat pane mounts), and
-#      clicking Home returns to the dashboard.
-#   5. ZERO `window.__errs` JS errors and zero Key-not-found / null-Observable
-#      / global-cache-delete warnings across the whole resume flow — asserted
-#      after EVERY navigation, not just at the end.
-#
-# MIGRATION NOTES vs the legacy raw-ElectronCall version:
-#   - `state.projects[][id]=p; notify(...)` poking is replaced by REAL project
-#     creation through `new_chat` (the dashboard "+ New project" flow), which is
-#     exactly the re-render path that closed the subsession in the bug.
-#   - DROPPED the legacy `.bt-card-name` per-project dashboard-card assertion:
-#     that UI no longer exists. The current dashboard renders the WORKER as a
-#     `.bt-card` and lists projects in a separate grouped/discovered section
-#     that does NOT carry a per-project `.bt-card-name` for freshly created
-#     chats (verified against the live DOM). The sidebar row IS the project's
-#     primary nav surface and is exactly where the bug's null-deref click fired,
-#     so the regression is fully covered by the sidebar-row + click-nav
-#     assertions. Dashboard-return is asserted via the stable hero text.
-#   - The legacy test scraped Chromium console-message + a hand-rolled
-#     console.* patch for the bug patterns. TestKit already installs
-#     `window.__errs` (uncaught errors + unhandled rejections). We additionally
-#     install a console.warn/error sink (`window.__bt_warns`) so the
-#     Key-not-found / null-Observable *warnings* (which aren't thrown) are still
-#     caught — those were the exact bug signature.
+# What it actually checks (per the user's complaint that I previously
+# only watched a log and called it green):
+#   1. Dashboard's "Home" entry rendered
+#   2. After adding a project + notify, the project's sidebar entry and
+#      the project's dashboard card are both visible in the DOM
+#   3. Clicking the sidebar entry actually navigates (chat panel mounts
+#      OR a "Starting chat for X…" placeholder shows up)
+#   4. Zero "Key N not found" / "TrackingOnly" / null-Observable warnings
+#      across the run
+#   5. Final-state screenshot saved so we can see what the user sees
 
-using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
-import .TestKit, BonitoAgents
-const TK = TestKit
-using .TestKit: text, end_turn
+using BonitoAgents, Bonito, HTTP, JSON
+import ElectronCall, BonitoWorker
 
-# Console.warn/error sink for the bug-pattern warnings (these are logged, not
-# thrown, so window.__errs alone wouldn't catch them).
-const WARN_SINK_JS = """
-(() => {
-    if (window.__bt_warns) return true;
-    window.__bt_warns = [];
-    for (const lvl of ['warn', 'error', 'log']) {
-        const orig = console[lvl];
-        console[lvl] = function(...args) {
-            try {
-                window.__bt_warns.push(args.map(a =>
-                    (typeof a === 'string' ? a : (() => { try { return JSON.stringify(a); }
-                                                          catch(e){ return String(a); } })())).join(' '));
-            } catch(e) {}
-            return orig.apply(this, args);
-        };
-    }
-    return true;
-})()
-"""
+# ── 1. server + worker ───────────────────────────────────────────────────
+state = BonitoAgents.serve(;
+    host          = "127.0.0.1",
+    port          = 0,
+    worker_secret = "resume-test-secret",
+    state_dir     = mktempdir(),
+    working_dir   = mktempdir())
+url = Bonito.online_url(state.srv, "")
+@info "Server up" url
 
-const BUG_PATTERNS = [
-    r"Key \d+ not found",
-    r"TrackingOnly: Key \d+ not found",
-    r"Trying to delete object \d+, which is not in global session cache",
-    r"Cannot read properties of null \(reading 'notify'\)",
-]
+worker_proj_root = mktempdir()
+worker_task = Base.errormonitor(@async try
+    BonitoWorker.connect_and_serve(;
+        server_url    = url,
+        secret        = "resume-test-secret",
+        worker_id     = "resume-test-worker-id",
+        name          = "ResumeTestWorker",
+        mcp_path      = "",
+        projects_root = worker_proj_root)
+catch e
+    @warn "worker task ended" exception=e
+end)
 
-# Returns (js_errs, bug_offenders) — both must be empty at every checkpoint.
-function jserror_state(s)
-    errs = TK.eval_js(s, "window.__errs || []")
-    warns = TK.eval_js(s, "window.__bt_warns || []")
-    warn_strs = warns isa AbstractVector ? String.(warns) : String[]
-    offenders = String[]
-    for w in warn_strs, pat in BUG_PATTERNS
-        occursin(pat, w) && push!(offenders, w)
+deadline = time() + 15
+while time() < deadline
+    haskey(state.workers[], "resume-test-worker-id") &&
+        state.workers[]["resume-test-worker-id"].status == :online && break
+    sleep(0.2)
+end
+@assert haskey(state.workers[], "resume-test-worker-id") "worker never connected"
+@info "Worker connected"
+
+# ── 2. open Electron + capture both main-process and renderer console
+app = ElectronCall.Application()
+win = ElectronCall.Window(app, ElectronCall.URI(url);
+                      options = Dict{String,Any}("show"=>false, "focusOnWebView"=>false))
+sleep(2.5)
+
+console_log = tempname() * ".jsonl"
+win_id = win.id
+ElectronCall.run(app, """
+    const win = electron.BrowserWindow.fromId($win_id);
+    const fs  = require('fs');
+    const log_path = $(JSON.json(console_log));
+    win.webContents.on('console-message', (...args) => {
+        try {
+            let level, message, line, source;
+            if (args.length === 1 && typeof args[0] === 'object') {
+                ({level, message, lineNumber: line, sourceId: source} = args[0]);
+            } else {
+                [, level, message, line, source] = args;
+            }
+            fs.appendFileSync(log_path,
+                JSON.stringify({src:'main', level, message, source, line}) + '\\n');
+        } catch(e) {}
+    });
+    null
+""")
+
+ElectronCall.run(win, """
+    (() => {
+        window.__bt_console = [];
+        for (const lvl of ['log','warn','error']) {
+            const orig = console[lvl];
+            console[lvl] = function(...args) {
+                try {
+                    window.__bt_console.push({lvl, msg: args.map(a => {
+                        try { return typeof a === 'string' ? a : JSON.stringify(a); }
+                        catch(e) { return String(a); }
+                    }).join(' ')});
+                } catch(e) {}
+                return orig.apply(this, args);
+            };
+        }
+        window.addEventListener('error', e =>
+            window.__bt_console.push({lvl:'error', msg: 'uncaught: ' + (e.message||String(e))}));
+        window.addEventListener('unhandledrejection', e =>
+            window.__bt_console.push({lvl:'error', msg: 'unhandled: ' + String(e.reason)}));
+    })()
+""")
+@info "Console capture armed" console_log
+# Verify the patch took:
+diag = ElectronCall.run(win, """JSON.stringify({
+    has_arr: Array.isArray(window.__bt_console),
+    arr_len: (window.__bt_console || []).length,
+    typeof_warn: typeof console.warn,
+    test_call: (() => { console.warn('TEST_PATCH_PROBE'); return (window.__bt_console || []).length; })(),
+})""")
+@info "Patch verification" diag
+
+wait_for(predicate; timeout=5.0) = begin
+    deadline = time() + timeout
+    while time() < deadline
+        try
+            ElectronCall.run(win, "(() => { return ($predicate); })()") === true && return true
+        catch end
+        sleep(0.1)
     end
-    return errs, offenders
+    false
 end
 
-# The dashboard hero text — stable across UI revisions, present only on the
-# dashboard view (not in a chat pane).
-const DASH_VISIBLE = "(document.querySelector('.bt-view-dash') !== null) && " *
-    "((document.querySelector('.bt-view-dash').innerText||'').indexOf('Multi-host orchestrator') !== -1)"
-
-# Click the Home sidebar row directly (empty data-project-id) and gate on the
-# dashboard actually rendering, rather than a fixed sleep.
-function goto_dashboard(s)
-    TK.eval_js(s, """(() => { const h = document.querySelector('.bt-side-item[data-project-id=""]');
-        if (h) h.click(); return true; })()""")
-    TK.wait_for(s, "dashboard view", DASH_VISIBLE; timeout = 10)
+screenshot(label) = begin
+    path = tempname() * ".png"
+    flag = path * ".done"
+    ElectronCall.run(app, """
+        const win = electron.BrowserWindow.fromId($win_id);
+        win.webContents.capturePage().then(img => {
+            require('fs').writeFileSync($(JSON.json(path)), img.toPNG());
+            require('fs').writeFileSync($(JSON.json(flag)), '1');
+        });
+        null
+    """)
+    t0 = time()
+    while !isfile(flag) && time() - t0 < 5; sleep(0.1); end
+    println("--- screenshot[$label] → $path ---")
+    return path
 end
 
-@testset "resume flow — project re-render, nav works, zero JS errors" begin
-    s = TK.dev_server(; agent = _msg -> [text("ok"), end_turn()])
-    try
-        TK.open_browser(s; width = 1280, height = 820)
-        TK.eval_js(s, WARN_SINK_JS)
+results = Pair{String,Bool}[]
+record(name, ok) = (push!(results, name => ok); println("  $(ok ? "PASS" : "FAIL")  $name"))
 
-        # ── 1. Home sidebar entry renders ─────────────────────────────────────
-        @test TK.wait_for(s, "Home sidebar entry",
-            "document.querySelector('.bt-side-item[data-project-id=\\\"\\\"]') !== null"; timeout = 15) == true
+try
+    # 3. dashboard rendered
+    record("Home sidebar entry visible",
+           wait_for("document.querySelector('.bt-side-item[data-project-id=\"\"]') !== null"; timeout=10))
+    record("Worker card visible (ResumeTestWorker)",
+           wait_for("document.body.innerText.indexOf('ResumeTestWorker') !== -1"; timeout=5))
+    sleep(0.5)
+    screenshot("01_empty_dashboard")
 
-        # ── 2. Create the first project (Alpha) — sidebar row + card appear ───
-        pid_a = TK.new_chat(s; cwd = mktempdir(), title = "Alpha")
-        @test TK.wait_for(s, "Alpha sidebar row",
-            "document.querySelector('.bt-side-item[data-project-id=\\\"$pid_a\\\"]') !== null"; timeout = 8) == true
+    # 4. add alpha (real Resume sequence: state.projects[][id]=p; notify)
+    p_alpha = BonitoAgents.ProjectInfo("alpha", "Alpha", "resume-test-worker-id",
+                joinpath(state.working_dir, "Alpha"),
+                joinpath(worker_proj_root, "Alpha"),
+                BonitoAgents.now(BonitoAgents.UTC))
+    mkpath(p_alpha.server_path); mkpath(p_alpha.worker_path)
+    state.projects[]["alpha"] = p_alpha
+    notify(state.projects)
 
-        # ── 3. Create a SECOND project (Beta) — the re-render that fired the bug
-        pid_b = TK.new_chat(s; cwd = mktempdir(), title = "Beta")
-        @test TK.wait_for(s, "Beta sidebar row",
-            "document.querySelector('.bt-side-item[data-project-id=\\\"$pid_b\\\"]') !== null"; timeout = 8) == true
-        # Alpha's row must still be present after the project_list re-render
-        # (the re-render that closed the old project_card subsession in the bug).
-        @test TK.eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\\\"$pid_a\\\"]') !== null") == true
+    record("Alpha sidebar entry appears after notify",
+           wait_for("document.querySelector('.bt-side-item[data-project-id=\"alpha\"]') !== null"; timeout=5))
+    record("Alpha project card appears in dashboard",
+           wait_for("Array.from(document.querySelectorAll('.bt-card-name')).some(e => e.innerText==='Alpha')"; timeout=5))
+    sleep(0.5)
 
-        # Returning to the dashboard must render cleanly after the re-render.
-        @test goto_dashboard(s) == true
-        # Both project rows are still present in the sidebar from the dashboard.
-        @test TK.eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\\\"$pid_a\\\"]') !== null") == true
-        @test TK.eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\\\"$pid_b\\\"]') !== null") == true
+    # 5. add beta — this is where project_list re-renders, the OLD
+    #    project_card subsession (holding current_view via interpolated
+    #    onclick) closes, and the bug fires WITHOUT the Bonito root-
+    #    session-counts-as-reference patch.
+    p_beta = BonitoAgents.ProjectInfo("beta", "Beta", "resume-test-worker-id",
+                joinpath(state.working_dir, "Beta"),
+                joinpath(worker_proj_root, "Beta"),
+                BonitoAgents.now(BonitoAgents.UTC))
+    mkpath(p_beta.server_path); mkpath(p_beta.worker_path)
+    state.projects[]["beta"] = p_beta
+    notify(state.projects)
 
-        # Checkpoint: no JS errors / bug-pattern warnings so far.
-        errs0, off0 = jserror_state(s)
-        @test isempty(errs0)
-        @test isempty(off0)
+    record("Beta sidebar entry appears after second notify",
+           wait_for("document.querySelector('.bt-side-item[data-project-id=\"beta\"]') !== null"; timeout=5))
+    sleep(0.5)
+    screenshot("02_two_projects")
 
-        # ── 4. Click-nav exercises current_view swaps (where the bug crashed) ─
-        # Alpha → chat pane mounts.
-        TK.click(s, ".bt-side-item[data-project-id=\"$pid_a\"]")
-        @test TK.wait_for(s, "Alpha chat pane",
-            "!!document.querySelector('.bt-chatpane') || !!document.querySelector('.bt-text-input')"; timeout = 15) == true
-        errs_a, off_a = jserror_state(s)
-        @test isempty(errs_a)
-        @test isempty(off_a)
+    # 6. click sidebar entries to drive current_view changes (this is
+    #    where the user's click handler dereferences null in the buggy
+    #    case — it executes $(current_view).notify(...) and current_view
+    #    has been freed from GLOBAL_OBJECT_CACHE).
+    ElectronCall.run(win, """document.querySelector('.bt-side-item[data-project-id="alpha"]').click()""")
+    sleep(0.6)
+    record("Click alpha → main panel shows Alpha",
+           wait_for("document.body.innerText.indexOf('Starting chat for Alpha') !== -1 || document.querySelector('.bt-app') !== null"; timeout=5))
+    screenshot("03_alpha_clicked")
+    println("    [console after alpha click] ",
+        ElectronCall.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
 
-        # Beta → chat pane mounts (this is the click that dereferenced null in
-        # the buggy build after the second project's card subsession freed
-        # current_view).
-        TK.click(s, ".bt-side-item[data-project-id=\"$pid_b\"]")
-        @test TK.wait_for(s, "Beta chat pane",
-            "!!document.querySelector('.bt-chatpane') || !!document.querySelector('.bt-text-input')"; timeout = 15) == true
-        errs_b, off_b = jserror_state(s)
-        @test isempty(errs_b)
-        @test isempty(off_b)
+    ElectronCall.run(win, """document.querySelector('.bt-side-item[data-project-id="beta"]').click()""")
+    sleep(0.6)
+    record("Click beta → main panel updates",
+           wait_for("document.body.innerText.indexOf('Starting chat for Beta') !== -1 || document.querySelector('.bt-app') !== null"; timeout=5))
+    screenshot("04_beta_clicked")
+    println("    [console after beta click] ",
+        ElectronCall.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
+    println("    [main panel HTML snippet] ",
+        ElectronCall.run(win, "document.querySelector('.bt-main')?.innerText?.slice(0,200) ?? '(no main)'"))
 
-        # Home → dashboard returns.
-        @test goto_dashboard(s) == true
-        errs_h, off_h = jserror_state(s)
-        @test isempty(errs_h)
-        @test isempty(off_h)
+    ElectronCall.run(win, """document.querySelector('.bt-side-item[data-project-id=""]').click()""")
+    sleep(0.6)
+    record("Click home → dashboard returns",
+           wait_for("document.body.innerText.indexOf('ResumeTestWorker') !== -1"; timeout=5))
+    screenshot("05_home_clicked")
 
-        # Back to Alpha once more — full cycle, still clean.
-        TK.click(s, ".bt-side-item[data-project-id=\"$pid_a\"]")
-        @test TK.wait_for(s, "Alpha chat pane again",
-            "!!document.querySelector('.bt-chatpane') || !!document.querySelector('.bt-text-input')"; timeout = 15) == true
+    sleep(1.0)
 
-        TK.screenshot(s, joinpath(tempdir(), "bt-resume-no-jserrors-final.png"))
-
-        # ── 5. Final assertion: zero JS errors / bug-pattern warnings ─────────
-        errs, offenders = jserror_state(s)
-        @test isempty(errs)
-        if !isempty(offenders)
-            for o in first(offenders, min(10, length(offenders)))
-                @info "BUG-PATTERN OFFENDER" o
+    # 7. drain console
+    main_lines = isfile(console_log) ? readlines(console_log) : String[]
+    main_msgs = String[]
+    for line in main_lines
+        try; push!(main_msgs, get(JSON.parse(line), "message", "")); catch end
+    end
+    rendered = ElectronCall.run(win, "JSON.stringify(window.__bt_console || [])")
+    rend_msgs = String[]
+    if rendered isa AbstractString
+        try
+            for entry in JSON.parse(rendered)
+                push!(rend_msgs, get(entry, "msg", ""))
             end
-        end
-        @test isempty(offenders)
-    finally
-        close(s)
+        catch end
     end
+    @info "console totals" main=length(main_msgs) renderer=length(rend_msgs)
+
+    all_msgs = vcat(main_msgs, rend_msgs)
+    bug_patterns = [
+        r"Key \d+ not found",
+        r"TrackingOnly: Key \d+ not found",
+        r"Trying to delete object \d+, which is not in global session cache",
+        r"Cannot read properties of null \(reading 'notify'\)",
+    ]
+    offenders = String[]
+    for m in all_msgs, pat in bug_patterns
+        occursin(pat, m) && push!(offenders, m)
+    end
+    record("zero Key-not-found / null-Observable messages", isempty(offenders))
+    if !isempty(offenders)
+        for o in first(offenders, min(10, length(offenders)))
+            println("    OFFENDER: ", o)
+        end
+    end
+
+finally
+    println("\n", "="^60)
+    pass = count(p -> p.second, results)
+    fail = length(results) - pass
+    println("Resume-flow regression: $pass passed, $fail failed")
+    try close(win) catch end
+    try close(app) catch end
+    try close(state.srv) catch end
 end

@@ -2,7 +2,7 @@
 TestKit: realistic end-to-end test harness for BonitoAgents.
 
 The whole production stack runs unchanged (real `dev_server`, real worker,
-real `SubprocessTransport` with subprocess spawn, real ACP JSON-RPC over
+real `LocalTransport` with subprocess spawn, real ACP JSON-RPC over
 stdio, real websockets). The ONLY thing swapped is the
 `claude-agent-acp` binary — replaced with the Julia
 `mocks/mock_claude_agent_acp.jl` script driven by a TCP dispatcher in this

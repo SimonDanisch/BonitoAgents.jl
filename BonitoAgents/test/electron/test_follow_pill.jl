@@ -1,159 +1,207 @@
-# Follow mode + "↓ New messages" pill, migrated onto the TestKit harness (real
-# dev_server, real worker subprocess, real ACP wire, real Electron browser; only
-# the agent's behaviour is faked, via the `agent=` callback).
+# Tier 2n — follow mode + "↓ New messages" pill.
 #
-# The scroll-UX contract (unchanged from the legacy test):
+# Verifies the new scroll-UX contract:
 #   - followMode starts true; chunks auto-scroll the viewport
-#   - streaming while at the bottom shows NO pill
-#   - user scrolls up → followMode flips false (pill stays hidden until there's
-#     actually something new)
+#   - user scrolls up → followMode flips false, pill mounts hidden
 #   - new content while disengaged → pill becomes visible, unreadCount++
-#   - clicking the pill → followMode back to true, pill hides, scrollTop snaps to
-#     the bottom
+#   - clicking the pill → followMode back to true, pill hides,
+#     scrollTop snaps to bottom (no smooth-scroll over 1000 messages)
 #   - user scrolling back to the very bottom (within AT_BOTTOM_PX) also
 #     re-engages followMode automatically (Slack/Discord style)
-#
-# Instead of poking the model with synthetic `chat_emit` bursts, we drive the
-# REAL agent stream: one long turn that streams a viewport-filling first wave,
-# holds the turn open with a quiet `delay` (the window in which the test scrolls
-# up and asserts "no pill yet"), then streams a second wave (the new content
-# that must surface the pill). `__bt_chat` is the chat instance's devtools hook;
-# we read followMode / unreadCount off it exactly as the legacy test did.
+#   - sending a user message always re-engages, even from scrollback
+isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
-using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
-import .TestKit, BonitoAgents
-const TK = TestKit
-using .TestKit: text, delay, end_turn
+using JSON
 
-# A long line per chunk so the message pane overflows and becomes scrollable in
-# a small window. `W1_N` chunks fill the viewport; the quiet `delay` is the
-# scroll-up window; `W2_N` chunks are the "new while disengaged" content.
-const LONG = "More content arriving while the chat streams a long agent reply that fills the viewport. "
-const W1_N = 30
-const QUIET_MS = 7000
-const W2_N = 15
+state = TH.make_state(; n_workers = 1, n_projects = 1)
+proj  = state.projects[]["p-1"]
+let
+    model = BonitoAgents.ChatModel(state, proj.server_path;
+                                  project_id = proj.id,
+                                  transport  = TH.mock_transport())
+    BonitoAgents.start_chat_client!(model)
+    TH.seed_chat_history!(model, 20)
+end
 
-@testset "follow mode + new-message pill — driven by the real agent stream" begin
-    s = TK.dev_server(; agent = msg -> begin
-        evs = Any[]
-        for i in 1:W1_N
-            push!(evs, text("[w1-$i] " * LONG)); push!(evs, delay(120))
-        end
-        # Hold the turn open, quietly, so the test can scroll up and assert the
-        # pill stays hidden BEFORE any new content arrives.
-        push!(evs, delay(QUIET_MS))
-        for i in 1:W2_N
-            push!(evs, text("[w2-$i] " * LONG)); push!(evs, delay(150))
-        end
-        push!(evs, end_turn())
-        evs
-    end)
-    try
-        # Small window so the stream overflows and the pane scrolls.
-        TK.open_browser(s; width = 900, height = 600)
-        pid = TK.new_chat(s)
-        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
-        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
-        sleep(0.5)
+ctx = TH.open_window(state)
+chat = state.chat_models["p-1"]
+results = Pair{String,Bool}[]
+record(name, ok) = push!(results, name => ok)
 
-        follow_mode() = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.followMode")
-        unread()      = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.unreadCount")
-        pill_visible() = TK.eval_js(s, """
-            (() => { const el = document.querySelector('.bt-new-msg-pill');
-                     return el ? el.classList.contains('bt-new-msg-pill-visible') : false; })()
-        """)
-        scroll_gap() = Int(TK.eval_js(s, """
-            (() => { const c = document.querySelector('.bt-messages');
-                     return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight); })()
-        """))
-        w2_count() = Int(TK.eval_js(s, """
-            (() => Array.from(document.querySelectorAll('.bt-agent-msg'))
-                     .reduce((n,b)=> n + (((b.innerText||'').match(/\\[w2-/g)||[]).length), 0))()
-        """))
+try
+    p1_idx = TH.eval_js(ctx, """(() => {
+        const items = document.querySelectorAll('.bt-side-item .bt-side-name');
+        for (let i = 0; i < items.length; i++) if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
+        return -1; })()""")
+    TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
+    @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "chat didn't mount"
+    sleep(1.0)
 
-        # ── 1. Initial state ──────────────────────────────────────────────
-        @test follow_mode() == true
-        @test unread() == 0
-        @test pill_visible() == false
+    follow_mode() = TH.eval_js(ctx,
+        "document.querySelector('.bt-messages').__bt_chat.followMode")
+    unread()      = TH.eval_js(ctx,
+        "document.querySelector('.bt-messages').__bt_chat.unreadCount")
+    pill_visible() = TH.eval_js(ctx, """
+        (() => {
+            const el = document.querySelector('.bt-new-msg-pill');
+            return el ? el.classList.contains('bt-new-msg-pill-visible') : false;
+        })()
+    """)
 
-        # ── 2. Streaming while at the bottom doesn't show the pill ─────────
-        TK.send_message(s, "stream a long reply")
-        # Wait until the pane is actually scrollable (content overflows).
-        TK.wait_for(s, "pane became scrollable", """
-            (() => { const c = document.querySelector('.bt-messages');
-                     return (c.scrollHeight - c.clientHeight) > 200; })()
-        """; timeout = 25)
-        sleep(1.0)
-        # Still following, still at the bottom → no pill, nothing unread.
-        @test follow_mode() == true
-        @test pill_visible() == false
-        @test unread() == 0
-
-        # ── 3. User scroll-to-top disengages follow mode (pill still hidden)
-        # We do this during the quiet window (after wave 1, before wave 2), so
-        # there is genuinely nothing new yet — the pill must stay hidden.
-        TK.wait_for(s, "wave 1 fully streamed",
-            "document.querySelector('.bt-messages').innerText.indexOf('[w1-$W1_N]') !== -1"; timeout = 25)
-        TK.eval_js(s, """(() => {
+    function scroll_up_as_user!()
+        TH.eval_js(ctx, """(() => {
             const c = document.querySelector('.bt-messages');
-            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: -100}));
+            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
             c.scrollTop = 0;
             c.dispatchEvent(new Event('scroll', {bubbles: true}));
-            return true; })()""")
-        sleep(0.4)
-        @test follow_mode() == false
-        @test pill_visible() == false   # nothing new yet during the quiet window
+            return true;
+        })()""")
+        sleep(0.3)
+    end
 
-        # ── 4. New content while disengaged surfaces the pill ─────────────
-        # Wave 2 starts after the quiet delay; the chunks land while we're
-        # scrolled away, so the pill must appear and unreadCount must climb.
-        TK.wait_for(s, "pill becomes visible on new content",
-            "document.querySelector('.bt-new-msg-pill.bt-new-msg-pill-visible') !== null"; timeout = 20)
-        @test follow_mode() == false      # new chunks didn't yank us back
-        @test Int(unread()) > 0
+    function emit_agent_burst(stream_id, n)
+        if !any(m -> m isa BonitoAgents.AgentMsg && m.id == stream_id, chat.msgs_store)
+            push!(chat.msgs_store, BonitoAgents.AgentMsg(stream_id, ""))
+            BonitoAgents.chat_emit(chat, Dict{String,Any}(
+                "type" => "agent", "id" => stream_id, "streaming" => true,
+                "text" => "", "n" => length(chat.msgs_store)))
+            sleep(0.15)
+        end
+        for _ in 1:n
+            BonitoAgents.chat_emit(chat, Dict{String,Any}(
+                "type" => "chunk", "id" => stream_id,
+                "text" => "More content arriving while user is scrolled away. "))
+        end
+    end
 
-        # ── 5. Clicking the pill jumps to bottom, hides pill, re-engages ──
-        TK.eval_js(s, "document.querySelector('.bt-new-msg-pill.bt-new-msg-pill-visible').click()")
-        @test TK.wait_for(s, "followMode true after pill click",
-            "document.querySelector('.bt-messages').__bt_chat.followMode === true"; timeout = 4)
-        @test TK.wait_for(s, "pill hidden after click", """
-            (() => { const el = document.querySelector('.bt-new-msg-pill');
-                     return !el || !el.classList.contains('bt-new-msg-pill-visible'); })()
-        """; timeout = 4)
-        @test unread() == 0
-        # Scroll settled at the bottom (rAF can be throttled offscreen → poll).
-        @test TK.wait_for(s, "scroll gap < 60 after pill click",
-            "(() => { const c = document.querySelector('.bt-messages'); return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 60; })()";
-            timeout = 4)
+    # ── 1. Initial state ──────────────────────────────────────────────────
+    TH.section("Initial: followMode=true, no pill") do
+        record("followMode is true",     @TH.test_eq follow_mode() true)
+        record("unreadCount is 0",       @TH.test_eq unread() 0)
+        record("pill not visible",       @TH.test_eq pill_visible() false)
+    end
 
-        # ── 6. Scrolling manually back to the bottom auto-re-engages ──────
-        # First disengage again.
-        TK.eval_js(s, """(() => {
+    # ── 2. Streaming while at bottom — no pill ───────────────────────────
+    TH.section("Streaming while at bottom doesn't show pill") do
+        emit_agent_burst("burst-1", 8)
+        sleep(0.8)
+        record("followMode still true",  @TH.test_eq follow_mode() true)
+        record("unreadCount still 0",    @TH.test_eq unread() 0)
+        record("pill still hidden",      @TH.test_eq pill_visible() false)
+    end
+
+    # ── 3. User scrolls up → followMode off, pill mounts hidden ──────────
+    TH.section("User scroll-to-top disengages follow mode") do
+        scroll_up_as_user!()
+        record("followMode is false",    @TH.test_eq follow_mode() false)
+        # Pill still hidden — nothing new yet to be unread.
+        record("pill still hidden (no unread yet)",
+               @TH.test_eq pill_visible() false)
+    end
+
+    # ── 4. New chunks while disengaged → pill becomes visible ────────────
+    TH.section("New content while disengaged surfaces the pill") do
+        emit_agent_burst("burst-2", 6)
+        sleep(0.8)
+        record("followMode still false (chunks didn't yank us back)",
+               @TH.test_eq follow_mode() false)
+        record("pill is visible",
+               @TH.test_true TH.wait_for(ctx,
+                   "document.querySelector('.bt-new-msg-pill.bt-new-msg-pill-visible') !== null";
+                   timeout = 2.0))
+        record("unreadCount > 0",        @TH.test_true (Int(unread()) > 0))
+    end
+
+    # ── 5. Click pill → followMode on, scroll to bottom, pill hides ──────
+    TH.section("Clicking the pill jumps back, hides pill, re-engages follow") do
+        TH.eval_js(ctx,
+            "document.querySelector('.bt-new-msg-pill.bt-new-msg-pill-visible').click()")
+        # Allow rAF + scroll handler to settle.
+        record("followMode is true after pill click",
+               @TH.test_true TH.wait_for(ctx,
+                   "document.querySelector('.bt-messages').__bt_chat.followMode === true";
+                   timeout = 2.0))
+        record("pill hidden after click",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const el = document.querySelector('.bt-new-msg-pill');
+                       return !el || !el.classList.contains('bt-new-msg-pill-visible');
+                   })()
+                   """; timeout = 2.0))
+        record("unreadCount cleared",    @TH.test_eq unread() 0)
+        # Scroll position should settle to the bottom — rAF can be
+        # throttled under offscreen Electron load, so poll up to 2s.
+        record("scroll gap < 50 after pill click (poll)",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const c = document.querySelector('.bt-messages');
+                       return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 50;
+                   })()
+                   """; timeout = 2.0))
+    end
+
+    # ── 6. Scrolling back to the very bottom auto-re-engages ─────────────
+    TH.section("Scrolling manually to the bottom auto-re-engages follow") do
+        # First disengage.
+        scroll_up_as_user!()
+        @assert follow_mode() == false
+        # Now simulate the user scrolling back down (via wheel + scrollTop
+        # set to scrollHeight - clientHeight, which IS the bottom).
+        TH.eval_js(ctx, """(() => {
             const c = document.querySelector('.bt-messages');
-            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: -100}));
-            c.scrollTop = 0;
-            c.dispatchEvent(new Event('scroll', {bubbles: true}));
-            return true; })()""")
-        sleep(0.4)
-        @test follow_mode() == false
-        # Now scroll back down to the very bottom (within AT_BOTTOM_PX).
-        TK.eval_js(s, """(() => {
-            const c = document.querySelector('.bt-messages');
-            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: 100}));
+            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
             c.scrollTop = c.scrollHeight - c.clientHeight;
             c.dispatchEvent(new Event('scroll', {bubbles: true}));
-            return true; })()""")
-        @test TK.wait_for(s, "followMode re-engaged by scrolling to bottom",
-            "document.querySelector('.bt-messages').__bt_chat.followMode === true"; timeout = 4)
-        @test pill_visible() == false
-
-        TK.screenshot(s, joinpath(tempdir(), "bt-follow-pill-final.png"))
-
-        # ── 7. No JS errors during the whole exercise ─────────────────────
-        errs = TK.eval_js(s, "window.__errs || []")
-        @test isempty(errs)
-    finally
-        close(s)
+            return true;
+        })()""")
+        sleep(0.4)
+        record("followMode re-engaged by scrolling to bottom",
+               @TH.test_eq follow_mode() true)
+        record("pill hidden after auto-re-engage",
+               @TH.test_eq pill_visible() false)
     end
+
+    # ── 7. Sending a user message from scrollback does NOT auto-re-engage
+    # Strict spec: "always stay at the position the user scrolls to". The
+    # user's own bubble appears, the pill stays up (counts as unread),
+    # and they have to click the pill (or scroll to the bottom) to come
+    # back. The agent reply that arrives later is also held off-screen.
+    TH.section("Sending a user message from scrollback stays in scrollback") do
+        scroll_up_as_user!()
+        @assert follow_mode() == false
+        emit_agent_burst("burst-3", 4)
+        sleep(0.4)
+        @assert pill_visible() == true
+        scroll_top_before = TH.eval_js(ctx,
+            "document.querySelector('.bt-messages').scrollTop")
+        TH.type_into(ctx, ".bt-text-input", "stay where I am")
+        sleep(0.1)
+        TH.dom_click(ctx, ".bt-send-btn")
+        sleep(0.8)
+        record("followMode still false after user send",
+               @TH.test_eq follow_mode() false)
+        record("pill still visible (unread count includes the send)",
+               @TH.test_eq pill_visible() true)
+        # ScrollTop shouldn't have changed materially — give a generous
+        # tolerance for any scroll-anchoring adjustment that could shift
+        # us when new bottom nodes get added.
+        scroll_top_after = TH.eval_js(ctx,
+            "document.querySelector('.bt-messages').scrollTop")
+        record("scrollTop didn't jump to the bottom",
+               @TH.test_true (abs(Int(scroll_top_after) -
+                                  Int(scroll_top_before)) < 200))
+    end
+
+    # ── 8. No JS errors ──────────────────────────────────────────────────
+    TH.section("No JS errors during the pill exercise") do
+        errs = TH.js_errors(ctx)
+        record("zero JS errors", @TH.test_eq length(errs) 0)
+        isempty(errs) || @info "JS errors:" errs
+    end
+
+    TH.emit_screenshot(ctx; label = "follow-pill final")
+
+finally
+    TH.report!("Tier 2n — follow mode + new-message pill", results)
+    TH.shutdown(ctx)
 end

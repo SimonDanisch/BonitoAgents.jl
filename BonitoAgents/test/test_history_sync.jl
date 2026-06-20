@@ -12,54 +12,47 @@
 # `session/load` (it has no prompt in flight). The refactored dispatcher only
 # fed updates to an active prompt turn and dropped these — `request_updates`
 # generalizes that so `session/load` captures them too.
-#
-# TestKit migration. The deleted `MockTransport` scaffolding is gone — this whole
-# file is the session/load REPLAY path, which is pure/state-logic, so it stays
-# DIRECT unit tests with NO transport / NO agent turn / NO DOM:
-#
-#   * replay coalescing is driven straight through `ACP.collect_replayed_updates`
-#     — the very seam `replay_history` was split into so it can be fed synthetic
-#     channels (a `Channel{SessionUpdate}` of parsed wire updates + a `response`
-#     channel carrying the session/load result). That is exactly the data
-#     `request_updates` would have delivered off a real wire, minus the
-#     subprocess; no Connection / transport needed.
-#   * `reconcile_replay!` / `adopt_replayed!` round-trip through a real
-#     `ChatModel(state, cwd)` whose `agent` is a no-op `MockAgent([])` (a state
-#     holder that never spawns a subprocess — nothing here drives a turn). The
-#     chat.md / tools persistence is asserted via `load_history` round-trips.
 
 using Test
+using JSON
 using BonitoAgents
 const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
 
 newstate() = BT.ServerState(; state_dir = mktempdir(),
                               working_dir = mktempdir(), worker_secret = "x")
-# A real ChatModel bound to a no-op MockAgent. Nothing in this file drives a
-# turn, so the agent is a pure state holder — it never spawns the mock binary.
-mkchat()   = BT.ChatModel(newstate(), mktempdir(); agent = BT.MockAgent([]))
+mkchat()   = BT.ChatModel(newstate(), mktempdir();
+                          transport = BT.MockTransport((o, i) -> nothing))
 
 am(t)  = ACP.AgentMessage(t)
 um(t)  = ACP.UserMessage(t)
 tcall(id; status="completed") = ACP.GenericTool(id, "read", "cat", status,
     ACP.ToolContent[ACP.TextContent("contents of $id")], Channel{ACP.ToolCall}(1))
 
-# Drive the session/load replay coalescer the way `replay_history` does, minus
-# the wire: parse each raw `update` dict into a `SessionUpdate` (exactly what
-# `request_updates` hands off the dispatcher), feed them through a bounded
-# channel + a `response` channel carrying the session/load result, and let
-# `collect_replayed_updates` assemble the ordered, coalesced history. This is
-# the test seam `collect_replayed_updates` was split out for.
-function replay_frames(frames; load_result = Dict{String,Any}())
-    updates = Channel{ACP.SessionUpdate}(64)
-    for upd in frames
-        put!(updates, ACP.parse_session_update(upd))
+# A MockTransport on_setup that answers `session/load` by streaming `frames`
+# (raw `update` dicts) as session/update notifications, then the load response.
+function load_responder(frames)
+    return function (outgoing::Channel{String}, incoming::Channel{String})
+        Base.errormonitor(@async try
+            for line in outgoing
+                msg = JSON.parse(line)
+                id  = get(msg, "id", nothing)
+                if get(msg, "method", "") == "session/load" && id !== nothing
+                    for upd in frames
+                        put!(incoming, JSON.json(Dict("jsonrpc" => "2.0",
+                            "method" => "session/update",
+                            "params" => Dict("sessionId" => "s", "update" => upd))))
+                    end
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>Dict())))
+                elseif id !== nothing
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>nothing)))
+                end
+            end
+        catch e
+            e isa InvalidStateException || @warn "load responder failed" exception=e
+        end)
+        return nothing
     end
-    close(updates)
-    response = Channel{Any}(1)
-    put!(response, load_result)
-    close(response)
-    return ACP.collect_replayed_updates(updates, response)
 end
 
 @testset "history sync" begin
@@ -73,7 +66,11 @@ end
                  "title"=>"cat", "status"=>"completed", "content"=>[]),
             Dict("sessionUpdate"=>"agent_thought_chunk", "content"=>Dict("type"=>"text","text"=>"")),
         ]
-        replay, load_result = replay_frames(frames)
+        t = BT.MockTransport(load_responder(frames))
+        t.on_setup(t.outgoing, t.incoming)
+        conn = ACP.Connection(t, ACP.FSRequestHandler("/tmp"))
+        replay, load_result = ACP.replay_history(conn, Dict("sessionId"=>"s","cwd"=>"/tmp","mcpServers"=>[]))
+        close(conn)
         @test load_result isa AbstractDict   # raw session/load response surfaced
 
         @test length(replay) == 4
@@ -90,7 +87,6 @@ end
         reloaded = BT.load_history(m.chat_session)          # round-trips through chat.md
         @test length(reloaded) == 3
         @test isfile(joinpath(m.chat_dir, "tools", "t1.json"))   # tool content persisted
-        close(m)
     end
 
     @testset "reconcile: identical replay is a no-op (idempotent)" begin
@@ -100,7 +96,6 @@ end
         n1 = length(m.msgs_store)
         BT.reconcile_replay!(m, mkreplay())                  # resume again, same history
         @test length(m.msgs_store) == n1 == 3
-        close(m)
     end
 
     @testset "reconcile: CLI-direct gap appends only the tail" begin
@@ -108,7 +103,6 @@ end
         BT.adopt_replayed!(m, um("q1")); BT.adopt_replayed!(m, am("a1"))
         BT.reconcile_replay!(m, ACP.Message[um("q1"), am("a1"), um("q2"), am("a2")])
         @test [x.text for x in m.msgs_store] == ["q1","a1","q2","a2"]
-        close(m)
     end
 
     @testset "reconcile: tools de-dup by id; empty thoughts skipped" begin
@@ -120,7 +114,6 @@ end
         @test length(m.msgs_store) == 4                      # only "after-tool" adopted
         @test m.msgs_store[end] isa BT.AgentMsg && m.msgs_store[end].text == "after-tool"
         @test !any(x -> x isa BT.ThoughtMsg, m.msgs_store)   # empty thought left no trace
-        close(m)
     end
 
 end

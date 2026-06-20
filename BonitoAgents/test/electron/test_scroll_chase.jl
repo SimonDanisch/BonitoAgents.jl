@@ -1,196 +1,258 @@
-# Scroll-to-bottom regression tests, migrated onto the TestKit harness (real
-# dev_server, real worker subprocess, real ACP wire, real Electron browser; only
-# the agent's behaviour is faked, via the `agent=` callback).
+# Scroll-to-bottom regression tests.
 #
-# User reports the original bugs guarded against: "sometimes I can't see the last
-# message nor the message field; on desktop sometimes it doesn't scroll to the
-# newest message; one time I thought the chat was hanging when the last message
-# just didn't scroll into view." Four distinct virtual-scroll auto-follow bugs:
+# User reports: "sometimes I can't see the last message nor the message
+# field; on desktop sometimes it doesn't scroll to the newest message;
+# one time I thought the chat was hanging when the last message just
+# didn't scroll into view." Symptoms point at four distinct bugs in
+# the virtual-scroll auto-follow logic (since fixed in the same commit
+# this test ships with):
 #
 #   1. bt-busy height transition (0↔28px / 150ms) shrinks the chat's
-#      clientHeight but doesn't re-scroll, so the last bubble slides below the
-#      fold during agent turns.
-#   2. scrollToBottom() read pre-layout scrollHeight after a textContent write,
-#      ending short of the actual bottom during streaming.
-#   3. atBottom() threshold was 60px — one 80-100px bubble flipped
-#      wasAtBottom=false, disengaging chase.
-#   4. the scroll listener treated programmatic scrolls (our own
-#      scrollToBottom) as user intent, racing the user-scroll handler.
+#      clientHeight but doesn't re-scroll, so the last bubble slides
+#      below the fold during agent turns.
+#   2. scrollToBottom() used scrollTop = scrollHeight synchronously
+#      after a textContent write — reads pre-layout scrollHeight, so
+#      we end up short of the actual bottom during streaming.
+#   3. atBottom() threshold was 60px — a single 80-100px message bubble
+#      flips wasAtBottom=false, disengaging chase.
+#   4. The scroll event listener treated all scroll events as user
+#      intent, including the ones our own scrollToBottom triggers, so
+#      programmatic scrolls would race with the user-scroll handler.
 #
-# The fix: ResizeObserver-driven re-scroll, rAF-batched scroll-to-bottom,
-# generous threshold, user-vs-programmatic scroll discrimination.
-#
-# MIGRATION NOTES vs the legacy MockTransport version:
-#   - Instead of poking `chat_emit` with synthetic chunk dicts, we drive the
-#     REAL agent stream: one long held-open turn that floods the viewport with
-#     `text(...)` chunks. The chunks travel the full ACP path and render real
-#     DOM, so the ResizeObserver-driven chase is exercised end to end.
-#   - `__bt_chat` is the chat instance devtools hook; we read followMode and
-#     call dispatch / setFollowMode / _queueScrollToBottom off it exactly as the
-#     legacy test did (all still present in assets/bonitoagents.js).
-#   - Chunk counts are scaled to keep a held-open turn responsive (a long line
-#     per chunk overflows a 900x600 window). The scroll invariants (at-bottom,
-#     last-bubble-visible, disengage-on-scroll-up, resize keeps tail) are NOT
-#     weakened — only synchronised on real DOM state, never wall-clock sleeps.
+# These tests cover the fix: ResizeObserver-driven re-scroll, rAF-batched
+# scroll-to-bottom, generous threshold, and user-vs-programmatic scroll
+# discrimination via wheel/touch/keydown tracking.
+using BonitoAgents
+isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
-using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
-import .TestKit, BonitoAgents
-const TK = TestKit
-using .TestKit: text, delay, end_turn
+using JSON
 
-# A long line per chunk so the pane overflows in a small window. Wave 1 fills the
-# viewport; the quiet delay holds the turn open so the test can assert against a
-# live (still-streaming) chat; wave 2 is the burst that must stay pinned.
-const LONG = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod. "
-const W1_N = 24
-const QUIET_MS = 9000
-const W2_N = 30
+state = TH.make_state(; n_workers = 1, n_projects = 1)
+let proj = state.projects[]["p-1"]
+    model = BonitoAgents.ChatModel(state, proj.server_path;
+                                  project_id     = proj.id,
+                                  transport      = TH.mock_transport())
+    BonitoAgents.start_chat_client!(model)
+    # Seed a small history so virtual scroll has something to mount but
+    # we still start "at bottom" with room to grow.
+    TH.seed_chat_history!(model, 8)
+end
 
-@testset "scroll chase — at-bottom, busy transition, burst, disengage, mobile resize" begin
-    s = TK.dev_server(; agent = msg -> begin
-        evs = Any[]
-        for i in 1:W1_N
-            push!(evs, text("[w1-$i] " * LONG)); push!(evs, delay(80))
-        end
-        # Hold the turn open so the test can exercise busy transitions / scroll
-        # while the chat is genuinely live, then fire the chunk burst (wave 2).
-        push!(evs, delay(QUIET_MS))
-        for i in 1:W2_N
-            push!(evs, text("[w2-$i] " * LONG)); push!(evs, delay(60))
-        end
-        push!(evs, end_turn())
-        evs
-    end)
-    try
-        # Small window so the stream overflows and the pane scrolls.
-        TK.open_browser(s; width = 900, height = 600)
-        pid = TK.new_chat(s)
-        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
-        TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
-        sleep(0.8)  # initial scroll-to-bottom + ResizeObserver settle
+ctx = TH.open_window(state)
 
-        follow_mode() = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.followMode")
-        scroll_state() = TK.eval_js(s, """(() => {
+results = Pair{String,Bool}[]
+record(name, ok) = push!(results, name => ok)
+
+try
+    p1_idx = TH.eval_js(ctx, """(() => {
+        const items = document.querySelectorAll('.bt-side-item .bt-side-name');
+        for (let i = 0; i < items.length; i++) if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
+        return -1; })()""")
+    TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
+    @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null";
+                        timeout = 15.0) "chat didn't mount"
+    sleep(1.0)  # initial scroll-to-bottom + RO settle
+
+    # Helper: read scroll state of the messages container.
+    function scroll_state()
+        TH.eval_js(ctx, """(() => {
             const c = document.querySelector('.bt-messages');
-            return { top:    Math.round(c.scrollTop),
-                     height: Math.round(c.scrollHeight),
-                     client: Math.round(c.clientHeight),
-                     gap:    Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) };
+            // Math.round throughout — Chromium can return fractional
+            // pixel values for scrollHeight/clientHeight when subpixel
+            // layout is in play; the Julia side compares against
+            // integer thresholds with `Int(...)`, which would raise
+            // InexactError on a Float64 with a non-zero fractional part.
+            return {
+                top:    Math.round(c.scrollTop),
+                height: Math.round(c.scrollHeight),
+                client: Math.round(c.clientHeight),
+                gap:    Math.round(c.scrollHeight - c.scrollTop - c.clientHeight),
+            };
         })()""")
-        gap() = Int(scroll_state()["gap"])
-        last_in_view() = TK.eval_js(s, """(() => {
+    end
+
+    TH.section("Initial mount lands at bottom") do
+        s = scroll_state()
+        record("scrollHeight grew past clientHeight",
+               @TH.test_true (Int(s["height"]) > Int(s["client"])))
+        record("gap below clientHeight < 50px (we're at bottom)",
+               @TH.test_true (Int(s["gap"]) < 50))
+    end
+
+    # ── Bug 1: busy transition ─────────────────────────────────────────────
+    TH.section("bt-busy height transition keeps us at bottom") do
+        TH.eval_js(ctx, """(() => {
+            document.querySelector('.bt-messages').__bt_chat.dispatch({type: 'busy_start'});
+        })()""")
+        # The CSS transition takes 150ms; wait through it + a frame.
+        sleep(0.3)
+        s = scroll_state()
+        record("still at bottom after busy_start (was ≤200, now ≤200)",
+               @TH.test_true (Int(s["gap"]) < 200))
+
+        TH.eval_js(ctx, """(() => {
+            document.querySelector('.bt-messages').__bt_chat.dispatch({type: 'busy_end'});
+        })()""")
+        sleep(0.3)
+        s = scroll_state()
+        record("still at bottom after busy_end",
+               @TH.test_true (Int(s["gap"]) < 200))
+    end
+
+    # ── Bug 2: streaming chunks land at bottom every frame ───────────────
+    TH.section("Streaming many chunks keeps us pinned at the tail") do
+        chat = state.chat_models["p-1"]
+        # Manually create a streaming agent message.
+        push!(chat.msgs_store, BonitoAgents.AgentMsg("stream-1", ""))
+        BonitoAgents.chat_emit(chat, Dict{String,Any}(
+            "type" => "agent", "id" => "stream-1", "streaming" => true,
+            "text" => "", "n" => length(chat.msgs_store)))
+        sleep(0.2)
+
+        # Fire a burst of chunks. Each chunk grows the bubble; the
+        # ResizeObserver on the message node should ensure we re-scroll.
+        for i in 1:30
+            BonitoAgents.chat_emit(chat, Dict{String,Any}(
+                "type" => "chunk", "id" => "stream-1",
+                "text" => "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "))
+        end
+        # Wait for the chase to settle rather than a fixed sleep. The chase
+        # settles in ~200ms (measured), but the headless suite window throttles
+        # rAF to ~1 Hz, so a fixed 0.5s sleep races the throttled chase ~50/50.
+        # Polling the gap is the correct, non-flaky check.
+        settled = TH.wait_for(ctx, """(() => {
+            const c = document.querySelector('.bt-messages');
+            return (c.scrollHeight - c.scrollTop - c.clientHeight) < 200;
+        })()"""; timeout = 6.0)
+
+        s = scroll_state()
+        # The streaming bubble is now ~1.5KB of text — must have stayed
+        # at the tail throughout, NOT lagged behind.
+        record("scroll at bottom after burst of 30 chunks",
+               @TH.test_true settled)
+
+        # The last message bubble's bottom edge should be within the viewport.
+        last_in_view = TH.eval_js(ctx, """(() => {
             const bubbles = document.querySelectorAll('.bt-agent-msg');
             if (bubbles.length === 0) return false;
             const last = bubbles[bubbles.length - 1];
             const r = last.getBoundingClientRect();
             const c = document.querySelector('.bt-messages').getBoundingClientRect();
-            return r.bottom <= c.bottom + 50; })()""")
-        input_visible() = TK.eval_js(s, """(() => {
-            const input = document.querySelector('.bt-text-input');
-            if (!input) return false;
-            const r = input.getBoundingClientRect();
-            return r.bottom > 0 && r.top < window.innerHeight; })()""")
+            // The last bubble's bottom should be at or above the
+            // container's bottom (visible).
+            return r.bottom <= c.bottom + 50;
+        })()""")
+        record("last bubble visible in viewport", @TH.test_true last_in_view)
+    end
 
-        # ── 1. Initial mount lands at bottom ──────────────────────────────────
-        # Empty chat: clientHeight is set, gap is ~0. followMode true on mount.
-        @test follow_mode() == true
-        @test gap() < 50
-
-        # ── Stream wave 1 so the pane overflows and becomes scrollable ────────
-        TK.send_message(s, "stream a long reply")
-        TK.wait_for(s, "pane became scrollable", """
-            (() => { const c = document.querySelector('.bt-messages');
-                     return (c.scrollHeight - c.clientHeight) > 200; })()
-        """; timeout = 25)
-        sleep(0.6)
-        s0 = scroll_state()
-        @test Int(s0["height"]) > Int(s0["client"])   # content overflows
-        # Mid-stream: offscreen rAF is throttled to ~1 Hz, so the chase can lag a
-        # frame behind the latest growth — poll for the at-bottom band (<200, the
-        # same threshold the legacy test used for all in-flight at-bottom checks).
-        @test TK.wait_for(s, "pinned at bottom while wave 1 streams",
-            "(() => { const c = document.querySelector('.bt-messages'); return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 200; })()";
-            timeout = 6)
-
-        # ── Bug 1: bt-busy height transition keeps us at bottom ───────────────
-        # The CSS transition takes 150ms; the ResizeObserver-driven re-scroll
-        # must keep the tail anchored across it.
-        TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.dispatch({type: 'busy_start'})")
-        @test TK.wait_for(s, "at bottom after busy_start",
-            "(() => { const c = document.querySelector('.bt-messages'); return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 200; })()";
-            timeout = 4)
-        TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.dispatch({type: 'busy_end'})")
-        @test TK.wait_for(s, "at bottom after busy_end",
-            "(() => { const c = document.querySelector('.bt-messages'); return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 200; })()";
-            timeout = 4)
-
-        # ── Bug 2+3: streaming the burst keeps us pinned at the tail ──────────
-        # Wait out the quiet window, then wave 2 floods chunks; the chase must
-        # ride every growth frame and keep the last bubble in view.
-        TK.wait_for(s, "wave 1 fully streamed",
-            "document.querySelector('.bt-messages').innerText.indexOf('[w1-$W1_N]') !== -1"; timeout = 25)
-        TK.wait_for(s, "burst (wave 2) started",
-            "document.querySelector('.bt-messages').innerText.indexOf('[w2-1]') !== -1"; timeout = 20)
-        TK.wait_for(s, "burst fully streamed",
-            "document.querySelector('.bt-messages').innerText.indexOf('[w2-$W2_N]') !== -1"; timeout = 20)
-        @test TK.wait_for(s, "scroll settled at bottom after burst",
-            "(() => { const c = document.querySelector('.bt-messages'); return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 200; })()";
-            timeout = 6)
-        @test last_in_view()
-
-        # ── Bug 4: scrolling far up disengages chase ──────────────────────────
-        # Synthetic wheel before the programmatic scrollTop write so the chat
-        # marks this as user-initiated (otherwise it's classed as a layout
-        # shift and re-anchors). Headless Electron throttles natural scroll
-        # events to ~1 Hz, so we dispatch a synthetic 'scroll' too.
-        TK.eval_js(s, """(() => {
+    # ── Scrolling up disengages chase ──────────────────────────────────
+    TH.section("Scrolling far up disengages chase") do
+        # Synthetic 'scroll' dispatch alongside the programmatic
+        # scrollTop write — Electron throttles natural scroll events
+        # to ~1 Hz when the window is hidden, so the chat's scroll
+        # handler won't run in time off the natural event alone.
+        TH.eval_js(ctx, """(() => {
             const c = document.querySelector('.bt-messages');
-            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: -100}));
+            // Simulate a wheel event before the scrollTop write so the
+            // chat marks this as user-initiated. Otherwise the chat's
+            // scroll handler treats it as a layout shift and re-anchors.
+            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
             c.scrollTop = 0;
             c.dispatchEvent(new Event('scroll', {bubbles: true}));
-            return true; })()""")
-        @test TK.wait_for(s, "followMode false after scroll-to-top",
-            "document.querySelector('.bt-messages').__bt_chat.followMode === false"; timeout = 4)
-
-        # ── Mobile keyboard / viewport shrink keeps tail + input visible ──────
-        TK.set_window_size(s, 480, 800)
+            return true;
+        })()""")
         sleep(0.3)
-        # Re-engage chase via the public path the pill-click uses.
-        TK.eval_js(s, """(() => {
+        follow = TH.eval_js(ctx, """
+            document.querySelector('.bt-messages').__bt_chat.followMode
+        """)
+        record("followMode is false after scrolling to top",
+               @TH.test_eq follow false)
+    end
+
+    # ── Mobile keyboard / viewport shrink ──────────────────────────────────
+    # Re-engage chase, then simulate the soft keyboard popping up by
+    # shrinking the viewport. The chat must keep the input field +
+    # last message visible across the resize.
+    TH.section("Mobile viewport shrink (soft-keyboard sim) keeps tail visible") do
+        # Mobile-ish baseline first.
+        TH.set_window_size(ctx, 480, 800)
+        sleep(0.3)
+        chat = state.chat_models["p-1"]
+        # Re-engage chase: any new message arriving while followMode is
+        # false won't auto-scroll, so the previous "scroll to top" test
+        # disengaged us. Use the public setFollowMode helper so we go
+        # through the same path the pill-click does.
+        TH.eval_js(ctx, """(() => {
             const c = document.querySelector('.bt-messages');
             c.__bt_chat.setFollowMode(true);
             c.__bt_chat._queueScrollToBottom();
-            return true; })()""")
-        @test TK.wait_for(s, "re-engaged (followMode true)",
-            "document.querySelector('.bt-messages').__bt_chat.followMode === true"; timeout = 4)
-
-        # Soft-keyboard slide-in: shrink the viewport ~half. onViewportResize +
-        # ResizeObserver must keep the input + last bubble visible.
-        TK.set_window_size(s, 480, 400)
-        sleep(0.5)
-        @test input_visible()
-        @test TK.wait_for(s, "tail in view after keyboard up",
-            "(() => { const c = document.querySelector('.bt-messages'); return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 200; })()";
-            timeout = 4)
-
-        # Close keyboard — restore full height; tail must remain anchored.
-        TK.set_window_size(s, 480, 800)
-        sleep(0.5)
-        @test input_visible()
-        @test TK.wait_for(s, "tail in view after keyboard close",
-            "(() => { const c = document.querySelector('.bt-messages'); return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 200; })()";
-            timeout = 4)
-
-        # Restore desktop viewport before the final screenshot.
-        TK.set_window_size(s, 1280, 800)
+        })()""")
         sleep(0.3)
-        TK.screenshot(s, joinpath(tempdir(), "bt-scroll-chase-final.png"))
+        for i in 1:5
+            BonitoAgents.chat_emit(chat, Dict{String,Any}(
+                "type" => "chunk", "id" => "stream-1",
+                "text" => "Tail content $i. "))
+        end
+        sleep(0.4)
 
-        # ── No JS errors throughout ───────────────────────────────────────────
-        errs = TK.eval_js(s, "window.__errs || []")
-        @test isempty(errs)
-    finally
-        close(s)
+        # Now shrink the viewport ~half — simulates iOS soft keyboard.
+        TH.set_window_size(ctx, 480, 400)
+        sleep(0.5)   # let onViewportResize + ResizeObserver fire + flush
+
+        # Verify the input field is still visible (not pushed off-screen
+        # by the streaming content).
+        input_visible = TH.eval_js(ctx, """(() => {
+            const input = document.querySelector('.bt-text-input');
+            if (!input) return false;
+            const r = input.getBoundingClientRect();
+            return r.bottom > 0 && r.top < window.innerHeight;
+        })()""")
+        record("input field still visible after viewport shrink",
+               @TH.test_true input_visible)
+
+        # Verify the last agent bubble is within the messages viewport.
+        last_in_messages = TH.eval_js(ctx, """(() => {
+            const bubbles = document.querySelectorAll('.bt-agent-msg');
+            if (bubbles.length === 0) return false;
+            const last = bubbles[bubbles.length - 1];
+            const lr = last.getBoundingClientRect();
+            const cr = document.querySelector('.bt-messages').getBoundingClientRect();
+            // Allow a generous tolerance for sub-pixel + threshold.
+            return lr.bottom <= cr.bottom + 50 && lr.bottom >= cr.top;
+        })()""")
+        record("last agent bubble still in the messages viewport",
+               @TH.test_true last_in_messages)
+
+        # Now "close keyboard" — restore full height.
+        TH.set_window_size(ctx, 480, 800)
+        sleep(0.5)
+        last_in_messages_after = TH.eval_js(ctx, """(() => {
+            const bubbles = document.querySelectorAll('.bt-agent-msg');
+            if (bubbles.length === 0) return false;
+            const last = bubbles[bubbles.length - 1];
+            const lr = last.getBoundingClientRect();
+            const cr = document.querySelector('.bt-messages').getBoundingClientRect();
+            return lr.bottom <= cr.bottom + 50 && lr.bottom >= cr.top;
+        })()""")
+        record("last bubble still visible after viewport restore",
+               @TH.test_true last_in_messages_after)
     end
+
+    # Restore desktop viewport before final screenshot so the saved PNG
+    # isn't a mobile snapshot.
+    TH.set_window_size(ctx, 1280, 800)
+    sleep(0.3)
+
+    # ── No JS errors throughout ──────────────────────────────────────────
+    TH.section("No JS errors in console") do
+        errs = TH.js_errors(ctx)
+        record("zero JS errors during scroll-chase exercise",
+               @TH.test_eq length(errs) 0)
+    end
+
+    TH.emit_screenshot(ctx; label = "scroll-chase final")
+
+finally
+    TH.report!("Tier 2g — scroll chase", results)
+    TH.shutdown(ctx)
 end

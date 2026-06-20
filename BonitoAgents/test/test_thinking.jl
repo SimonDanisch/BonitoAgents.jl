@@ -1,39 +1,39 @@
-# Agent-thinking path, end to end. Migrated onto the TestKit harness for the
-# agent-driven parts (real dev_server, real worker subprocess, real ACP wire,
-# real Electron browser; only the agent's behaviour is faked via the `agent=`
-# callback). The genuinely agent-free pieces — the ACP per-turn coalescer and
-# the reusable `Collapsable` server-side component — stay plain unit tests that
-# call the functions directly (no ChatModel, no transport).
+# Tests for the agent-thinking path, end to end:
+#
+#   ACP coalescer   — agent_thought_chunk(s) → one `Thought`, text reconstructed
+#   process!        — transient "reasoning…" indicator; commit a ThoughtMsg ONLY
+#                     if non-empty (this agent redacts thinking → empty thoughts,
+#                     which must leave no trace in the store)
+#   persistence     — a non-empty thought round-trips append_thought → load_history
+#                     (reloaded with id + text); empty thoughts are not persisted
+#   wire shapes     — wire_new / wire_final carry the thought id + html
+#   Collapsable     — the eager server-side component renders a <details>
 #
 # Background: claude-agent-acp returns thinking blocks with an empty plaintext
 # `thinking` field and only an encrypted `signature`, so every thought reaching
-# us is empty. The pipeline must (a) still signal "the model is reasoning" via a
-# transient indicator and (b) never render/persist an empty bubble — while
-# staying correct for a future agent that DOES expose plaintext thinking.
-#
-# Behaviour asserted through the REAL DOM (driven by `TK.thought(...)` events):
-#
-#   * empty thought  → only the transient indicator; no `.bt-thought-msg`
-#                      committed, nothing persisted.
-#   * non-empty one  → persists + renders a `.bt-thought-msg` Collapsable
-#                      (`<details>`) whose body carries the rendered thought.
-#   * wire shapes    → the model's msgs_store ends with exactly one ThoughtMsg
-#                      whose text round-trips; wire_new/wire_final carry id+html.
+# us is empty. The pipeline must (a) still signal "the model is reasoning" and
+# (b) never render/persist an empty bubble — while staying correct for a future
+# agent that DOES expose plaintext thinking.
 
 using Test
+using Dates
 using Markdown
-include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
-import .TestKit, BonitoAgents
+using BonitoAgents
 using Bonito
-const TK  = TestKit
 const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
-using .TestKit: text, thought, end_turn
 
-# ── Pure unit tests (no agent, no chat) ─────────────────────────────────────
+newstate() = BT.ServerState(; state_dir = mktempdir(),
+                              working_dir = mktempdir(),
+                              worker_secret = "x")
+
+# Build a ChatModel with an inert mock transport (process! never touches it).
+mkchat() = BT.ChatModel(newstate(), mktempdir();
+                        transport = BT.MockTransport((o, i) -> nothing))
 
 # Run a sequence of SessionUpdates through the per-turn coalescer exactly like
-# `prompt!` does, draining each streaming body into a `(message, text)` pair.
+# `prompt!` does, and return the resulting messages with each streaming body
+# fully drained into a `(message, text)` pair.
 function coalesce_updates(updates::Vector)
     out = Channel{ACP.Message}(256)
     st  = ACP.TurnState()
@@ -47,27 +47,112 @@ function coalesce_updates(updates::Vector)
                 m.text * join(collect(m.updates)) : "") for m in msgs]
 end
 
-acp_thought(t) = ACP.AgentThoughtChunk(ACP.TextContent(t))
+thought(text) = ACP.AgentThoughtChunk(ACP.TextContent(text))
 
 @testset "agent thinking" begin
 
-    @testset "coalescer reconstructs thought text (pure)" begin
+    @testset "coalescer reconstructs thought text" begin
         # Multiple thought chunks coalesce into ONE Thought whose text is the
         # concatenation of the seed + every delta.
-        got = coalesce_updates([acp_thought("Let me "), acp_thought("think "), acp_thought("carefully.")])
+        got = coalesce_updates([thought("Let me "), thought("think "), thought("carefully.")])
         @test length(got) == 1
         @test got[1][1] isa ACP.Thought
         @test got[1][2] == "Let me think carefully."
 
         # A single empty chunk (the redacted case) still produces a Thought, but
         # with empty text — process! is what drops it, not the coalescer.
-        got_empty = coalesce_updates([acp_thought("")])
+        got_empty = coalesce_updates([thought("")])
         @test length(got_empty) == 1
         @test got_empty[1][1] isa ACP.Thought
         @test got_empty[1][2] == ""
     end
 
-    @testset "Collapsable component (pure)" begin
+    @testset "process!: empty thought leaves no trace, only the indicator" begin
+        chat = mkchat()
+        events = Dict{String,Any}[]
+        on(d -> push!(events, d), chat.comm)
+
+        th = ACP.Thought("")        # redacted: empty plaintext
+        close(th)
+        BT.process!(chat, th)
+
+        # No stored bubble, nothing persisted.
+        @test isempty([m for m in chat.msgs_store if m isa BT.ThoughtMsg])
+        @test isempty([m for m in BT.load_history(chat.chat_session) if m isa BT.ThoughtMsg])
+
+        # The transient indicator was raised then lowered, and no `thought`
+        # message event was emitted.
+        kinds = [get(e, "type", "") for e in events]
+        @test count(==("thinking"), kinds) == 2
+        @test !any(==("thought"), kinds)
+        @test !any(==("thought_final"), kinds)
+        active = [e["active"] for e in events if get(e, "type", "") == "thinking"]
+        @test active == [true, false]
+    end
+
+    @testset "process!: non-empty thought commits a collapsed, persisted bubble" begin
+        chat = mkchat()
+        events = Dict{String,Any}[]
+        on(d -> push!(events, d), chat.comm)
+
+        th = ACP.Thought("Hello ")
+        append!(th, "world")        # a streamed delta (buffered)
+        close(th)
+        BT.process!(chat, th)
+
+        tms = [m for m in chat.msgs_store if m isa BT.ThoughtMsg]
+        @test length(tms) == 1
+        @test tms[1].text == "Hello world"
+
+        # Indicator raised (count=0), the first delta's count tick (later
+        # ticks are throttled to ~150 ms, irrelevant for one delta), then
+        # lowered — plus the bubble's new + final events. The active pattern
+        # is what matters: starts true, ends false.
+        kinds = [get(e, "type", "") for e in events]
+        @test count(==("thinking"), kinds) == 3
+        thinking = [e for e in events if get(e, "type", "") == "thinking"]
+        @test first(thinking)["active"] === true
+        @test last(thinking)["active"] === false
+        @test count(==("thought"), kinds) == 1          # wire_new
+        @test count(==("thought_final"), kinds) == 1    # wire_final
+
+        # The final event carries the rendered html (the text reached the wire).
+        fin = events[findfirst(e -> get(e, "type", "") == "thought_final", events)]
+        @test fin["id"] == tms[1].id
+        @test occursin("Hello world", fin["html"])
+    end
+
+    @testset "persistence round-trips a thought; empties are skipped" begin
+        chat = mkchat()
+        BT.append_thought(chat.chat_session, BT.ThoughtMsg("tid-keep", "real reasoning\nsecond line"))
+        BT.append_thought(chat.chat_session, BT.ThoughtMsg("tid-empty", "   "))
+
+        reloaded = [m for m in BT.load_history(chat.chat_session) if m isa BT.ThoughtMsg]
+        @test length(reloaded) == 1                    # the empty one was not written
+        @test reloaded[1].id == "tid-keep"
+        @test reloaded[1].text == "real reasoning\nsecond line"
+
+        # A reloaded thought still renders to non-empty html (lazy body source).
+        html = sprint(show, MIME("text/html"), Markdown.parse(reloaded[1].text))
+        @test occursin("real reasoning", html)
+    end
+
+    @testset "wire shapes" begin
+        chat = mkchat()
+        tm = BT.ThoughtMsg(chat, "some reasoning")
+        wn = BT.wire_new(chat, tm)
+        @test wn["type"] == "thought"
+        @test wn["id"] == tm.id
+        @test haskey(wn, "summary")        # collapsed/lazy, NOT streaming
+        @test !get(wn, "streaming", false)
+
+        wf = BT.wire_final(tm)
+        @test wf["type"] == "thought_final"
+        @test wf["id"] == tm.id
+        @test occursin("some reasoning", wf["html"])
+    end
+
+    @testset "Collapsable component" begin
         # tool_subsection delegates to the reusable Collapsable.
         sub = BT.tool_subsection("Code", DOM.div("x = 1"); preview="x = 1")
         @test sub isa BT.Collapsable
@@ -82,107 +167,6 @@ acp_thought(t) = ACP.AgentThoughtChunk(ACP.TextContent(t))
         @test occursin("the-body-text", html)
         @test occursin("bt-subsection", html)
         @test occursin("Output", html)
-    end
-
-    @testset "wire shapes (pure)" begin
-        # wire_new/wire_final carry the thought id + html. A ThoughtMsg bound to a
-        # model is enough — no transport, no streaming.
-        s = TK.dev_server()
-        try
-            TK.open_browser(s; width = 1280, height = 820)
-            pid = TK.new_chat(s)
-            chat = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
-
-            tm = BT.ThoughtMsg(chat, "some reasoning")
-            wn = BT.wire_new(chat, tm)
-            @test wn["type"] == "thought"
-            @test wn["id"] == tm.id
-            @test haskey(wn, "summary")        # collapsed/lazy, NOT streaming
-            @test !get(wn, "streaming", false)
-
-            wf = BT.wire_final(tm)
-            @test wf["type"] == "thought_final"
-            @test wf["id"] == tm.id
-            @test occursin("some reasoning", wf["html"])
-        finally
-            close(s)
-        end
-    end
-
-    # ── DOM e2e: empty vs non-empty thoughts through the REAL stack ──────────
-
-    @testset "empty thought → indicator only, no bubble, not persisted (DOM)" begin
-        # The agent emits a single EMPTY thought (the redacted case) then ends.
-        s = TK.dev_server(; agent = msg -> [thought(""), text("answer"), end_turn()])
-        try
-            TK.open_browser(s; width = 1280, height = 820)
-            pid = TK.new_chat(s)
-            TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
-            TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
-            chat = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
-
-            TK.send_message(s, "think then answer")
-            # The agent's text answer lands…
-            @test TK.wait_for(s, "agent answer landed",
-                "document.querySelectorAll('.bt-agent-msg').length >= 1"; timeout = 30) == true
-            @assert timedwait(() -> !chat.busy_active[], 20.0) === :ok "turn never settled"
-
-            # …but an EMPTY thought leaves NO committed bubble in the DOM and
-            # nothing in the store / persistence.
-            @test TK.eval_js(s, "document.querySelectorAll('.bt-thought-msg').length") == 0
-            tms = lock(() -> [m for m in chat.msgs_store if m isa BT.ThoughtMsg], chat.lock)
-            @test isempty(tms)
-            @test isempty([m for m in BT.load_history(chat.chat_session) if m isa BT.ThoughtMsg])
-
-            errs = TK.eval_js(s, "window.__errs || []")
-            @test isempty(errs)
-        finally
-            close(s)
-        end
-    end
-
-    @testset "non-empty thought → persisted Collapsable bubble in the DOM" begin
-        # A future agent that DOES expose plaintext reasoning: the thought must
-        # commit a real (collapsed, persisted) bubble.
-        s = TK.dev_server(; agent = msg -> [thought("Hello world reasoning"), text("the answer"), end_turn()])
-        try
-            TK.open_browser(s; width = 1280, height = 820)
-            pid = TK.new_chat(s)
-            TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
-            TK.wait_for(s, "chat mounted", "!!document.querySelector('.bt-text-input')"; timeout = 10)
-            chat = lock(s.h.state.lock) do; s.h.state.chat_models[pid]; end
-
-            TK.send_message(s, "reason out loud")
-
-            # A real thought bubble renders to a `.bt-thought-msg` carrying a
-            # native <details> (the Collapsable).
-            @test TK.wait_for(s, "thought bubble appears",
-                "document.querySelectorAll('.bt-thought-msg').length >= 1"; timeout = 30) == true
-            @test TK.wait_for(s, "thought body carries the reasoning text",
-                "(document.querySelector('.bt-thought-msg').innerHTML||'').indexOf('Hello world reasoning') !== -1";
-                timeout = 10) == true
-            @test TK.eval_js(s,
-                "document.querySelector('.bt-thought-msg details') !== null") == true
-
-            @assert timedwait(() -> !chat.busy_active[], 20.0) === :ok "turn never settled"
-
-            # Store shape: exactly one ThoughtMsg whose text round-trips, and it
-            # persisted (reloads from history with its text intact).
-            tms = lock(() -> [m for m in chat.msgs_store if m isa BT.ThoughtMsg], chat.lock)
-            @test length(tms) == 1
-            @test tms[1].text == "Hello world reasoning"
-            reloaded = [m for m in BT.load_history(chat.chat_session) if m isa BT.ThoughtMsg]
-            @test length(reloaded) == 1
-            @test reloaded[1].text == "Hello world reasoning"
-            # A reloaded thought still renders to non-empty html (lazy body source).
-            html = sprint(show, MIME("text/html"), Markdown.parse(reloaded[1].text))
-            @test occursin("Hello world reasoning", html)
-
-            errs = TK.eval_js(s, "window.__errs || []")
-            @test isempty(errs)
-        finally
-            close(s)
-        end
     end
 
 end

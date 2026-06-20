@@ -85,18 +85,13 @@ end
         @test Malt.remote_eval_fetch(iow, :(1+1)) == 2
 
         # === server side: the shown_app ToolMsg → render_tool_body → embed ===
-        model = BT.ChatModel(h.state, mktempdir(); project_id=pid, agent=BT.MockAgent([]))   # never-started holder; only render_tool_body is exercised
+        model = BT.ChatModel(h.state, mktempdir(); project_id=pid, transport=BT.MockTransport((o,i)->nothing))
         toolid = string(Bonito.uuid4())
         tc = ACP.GenericTool(toolid, "mcp", "bt_show_app", "completed",
                               ACP.ToolContent[ACP.TextContent("shown_app: $appid")], Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(model.chat_dir, tc)
-        # The chat routes a `bt_show_app` tool to a BonitoAppMsg (is_bonito_app),
-        # whose render_tool_body mounts the live RemoteAppPlaceholder keyed on
-        # `app_id`. (Migration: the old fixture hand-built a GenericToolMsg, which
-        # is NOT a bonito-app type, so render_tool_body rendered the `shown_app:`
-        # text as markdown instead of the embed — fixed to match the real path.)
-        tm = BT.BonitoAppMsg(toolid, "bonito_app", "bt_show_app", "completed", "",
-                              0.0, 0.0, "", appid, nothing)
+        tm = BT.GenericToolMsg(toolid, "mcp", "bt_show_app", "completed", "",
+                                0.0, 0.0, nothing)
         body = BT.render_tool_body(h.state, tm, model.cwd, model.chat_dir; project_id=pid)
         # render_tool_body wraps the live embed in the detach frame, so the
         # RemoteAppPlaceholder is nested in the returned DOM rather than the body

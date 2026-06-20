@@ -53,7 +53,8 @@ end
 function fresh_chat()
     state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
                               worker_secret = "x")
-    BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
+    BT.ChatModel(state, mktempdir();
+                  transport = BT.MockTransport((o, i) -> nothing))
 end
 
 function drive_edit_tool(snaps::Vector{<:ACP.ToolCall}; tool_id::String = "toolu_EDIT")
@@ -107,7 +108,8 @@ end
 @testset "render_tool_body for an edit tool uses compact max_height" begin
     state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
                               worker_secret = "x")
-    chat = BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
+    chat = BT.ChatModel(state, mktempdir();
+                         transport = BT.MockTransport((o, i) -> nothing))
     m = BT.GenericToolMsg("t-edit", "edit", "Edit", "completed", "",
                            time(), nothing, chat)
     diff = ACP.DiffContent("/p.jl", "x\n", "y\n")

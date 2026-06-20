@@ -10,23 +10,15 @@
 # by `process_update!` from every snap. `render_tool_body` reads RAM first;
 # disk is the fallback for tools the current server process never saw live
 # (history reload from chat.md after a server restart).
-#
-# TestKit migration. This is a cache/persistence contract — every assertion
-# drives `tool_content_cache` (a plain `Dict`) + `chat_dir/tools/*.json` directly
-# through a `ChatModel`. Nothing renders to a browser and nothing drives an agent
-# turn, so per the rule it stays ALL DIRECT unit tests. The only change is the
-# fixture: the deleted `transport = MockTransport(...)` kwarg is replaced with a
-# no-op, un-started `agent = MockAgent([])` (an agent type, not a fake transport)
-# — verified: it never spawns a subprocess, the model just needs a real agent
-# field + chat_dir.
+
 using Test
 import BonitoAgents
+import BonitoAgents.AgentClientProtocol as ACP
 const BT = BonitoAgents
-const ACP = BonitoAgents.AgentClientProtocol
 
 mk_chat() = BT.ChatModel(
     BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x"),
-    mktempdir(); agent = BT.MockAgent([]))
+    mktempdir(); transport = BT.MockTransport((o, i) -> nothing))
 
 mk_tool(model, id; status::AbstractString = "in_progress") =
     BT.GenericToolMsg(id, "edit", "Edit", String(status), "", time(), nothing, model)

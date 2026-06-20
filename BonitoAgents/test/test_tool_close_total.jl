@@ -25,15 +25,12 @@ const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
 
 # Same `make_chat` helper used in test_tool_messages.jl — chat backed by a
-# real ChatSession so the persist path is exercised end-to-end. The chat is
-# never `start!`ed here (these tests drive the close/sweep paths directly over
-# `msgs_store`), so an un-started `MockAgent([])` is just a no-op state holder —
-# no subprocess, no client. (Was `transport = MockTransport(...)`; the fake
-# transports were deleted, the agent model replaces them.)
+# real ChatSession so the persist path is exercised end-to-end.
 function make_chat_total()
     state = BT.ServerState(; state_dir = mktempdir(),
                               working_dir = mktempdir(), worker_secret = "x")
-    BT.ChatModel(state, mktempdir(); agent = BT.MockAgent([]))
+    BT.ChatModel(state, mktempdir();
+                  transport = BT.MockTransport((o, i) -> nothing))
 end
 
 # ── 1. ACP close(::TurnState) — force-fail pending tools ───────────────────
