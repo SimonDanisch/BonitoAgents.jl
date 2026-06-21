@@ -8,11 +8,11 @@
 # backpressures (blocks until the consumer drains) instead of dropping.
 #
 # We assert against the SERVER-side msgs_store (the authoritative count): a single
-# "fill 500" must reach all 500 tool rows + the user + the trailing text.
-#
-# Run:  julia --project=. test/e2e/streaming_flood.jl
+# "fill 500" must reach all 500 tool rows + the user + the trailing text. This is
+# the one allowed server-side read — a SECONDARY count, not used to drive.
+
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -28,9 +28,8 @@ function agent_script(prompt)
     return evs
 end
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
     pid = TK.new_chat(server; title = "Flood")
     TK.open_chat(server, pid)
     TK.wait_for(server, "input", "[...document.querySelectorAll('.bt-text-input')].some(e=>e.offsetParent)"; timeout = 15)
@@ -51,10 +50,23 @@ try
         @test ok == true
         @test serverlen() == 502
         # And the browser virtual-scroll agrees (the wire events all arrived).
+        # Under the shared runner this chat is the Nth in a long soak, so the 500
+        # wire events take longer to drain into the browser than on a cold server
+        # — give the catch-up room (still far short of the pre-fix hang, which
+        # never reaches 502 at all).
         @test TK.wait_for(server, "browser totalCount",
-            "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.totalCount>=502; })()"; timeout = 15) == true
+            "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.totalCount>=502; })()"; timeout = 40) == true
     end
-finally
-    close(server)
+    return server
 end
-TK.exit_success()
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

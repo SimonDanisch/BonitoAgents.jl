@@ -11,10 +11,8 @@
 #   * closing a file tab drops its panel
 #   * a real `.bt-path-link` click opens the editor (the JS delegation path)
 #
-# Run:  julia --project=. test/e2e/file_open.jl
-
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -43,9 +41,8 @@ agent_script(prompt) = [TK.tool(kind = "read", title = joinpath(CWD, "hello.jl")
                                  content = [TK.text_block("```julia\nprintln(\"hi from hello\")\n```")]),
                         TK.text("opened.")]
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
 
     @testset "BonitoAgents file open (UI-only)" begin
         TK.new_chat(server; cwd = CWD, title = "Files")
@@ -135,9 +132,16 @@ try
                 "(document.querySelector('.bw-tab.bw-active .bw-tab-label')?.textContent || '') === 'Home'"; timeout = 6) == true
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

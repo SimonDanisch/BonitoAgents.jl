@@ -9,10 +9,16 @@
 # spawns a fresh mock-agent subprocess (slow cold start), but once its session
 # is bound, further turns in the same chat are fast.
 #
-# Run:  julia --project=. test/e2e/workflows.jl
+# Shared-runner form: `run(server)` swaps the server's agent script to this
+# suite's `agent_script`, then drives the shared page. It does NOT create or
+# close the server. The standalone tail at the bottom lets a single suite still
+# be debugged alone (`julia --project=. test/e2e/workflows.jl`).
 
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+# Guarded: when run under run_all.jl, the runner injects a SHARED `TestKit` into
+# this module first (so every suite drives the one server through the one harness
+# type). Standalone, we include our own copy.
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -41,9 +47,15 @@ function turn(server, msg)
     sleep(2.5)
 end
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+"""
+    run_suite(server) -> server
+
+Drive this suite against an already-open shared `TestServer` (browser open).
+Swaps the server's agent script to ours, scopes work to a fresh chat, and runs
+the testsets. Does not create or close the server.
+"""
+function run_suite(server)
+    server.agent_fn[] = agent_script
 
     @testset "BonitoAgents e2e (UI-only)" begin
 
@@ -108,11 +120,18 @@ try
                 timeout = 8) == true
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+# Standalone: a single suite is still debuggable alone.
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    # Suite passed if we reach here (a failing @testset throws first).
+    TK.exit_success()
+end

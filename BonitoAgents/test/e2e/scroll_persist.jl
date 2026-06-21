@@ -18,11 +18,9 @@
 # scroll-jumps-to-bottom-on-switch bug: it needs a LONG history (a real bottom
 # to chase, and stable fixed-pixel parking — a 2-row chat clamps oddly), built
 # with a "fill N" agent prompt that streams N short tool-message rows.
-#
-# Run:  julia --project=. test/e2e/scroll_persist.jl
 
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -49,9 +47,8 @@ const AT_BOTTOM = "(() => { const c=document.querySelector('.bt-messages'); retu
 marker_present(s, m) = TK.wait_for(s, "marker $(m)",
     "(() => { const c=document.querySelector('.bt-messages'); return !!c && c.innerText.includes($(TK.json(m))); })()"; timeout = 20)
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
 
     @testset "BonitoAgents scroll + persistence (UI-only)" begin
         pid = TK.new_chat(server; title = "Scroll")
@@ -140,11 +137,16 @@ try
         end
 
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

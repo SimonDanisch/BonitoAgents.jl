@@ -4,19 +4,21 @@
 # the online count. We read only the rendered DOM; spawning/killing worker
 # processes are real-world actions, not fake state pokes.
 #
-# Run:  julia --project=. test/e2e/cross_worker.jl
+# Shared-runner safe: this suite spawns + kills a SECOND worker only; the main
+# worker is untouched, so it can run mid-run. See run_all.jl.
 
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
 # Predicate: the "N /M workers online" header has exactly `n` online.
 online_is(n) = "(() => { const m = document.body.innerText.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*workers online/); return m && parseInt(m[1]) === $(n); })()"
 
-server = TK.dev_server(agent = p -> [TK.text("hi")])
-try
-    TK.open_browser(server)
+agent_script(_p) = [TK.text("hi")]
+
+function run_suite(server)
+    server.agent_fn[] = agent_script
     TK.to_dashboard(server)
 
     @testset "BonitoAgents cross-worker (UI-only)" begin
@@ -39,11 +41,16 @@ try
             @test TK.wait_for(server, "back to 1 online", online_is(1); timeout = 15) == true
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

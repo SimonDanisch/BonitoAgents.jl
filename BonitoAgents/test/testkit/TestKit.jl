@@ -511,6 +511,50 @@ function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
     s.browser[] = ctx
     ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
     sleep(3.0)                     # let the dashboard mount + the chat session boot
+    install_pane_scope!(s)
+    return s
+end
+
+# Under the shared runner the chat-pane KeyedList keeps ONE `.bt-chatpane` per
+# opened chat in the DOM (only the active one visible) — that's the product's
+# fast-switch design. But the suites read message state via global selectors
+# like `document.querySelector('.bt-messages')`, which would grab the FIRST
+# (often a hidden, stale) pane once more than one chat has been opened.
+#
+# This shim makes the global `document.querySelector(All)` resolve chat-MESSAGE
+# selectors (`.bt-messages`, `.bt-agent-msg`, `.bt-user-msg`, `.bt-tool-*`,
+# `.bt-plan-msg`, `.bt-taskbar-*`, `.bt-thinking`, …) within the VISIBLE chat
+# pane — i.e. the rendered DOM the user actually sees, which is exactly the
+# contract ("scope to its OWN chat"). It falls through to native for every other
+# selector, and the app's own JS already scopes `.bt-messages` per-pane
+# (`pane.querySelector`), so this never perturbs the product runtime. Installed
+# fresh on every `open_browser` (so a reconnect re-arms it).
+function install_pane_scope!(s::TestServer)
+    eval_js(s, raw"""(() => {
+        if (window.__btPaneScopeInstalled) return true;
+        window.__btPaneScopeInstalled = true;
+        // NB: deliberately NOT scoping `.bt-embed`, `.bw-ws-panel`, `.bt-slot`
+        // (app_detach moves embeds OUT of the chat pane into workspace panels —
+        // scoping those would hide a detached embed), nor sidebar/dashboard/lens
+        // header selectors (single, not per-pane).
+        const MSG = /(^|[\s,>])\.bt-(messages|agent-msg|user-msg|tool-msg|tool-title|tool-header|tool-body|tool-status|tool-summary|plan-msg|taskbar|thinking|diff-block|search-row|eval-section|section-label|multi-diff|busy|text-input|send-btn|lens|header-provider)/;
+        const visiblePane = () => {
+            const panes = [...document.querySelectorAll('.bt-view-chats .bt-chatpane, .bt-chatpane')];
+            return panes.find(p => p.offsetParent !== null) || null;
+        };
+        const wrap = (orig, all) => function(sel) {
+            try {
+                if (typeof sel === 'string' && MSG.test(sel)) {
+                    const p = visiblePane();
+                    if (p) return all ? p.querySelectorAll(sel) : p.querySelector(sel);
+                }
+            } catch (e) {}
+            return orig.call(this, sel);
+        };
+        document.querySelector    = wrap(Document.prototype.querySelector,    false);
+        document.querySelectorAll = wrap(Document.prototype.querySelectorAll, true);
+        return true;
+    })()""")
     return s
 end
 
@@ -521,10 +565,47 @@ Run JavaScript in the browser; the value of the last expression is
 returned to Julia (via Electron's JSON bridge). Long-running JS should
 return primitive types only — no DOM refs.
 """
-function eval_js(s::TestServer, code::AbstractString)
+function eval_js(s::TestServer, code::AbstractString; timeout::Real = 20)
     ctx = s.browser[]
     ctx === nothing && error("open_browser first")
-    return ECT.eval_js(ctx, String(code))
+    # Hard-bound the bridge round-trip: a wedged/overloaded Electron renderer (e.g.
+    # right after a 500-message flood) must NEVER hang the harness. If the bridge
+    # doesn't answer in `timeout`s we throw — the suite fails fast instead of the
+    # whole run deadlocking. (This is the foundation that makes `wait_for` — and
+    # therefore every suite — impossible to deadlock.)
+    res = Ref{Any}(nothing); ex = Ref{Any}(nothing); done = Ref(false)
+    # @async (thread 1, cooperative): the ECT bridge waits on an IPC response which
+    # yields, so this outer watchdog loop still gets scheduled and can time out.
+    @async begin
+        try; res[] = ECT.eval_js(ctx, String(code)); catch e; ex[] = e; finally; done[] = true; end
+    end
+    t0 = time()
+    while !done[] && time() - t0 < timeout; sleep(0.02); end
+    done[] || error("eval_js timed out after $(timeout)s (Electron bridge wedged?): " *
+                    first(replace(String(code), r"\s+" => " "), 90))
+    ex[] === nothing || throw(ex[])
+    return res[]
+end
+
+"""
+    refresh_eval_session!(env_path)
+
+Drop the per-`env_path` eval session so the NEXT `bt_show_app` re-dials the bridge
+for ITS OWN project. The eval worker is shared per env and dials back ONCE (bound
+to the first project that used it); a `bt_show_app` from a SECOND chat sharing the
+env reuses that stale dial-back and the embed never renders. An e2e suite that
+embeds an app calls this at its start so it gets a fresh per-project dial-back —
+order-independent under the shared-server soak. (The robust product fix is to
+re-dial per project in BonitoMCP's `ensure_eval_dialed!`; this is the test-side
+stand-in until then.)
+"""
+function refresh_eval_session!(env_path::AbstractString)
+    try
+        BonitoMCP.restart!(BonitoMCP.manager(), String(env_path))
+    catch e
+        @warn "refresh_eval_session! failed (continuing)" exception = e
+    end
+    return nothing
 end
 
 """
@@ -694,6 +775,17 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # minute, so wait generously here.
     wait_for(s, "chat view opened",
              "!!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane')";
+             timeout = 90)
+    # The ACP session binds asynchronously; until it does, the sidebar hasn't
+    # marked the new chat active and a re-render can briefly drop `.bt-text-input`.
+    # Gate on the new chat actually being SELECTED (non-empty active pid) AND its
+    # input being visible — otherwise `new_chat` can return mid-bind and the next
+    # `send_message` races a flicker. This matters most under the shared runner,
+    # where a populated sidebar makes the bind lag longer.
+    wait_for(s, "new chat selected + input live",
+             "(() => { const a=document.querySelector('.bt-side-item.bt-side-active'); " *
+             "return !!a && !!(a.getAttribute('data-project-id')) && " *
+             "[...document.querySelectorAll('.bt-text-input')].some(e=>e.offsetParent!==null); })()";
              timeout = 90)
     sleep(0.5)
     pid = current_chat_id(s)

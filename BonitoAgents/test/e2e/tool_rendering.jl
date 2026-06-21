@@ -10,10 +10,8 @@
 #   * execute       -> a status pill that walks pending -> in_progress ->
 #                      completed (driven by tool_update + delay, turn held open)
 #
-# Run:  julia --project=. test/e2e/tool_rendering.jl
-
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -63,9 +61,8 @@ in_card(id, sel) = """(() => { for (const m of document.querySelectorAll('.bt-to
     return null; })()"""
 body_has(id) = "document.querySelector('.bt-tool-body[data-tool-id=\"$(id)\"]')"
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
 
     @testset "BonitoAgents tool rendering (UI-only)" begin
         TK.new_chat(server; title = "Tools")
@@ -134,11 +131,16 @@ try
                 "[...$(body_has("eval-err")).querySelectorAll('.bt-section-label')].some(l => l.textContent === 'ERROR')"; timeout = 8) == true
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

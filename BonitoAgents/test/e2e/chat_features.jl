@@ -1,11 +1,9 @@
 # More end-to-end chat features, UI-only via TestKit: streaming accumulation,
 # markdown rendering, responsive (mobile) layout, and switching between chats.
 # Same rules as workflows.jl: real app, no internal-API calls.
-#
-# Run:  julia --project=. test/e2e/chat_features.jl
 
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -36,9 +34,8 @@ end
 
 turn(server, msg) = (TK.send_message(server, msg); sleep(2.5))
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
 
     @testset "BonitoAgents chat features (UI-only)" begin
 
@@ -92,11 +89,16 @@ try
             @test TK.current_chat_id(server) == pidB
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

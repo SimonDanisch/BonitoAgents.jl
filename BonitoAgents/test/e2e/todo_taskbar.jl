@@ -12,10 +12,8 @@
 # claude-agent-acp uses — the TodoWrite tool_call path is inert), held open
 # with `delay` events so the live panel is observable before the turn ends.
 #
-# Run:  julia --project=. test/e2e/todo_taskbar.jl
-
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -31,9 +29,8 @@ agent_script(_prompt) = [TK.todo(PLAN_V1), TK.delay(3500),
                          TK.todo(PLAN_V2), TK.delay(3500),
                          TK.text("All wrapped up.")]
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
 
     @testset "BonitoAgents todo taskbar (UI-only)" begin
         TK.new_chat(server; title = "Plan")
@@ -64,11 +61,16 @@ try
                 "document.querySelector('.bt-taskbar-todo') === null"; timeout = 6) == true
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

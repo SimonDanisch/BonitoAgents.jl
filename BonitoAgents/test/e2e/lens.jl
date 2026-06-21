@@ -12,15 +12,15 @@
 # Reading the chat's own client state (`.bt-messages.__bt_chat.*`) is fair game
 # here — it's the UI's state, not a Julia internal.
 #
-# Run:  julia --project=. test/e2e/lens.jl
-
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
-# Keep saved lenses out of the real ~/.config — point them at a temp file. Set
-# before dev_server so the server/worker pick it up.
+# Keep saved lenses out of the real ~/.config — point them at a temp file.
+# `lenses_path()` reads this ENV live (in the server process, same process as
+# the test), so setting it inside `run` is enough; we also set it here so a
+# standalone run never touches ~/.config.
 const LENS_FILE = joinpath(mktempdir(), "lenses.json")
 ENV["BONITOAGENTS_LENSES_PATH"] = LENS_FILE
 
@@ -32,9 +32,9 @@ set_lens(q) = """(() => { const i = document.querySelector('.bt-lens-input');
     i.value = $(TK.json(q)); i.dispatchEvent(new Event('input', {bubbles:true})); return true; })()"""
 chat_state(expr) = "document.querySelector('.bt-messages').__bt_chat.$(expr)"
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
+    ENV["BONITOAGENTS_LENSES_PATH"] = LENS_FILE   # ensure our temp file under the shared runner
 
     @testset "BonitoAgents lens search (UI-only)" begin
         TK.new_chat(server; title = "Lens")
@@ -96,11 +96,16 @@ try
                 "document.querySelector('.bt-lens-chip') === null"; timeout = 5) == true
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

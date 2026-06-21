@@ -7,9 +7,8 @@
 # stuck inline). Now each embed gets its own panel keyed by tool id, resolved via
 # the chat's canonical `toolSlot` — and several apps can be detached at once.
 #
-# Run:  julia --project=. test/e2e/app_detach.jl
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -47,9 +46,11 @@ detach_btn(s, tid) = TK.eval_js(s, """(() => {
     const btn = host && host.querySelector('.bt-tool-detach');
     if (!btn) return false; btn.click(); return true; })()""")
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
+    # Fresh per-project dial-back so this suite's apps don't inherit a prior
+    # suite's stale eval-worker binding (see TestKit.refresh_eval_session!).
+    TK.refresh_eval_session!(APP_ENV)
 
     @testset "BonitoAgents bt_show_app detach (UI-only)" begin
         TK.new_chat(server; title = "Detach")
@@ -88,7 +89,16 @@ try
         @test whereis(server, 1, tids[1]) == "SLOT"
         @test whereis(server, 2, tids[2]) == "OWN-PANEL"   # the other app unaffected
     end
-finally
-    close(server)
+    return server
 end
-TK.exit_success()
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

@@ -3,11 +3,9 @@
 # path — BonitoMCP runs the code in a Malt worker, registers the app, and the
 # chat mounts it over the dial-back eval bridge. UI-only assertions, no internal
 # API calls.
-#
-# Run:  julia --project=. test/e2e/embedded_app.jl
 
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -26,9 +24,11 @@ function agent_script(prompt::AbstractString)
     end
 end
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
+    # Fresh per-project dial-back: a prior suite's bt_show_app may have bound the
+    # shared per-env eval worker to its own project (see refresh_eval_session!).
+    TK.refresh_eval_session!(APP_ENV)
 
     @testset "BonitoAgents embedded app (bt_show_app, UI-only)" begin
         TK.new_chat(server; title = "AppDemo")
@@ -41,11 +41,16 @@ try
         @test TK.wait_for(server, "embedded content",
             "document.body.innerText.includes('EMBEDDED-OK-42')"; timeout = 90) == true
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end

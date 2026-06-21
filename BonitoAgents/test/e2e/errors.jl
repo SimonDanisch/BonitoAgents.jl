@@ -9,10 +9,8 @@
 # on the transport error being classified by `is_session_dead_error`, and
 # overlaps the restart suite — left in ../electron/test_chat_errors.jl.
 #
-# Run:  julia --project=. test/e2e/errors.jl
-
 using Test
-include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
@@ -22,9 +20,8 @@ agent_script(_prompt) = [TK.error_reply(ERR_MSG)]
 has_inline_error = "[...document.querySelectorAll('.bt-agent-msg')].some(b => (b.innerText || '').includes('[error:'))"
 busy_inactive = "!(document.querySelector('.bt-busy') || {classList:{contains:() => false}}).classList.contains('bt-busy-active')"
 
-server = TK.dev_server(agent = agent_script)
-try
-    TK.open_browser(server)
+function run_suite(server)
+    server.agent_fn[] = agent_script
 
     @testset "BonitoAgents error rendering (UI-only)" begin
         TK.new_chat(server; title = "Errors")
@@ -40,11 +37,16 @@ try
             @test TK.wait_for(server, "busy cleared", busy_inactive; timeout = 8) == true
         end
     end
-finally
-    close(server)
+    return server
 end
 
-# Suite passed if we reach here (a failing @testset throws first); force-terminate.
-# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
-# normal exit until the CI step timeout. See TestKit.exit_success.
-TK.exit_success()
+if abspath(PROGRAM_FILE) == @__FILE__
+    server = TK.dev_server(agent = agent_script)
+    try
+        TK.open_browser(server)
+        run_suite(server)
+    finally
+        close(server)
+    end
+    TK.exit_success()
+end
