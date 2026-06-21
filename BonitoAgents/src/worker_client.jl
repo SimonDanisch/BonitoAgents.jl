@@ -329,6 +329,7 @@ identity check is the guard.
 """
 function teardown_worker_control!(state::ServerState, worker_id::AbstractString, ws)
     affected = String[]
+    evicted  = ChatModel[]
     is_current = lock(state.lock) do
         current = get(state.worker_control_ws, worker_id, nothing)
         current === ws || return false           # superseded — leave the live one alone
@@ -338,6 +339,8 @@ function teardown_worker_control!(state::ServerState, worker_id::AbstractString,
         end
         for p in values(state.projects[])
             if p.worker_id == worker_id
+                m = get(state.chat_models, p.id, nothing)
+                m === nothing || push!(evicted, m)
                 delete!(state.chat_models, p.id)
                 push!(affected, p.id)
             end
@@ -345,6 +348,17 @@ function teardown_worker_control!(state::ServerState, worker_id::AbstractString,
         return true
     end
     if is_current
+        # CLOSE the evicted chat models — dropping them from `chat_models` is NOT
+        # enough: each leaves a `run_chat!` consumer AND a 1 Hz background poller
+        # alive (a running `poller_task` keeps the model referenced), leaking on every
+        # worker disconnect. `close(model)` closes `user_messages`, ending both;
+        # `stop!(agent)` tears down the (already-dead) worker ACP session. Outside
+        # the lock — these signal tasks / do I/O.
+        for m in evicted
+            try; close(m); stop!(m.agent); catch e
+                @warn "evicting chat model on worker disconnect" exception=e
+            end
+        end
         # The worker host is gone → its eval workers (and their bridges) are gone.
         # Tear them down explicitly outside the lock (close asset host is I/O); a
         # WS drop alone no longer does this — the bridge follows the worker session.
@@ -445,13 +459,18 @@ workers; closing the control WS here just hangs up the current link.
 function remove_worker!(state::ServerState, worker_id::AbstractString;
                          remove_projects::Bool = true)
     wid = String(worker_id)
-    ws, dropped = lock(state.lock) do
+    ws, dropped, evicted, affected = lock(state.lock) do
         sock = get(state.worker_control_ws, wid, nothing)
         delete!(state.worker_control_ws, wid)
         delete!(state.workers[], wid)
-        dropped = String[]
+        dropped  = String[]
+        evicted  = ChatModel[]
+        affected = String[]
         for p in collect(values(state.projects[]))
             p.worker_id == wid || continue
+            push!(affected, p.id)
+            m = get(state.chat_models, p.id, nothing)
+            m === nothing || push!(evicted, m)
             delete!(state.chat_models, p.id)
             if remove_projects
                 delete!(state.projects[], p.id)
@@ -460,7 +479,21 @@ function remove_worker!(state::ServerState, worker_id::AbstractString;
         end
         save_workers!(state)
         remove_projects && save_projects!(state)
-        (sock, dropped)
+        (sock, dropped, evicted, affected)
+    end
+    # Close evicted models so their consumer + background poller don't leak (see
+    # teardown_worker_control!). Outside the lock — close()/stop! signal tasks.
+    for m in evicted
+        try; close(m); stop!(m.agent); catch e
+            @warn "evicting chat model on worker removal" exception=e
+        end
+    end
+    # The worker host is gone → its eval-bridge workers AND host-side wiring
+    # (EVAL_WORKERS / BRIDGE_ATTACHED / MOUNTS) are dead. Tear them down for every
+    # affected project so they don't leak — the worker-DISCONNECT path does this
+    # too; explicit removal must not skip it. Idempotent.
+    for pid in affected
+        teardown_eval_bridge!(state, pid)
     end
     # Close the control WS outside the lock — it's network I/O, and closing it
     # ends the worker's `handle_worker_control` receive loop (its `finally`

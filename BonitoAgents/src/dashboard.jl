@@ -427,8 +427,8 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     end
     # close is idempotent + total now; a real error here is worth surfacing.
     # `close(model)` (T4) closes `user_messages`, ending the `run_chat!` consumer
-    # AND the 1 Hz background poller — without it both leak forever, keeping the
-    # ChatModel alive via the `BG_POLLERS` IdDict. Close the model BEFORE the
+    # AND the 1 Hz background poller — without it both leak forever, the running
+    # `poller_task` keeping the ChatModel referenced. Close the model BEFORE the
     # client so the consumer's `for … in user_messages` exits cleanly rather
     # than erroring on a torn-down client mid-turn.
     if model !== nothing

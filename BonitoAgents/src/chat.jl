@@ -84,6 +84,23 @@ mutable struct ChatModel
     # the ACP client, not the consumer). Shared across per-session views.
     consumer_task::Ref{Union{Task,Nothing}}
 
+    # The per-chat background-output poller task (the taskbar's server-side
+    # bookkeeping loop — walks this chat's live bg items every second). A FIELD,
+    # not a global registry: its lifetime is the chat's, so a closed/dropped chat
+    # takes it with it. There is no global IdDict to leak (the old design pinned
+    # every chat alive and had to be hand-drained on each teardown path).
+    poller_task::Ref{Union{Task,Nothing}}
+
+    # Restart coordination, per shared chat. Fields, not `IdDict{ChatModel}`
+    # globals: `restart_gen` (the old global was bumped per restart and NEVER
+    # deleted → it pinned every restarted chat's model forever) and
+    # `restart_inflight` (one bring-up worker at a time) live and die with the
+    # chat. `restart_lock` guards the brief read-test-set (held only there, never
+    # across the seconds-long bring-up). See `restart_chat_session!`.
+    restart_inflight::Base.RefValue{Bool}
+    restart_gen::Base.RefValue{Int}
+    restart_lock::ReentrantLock
+
     # Backreference for per-session copies. `nothing` for the shared parent;
     # points back to it for any `copy(model, session)` view so writes to the
     # broadcast observables reach every tab via the parent→child bridges.
@@ -174,6 +191,10 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         busy_active,
         Observable(Any[]),          # session_meta
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
+        Ref{Union{Task,Nothing}}(nothing),   # poller_task
+        Ref(false),                 # restart_inflight
+        Ref(0),                     # restart_gen
+        ReentrantLock(),            # restart_lock
         nothing,                    # parent: this is the shared instance itself
         Dict{String,Vector}(),      # tool_content_cache
         nothing,                    # plotpane: window-scoped, set per session view
@@ -210,6 +231,10 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.busy_active),
             map(identity, session, m.session_meta),
             m.consumer_task,           # shared → only the parent runs the loop
+            m.poller_task,             # shared → one poller per chat
+            m.restart_inflight,        # shared → one restart coordinator per chat
+            m.restart_gen,
+            m.restart_lock,
             m,    # parent → the shared instance we copied from
             m.tool_content_cache,      # shared Dict; per-tab views see same RAM cache
             nothing,                   # plotpane: per WINDOW — ChatPaneRef sets it
@@ -2344,26 +2369,18 @@ const BG_QUIESCE_SECS = 20.0
 # global cadence constant — the 1 s sleep is inline, the task's
 # lifetime is the chat's, and a closed chat takes its poller with it.
 #
-# We use an IdDict keyed on the shared model rather than a field so the
-# struct layout stays stable (= no precompile rebuild). Lookups are
-# O(1) and the dict only ever has one entry per live chat.
-const BG_POLLERS         = IdDict{ChatModel,Task}()
-const BG_POLLERS_GC_LOCK = ReentrantLock()
-
+# The poller lives on `shared(model).poller_task` (a field), so its lifetime is
+# the chat's — no global registry pinning every chat alive and no per-teardown
+# hand-draining. Idempotent: a still-running poller is left alone; a finished one
+# (the chat closed and `background_poll_loop`'s `while isopen(user_messages)`
+# guard exited) is replaced. The check-and-set runs under the model lock so two
+# concurrent `start_chat_client!`s can't spawn two pollers.
 function start_background_poller!(state::ServerState, model::ChatModel)
     s = shared(model)
-    lock(BG_POLLERS_GC_LOCK) do
-        existing = get(BG_POLLERS, s, nothing)
+    lock(s.lock) do
+        existing = s.poller_task[]
         existing === nothing || istaskdone(existing) || return  # already live
-        BG_POLLERS[s] = Base.errormonitor(@async begin
-            try
-                background_poll_loop(state, s)
-            finally
-                lock(BG_POLLERS_GC_LOCK) do
-                    delete!(BG_POLLERS, s)
-                end
-            end
-        end)
+        s.poller_task[] = Base.errormonitor(@async background_poll_loop(state, s))
         return nothing
     end
     return nothing
@@ -2615,10 +2632,10 @@ end
 # Tear a ChatModel's long-lived tasks down (T4). Closing `user_messages` ends
 # the `run_chat!` consumer (its `for … in chat.user_messages` loop exits on a
 # closed channel) AND signals `background_poll_loop` to exit (its
-# `while isopen(model.user_messages)` guard) — so the 1 Hz poller stops and
-# `start_background_poller!`'s `finally` drops the `BG_POLLERS` entry, releasing
-# the last strong ref to the ChatModel. We resolve to the shared parent so a
-# per-session view never half-closes the real model.
+# `while isopen(model.user_messages)` guard) — so the 1 Hz poller stops and its
+# `model.poller_task` finishes, releasing the running task's ref to the model.
+# We resolve to the shared parent so a per-session view never half-closes the
+# real model.
 #
 # Idempotent: closing an already-closed channel is a no-op (we guard `isopen`),
 # and `stop_session!` may run more than once for the same project.
@@ -3131,28 +3148,17 @@ function start_chat_client!(model::ChatModel)
     return nothing
 end
 
-# Serializer for `restart_chat_session!` — keyed on the SHARED parent
-# ChatModel (so per-session views funnel to one gate). Two concurrent
-# restart calls would otherwise both close(old_client), both wait, both
-# call start_chat_client! — at best one of them losing its newly-spawned
-# client into the wind, at worst deadlocking because each blocks the
-# consumer task's `sweep_turn_orphans!` from acquiring `model.lock`. The
-# module-level IdDict avoids adding a struct field — restart is rare
-# (user click) so an IdDict lookup per call is fine; the entry lifetime
-# is one restart so no GC pressure either. The companion `RESTART_LOCK`
-# guards the dict itself across the read-test-set sequence.
-const RESTART_LOCK   = ReentrantLock()
-const RESTART_INFLIGHT = IdDict{ChatModel,Bool}()
-# Monotonic "restart requested" counter per shared model. Every
-# `restart_chat_session!` call bumps it; the single in-flight worker re-runs the
-# bring-up until it has satisfied the LATEST request. This is what makes rapid
-# provider switches correct: a switch that lands while an earlier switch's
-# restart is still running used to be COALESCED AWAY (the old code just waited
-# for the in-flight one and returned), so the session came up on the *previous*
-# provider while the header showed the new one — e.g. OpenCode selected but
-# MiMo's models in the picker. Now the worker loops and brings up the latest
-# `transport.provider`, so the final session always matches the last switch.
-const RESTART_GEN = IdDict{ChatModel,Int}()
+# Restart coordination lives on the shared ChatModel (`restart_inflight`,
+# `restart_gen`, `restart_lock` fields), so per-session views funnel to one gate
+# and the state dies with the chat. Two concurrent restart calls would otherwise
+# both close(old_client), both wait, both call start_chat_client! — at best one
+# losing its newly-spawned client, at worst deadlocking because each blocks the
+# consumer task's `sweep_turn_orphans!` from acquiring `model.lock`. `restart_lock`
+# guards the brief read-test-set; `restart_inflight` elects the single worker; and
+# `restart_gen` is the monotonic "restart requested" counter — every call bumps it
+# and the in-flight worker re-runs the bring-up until it has satisfied the LATEST
+# request, so a rapid provider switch can't be coalesced away (which used to bring
+# the session up on the *previous* provider while the header showed the new one).
 
 # One bring-up cycle: tear the old client down and spin a fresh one from the
 # CURRENT `model.agent` (so it reflects the latest provider). Errors are
@@ -3209,18 +3215,18 @@ function restart_chat_session!(model::ChatModel)
     # finishing — and wait (bounded) for it to settle. Otherwise WE are the
     # worker. Concurrent restarts must never both `close(old)`/`start_chat_client!`
     # (lost client / consumer-lock deadlock), so exactly one worker runs at a time.
-    iam_worker = lock(RESTART_LOCK) do
-        RESTART_GEN[s] = get(RESTART_GEN, s, 0) + 1
-        if get(RESTART_INFLIGHT, s, false)
+    iam_worker = lock(s.restart_lock) do
+        s.restart_gen[] += 1
+        if s.restart_inflight[]
             false
         else
-            RESTART_INFLIGHT[s] = true
+            s.restart_inflight[] = true
             true
         end
     end
     if !iam_worker
         deadline = time() + 20.0
-        while time() < deadline && lock(RESTART_LOCK) do; get(RESTART_INFLIGHT, s, false); end
+        while time() < deadline && lock(() -> s.restart_inflight[], s.restart_lock)
             sleep(0.02)
         end
         return nothing
@@ -3230,11 +3236,11 @@ function restart_chat_session!(model::ChatModel)
         # requested (generation bumped) while we were bringing one up, go again
         # so the FINAL session reflects the last switch's provider.
         while true
-            target = lock(RESTART_LOCK) do; RESTART_GEN[s]; end
+            target = lock(() -> s.restart_gen[], s.restart_lock)
             bring_up_once!(model)
-            done = lock(RESTART_LOCK) do
-                if RESTART_GEN[s] == target
-                    delete!(RESTART_INFLIGHT, s)
+            done = lock(s.restart_lock) do
+                if s.restart_gen[] == target
+                    s.restart_inflight[] = false
                     true
                 else
                     false   # a newer request arrived mid-restart — run again
@@ -3246,7 +3252,7 @@ function restart_chat_session!(model::ChatModel)
         # Defensive: never leave the in-flight flag stuck (would wedge all future
         # restarts). bring_up_once! already swallows bring-up errors, so this only
         # fires on something truly unexpected.
-        lock(RESTART_LOCK) do; delete!(RESTART_INFLIGHT, s); end
+        lock(() -> (s.restart_inflight[] = false), s.restart_lock)
         rethrow()
     end
     return nothing

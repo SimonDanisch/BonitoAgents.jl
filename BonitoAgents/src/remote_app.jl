@@ -60,8 +60,14 @@ function send_tagged(eb::EvalBridge, tag::UInt8, payload::AbstractVector{UInt8})
     @inbounds buf[1] = tag
     copyto!(buf, 2, payload, firstindex(payload), length(payload))
     lock(eb.wlock) do
+        ws = eb.ws
+        # Bridge torn down (worker session ended / restart!): `ws === nothing` — a
+        # late browser→worker frame has nowhere to go. Drop it silently; without
+        # this guard `send(::Nothing, …)` throws a MethodError that the catch turns
+        # into a scary "frame send failed" warning on every teardown frame.
+        ws === nothing && return
         try
-            HTTP.WebSockets.send(eb.ws, buf)
+            HTTP.WebSockets.send(ws, buf)
         catch e
             # The expected failure here is a send racing the dial-back socket
             # dropping/swapping. Anything else is real signal — `@debug` would
