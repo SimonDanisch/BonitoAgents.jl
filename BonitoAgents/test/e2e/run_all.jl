@@ -50,6 +50,7 @@ const SUITES = [
     "app_stress.jl",         # heavy: 100× detach/close/switch cycle on a live embed
     "app_interactive.jl",    # two live apps; clicks round-trip to Julia + independence
     "app_multi.jl",          # three apps: detach all, drive each while floating, close 1-by-1
+    "app_tabs.jl",           # dock app floats into the chat group as TABS: switch + close
     "cross_worker.jl",       # kills a SECOND worker (main untouched) — safe here
     "worker_lifecycle.jl",   # DESTRUCTIVE: kills the MAIN worker — MUST be last
 ]
