@@ -44,6 +44,7 @@ deadlock and not server-side). Running the flood early isolates its real target
 | `chat_features.jl`    | streaming accumulation, markdown (h1/ul/pre/strong/a), responsive layout (480/1280), multi-chat switching |
 | `embedded_app.jl`     | `bt_show_app` dial-back eval bridge + embedded frame render            |
 | `app_stress.jl`       | bt_show_app moved bubble↔float 100×, chat-switch round-trips, asserting the SAME live node survives every move via a preserved counter; no orphan nodes, no JS errors |
+| `app_interactive.jl`  | TWO live bt_show_apps at once; clicking each runs its Julia `map` in the worker (output = 7×clicks / 100+clicks, never computed in JS) and the DOM reflects the round-tripped value; the two apps stay independent |
 | `scroll_persist.jl`   | new content follows to bottom (followMode), overflow, history survives a browser reconnect |
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |
