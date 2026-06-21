@@ -47,6 +47,7 @@ const SUITES = [
     "scroll_persist.jl",
     "embedded_app.jl",       # heavy: Malt worker cold start + Bonito load
     "app_detach.jl",         # heavy: two embedded apps
+    "app_stress.jl",         # heavy: 100× detach/close/switch cycle on a live embed
     "cross_worker.jl",       # kills a SECOND worker (main untouched) — safe here
     "worker_lifecycle.jl",   # DESTRUCTIVE: kills the MAIN worker — MUST be last
 ]
