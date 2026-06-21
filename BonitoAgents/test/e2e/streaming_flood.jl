@@ -49,13 +49,15 @@ function run_suite(server)
         end
         @test ok == true
         @test serverlen() == 502
-        # And the browser virtual-scroll agrees (the wire events all arrived).
-        # Under the shared runner this chat is the Nth in a long soak, so the 500
-        # wire events take longer to drain into the browser than on a cold server
-        # — give the catch-up room (still far short of the pre-fix hang, which
-        # never reaches 502 at all).
+        # And the browser virtual-scroll agrees (the wire events all arrived). The
+        # runner schedules this suite EARLY (2nd, near-empty session) so the 500-row
+        # burst paints in ~1–2s — see the ordering note in run_all.jl. A tight
+        # budget is therefore the right detector (the pre-fix hang NEVER reaches
+        # 502; a wedge here would blow this budget). Run late, an unrelated
+        # client-side accumulation bug makes the same burst take minutes — which is
+        # exactly why it runs early.
         @test TK.wait_for(server, "browser totalCount",
-            "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.totalCount>=502; })()"; timeout = 40) == true
+            "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.totalCount>=502; })()"; timeout = 20) == true
     end
     return server
 end

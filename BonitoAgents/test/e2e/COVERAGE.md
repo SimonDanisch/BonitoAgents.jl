@@ -10,6 +10,32 @@ directly (an internal API). Each `../electron/` test is deleted once a suite
 here covers its behaviour; what is still listed in `../electron/runtests.jl`
 is the remaining backlog.
 
+## Runner guarantees (`run_all.jl`)
+
+- ONE dev server + browser + mock agent for ALL suites (a soak; state accumulates
+  by design). Each `run_suite(server)` swaps the shared agent callback and drives
+  the one DOM page.
+- **No-JS-errors gate**: after every suite the runner samples the error sink
+  (`window.onerror` + `unhandledrejection`, installed in `open_browser`) and
+  asserts it empty, attributed to that suite, then clears it. Driving the real DOM
+  is only worth it if we also notice when the DOM throws.
+- **Un-hangable**: every bridge round-trip (`eval_js`, `js_errors`,
+  `clear_js_errors`) is watchdog-bounded and throws a typed `BridgeTimeout`;
+  `wait_for` treats a busy poll as "not yet" and retries within its own budget. A
+  pegged renderer can never hang the run.
+- **Resilient**: a suite that fails is recorded and the soak CONTINUES — the leak
+  audit still runs, and the failure is re-surfaced as a final failing testset.
+- **Leak audit** at the end asserts server-side bounds (models / pollers /
+  mock subprocs / worker-ws / pending) and logs the counts.
+
+## Known product bug surfaced by the soak
+
+`streaming_flood.jl` runs EARLY (2nd) on purpose. A large message burst paints in
+~1–2s on the first chats but the renderer WEDGES by ~chat #3 once many messages are
+mounted (cost ≈ mounted × streamed — a client-side cross-chat accumulation, not a
+deadlock and not server-side). Running the flood early isolates its real target
+(the `deliver_update!` deadlock regression) from this separate, still-open bug.
+
 ## Suites
 
 | File                  | Covers                                                                 |

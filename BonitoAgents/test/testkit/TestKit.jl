@@ -51,7 +51,8 @@ export TestServer, dev_server, add_worker!,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
        exit_success,
-       screenshot, eval_js, wait_for, current_chat_id
+       screenshot, eval_js, wait_for, current_chat_id,
+       js_errors, clear_js_errors
 
 # ── Event DSL ──────────────────────────────────────────────────────────────
 # Each constructor returns a small `Dict` carrying the event type + payload.
@@ -565,12 +566,24 @@ Run JavaScript in the browser; the value of the last expression is
 returned to Julia (via Electron's JSON bridge). Long-running JS should
 return primitive types only — no DOM refs.
 """
+# Thrown when the Electron bridge doesn't answer within the per-call watchdog.
+# TYPED so `wait_for` can tell "bridge was busy for THIS poll" (retry within its
+# own budget) apart from a real JS/bridge error (rethrow). A bare `error()` would
+# force string-matching at the catch site.
+struct BridgeTimeout <: Exception
+    secs::Float64
+    code::String
+end
+Base.showerror(io::IO, e::BridgeTimeout) =
+    print(io, "eval_js timed out after $(e.secs)s (Electron bridge wedged?): ",
+          first(replace(e.code, r"\s+" => " "), 90))
+
 function eval_js(s::TestServer, code::AbstractString; timeout::Real = 20)
     ctx = s.browser[]
     ctx === nothing && error("open_browser first")
     # Hard-bound the bridge round-trip: a wedged/overloaded Electron renderer (e.g.
     # right after a 500-message flood) must NEVER hang the harness. If the bridge
-    # doesn't answer in `timeout`s we throw — the suite fails fast instead of the
+    # doesn't answer in `timeout`s we throw — the caller fails fast instead of the
     # whole run deadlocking. (This is the foundation that makes `wait_for` — and
     # therefore every suite — impossible to deadlock.)
     res = Ref{Any}(nothing); ex = Ref{Any}(nothing); done = Ref(false)
@@ -581,10 +594,48 @@ function eval_js(s::TestServer, code::AbstractString; timeout::Real = 20)
     end
     t0 = time()
     while !done[] && time() - t0 < timeout; sleep(0.02); end
-    done[] || error("eval_js timed out after $(timeout)s (Electron bridge wedged?): " *
-                    first(replace(String(code), r"\s+" => " "), 90))
+    done[] || throw(BridgeTimeout(Float64(timeout), String(code)))
     ex[] === nothing || throw(ex[])
     return res[]
+end
+
+"""
+    js_errors(s) -> Vector
+
+JavaScript errors captured by the sink installed in `open_browser`
+(`window.onerror` + `unhandledrejection`), since the last `clear_js_errors`.
+Each entry has `type`/`message` (and maybe `filename`/`lineno`). A non-empty
+result means the UI threw during the run — a real bug, not test noise. The
+runner gates every suite on this being empty.
+"""
+function js_errors(s::TestServer)
+    s.browser[] === nothing && return Any[]
+    # Route through the WATCHDOG eval_js, not ECT.js_errors (whose eval is
+    # unbounded): the gate runs right after a suite, and a suite that pegged the
+    # renderer (e.g. the 500-row flood) would otherwise hang the gate — and thus
+    # the whole runner — waiting for the paint to finish. Bounded: a pegged
+    # renderer makes this throw BridgeTimeout, which the runner treats as
+    # "couldn't sample, renderer busy" rather than a hang.
+    v = eval_js(s, "window.__errs || []"; timeout = 10)
+    return v === nothing ? Any[] : v
+end
+
+"""
+    clear_js_errors(s)
+
+Reset the JS error sink. The runner calls this between suites so an error is
+attributed to the suite that actually caused it.
+"""
+function clear_js_errors(s::TestServer)
+    s.browser[] === nothing && return nothing
+    # Bounded + best-effort (same reasoning as js_errors): if the renderer is
+    # pegged the sink simply clears once it frees; never hang the runner on it.
+    try
+        eval_js(s, "window.__errs = []; true"; timeout = 10)
+    catch e
+        e isa BridgeTimeout || rethrow()
+    end
+    return nothing
 end
 
 """
@@ -618,8 +669,21 @@ function wait_for(s::TestServer, label::AbstractString, predicate::AbstractStrin
                    timeout::Real = 8, interval::Real = 0.1)
     t0 = time()
     code = "(() => { try { return " * String(predicate) * "; } catch (e) { return false; } })()"
+    # Per-poll bound is SHORT (≤5s): if the renderer is momentarily pinned (e.g.
+    # synchronously rendering a 500-row flood) THIS poll's round-trip is abandoned
+    # and we retry within `timeout`, instead of one 20s round-trip eating the whole
+    # budget — or worse, throwing and aborting the suite. A genuinely dead bridge
+    # makes every poll BridgeTimeout, so we still exhaust `timeout` and throw below
+    # (bounded detector intact). Only the bridge-timeout is swallowed; a real
+    # eval/bridge error rethrows.
+    poll = min(Float64(timeout), 5.0)
     while time() - t0 < timeout
-        v = eval_js(s, code)
+        v = try
+            eval_js(s, code; timeout = poll)
+        catch e
+            e isa BridgeTimeout || rethrow()
+            nothing
+        end
         v in (false, nothing) || return v
         sleep(interval)
     end

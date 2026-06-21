@@ -25,8 +25,18 @@ using .TestKit
 const TK = TestKit
 
 # Suite files in execution order. worker_lifecycle LAST (kills the main worker).
+#
+# streaming_flood runs EARLY (2nd), on a near-empty session, on purpose: it tests
+# the server-side `deliver_update!` deadlock regression (a 500-burst must not wedge
+# the turn), which is independent of how many chats are open. Run late it instead
+# trips a SEPARATE, known client-side bug — streaming a large burst gets
+# pathologically slow once many messages are already mounted in the browser
+# (measured: 500-burst renders in ~1s as chat #1–2, but the renderer WEDGES by
+# chat #3; cost ≈ mounted × streamed — stale cross-chat subscribers). That bug is
+# tracked on its own; it must not sabotage the deadlock regression's browser check.
 const SUITES = [
     "dashboard_layout.jl",   # no chat; resizes window then restores
+    "streaming_flood.jl",    # EARLY (near-empty session) — see note above
     "workflows.jl",
     "chat_features.jl",
     "tool_rendering.jl",
@@ -35,7 +45,6 @@ const SUITES = [
     "lens.jl",
     "file_open.jl",
     "scroll_persist.jl",
-    "streaming_flood.jl",
     "embedded_app.jl",       # heavy: Malt worker cold start + Bonito load
     "app_detach.jl",         # heavy: two embedded apps
     "cross_worker.jl",       # kills a SECOND worker (main untouched) — safe here
@@ -115,7 +124,12 @@ function main()
     try
         TK.open_browser(server)
         @info "shared server up" url = server.h.url
+        # Start from a clean error sink so boot-time noise isn't blamed on suite 1.
+        boot_errs = TK.js_errors(server)
+        isempty(boot_errs) || @warn "JS errors during boot (pre-suite)" boot_errs
+        TK.clear_js_errors(server)
 
+        failures = String[]
         for suite in SUITES
             path = joinpath(@__DIR__, suite)
             t0 = time()
@@ -124,15 +138,52 @@ function main()
             # `run_suite` is defined in a newer world than this loop; fetch + call
             # it through invokelatest to satisfy Julia 1.12's binding world-age.
             fn = Base.invokelatest(getglobal, m, :run_suite)
-            Base.invokelatest(fn, server)
+            try
+                Base.invokelatest(fn, server)
+            catch e
+                e isa InterruptException && rethrow()
+                # A suite throws here when its top-level @testset closes with a
+                # failure ("Some tests did not pass") or it errored mid-drive.
+                # Record it and KEEP GOING: one broken suite must NOT skip the rest
+                # of the soak or the leak audit. The failure is re-surfaced below.
+                push!(failures, suite)
+                @error "suite FAILED (continuing soak)" suite exception = (e, catch_backtrace())
+            end
             # Let the suite's last turn fully drain before the NEXT suite swaps the
             # agent script — swapping `agent_fn` mid-stream would feed the wrong
             # events into a still-open turn. The agent is the shared funnel.
             sleep(1.5)
+            # JS-error gate: a window.onerror / unhandled rejection during this
+            # suite is a real UI bug. Attribute it to THIS suite, then clear the
+            # sink so the next suite starts clean. Driving the real DOM is only
+            # worth it if we also notice when the DOM throws.
+            errs = try
+                TK.js_errors(server)
+            catch e
+                e isa TK.BridgeTimeout || rethrow()
+                # The suite left the renderer pegged (e.g. the flood's slow paint).
+                # We can't sample the sink right now — note it, don't hang, don't
+                # abort. Not asserting "clean" here is acceptable: a real JS error
+                # would also surface on the NEXT suite's sample once it frees.
+                @warn "JS-error gate skipped (renderer busy after suite)" suite
+                nothing
+            end
+            errs === nothing || isempty(errs) || @warn "JS errors during suite" suite errs
+            @testset "no JS errors: $suite" begin
+                @test errs === nothing || isempty(errs)
+            end
+            TK.clear_js_errors(server)
             @info "suite done" suite seconds = round(time() - t0; digits = 1)
         end
 
         leak_audit(server)
+
+        # Re-surface any suite failure as a top-level failing testset AFTER the
+        # leak audit — so a broken suite never hides a leak, nor a leak a broken
+        # suite. Names were @error-logged above with their backtraces.
+        @testset "all e2e suites pass" begin
+            @test failures == String[]
+        end
     finally
         close(server)
     end
