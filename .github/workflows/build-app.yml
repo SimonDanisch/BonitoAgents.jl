@@ -50,9 +50,9 @@ jobs:
             os: macos
             arch: aarch64
             bundle: tarball
-          - runner: macos-13
+          - runner: macos-15-intel
             os: macos
-            arch: x86_64
+            arch: x64
             bundle: tarball
           - runner: ubuntu-latest
             os: linux
