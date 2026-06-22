@@ -28,8 +28,11 @@ import JSON
     p2 = mk("p2", "ProjB", wid)
     p3 = mk("p3", "Other", "worker-2")        # different worker → must survive
     for p in (p1, p2, p3); st.projects[][p.id] = p; end
-    st.chat_models["p1"] = :fake_model_1
-    st.chat_models["p3"] = :fake_model_3
+    # Real ChatModels (not Symbol stand-ins): worker eviction now close()s each
+    # model and stop!s its agent, which needs the real type. A never-started model
+    # (no agent subprocess, no consumer/poller) evicts cleanly.
+    st.chat_models["p1"] = BT.ChatModel(st, mktempdir(); project_id = "p1")
+    st.chat_models["p3"] = BT.ChatModel(st, mktempdir(); project_id = "p3")
     BT.save_workers!(st); BT.save_projects!(st)
 
     notified = Ref(0)
@@ -63,7 +66,7 @@ import JSON
                                        "/home/v/projects", :offline, now(UTC))
     p4 = mk("p4", "Keep", wid2)
     st.projects[][p4.id] = p4
-    st.chat_models["p4"] = :fake_model_4
+    st.chat_models["p4"] = BT.ChatModel(st, mktempdir(); project_id = "p4")
     BT.remove_worker!(st, wid2; remove_projects = false)
     @test !haskey(st.workers[], wid2)
     @test haskey(st.projects[], "p4")              # row kept
@@ -170,7 +173,7 @@ end
     st.projects[][ "pp" ] = BT.ProjectInfo("pp", "Proj", wid,
                                 joinpath(dir, "work", "Proj"),
                                 "/home/u/projects/Proj", now(UTC))
-    st.chat_models["pp"] = :live_model
+    st.chat_models["pp"] = BT.ChatModel(st, mktempdir(); project_id = "pp")
 
     # Sockets are compared by `===`, so any two distinct objects stand in for
     # two real WebSockets here.

@@ -37,8 +37,13 @@ function run_suite(server)
         TK.send_message(server, "make a plan")
 
         @testset "live todo is a pinned panel, not a chat bubble" begin
+            # FIRST render after the first send — on the cold standalone path (fresh
+            # dev_server + electron + mock-agent spawn + first ACP turn), this is
+            # slow in CI. Give it a cold-start budget like the other suites' first
+            # wait (workflows 10s, chat_features 30s, …); the waits below run warm,
+            # so they stay tight.
             @test TK.wait_for(server, "taskbar todo panel",
-                "document.querySelector('.bt-taskbar-todo') !== null"; timeout = 6) == true
+                "document.querySelector('.bt-taskbar-todo') !== null"; timeout = 20) == true
             @test TK.wait_for(server, "panel lists both items",
                 "document.querySelectorAll('.bt-taskbar-todo-item').length >= 2"; timeout = 6) == true
             # While live there is no finalized plan bubble in the chat.
