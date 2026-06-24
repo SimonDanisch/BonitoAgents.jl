@@ -67,4 +67,10 @@ export AgentProvider, BinAgent, WorkerAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent
 export start!, stop!, client, switch_provider!
 
+# Bake the real browser-driven paths captured from the e2e suite: literal
+# `precompile(...)` calls (see BonitoAgentsApp/precompile/) that run during
+# precompilation and land in this package's pkgimage. Regenerate with
+# precompile/generate.jl. Guarded so a fresh checkout without a capture still loads.
+isfile(joinpath(@__DIR__, "precompile_statements.jl")) && include("precompile_statements.jl")
+
 end # module BonitoAgents

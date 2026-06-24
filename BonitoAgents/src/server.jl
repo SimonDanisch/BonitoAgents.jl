@@ -97,7 +97,11 @@ function serve(; host::String        = "0.0.0.0",
     # every chat's msgs_store" mismatch with the taskbar's per-chat
     # mental model. See `start_background_poller!` in chat.jl.
 
-    @info "BonitoAgents dashboard running" url=Bonito.online_url(srv, "") state=sd
+    # Show the SAME canonical url the UI + worker-install snippet use (`base_url`
+    # = the configured --public-url, or the detected address) — not the bind-based
+    # `online_url(srv)` (0.0.0.0/localhost), which mismatched the dashboard's
+    # "add worker" url whenever --public-url was set.
+    @info "BonitoAgents dashboard running" url=base_url state=sd
     @info "Worker install — run on each agent machine" *
           "\n    Linux / macOS  : curl -fsSL $base_url/install | sh" *
           "\n    Windows (PS)   : irm $base_url/install | iex"

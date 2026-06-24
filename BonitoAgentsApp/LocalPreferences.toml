@@ -3,6 +3,8 @@ bundler = "juliaimg"
 windowed = true
 juliaimg_precompile = true
 juliaimg_incremental = false
+juliaimg_strip_debug = true
+juliaimg_strip_docs = true
 selfsign = true
 
 app_name = "BonitoAgents"
