@@ -85,30 +85,6 @@ function seed_temp_env_with_bonito!(env_dir::AbstractString)
     end
 end
 
-# A shared env that pins the SAME Bonito the host runs (the proxy-aware dev
-# Bonito with `proxy_send` / `id_prefix`). Stacked onto every eval worker's
-# LOAD_PATH (see `start!`) so a Malt worker's `using Bonito` resolves to it for
-# the bt_show_app bridge even when the PROJECT env doesn't pin Bonito — without
-# it, `using Bonito` falls through to a *registered* Bonito in the global depot
-# that lacks the remote-app API, so `RemoteProxy.ensure_bridge!` throws
-# `UndefVarError: proxy_send` and the embed shows "(eval session not connected)".
-# Inserted AFTER the active project, so a project that DOES pin its own Bonito
-# still wins; this only beats the global-depot fallback. Created once, lazily.
-const BRIDGE_BONITO_ENV = Ref{Union{String,Nothing}}(nothing)
-const BRIDGE_BONITO_LOCK = ReentrantLock()
-
-function bridge_bonito_env()
-    @lock BRIDGE_BONITO_LOCK begin
-        BRIDGE_BONITO_ENV[] === nothing || return BRIDGE_BONITO_ENV[]
-        bonito_path = _find_bonito_path()
-        bonito_path === nothing && return nothing
-        env_dir = mktempdir(prefix = "bonitoagents-bridge-bonito-")
-        seed_temp_env_with_bonito!(env_dir) || return nothing
-        BRIDGE_BONITO_ENV[] = env_dir
-        return env_dir
-    end
-end
-
 # ── JuliaSession ────────────────────────────────────────────────────────────
 mutable struct JuliaSession
     env_path::Union{String,Nothing}
@@ -143,6 +119,18 @@ function JuliaSession(env_path;
 end
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
+
+# Env overrides for the eval worker so it behaves like a bare
+# `julia --project=env_path`. The BonitoAgentsApp bundle launcher exports a fixed
+# `JULIA_LOAD_PATH` (bundle project + stdlib, with NO `@`); Malt workers inherit
+# the parent env, so without this override the worker resolves packages against
+# the BUNDLE's project and ignores `--project=env_path` entirely. Malt's `env`
+# kwarg can only SET vars (it routes through `Base.byteenv`, which can't express
+# removal), so we reset `JULIA_LOAD_PATH` to Julia's documented default — exactly
+# what an un-set `JULIA_LOAD_PATH` would yield: `@` (the active project, i.e.
+# env_path via --project), `@v#.#` (shared default env), `@stdlib`.
+const DEFAULT_LOAD_PATH = join(["@", "@v#.#", "@stdlib"], Sys.iswindows() ? ";" : ":")
+worker_env() = ["JULIA_LOAD_PATH" => DEFAULT_LOAD_PATH]
 
 # Build the exeflags vector. Handles juliaup `+channel` syntax + custom flags.
 function build_exeflags(env_path, julia_cmd)::Vector{String}
@@ -307,6 +295,7 @@ function start!(s::JuliaSession)
     s.worker = Malt.Worker(
         monitor_stdout = false,
         monitor_stderr = false,
+        env            = worker_env(),
         exeflags       = build_exeflags(s.env_path, s.julia_cmd),
     )
     # Background pumps drain worker stdout/stderr into our buffer (and tee
@@ -315,30 +304,12 @@ function start!(s::JuliaSession)
     s.stdout_pump = Threads.@spawn pump_pipe!(s, s.worker.stdout)
     s.stderr_pump = Threads.@spawn pump_pipe!(s, s.worker.stderr)
 
-    # Stack the host's proxy-aware Bonito onto the worker's LOAD_PATH as a
-    # FALLBACK only — inserted AFTER the active project but BEFORE the global
-    # depot. A project that declares its OWN Bonito (position 1) always wins, so
-    # plain `bt_julia_eval` keeps using the project's Bonito exactly as the
-    # user's env dictates; we never override it. The fallback ONLY kicks in when
-    # the project declares no Bonito — there `using Bonito` would otherwise
-    # resolve a *registered* depot Bonito that lacks the remote-app API
-    # (`proxy_send`) and breaks bt_show_app; the bridge env (same source as the
-    # server, freshly resolved) is the right thing to use instead. Only
-    # `using Bonito` is affected (the env declares no other deps).
-    #
-    # NOTE: a project that DOES pin Bonito but with a STALE Manifest (e.g.
-    # "Bonito does not have PrecompileTools in its dependencies") still wins and
-    # still fails — by design, we don't silently swap the project's pinned
-    # Bonito. That precompile error now surfaces via bt_show_app's dial_error;
-    # the fix is to re-resolve the project (`Pkg.resolve()`), since plain eval
-    # `using Bonito` is broken there too.
-    let be = bridge_bonito_env()
-        be === nothing || try
-            Malt.remote_eval_fetch(s.worker, :(insert!(LOAD_PATH, min(2, length(LOAD_PATH)+1), $be); nothing))
-        catch e
-            @warn "start!: could not stack the proxy Bonito env on the worker LOAD_PATH" exception = e
-        end
-    end
+    # The worker is a plain `julia --project=env_path`: `--project` sets the env,
+    # and `worker_env()` resets JULIA_LOAD_PATH to Julia's default so the inherited
+    # bundle JULIA_LOAD_PATH can't shadow it (see worker_env). Packages resolve
+    # exactly as the user's env dictates — we do NOT stack any extra entry. If
+    # bt_show_app needs a proxy-aware Bonito, the project's env must declare it
+    # (surfaced as a dial_error otherwise); we never silently inject a Bonito.
 
     # Auto-Revise (best-effort) + load our format helper. The trailing
     # `; nothing` is load-bearing: include() returns the module object and
