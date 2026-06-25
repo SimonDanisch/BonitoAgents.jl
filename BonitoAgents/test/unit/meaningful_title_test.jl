@@ -1,0 +1,154 @@
+@testitem "unit:meaningful_title" tags = [:unit] begin
+
+# Regression suite for `meaningful_title`: extracts a sidebar/dashboard
+# label from the user's FIRST prompt of a chat. claude-agent-acp +
+# Claude Code's slash-command machinery wrap that prompt in a stack of
+# context tags (`<ide_selection>`, `<local-command-*>`, `<command-name>`,
+# `<system-reminder>`, …) which used to leak into the title — every
+# dashboard card opening with `<ide_selection>The user selected lines
+# 1 to 264 from foo.jl …`. This test pins each pattern the user has
+# seen in the wild (see the screenshot from 2026-06-09 for the trigger)
+# and the structural variants the regex has to tolerate (attributes,
+# self-closing, multiline content, multiple consecutive wrappers).
+
+using Test
+import BonitoAgents
+meaningful_title(x) = BonitoAgents.meaningful_title(x)
+
+@testset "meaningful_title — strips claude-agent-acp wrappers" begin
+
+    @testset "raw prompts pass through unchanged" begin
+        @test meaningful_title("Why is the sky blue?") == "Why is the sky blue?"
+        @test meaningful_title("  trim me  ")          == "trim me"
+        @test meaningful_title("multi\nline\nprompt")  == "multi line prompt"  # whitespace collapsed
+    end
+
+    @testset "paired tag wrappers strip cleanly" begin
+        # The whole vocabulary of paired wrappers we've seen in the wild.
+        # Each gets its block + a real user prompt after.
+        wrappers = [
+            "system-reminder",          # Claude Code reminders
+            "ide_selection",            # VS Code "selected lines N to M from foo.jl"
+            "ide_opened_file",          # VS Code "opened foo.jl in the IDE"
+            "local-command-caveat",     # slash-command leading caveat
+            "local-command-stdout",     # slash-command output
+            "local-command-stderr",
+            "command-name",             # /<slash-command> machinery
+            "command-message",
+            "command-args",
+            "user-prompt-submit-hook",  # bash hooks
+        ]
+        for tag in wrappers
+            input    = "<$tag>some injected content</$tag>\nthe real prompt"
+            @test meaningful_title(input) == "the real prompt"
+        end
+    end
+
+    @testset "slash-command preamble + caveat + stdout + real prompt" begin
+        # The exact pattern Claude Code emits when the user types `/foo bar`:
+        # a stack of paired tags BEFORE the actual prompt text. Pre-fix the
+        # title was the first wrapper's tag + content; we want the prompt.
+        input = string(
+            "<command-name>/model</command-name>",
+            "<command-message>model</command-message>",
+            "<command-args>default</command-args>",
+            "<local-command-stdout>Set model to claude-opus-4-7</local-command-stdout>\n",
+            "lets go again! I restarted",
+        )
+        @test meaningful_title(input) == "lets go again! I restarted"
+    end
+
+    @testset "tag attributes are tolerated" begin
+        # Earlier regex `[A-Za-z][\w-]*\s*>` bailed at the first attribute
+        # space and let the whole opener leak into the title.
+        @test meaningful_title(
+            "<command-args foo=\"bar\"></command-args>\nthe prompt") == "the prompt"
+        @test meaningful_title(
+            "<system-reminder kind=\"todo\">x</system-reminder>\nplease keep going") == "please keep going"
+    end
+
+    @testset "self-closing tags are peeled" begin
+        @test meaningful_title("<command-args/>\nthe rest") == "the rest"
+        @test meaningful_title("<command-args foo=\"x\"/>\nthe rest") == "the rest"
+    end
+
+    @testset "multiline tag bodies are stripped" begin
+        @test meaningful_title("<system-reminder>line1\nline2\nline3</system-reminder>\nthe prompt") ==
+              "the prompt"
+    end
+
+    @testset "consecutive wrappers all peel" begin
+        @test meaningful_title("<a>x</a><b>y</b>real")        == "real"
+        @test meaningful_title("<a>x</a>\n<b>y</b>\nreal")    == "real"
+        @test meaningful_title("<a/><b>y</b><c/>real")        == "real"
+    end
+
+    @testset "bare opener (no closer) ⇒ system commentary, skip" begin
+        # `<ide_selection>The user selected the lines 1 to 264 from foo.jl`
+        # — no closing tag in this variant. Saving this verbatim was the
+        # exact bug in the user's screenshot.
+        @test meaningful_title(
+            "<ide_selection>The user selected the lines 1 to 264 from foo.jl") === nothing
+        # `<ide_opened_file>The user opened …` same shape.
+        @test meaningful_title(
+            "<ide_opened_file>The user opened /sim/foo.jl in the IDE") === nothing
+        # Attributes on the opener-only form must also trigger the skip:
+        @test meaningful_title("<system-reminder kind=\"foo\">no closer here") === nothing
+    end
+
+    @testset "caveat-only prompts skip" begin
+        @test meaningful_title("Caveat: The messages below were generated by the user while running local commands. …") === nothing
+        # Even after stripping a leading wrapper, if the remainder is just
+        # the caveat we still skip.
+        @test meaningful_title(
+            "<command-name>/m</command-name>\nCaveat: The messages below were generated by the user.") === nothing
+    end
+
+    @testset "empty / whitespace prompts return nothing" begin
+        @test meaningful_title("")              === nothing
+        @test meaningful_title("   \n\t   ")    === nothing
+        @test meaningful_title("<a>x</a>\n   ") === nothing
+    end
+
+    @testset "long prompts ellipsize at 80 chars" begin
+        s = "x" ^ 200
+        t = meaningful_title(s)
+        @test t !== nothing
+        @test length(t) == 80   # 79 chars + "…"
+        @test endswith(t, "…")
+    end
+
+    @testset "real prompts from the 2026-06-09 screenshot" begin
+        # These are the exact bad titles the user reported. They all came
+        # from old projects.json saved BEFORE the strip filter existed.
+        # With the current filter these inputs should produce a sensible
+        # title (or nothing if there's no prose).
+
+        # `<ide_selection>The user selected the lines 1 to 264 from /sim/Programmieren/VulkanDev/RayDemo/Crown/crown.jl: include("…`
+        # No closer → bare opener → skip.
+        @test meaningful_title(
+            "<ide_selection>The user selected the lines 1 to 264 from /sim/Programmieren/VulkanDev/RayDemo/Crown/crown.jl: include(\"foo\")") === nothing
+
+        # `<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. …`
+        # Closed wrapper → strips to "" → nothing. With prose after, returns the prose.
+        @test meaningful_title(
+            "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages</local-command-caveat>") === nothing
+        @test meaningful_title(
+            "<local-command-caveat>Caveat: blah</local-command-caveat>\nDoes Lava run all the RayDemo examples with RayMakie?") ==
+              "Does Lava run all the RayDemo examples with RayMakie?"
+
+        # Real prompts that should pass through:
+        @test meaningful_title("Does Lava run all the RayDemo examples with RayMakie?") ==
+              "Does Lava run all the RayDemo examples with RayMakie?"
+        @test meaningful_title("For Raycore registration, I get: Error while trying to register: Error in (Julia)Project.toml: Package 'Lava' with UUID...") !== nothing
+        # 82 chars → truncates to 80 (79 + "…"). Tests the ellipsis path with
+        # a real prompt from the screenshot.
+        let t = meaningful_title("Ok, we did a few improvements in Raycore and now CI fails. Can you fix the tests?")
+            @test t !== nothing
+            @test startswith(t, "Ok, we did a few improvements in Raycore and now CI fails. Can you fix")
+            @test endswith(t, "…")
+        end
+    end
+end
+
+end

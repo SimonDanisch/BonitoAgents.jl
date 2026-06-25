@@ -85,6 +85,12 @@ function seed_temp_env_with_bonito!(env_dir::AbstractString)
     end
 end
 
+# The minimum Bonito version with the remote-app proxy API that bt_show_app's
+# bridge needs. The eval worker uses the PROJECT's own Bonito (we never touch its
+# LOAD_PATH); if that Bonito is older, bt_show_app errors clearly and only
+# app-display is affected — plain `bt_julia_eval` is untouched.
+const MIN_SHOW_APP_BONITO = v"5"
+
 # ── JuliaSession ────────────────────────────────────────────────────────────
 mutable struct JuliaSession
     env_path::Union{String,Nothing}
@@ -128,7 +134,9 @@ is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
 # kwarg can only SET vars (it routes through `Base.byteenv`, which can't express
 # removal), so we reset `JULIA_LOAD_PATH` to Julia's documented default — exactly
 # what an un-set `JULIA_LOAD_PATH` would yield: `@` (the active project, i.e.
-# env_path via --project), `@v#.#` (shared default env), `@stdlib`.
+# env_path via --project), `@v#.#` (shared default env), `@stdlib`. Keeps the
+# worker on the PROJECT's Bonito/WGLMakie, never the bundle's precompiled copies;
+# JULIA_DEPOT_PATH is left as-is so the worker keeps a writable precompile depot.
 const DEFAULT_LOAD_PATH = join(["@", "@v#.#", "@stdlib"], Sys.iswindows() ? ";" : ":")
 worker_env() = ["JULIA_LOAD_PATH" => DEFAULT_LOAD_PATH]
 
@@ -211,6 +219,28 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
         return s
     end
     try
+        # bt_show_app's bridge needs Bonito ≥ 5 (the remote-app proxy API). The
+        # eval worker uses the PROJECT's OWN Bonito — we never touch its env or
+        # LOAD_PATH. If that Bonito is too old, fail with a clear, actionable
+        # message BEFORE the RemoteProxy include (which would otherwise throw a
+        # cryptic `UndefVarError: proxy_send`). Only app display is affected;
+        # plain bt_julia_eval works regardless of the Bonito version.
+        ok, vstr = Malt.remote_eval_fetch(s.worker, quote
+            using Bonito
+            local v = pkgversion(Bonito)
+            (v !== nothing && v >= $(MIN_SHOW_APP_BONITO),
+             v === nothing ? "unknown" : string(v))
+        end)
+        if !ok
+            s.dial_error = "bt_show_app needs Bonito ≥ $(MIN_SHOW_APP_BONITO) " *
+                "(the remote-app proxy API), but this chat's project env resolved " *
+                "Bonito v$(vstr). Add a Bonito ≥ $(MIN_SHOW_APP_BONITO) to the project " *
+                "env (e.g. `[sources] Bonito = {path = \"…/dev/Bonito\"}` then " *
+                "`Pkg.resolve()`) and reopen the chat. Only live-app display is " *
+                "affected — bt_julia_eval works regardless."
+            @warn "BonitoMCP: bt_show_app needs Bonito ≥ $(MIN_SHOW_APP_BONITO); this project env has Bonito v$(vstr) — skipping bridge setup" project_env = s.env_path
+            return s
+        end
         # Bootstrap over BonitoMCP's OWN Malt link: include RemoteProxy + build the
         # bridge, get its namespace prefix. The dial-back socket itself carries NO
         # Malt — it's a raw Bonito frame pipe (see RemoteProxy.serve_bridge); Malt

@@ -1561,17 +1561,94 @@ const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
     ".ogg" => "video/ogg", ".mov" => "video/quicktime")
 const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
 
-function render_show_file(st::ShowTool)
-    path = fetch_show_file(st)
-    ext = lowercase(splitext(path)[2])
-    if ext in SHOW_IMAGE_EXTS
-        return DOM.img(src=Bonito.Asset(path),
-            style=Styles("max-width" => "100%", "display" => "block"))
-    elseif haskey(SHOW_VIDEO_MIME, ext)
-        return DOM.video(DOM.source(src=Bonito.Asset(path), type=SHOW_VIDEO_MIME[ext]);
-            controls=true,
-            style=Styles("max-width" => "100%", "display" => "block"))
+# Click-to-enlarge. Clones the media into a fullscreen overlay (Esc or backdrop
+# click closes). Self-contained so there's no global-JS dependency or load-order
+# coupling; shared by bt_show previews and inline Read-tool images.
+const LIGHTBOX_OPEN_JS = js"""
+event => {
+    event.stopPropagation();
+    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const media = wrap && wrap.querySelector('.bt-media');
+    if (!media) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'bt-lightbox-overlay';
+    const big = media.cloneNode(true);
+    big.classList.add('bt-lightbox-media');
+    if (big.tagName === 'VIDEO') { big.controls = true; big.autoplay = true; }
+    overlay.appendChild(big);
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
+    const onkey = e => { if (e.key === 'Escape') close(); };
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', onkey);
+    document.body.appendChild(overlay);
+}
+"""
+
+# A media element (image / video) with click-to-enlarge. `src` can be a streamed
+# proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
+# an <img>/<video> src. `mime` only matters for the <video><source> type. Images
+# enlarge on click; videos keep native controls for clicks and enlarge via the ⤢
+# button (so a frame click still plays/pauses).
+function media_element(src, mime::AbstractString, is_video::Bool)
+    inner = is_video ?
+        DOM.video(DOM.source(; src, type = mime); controls = true, class = "bt-media",
+            style = Styles("max-width" => "100%", "display" => "block")) :
+        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS,
+            style = Styles("max-width" => "100%", "display" => "block", "cursor" => "zoom-in"))
+    return DOM.div(inner,
+        DOM.button("⤢"; class = "bt-media-enlarge", type = "button",
+            title = "Enlarge", onclick = LIGHTBOX_OPEN_JS);
+        class = "bt-media-wrap")
+end
+
+# Source for a worker media file: a streamed proxied-asset url when the worker
+# bridge is live (range reads on demand, no whole-file copy), else the
+# copy-then-serve local Asset fallback (e.g. a reloaded chat with no live worker).
+function show_media_src(st::ShowTool)
+    eb = eval_bridge_for(st.state, st.project_id)
+    if eb !== nothing
+        proj = get(st.state.projects[], st.project_id, nothing)
+        worker_src = (isabspath(st.path) || proj === nothing) ? st.path :
+            joinpath(proj.worker_path, st.path)
+        try
+            return worker_asset_url(eb, worker_src)
+        catch e
+            @warn "bt_show: stream via bridge failed; copying instead" exception = (e, catch_backtrace()) path = st.path
+        end
     end
+    return Bonito.Asset(fetch_show_file(st))
+end
+
+# Not every ToolMsg subtype carries `raw_input` (Bash/Task/BonitoApp don't).
+tool_raw_input(m) = hasproperty(m, :raw_input) ? m.raw_input : Dict{String,Any}()
+
+# Inline image from a tool result (e.g. Read on a PNG ships an ACP ImageContent).
+# Stream it from the worker when we can resolve a file path + live bridge (so big
+# images don't ride as base64 through chat history); else fall back to the ACP
+# base64 the agent sent. Either way it gets the lightbox via `media_element`.
+function read_image_element(state::ServerState, project_id::AbstractString,
+                            m::ToolMsg, c::ImageContent)
+    fp = get(tool_raw_input(m), "file_path", nothing)
+    eb = isempty(project_id) ? nothing : eval_bridge_for(state, project_id)
+    if fp !== nothing && eb !== nothing
+        try
+            return media_element(worker_asset_url(eb, String(fp)), c.mime_type, false)
+        catch e
+            @warn "read image: stream via bridge failed; inlining base64" exception = (e, catch_backtrace())
+        end
+    end
+    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, false)
+end
+
+function render_show_file(st::ShowTool)
+    ext = lowercase(splitext(st.path)[2])
+    if ext in SHOW_IMAGE_EXTS
+        return media_element(show_media_src(st), "", false)
+    elseif haskey(SHOW_VIDEO_MIME, ext)
+        return media_element(show_media_src(st), SHOW_VIDEO_MIME[ext], true)
+    end
+    # Non-media: the bytes have to be on the server (Monaco / caption read them).
+    path = fetch_show_file(st)
     # Any non-binary file Monaco can show — known text extensions,
     # extensionless (Makefile, LICENSE), unknown extensions. Size-capped
     # like the editor, and NUL-sniffed so a mislabeled binary degrades to
@@ -1773,8 +1850,7 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
         elseif c isa DiffContent
             push!(parts, render_diff_block(c))
         elseif c isa ImageContent
-            push!(parts, DOM.img(src="data:$(c.mime_type);base64,$(c.data)",
-                style=Styles("max-width" => "100%")))
+            push!(parts, read_image_element(state, project_id, m, c))
         end
     end
     isempty(parts) && return DOM.div("(empty)", class="bt-tool-empty")
@@ -3810,6 +3886,12 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
             }""")
     end
 
+    # Project environment this chat's eval sessions run in (the Project.toml /
+    # working dir). A muted monospace sub-line under the title row so each tab
+    # makes its env unmistakable. Home-contracted for readability; full path on
+    # hover.
+    env_line = DOM.div(replace(cwd, homedir() => "~"); class="bt-header-env", title=cwd)
+
     # Session config (model / mode / effort …) as a plain-text second header
     # line; re-renders whenever the agent reports a change (bring-up,
     # config_option_update). The model pill is a native `<select>` and posts
@@ -4011,6 +4093,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 restart_button;
                 class="bt-header-actions"),
             class="bt-header-row"),
+        env_line,
         # Lens search bar — always visible. JS (`_setupLens`) builds the input
         # + autocomplete + saved-lens chips inside it and wires it to `comm`.
         DOM.div(class="bt-lens-bar");

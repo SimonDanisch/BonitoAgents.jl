@@ -240,6 +240,14 @@ const ChatStyles = Bonito.Styles(
         "font-family" => "ui-monospace, monospace", "font-size" => "12px",
         "color" => "var(--bt-text-muted)", "font-weight" => "400",
         "margin-left" => "6px"),
+    # Project-env sub-line under the title row. Muted monospace, single line
+    # with ellipsis so a long absolute path never widens the header.
+    CSS(".bt-header-env",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11px",
+        "color" => "var(--bt-text-muted)", "font-weight" => "400",
+        "margin-top" => "2px", "max-width" => "100%",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap"),
     CSS(".bt-header-sync",
         "appearance" => "none",
         "border" => "1px solid var(--bt-border)",
@@ -976,6 +984,27 @@ const ChatStyles = Bonito.Styles(
         "padding" => "8px 0",
         "color" => "var(--bt-text-faint)",
         "font-style" => "italic", "font-size" => "12px"),
+
+    # Media (bt_show / Read image & video) + click-to-enlarge lightbox. The wrap
+    # is the hover target for the ⤢ button; the fullscreen overlay holds a clone
+    # of the media and closes on backdrop click or Esc.
+    CSS(".bt-media-wrap",
+        "position" => "relative", "display" => "inline-block", "max-width" => "100%"),
+    CSS(".bt-media-enlarge",
+        "position" => "absolute", "top" => "6px", "right" => "6px",
+        "appearance" => "none", "border" => "none",
+        "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
+        "font-size" => "14px", "line-height" => "1",
+        "padding" => "4px 7px", "border-radius" => "6px",
+        "cursor" => "zoom-in", "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-media-wrap:hover .bt-media-enlarge", "opacity" => "1"),
+    CSS(".bt-lightbox-overlay",
+        "position" => "fixed", "inset" => "0", "z-index" => "9999",
+        "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
+    CSS(".bt-lightbox-media",
+        "max-width" => "95vw", "max-height" => "95vh",
+        "box-shadow" => "0 8px 40px rgba(0,0,0,0.6)", "cursor" => "default"),
     CSS(".bt-tool-md",
         "font-size" => "13px", "line-height" => "1.5",
         "padding-top" => "8px"),
