@@ -2388,13 +2388,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # toggles visibility based on workers-empty. Keeps the install snippet
     # out of every render's hot path.
     #
-    # The server serves /install with User-Agent sniffing — curl gets the bash
-    # wrapper, PowerShell's `irm` gets the PS1 wrapper. Both wrappers verify
-    # `julia` is on PATH and then run the cross-platform install.jl. The /install
-    # URL gives us one shape per OS that mirrors the familiar `curl URL | sh`.
-    install_url  = "$(install_base_url(state))/install"
-    install_unix = "curl -fsSL $install_url | sh"
-    install_win  = "irm $install_url | iex"
+    # OS-explicit routes — we already know the platform per row, so we hit
+    # /install.sh and /install.ps1 directly instead of relying on /install's
+    # User-Agent sniff to guess. Both wrappers verify `julia` is on PATH and
+    # then run the cross-platform install.jl. This snippet matches the
+    # worker-install hint the server banner + install_server.sh print verbatim.
+    base         = install_base_url(state)
+    install_unix = "curl -fsSL $base/install.sh | sh"
+    install_win  = "irm $base/install.ps1 | iex"
     # Copy MUST work on plain-http origins too: `navigator.clipboard` is
     # undefined outside secure contexts (https / localhost), which is exactly
     # how a LAN-hosted BonitoAgents is reached — that's why the button "did

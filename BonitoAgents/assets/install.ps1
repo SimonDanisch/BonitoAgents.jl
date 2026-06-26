@@ -1,6 +1,6 @@
 # BonitoAgents worker bootstrap (Windows).
 #
-#   irm {{SERVER_URL}}/install | iex
+#   irm {{SERVER_URL}}/install.ps1 | iex
 #
 # Tiny shim around the cross-platform Julia installer. We don't pipe the .jl
 # directly into `julia -` because PowerShell pipelines pass objects (not a raw

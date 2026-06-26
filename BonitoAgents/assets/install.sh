@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # BonitoAgents worker bootstrap (Linux / macOS).
 #
-#   curl -fsSL {{SERVER_URL}}/install | sh
+#   curl -fsSL {{SERVER_URL}}/install.sh | sh
 #
 # Tiny shim around the cross-platform Julia installer: verify `julia` is on
 # PATH (we don't bootstrap juliaup — install Julia separately), then fetch

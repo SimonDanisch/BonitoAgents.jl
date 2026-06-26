@@ -3,15 +3,18 @@
 #
 #   bash BonitoAgents/assets/uninstall_server.sh [options]
 #
-# Stops + disables + removes the systemd unit. Data dir (workers.json /
-# projects.json + project mirrors) and config (worker secret, public URL)
-# are removed by default — pass --keep-state to preserve them so a fresh
-# install reuses the same secret + workers without re-registering each
-# worker. The monorepo checkout is never touched.
+# Stops + disables + removes the systemd unit. The data dir
+# /var/lib/bonitoagents (workers.json / projects.json, project mirrors, and the
+# worker secret at state/worker_secret) is removed by default — pass
+# --keep-state to preserve it so a fresh install reuses the same secret +
+# workers without re-registering each worker. The legacy config dir
+# /etc/bonitoagents (only present from pre-CLI installs; current installs keep
+# the secret in the data dir and bake the public URL into the systemd unit) is
+# also removed. The monorepo checkout is never touched.
 #
 # Options:
 #   --keep-state   Preserve /var/lib/bonitoagents (workers.json, project
-#                  mirrors) and /etc/bonitoagents (worker secret).
+#                  mirrors, worker secret) and the legacy /etc/bonitoagents.
 #   --yes          Skip the confirmation prompt.
 set -euo pipefail
 
