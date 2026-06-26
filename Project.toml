@@ -10,7 +10,7 @@ RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
 
 [sources]
 AgentClientProtocol = {path = "AgentClientProtocol"}
-Bonito = {rev = "sd/remote-app", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
+Bonito = {rev = "master", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoMCP = {path = "BonitoMCP"}
 BonitoAgents = {path = "BonitoAgents"}
