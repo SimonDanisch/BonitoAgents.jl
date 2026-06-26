@@ -1492,8 +1492,21 @@ end
 # whose fetch outlived that window (or whose node was off-window at swap
 # time) kept its spinner forever; only a manual re-render, by then on the
 # isfile fast path, showed it.
-Bonito.jsrender(session::Bonito.Session, st::ShowTool) =
-    Bonito.jsrender(session, render_show_file(st))
+# A file that can't be fetched/rendered (missing on the worker, transfer
+# failed, unreadable) must degrade to a visible, self-contained error node —
+# NOT throw out of `jsrender`, where Bonito's generic `handle_render_error`
+# would swap in its own opaque placeholder (and the bt_show body would never
+# carry the `.bt-tool-error` the UI/tests key on).
+function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
+    body = try
+        render_show_file(st)
+    catch e
+        @warn "bt_show: could not render file" path = st.path exception = (e, catch_backtrace())
+        DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
+            class = "bt-tool-error")
+    end
+    return Bonito.jsrender(session, body)
+end
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
 # project tree map straight onto the server mirror (cwd ⟷ worker_path); an

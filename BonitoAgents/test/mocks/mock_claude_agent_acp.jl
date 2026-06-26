@@ -281,6 +281,30 @@ function run_dispatcher_prompt(prompt_id)
     stop_reason = "end_turn"
     next_tool_id = 1
     while !eof(sock)
+        # Cancel arriving mid-stream (set by the concurrently-running stdin
+        # reader in `dispatch_loop`) ends the turn the way real claude does:
+        # stop emitting further frames and resolve the prompt with
+        # `stopReason: "cancelled"`. The chat side's `cancel!` has already
+        # flipped its consumer into drain-mode, and the `cancelled` response
+        # below is what actually unblocks `run_turn!`.
+        #
+        # We must still DRAIN this turn's remaining events off the socket
+        # (without emitting them) up to and including the `{"type":"end"}`
+        # the dispatcher always appends — otherwise the unread events sit in
+        # the socket buffer, the dispatcher blocks writing them and never
+        # reads the NEXT prompt line, and the follow-up turn would also read
+        # this turn's stale tail. Draining keeps the persistent connection
+        # clean for the next prompt.
+        if cancelled[]
+            stop_reason = "cancelled"
+            while !eof(sock)
+                tail = try readline(sock) catch; break end
+                isempty(tail) && continue
+                tev = try JSON.parse(tail) catch; continue end
+                String(get(tev, "type", "")) == "end" && break
+            end
+            break
+        end
         line = try readline(sock) catch; break end
         isempty(line) && continue
         ev = try JSON.parse(line) catch; continue end
@@ -399,6 +423,10 @@ function run_dispatcher_prompt(prompt_id)
             fields = Dict{String,Any}("toolCallId" => String(ev["id"]))
             haskey(ev, "status")  && (fields["status"]  = String(ev["status"]))
             haskey(ev, "content") && (fields["content"] = pack_tool_content(ev["content"]))
+            # Streamed tool input: the real arguments ride a later
+            # tool_call_update; ACP merges this `rawInput` into the live
+            # MCPCall/GenericTool so the eval extras + ✎ path hint materialise.
+            haskey(ev, "raw_input") && (fields["rawInput"] = ev["raw_input"])
             upd("tool_call_update", fields)
         elseif et == "todo"
             # Live plan/todo list. Real claude-agent-acp reports todos as
@@ -412,7 +440,16 @@ function run_dispatcher_prompt(prompt_id)
             # emitted stay live (e.g. the pinned todo panel) while the test
             # asserts against them. The prompt response is only sent after the
             # `end` event, so the turn is held open for this whole sleep.
-            sleep(Float64(get(ev, "ms", 0)) / 1000)
+            # Sliced so a `session/cancel` landing mid-delay is honored
+            # promptly (the cancel test streams chunk/`delay` pairs and yanks
+            # the turn mid-way): bail out of the slice loop and let the
+            # loop-top `cancelled[]` check resolve `stopReason: "cancelled"`.
+            remaining = Float64(get(ev, "ms", 0)) / 1000
+            while remaining > 0 && !cancelled[]
+                slice = min(remaining, 0.05)
+                sleep(slice)
+                remaining -= slice
+            end
         elseif et == "error_reply"
             # Agent is alive but answers the prompt with a JSON-RPC error — the
             # chat shows an inline `[error: ...]` bubble. Reply here and skip
@@ -421,6 +458,16 @@ function run_dispatcher_prompt(prompt_id)
                       "error" => Dict("code" => -32603,
                                       "message" => String(get(ev, "message", "error")))))
             return
+        elseif et == "crash"
+            # Hard-kill the agent subprocess MID-PROMPT, exactly like a real
+            # claude-agent-acp dying. We never send a `session/prompt` response,
+            # so the chat's pending read on this connection fails with
+            # EOFError/ConnectionClosed → `is_session_dead_error` → the chat
+            # flips `session_alive=false` and the header restart button pulses.
+            # This is the black-box, dispatcher-protocol analog of the `crash`
+            # scenario (`exit(1)` after `session/prompt`).
+            flush(stdout); flush(stderr)
+            exit(1)
         elseif et == "end"
             stop_reason = String(get(ev, "stopReason", "end_turn"))
             break
@@ -463,7 +510,14 @@ function dispatch_loop()
             prompt_blocks = get(params, "prompt", Any[])
             LAST_PROMPT[] = join(String(get(b, "text", "")) for b in prompt_blocks
                                   if isa(b, AbstractDict) && get(b, "type", "") == "text")
-            try
+            # Run the turn CONCURRENTLY with the stdin reader. The real agent
+            # processes `session/cancel` notifications while a turn is in
+            # flight; if we ran `handle_prompt` inline here the loop couldn't
+            # read the cancel line off stdin until the turn already finished,
+            # so a mid-stream cancel could never be honored. A turn that hangs
+            # (the `hang_*` scenarios) still parks in its own task, leaving the
+            # loop free to read the eventual stdin EOF / cancel.
+            @async try
                 handle_prompt(id, SCENARIO)
             catch e
                 # A scenario-side throw shouldn't kill the dispatcher; the

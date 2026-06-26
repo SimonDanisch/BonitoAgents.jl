@@ -47,7 +47,7 @@ const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_f
 
 export TestServer, dev_server, add_worker!,
        text, thought, edit, bash, todo, delay, tool, tool_update,
-       diff_block, text_block, error_reply, end_turn, bt_eval, bt_show_app,
+       diff_block, text_block, error_reply, crash, end_turn, bt_eval, bt_show_app,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
        exit_success,
@@ -113,35 +113,49 @@ diff_block(path, old, new) = Dict("type" => "diff", "path" => String(path),
 text_block(s::AbstractString) = Dict("type" => "text", "text" => String(s))
 
 """
-    tool(; kind, title, status, content, tool_name, id, complete, open_status) -> Dict
+    tool(; kind, title, status, content, tool_name, id, complete, open_status,
+           raw_input) -> Dict
 
 Agent event for a generic tool call of any `kind` ("edit", "search",
 "execute", "other"). `content` is a vector of `diff_block` / `text_block`.
 Pass `complete = false` to leave the bubble live (open) for follow-up
 `tool_update`s; `open_status` sets the opening status (default "in_progress").
+`raw_input` is the tool call's argument dict (ACP's `rawInput`) — it rides the
+opening `tool_call` frame and feeds the eval extras (code preview, ⏱ timeout
+badge, ⊗ stop) and the ✎ editable-path derivation. Real claude-agent-acp
+STREAMS tool input, so the common shape is to open with an EMPTY `raw_input`
+and ship the real args on a later [`tool_update`](@ref) (which also forwards
+`raw_input`).
 """
 tool(; kind = "other", title = "tool", status = "completed", content = Any[],
        tool_name = nothing, id = nothing, complete = true,
-       open_status = "in_progress") = begin
+       open_status = "in_progress", raw_input = nothing) = begin
     d = Dict{String,Any}("type" => "tool", "kind" => String(kind),
                          "title" => String(title), "status" => String(status),
                          "content" => content, "complete" => complete,
                          "open_status" => String(open_status))
     id        === nothing || (d["id"]        = String(id))
     tool_name === nothing || (d["tool_name"] = String(tool_name))
+    raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
     d
 end
 
 """
-    tool_update(id; status, content) -> Dict
+    tool_update(id; status, content, raw_input) -> Dict
 
 Agent event that updates an already-open tool (matched by `id`) — flip its
-status and/or ship more content, without restating its identity.
+status and/or ship more content, without restating its identity. `raw_input`
+streams (merges) the tool call's arguments AFTER the announcement, exactly the
+way real claude-agent-acp delivers tool input: ACP merges it into the live
+`MCPCall`/`GenericTool`, so the eval extras (code preview, ⏱, ⊗) and the ✎
+editable-path hint materialise on this in-flight update rather than the empty
+opening header.
 """
-tool_update(id; status = nothing, content = nothing) = begin
+tool_update(id; status = nothing, content = nothing, raw_input = nothing) = begin
     d = Dict{String,Any}("type" => "tool_update", "id" => String(id))
-    status  === nothing || (d["status"]  = String(status))
-    content === nothing || (d["content"] = content)
+    status    === nothing || (d["status"]    = String(status))
+    content   === nothing || (d["content"]   = content)
+    raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
     d
 end
 
@@ -176,6 +190,18 @@ Agent event: answer the prompt with a JSON-RPC error (the agent is alive but
 failed). The chat renders an inline `[error: <message>]` bubble.
 """
 error_reply(message::AbstractString) = Dict("type" => "error_reply", "message" => String(message))
+
+"""
+    crash() -> Dict
+
+Agent event that HARD-KILLS the mock agent subprocess mid-prompt (`exit(1)`),
+exactly like a real claude-agent-acp dying. No `session/prompt` response is
+ever sent, so the chat's pending read fails with EOFError/ConnectionClosed →
+`is_session_dead_error` → `session_alive` flips false and the header restart
+button gains its dead/pulse class (`.bt-header-restart-dead`). Clicking it runs
+`restart_chat_session!`, which respawns a fresh mock agent and revives the chat.
+"""
+crash()                              = Dict("type" => "crash")
 
 end_turn(; stopReason = "end_turn")  = Dict("type" => "end", "stopReason" => String(stopReason))
 

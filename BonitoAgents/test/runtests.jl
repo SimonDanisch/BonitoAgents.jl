@@ -16,6 +16,22 @@
 #     julia --project=. -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=["unit"])'
 using ReTestItems, BonitoAgents
 
+# The `e2e:*` app-embed items (`app_*`, `embedded_app`, `keyed_list`) mount a
+# live Bonito App through `bt_show_app`, which spins a Malt eval worker on the
+# `test/appenv` project. That env must be RESOLVED + PRECOMPILED before the
+# worker dials in — otherwise the worker re-resolves the heavy test env on
+# first touch and the app mount times out. `test/appenv` pins only dev Bonito
+# (v5), so this is a fast cache hit; do it once here, before the workers fork.
+let appenv = joinpath(@__DIR__, "appenv"), cur = Base.active_project()
+    import Pkg
+    try
+        Pkg.activate(appenv; io = devnull)
+        Pkg.instantiate(; io = devnull)
+    finally
+        Pkg.activate(cur; io = devnull)
+    end
+end
+
 const NAME = isempty(ARGS) ? nothing : Regex(join(ARGS, "|"))
 ReTestItems.runtests(BonitoAgents;
     nworkers = parse(Int, get(ENV, "BT_TEST_NWORKERS", "4")),
