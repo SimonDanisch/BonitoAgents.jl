@@ -45,8 +45,17 @@
     # small delay — long enough (≈ CHUNKS * DELAY_MS ms) that the test can land
     # a cancel mid-stream. Anything else gets a one-shot fast reply (used for
     # the post-cancel follow-up so it completes immediately).
-    const CHUNKS   = 20     # ~ CHUNKS * DELAY_MS ms of stream if never cancelled
-    const DELAY_MS = 300    # slow enough to land a cancel with margin before the last chunk
+    # The stream must stay live LONG ENOUGH that the cancel reliably lands before
+    # the last chunk — the window is `~CHUNKS * DELAY_MS` minus the harness's
+    # round-trip latency to detect mid-stream + ship the cancel. Under nworkers=4
+    # those eval_js/websocket round-trips cost several seconds, so a 6s window
+    # (the old 20×300) let the whole stream drain before the cancel arrived and
+    # `part<CHUNKS>` showed up → flake. A ~16s window comfortably outlasts that
+    # latency. This does NOT slow the test: a successful cancel ends the turn
+    # early (after `part2`-ish), so the full duration only ever runs if the
+    # cancel genuinely never lands — which is the failure we want to catch.
+    const CHUNKS   = 40
+    const DELAY_MS = 400
 
     function agent_script(prompt)
         p = lowercase(prompt)
