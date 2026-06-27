@@ -1,14 +1,15 @@
 """
 TestKit: realistic end-to-end test harness for BonitoAgents.
 
-The whole production stack runs unchanged (real `dev_server`, real worker,
-real `LocalTransport` with subprocess spawn, real ACP JSON-RPC over
-stdio, real websockets). The ONLY thing swapped is the
-`claude-agent-acp` binary — replaced with the Julia
-`mocks/mock_claude_agent_acp.jl` script driven by a TCP dispatcher in this
-process. The dispatcher invokes a user-supplied `agent::Function` for each
-prompt and translates its returned event list into the ACP frames the
-chat would have seen from real claude.
+The whole production stack runs unchanged (real `dev_server`, real worker, real
+subprocess spawn, real ACP JSON-RPC over the worker WebSocket, real websockets).
+The ONLY thing swapped is the agent: the test enables the `MockAgent` provider
+(`BT_ENABLE_MOCK_AGENT`) and makes it the default (`BT_DEFAULT_PROVIDER`), so the
+worker spawns the `MockACP` package (`julia -m MockACP`) like any other provider —
+no bash wrapper, no `agent_bin` override. MockACP runs in "dispatcher" mode: it
+dials back to a TCP dispatcher in THIS process, which invokes a user-supplied
+`agent::Function` per prompt and translates its returned event list into the ACP
+frames the chat would have seen from real claude.
 
 Usage:
 
@@ -274,27 +275,27 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
         end
     end)
 
-    # 2. Build the mock-agent invocation. The mock is a bash wrapper that
-    #    re-execs Julia with the right project; pass it through wholesale,
-    #    threading dispatcher coordinates + scenario via env.
-    here = @__DIR__
-    mock = joinpath(here, "..", "mocks", "mock_claude_agent_acp")
-    isfile(mock) || error("mock_claude_agent_acp not found at $mock")
-    Sys.iswindows() || chmod(mock, 0o755)                  # idempotent perm fix
-    # The mock binary's wrapper activates `BT_MOCK_PROJECT` for the Julia
-    # subprocess. Point it at the tiny `test/mocks` env (just JSON + Sockets):
-    # a small manifest keeps each mock-agent cold start fast, so the chat
-    # session binds quickly instead of waiting out a full-manifest startup.
-    mock_project = abspath(get(ENV, "BT_MOCK_PROJECT_OVERRIDE",
-                               joinpath(@__DIR__, "..", "mocks")))
-
+    # 2. Enable the mock as a real, selectable provider. It is no longer a bash
+    #    wrapper handed to the worker as `agent_bin` — it's the AgentProviders
+    #    `MockAgent` descriptor, which launches the `MockACP` package
+    #    (`julia -m MockACP`) like any other agent. We just:
+    #      • include it in the provider list   (BT_ENABLE_MOCK_AGENT)
+    #      • make it the test env's default     (BT_DEFAULT_PROVIDER=MockCode)
+    #      • point MockACP at THIS process's dispatcher socket + scenario
+    #      • tell it which project resolves MockACP (the BonitoAgents test env)
+    #    These reach BOTH the server (this process) and the worker (its child)
+    #    because `dev_server` writes `agent_env` into `ENV` before spawning the
+    #    worker, which inherits it (and the spawned MockACP inherits it in turn).
+    test_env = abspath(joinpath(@__DIR__, ".."))   # .../BonitoAgents/test — where MockACP is a dep
     agent_env = Dict{String,String}(
+        "BT_ENABLE_MOCK_AGENT"   => "1",
+        "BT_DEFAULT_PROVIDER"    => "MockCode",
         "BT_MOCK_ACP_SCENARIO"   => "dispatcher",
         "BT_MOCK_ACP_DISPATCHER" => "127.0.0.1:$(disp_port)",
-        "BT_MOCK_PROJECT"        => mock_project,
+        "BT_MOCK_PROJECT"        => test_env,
     )
 
-    h = BT.dev_server(; port = port, agent_bin = mock, agent_env = agent_env, kwargs...)
+    h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Now publish the server URL + secret to the dispatcher so that
     # `bt_show_app` / `bt_eval` invocations can route the eval worker's
@@ -322,6 +323,15 @@ function handle_client(client, agent_ref::Ref{Function})
             isempty(line) && continue
             msg = JSON.parse(line)
             prompt = String(get(msg, "prompt", ""))
+            # On a resumed session the server prepends a transcript of the prior
+            # conversation, with the user's real new message after a "My new
+            # message:" divider. A real agent reads the transcript and replies to
+            # the new message; the scripted test agents instead branch on the
+            # prompt text, so hand them ONLY the new message — otherwise replayed
+            # history (e.g. a past "crash now") would wrongly re-trigger them.
+            if occursin("My new message:", prompt)
+                prompt = String(strip(last(split(prompt, "My new message:"; limit = 2))))
+            end
             response = try
                 # invokelatest so tests can swap `agent_fn` mid-run (the
                 # dispatcher task is spawned before those closures exist).

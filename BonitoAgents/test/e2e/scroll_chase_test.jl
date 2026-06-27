@@ -163,8 +163,13 @@
             h_before = height()
 
             TK.send_message(s, "tall block now")
+            # The tall block renders as a <pre> containing "tail line N". Assert
+            # THAT pre is present — not a count of >= 2 pres: virtual scroll only
+            # keeps the visible window in the DOM, and once the tall block lands at
+            # the bottom the seed's far-up <pre> is windowed out, so the two are
+            # never in the DOM at the same time.
             @test TK.wait_for(s, "tall block rendered",
-                "document.querySelectorAll('.bt-agent-msg pre').length >= 2"; timeout = 20) == true
+                "[...document.querySelectorAll('.bt-agent-msg pre')].some(p => (p.innerText||'').includes('tail line'))"; timeout = 20) == true
             # Height jumped (the tall block landed)...
             @test TK.wait_for(s, "height grew from tall block",
                 "Math.round(document.querySelector('.bt-messages').scrollHeight) > $(h_before + 100)"; timeout = 10) == true

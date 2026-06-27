@@ -145,9 +145,9 @@ mutable struct ChatModel
     taskbar_clock::Observable{Float64}
     taskbar_clock_on::Base.RefValue{Bool}
 
-    # Current agent KIND for this chat (a concrete BinAgent type, e.g.
-    # `ClaudeCodeAgent`). Observable so the UI provider-switcher can react. For
-    # a `WorkerAgent` this is `agent.kind`; for a `BinAgent` it's `typeof(agent)`.
+    # Current provider for this chat — the singleton descriptor the worker spawns
+    # (a `BinAgent`, e.g. the `ClaudeCodeAgent` singleton). Observable so the UI
+    # provider-switcher can react.
     provider::Observable{Any}
 
     # Pending permission / question asks for THIS chat: request key → (reply
@@ -165,10 +165,9 @@ mutable struct ChatModel
     tool_cache_order::Vector{String}
 end
 
-# The agent KIND tracked by the `provider` observable: for a worker session
-# it's the provider the worker spawns, for a local one it's the agent's own type.
-agent_kind(a::WorkerAgent) = a.kind
-agent_kind(a::BinAgent)    = typeof(a)
+# The provider tracked by the `provider` observable: the singleton descriptor the
+# worker spawns for this chat.
+agent_kind(a::WorkerAgent) = a.provider
 
 function ChatModel(state::ServerState, cwd::AbstractString;
     project_id::AbstractString="",
@@ -177,12 +176,12 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     chat_dir = chat_storage_dir(state, project_id, cwd)
     chat_session = load_session(chat_dir, cwd)
     msgs_store = load_history(chat_session)
-    # Default: a local Claude agent spawned on the server box. A caller (the
-    # dashboard) hands a `WorkerAgent` for remote sessions.
-    actual_agent = agent === nothing ?
-                   ClaudeCodeAgent(; cwd = String(cwd),
-                                   mcp = collect(AgentClientProtocol.MCPServer, mcp_servers)) :
-                   agent
+    # Every chat runs on a worker: the dashboard hands a `WorkerAgent`. There is
+    # no local/in-process agent fallback anymore — a chat cannot exist without a
+    # worker, so a missing agent is a programming error, not a silent default.
+    agent === nothing &&
+        error("ChatModel requires an agent (a WorkerAgent); none was provided")
+    actual_agent = agent
     busy_active = Observable(false)
     # Wire busy_active → sidebar status LED: a prompt going in-flight (or
     # finishing) flips chat_status, which the sidebar wants to know about
@@ -3499,13 +3498,13 @@ end
 function record_bound_session!(model::ChatModel, session_id::AbstractString)
     pid = model.project_id
     (isempty(pid) || isempty(session_id)) && return
-    # Only persist a CLAUDE session id. The provider isn't persisted across server
-    # restarts (it resets to ClaudeCode by design), so recording e.g. a MiMo
-    # session id would make the next ClaudeCode bring-up `session/load` a session
-    # it never created — the exact error `switch_provider!` clears the id to
-    # avoid. Claude sessions are also the only ones the worker's discover scan
-    # surfaces, so this is exactly the set the thread dedup/resume needs.
-    agent_kind(model.agent) === ClaudeCodeAgent || return
+    # Only persist a session id for providers that support claude-style
+    # `session/load` re-attach (ClaudeCode, and the mock which mimics it).
+    # Recording e.g. a MiMo session id would make the next bring-up `session/load`
+    # a session that provider never created — the exact error `switch_provider!`
+    # clears the id to avoid. Claude sessions are also the only ones the worker's
+    # discover scan surfaces, so this is exactly the set thread dedup/resume needs.
+    resumable_session(agent_kind(model.agent)) || return
     haskey(model.state.projects[], pid) || return
     p = model.state.projects[][pid]
     p.resume_session_id == session_id && return
@@ -4003,8 +4002,18 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # reads "Restarting…" so the click is acknowledged synchronously.
     restart_status = Observable("")
     restart_label  = map(s -> isempty(s) ? "Restart" : s, restart_status)
-    restart_class  = map(model.session_alive) do alive
-        alive ? "bt-header-restart" : "bt-header-restart bt-header-restart-dead"
+    restart_class  = map(model.session_alive, restart_status) do alive, status
+        # While a restart is running show the "working" state — NOT the red dead
+        # pulse — so the button reads as busy, not as a clickable failure. The
+        # handler also ignores clicks during a restart, but dropping the dead look
+        # is what stops a user (or an impatient poll) from trying to click again.
+        if status == "Restarting…"
+            "bt-header-restart bt-header-restart-busy"
+        elseif alive
+            "bt-header-restart"
+        else
+            "bt-header-restart bt-header-restart-dead"
+        end
     end
     restart_title  = map(model.session_alive, model.last_error) do alive, err
         alive  && return "Stop and respawn the agent process for this chat"
@@ -4017,6 +4026,13 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         onclick = js"event => $(restart_status).notify('__click__')")
     on(session, restart_status) do s
         s == "__click__" || return
+        # The dead-state button stays clickable through the seconds-long bring-up,
+        # so a quick second click (or an e2e poller that re-clicks until the dead
+        # class clears) would otherwise bump the restart generation and trigger a
+        # redundant second bring-up — which tears down the just-revived session and
+        # drops the next prompt. Ignore a click while a restart is already running.
+        sh = shared(model)
+        lock(() -> sh.restart_inflight[], sh.restart_lock) && return
         restart_status[] = "Restarting…"
         @async begin
             try
@@ -4043,32 +4059,34 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # as a bare, always-on attribute, which would select every option).
     provider_status = Observable("")
     provider_choice = Observable("")
-    # Each menu entry is an agent KIND (a concrete BinAgent type). The <option>
-    # value is its stable `provider_name` ("ClaudeCode", …); the label is its
-    # `label`. `cur` is the current kind type held by `model.provider`.
-    provider_opt(kind, cur) = DOM.option(label(kind());
-        (kind === cur ? (; value = provider_name(kind()), selected = true) :
-                        (; value = provider_name(kind())))...)
+    # Each menu entry is a provider singleton (a `BinAgent` descriptor). The
+    # <option> value is its stable `provider_name` ("ClaudeCode", …); the label is
+    # its `label`. `cur` is the current provider held by `model.provider`. The set
+    # offered is `current_providers()` — the mock appears only when its env is set.
+    provider_opt(p, cur) = DOM.option(label(p);
+        (p === cur ? (; value = provider_name(p), selected = true) :
+                     (; value = provider_name(p)))...)
     provider_select = map(session, model.provider) do cur
         DOM.select(
-            (provider_opt(kind, cur) for kind in AGENT_KINDS)...;
+            (provider_opt(p, cur) for p in current_providers())...;
             class = "bt-header-provider-select",
             title = "Switch AI agent backend",
             onchange = js"event => $(provider_choice).notify(event.target.value)")
     end
     on(session, provider_choice) do val
         isempty(val) && return
-        # Resolve the wire name back to the agent kind (default Claude).
-        new_kind = something(
-            findfirst(k -> provider_name(k()) == val, AGENT_KINDS),
-            nothing)
-        new_kind = new_kind === nothing ? ClaudeCodeAgent : AGENT_KINDS[new_kind]
+        # Resolve the wire name back to the provider singleton (default Claude).
+        new_provider = try
+            find_provider(val)
+        catch
+            find_provider("ClaudeCode")
+        end
         current = model.provider[]
-        new_kind === current && return
-        provider_status[] = "Switching to $(label(new_kind()))…"
+        new_provider === current && return
+        provider_status[] = "Switching to $(label(new_provider))…"
         @async begin
             try
-                switch_provider!(model, new_kind)
+                switch_provider!(model, new_provider)
                 # `switch_provider!` → `restart_chat_session!` swallows bring-up
                 # errors (sets `last_error`, keeps the chat object alive), so a
                 # failed switch returns normally. Surface it from the resulting
@@ -4116,51 +4134,38 @@ end
 # ── Provider switching ────────────────────────────────────────────────────────
 
 """
-    switch_provider!(model::ChatModel, new_kind::Type{<:BinAgent})
+    switch_provider!(model::ChatModel, new_provider::BinAgent)
 
 Switch the agent backend for a chat. This:
 1. Updates the provider observable
-2. Swaps the live agent INSTANCE to one running `new_kind` (preserving the
-   chat's cwd / handler / mcp / project context)
+2. Points the live `WorkerAgent` at `new_provider` (the worker spawns it on the
+   next bring-up; the chat's cwd / mcp / project context are preserved)
 3. Restarts the session with the new backend
 
 The provider choice is NOT persisted across server restarts — it resets
 to ClaudeCode on construction. This is by design: providers may not be
 available on all machines, so a hard-coded preference would break.
 """
-function switch_provider!(model::ChatModel, new_kind::Type{<:BinAgent})
+function switch_provider!(model::ChatModel, new_provider::BinAgent)
     s = shared(model)
-    s.provider[] = new_kind
+    s.provider[] = new_provider
     # Drop the previous provider's session config (model/mode pills) right away:
     # otherwise the header keeps showing e.g. Claude's model list while we bring
     # up MiMo, which reads as "switched, but the model picker is still Claude's".
     # `start_chat_client!` repopulates it from the new session's config.
     s.session_meta[] = Any[]
 
-    old = s.agent
-    if old isa WorkerAgent
-        # WorkerAgent: keep the worker wiring, change only WHICH provider it
-        # spawns. A switch must start a FRESH session: `resume_session_id` is the
-        # OLD provider's session id (e.g. a claude-agent-acp UUID). Asking MiMo to
-        # `session/load` a session it never created errors ("Internal error") and
-        # the restart fails — leaving the chat dead with no model picker. Clearing
-        # it routes start! through `session/new`; the chat's history is fed
-        # forward to the new agent as a one-shot prelude (see `arm_history_replay!`
-        # in start_chat_client!).
-        old.kind = new_kind
-        old.resume_session_id = nothing
-    else
-        # Local agent: a switch builds a FRESH instance of the new kind, so the
-        # old agent is orphaned — `restart_chat_session!` below `stop!`s the NEW
-        # `model.agent`, never `old`. Tear the old session down explicitly first or
-        # its subprocess leaks. `stop!` is idempotent + total; its config fields
-        # (`cwd`/`handler`) stay readable afterward.
-        stop!(old)
-        s.agent = new_agent(new_kind;
-            cwd = agent_cwd(old),
-            handler = old.handler,
-            mcp = s.mcp_servers)
-    end
+    # Every chat's agent is a `WorkerAgent`: keep the worker wiring, change only
+    # WHICH provider it spawns. A switch must start a FRESH session:
+    # `resume_session_id` is the OLD provider's session id (e.g. a
+    # claude-agent-acp UUID). Asking MiMo to `session/load` a session it never
+    # created errors ("Internal error") and the restart fails — leaving the chat
+    # dead with no model picker. Clearing it routes start! through `session/new`;
+    # the chat's history is fed forward to the new agent as a one-shot prelude
+    # (see `arm_history_replay!` in start_chat_client!).
+    old = s.agent::WorkerAgent
+    old.provider = new_provider
+    old.resume_session_id = nothing
 
     # Restart the session with the new provider
     restart_chat_session!(model)

@@ -102,7 +102,7 @@
         @test length(TK.js_errors(s)) == before_errs
     end
 
-    @testset "Session-ended Restart button revives the chat" begin
+    @testset "Session-ended Restart: dead → working state → revived (guarded)" begin
         # Healthy to start: the header restart button carries no dead class.
         @test TK.eval_js(s, vpHas(".bt-header-restart")) == true
         @test TK.eval_js(s, vpHas(".bt-header-restart-dead")) == false
@@ -113,19 +113,34 @@
         @test TK.wait_for(s, "restart button went dead",
             vpHas(".bt-header-restart-dead"); timeout = 30) == true
 
-        # Click the now-pulsing restart button. `restart_chat_session!` respawns
-        # a fresh mock agent and sets session_alive back to true → dead class
-        # clears. Re-click rides out the handler-attach race on a cold remount.
-        @test TK.wait_for(s, "restart revived the session",
-            "(() => { const p=$VP; if(!p) return false; " *
-            "const b=p.querySelector('.bt-header-restart-dead'); " *
-            "if (b) { b.click(); return false; } return true; })()";
-            timeout = 60, interval = 0.5) == true
+        # ONE click starts the restart. The button must immediately swap the red
+        # dead pulse for the "working" state — visual feedback that it's busy, and
+        # what stops a user (or an impatient poll) re-clicking a still-broken-looking
+        # button. The dead class is gone while it works.
+        @test TK.eval_js(s, vpClick(".bt-header-restart")) == true
+        @test TK.wait_for(s, "restart shows working state",
+            vpHas(".bt-header-restart-busy"); timeout = 10, interval = 0.05) == true
         @test TK.eval_js(s, vpHas(".bt-header-restart-dead")) == false
 
-        # Revived: the composer is live again and a fresh turn round-trips.
+        # Guard: extra clicks WHILE the restart is running must be no-ops. A second
+        # bring-up would tear down the just-revived session and drop the next
+        # prompt. Fire a burst now (still inside the ~1s working window); the clean
+        # single revival + echo below prove they were ignored — before the guard,
+        # this double-restart raced the send and the "alive?" turn never rendered.
+        for _ in 1:3
+            TK.eval_js(s, vpClick(".bt-header-restart"))
+        end
+
+        # Revived: both the working and dead classes clear, composer live again.
+        @test TK.wait_for(s, "restart revived the session",
+            "(() => { const p=$VP; if(!p) return false; " *
+            "return !p.querySelector('.bt-header-restart-dead') " *
+            "&& !p.querySelector('.bt-header-restart-busy'); })()";
+            timeout = 60, interval = 0.2) == true
         @test TK.wait_for(s, "composer live after restart",
             "!!document.querySelector('.bt-text-input')"; timeout = 30) == true
+
+        # The session survived the burst of clicks: a fresh turn round-trips.
         TK.send_message(s, "alive?")
         @test TK.wait_for(s, "agent replies after restart",
             "(document.querySelector('.bt-messages').innerText||'').includes('echo: alive?')";

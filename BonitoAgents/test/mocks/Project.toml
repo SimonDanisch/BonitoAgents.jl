@@ -1,7 +1,0 @@
-# Minimal environment for the mock ACP agent subprocess. It only needs JSON
-# (Sockets is stdlib), so keeping this tiny makes each mock-agent spawn start
-# fast — the chat session binds in a second or two instead of parsing the full
-# BonitoAgents manifest on every cold start. TestKit points BT_MOCK_PROJECT here.
-[deps]
-JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"

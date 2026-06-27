@@ -9,6 +9,7 @@ module BonitoWorker
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
 using Scratch: @get_scratch!
+import AgentProviders   # provider descriptors (find_provider) — the SSOT shared with the server
 
 # Per-install config directory, managed by Scratch.jl. Resolves to
 # `~/.julia/scratchspaces/<BonitoWorker-uuid>/config/` on every OS, so we get
@@ -762,45 +763,25 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
                           Dict{String,String}(get(cmd, "env", Dict{String,String}())))
     isempty(sid) && (@error "open_session missing sid"; return)
 
-    # Handle provider selection: the server may request a specific agent
-    # provider (e.g. "ClaudeCode", "MiMoCode", or "OpenCode"). If specified,
-    # resolve the correct binary for that provider; otherwise use the worker's
-    # default agent_bin.
-    provider_str = String(get(cmd, "provider", ""))
-    resolved_agent_bin = if !isempty(provider_str)
-        if provider_str == "MiMoCode"
-            mimo_bin = get(ENV, "MIMO_AGENT_ACP", "")
-            if isempty(mimo_bin)
-                mimo_bin_path = which_executable("mimo")
-                if mimo_bin_path === nothing
-                    mimo_path = joinpath(homedir(), ".mimocode", "bin", "mimo")
-                    mimo_bin = isfile(mimo_path) ? mimo_path : "mimo"
-                else
-                    mimo_bin = mimo_bin_path
-                end
-            end
-            mimo_bin
-        elseif provider_str == "OpenCode"
-            oc_bin = get(ENV, "OPENCODE_AGENT_ACP", "")
-            if isempty(oc_bin)
-                oc_bin_path = which_executable("opencode")
-                if oc_bin_path === nothing
-                    oc_path = joinpath(homedir(), ".opencode", "bin", "opencode")
-                    oc_bin = isfile(oc_path) ? oc_path : "opencode"
-                else
-                    oc_bin = oc_bin_path
-                end
-            end
-            oc_bin
-        elseif provider_str == "ClaudeCode"
-            agent_bin
-        else
-            @warn "BonitoWorker: unknown provider '$provider_str', falling back to default" sid
-            agent_bin
-        end
-    else
-        agent_bin
+    # Resolve the requested provider from the single AgentProviders registry — the
+    # SAME descriptors + list the server's dropdown is built from, so the two sides
+    # can't disagree. The provider arrives as a name string (a Julia type can't
+    # cross the JSON control-WS); its `bin`/`args`/`env` are resolved HERE,
+    # worker-side, so `Sys.which` runs on the machine that owns the binary. An
+    # unknown provider — or the mock when `BT_ENABLE_MOCK_AGENT` is unset — is
+    # rejected, not silently swapped for a default binary.
+    provider_str = String(get(cmd, "provider", "ClaudeCode"))
+    provider = try
+        AgentProviders.find_provider(provider_str)
+    catch e
+        return report_open_session_failed(ws, sid,
+            "unknown provider '$provider_str': $(sprint(showerror, e))")
     end
+    # Honor the worker's configured `agent_bin` for the default ClaudeCode provider
+    # (the installer points it at the local claude-agent-acp); every other provider
+    # uses the descriptor's worker-side resolved bin.
+    resolved_agent_bin = (provider_str == "ClaudeCode" && !isempty(agent_bin)) ?
+        agent_bin : provider.bin
 
     # Create the working dir if missing. A failure here (permissions, a file in
     # the way) is fatal for this session — narrow the catch to filesystem errors,
@@ -823,25 +804,18 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     # reachable. The server cannot reliably guess its own outward URL (see
     # `Bonito.online_url` behavior under `proxy_url="."`), so it stays out of
     # the URL-naming business.
-    # Provider-specific env: Claude uses CLAUDE_* vars, MiMo/OpenCode use their own.
-    provider_env = if provider_str == "ClaudeCode"
-        Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
-             "CLAUDE_MAX_TURNS"       => "100")
-    else
-        # MiMo and OpenCode don't need CLAUDE_* env vars
-        Dict{String,String}()
-    end
+    # Provider-specific env (e.g. Claude's CLAUDE_* vars) comes from the descriptor;
+    # the worker layers live ENV under it and the server-url on top. Live ENV stays
+    # the base so the agent inherits PATH etc.; `provider.env` and the per-session
+    # overrides win.
     env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
-                provider_env,
+                provider.env,
                 Dict("BONITOAGENTS_SERVER_URL"  => server_url),
                 env_overrides)
 
-    # `mimo`/`opencode` are multi-command CLIs whose ACP server lives under the
-    # `acp` subcommand; the bare binary launches their TUI and never speaks ACP
-    # (the `initialize` handshake would hang). `claude-agent-acp` speaks ACP
-    # directly, so it takes no subcommand.
-    agent_args = (provider_str == "MiMoCode" || provider_str == "OpenCode") ?
-        String["acp"] : String[]
+    # `provider.args` carries any required subcommand (e.g. `["acp"]` for
+    # mimo/opencode, whose ACP server lives under that subcommand).
+    agent_args = provider.args
     proc = try
         open(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd), "r+")
     catch e
@@ -1497,6 +1471,17 @@ function relay_proc_to_ws(proc, ws)
         e isa Base.IOError              && return
         WebSockets.isclosed(ws)         && return
         @warn "BonitoWorker proc→ws relay error" exception=e
+    finally
+        # The agent produced no more output — it EXITED (e.g. crashed mid-turn, or
+        # was reaped on a normal close). Close the dial-back WS so the SERVER's ACP
+        # reader sees EOF and flips the session dead (header restart button),
+        # instead of hanging forever on a `session/prompt` response that will never
+        # arrive. Best-effort + idempotent: on a normal close the ws is already
+        # going down; the handler still reaps `proc` either way.
+        try
+            WebSockets.isclosed(ws) || close(ws)
+        catch
+        end
     end
 end
 

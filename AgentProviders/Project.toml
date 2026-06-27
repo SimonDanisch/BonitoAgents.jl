@@ -1,0 +1,6 @@
+name = "AgentProviders"
+uuid = "c3d4e5f6-7a8b-49c0-b1d2-e3f4a5b6c7d8"
+authors = ["Simon Danisch <sdanisch@gmail.com>"]
+version = "0.1.0"
+
+[deps]

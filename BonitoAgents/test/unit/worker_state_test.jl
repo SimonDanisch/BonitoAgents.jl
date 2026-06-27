@@ -32,9 +32,13 @@ import JSON
     for p in (p1, p2, p3); st.projects[][p.id] = p; end
     # Real ChatModels (not Symbol stand-ins): worker eviction now close()s each
     # model and stop!s its agent, which needs the real type. A never-started model
-    # (no agent subprocess, no consumer/poller) evicts cleanly.
-    st.chat_models["p1"] = BT.ChatModel(st, mktempdir(); project_id = "p1")
-    st.chat_models["p3"] = BT.ChatModel(st, mktempdir(); project_id = "p3")
+    # (no agent subprocess, no consumer/poller) evicts cleanly. Each carries a
+    # WorkerAgent for its worker — the only agent kind now (no local default).
+    c1 = mktempdir(); c3 = mktempdir()
+    st.chat_models["p1"] = BT.ChatModel(st, c1; project_id = "p1",
+                                        agent = BT.WorkerAgent(st, wid, c1))
+    st.chat_models["p3"] = BT.ChatModel(st, c3; project_id = "p3",
+                                        agent = BT.WorkerAgent(st, "worker-2", c3))
     BT.save_workers!(st); BT.save_projects!(st)
 
     notified = Ref(0)
@@ -68,7 +72,9 @@ import JSON
                                        "/home/v/projects", :offline, now(UTC))
     p4 = mk("p4", "Keep", wid2)
     st.projects[][p4.id] = p4
-    st.chat_models["p4"] = BT.ChatModel(st, mktempdir(); project_id = "p4")
+    c4 = mktempdir()
+    st.chat_models["p4"] = BT.ChatModel(st, c4; project_id = "p4",
+                                        agent = BT.WorkerAgent(st, wid2, c4))
     BT.remove_worker!(st, wid2; remove_projects = false)
     @test !haskey(st.workers[], wid2)
     @test haskey(st.projects[], "p4")              # row kept
@@ -175,7 +181,9 @@ end
     st.projects[][ "pp" ] = BT.ProjectInfo("pp", "Proj", wid,
                                 joinpath(dir, "work", "Proj"),
                                 "/home/u/projects/Proj", now(UTC))
-    st.chat_models["pp"] = BT.ChatModel(st, mktempdir(); project_id = "pp")
+    cpp = mktempdir()
+    st.chat_models["pp"] = BT.ChatModel(st, cpp; project_id = "pp",
+                                        agent = BT.WorkerAgent(st, wid, cpp))
 
     # Sockets are compared by `===`, so any two distinct objects stand in for
     # two real WebSockets here.

@@ -5,6 +5,7 @@ authors = ["Simon Danisch <sdanisch@gmail.com>"]
 
 [deps]
 AgentClientProtocol = "a1b2c3d4-1234-5678-abcd-a1b2c3d4e5f6"
+AgentProviders = "c3d4e5f6-7a8b-49c0-b1d2-e3f4a5b6c7d8"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 BonitoBook = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
@@ -27,6 +28,7 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
 AgentClientProtocol = {path = "../AgentClientProtocol"}
+AgentProviders = {path = "../AgentProviders"}
 Bonito = {rev = "master", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoMCP = {path = "../BonitoMCP"}

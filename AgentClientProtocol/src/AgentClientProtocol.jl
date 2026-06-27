@@ -2,14 +2,16 @@ module AgentClientProtocol
 
 using JSON
 using Base64
+using HTTP
 
 include("types.jl")
 include("connection.jl")
+include("worker_transport.jl")
 include("messages.jl")
 include("client.jl")
 
 export Client, MCPServer, ImageAttachment, prompt!, cancel!, set_config_option!
-export Transport, SubprocessTransport
+export Transport, WorkerTransport
 export Handler, DiscardHandler
 export ConnectionClosed
 export SessionUpdate, AgentMessageChunk, UserMessageChunk, AgentThoughtChunk

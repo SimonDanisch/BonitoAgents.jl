@@ -304,6 +304,18 @@ const ChatStyles = Bonito.Styles(
     CSS("@keyframes bt-restart-pulse",
         CSS("0%, 100%", "box-shadow" => "0 0 0 0 rgba(220,38,38,0.0)"),
         CSS("50%",      "box-shadow" => "0 0 0 6px rgba(220,38,38,0.15)")),
+    # While a restart is actually running the button shows this "working" state
+    # instead of the red dead pulse — so it reads as "restarting…", not "broken,
+    # click me", and isn't styled as the clickable failure indicator. `progress`
+    # cursor + a gentle opacity breathe; clicks are ignored by the handler guard.
+    CSS(".bt-header-restart-busy",
+        "cursor" => "progress",
+        "animation" => "bt-restart-working 1s ease-in-out infinite"),
+    CSS(".bt-header-restart-busy:hover",
+        "background" => "var(--bt-surface)"),
+    CSS("@keyframes bt-restart-working",
+        CSS("0%, 100%", "opacity" => "0.5"),
+        CSS("50%",      "opacity" => "0.9")),
     # ── Provider switcher ──────────────────────────────────────────────────
     # Dropdown to switch between Claude Code and MiMo Code. Styled as a
     # compact pill similar to the restart button.

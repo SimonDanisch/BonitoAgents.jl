@@ -37,16 +37,28 @@
 
 using JSON, Sockets
 
-const SCENARIO  = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
-const N_CHUNKS  = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNKS",  "3")))
-const SESSION   = String(get(ENV, "BT_MOCK_ACP_SESSION", "s"))
-const CHUNK_MS  = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNK_MS", "0")))
-# Dispatcher mode (scenario = "dispatcher"): connect back to a TCP socket
-# in the parent test process. Per `session/prompt` we send a single JSON
-# object {"prompt": "..."} and the dispatcher streams back a list of
-# events terminated by a line {"type":"end"} which carries the optional
-# stopReason. Each event maps to one ACP frame.
-const DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
+# Runtime config. This is a PACKAGE now (`julia -m MockACP`), so the spawner's
+# env must be read when `main` RUNS, not at precompile — hence typed globals
+# filled by `_configure!()` (called from `main`) rather than `const`s.
+# Dispatcher mode (scenario = "dispatcher"): connect back to a TCP socket in the
+# parent test process. Per `session/prompt` we send a single JSON object
+# {"prompt": "..."} and the dispatcher streams back a list of events terminated
+# by a line {"type":"end"} which carries the optional stopReason. Each event maps
+# to one ACP frame.
+SCENARIO::String        = "normal"
+N_CHUNKS::Int           = 3
+SESSION::String         = "s"
+CHUNK_MS::Int           = 0
+DISPATCHER_ADDR::String = ""
+
+function _configure!()
+    global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
+    global N_CHUNKS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNKS",  "3")))
+    global SESSION         = String(get(ENV, "BT_MOCK_ACP_SESSION", "s"))
+    global CHUNK_MS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNK_MS", "0")))
+    global DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
+    return nothing
+end
 
 # Flushing line writer: the real claude-agent-acp emits each frame as one
 # line + flush; mirror it so the reader-loop in `ACP.Connection` sees
@@ -535,5 +547,3 @@ function dispatch_loop()
         # for unknown methods.
     end
 end
-
-dispatch_loop()

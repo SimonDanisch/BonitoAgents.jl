@@ -114,8 +114,12 @@
     after_total   = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.totalCount")
     after_bubbles = TK.eval_js(s, "document.querySelectorAll('.bt-agent-msg, .bt-user-msg').length")
 
-    # totalCount went up by 4 (1 user "background 3" + 3 agent bubbles).
-    @test (after_total - before_total) == 4
+    # totalCount went up by 2: the user "background 3" message + ONE agent
+    # message. The three streamed text chunks coalesce into a single assistant
+    # bubble (that's how streaming works — chunks build up one message), so the
+    # count is +2, not +4. What this test actually guards is that the new bubble
+    # reaches the DOM while rAF is parked (checked above + by `after_bubbles`).
+    @test (after_total - before_total) == 2
     # DOM bubble count grew — the bubbles aren't stuck in cache.
     @test after_bubbles > before_bubbles
 

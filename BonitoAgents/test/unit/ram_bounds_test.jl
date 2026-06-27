@@ -15,7 +15,10 @@ newstate() = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir()
 
 @testset "tool_content_cache is LRU-bounded" begin
     cap = BT.TOOL_CONTENT_CACHE_CAP
-    m = BT.ChatModel(newstate(), mktempdir(); project_id = "p")
+    st = newstate(); cwd = mktempdir()
+    # A chat always has an agent now (no local-default); a WorkerAgent is a plain
+    # struct — nothing connects until `start!`, which this cache test never calls.
+    m = BT.ChatModel(st, cwd; project_id = "p", agent = BT.WorkerAgent(st, "w", cwd))
     cache, order = m.tool_content_cache, m.tool_cache_order
 
     # Fill well past the cap with completed (non-empty) tools, then a couple of

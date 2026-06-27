@@ -168,6 +168,20 @@
 
         # ── 6. Scrolling back to the very bottom auto-re-engages ────────────
         @testset "scrolling to the bottom auto-re-engages follow mode" begin
+            # Let the prior burst finish streaming before we drive the scroll by
+            # hand. A chunk landing mid-gesture grows scrollHeight and races the
+            # synthetic scroll-to-bottom, so the handler can sample a position
+            # that's no longer within AT_BOTTOM_PX. (The re-engage logic itself is
+            # correct — verified directly: a user scroll landing at the bottom
+            # flips followMode back on, gap 0, even with this much content.)
+            let last = -1, n = -2, tries = 0
+                while n != last && tries < 40
+                    last = n
+                    n = Int(TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.totalCount"))
+                    tries += 1
+                    sleep(0.3)
+                end
+            end
             # First disengage.
             scroll_up_as_user!()
             @test follow_mode() == false

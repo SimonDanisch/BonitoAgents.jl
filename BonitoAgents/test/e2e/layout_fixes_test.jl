@@ -109,8 +109,10 @@
             timeout = 5) == true
         active_h = TK.eval_js(s,
             "Math.round(document.querySelector('.bt-busy').getBoundingClientRect().height)")
-        # 28px per the CSS rule (allow a couple px of layout rounding).
-        @test 24 <= active_h <= 32
+        # CSS sets content height 28px; the bounding box is ~36px once its padding
+        # is included. Assert the expanded box height (well clear of the 0 resting
+        # height), allowing for padding + layout rounding.
+        @test 28 <= active_h <= 42
 
         # Pre-fix the row jumped; post-fix it transitions. We can't time the
         # 150ms tween reliably under rAF throttling on a hidden window, but we
@@ -148,11 +150,15 @@
         @test TK.wait_for(s, "busy active after send",
             "!!document.querySelector('.bt-busy.bt-busy-active')"; timeout = 10) == true
 
-        # Navigate Home — the chat pane's DOM subsession tears down / hides
-        # (the input disappears from the VISIBLE pane the harness scopes to).
+        # Navigate Home — the chat pane is HIDDEN (the KeyedList keeps it in the
+        # DOM for fast switching, so the input still exists but is no longer
+        # visible). Assert no VISIBLE input, not that it's gone from the DOM.
+        # (Checking `=== null` would never succeed — it'd block the full timeout,
+        # by which point the streaming turn below has already finished.)
         TK.to_dashboard(s)
-        @test TK.wait_for(s, "chat unmounted on Home",
-            "document.querySelector('.bt-text-input') === null"; timeout = 8) == true
+        @test TK.wait_for(s, "chat input not visible on Home",
+            "[...document.querySelectorAll('.bt-text-input')].every(e => e.offsetParent === null)";
+            timeout = 8) == true
         sleep(0.3)
 
         # Back to the same chat — the pane re-mounts. Because the spinner class

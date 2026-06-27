@@ -16,10 +16,8 @@ include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
 import .TestKit
 const TK = TestKit
 
-# The mock agent re-execs Julia under BT_MOCK_PROJECT; pin it to the active
-# (root) project so it has JSON/Sockets, regardless of the test's pwd. Per
-# CLAUDE.md the root project is the only instantiated env — never a package's.
-ENV["BT_MOCK_PROJECT_OVERRIDE"] = dirname(Base.active_project())
+# (TestKit now points the mock — `julia -m MockACP` — at the test env via
+# BT_MOCK_PROJECT itself; no per-test override needed.)
 
 const RESUME_SHOT_DIR = joinpath(tempdir(), "bt-resume-e2e")
 mkpath(RESUME_SHOT_DIR)

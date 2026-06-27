@@ -9,6 +9,7 @@ module BonitoAgents
 
 using Bonito
 using AgentClientProtocol
+using AgentProviders     # provider descriptors + current_providers/find_provider (SSOT, shared w/ worker)
 using HTTP
 using JSON
 using Markdown
@@ -42,8 +43,8 @@ bonito_asset(parts::AbstractString...) =
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("progress.jl")         # notify_progress / format_progress_string — shared by sync + import
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
-include("transport.jl")        # ChatTransport + WorkerTransport (worker WS line I/O)
-include("agents.jl")           # AgentProvider + BinAgent (Claude/MiMo/OpenCode/Mock) + WorkerAgent
+include("transport.jl")        # ACP bring-up payload helpers (mcp list, system prompt)
+include("agents.jl")           # WorkerAgent (server-side live agent over the worker WS)
 include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
