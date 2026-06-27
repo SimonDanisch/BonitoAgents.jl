@@ -51,12 +51,18 @@
     # user-side composer DOM + the user bubble landing.
     s.agent_fn[] = _prompt -> [TK.end_turn()]
 
-    # Fresh chat → fresh composer with an empty attachments bar.
-    TK.new_chat(s)
+    # Fresh chat → fresh composer with an empty attachments bar. SCOPE every query
+    # to THIS chat's pane (`P`): the soak server keeps prior items' chat panes
+    # mounted (keep-alive KeyedList), so a bare `document.querySelector('.bt-
+    # attachments')` / a global `.bt-attachment-thumb` count would read a STALE
+    # pane and flake (worse the later this item runs in the soak). Other e2e items
+    # pane-scope for exactly this reason.
+    pid = TK.new_chat(s)
+    P = ".bt-chatpane[data-pane-pid=\"$(pid)\"] "
     @test TK.wait_for(s, "chat input mounted",
-        "document.querySelector('.bt-text-input') !== null"; timeout = 30)
+        "document.querySelector('$(P).bt-text-input') !== null"; timeout = 30)
     @test TK.wait_for(s, "attachments bar mounted",
-        "document.querySelector('.bt-attachments') !== null"; timeout = 10)
+        "document.querySelector('$(P).bt-attachments') !== null"; timeout = 10)
 
     # Tiny synthetic byte payload. Not a valid PNG — neither end decodes it; the
     # MIME tag drives routing. Shipped as a JS hex→Uint8Array snippet.
@@ -72,7 +78,7 @@
         })()
     """
 
-    attach_count() = TK.eval_js(s, "document.querySelectorAll('.bt-attachment-thumb').length")
+    attach_count() = TK.eval_js(s, "document.querySelectorAll('$(P).bt-attachment-thumb').length")
 
     # Build a real File in JS, dispatch the real ClipboardEvent against the
     # textarea, and fall back to the composer's `_attachAddBlob` if the
@@ -83,12 +89,12 @@
             const file  = new File([bytes], $(repr(filename)), {type: $(repr(mime))});
             const dt = new DataTransfer();
             dt.items.add(file);
-            const ta  = document.querySelector('.bt-text-input');
+            const ta  = document.querySelector('$(P).bt-text-input');
             const evt = new ClipboardEvent('paste',
                 {clipboardData: dt, bubbles: true, cancelable: true});
             ta.dispatchEvent(evt);
             if (!evt.clipboardData || evt.clipboardData.files.length === 0) {
-                const chat = document.querySelector('.bt-messages').__bt_chat;
+                const chat = document.querySelector('$(P).bt-messages').__bt_chat;
                 chat._attachAddBlob(file, file.type, file.name);
             }
             return true;
@@ -109,7 +115,7 @@
                 {dataTransfer: dt, bubbles: true, cancelable: true});
             app.dispatchEvent(drop);
             if (!drop.dataTransfer || drop.dataTransfer.files.length === 0) {
-                const chat = document.querySelector('.bt-messages').__bt_chat;
+                const chat = document.querySelector('$(P).bt-messages').__bt_chat;
                 chat._attachAddBlob(file, file.type, file.name);
             }
             return true;
@@ -118,55 +124,55 @@
 
     # ── Empty state ─────────────────────────────────────────────────────────
     @test attach_count() == 0
-    @test TK.eval_js(s, """document.querySelector('.bt-attachments')
+    @test TK.eval_js(s, """document.querySelector('$(P).bt-attachments')
         .classList.contains('bt-attachments-active')""") === false
 
     # ── Paste one image → one thumbnail, bar active, <img> is a data: URL ─────
     paste_image("pasted-1.png", TINY_PNG_HEX)
     @test TK.wait_for(s, "one thumbnail",
-        "document.querySelectorAll('.bt-attachment-thumb').length === 1"; timeout = 5)
-    @test TK.eval_js(s, """document.querySelector('.bt-attachments')
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 1"; timeout = 5)
+    @test TK.eval_js(s, """document.querySelector('$(P).bt-attachments')
         .classList.contains('bt-attachments-active')""") === true
     @test TK.eval_js(s, """(() => {
-        const img = document.querySelector('.bt-attachment-thumb img');
+        const img = document.querySelector('$(P).bt-attachment-thumb img');
         return !!(img && img.src.startsWith('data:image/'));
     })()""") === true
 
     # ── Paste a second image → two thumbnails ────────────────────────────────
     paste_image("pasted-2.png", TINY_PNG_HEX)
     @test TK.wait_for(s, "two thumbnails",
-        "document.querySelectorAll('.bt-attachment-thumb').length === 2"; timeout = 5)
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 2"; timeout = 5)
 
     # ── Drop a third onto .bt-app → three thumbnails, drag-over cleared ───────
     drop_image("dropped-3.png", TINY_PNG_HEX)
     @test TK.wait_for(s, "three thumbnails",
-        "document.querySelectorAll('.bt-attachment-thumb').length === 3"; timeout = 5)
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 3"; timeout = 5)
     @test TK.eval_js(s, """document.querySelector('.bt-app')
         .classList.contains('bt-drag-over')""") === false
 
     # ── Click × on the middle thumb → two remain (persistence until removed) ──
     TK.eval_js(s, """(() => {
-        const thumbs = document.querySelectorAll('.bt-attachment-thumb');
+        const thumbs = document.querySelectorAll('$(P).bt-attachment-thumb');
         thumbs[1].querySelector('.bt-attachment-remove').click();
         return true;
     })()""")
     @test TK.wait_for(s, "two thumbnails remain",
-        "document.querySelectorAll('.bt-attachment-thumb').length === 2"; timeout = 5)
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 2"; timeout = 5)
 
     # ── Send with attachments → bubble lands, strip + textarea cleared ────────
-    n_user_before = TK.eval_js(s, "document.querySelectorAll('.bt-user-msg').length")
+    n_user_before = TK.eval_js(s, "document.querySelectorAll('$(P).bt-user-msg').length")
     TK.send_message(s, "look at these")
     @test TK.wait_for(s, "user bubble appears",
-        "document.querySelectorAll('.bt-user-msg').length >= $(n_user_before + 1)"; timeout = 10)
+        "document.querySelectorAll('$(P).bt-user-msg').length >= $(n_user_before + 1)"; timeout = 10)
     bubble = String(TK.eval_js(s, """(() => {
-        const bs = document.querySelectorAll('.bt-user-msg');
+        const bs = document.querySelectorAll('$(P).bt-user-msg');
         return bs[bs.length - 1].innerText;
     })()"""))
     @test occursin("look at these", bubble)
     @test TK.wait_for(s, "thumbs cleared on send",
-        "document.querySelectorAll('.bt-attachment-thumb').length === 0"; timeout = 5)
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 0"; timeout = 5)
     @test TK.wait_for(s, "textarea cleared on send",
-        "document.querySelector('.bt-text-input').value === ''"; timeout = 5)
+        "document.querySelector('$(P).bt-text-input').value === ''"; timeout = 5)
 
     # ── Oversize image is rejected client-side (no thumb, "too large" chip) ───
     # A 6 MB Uint8Array trips the .size guard in `_attachAddBlob` before any
@@ -174,52 +180,52 @@
     TK.eval_js(s, """(() => {
         const big  = new Uint8Array(6 * 1024 * 1024);
         const file = new File([big], 'huge.png', {type: 'image/png'});
-        document.querySelector('.bt-messages').__bt_chat
+        document.querySelector('$(P).bt-messages').__bt_chat
             ._attachAddBlob(file, file.type, file.name);
         return true;
     })()""")
     @test TK.wait_for(s, "error chip appears",
-        "document.querySelector('.bt-attach-error') !== null"; timeout = 5)
+        "document.querySelector('$(P).bt-attach-error') !== null"; timeout = 5)
     @test attach_count() == 0
     @test occursin("too large", lowercase(String(
-        TK.eval_js(s, "document.querySelector('.bt-attach-error')?.innerText || ''"))))
+        TK.eval_js(s, "document.querySelector('$(P).bt-attach-error')?.innerText || ''"))))
 
     # ── Server-side reject for unsupported mime → attach_error chip ───────────
     # Clear any leftover chip so we can detect a FRESH one, then queue a PDF
     # (JS trusts the browser mime; the server is the authority).
     TK.eval_js(s, """(() => {
-        const c = document.querySelector('.bt-attach-error'); if (c) c.remove();
+        const c = document.querySelector('$(P).bt-attach-error'); if (c) c.remove();
         return true;
     })()""")
     TK.eval_js(s, """(() => {
         const bytes = new Uint8Array([0xff, 0xd8, 0xff]);
         const file  = new File([bytes], 'foo.pdf', {type: 'application/pdf'});
-        document.querySelector('.bt-messages').__bt_chat
+        document.querySelector('$(P).bt-messages').__bt_chat
             ._attachAddBlob(file, file.type, file.name);
         return true;
     })()""")
     @test TK.wait_for(s, "pdf thumb queued (JS doesn't gate mime)",
-        "document.querySelectorAll('.bt-attachment-thumb').length === 1"; timeout = 5)
-    TK.click(s, ".bt-send-btn")
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 1"; timeout = 5)
+    TK.click(s, "$(P).bt-send-btn")
     @test TK.wait_for(s, "attach_error chip mentions mime", """(() => {
-        const c = document.querySelector('.bt-attach-error');
+        const c = document.querySelector('$(P).bt-attach-error');
         return !!(c && c.innerText.toLowerCase().indexOf('mime') !== -1);
     })()"""; timeout = 5)
     # Cleanup the bad thumb + chip before the text-only check.
     TK.eval_js(s, """(() => {
-        const chat = document.querySelector('.bt-messages').__bt_chat;
+        const chat = document.querySelector('$(P).bt-messages').__bt_chat;
         chat._attachClear();
-        const c = document.querySelector('.bt-attach-error'); if (c) c.remove();
+        const c = document.querySelector('$(P).bt-attach-error'); if (c) c.remove();
         return true;
     })()""")
 
     # ── Pure-text send still works (no attachments queued) ────────────────────
-    n_user_before2 = TK.eval_js(s, "document.querySelectorAll('.bt-user-msg').length")
+    n_user_before2 = TK.eval_js(s, "document.querySelectorAll('$(P).bt-user-msg').length")
     TK.send_message(s, "plain text after attachments")
     @test TK.wait_for(s, "new user bubble",
-        "document.querySelectorAll('.bt-user-msg').length >= $(n_user_before2 + 1)"; timeout = 10)
+        "document.querySelectorAll('$(P).bt-user-msg').length >= $(n_user_before2 + 1)"; timeout = 10)
     last_text = String(TK.eval_js(s, """(() => {
-        const bs = document.querySelectorAll('.bt-user-msg');
+        const bs = document.querySelectorAll('$(P).bt-user-msg');
         return bs[bs.length - 1].innerText;
     })()"""))
     @test occursin("plain text after attachments", last_text)
