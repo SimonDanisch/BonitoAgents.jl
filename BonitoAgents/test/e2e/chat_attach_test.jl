@@ -108,7 +108,7 @@
             const file  = new File([bytes], $(repr(filename)), {type: $(repr(mime))});
             const dt = new DataTransfer();
             dt.items.add(file);
-            const app = document.querySelector('.bt-app');
+            const app = document.querySelector('$(P).bt-app');
             app.dispatchEvent(new DragEvent('dragover',
                 {dataTransfer: dt, bubbles: true, cancelable: true}));
             const drop = new DragEvent('drop',
@@ -147,7 +147,7 @@
     drop_image("dropped-3.png", TINY_PNG_HEX)
     @test TK.wait_for(s, "three thumbnails",
         "document.querySelectorAll('$(P).bt-attachment-thumb').length === 3"; timeout = 5)
-    @test TK.eval_js(s, """document.querySelector('.bt-app')
+    @test TK.eval_js(s, """document.querySelector('$(P).bt-app')
         .classList.contains('bt-drag-over')""") === false
 
     # ── Click × on the middle thumb → two remain (persistence until removed) ──
