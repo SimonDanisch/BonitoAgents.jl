@@ -718,7 +718,13 @@ const SidebarStyles = Bonito.Styles(
         # dashboard" empty state: a 56px column has no room for a sentence.
         # The dashboard view that text refers to is already visible to the
         # right; hide on mobile so the sidebar stays purely icons.
-        CSS(".bt-side-empty", "display" => "none")),
+        CSS(".bt-side-empty", "display" => "none"),
+        # The per-chat "▾ files" affordance is absolutely positioned at the
+        # row's bottom-right; in the 56px icon rail it overlays the chat icon.
+        # The explicit `.bt-collapsed` path hides it (above) — the responsive
+        # 56px path must too, or a narrow window shows the menu over the icon.
+        CSS(".bt-side-tree-hint", "display" => "none"),
+        CSS(".bt-side-tree-wrap", "display" => "none")),
 )
 
 # ── Unified App ────────────────────────────────────────────────────────────

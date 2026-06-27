@@ -2035,9 +2035,27 @@ const MARKDOWN_LOCK = ReentrantLock()
 # is GitHub-style and already loaded into the shell) handles tables, code
 # blocks, lists, etc. — we don't have to duplicate the styling.
 markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
-    "<div class=\"markdown-body\">" *
-    sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text)))) *
-    "</div>"
+    inner = try
+        sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text))))
+    catch e
+        # We re-render on every streamed chunk, so the parser is routinely handed
+        # half-formed markdown — it must not be able to break message rendering.
+        # The one known failure is CommonMark's GFM table rule: a separator row
+        # that starts with `|` and is all `|-: ` passes its permissive
+        # `valid_table_spec`, but `parse_table_spec` (which needs `|dashes|`)
+        # returns an empty column spec, so `inline_modifier` indexes `spec[0]` →
+        # BoundsError. A streamed table trips exactly that on its way to `|---|`
+        # (`|`, `|-`, `| |`, …). Catch ONLY that and show the text verbatim
+        # (escaped, line breaks kept) — this preserves the content (tightening
+        # `valid_table_spec` instead makes CommonMark drop the header line) and
+        # the next chunk re-renders cleanly. Anything else is an unexpected bug
+        # and must surface, so rethrow. @debug not @warn: it fires per streamed
+        # partial, and warning would just reproduce the log flood it prevents.
+        e isa BoundsError || rethrow()
+        @debug "markdown_html: CommonMark BoundsError; showing text verbatim" exception = (e, catch_backtrace())
+        replace(esc_html(String(text)), "\n" => "<br>")
+    end
+    "<div class=\"markdown-body\">" * inner * "</div>"
 end
 
 # "new message" event. Streaming-open shape for agent/thought (seeded with the
@@ -3853,6 +3871,14 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     state = model.state
     project_id = model.project_id
     cwd = model.cwd
+    # The folder shown to the user is the project's path ON THE WORKER — where the
+    # agent and `bt_julia_eval` actually run, and the same path the projects scan
+    # list shows (`ProjectInfo.worker_path`). `model.cwd` is the server-side mirror
+    # under the state dir (`/…/state/working/<worker>-<name>`), which is
+    # meaningless to the user. Fall back to `cwd` only when there's no project yet.
+    project_now = isempty(project_id) ? nothing : get(state.projects[], project_id, nothing)
+    worker_dir = (project_now === nothing || isempty(project_now.worker_path)) ?
+        cwd : project_now.worker_path
 
     status_dot = map(model.session_alive) do alive
         DOM.span(""; class=alive ? "bt-dot bt-dot-online" : "bt-dot bt-dot-offline",
@@ -3882,12 +3908,12 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
     title_node = if isempty(project_id)
-        DOM.div(DOM.span(fallback_title; title=cwd), class="bt-header-title")
+        DOM.div(DOM.span(fallback_title; title=worker_dir), class="bt-header-title")
     else
         DOM.input(; type = "text",
             class = "bt-header-title bt-header-title-edit",
             value = title_val,
-            title = "Chat title — click to edit · folder: $cwd",
+            title = "Chat title — click to edit · folder: $worker_dir",
             onchange  = js"event => $(title_edit).notify(event.target.value)",
             onkeydown = js"""event => {
                 if (event.key === 'Enter') { event.target.blur(); }
@@ -3902,7 +3928,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # working dir). A muted monospace sub-line under the title row so each tab
     # makes its env unmistakable. Home-contracted for readability; full path on
     # hover.
-    env_line = DOM.div(replace(cwd, homedir() => "~"); class="bt-header-env", title=cwd)
+    env_line = DOM.div(replace(worker_dir, homedir() => "~"); class="bt-header-env", title=worker_dir)
 
     # Session config (model / mode / effort …) as a plain-text second header
     # line; re-renders whenever the agent reports a change (bring-up,

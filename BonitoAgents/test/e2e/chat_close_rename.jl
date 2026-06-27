@@ -76,6 +76,23 @@ function run_suite(server)
     server.agent_fn[] = (msg -> [TK.text("Echo: $msg")])
 
     @testset "close button + name persistence (UI)" begin
+        # ── Header shows the WORKER project path, not the server mirror ──────
+        # The folder line under the chat title must be the project's pwd on the
+        # worker (`ProjectInfo.worker_path`, what the projects scan list shows) —
+        # NOT `model.cwd` / `server_path`, the state-dir mirror that's meaningless
+        # to the user.
+        @testset "header folder line is the worker path" begin
+            pid = TK.new_chat(server; title = "PathProbe")
+            @test TK.wait_for(server, "header env present",
+                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); return !!(p && p.querySelector('.bt-header-env')); })()";
+                timeout = 10) == true
+            shown = TK.eval_js(server,
+                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); return p.querySelector('.bt-header-env').getAttribute('title'); })()")
+            proj = server.h.state.projects[][pid]
+            @test shown == proj.worker_path
+            @test shown != proj.server_path
+        end
+
         # ── Close removes the chat from the homebar ─────────────────────────
         @testset "✕ closes the chat: leaves the homebar, returns to dashboard" begin
             pid = TK.new_chat(server; title = "Closable")

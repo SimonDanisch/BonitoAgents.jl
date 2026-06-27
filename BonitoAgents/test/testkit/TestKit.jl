@@ -535,8 +535,13 @@ end
 Open one Electron window pointed at the dev server. Idempotent — the
 second call closes the prior window and opens a fresh one.
 """
+# `offscreen = true` (the DEFAULT) renders via OSR so requestAnimationFrame runs
+# at ~60fps instead of the ~1.5fps a plain hidden window's compositor produces —
+# the whole e2e suite exercises rAF-paced scroll/animation code, so faithful
+# timing is the correct default. Pass `offscreen = false` to opt a specific test
+# back onto the plain hidden-window path (e.g. to bisect an OSR-only difference).
 function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
-                       route::AbstractString = "/")
+                       route::AbstractString = "/", offscreen::Bool = true)
     ensure_display!()
     old = s.browser[]
     old === nothing || close(old)
@@ -544,7 +549,15 @@ function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
     # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
     # capturePage on the headless (show=false) window stays fresh.
-    ctx = ECT.open_window(url; width = width, height = height, show = false)
+    # `offscreen = true` switches to OSR so requestAnimationFrame runs at ~60fps
+    # instead of the ~1.5fps a plain hidden window's compositor produces — needed
+    # for tests that exercise rAF-paced scroll timing (momentum, follow-restore).
+    # Only pass the kwarg when actually requested: the CI/test env pins a git
+    # ElectronCall that predates `offscreen`, so the default path must call the
+    # old signature. OSR is opt-in and only resolves against the dev checkout.
+    ctx = offscreen ?
+        ECT.open_window(url; width = width, height = height, show = false, offscreen = true) :
+        ECT.open_window(url; width = width, height = height, show = false)
     s.browser[] = ctx
     ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
     sleep(3.0)                     # let the dashboard mount + the chat session boot
