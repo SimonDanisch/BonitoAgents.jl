@@ -1201,7 +1201,15 @@ function unified_main(session::Bonito.Session, state::ServerState,
     on(session, state.chat_signal) do _
         cur = alive[]
         keep = filter(pid -> haskey(state.chat_models, pid), cur)
-        length(keep) == length(cur) || (alive[] = keep)
+        # A worker MOVE (transfer_project! → ensure_project_session!) DELETES then
+        # RE-ADDS the chat model. The delete edge prunes the still-OPEN chat out of
+        # `alive` (filter above); the re-add edge must put it back, or its pane
+        # never re-materialises — it stays the current view but renders blank.
+        # `current_view` is cleared to "" on a real close, so this only revives a
+        # chat that's genuinely live again (a move), never an intentionally closed one.
+        cv = current_view[]
+        (!isempty(cv) && haskey(state.chat_models, cv) && !(cv in keep)) && push!(keep, cv)
+        keep == cur || (alive[] = keep)
     end
 
     container = DOM.div(dash_pane, chats_host, overlay_pane; class = "bt-main-views")
