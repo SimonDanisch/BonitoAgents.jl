@@ -136,13 +136,20 @@ function run_suite(server)
             # the pan scroller (see the file header), which is why nothing caught
             # this before. Pane-scoped selector since the soak server has many.
             sel = ".bt-chatpane[data-pane-pid=\"$pid\"] .bt-messages"
-            momentum = TK.eval_js(server, """(() => {
-                const c = document.querySelector($(repr(sel))); if (!c) return "no-container";
-                c.scrollTop = 1000;
-                const pd=(t,y)=>c.dispatchEvent(new PointerEvent(t,{bubbles:true,pointerId:1,button:0,pointerType:'mouse',clientY:y}));
-                pd('pointerdown',300); for (let y=312;y<=520;y+=14) pd('pointermove',y); pd('pointerup',520);
-                const ch=c.__bt_chat; return (ch._momentumRaf!==null || ch._springRaf!==null);
-            })()""")
+            # A REALISTIC upward fling: the pointermoves are spaced in REAL time so
+            # the pan scroller derives a FINITE velocity. Dispatching the whole burst
+            # synchronously gives every move dt≈0 → unbounded velocity, and under
+            # OSR's real 60fps momentum that overshoots straight to scrollTop 0 before
+            # the hide even fires (the old ~1.5fps hidden-window path moved too little
+            # per frame to expose it). Spacing the moves keeps the fling realistic.
+            pd(t, y) = TK.eval_js(server, """(()=>{document.querySelector($(repr(sel)))
+                .dispatchEvent(new PointerEvent("$(t)",{bubbles:true,pointerId:1,button:0,pointerType:'mouse',clientY:$(y)}));return true;})()""")
+            TK.eval_js(server, "(()=>{document.querySelector($(repr(sel))).scrollTop=1000;return true;})()")
+            pd("pointerdown", 300)
+            for y in 312:14:520; pd("pointermove", y); sleep(0.01); end
+            pd("pointerup", 520)
+            momentum = TK.eval_js(server, """(()=>{const ch=document.querySelector($(repr(sel))).__bt_chat;
+                return ch._momentumRaf!==null || ch._springRaf!==null;})()""")
             @test momentum === true                       # the fling engaged the pan momentum
             TK.to_dashboard(server)                        # hide mid-fling → onHidden
             sleep(0.1)
