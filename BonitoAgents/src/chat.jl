@@ -2828,6 +2828,15 @@ end
 # for `drain_turn!`, or `nothing` when there's no client.
 function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     promote_queued_user_bubble!(chat)
+    s = shared(chat)
+    # A turn can still be drained from the channel AFTER the chat is closed:
+    # `close(::ChatModel)` shuts `user_messages`, but the consumer keeps draining
+    # whatever was already buffered (a `for … in channel` finishes the buffer
+    # before exiting). Lazily binding here would spawn an agent + an LRU entry
+    # for a session that's already gone — an orphaned MockACP subprocess (the
+    # leak_cycle CI flake) and a stale `bound_lru` entry that never clears. The
+    # bind_lock can't catch this: the turn fires entirely AFTER stop_session!.
+    isopen(s.user_messages) || return nothing
     cli = client(chat.agent)
     if cli === nothing
         try
@@ -2838,7 +2847,6 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
         cli = client(chat.agent)
     end
     cli === nothing && return nothing
-    s = shared(chat)
     lock(() -> s.turns_active[] += 1, s.lock)
     s.last_stream_at[] = time()
     s.busy_active[] || (s.busy_active[] = true)
@@ -3231,6 +3239,12 @@ const BIND_CAP = 8
 function note_bound!(state::ServerState, pid::AbstractString)
     isempty(pid) && return nothing
     victim_pid = lock(state.lock) do
+        # If the chat was closed (removed from chat_models) before this bind's
+        # note_bound! landed — a turn buffered past close that still lazily
+        # bound — don't (re)enter it into the LRU. stop_session! already pruned
+        # the pid under THIS lock; re-adding it here leaks a dead entry that
+        # nothing ever filters out again (the leak_cycle bound_lru leak).
+        haskey(state.chat_models, pid) || return ""
         lru = state.bound_lru
         filter!(!=(pid), lru)
         push!(lru, pid)                       # most-recently-bound last

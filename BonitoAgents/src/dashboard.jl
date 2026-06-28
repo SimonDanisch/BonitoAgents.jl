@@ -449,8 +449,11 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         # the reader loop exits on its `while !conn.closed` guard (a plain
         # transport close would leave `conn.closed == false` and spin the reader
         # at 100% CPU). `stop!` is idempotent + total: a never-started agent just
-        # no-ops. This mirrors the restart path's `stop!(model.agent)`.
-        stop!(model.agent)
+        # no-ops. `permanent=true` latches the agent dead: a turn buffered past
+        # this close must not lazily re-bind it into an orphaned subprocess (the
+        # leak_cycle leak). Unlike the restart path's `stop!(model.agent)`, a
+        # closed chat never reuses THIS agent — a reopen builds a fresh one.
+        stop!(model.agent; permanent = true)
         notify_chats!(state)   # drop from the active-chats sidebar
     end
     release_project!(state, p)

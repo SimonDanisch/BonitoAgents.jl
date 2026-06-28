@@ -105,6 +105,11 @@ function run_suite(server)
         end
         @test n_pollers == 0
         @test wait_server(() -> mock_count() <= mocks_peak - CHURN_N)
+        # No agent left in the live-agent LRU after closing every chat. Guards the
+        # regression where a turn buffered past a chat's close lazily re-bound the
+        # already-dead session and pushed its pid into bound_lru AFTER stop_session!
+        # had pruned it — a stale entry nothing ever filtered out again.
+        @test wait_server(() -> isempty(state.bound_lru))
         @test length(state.pending_rpcs) <= 8
 
         # Coarse process-RSS backstop: opening + closing CHURN_N chats and a

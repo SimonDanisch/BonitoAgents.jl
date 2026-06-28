@@ -46,6 +46,12 @@ mutable struct WorkerAgent <: AgentProvider
     # Serialises start!/stop! for THIS agent: a ✕-close (stop_session! → stop!)
     # can land mid-bind and null `ws[]` out from under the half-built connection.
     bind_lock          :: ReentrantLock
+    # Set by stop! (under bind_lock): this agent is permanently dead. A turn
+    # buffered past a chat's close can still reach start! AFTER stop! already
+    # ran on the (lazy, still-unbound) agent — without this flag start! would
+    # bind it, spawning an orphaned subprocess nothing reaps. A reopen always
+    # builds a FRESH WorkerAgent, so latching this closed is correct.
+    closed             :: Bool
 end
 
 # Default provider is ClaudeCode, overridable via `BT_DEFAULT_PROVIDER` — set by
@@ -60,7 +66,7 @@ WorkerAgent(state::ServerState, worker_id::AbstractString, worker_path::Abstract
             handler::ACP.Handler = ACP.DiscardHandler()) =
     WorkerAgent(state, String(worker_id), String(worker_path),
                 collect(ACP.MCPServer, mcp), resume_session_id, provider, handler,
-                Ref{Any}(nothing), nothing, ACP.Message[], ReentrantLock())
+                Ref{Any}(nothing), nothing, ACP.Message[], ReentrantLock(), false)
 
 # The agent the worker sees as its cwd is the worker-side path.
 agent_cwd(a::WorkerAgent) = a.worker_path
@@ -84,6 +90,8 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     lock(a.bind_lock)
     try
     a.client === nothing || return a       # re-check under the lock
+    a.closed && return a                    # stop! already ran: dead agent (a turn buffered
+                                            # past close); don't re-bind — a reopen makes a fresh one
     haskey(a.state.worker_control_ws, a.worker_id) ||
         error("Worker '$(a.worker_id)' is not connected")
 
@@ -151,10 +159,18 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     end
 end
 
-function stop!(a::WorkerAgent)
+function stop!(a::WorkerAgent; permanent::Bool = false)
     # Hold bind_lock so a mid-bind stop! WAITS for the bind to finish (then a.client
     # is set and we close cleanly) instead of nulling ws[] under the half-built conn.
     lock(a.bind_lock) do
+        # `permanent=true` (stop_session! on a CLOSED/evicted chat) latches the
+        # agent dead so a turn buffered past close can't lazily re-bind it into an
+        # orphaned subprocess. Done UNDER bind_lock so it races cleanly with a
+        # concurrent start!: either start! already holds the lock (we wait, then
+        # close the freshly-bound client → reaped) or it runs after us (sees
+        # `closed` → aborts). Restart / worker-reconnect pass permanent=false:
+        # they stop! then re-bind the SAME agent, so they must NOT latch.
+        permanent && (a.closed = true)
         a.client === nothing || close(a.client)
         a.client = nothing
         a.replay = ACP.Message[]
