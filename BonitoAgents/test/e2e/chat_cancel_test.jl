@@ -45,15 +45,15 @@
     # small delay — long enough (≈ CHUNKS * DELAY_MS ms) that the test can land
     # a cancel mid-stream. Anything else gets a one-shot fast reply (used for
     # the post-cancel follow-up so it completes immediately).
-    # The stream must stay live LONG ENOUGH that the cancel reliably lands before
-    # the last chunk — the window is `~CHUNKS * DELAY_MS` minus the harness's
-    # round-trip latency to detect mid-stream + ship the cancel. Under nworkers=4
-    # those eval_js/websocket round-trips cost several seconds, so a 6s window
-    # (the old 20×300) let the whole stream drain before the cancel arrived and
-    # `part<CHUNKS>` showed up → flake. A ~16s window comfortably outlasts that
-    # latency. This does NOT slow the test: a successful cancel ends the turn
-    # early (after `part2`-ish), so the full duration only ever runs if the
-    # cancel genuinely never lands — which is the failure we want to catch.
+    # The stream must stay live LONG ENOUGH that the cancel lands before the last
+    # chunk — the window is `~CHUNKS * DELAY_MS` minus the harness's round-trip
+    # latency to detect mid-stream + ship the cancel. (The actual flake that bit
+    # us was NOT the window — it was a global `.bt-stop-btn` resolving to a stale
+    # pane, fixed by the `P` pane-scoping below; once the cancel reaches the right
+    # chat it lands in well under a second. We still keep a generous window so the
+    # cancel comfortably outraces a slow round-trip under nworkers=4 load.) This
+    # does NOT slow the test: a successful cancel ends the turn early (after
+    # `part2`-ish), so the full duration only runs if the cancel never lands.
     const CHUNKS   = 40
     const DELAY_MS = 400
 
@@ -75,8 +75,18 @@
 
     pid = TK.new_chat(s; title = "Cancel")
     TK.open_chat(s, pid)
+    # PANE-SCOPE every interaction to THIS chat's pane. SharedServer keeps other
+    # test items' chat panes mounted (display:none but still in the DOM), so a
+    # GLOBAL `.bt-stop-btn` / `.bt-busy` selector can resolve to a STALE pane.
+    # `TK.click`/`querySelector` (unlike `TK.set_input`) do NOT visibility-filter,
+    # so the cancel click landed on the wrong (idle) chat's stop button: the
+    # streaming chat was never cancelled, ran to completion (`part<CHUNKS>`), and
+    # "stream stopped early" failed. This reproduced deterministically even at
+    # nworkers=1 once other pane-creating items had run first — it is NOT a
+    # timing/load flake. Pin all selectors to this pane via `data-pane-pid`.
+    P = ".bt-chatpane[data-pane-pid=\"$(pid)\"] "
     TK.wait_for(s, "input live",
-        "[...document.querySelectorAll('.bt-text-input')].some(e=>e.offsetParent)"; timeout = 15)
+        "[...document.querySelectorAll('$(P).bt-text-input')].some(e=>e.offsetParent)"; timeout = 15)
 
     # One cancel scenario: send a long story, wait until we're genuinely
     # mid-stream (the streaming bubble exists AND has accrued a couple of
@@ -89,20 +99,23 @@
         # the ESC handler is wired (`_onEscapeKey` is the last listener
         # `_setupInputs` attaches) before we drive anything.
         @test TK.wait_for(s, "$(label): chat mounted",
-            "!!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-stop-btn')";
+            "!!document.querySelector('$(P).bt-text-input') && !!document.querySelector('$(P).bt-stop-btn')";
             timeout = 15) == true
         @test TK.wait_for(s, "$(label): ESC handler wired",
-            "(() => { const m = document.querySelector('.bt-messages'); " *
+            "(() => { const m = document.querySelector('$(P).bt-messages'); " *
             "return !!m && !!m.__bt_chat && typeof m.__bt_chat._onEscapeKey === 'function'; })()";
             timeout = 15) == true
 
         # Count agent bubbles already visible so we can refer to "the new one"
         # this turn produces. `VIS` = bubbles in the visible pane.
-        VIS = "[...document.querySelectorAll('.bt-agent-msg')].filter(e=>e.offsetParent!==null)"
+        VIS = "[...document.querySelectorAll('$(P).bt-agent-msg')].filter(e=>e.offsetParent!==null)"
         n_before = TK.eval_js(s, "$(VIS).length")
         n_before = n_before === nothing ? 0 : Int(n_before)
 
-        TK.send_message(s, "tell me a long story please")
+        # Pane-scoped send: `set_input` already visibility-filters, but pin the
+        # send button too so we never click a stale pane's `.bt-send-btn`.
+        TK.set_input(s, "$(P).bt-text-input", "tell me a long story please")
+        TK.click(s, "$(P).bt-send-btn")
 
         # Genuinely mid-stream: a NEW agent bubble has accrued a couple of chunks
         # (`part2 `) AND the turn is STILL generating (`.bt-busy-active`). NB:
@@ -114,7 +127,7 @@
         @test TK.wait_for(s, "$(label): streaming bubble mid-stream",
             "(() => { const b = $(VIS); " *
             "if (b.length <= $(n_before)) return false; " *
-            "const busy = document.querySelector('.bt-busy'); " *
+            "const busy = document.querySelector('$(P).bt-busy'); " *
             "const generating = !!busy && busy.classList.contains('bt-busy-active'); " *
             "return generating && (b[b.length - 1].innerText||'').includes('part2 '); })()";
             timeout = 30) == true
@@ -136,7 +149,7 @@
         # `.bt-stream-text === null` "sealed" check — that span is transient and
         # not a dependable signal.)
         @test TK.wait_for(s, "$(label): turn ended (busy cleared)",
-            "(() => { const el = document.querySelector('.bt-busy'); " *
+            "(() => { const el = document.querySelector('$(P).bt-busy'); " *
             "return !!el && !el.classList.contains('bt-busy-active'); })()";
             timeout = 20) == true
 
@@ -152,11 +165,12 @@
         # FOLLOW-UP WORKS: after the cancel the chat is in a clean state and a
         # new message completes a fresh turn end to end. The follow-up agent
         # reply is a distinct, fast one-shot we can match on.
-        n_after_cancel = TK.eval_js(s, "[...document.querySelectorAll('.bt-agent-msg')].filter(e=>e.offsetParent!==null).length")
+        n_after_cancel = TK.eval_js(s, "$(VIS).length")
         n_after_cancel = n_after_cancel === nothing ? 0 : Int(n_after_cancel)
-        TK.send_message(s, "$(label) ping")
+        TK.set_input(s, "$(P).bt-text-input", "$(label) ping")
+        TK.click(s, "$(P).bt-send-btn")
         @test TK.wait_for(s, "$(label): follow-up turn completes after cancel",
-            "(() => { const b = [...document.querySelectorAll('.bt-agent-msg')].filter(e=>e.offsetParent!==null); " *
+            "(() => { const b = $(VIS); " *
             "if (b.length <= $(n_after_cancel)) return false; " *
             "return (b[b.length - 1].innerText || '').includes('followup-done: $(label) ping'); })()";
             timeout = 30) == true
@@ -165,7 +179,7 @@
 
     @testset "BonitoAgents cancel mid-stream (stop button + ESC, sealed partial, follow-up)" begin
         @testset "stop button cancels mid-stream" begin
-            run_cancel("stop-click", () -> TK.click(s, ".bt-stop-btn"))
+            run_cancel("stop-click", () -> TK.click(s, "$(P).bt-stop-btn"))
         end
 
         @testset "ESC key cancels mid-stream (no focus required)" begin
