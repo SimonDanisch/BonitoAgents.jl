@@ -41,6 +41,11 @@ end
 
 function recv(t::WorkerTransport)
     ws = t.ws[]
+    # A nothing ws (never dialed, or `stop!` cleared it under a running reader)
+    # is EOF — NOT an error. Without this guard `isclosed(nothing)` would throw a
+    # MethodError up through the reader loop and get logged as a spurious "ACP
+    # reader failed". Mirrors `send`/`close`/`transport_eof`'s nothing handling.
+    ws === nothing && return ""
     HTTP.WebSockets.isclosed(ws) && return ""
     try
         return String(HTTP.WebSockets.receive(ws))

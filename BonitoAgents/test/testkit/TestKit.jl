@@ -746,8 +746,16 @@ Click the first element matching the CSS selector. Throws if it's missing.
 """
 function click(s::TestServer, selector::AbstractString)
     sel = String(selector)
+    # Prefer the VISIBLE match. SharedServer keeps other chats' panes mounted but
+    # hidden (display:none ⇒ offsetParent null), so a bare `querySelector` on a
+    # pane element (`.bt-stop-btn`, `.bt-send-btn`, …) could resolve to a STALE
+    # pane and click the wrong chat. Targeting the visible one auto-scopes every
+    # click to the active pane, so a test can't leak across panes by accident.
+    # Falls back to the first match when nothing is "visible" (e.g. a global
+    # dashboard control), preserving old behaviour for non-pane selectors.
     ok = eval_js(s, """(() => {
-        const el = document.querySelector($(json(sel)));
+        const els = [...document.querySelectorAll($(json(sel)))];
+        const el = els.find(e => e.offsetParent !== null) || els[0];
         if (!el) return false;
         el.click();
         return true;
@@ -967,9 +975,10 @@ Type `text` into the chat composer and click send, the same path a user takes.
 A chat must be open (see [`new_chat`](@ref) / [`open_chat`](@ref)).
 """
 function send_message(s::TestServer, txt::AbstractString)
-    set_input(s, ".bt-text-input", String(txt))
-    ok = eval_js(s, "(() => { const b=document.querySelector('.bt-send-btn'); if(!b)return false; b.click(); return true; })()")
-    ok === true || error("send_message: send button (.bt-send-btn) not found — is a chat open?")
+    set_input(s, ".bt-text-input", String(txt))   # set_input already visibility-filters
+    # Click the VISIBLE send button (the active pane's), never a hidden pane's.
+    ok = eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-send-btn')].find(e=>e.offsetParent!==null); if(!b)return false; b.click(); return true; })()")
+    ok === true || error("send_message: no visible send button (.bt-send-btn) — is a chat open?")
     return s
 end
 
