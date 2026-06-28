@@ -33,13 +33,11 @@ let appenv = joinpath(@__DIR__, "appenv"), cur = Base.active_project()
 end
 
 const NAME = isempty(ARGS) ? nothing : Regex(join(ARGS, "|"))
+# No `retries` kwarg on purpose: we NEVER retry a failing test. ReTestItems already
+# defaults to 0; a retry that greens a red item only hides a real bug or a test we
+# don't understand (the flakes it used to paper over were all real — chat-bind
+# deadlock, multi-pane selector leaks, SIGTERM-vs-load worker kill — found + fixed
+# once we stopped retrying). Don't add it back.
 ReTestItems.runtests(BonitoAgents;
     nworkers = parse(Int, get(ENV, "BT_TEST_NWORKERS", "4")),
-    # Default 0: a retry that turns a red item green only hides a real bug or a
-    # test we don't understand. The flakes retries used to paper over were real —
-    # the chat-bind deadlock (provider-list build), the multi-pane cancel selector
-    # leak, the SIGTERM-vs-load worker kill — and are fixed at the root. Keep it 0
-    # so any new flake surfaces instead of being silently retried. (Override with
-    # BT_TEST_RETRIES if you must, e.g. to triage a suspected-transient locally.)
-    retries = parse(Int, get(ENV, "BT_TEST_RETRIES", "0")),
     name = NAME)
