@@ -62,7 +62,17 @@ jobs:
         # keep a stale tree even after a fork branch moves) and precompile the
         # whole stack so the downstream jobs compile nothing.
         run: |
+          # The UI forks (Bonito, BonitoBook, BonitoWidgets) live in
+          # BonitoAgents/[sources]; ElectronCall is a TEST-only fork, in
+          # test/[sources]. Update + precompile EACH env where its forks actually
+          # live — `Pkg.update(["ElectronCall"])` on the main env errors with
+          # "not found in project or manifest" (ElectronCall isn't a main dep).
           julia --project=BonitoAgents -e '
+            using Pkg
+            Pkg.instantiate()
+            Pkg.update(["Bonito", "BonitoWidgets", "BonitoBook"])
+            Pkg.precompile()'
+          julia --project=BonitoAgents/test -e '
             using Pkg
             Pkg.instantiate()
             Pkg.update(["ElectronCall", "Bonito", "BonitoWidgets", "BonitoBook"])
