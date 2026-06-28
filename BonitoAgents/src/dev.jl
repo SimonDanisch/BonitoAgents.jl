@@ -98,6 +98,25 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     write(joinpath(worker_config, "worker_id"), worker_id)   # pin the ephemeral dev id
     resolved_agent_bin === nothing || (ENV["CLAUDE_AGENT_ACP"] = resolved_agent_bin)
     for (k, v) in agent_env; ENV[k] = v; end
+    # Build the provider singleton list ONCE here, on the uncontended startup path
+    # (ENV is now fully configured; no browser is attached yet). Without this the
+    # list is built lazily on the FIRST chat bind — and that first build compiles
+    # four descriptor constructors, reached concurrently from the bind path
+    # (`default_provider`) AND the provider-dropdown render (`current_providers`).
+    # Under nworkers=4 load that concurrent first-build stalled the bind for >90 s
+    # ("chat view opened" timeout); worse, since the memo only caches AFTER a full
+    # build, a stalled build was never cached, so every later bind on that worker
+    # re-entered the build and re-hung. `refresh_providers!` builds + first-compiles
+    # the four descriptor constructors once here, uncontended, so no bind ever
+    # first-builds it; it also rebuilds from the now-complete ENV, so a list
+    # memoised earlier (before `BT_ENABLE_MOCK_AGENT` was set) can't hide the mock.
+    refresh_providers!()
+    # …and first-compile the rest of the resolver chain the bind walks
+    # (`default_provider` → `find_provider`) here too, so NONE of it first-compiles
+    # on a bind concurrently with the dropdown render. The list is correct now, so
+    # this resolves cleanly (a genuinely misconfigured default would surface here,
+    # which is the right place for it).
+    default_provider()
     BonitoWorker.write_config!(; server_url = server_url, secret = secret,
                                 projects_root = worker_root, name = actual_name)
     worker_proc, _ = BonitoWorker.spawn_worker()

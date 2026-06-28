@@ -15,7 +15,7 @@ module AgentProviders
 export AgentProvider, BinAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent
 export provider_name, label, icon, resumable_session
-export current_providers, find_provider
+export current_providers, find_provider, refresh_providers!
 
 # `WorkerAgent` (BonitoAgents) also subtypes `AgentProvider`; the worker-spawned
 # binary providers are `BinAgent`s.
@@ -126,12 +126,52 @@ resumable_session(::MockAgent)       = true
 # offered only when `BT_ENABLE_MOCK_AGENT` is set — absent in production, set by
 # the test harness. The dropdown iterates this; the worker resolves through it.
 const _PROVIDERS = Ref{Vector{AgentProvider}}()
+# Guards the lazy build. WITHOUT it the memo was task-unsafe: the build is
+# reached from at least two independent tasks — the chat-bind path
+# (`default_provider` → `find_provider`) and the provider-dropdown render
+# (`current_providers` in the chat header) — and the FIRST call also triggers
+# first-time compilation of the four descriptor constructors. With no lock, two
+# tasks could enter the build concurrently and deadlock against each other on
+# Julia's codegen lock while first-compiling the same methods, stranding the
+# chat-bind for >90 s. Because the memo only writes `_PROVIDERS[]` AFTER a full
+# build, a stalled first build is never cached, so EVERY later bind on that
+# worker re-enters the build and re-hangs. The lock makes exactly one task build
+# (and compile) the list; everyone else waits, then hits the cache.
+const _PROVIDERS_LOCK = ReentrantLock()
+
+# Build (NOT memoised) the provider list from the CURRENT process ENV. The mock
+# is offered only when `BT_ENABLE_MOCK_AGENT` is set — so the result depends on
+# ENV at the moment of the call, which is exactly why the memo below must not be
+# populated before the spawner has finished configuring that ENV.
+_build_providers() = (ps = AgentProvider[ClaudeCodeAgent(), MiMoAgent(), OpenCodeAgent()];
+                      haskey(ENV, "BT_ENABLE_MOCK_AGENT") && push!(ps, MockAgent()); ps)
 
 function current_providers()
     isassigned(_PROVIDERS) && return _PROVIDERS[]
-    providers = AgentProvider[ClaudeCodeAgent(), MiMoAgent(), OpenCodeAgent()]
-    haskey(ENV, "BT_ENABLE_MOCK_AGENT") && push!(providers, MockAgent())
-    return _PROVIDERS[] = providers
+    lock(_PROVIDERS_LOCK) do
+        isassigned(_PROVIDERS) && return _PROVIDERS[]   # double-checked
+        _PROVIDERS[] = _build_providers()
+    end
+    return _PROVIDERS[]
+end
+
+"""
+    refresh_providers!() -> Vector{AgentProvider}
+
+Force-rebuild the memoised provider list from the CURRENT ENV and return it.
+`dev_server` calls this once, right after it finishes writing the agent ENV, for
+two reasons: (1) it WARMS the list — building + first-compiling the four
+descriptor constructors on the uncontended startup path, so the first chat bind
+never triggers that build concurrently with the provider-dropdown render (which
+under load stalled the bind >90 s and, never being cached, wedged every later
+bind on the worker); and (2) it OVERRIDES any list memoised earlier — e.g. before
+`BT_ENABLE_MOCK_AGENT` was set — which would otherwise hide the mock provider.
+"""
+function refresh_providers!()
+    lock(_PROVIDERS_LOCK) do
+        _PROVIDERS[] = _build_providers()
+    end
+    return _PROVIDERS[]
 end
 
 """
