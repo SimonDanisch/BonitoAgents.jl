@@ -117,6 +117,13 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # this resolves cleanly (a genuinely misconfigured default would surface here,
     # which is the right place for it).
     default_provider()
+    # Tie the worker's lifetime to OURS: `dev_server` is ephemeral (we already
+    # atexit-cleanup), so a worker it spawns must not outlive us. We pass our PID;
+    # the worker arms `PR_SET_PDEATHSIG` so the KERNEL reaps it when we die — even
+    # on an OOM-kill / SIGKILL that skips atexit. Without it, an abnormally-killed
+    # test runner (nworkers=N, OOM) orphans its detached worker subtree. The worker
+    # inherits this var at spawn.
+    ENV["BONITOAGENTS_DIE_WITH_PARENT"] = string(getpid())
     BonitoWorker.write_config!(; server_url = server_url, secret = secret,
                                 projects_root = worker_root, name = actual_name)
     worker_proc, _ = BonitoWorker.spawn_worker()
@@ -216,7 +223,7 @@ function Base.close(h::DevHandle)
     # Drop the env we set so this process is left as we found it (the detached
     # worker already inherited it at spawn; this just prevents leakage into
     # later dev_server / test runs in the same Julia session).
-    for k in ("BONITOAGENTS_CONFIG_DIR", "CLAUDE_AGENT_ACP")
+    for k in ("BONITOAGENTS_CONFIG_DIR", "CLAUDE_AGENT_ACP", "BONITOAGENTS_DIE_WITH_PARENT")
         haskey(ENV, k) && delete!(ENV, k)
     end
     # Bonito.Server.close blocks waiting for accept loops + WS handlers to

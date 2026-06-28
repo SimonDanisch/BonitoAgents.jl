@@ -609,7 +609,29 @@ Refuses to start if another live worker already holds the pidfile (a duplicate
 would fight it over the server's control-WS registration). Pass `force=true`
 to start anyway (e.g. you intend to replace a wedged instance you'll kill).
 """
+# Bind our lifetime to the spawning parent's (Linux only). `dev_server` sets
+# `BONITOAGENTS_DIE_WITH_PARENT` to its own PID; we then ask the kernel to SIGKILL
+# us the moment that parent dies — via `PR_SET_PDEATHSIG`, which fires even on an
+# OOM-kill / `kill -9` that skips the parent's atexit cleanup. Without this a
+# detached worker (we `setsid` to look like a real install) outlives an abnormally
+# -killed test runner and orphans its whole agent subtree → the process explosion.
+# Production leaves the var UNSET: the worker is a service meant to outlive its
+# launcher, so it stays detached.
+function _bind_lifetime_to_parent!()
+    Sys.islinux() || return nothing
+    want = tryparse(Int, get(ENV, "BONITOAGENTS_DIE_WITH_PARENT", ""))
+    want === nothing && return nothing
+    # PR_SET_PDEATHSIG (1) = SIGKILL (9).
+    ccall(:prctl, Cint, (Cint, Culong, Culong, Culong, Culong), 1, 9, 0, 0, 0)
+    # Race: pdeathsig only fires on a FUTURE parent death. If the parent already
+    # died (we've been reparented) before we set it, exit now instead of lingering.
+    ccall(:getppid, Cint, ()) == want ||
+        (@warn "BonitoWorker: spawning parent already gone; exiting"; exit(0))
+    return nothing
+end
+
 function start(; force::Bool = false)
+    _bind_lifetime_to_parent!()
     cfg = config_path()
     isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
                           "(`curl -fsSL <server-url>/install.jl | julia -`)")
