@@ -221,6 +221,10 @@ mutable struct ServerState
     # Per-path serialization lock for fetched `bt_show` files (server_dst => lock);
     # a process-level coordination pool, server-scoped here so it dies with the server.
     show_fetch_inflight :: Dict{String,ReentrantLock}
+    # LRU of project_ids whose agent is currently BOUND, most-recently last. Capped:
+    # binding past the cap closes the oldest idle session (reaps its agent; lazy
+    # ACP re-binds it from disk history on the next turn). Bounds agent processes.
+    bound_lru          :: Vector{String}
 end
 
 """
@@ -249,6 +253,7 @@ function ServerState(; state_dir::String,
         Dict{String,Any}(),                       # mcp_ctrl
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
+        String[],                                 # bound_lru
     )
     load_workers!(s)
     load_projects!(s)
@@ -283,6 +288,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.mcp_ctrl,                # sessions cooperate on the same tables
             s.session_inflight,
             s.show_fetch_inflight,
+            s.bound_lru,               # shared registry — one per server
         )
     end
 end

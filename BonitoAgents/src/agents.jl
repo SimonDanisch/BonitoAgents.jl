@@ -43,6 +43,9 @@ mutable struct WorkerAgent <: AgentProvider
     ws                 :: Ref{Any}                  # the dialed-back ACP WebSocket
     client             :: Union{ACP.Client,Nothing}
     replay             :: Vector{ACP.Message}
+    # Serialises start!/stop! for THIS agent: a ✕-close (stop_session! → stop!)
+    # can land mid-bind and null `ws[]` out from under the half-built connection.
+    bind_lock          :: ReentrantLock
 end
 
 # Default provider is ClaudeCode, overridable via `BT_DEFAULT_PROVIDER` — set by
@@ -57,7 +60,7 @@ WorkerAgent(state::ServerState, worker_id::AbstractString, worker_path::Abstract
             handler::ACP.Handler = ACP.DiscardHandler()) =
     WorkerAgent(state, String(worker_id), String(worker_path),
                 collect(ACP.MCPServer, mcp), resume_session_id, provider, handler,
-                Ref{Any}(nothing), nothing, ACP.Message[])
+                Ref{Any}(nothing), nothing, ACP.Message[], ReentrantLock())
 
 # The agent the worker sees as its cwd is the worker-side path.
 agent_cwd(a::WorkerAgent) = a.worker_path
@@ -77,7 +80,10 @@ ACP.WorkerTransport(a::WorkerAgent) = ACP.WorkerTransport(a.ws)
 # ACP `Connection` can drive line-level frames over it. The WorkerAgent owns one;
 # `start!` wires its `ws` Ref to the agent's.
 function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
-    a.client === nothing || return a       # idempotent
+    a.client === nothing || return a       # fast idempotent path
+    lock(a.bind_lock)
+    try
+    a.client === nothing || return a       # re-check under the lock
     haskey(a.state.worker_control_ws, a.worker_id) ||
         error("Worker '$(a.worker_id)' is not connected")
 
@@ -140,12 +146,19 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     a.client = ACP.Client(conn, session_id, a.worker_path, ACP._result_dict(result))
     a.replay = msgs
     return a
+    finally
+        unlock(a.bind_lock)
+    end
 end
 
 function stop!(a::WorkerAgent)
-    a.client === nothing || close(a.client)
-    a.client = nothing
-    a.replay = ACP.Message[]
-    a.ws[] = nothing
+    # Hold bind_lock so a mid-bind stop! WAITS for the bind to finish (then a.client
+    # is set and we close cleanly) instead of nulling ws[] under the half-built conn.
+    lock(a.bind_lock) do
+        a.client === nothing || close(a.client)
+        a.client = nothing
+        a.replay = ACP.Message[]
+        a.ws[] = nothing
+    end
     return a
 end

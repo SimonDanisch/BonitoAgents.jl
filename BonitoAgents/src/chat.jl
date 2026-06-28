@@ -2829,6 +2829,14 @@ end
 function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     promote_queued_user_bubble!(chat)
     cli = client(chat.agent)
+    if cli === nothing
+        try
+            start_chat_client!(chat)   # LAZY ACP: bind the agent on the first turn
+        catch e
+            @error "lazy ACP bind failed" project_id = chat.project_id exception = (e, catch_backtrace())
+        end
+        cli = client(chat.agent)
+    end
     cli === nothing && return nothing
     s = shared(chat)
     lock(() -> s.turns_active[] += 1, s.lock)
@@ -3208,6 +3216,45 @@ function handle_elicitation_request(chat::ChatModel, params)
 end
 
 # ── Client lifecycle ───────────────────────────────────────────────────────
+
+# At most this many chats keep a live agent (ACP subprocess) at once. Lazy ACP
+# already means only chats you've MESSAGED bind; this caps even that so a server
+# can't accumulate unbounded agent processes. Generous — the rest still open
+# instantly and show history from disk.
+const BIND_CAP = 8
+
+# Record that `pid`'s agent just bound (MRU) and keep at most BIND_CAP agents
+# alive: when we exceed it, fully CLOSE the oldest IDLE session (`stop_session!`
+# reaps its agent + drops the model). With lazy ACP a re-open rebuilds the chat
+# from its on-disk history and re-binds on the next turn — and the fresh
+# ChatModel/agent avoids reusing one agent's `ws` Ref across generations.
+function note_bound!(state::ServerState, pid::AbstractString)
+    isempty(pid) && return nothing
+    victim_pid = lock(state.lock) do
+        lru = state.bound_lru
+        filter!(!=(pid), lru)
+        push!(lru, pid)                       # most-recently-bound last
+        length(lru) <= BIND_CAP && return ""
+        for i in eachindex(lru)
+            cand = lru[i]
+            cand == pid && continue           # never evict the one we just bound
+            m = get(state.chat_models, cand, nothing)
+            m === nothing && (deleteat!(lru, i); return "")   # stale entry
+            shared(m).busy_active[] && continue               # don't cut a chat off mid-turn
+            return cand
+        end
+        return ""                             # everyone's busy — let it ride once
+    end
+    if !isempty(victim_pid)
+        p = get(state.projects[], victim_pid, nothing)
+        if p !== nothing
+            @info "LRU: closing idle chat to cap live agents" pid = victim_pid cap = BIND_CAP
+            stop_session!(state, p)           # reaps the agent + prunes bound_lru
+        end
+    end
+    return nothing
+end
+
 function start_chat_client!(model::ChatModel)
     # fs/* RPCs delegate to the stock FSRequestHandler; permission requests
     # render as interactive cards (see ChatPermissionHandler above).
@@ -3274,28 +3321,25 @@ function start_chat_client!(model::ChatModel)
     # Recording it makes the thread dedup/resume machinery (thread_dedup_key,
     # find_thread, the browser's imported-session hide) all agree on one chat.
     record_bound_session!(model, new_session_id)
+    shared(model).session_alive[] = true
+    note_bound!(model.state, model.project_id)
+    return nothing
+end
 
-    # Start the single consumer loop ONCE (it survives restarts, which only
-    # swap `client[]`). Runs on the shared parent so all per-session views and
-    # producers feed the one queue / one consumer.
+# Make a chat LIVE for VIEWING — cache it, start its consumer + poller — WITHOUT
+# binding an agent (the ACP subprocess is spawned lazily on the first turn).
+function register_chat_model!(model::ChatModel)
     s = shared(model)
     if s.consumer_task[] === nothing
         s.consumer_task[] = Base.errormonitor(@async run_chat!(s))
     end
-    # And the per-chat background-output poller (one task that ticks every
-    # second, walks THIS chat's live `BashToolMsg`s with `bg_running=true`).
-    # Idempotent: re-calls on restart find the existing task still alive and
-    # do nothing. The task ends when the chat closes.
     start_background_poller!(model.state, s)
-
-    # Cache the live model so the sidebar can swap to this chat instantly and
-    # test rigs can drive prompts via state.chat_models[pid] without the UI.
     if !isempty(model.project_id)
-        @info "registering chat model" project_id = model.project_id session_id = client(model.agent).session_id
+        @info "registering chat model" project_id = model.project_id
         lock(model.state.lock) do
             model.state.chat_models[model.project_id] = model
         end
-        notify_chats!(model.state)   # surface in the active-chats sidebar
+        notify_chats!(model.state)
     end
     return nothing
 end

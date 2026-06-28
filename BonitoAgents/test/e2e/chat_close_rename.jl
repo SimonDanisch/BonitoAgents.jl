@@ -100,9 +100,17 @@ function run_suite(server)
             @test TK.wait_for(server, "chat listed in homebar",
                 "[...document.querySelectorAll('.bt-side-item')].some(e => e.getAttribute('data-project-id') === $(repr(pid)))";
                 timeout = 10) == true
-            # Root fix for name-revert: a fresh chat binds its claude session id
-            # (so it's one tracked thread, not a duplicate in the threads browser).
-            @test bound_sid(server, pid) !== nothing
+            # Root fix for name-revert: a chat binds its claude session id (so it's
+            # one tracked thread, not a duplicate in the threads browser). With lazy
+            # ACP the bind happens ASYNC on the first message, so poll for it rather
+            # than assert instantly (the eager path bound synchronously at open).
+            @test let ok = false
+                for _ in 1:80
+                    bound_sid(server, pid) !== nothing && (ok = true; break)
+                    sleep(0.1)
+                end
+                ok
+            end
 
             @test click_close(server, pid) == "clicked"
             # The ✕ must actually remove the entry (the bug: it lingered).

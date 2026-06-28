@@ -409,7 +409,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
                        project_id  = p.id,
                        mcp_servers = mcp,
                        agent       = agent)
-    start_chat_client!(model)        # also caches into state.chat_models
+    register_chat_model!(model)      # LAZY: register for viewing; bind on first turn
     fire_auto_prompt!(model)
     return model
 end
@@ -433,6 +433,7 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     model = lock(state.lock) do
         m = get(state.chat_models, p.id, nothing)
         m === nothing || delete!(state.chat_models, p.id)
+        filter!(!=(p.id), state.bound_lru)   # drop from the live-agent LRU
         m
     end
     # close is idempotent + total now; a real error here is worth surfacing.
