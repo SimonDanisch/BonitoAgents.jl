@@ -726,6 +726,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             t = get(cmd, "type", "")
             if t == "open_session"
                 @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
+            elseif t == "close_session"
+                @async handle_close_session(cmd)
             elseif t == "open_transfer"
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
@@ -771,6 +773,13 @@ function report_open_session_failed(ws, sid::AbstractString, reason::AbstractStr
     end
     return nothing
 end
+
+# Live agent subprocesses keyed by their cwd (= the server's `worker_path`, one
+# per chat). Lets a `close_session` control message reap the proc EXPLICITLY when
+# the acp dial-back ws goes half-open in a bind-vs-close race and the relay never
+# reaches its kill (see `handle_close_session`).
+const _SESSION_PROCS = Dict{String,Any}()
+const _SESSION_PROCS_LOCK = ReentrantLock()
 
 function handle_open_session(ws, server_url::String, secret::String, agent_bin::String,
                               cmd::AbstractDict;
@@ -845,6 +854,10 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
             "failed to spawn agent ($resolved_agent_bin $(join(agent_args, ' '))): $(sprint(showerror, e))")
     end
     @info "BonitoWorker: ACP session started" sid cwd pid=getpid() provider=provider_str
+    # Register the proc BEFORE the acp dial-back so a `close_session` (server's
+    # reliable reap over the control ws) can always find it, even if the dial /
+    # ack races with the server tearing the session down.
+    lock(_SESSION_PROCS_LOCK) do; _SESSION_PROCS[cwd] = proc end
 
     acp_url = ws_url(server_url, "/worker-acp")
     # Outer try/finally guarantees the agent process is reaped on EVERY exit
@@ -877,6 +890,11 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         # errors are reported too; harmless if the session already came up.
         report_open_session_failed(ws, sid, "ACP session error: $(sprint(showerror, e))")
     finally
+        # Deregister (only if still us — a fast reopen on the same cwd may have
+        # replaced the entry) so a late close_session can't kill a newer session.
+        lock(_SESSION_PROCS_LOCK) do
+            get(_SESSION_PROCS, cwd, nothing) === proc && delete!(_SESSION_PROCS, cwd)
+        end
         # Backstop reap: covers the paths the inner finally never reaches — dial
         # failure, rejected ack, or any throw before the relays start. Idempotent
         # with the inner kill (kill of an already-dead proc is a no-op).
@@ -885,12 +903,39 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     @info "BonitoWorker: ACP session ended" sid cwd
 end
 
+# Explicit reap requested by the server (stop_session! on a closed/evicted chat).
+# The normal teardown is the acp dial-back ws closing → the relay's finally kills
+# the proc. But if a bind raced with the close, that ws can be half-open — the
+# relay blocks in `receive` and never reaps. Killing the proc here closes its
+# stdin (the agent exits on EOF) and unblocks the relay. Idempotent: a no-op if
+# the session already tore down (entry gone) or the proc is already dead.
+function handle_close_session(cmd)
+    cwd = String(get(cmd, "cwd", ""))
+    isempty(cwd) && return
+    proc = lock(_SESSION_PROCS_LOCK) do; get(_SESSION_PROCS, cwd, nothing) end
+    proc === nothing && return
+    @info "BonitoWorker: close_session — reaping agent" cwd
+    kill_proc!(proc)
+end
+
 # Kill + close an agent process, tolerating an already-dead/closed one.
 function kill_proc!(proc)
+    # Gate on the OS PROCESS state, not `isopen(proc)` — `isopen` tracks the IO
+    # streams, and a relay that already ran `close(proc.in)` flips it false while
+    # the agent is still alive. The old `isopen(proc) && kill` then SKIPPED the
+    # kill and orphaned the subprocess (the leak_cycle straggler). SIGTERM for a
+    # clean exit, then SIGKILL as a guaranteed backstop: an agent reaped mid-start
+    # (still precompiling, or with its stdio already shut so it never sees the
+    # stdin-EOF) can outlive SIGTERM.
     try
-        isopen(proc) && kill(proc)
+        process_running(proc) && kill(proc)
     catch e
-        @warn "BonitoWorker: kill failed" exception=e
+        e isa Base.IOError || @warn "BonitoWorker: SIGTERM failed" exception=e
+    end
+    try
+        process_running(proc) && kill(proc, Base.SIGKILL)
+    catch e
+        e isa Base.IOError || @warn "BonitoWorker: SIGKILL failed" exception=e
     end
     try
         close(proc)

@@ -176,5 +176,19 @@ function stop!(a::WorkerAgent; permanent::Bool = false)
         a.replay = ACP.Message[]
         a.ws[] = nothing
     end
+    # Belt-and-suspenders reap (permanent close only): the acp-ws teardown above
+    # SHOULD make the worker's relay exit and kill the agent subprocess, but a
+    # bind that raced with this close can leave the dial-back ws half-open — the
+    # worker blocks in `receive` and never reaps, orphaning the subprocess. Tell
+    # the worker to kill it explicitly over the reliable control ws (idempotent
+    # with the relay's own kill). Keyed by worker_path = the worker-side cwd.
+    if permanent && haskey(a.state.worker_control_ws, a.worker_id)
+        try
+            send_command(a.state, a.worker_id,
+                         Dict("type" => "close_session", "cwd" => a.worker_path))
+        catch e
+            @debug "WorkerAgent.stop!: close_session send failed" exception = e
+        end
+    end
     return a
 end
