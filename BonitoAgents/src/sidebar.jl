@@ -529,9 +529,10 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-sidebar.bt-collapsed .bt-side-empty", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-header", "justify-content" => "center", "padding" => "0 0 6px"),
     CSS(".bt-side-item",
-        # `align-items: flex-start` keeps the icon at the top of two-line
-        # titles instead of jumping down to vertical-center the row.
-        "display" => "flex", "align-items" => "flex-start", "gap" => "8px",
+        # Vertically center the label against the icon — reads as a normal
+        # inline `[icon] text` row. For a two-line title the icon centers to
+        # the text block, which is what you want too.
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "6px 10px",
         "cursor" => "pointer",
         "border-left" => "3px solid transparent",
@@ -656,10 +657,13 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-tree-hint",
         "position" => "absolute", "right" => "6px", "bottom" => "3px",
         "display" => "flex", "align-items" => "center", "gap" => "3px",
-        "padding" => "0 2px",
-        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.2",
+        "padding" => "0 3px",
+        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.3",
         "white-space" => "nowrap",
         "color" => "var(--bt-text-muted)",
+        # Subtle backdrop so the floating label stays legible when it overlays
+        # the title's text — matches the row's hover/open tint so it blends in.
+        "background" => "var(--bt-surface-2)",
         "border-radius" => "var(--bt-radius-sm)",
         "cursor" => "pointer", "user-select" => "none",
         "opacity" => "0", "pointer-events" => "none",
