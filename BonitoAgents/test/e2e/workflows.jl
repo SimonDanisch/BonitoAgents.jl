@@ -112,12 +112,38 @@ function run_suite(server)
         end
 
         @testset "switching agents (provider dropdown)" begin
+            # A REAL switch between two DISTINCT provider types. The chat starts on
+            # the default backend (Mock Agent); we switch to a SECOND hermetic mock
+            # backend (Mock Agent 2). Regression guard: the per-tab `provider`
+            # observable used to narrow to the initial provider's concrete type, so
+            # `switch_provider!` threw a `convert` MethodError on the backend swap —
+            # the session never restarted and the header showed "switch failed".
+            # (Switching to the SAME provider is a no-op early-return, which is why
+            # a single mock backend can never exercise this path.)
             opts = TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return s ? [...s.options].map(o => o.textContent.trim()) : []; })()")
             @test "Mock Agent" in opts
-            TK.switch_agent(server, "Mock Agent")
-            @test TK.wait_for(server, "provider = Mock Agent",
-                "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent'; })()";
-                timeout = 8) == true
+            @test "Mock Agent 2" in opts
+            # Must really start on the default — otherwise the switch below would be
+            # a no-op early-return and prove nothing.
+            @test TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent'; })()") == true
+
+            TK.switch_agent(server, "Mock Agent 2")
+            # The dropdown reflects the new provider (this alone does NOT prove the
+            # switch worked — `provider[]` is set before the restart that can fail).
+            @test TK.wait_for(server, "provider = Mock Agent 2",
+                "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent 2'; })()";
+                timeout = 10) == true
+            # The real proof the switch SUCCEEDED: the new backend is LIVE and
+            # answers a fresh turn. A failed switch leaves the old session dead and
+            # no reply ever lands.
+            turn(server, "after the switch")
+            @test TK.wait_for(server, "reply from switched backend",
+                "[...document.querySelectorAll('.bt-agent-msg')].some(b => (b.innerText||'').includes('Echo: after the switch'))";
+                timeout = 20) == true
+            # And the transient status settled to "" (success), never "switch failed".
+            @test TK.wait_for(server, "switch status cleared",
+                "(() => { const s=document.querySelector('.bt-header-status'); return !!s && (s.innerText||'').trim() === ''; })()";
+                timeout = 10) == true
         end
     end
     return server

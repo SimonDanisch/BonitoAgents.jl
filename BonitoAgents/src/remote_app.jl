@@ -97,6 +97,14 @@ Bonito.proxy_forward(eb::EvalBridge, data) = send_data(eb, Bonito.MsgPack.pack(d
 Bonito.proxy_fetch(eb::EvalBridge, key, start, stop) =
     ctrl_bytes(call_ctrl(eb, "asset_read"; key = key, start = start, stop = stop))
 
+# Expose a worker-disk file to the browser as a streamable proxied asset and
+# return its host-relative `/assets/<key>` url. Range reads are proxied on demand
+# (no whole-file copy to the host), so a `<video src=…>` scrubs by pulling only
+# the bytes it needs. Media wants a streamable url, not a Bonito session — so this
+# is a plain url for a plain <img>/<video>, no App/subsession.
+worker_asset_url(eb::EvalBridge, path::AbstractString) =
+    String(call_ctrl(eb, "asset_url"; path = String(path)))
+
 # A control request that expects a reply (delegate / asset_read). The dial-back
 # relay loop resolves it via `pending`; this runs on a DIFFERENT task (a chat
 # command or an HTTP asset handler), so the wait can't deadlock the relay.

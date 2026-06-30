@@ -462,6 +462,7 @@ class BonitoChat {
             // and normal scrolling composites natively.
             this.container.classList.toggle('bt-overscrolling', v !== 0);
         };
+        this._setOverscroll = setOverscroll;   // so onHidden can clear it
 
         this._cancelMomentum = () => {
             if (this._momentumRaf !== null) {
@@ -2793,6 +2794,16 @@ class BonitoChat {
     // multi-attempt cascade in `onShown` we treat the browser as opaque
     // and just brute-force the right answer.
     onHidden() {
+        // Freeze all in-flight scroll animation BEFORE snapshotting the position.
+        // A pan fling leaves momentum/spring rAFs (and an append chase rAF) that
+        // write `scrollTop` every frame; if the pane is hidden mid-fling they keep
+        // mutating the now-zero-height container and then fight `onShown`'s restore
+        // on return, so the user's read position is lost — it snaps to the top
+        // (upward fling decays toward scrollTop 0) or the bottom. Cancelling here
+        // makes the saved scrollTop authoritative across the hide/show.
+        if (this._cancelMomentum) this._cancelMomentum();
+        this._cancelPendingScroll();
+        if (this._setOverscroll) this._setOverscroll(0);
         this._savedScrollTop  = this.container.scrollTop;
         this._savedFollowMode = this.followMode;
     }

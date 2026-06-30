@@ -20,7 +20,7 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
-const APP_ENV = abspath(joinpath(@__DIR__, "..", ".."))
+const APP_ENV = abspath(joinpath(@__DIR__, "..", "appenv"))
 const APPS = [(t = "a", L = "A", f = "2c"),
               (t = "b", L = "B", f = "10 + c"),
               (t = "c", L = "C", f = "100 + c")]

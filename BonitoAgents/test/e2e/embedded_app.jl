@@ -11,7 +11,7 @@ const TK = TestKit
 
 # The bt_show_app code runs in a Malt worker; point it at an env that has Bonito
 # (the BonitoAgents package dir).
-const APP_ENV = abspath(joinpath(@__DIR__, "..", ".."))
+const APP_ENV = abspath(joinpath(@__DIR__, "..", "appenv"))
 
 function agent_script(prompt::AbstractString)
     if occursin("app", lowercase(prompt))

@@ -1,0 +1,12 @@
+name = "MockACP"
+uuid = "d4e5f6a7-8b9c-40d1-a2e3-f4a5b6c7d8e9"
+authors = ["Simon Danisch <sdanisch@gmail.com>"]
+version = "0.1.0"
+
+# Test-only mock ACP agent, launched as an application: `julia -m MockACP`. A
+# drop-in for the real claude-agent-acp binary (same JSON-RPC-over-stdio dialect),
+# selected like any other provider via the `MockAgent` descriptor. Minimal deps so
+# each spawn is a fast cold start.
+[deps]
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"

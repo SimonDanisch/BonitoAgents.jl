@@ -122,6 +122,47 @@ function run_suite(server)
             sleep(0.3)
         end
 
+        @testset "pan momentum is cancelled on hide (no reset-to-top on switch)" begin
+            # Regression for the intermittent "switching between busy chats resets
+            # the scroll to the very top" bug. The custom pan/spring scroller runs
+            # momentum + spring-back via requestAnimationFrame, writing scrollTop
+            # every frame. If the pane is hidden (chat switch / dashboard) WHILE a
+            # fling is still decaying, those rAFs used to keep running on the now
+            # zero-height pane; an upward fling decays toward scrollTop 0, so the
+            # saved read position was driven to the top and "reset to the start" on
+            # return. `onHidden()` now cancels momentum/spring/chase before saving.
+            #
+            # NOTE: this needs POINTER events — a synthetic `wheel` does not drive
+            # the pan scroller (see the file header), which is why nothing caught
+            # this before. Pane-scoped selector since the soak server has many.
+            sel = ".bt-chatpane[data-pane-pid=\"$pid\"] .bt-messages"
+            # A REALISTIC upward fling: the pointermoves are spaced in REAL time so
+            # the pan scroller derives a FINITE velocity. Dispatching the whole burst
+            # synchronously gives every move dt≈0 → unbounded velocity, and under
+            # OSR's real 60fps momentum that overshoots straight to scrollTop 0 before
+            # the hide even fires (the old ~1.5fps hidden-window path moved too little
+            # per frame to expose it). Spacing the moves keeps the fling realistic.
+            pd(t, y) = TK.eval_js(server, """(()=>{document.querySelector($(repr(sel)))
+                .dispatchEvent(new PointerEvent("$(t)",{bubbles:true,pointerId:1,button:0,pointerType:'mouse',clientY:$(y)}));return true;})()""")
+            TK.eval_js(server, "(()=>{document.querySelector($(repr(sel))).scrollTop=1000;return true;})()")
+            pd("pointerdown", 300)
+            for y in 312:14:520; pd("pointermove", y); sleep(0.01); end
+            pd("pointerup", 520)
+            momentum = TK.eval_js(server, """(()=>{const ch=document.querySelector($(repr(sel))).__bt_chat;
+                return ch._momentumRaf!==null || ch._springRaf!==null;})()""")
+            @test momentum === true                       # the fling engaged the pan momentum
+            TK.to_dashboard(server)                        # hide mid-fling → onHidden
+            sleep(0.1)
+            # The fix: onHidden cancelled both rAFs (none left mutating scrollTop on
+            # the hidden pane) and froze a non-top saved position.
+            @test TK.eval_js(server, """(() => { const ch=document.querySelector($(repr(sel))).__bt_chat;
+                return ch._momentumRaf===null && ch._springRaf===null; })()""") === true
+            @test TK.eval_js(server, "Math.round(document.querySelector($(repr(sel))).__bt_chat._savedScrollTop)") > 100
+            TK.open_chat(server, pid); sleep(0.3)
+            TK.eval_js(server, "(() => { const c=document.querySelector($(repr(sel))).__bt_chat; c.setFollowMode(true); c.scrollToBottom(); return true; })()")
+            sleep(0.2)
+        end
+
         @testset "history survives a browser reconnect" begin
             # A short, distinctive LAST message (echo, not a tall block) so the
             # marker stays in the bottom render window follow-mode pins to.

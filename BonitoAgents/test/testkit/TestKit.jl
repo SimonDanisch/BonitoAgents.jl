@@ -1,14 +1,15 @@
 """
 TestKit: realistic end-to-end test harness for BonitoAgents.
 
-The whole production stack runs unchanged (real `dev_server`, real worker,
-real `LocalTransport` with subprocess spawn, real ACP JSON-RPC over
-stdio, real websockets). The ONLY thing swapped is the
-`claude-agent-acp` binary — replaced with the Julia
-`mocks/mock_claude_agent_acp.jl` script driven by a TCP dispatcher in this
-process. The dispatcher invokes a user-supplied `agent::Function` for each
-prompt and translates its returned event list into the ACP frames the
-chat would have seen from real claude.
+The whole production stack runs unchanged (real `dev_server`, real worker, real
+subprocess spawn, real ACP JSON-RPC over the worker WebSocket, real websockets).
+The ONLY thing swapped is the agent: the test enables the `MockAgent` provider
+(`BT_ENABLE_MOCK_AGENT`) and makes it the default (`BT_DEFAULT_PROVIDER`), so the
+worker spawns the `MockACP` package (`julia -m MockACP`) like any other provider —
+no bash wrapper, no `agent_bin` override. MockACP runs in "dispatcher" mode: it
+dials back to a TCP dispatcher in THIS process, which invokes a user-supplied
+`agent::Function` per prompt and translates its returned event list into the ACP
+frames the chat would have seen from real claude.
 
 Usage:
 
@@ -47,7 +48,7 @@ const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_f
 
 export TestServer, dev_server, add_worker!,
        text, thought, edit, bash, todo, delay, tool, tool_update,
-       diff_block, text_block, error_reply, end_turn, bt_eval, bt_show_app,
+       diff_block, text_block, error_reply, crash, end_turn, bt_eval, bt_show_app,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
        exit_success,
@@ -113,35 +114,49 @@ diff_block(path, old, new) = Dict("type" => "diff", "path" => String(path),
 text_block(s::AbstractString) = Dict("type" => "text", "text" => String(s))
 
 """
-    tool(; kind, title, status, content, tool_name, id, complete, open_status) -> Dict
+    tool(; kind, title, status, content, tool_name, id, complete, open_status,
+           raw_input) -> Dict
 
 Agent event for a generic tool call of any `kind` ("edit", "search",
 "execute", "other"). `content` is a vector of `diff_block` / `text_block`.
 Pass `complete = false` to leave the bubble live (open) for follow-up
 `tool_update`s; `open_status` sets the opening status (default "in_progress").
+`raw_input` is the tool call's argument dict (ACP's `rawInput`) — it rides the
+opening `tool_call` frame and feeds the eval extras (code preview, ⏱ timeout
+badge, ⊗ stop) and the ✎ editable-path derivation. Real claude-agent-acp
+STREAMS tool input, so the common shape is to open with an EMPTY `raw_input`
+and ship the real args on a later [`tool_update`](@ref) (which also forwards
+`raw_input`).
 """
 tool(; kind = "other", title = "tool", status = "completed", content = Any[],
        tool_name = nothing, id = nothing, complete = true,
-       open_status = "in_progress") = begin
+       open_status = "in_progress", raw_input = nothing) = begin
     d = Dict{String,Any}("type" => "tool", "kind" => String(kind),
                          "title" => String(title), "status" => String(status),
                          "content" => content, "complete" => complete,
                          "open_status" => String(open_status))
     id        === nothing || (d["id"]        = String(id))
     tool_name === nothing || (d["tool_name"] = String(tool_name))
+    raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
     d
 end
 
 """
-    tool_update(id; status, content) -> Dict
+    tool_update(id; status, content, raw_input) -> Dict
 
 Agent event that updates an already-open tool (matched by `id`) — flip its
-status and/or ship more content, without restating its identity.
+status and/or ship more content, without restating its identity. `raw_input`
+streams (merges) the tool call's arguments AFTER the announcement, exactly the
+way real claude-agent-acp delivers tool input: ACP merges it into the live
+`MCPCall`/`GenericTool`, so the eval extras (code preview, ⏱, ⊗) and the ✎
+editable-path hint materialise on this in-flight update rather than the empty
+opening header.
 """
-tool_update(id; status = nothing, content = nothing) = begin
+tool_update(id; status = nothing, content = nothing, raw_input = nothing) = begin
     d = Dict{String,Any}("type" => "tool_update", "id" => String(id))
-    status  === nothing || (d["status"]  = String(status))
-    content === nothing || (d["content"] = content)
+    status    === nothing || (d["status"]    = String(status))
+    content   === nothing || (d["content"]   = content)
+    raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
     d
 end
 
@@ -176,6 +191,18 @@ Agent event: answer the prompt with a JSON-RPC error (the agent is alive but
 failed). The chat renders an inline `[error: <message>]` bubble.
 """
 error_reply(message::AbstractString) = Dict("type" => "error_reply", "message" => String(message))
+
+"""
+    crash() -> Dict
+
+Agent event that HARD-KILLS the mock agent subprocess mid-prompt (`exit(1)`),
+exactly like a real claude-agent-acp dying. No `session/prompt` response is
+ever sent, so the chat's pending read fails with EOFError/ConnectionClosed →
+`is_session_dead_error` → `session_alive` flips false and the header restart
+button gains its dead/pulse class (`.bt-header-restart-dead`). Clicking it runs
+`restart_chat_session!`, which respawns a fresh mock agent and revives the chat.
+"""
+crash()                              = Dict("type" => "crash")
 
 end_turn(; stopReason = "end_turn")  = Dict("type" => "end", "stopReason" => String(stopReason))
 
@@ -248,27 +275,27 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
         end
     end)
 
-    # 2. Build the mock-agent invocation. The mock is a bash wrapper that
-    #    re-execs Julia with the right project; pass it through wholesale,
-    #    threading dispatcher coordinates + scenario via env.
-    here = @__DIR__
-    mock = joinpath(here, "..", "mocks", "mock_claude_agent_acp")
-    isfile(mock) || error("mock_claude_agent_acp not found at $mock")
-    Sys.iswindows() || chmod(mock, 0o755)                  # idempotent perm fix
-    # The mock binary's wrapper activates `BT_MOCK_PROJECT` for the Julia
-    # subprocess. Point it at the tiny `test/mocks` env (just JSON + Sockets):
-    # a small manifest keeps each mock-agent cold start fast, so the chat
-    # session binds quickly instead of waiting out a full-manifest startup.
-    mock_project = abspath(get(ENV, "BT_MOCK_PROJECT_OVERRIDE",
-                               joinpath(@__DIR__, "..", "mocks")))
-
+    # 2. Enable the mock as a real, selectable provider. It is no longer a bash
+    #    wrapper handed to the worker as `agent_bin` — it's the AgentProviders
+    #    `MockAgent` descriptor, which launches the `MockACP` package
+    #    (`julia -m MockACP`) like any other agent. We just:
+    #      • include it in the provider list   (BT_ENABLE_MOCK_AGENT)
+    #      • make it the test env's default     (BT_DEFAULT_PROVIDER=MockCode)
+    #      • point MockACP at THIS process's dispatcher socket + scenario
+    #      • tell it which project resolves MockACP (the BonitoAgents test env)
+    #    These reach BOTH the server (this process) and the worker (its child)
+    #    because `dev_server` writes `agent_env` into `ENV` before spawning the
+    #    worker, which inherits it (and the spawned MockACP inherits it in turn).
+    test_env = abspath(joinpath(@__DIR__, ".."))   # .../BonitoAgents/test — where MockACP is a dep
     agent_env = Dict{String,String}(
+        "BT_ENABLE_MOCK_AGENT"   => "1",
+        "BT_DEFAULT_PROVIDER"    => "MockCode",
         "BT_MOCK_ACP_SCENARIO"   => "dispatcher",
         "BT_MOCK_ACP_DISPATCHER" => "127.0.0.1:$(disp_port)",
-        "BT_MOCK_PROJECT"        => mock_project,
+        "BT_MOCK_PROJECT"        => test_env,
     )
 
-    h = BT.dev_server(; port = port, agent_bin = mock, agent_env = agent_env, kwargs...)
+    h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Now publish the server URL + secret to the dispatcher so that
     # `bt_show_app` / `bt_eval` invocations can route the eval worker's
@@ -296,6 +323,15 @@ function handle_client(client, agent_ref::Ref{Function})
             isempty(line) && continue
             msg = JSON.parse(line)
             prompt = String(get(msg, "prompt", ""))
+            # On a resumed session the server prepends a transcript of the prior
+            # conversation, with the user's real new message after a "My new
+            # message:" divider. A real agent reads the transcript and replies to
+            # the new message; the scripted test agents instead branch on the
+            # prompt text, so hand them ONLY the new message — otherwise replayed
+            # history (e.g. a past "crash now") would wrongly re-trigger them.
+            if occursin("My new message:", prompt)
+                prompt = String(strip(last(split(prompt, "My new message:"; limit = 2))))
+            end
             response = try
                 # invokelatest so tests can swap `agent_fn` mid-run (the
                 # dispatcher task is spawned before those closures exist).
@@ -499,8 +535,13 @@ end
 Open one Electron window pointed at the dev server. Idempotent — the
 second call closes the prior window and opens a fresh one.
 """
+# `offscreen = true` (the DEFAULT) renders via OSR so requestAnimationFrame runs
+# at ~60fps instead of the ~1.5fps a plain hidden window's compositor produces —
+# the whole e2e suite exercises rAF-paced scroll/animation code, so faithful
+# timing is the correct default. Pass `offscreen = false` to opt a specific test
+# back onto the plain hidden-window path (e.g. to bisect an OSR-only difference).
 function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
-                       route::AbstractString = "/")
+                       route::AbstractString = "/", offscreen::Bool = true)
     ensure_display!()
     old = s.browser[]
     old === nothing || close(old)
@@ -508,7 +549,15 @@ function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
     # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
     # capturePage on the headless (show=false) window stays fresh.
-    ctx = ECT.open_window(url; width = width, height = height, show = false)
+    # `offscreen = true` switches to OSR so requestAnimationFrame runs at ~60fps
+    # instead of the ~1.5fps a plain hidden window's compositor produces — needed
+    # for tests that exercise rAF-paced scroll timing (momentum, follow-restore).
+    # Only pass the kwarg when actually requested: the CI/test env pins a git
+    # ElectronCall that predates `offscreen`, so the default path must call the
+    # old signature. OSR is opt-in and only resolves against the dev checkout.
+    ctx = offscreen ?
+        ECT.open_window(url; width = width, height = height, show = false, offscreen = true) :
+        ECT.open_window(url; width = width, height = height, show = false)
     s.browser[] = ctx
     ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
     sleep(3.0)                     # let the dashboard mount + the chat session boot
@@ -697,8 +746,16 @@ Click the first element matching the CSS selector. Throws if it's missing.
 """
 function click(s::TestServer, selector::AbstractString)
     sel = String(selector)
+    # Prefer the VISIBLE match. SharedServer keeps other chats' panes mounted but
+    # hidden (display:none ⇒ offsetParent null), so a bare `querySelector` on a
+    # pane element (`.bt-stop-btn`, `.bt-send-btn`, …) could resolve to a STALE
+    # pane and click the wrong chat. Targeting the visible one auto-scopes every
+    # click to the active pane, so a test can't leak across panes by accident.
+    # Falls back to the first match when nothing is "visible" (e.g. a global
+    # dashboard control), preserving old behaviour for non-pane selectors.
     ok = eval_js(s, """(() => {
-        const el = document.querySelector($(json(sel)));
+        const els = [...document.querySelectorAll($(json(sel)))];
+        const el = els.find(e => e.offsetParent !== null) || els[0];
         if (!el) return false;
         el.click();
         return true;
@@ -918,9 +975,10 @@ Type `text` into the chat composer and click send, the same path a user takes.
 A chat must be open (see [`new_chat`](@ref) / [`open_chat`](@ref)).
 """
 function send_message(s::TestServer, txt::AbstractString)
-    set_input(s, ".bt-text-input", String(txt))
-    ok = eval_js(s, "(() => { const b=document.querySelector('.bt-send-btn'); if(!b)return false; b.click(); return true; })()")
-    ok === true || error("send_message: send button (.bt-send-btn) not found — is a chat open?")
+    set_input(s, ".bt-text-input", String(txt))   # set_input already visibility-filters
+    # Click the VISIBLE send button (the active pane's), never a hidden pane's.
+    ok = eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-send-btn')].find(e=>e.offsetParent!==null); if(!b)return false; b.click(); return true; })()")
+    ok === true || error("send_message: no visible send button (.bt-send-btn) — is a chat open?")
     return s
 end
 

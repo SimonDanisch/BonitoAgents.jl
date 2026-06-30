@@ -34,46 +34,13 @@ abstract type Transport end
 # Default fallback for transports that don't need extra teardown.
 Base.close(::Transport) = nothing
 
-# Local subprocess transport — the original `Connection(::Base.Process)`
-# path. Kept here because every consumer of ACP today goes through this
-# shape; new transports live in their own packages.
-struct SubprocessTransport <: Transport
-    proc::Base.Process
-end
+# The single concrete transport is `WorkerTransport` (worker_transport.jl) — the
+# worker dial-back WebSocket. The old local `SubprocessTransport` is gone: every
+# agent runs behind a worker now, so there's no in-process subprocess transport.
 
-send(t::SubprocessTransport, line::AbstractString) =
-    (write(t.proc.in, line); flush(t.proc.in); nothing)
-
-recv(t::SubprocessTransport) = readline(t.proc.out; keep = false)
-
-# True once the transport can yield no more frames: stdout hit EOF or the agent
-# exited. Lets `reader_loop` tell a real EOF from a stray blank line (A4) — a
-# `recv` returning "" is ambiguous on its own.
-transport_eof(t::SubprocessTransport) = eof(t.proc.out) || !process_running(t.proc)
-# Default for channel/test transports: rely on the `recv == ""` convention.
+# Default for transports without an explicit EOF signal: rely on the `recv == ""`
+# convention. `WorkerTransport` overrides this (a closed WS is a real EOF).
 transport_eof(::Transport) = false
-
-# Idempotent + total: safe to call on a already-torn-down process.
-# Closing stdin signals EOF to the agent so it exits cleanly; if it's
-# still alive after that, we kill it. `isopen` / `process_running`
-# guard against the throw conditions, so no try/catch is needed.
-function Base.close(t::SubprocessTransport)
-    isopen(t.proc.in) && close(t.proc.in)
-    if process_running(t.proc)
-        kill(t.proc)   # SIGTERM: lets a well-behaved agent exit + reap its children
-        # Escalate to SIGKILL if it doesn't die. An agent that ignores SIGTERM (or
-        # a child parked in `sleep`/mid-JIT) would otherwise leak — and keep its
-        # stdout open, parking the reader loop forever (turns_active never settles).
-        # Detached so `close` stays non-blocking; a well-behaved child has already
-        # exited well before the grace window.
-        Base.errormonitor(@async begin
-            if timedwait(() -> !process_running(t.proc), 2.0) !== :ok
-                process_running(t.proc) && kill(t.proc, Base.SIGKILL)
-            end
-        end)
-    end
-    return nothing
-end
 
 # ── Handler protocol ──────────────────────────────────────────────────────────
 #
@@ -201,12 +168,6 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
     conn.reader_task     = @async reader_loop(conn)
     return conn
 end
-
-# Convenience: `Connection(proc::Base.Process)` still works for the local
-# subprocess case — wraps `proc` in a SubprocessTransport.
-Connection(proc::Base.Process, handler::Handler = DiscardHandler();
-           on_frame::Union{Function,Nothing} = nothing) =
-    Connection(SubprocessTransport(proc), handler; on_frame)
 
 # Feed one frame to the wire tap. Isolated so a throwing tap can never take
 # down the reader loop or fail a send — the tap is observability, not flow.

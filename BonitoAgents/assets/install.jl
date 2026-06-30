@@ -100,13 +100,8 @@ const SPECS = [
     Pkg.PackageSpec(name = "RemoteSync",   url = REPO, subdir = "RemoteSync",   rev = REV),
     Pkg.PackageSpec(name = "BonitoWorker", url = REPO, subdir = "BonitoWorker", rev = REV),
     Pkg.PackageSpec(name = "BonitoMCP",    url = REPO, subdir = "BonitoMCP",    rev = REV),
-    # Ship Bonito at the server's exact version. BonitoMCP doesn't declare it
-    # as a dep (so a user's own project can supply theirs for bt_julia_eval),
-    # but `bt_show_app`'s temp-env path (`seed_temp_env_with_bonito!`) looks
-    # this up via `Pkg.dependencies()` against the @bonito-agents env — without
-    # it we'd fall through to whatever the registry has and the remote-app
-    # protocol drifts. Pinned to the server-templated url+rev.
-    Pkg.PackageSpec(name = "Bonito", url = BONITO_URL, rev = BONITO_REV),
+    Pkg.PackageSpec(name = "AgentProviders", url = REPO, subdir = "AgentProviders", rev = REV),
+    Pkg.PackageSpec(name = "Bonito", rev = BONITO_REV),
 ]
 
 # Capture the pre-install tree-shas for the three packages so we can detect

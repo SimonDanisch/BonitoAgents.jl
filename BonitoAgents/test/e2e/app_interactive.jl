@@ -15,7 +15,7 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
-const APP_ENV = abspath(joinpath(@__DIR__, "..", ".."))
+const APP_ENV = abspath(joinpath(@__DIR__, "..", "appenv"))
 
 # Two interactive apps with DISTINCT Julia-side formulas (so an output can't be
 # confused for the other's): A shows 7×clicks, B shows 100+clicks. The onclick

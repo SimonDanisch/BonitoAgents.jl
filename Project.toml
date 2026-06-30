@@ -4,18 +4,16 @@ Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 BonitoBook = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
 BonitoMCP = "4a1c91af-1c90-46a4-8594-a3846516869d"
 BonitoAgents = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
-BonitoAgentsApp = "ada3638d-cc8c-48ff-af65-d13385ab7a5c"
 BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
 
 [sources]
 AgentClientProtocol = {path = "AgentClientProtocol"}
-Bonito = {rev = "sd/remote-app", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
+Bonito = {rev = "master", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoMCP = {path = "BonitoMCP"}
 BonitoAgents = {path = "BonitoAgents"}
-BonitoAgentsApp = {path = "BonitoAgentsApp"}
 BonitoWorker = {path = "BonitoWorker"}
 RemoteSync = {path = "RemoteSync"}
-MsgPack = {url = "https://github.com/JuliaIO/MsgPack.jl", rev = "perf/write-be"}
+MsgPack = {url = "https://github.com/JuliaIO/MsgPack.jl", rev = "master"}

@@ -232,6 +232,7 @@ class BonitoChat {
             this.container.style.setProperty('--bt-overscroll', v + 'px');
             this.container.classList.toggle('bt-overscrolling', v !== 0);
         };
+        this._setOverscroll = setOverscroll;
         this._cancelMomentum = ()=>{
             if (this._momentumRaf !== null) {
                 cancelAnimationFrame(this._momentumRaf);
@@ -2015,6 +2016,9 @@ class BonitoChat {
         this.refresh();
     }
     onHidden() {
+        if (this._cancelMomentum) this._cancelMomentum();
+        this._cancelPendingScroll();
+        if (this._setOverscroll) this._setOverscroll(0);
         this._savedScrollTop = this.container.scrollTop;
         this._savedFollowMode = this.followMode;
     }

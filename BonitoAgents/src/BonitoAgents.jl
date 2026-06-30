@@ -9,6 +9,7 @@ module BonitoAgents
 
 using Bonito
 using AgentClientProtocol
+using AgentProviders     # provider descriptors + current_providers/find_provider (SSOT, shared w/ worker)
 using HTTP
 using JSON
 using Markdown
@@ -42,8 +43,8 @@ bonito_asset(parts::AbstractString...) =
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("progress.jl")         # notify_progress / format_progress_string — shared by sync + import
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
-include("transport.jl")        # ChatTransport + WorkerTransport (worker WS line I/O)
-include("agents.jl")           # AgentProvider + BinAgent (Claude/MiMo/OpenCode/Mock) + WorkerAgent
+include("transport.jl")        # ACP bring-up payload helpers (mcp list, system prompt)
+include("agents.jl")           # WorkerAgent (server-side live agent over the worker WS)
 include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
@@ -66,5 +67,11 @@ export serve, dev_server
 export AgentProvider, BinAgent, WorkerAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent
 export start!, stop!, client, switch_provider!
+
+# Bake the real browser-driven paths captured from the e2e suite: literal
+# `precompile(...)` calls (see BonitoAgentsApp/precompile/) that run during
+# precompilation and land in this package's pkgimage. Regenerate with
+# precompile/generate.jl. Guarded so a fresh checkout without a capture still loads.
+isfile(joinpath(@__DIR__, "precompile_statements.jl")) && include("precompile_statements.jl")
 
 end # module BonitoAgents

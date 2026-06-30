@@ -37,7 +37,15 @@ function run_suite(server)
         end
 
         @testset "killing the second worker drops the online count" begin
-            kill(w2)   # the second machine goes offline
+            # SIGKILL, not the default SIGTERM: a machine "going offline" is abrupt
+            # (power loss / network drop), and that's also what makes detection
+            # deterministic. SIGTERM asks Julia to shut down gracefully, which has
+            # to be serviced at a safepoint + run atexit — under the nworkers=4
+            # parallel load the worker could take >15 s to actually exit (its
+            # control WS stayed open until teardown, so the server still counted it
+            # online and "back to 1 online" timed out). SIGKILL drops it at the
+            # kernel level, so its sockets close at once and the server sees it go.
+            kill(w2, Base.SIGKILL)   # the second machine goes offline, hard
             @test TK.wait_for(server, "back to 1 online", online_is(1); timeout = 15) == true
         end
     end

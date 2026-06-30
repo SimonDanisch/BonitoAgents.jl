@@ -52,9 +52,9 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-${{ github.run_id }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
           restore-keys: |
-            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-
+            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
 
       - name: Instantiate + refresh the git-pinned forks, then precompile
@@ -62,14 +62,24 @@ jobs:
         # keep a stale tree even after a fork branch moves) and precompile the
         # whole stack so the downstream jobs compile nothing.
         run: |
+          # The UI forks (Bonito, BonitoBook, BonitoWidgets) live in
+          # BonitoAgents/[sources]; ElectronCall is a TEST-only fork, in
+          # test/[sources]. Update + precompile EACH env where its forks actually
+          # live — `Pkg.update(["ElectronCall"])` on the main env errors with
+          # "not found in project or manifest" (ElectronCall isn't a main dep).
           julia --project=BonitoAgents -e '
+            using Pkg
+            Pkg.instantiate()
+            Pkg.update(["Bonito", "BonitoWidgets", "BonitoBook"])
+            Pkg.precompile()'
+          julia --project=BonitoAgents/test -e '
             using Pkg
             Pkg.instantiate()
             Pkg.update(["ElectronCall", "Bonito", "BonitoWidgets", "BonitoBook"])
             Pkg.precompile()'
 
-      - name: Instantiate + precompile the mock-agent env (tiny JSON + Sockets)
-        run: julia --project=BonitoAgents/test/mocks -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+      # (The old separate `test/mocks` agent env is gone — the mock is now the
+      # `MockACP` package inside the test env above, precompiled with it.)
 
       # The downstream jobs MUST reuse this exact Manifest (the forks moved in
       # the update above) or they'd re-resolve to other commits and miss the
@@ -80,7 +90,7 @@ jobs:
           name: manifests
           path: |
             BonitoAgents/Manifest.toml
-            BonitoAgents/test/mocks/Manifest.toml
+            BonitoAgents/test/Manifest.toml
           if-no-files-found: error
           retention-days: 1
 
@@ -101,15 +111,18 @@ jobs:
       - name: Restore the shared Manifests
         run: |
           cp manifests-dl/Manifest.toml BonitoAgents/Manifest.toml
-          cp manifests-dl/test/mocks/Manifest.toml BonitoAgents/test/mocks/Manifest.toml
+          cp manifests-dl/test/Manifest.toml BonitoAgents/test/Manifest.toml
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-${{ github.run_id }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
       - name: Instantiate (no-op against the cached depot)
-        run: julia --project=BonitoAgents -e 'using Pkg; Pkg.instantiate()'
+        run: julia --project=BonitoAgents/test -e 'using Pkg; Pkg.instantiate()'
       - name: Unit tests
-        run: julia --project=BonitoAgents BonitoAgents/test/runtests.jl
+        # runtests.jl + ReTestItems + the test deps all live in the TEST env
+        # (BonitoAgents/test), not the main package. Filter to the headless
+        # `unit:*` items; the e2e matrix runs the browser items.
+        run: julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl unit
 
       - name: RemoteSync transfer tests (incl. close-vs-tail stress)
         # RemoteSync is a path [source] of BonitoAgents, so its deps (HTTP,
@@ -165,17 +178,23 @@ jobs:
       - name: Restore the shared Manifests
         run: |
           cp manifests-dl/Manifest.toml BonitoAgents/Manifest.toml
-          cp manifests-dl/test/mocks/Manifest.toml BonitoAgents/test/mocks/Manifest.toml
+          cp manifests-dl/test/Manifest.toml BonitoAgents/test/Manifest.toml
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-${{ github.run_id }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
       - name: Instantiate (no-op against the cached depot)
-        run: julia --project=BonitoAgents -e 'using Pkg; Pkg.instantiate()'
+        run: julia --project=BonitoAgents/test -e 'using Pkg; Pkg.instantiate()'
       - name: 'E2E — ${{ matrix.suite }}'
+        # Run the suite's `@testitem` through runtests.jl (it owns the
+        # SharedServer setup + ReTestItems harness); the bare `e2e/<suite>.jl`
+        # is just the TestKit logic and isn't standalone-runnable. The arg is a
+        # name filter → `e2e:<suite>`. ONE worker = one dev_server (no fan-out).
+        env:
+          BT_TEST_NWORKERS: '1'
         run: |
           timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
-            julia --project=BonitoAgents BonitoAgents/test/e2e/${{ matrix.suite }}.jl
+            julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '${{ matrix.suite }}'
 
   # ── Single required check for branch protection ───────────────────────────
   all-green:

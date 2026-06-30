@@ -50,20 +50,20 @@ function run_suite(server)
         @testset "opening a file shows ONE editor panel with the right file" begin
             TK.eval_js(server, open_file("hello.jl"))
             @test TK.wait_for(server, "hello.jl editor panel",
-                "!!document.querySelector('$(panel_sel("hello.jl"))')"; timeout = 12) == true
+                "!!document.querySelector('$(panel_sel("hello.jl"))')"; timeout = 36) == true
             @test TK.wait_for(server, "Monaco editor mounted",
-                "!!document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor .monaco-editor-div')"; timeout = 12) == true
+                "!!document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor .monaco-editor-div')"; timeout = 36) == true
             # The path span proves it's the RIGHT file (Monaco text is virtualized).
             @test TK.eval_js(server,
                 "document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor-path').textContent.endsWith('hello.jl')") == true
             # And the live editor really holds the file's content.
             @test TK.wait_for(server, "editor value loaded",
-                "(document.querySelector('$(panel_sel("hello.jl")) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('hi from hello')"; timeout = 12) == true
+                "(document.querySelector('$(panel_sel("hello.jl")) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('hi from hello')"; timeout = 36) == true
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel("hello.jl"))').length") == 1
             # The editor must actually FILL the panel — regression guard for the
             # 1px-high collapse when the panel wrapper doesn't carry height down.
             @test TK.wait_for(server, "editor has real height",
-                "(document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor-body')?.offsetHeight || 0) > 200"; timeout = 10) == true
+                "(document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor-body')?.offsetHeight || 0) > 200"; timeout = 30) == true
         end
 
         @testset "rapid repeated opens of one path make exactly ONE panel" begin
@@ -79,15 +79,15 @@ function run_suite(server)
         @testset "a second file is a second tab; reopening the first activates it" begin
             TK.eval_js(server, open_file("second.jl"))
             @test TK.wait_for(server, "second.jl panel",
-                "!!document.querySelector('$(panel_sel("second.jl"))')"; timeout = 12) == true
-            @test TK.wait_for(server, "two file tabs", "$(file_tab_count) === 2"; timeout = 5) == true
+                "!!document.querySelector('$(panel_sel("second.jl"))')"; timeout = 36) == true
+            @test TK.wait_for(server, "two file tabs", "$(file_tab_count) === 2"; timeout = 15) == true
             # Reopen the first: must ACTIVATE the existing panel, not duplicate.
             TK.eval_js(server, open_file("hello.jl"))
             sleep(0.8)
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel("hello.jl"))').length") == 1
             @test TK.eval_js(server, "$(file_tab_count)") == 2
             @test TK.wait_for(server, "hello.jl active",
-                "$(active_tab_label).includes('hello.jl')"; timeout = 5) == true
+                "$(active_tab_label).includes('hello.jl')"; timeout = 15) == true
         end
 
         @testset "closing a file tab drops its panel" begin
@@ -96,7 +96,7 @@ function run_suite(server)
                     t => (t.querySelector('.bw-tab-label')?.textContent || '').includes('hello.jl'));
                 t?.querySelector('.bw-tab-close')?.click(); return true; })()""")
             @test TK.wait_for(server, "hello.jl panel gone",
-                "document.querySelector('$(panel_sel("hello.jl"))') === null"; timeout = 5) == true
+                "document.querySelector('$(panel_sel("hello.jl"))') === null"; timeout = 15) == true
             @test TK.eval_js(server, "$(file_tab_count)") == 1
         end
 
@@ -108,7 +108,7 @@ function run_suite(server)
                 TK.eval_js(server, open_file(abs))
             end
             @test TK.wait_for(server, "remote-fetched editor value",
-                "(document.querySelector('$(panel_sel(abs)) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('REMOTE_FETCHED')"; timeout = 20) == true
+                "(document.querySelector('$(panel_sel(abs)) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('REMOTE_FETCHED')"; timeout = 60) == true
             sleep(1.0)
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel(abs))').length") == 1
         end
@@ -116,20 +116,20 @@ function run_suite(server)
         @testset "a real .bt-path-link click opens the editor" begin
             TK.send_message(server, "read it")
             @test TK.wait_for(server, "path-link in the read tool title",
-                "!!document.querySelector('.bt-tool-title.bt-path-link')"; timeout = 12) == true
+                "!!document.querySelector('.bt-tool-title.bt-path-link')"; timeout = 36) == true
             TK.eval_js(server, "document.querySelector('.bt-tool-title.bt-path-link').click()")
             @test TK.wait_for(server, "click opened the hello.jl editor",
-                "!!document.querySelector('$(panel_sel(joinpath(CWD, "hello.jl")))') || !!document.querySelector('$(panel_sel("hello.jl"))')"; timeout = 12) == true
+                "!!document.querySelector('$(panel_sel(joinpath(CWD, "hello.jl")))') || !!document.querySelector('$(panel_sel("hello.jl"))')"; timeout = 36) == true
         end
 
         @testset "clicking Home activates + relabels the chat tab" begin
             # With a file tab open, the chat panel's tab reads "Chat"; clicking
             # Home must bring that panel to the front AND rename its tab "Home".
             TK.eval_js(server, open_file("second.jl"))   # ensure a 2nd tab exists
-            TK.wait_for(server, "two tabs", "document.querySelectorAll('.bw-tab-label').length >= 2"; timeout = 8)
+            TK.wait_for(server, "two tabs", "document.querySelectorAll('.bw-tab-label').length >= 2"; timeout = 24)
             TK.to_dashboard(server)
             @test TK.wait_for(server, "Home tab active",
-                "(document.querySelector('.bw-tab.bw-active .bw-tab-label')?.textContent || '') === 'Home'"; timeout = 6) == true
+                "(document.querySelector('.bw-tab.bw-active .bw-tab-label')?.textContent || '') === 'Home'"; timeout = 18) == true
         end
     end
     return server

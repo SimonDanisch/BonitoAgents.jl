@@ -1,6 +1,6 @@
 # BonitoAgents desktop app: one process that boots the BonitoAgents server on
 # loopback, registers this machine as a local worker, and shows the dashboard
-# in an ElectronCall window. Closing the window shuts everything down.
+# in the user's default browser. The process runs until interrupted (Ctrl+C).
 #
 # This is the entry point AppBundler packages into the distributable bundles
 # (`julia -m BonitoAgentsApp`, or the bundled launcher binary).
@@ -9,9 +9,7 @@ module BonitoAgentsApp
 import Bonito
 using BonitoAgents
 using BonitoWorker
-using ElectronCall
 import Downloads
-using URIs: URI
 using Random: randstring
 using PrecompileTools: @setup_workload, @compile_workload
 
@@ -89,7 +87,16 @@ end
 # DEPOT_PATH are exported into ENV by `export_julia_env!` and inherited by the
 # child, so `-m BonitoAgentsApp` resolves to the same code. One binary, two roles.
 function worker_command(; server_url, secret, worker_id, projects_root, data_dir)
-    return `$(Base.julia_cmd()) --startup-file=no -m BonitoAgentsApp worker
+    jl = Base.julia_cmd()
+    # Opt-in tracing for the precompile harness: when BONITOAGENTS_TRACE_DIR is
+    # set (precompile/capture.sh), the worker self-traces method compilation to a
+    # per-worker file. The ACP / agent-side paths compile HERE, not in the server
+    # process, so this is how they reach the precompile statement list. No-op
+    # (empty Cmd interpolates away) in normal runs.
+    tracedir = get(ENV, "BONITOAGENTS_TRACE_DIR", "")
+    trace = isempty(tracedir) ? `` :
+            `--trace-compile=$(joinpath(tracedir, "worker-$(worker_id).jl"))`
+    return `$jl $trace --startup-file=no -m BonitoAgentsApp worker
             --server-url=$server_url --secret=$secret --worker-id=$worker_id
             --projects-root=$projects_root --data-dir=$data_dir`
 end
@@ -188,23 +195,17 @@ function BonitoAgents.wait!(h::AppHandle)
     return h
 end
 
-# Open the dashboard in an ElectronCall window and block until the user closes
-# it (or the Electron process dies, or Ctrl+C).
-function run_window(url::String)
-    app = ElectronCall.Application(; name = "BonitoAgents")
-    win = ElectronCall.Window(app, URI(url);
-                              width = 1600, height = 1000,
-                              title = "BonitoAgents")
-    try
-        while isopen(win) && app.exists
-            sleep(0.25)
-        end
-    catch e
-        e isa InterruptException || rethrow()
-    finally
-        # `close(app)` errors on an already-closed app, and the loop above can
-        # end exactly because the Electron process went away.
-        app.exists && close(app)
+# Open the dashboard in the user's default browser. Unlike the old ElectronCall
+# window there's no window-close event to react to — the browser tab is just a
+# viewer over the loopback server — so the desktop lifecycle now matches the
+# headless path: the process runs until close(h) or Ctrl+C (see `desktop`).
+# Non-fatal when no browser is available (headless / CI / SSH): warn and keep
+# serving so the printed URL can be opened manually. `openurl` shells out to the
+# platform opener (open / xdg-open / powershell start) and returns false if none
+# is found — it never throws, so it's safe on a server with no display.
+function open_browser(url::String)
+    if !Bonito.HTTPServer.openurl(url)
+        @warn "BonitoAgents: couldn't open a browser automatically — open the URL manually" url
     end
     return
 end
@@ -212,19 +213,18 @@ end
 """
     desktop(; port = nothing, window = true)
 
-Run the BonitoAgents desktop app: server + local worker + dashboard window.
-Blocks until the window is closed (or Ctrl+C with `window = false`), then
-shuts the server down. This is what `julia -m BonitoAgentsApp` runs.
+Run the BonitoAgents desktop app: server + local worker + dashboard. With
+`window = true` (default) the dashboard is opened in the user's default browser;
+with `window = false` only the URL is printed (headless / CI). Either way it
+blocks until Ctrl+C (or `close` from elsewhere), then shuts the server down.
+This is what `julia -m BonitoAgentsApp` runs.
 """
 function desktop(; port::Union{Int,Nothing} = nothing, window::Bool = true)
     h = start_app(; port)
     try
-        if window
-            run_window(h.url)
-        else
-            println("BonitoAgents running at $(h.url) — Ctrl+C to stop.")
-            BonitoAgents.wait!(h)
-        end
+        window && open_browser(h.url)
+        println("BonitoAgents running at $(h.url) — Ctrl+C to stop.")
+        BonitoAgents.wait!(h)
     finally
         close(h)
     end
@@ -237,7 +237,7 @@ BonitoAgents — one bundle, three roles.
 Usage: bonitoagents [MODE] [options]
 
 Modes (default: desktop):
-  desktop                 server + local worker + dashboard window
+  desktop                 server + local worker + dashboard in your browser
   server                  headless dashboard server (workers dial back to it)
   worker                  connect this machine to a remote server as a worker
 
@@ -285,7 +285,7 @@ function parse_opts(args)
     return opts
 end
 
-# `desktop`: the original behaviour — server + local worker + Electron window.
+# `desktop`: server + local worker + dashboard opened in the user's browser.
 function run_desktop(args)
     port = nothing
     window = true
@@ -441,6 +441,19 @@ end
                                    downloader = Downloads.Downloader(; grace = 0))
             catch e
                 @debug "precompile workload: dashboard fetch failed" exception = e
+            end
+            # The libcurl GET above compiles the HTML serve path but never runs
+            # the client JS, so the LIVE path a browser drives stays cold — the
+            # 2-5s "until visible": websocket session announce → init_session →
+            # init-message flush → observable updates → evaljs round-trip. Bonito's
+            # own `serve_workload` speaks that exact frontend protocol against a
+            # loopback ws client (no browser needed), so it compiles into our
+            # pkgimage with the dashboard's real component types loaded. Its server
+            # + IO poller are torn down by `cleanup_globals()` at the end.
+            try
+                Bonito.serve_workload(BonitoAgents.dashboard_app(state))
+            catch e
+                @debug "precompile workload: serve_workload failed" exception = e
             end
             # Close the sessions the render created (compiles teardown paths too),
             # then the server — which stops its accept loop AND its 1-Hz cleanup
