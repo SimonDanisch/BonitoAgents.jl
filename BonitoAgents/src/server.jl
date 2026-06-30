@@ -12,6 +12,11 @@ const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 # the familiar `curl URL | sh` shape on each OS. They only check that `julia`
 # is on PATH and then hand off to install.jl — they do NOT install juliaup
 # (Julia is a prerequisite the user installs separately).
+
+Base.include_dependency(joinpath(ASSETS_DIR, "install.jl"))
+Base.include_dependency(joinpath(ASSETS_DIR, "install.sh"))
+Base.include_dependency(joinpath(ASSETS_DIR, "install.ps1"))
+
 const INSTALL_SCRIPT = read(joinpath(ASSETS_DIR, "install.jl"), String)
 const INSTALL_SH     = read(joinpath(ASSETS_DIR, "install.sh"),  String)
 const INSTALL_PS1    = read(joinpath(ASSETS_DIR, "install.ps1"), String)

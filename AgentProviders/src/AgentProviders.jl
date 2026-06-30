@@ -13,7 +13,7 @@ module AgentProviders
 # memoised. `find_provider(name)` maps the wire name back to its singleton.
 
 export AgentProvider, BinAgent
-export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent
+export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent, MockAgent2
 export provider_name, label, icon, resumable_session
 export current_providers, find_provider, refresh_providers!
 
@@ -94,6 +94,22 @@ function MockAgent()
     MockAgent(bin, args, Dict{String,String}(), Dict{String,Any}("form" => true))
 end
 
+# A SECOND mock backend, identical to `MockAgent` but with its own provider
+# identity ("MockCode2"). Exists ONLY so the test harness can offer two
+# distinct, hermetic backends and exercise a REAL provider switch end-to-end
+# (`MockCode` → `MockCode2`) — a switch between the SAME singleton is a no-op
+# (`switch_provider!` early-returns on `new === current`), so a single mock can
+# never test the switch path. Gated behind the same `BT_ENABLE_MOCK_AGENT` env
+# var, so it is absent in production. Launches the same `MockACP` and dials the
+# same dispatcher as `MockAgent`.
+struct MockAgent2 <: BinAgent
+    bin::String; args::Vector{String}; env::Dict{String,String}; elicitation::Dict{String,Any}
+end
+function MockAgent2()
+    bin, args = mock_bin_args()
+    MockAgent2(bin, args, Dict{String,String}(), Dict{String,Any}("form" => true))
+end
+
 # ── Per-provider display + protocol identity (dispatch, NOT predicate chains) ─
 # `provider_name` is the wire string the worker keys on AND the UI's stable
 # identity. `label`/`icon` are the human-facing strings.
@@ -101,16 +117,19 @@ provider_name(::ClaudeCodeAgent) = "ClaudeCode"
 provider_name(::MiMoAgent)       = "MiMoCode"
 provider_name(::OpenCodeAgent)   = "OpenCode"
 provider_name(::MockAgent)       = "MockCode"
+provider_name(::MockAgent2)      = "MockCode2"
 
 label(::ClaudeCodeAgent) = "Claude Code"
 label(::MiMoAgent)       = "MiMo Code"
 label(::OpenCodeAgent)   = "OpenCode"
 label(::MockAgent)       = "Mock Agent"
+label(::MockAgent2)      = "Mock Agent 2"
 
 icon(::ClaudeCodeAgent) = "bt-provider-claude"
 icon(::MiMoAgent)       = "bt-provider-mimo"
 icon(::OpenCodeAgent)   = "bt-provider-opencode"
 icon(::MockAgent)       = "bt-provider-mock"
+icon(::MockAgent2)      = "bt-provider-mock"
 
 # Whether a chat should PERSIST this provider's session id for resume across
 # server restarts. True only for providers that support claude-style
@@ -120,6 +139,7 @@ icon(::MockAgent)       = "bt-provider-mock"
 resumable_session(::AgentProvider)  = false
 resumable_session(::ClaudeCodeAgent) = true
 resumable_session(::MockAgent)       = true
+resumable_session(::MockAgent2)      = true
 
 # ── The one provider list ────────────────────────────────────────────────────
 # Memoised singletons; the ENV is read exactly once, on first call. The mock is
@@ -144,7 +164,7 @@ const _PROVIDERS_LOCK = ReentrantLock()
 # ENV at the moment of the call, which is exactly why the memo below must not be
 # populated before the spawner has finished configuring that ENV.
 _build_providers() = (ps = AgentProvider[ClaudeCodeAgent(), MiMoAgent(), OpenCodeAgent()];
-                      haskey(ENV, "BT_ENABLE_MOCK_AGENT") && push!(ps, MockAgent()); ps)
+                      haskey(ENV, "BT_ENABLE_MOCK_AGENT") && append!(ps, (MockAgent(), MockAgent2())); ps)
 
 function current_providers()
     isassigned(_PROVIDERS) && return _PROVIDERS[]

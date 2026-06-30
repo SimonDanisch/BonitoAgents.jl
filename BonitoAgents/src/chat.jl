@@ -226,6 +226,24 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     )
 end
 
+# Per-tab bridge for a POLYMORPHIC observable. A plain `map(identity, session,
+# obs)` types the child to the INITIAL value's concrete type (Observables builds
+# the result observable from the runtime value), so a later update carrying a
+# DIFFERENT concrete type throws a `convert` MethodError inside the notify. For
+# `provider` that update IS a backend switch (`MockAgent` → `OpenCodeAgent`, …):
+# the throw propagated out of `s.provider[] = new_provider`, aborting
+# `switch_provider!` before `restart_chat_session!` ever ran, which the header
+# surfaced as "switch failed". Keeping the child `Observable{Any}` lets the held
+# value change type across a switch. (Session-scoped `on` auto-GCs on close, same
+# lifetime guarantee as the `map(session, …)` bridges.)
+function any_bridge(session::Bonito.Session, src::Observable)
+    dest = Observable{Any}(src[])
+    on(session, src) do v
+        dest[] = v
+    end
+    return dest
+end
+
 # Per-session view. SHARES the lock, client, msgs_store, chat_session, the
 # user-message queue, etc. with the parent. Observable fields are bridged via
 # `map(identity, session, obs)` so each tab gets its own connected child
@@ -260,7 +278,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.last_stream_at,          # shared timestamp
             map(identity, session, m.taskbar_clock),   # per-tab clock bridge
             m.taskbar_clock_on,        # shared guard
-            map(identity, session, m.provider),  # per-tab provider bridge
+            any_bridge(session, m.provider),  # per-tab provider bridge (Any-typed: provider type varies across a switch)
             m.pending_asks,            # shared → asks resolve against the parent
             m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
         )
