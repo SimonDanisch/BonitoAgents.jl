@@ -36,6 +36,14 @@ Usage:
 
 Event constructors (`text`, `edit`, `bash`, `thought`, `end_turn`) build a
 small DSL the dispatcher serialises to JSON for the mock binary.
+
+STRICT E2E POLICY (see CONVENTIONS.md "E2E tests — STRICT policy"): drive
+EVERYTHING through this harness — `dev_server` + a real electron browser by URL
+(`open_browser`/`new_chat`/`send_message`/`click`/`wait_for`/`eval_js`), asserting
+ONLY on the rendered DOM, exactly as a user would. Do NOT hand-spawn Malt/eval
+workers, call `*_handler`/`render_eval_html`/internals, or otherwise bypass the
+chat inside an e2e test. Eval packages → a committed test env (e.g. `test/evalenv`)
++ warmup, never a runtime-built tmp project.
 """
 module TestKit
 
@@ -48,7 +56,7 @@ const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_f
 
 export TestServer, dev_server, add_worker!,
        text, thought, edit, bash, todo, delay, tool, tool_update,
-       diff_block, text_block, error_reply, crash, end_turn, bt_eval, bt_show_app,
+       diff_block, text_block, error_reply, crash, end_turn, bt_eval,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
        exit_success,
@@ -87,21 +95,6 @@ bt_eval(code; env_path = nothing, id = nothing) = begin
     d = Dict{String,Any}("type" => "bt_eval", "code" => String(code))
     env_path === nothing  || (d["env_path"] = String(env_path))
     id       === nothing  || (d["id"]       = String(id))
-    d
-end
-
-"""
-    bt_show_app(code; env_path = nothing, id = nothing) -> Dict
-
-Agent event that runs a bt_show_app expression through real BonitoMCP. The
-expression's last value must be a Bonito-renderable (`Bonito.App`,
-`DOM.div`, etc.); the dispatcher registers it on the dial-back eval worker
-and ships the `shown_app: <id>` reference back to the chat.
-"""
-bt_show_app(code; env_path = nothing, id = nothing) = begin
-    d = Dict{String,Any}("type" => "bt_show_app", "code" => String(code))
-    env_path === nothing || (d["env_path"] = String(env_path))
-    id       === nothing || (d["id"]       = String(id))
     d
 end
 
@@ -242,7 +235,7 @@ end
 
 # The dispatcher's TCP server starts BEFORE `dev_server` returns so the
 # worker can connect back the moment it spawns a mock agent. But
-# `bt_show_app` needs the server URL + worker-secret to point the eval
+# `bt_eval` needs the server URL + worker-secret to point the eval
 # bridge at — these are known only after `dev_server` returns. Stash
 # them in a Ref the dispatcher reads each time it invokes a real
 # BonitoMCP handler. `nothing` until `TestServer` finishes wiring up.
@@ -298,8 +291,8 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Now publish the server URL + secret to the dispatcher so that
-    # `bt_show_app` / `bt_eval` invocations can route the eval worker's
-    # dial-back to the right BonitoAgents instance.
+    # `bt_eval` invocations can route the eval worker's dial-back to the
+    # right BonitoAgents instance.
     SERVER_CONTEXT[] = (url = h.url, secret = h.secret, project_id = Ref(""))
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
@@ -309,13 +302,12 @@ end
 # Dispatcher loop per mock-agent connection. Reads one `{"prompt": "..."}`
 # per session/prompt, invokes the agent function, streams the resulting
 # events back as line-delimited JSON. For high-level events that need
-# real MCP execution (`bt_eval`, `bt_show_app`), the dispatcher runs the
-# corresponding BonitoMCP handler IN THIS PROCESS, then forwards the
-# result blocks to the mock as a `bt_eval_result` / `bt_show_app_result`
-# event the mock knows how to wrap as ACP tool_call frames. This keeps
-# the bt_* execution real (same Malt worker, same env_path, same
-# package resolution) without making the mock binary itself an MCP
-# client.
+# real MCP execution (`bt_eval`), the dispatcher runs the corresponding
+# BonitoMCP handler IN THIS PROCESS, then forwards the result blocks to
+# the mock as a `bt_eval_result` event the mock knows how to wrap as ACP
+# tool_call frames. This keeps the bt_* execution real (same Malt worker,
+# same env_path, same package resolution) without making the mock binary
+# itself an MCP client.
 function handle_client(client, agent_ref::Ref{Function})
     try
         while !eof(client)
@@ -354,14 +346,12 @@ function handle_client(client, agent_ref::Ref{Function})
 end
 
 # Per-event dispatch — high-level events get rewritten into the lower-level
-# `bt_eval_result` / `bt_show_app_result` events the mock knows how to map
-# to ACP frames; everything else is forwarded verbatim.
+# `bt_eval_result` event the mock knows how to map to ACP frames; everything
+# else is forwarded verbatim.
 function forward_event(client, ev::AbstractDict)
     t = String(get(ev, "type", ""))
     if t == "bt_eval"
         invoke_bt_eval(client, ev)
-    elseif t == "bt_show_app"
-        invoke_bt_show_app(client, ev)
     else
         println(client, JSON.json(ev)); flush(client)
     end
@@ -373,6 +363,30 @@ end
 # isError. We forward those to the mock as a structured event the mock
 # turns into ACP `tool_call` + `tool_call_update` frames carrying the
 # same content.
+# Point the eval worker's dial-back at OUR dev_server (url / secret / project_id)
+# for the duration of `f`, then restore. `bt_eval` needs this:
+# the worker inherits these env vars when `get_or_create!` spawns it, and
+# `ensure_eval_dialed!` uses them to (a) load `RemoteProxy` + build the bridge —
+# which is what makes `render_eval_html` available so the result renders to a LIVE
+# fragment instead of the text fallback — and (b) land the bridge in
+# `EVAL_WORKERS[project_id]`, the dict the chat looks up when mounting. Without
+# `BONITOAGENTS_SERVER_URL` the dial bails early (session.jl) and RemoteProxy
+# never loads. The project_id MUST match the chat's pid (the EVAL_WORKERS key).
+function with_bridge_env(ctx, f)
+    keys = ("BONITOAGENTS_SERVER_URL", "BONITOAGENTS_SECRET", "BONITOAGENTS_PROJECT_ID")
+    prev = map(k -> get(ENV, k, nothing), keys)
+    ENV["BONITOAGENTS_SERVER_URL"] = ctx.url
+    ENV["BONITOAGENTS_SECRET"]     = ctx.secret
+    isempty(ctx.project_id[]) || (ENV["BONITOAGENTS_PROJECT_ID"] = ctx.project_id[])
+    try
+        return f()
+    finally
+        for (k, v) in zip(keys, prev)
+            v === nothing ? delete!(ENV, k) : (ENV[k] = v)
+        end
+    end
+end
+
 function invoke_bt_eval(client, ev::AbstractDict)
     args = Dict{String,Any}("code" => String(get(ev, "code", "")))
     haskey(ev, "env_path") && (args["env_path"] = String(ev["env_path"]))
@@ -380,8 +394,13 @@ function invoke_bt_eval(client, ev::AbstractDict)
     haskey(ev, "max_response_bytes") && (args["max_response_bytes"] = ev["max_response_bytes"])
     haskey(ev, "full_output") && (args["full_output"] = ev["full_output"])
 
+    ctx = SERVER_CONTEXT[]
+    runner() = BonitoMCP.julia_eval_handler(args)
     result = try
-        BonitoMCP.julia_eval_handler(args)
+        # `ctx === nothing` is the standalone case (no live bridge → text fallback,
+        # still a valid result). With a server context, wire the dial-back so the
+        # result renders to a LIVE Bonito fragment over the eval bridge.
+        ctx === nothing ? runner() : with_bridge_env(ctx, runner)
     catch e
         Dict{String,Any}(
             "content" => Any[Dict("type" => "text",
@@ -393,64 +412,6 @@ function invoke_bt_eval(client, ev::AbstractDict)
     out = Dict{String,Any}(
         "type"     => "bt_eval_result",
         "tool_id"  => String(get(ev, "id", "te_$(rand(UInt32))")),
-        "code"     => String(get(ev, "code", "")),
-        "env_path" => get(ev, "env_path", nothing),
-        "content"  => get(result, "content", Any[]),
-        "is_error" => Bool(get(result, "isError", false)),
-    )
-    println(client, JSON.json(out)); flush(client)
-end
-
-# bt_show_app result: runs the test's Julia code through real BonitoMCP
-# (Malt worker → `RemoteProxy.register_app!` → `prerender_app`). The
-# resulting `shown_app: <id>` reference is forwarded to the mock so it
-# emits an MCP-style ACP tool_call whose tool_name parses to
-# `bt_show_app` — the chat's `is_bonito_app(::MCPCall)` then routes it
-# to the `BonitoAppMsg` lifecycle, which mounts the live embed via the
-# dial-back eval bridge.
-#
-# `BONITOAGENTS_SERVER_URL` + `BONITOAGENTS_SECRET` go into the test process's
-# env BEFORE the Malt worker is spawned by `get_or_create!` — the worker
-# inherits them and uses them to dial back to OUR dev_server. Without
-# this the eval-ws bridge would fall back to the URL the chat MCP
-# session was started with (production case) or never connect at all
-# (test case, since no agent has populated those env vars here).
-function invoke_bt_show_app(client, ev::AbstractDict)
-    ctx = SERVER_CONTEXT[]
-    if ctx === nothing
-        println(client, JSON.json(Dict("type" => "text",
-            "text" => "[bt_show_app: SERVER_CONTEXT not set — TestServer wiring race]")))
-        flush(client); return
-    end
-    args = Dict{String,Any}("code" => String(get(ev, "code", "")))
-    haskey(ev, "env_path") && (args["env_path"] = String(ev["env_path"]))
-
-    prev_url = get(ENV, "BONITOAGENTS_SERVER_URL", nothing)
-    prev_sec = get(ENV, "BONITOAGENTS_SECRET",     nothing)
-    prev_pid = get(ENV, "BONITOAGENTS_PROJECT_ID", nothing)
-    ENV["BONITOAGENTS_SERVER_URL"] = ctx.url
-    ENV["BONITOAGENTS_SECRET"]     = ctx.secret
-    # The eval-WS handshake's `project_id` MUST match the chat's pid so
-    # the bridge lands in `EVAL_WORKERS[pid]` — that's the dict the chat
-    # looks up when rendering the embed. Override here; restore after.
-    isempty(ctx.project_id[]) || (ENV["BONITOAGENTS_PROJECT_ID"] = ctx.project_id[])
-    result = try
-        BonitoMCP.julia_show_app_handler(args)
-    catch e
-        Dict{String,Any}(
-            "content" => Any[Dict("type" => "text",
-                                   "text" => "TestKit bt_show_app crash: $(sprint(showerror, e))")],
-            "isError" => true,
-        )
-    finally
-        prev_url === nothing ? delete!(ENV, "BONITOAGENTS_SERVER_URL") : (ENV["BONITOAGENTS_SERVER_URL"] = prev_url)
-        prev_sec === nothing ? delete!(ENV, "BONITOAGENTS_SECRET")     : (ENV["BONITOAGENTS_SECRET"]     = prev_sec)
-        prev_pid === nothing ? delete!(ENV, "BONITOAGENTS_PROJECT_ID") : (ENV["BONITOAGENTS_PROJECT_ID"] = prev_pid)
-    end
-
-    out = Dict{String,Any}(
-        "type"     => "bt_show_app_result",
-        "tool_id"  => String(get(ev, "id", "ta_$(rand(UInt32))")),
         "code"     => String(get(ev, "code", "")),
         "env_path" => get(ev, "env_path", nothing),
         "content"  => get(result, "content", Any[]),
@@ -690,14 +651,14 @@ end
 """
     refresh_eval_session!(env_path)
 
-Drop the per-`env_path` eval session so the NEXT `bt_show_app` re-dials the bridge
+Drop the per-`env_path` eval session so the NEXT `bt_eval` re-dials the bridge
 for ITS OWN project. The eval worker is shared per env and dials back ONCE (bound
-to the first project that used it); a `bt_show_app` from a SECOND chat sharing the
-env reuses that stale dial-back and the embed never renders. An e2e suite that
-embeds an app calls this at its start so it gets a fresh per-project dial-back —
-order-independent under the shared-server soak. (The robust product fix is to
-re-dial per project in BonitoMCP's `ensure_eval_dialed!`; this is the test-side
-stand-in until then.)
+to the first project that used it); a `bt_eval` from a SECOND chat sharing the
+env reuses that stale dial-back and the live result never renders. An e2e suite
+that mounts a live result calls this at its start so it gets a fresh per-project
+dial-back — order-independent under the shared-server soak. (The robust product
+fix is to re-dial per project in BonitoMCP's `ensure_eval_dialed!`; this is the
+test-side stand-in until then.)
 """
 function refresh_eval_session!(env_path::AbstractString)
     try

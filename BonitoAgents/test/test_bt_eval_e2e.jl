@@ -15,6 +15,7 @@
 # `bt_eval` ran INSIDE that project, not in the test process's session.
 
 using Test, JSON
+using Bonito           # test dep — used to locate the RESOLVED v5 Bonito source
 include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
 import .TestKit
 const TK = TestKit
@@ -166,6 +167,128 @@ end
         TK.screenshot(s, shot("bt_eval-envB.png"))
 
         @info "screenshots saved" dir=SHOT_DIR files=readdir(SHOT_DIR)
+    finally
+        close(s)
+    end
+end
+
+# A tmp project that pins the dev Bonito so the eval worker can render the
+# result to a LIVE fragment (`render_eval_html`). Pre-instantiated (the worker
+# does NOT auto-instantiate) — Bonito is already precompiled in the depot, so
+# this resolves fast.
+function bonito_project()
+    d = mktempdir(; prefix = "bt-eval-bonito-")
+    bonito = pkgdir(Bonito)   # the v5 source the test env actually resolved (sandbox-safe)
+    open(joinpath(d, "Project.toml"), "w") do io
+        write(io, """
+        name = "btbon"
+        uuid = "$(string(Base.UUID(rand(UInt128))))"
+        version = "0.0.1"
+
+        [deps]
+        Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+
+        [sources]
+        Bonito = {path = "$bonito"}
+        """)
+    end
+    run(pipeline(`$(Base.julia_cmd()) --project=$d -e "import Pkg; Pkg.instantiate()"`;
+                 stdout = devnull, stderr = devnull))
+    return d
+end
+
+@testset "bt_eval e2e — rich result renders as a LIVE Bonito fragment (not text fallback)" begin
+    project = bonito_project()
+    @info "bonito project env" project
+    s = TK.dev_server(; agent = msg -> [
+        text("rendering it live"),
+        bt_eval("using Bonito; DOM.div(\"FRAGMENT-MARKER-9173\"; class = \"my-eval-result\")";
+                env_path = project, id = "tf-1"),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        sleep(1)
+        TK.send_message(s, "render a div please")
+        TK.wait_for(s, "eval tool completed",
+            "document.querySelector('.bt-tool-msg .bt-tool-status')?.textContent === 'completed'";
+            timeout = 120)
+        sleep(1.0)
+        # The result body is lazy-mounted on expand (ToolRenderCommand fires when
+        # the header is clicked) — expand it so the eval body + result render.
+        TK.click(s, ".bt-tool-msg .bt-tool-header")
+        sleep(2)
+        # The result mounted as a LIVE worker fragment (render_eval_html → HTML
+        # over the bridge): the worker-side div, WITH its `my-eval-result` class,
+        # is in the page. A text-fallback repr would NOT carry that class — so
+        # this distinguishes the new HTML chain from the old text path.
+        @test TK.wait_for(s, "live fragment mounted",
+            "document.querySelector('.my-eval-result')?.textContent?.includes('FRAGMENT-MARKER-9173') === true";
+            timeout = 30) == true
+        # The env_path is ALWAYS shown in the eval header.
+        @test TK.eval_js(s, "document.body.innerText.includes($(TK.json(project)))") == true
+        TK.screenshot(s, shot("bt_eval-fragment.png"))
+    finally
+        close(s)
+    end
+end
+
+# This is the crux of "bt_show_app is redundant": an INTERACTIVE result (an
+# Observable wired to a button) must round-trip through the LIVE eval bridge, not
+# just render static markup. If clicking the button updates the count, the
+# worker-side session is live over the bridge — exactly what bt_show_app provided,
+# now via the plain bt_julia_eval render path. `$(obs)` must reach the test source
+# as a literal `$` (escaped) so it's Bonito JS interpolation, not Julia's.
+@testset "bt_eval e2e — INTERACTIVE result is live over the eval bridge" begin
+    project = bonito_project()
+    # Mirror app_interactive.jl's proven pattern: the displayed value is a Julia
+    # `map` over a click counter, computed IN THE WORKER (7×clicks). The onclick
+    # only bumps the raw counter; "C=7" can ONLY appear if the click round-tripped
+    # to the worker, the map ran there, and the value streamed back. A static/dead
+    # mount leaves it at "C=0".
+    code = "using Bonito; App() do; " *
+        "clicks = Observable(0); " *
+        "out = map(c -> \"C=\" * string(7c), clicks); " *
+        "DOM.div(DOM.span(out; class=\"counter-out\"), " *
+        "DOM.div(\"bump\"; class=\"counter-btn\", onclick=js\"(e)=> \$(clicks).notify(\$(clicks).value + 1)\"); " *
+        "class=\"my-counter\"); end"
+    s = TK.dev_server(; agent = msg -> [
+        text("live counter"),
+        bt_eval(code; env_path = project, id = "tc-1"),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        sleep(1)
+        # Bind a fresh per-project dial-back for THIS chat's eval worker (the worker
+        # dials back once, bound to the first project that used it — app_interactive
+        # does the same so the embed renders for the right chat).
+        TK.refresh_eval_session!(project)
+        TK.send_message(s, "give me a counter")
+        TK.wait_for(s, "eval tool completed",
+            "document.querySelector('.bt-tool-msg .bt-tool-status')?.textContent === 'completed'";
+            timeout = 120)
+        sleep(1.0)
+        TK.click(s, ".bt-tool-msg .bt-tool-header")   # expand → lazy-mount the body
+        # The counter renders with its Julia-computed initial value (static markup).
+        @test TK.wait_for(s, "counter mounted",
+            "document.querySelector('.counter-out')?.textContent === 'C=0'"; timeout = 30) == true
+        # Click the button; the Julia map (7×clicks) runs in the worker and streams
+        # back — only possible over a LIVE bridge.
+        # Click the button; the Julia map (7×clicks) runs in the worker and streams
+        # back over the live proxy bridge — same single render path as any result.
+        # (Regression guard for the dropped-frame bug: the init bundle's
+        # `proxy_asset_add` fires at eval-time before the dial-back connects; the
+        # BridgeDriver must buffer it and flush on connect, else the host never
+        # learns `/assets/<key>` is proxied and the browser's fetch isn't forwarded.)
+        TK.click(s, ".my-counter .counter-btn")
+        @test TK.wait_for(s, "counter incremented over the bridge",
+            "document.querySelector('.counter-out')?.textContent === 'C=7'"; timeout = 30) == true
+        TK.screenshot(s, shot("bt_eval-counter.png"))
     finally
         close(s)
     end

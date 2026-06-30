@@ -10,9 +10,9 @@
 # Wire format on the dial-back WS: `[tag][payload]`.
 #   * `D` (data)    — a Bonito frame, piped verbatim (worker→browser and back).
 #   * `C` (control) — a small msgpack dict for the few request/response ops:
-#                     `delegate` (render an app subsession → init bundle),
-#                     `asset_read` (lazy range fetch), `close` (a subsession),
-#                     and the worker→host `asset_add`/`asset_remove` push.
+#                     `asset_read` (lazy range fetch), `asset_url` (expose a
+#                     worker-disk file as a streamable asset), `close` (a
+#                     subsession), and the worker→host `asset_add`/`asset_remove` push.
 
 const Malt = BonitoMCP.Malt   # only the BonitoMCP-side bootstrap touches Malt
 
@@ -105,7 +105,7 @@ Bonito.proxy_fetch(eb::EvalBridge, key, start, stop) =
 worker_asset_url(eb::EvalBridge, path::AbstractString) =
     String(call_ctrl(eb, "asset_url"; path = String(path)))
 
-# A control request that expects a reply (delegate / asset_read). The dial-back
+# A control request that expects a reply (asset_read / asset_url). The dial-back
 # relay loop resolves it via `pending`; this runs on a DIFFERENT task (a chat
 # command or an HTTP asset handler), so the wait can't deadlock the relay.
 function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, kw...)
@@ -319,10 +319,10 @@ function handle_eval_ws(state::ServerState, ws)
     end
 
     # Worker→browser writes are DECOUPLED from this relay loop. The loop also
-    # delivers control REPLIES (delegate / asset_read), so a slow or CPU-bound
+    # delivers control REPLIES (asset_read / asset_url), so a slow or CPU-bound
     # browser (WGLMakie, or headless software-WebGL) that drains its socket slowly
     # would otherwise block the loop on `write(rc, …)` and starve those replies →
-    # 30s `call_ctrl` timeouts ("delegate timed out" / stuck "loading…"). Data
+    # 30s `call_ctrl` timeouts ("asset_read timed out" / stuck "loading…"). Data
     # frames go onto a bounded queue drained by a dedicated `relay_writer`; the
     # loop stays responsive to control frames regardless of browser speed. The
     # bound also back-pressures a runaway stream (a full queue blocks the loop —
@@ -503,34 +503,6 @@ function eval_dialback_env(state::ServerState, project_id::AbstractString)
     )
 end
 
-# Host-side renderable: embeds the worker fragment and drives the worker
-# session's `init_session` in the browser via on_document_load.
-struct RemoteWorkerApp
-    html::String
-    init_url::String
-    session_id::String          # sub.id — passed to `Bonito.init_session(…)` so the browser
-                                # bootstraps this exact subsession's queued messages.
-    bridge_prefix::String       # `id_prefix(connection(sub))` — the namespace the worker stamps
-                                # onto every cache_key / dom-jscall-id / sub-session-id it puts
-                                # into the browser's three global namespaces. Used by the host's
-                                # `route_to_remote` to forward inbound frames back to the worker,
-                                # and exposed via `data-bonito-remote` so callers driving the
-                                # embed from JS know what prefix to construct cache keys with.
-    compression::Bool
-end
-
-function Bonito.jsrender(session::Bonito.Session, app::RemoteWorkerApp)
-    # `Base.HTML{String}` is the first-class raw-HTML primitive: Bonito's
-    # `RAW_HTML_TAG` msgpack rule (serialization/msgpack.jl) ships the bytes
-    # through the dynamic `dom_in_js` path binary-safe — no string-escaping,
-    # no JS-literal newline pitfalls.
-    node = Bonito.DOM.div(Base.HTML{String}(app.html); dataBonitoRemote = app.bridge_prefix)
-    Bonito.onload(session, node, js"""(el) => {
-        Bonito.init_session($(app.session_id), Bonito.fetch_binary($(app.init_url)), "sub", $(app.compression));
-    }""")
-    return Bonito.jsrender(session, node)
-end
-
 # ── Host-side bridge attachment (per stable root session) ───────────────────
 #
 # The worker→host frame relay and the browser→worker routing are bound to the
@@ -607,124 +579,33 @@ end
 close_remote_sub!(eb::EvalBridge, sub_id::AbstractString) =
     (send_ctrl(eb, Dict("op" => "close", "sub" => String(sub_id))); nothing)
 
-"""
-    embed_remote_app(host::Session, eb::EvalBridge, app_id::AbstractString) -> RemoteWorkerApp
-
-Embed a Bonito.App registered on the eval worker's `RemoteProxy` bridge (by
-`bt_show_app` / `show_remote_app!`) into `host`'s browser page.
-
-Bridge host-side wiring (the worker→browser frame relay in `handle_eval_ws`, the
-browser→worker routing, and the per-worker asset registry) is attached ONCE to
-the tab's stable root session — see `attach_bridge_host!`. This call sends a
-`delegate` control frame; the worker renders a FRESH subsession of the bridge
-parent, packs its init bundle as a `BinaryAsset` (pushing `asset_add` control
-frames the relay registers on `eb.asset_host`), and replies `(sub_id, html,
-init_url)`. We wait until the init bundle is serveable before returning so the
-browser's `fetch(init_url)` can't race ahead to a 404.
-
-Because a `Collapsable` tool body is re-rendered on every expand (and the old
-DOM is dropped with `innerHTML=''`, which does NOT close the proxied sub), we
-explicitly close the previously-mounted worker sub for this (tab, app) — that
-releases its asset and frees its browser-side listeners (see `close_remote_sub!`).
-"""
-function embed_remote_app(host::Bonito.Session, eb::EvalBridge, app_id::AbstractString)
-    root = Bonito.root_session(host)
-    attach_bridge_host!(root, eb)
-    # One control round-trip: the worker renders a fresh subsession, packs its init
-    # bundle as a BinaryAsset (which fires `asset_add` control frames the relay loop
-    # registers on `eb.asset_host`), and replies with (sub_id, html, init_url).
-    sub_id, html, init_url = call_ctrl(eb, "delegate"; app = String(app_id))
-    sub_id = String(sub_id); html = String(html); init_url = String(init_url)
-    # The worker sends `asset_add` BEFORE the delegate reply (same socket, in order),
-    # so the init bundle is normally already registered; this is just a safety net.
-    if Base.timedwait(() -> haskey(eb.asset_host.parent.files, init_url), 10.0) !== :ok
-        @warn "embed_remote_app: init asset not registered in time" init_url
-    end
-    # Supersede the previous mount of this app in this tab: close its worker sub.
-    prev = swap_mount!(root, eb, String(app_id), sub_id)
-    prev === nothing || prev == sub_id || close_remote_sub!(eb, prev)
-    # The bridge runs uncompressed, so the proxied subsession does too.
-    return RemoteWorkerApp(html, init_url, sub_id, eb.prefix, false)
+# ── Pre-rendered eval RESULT (bt_julia_eval) ─────────────────────────────────
+# Unlike a live `bonito_app`, the worker ALREADY rendered the result VALUE to a
+# self-contained HTML fragment (`RemoteProxy.render_eval_html`), shipped as the
+# final ACP content block. Its inline `init_session(...)` runs on mount thanks
+# to Bonito's RAW_HTML script-rerun, so there's NO `delegate` round-trip: we
+# just attach the bridge host wiring — so the fragment's proxied assets +
+# observables route to the worker — and drop the HTML in. The html string IS the
+# persisted result; with no live bridge (history reloaded, worker gone) it still
+# mounts as a STATIC snapshot, only the proxied asset/obs traffic won't resolve.
+struct EvalResultPlaceholder
+    bridge::Union{Nothing, EvalBridge}
+    html::String
 end
 
-# ── Chat integration: a live worker app as a chat tool bubble ────────────────
-#
-# A `bonito_app` ToolMsg in the chat renders its body lazily via
-# `render_tool_body` → a `RemoteAppPlaceholder`, whose `jsrender` runs
-# `embed_remote_app` against the live per-tab `Bonito.Session` (mounted by the
-# existing `ToolRenderCommand` → `dom_in_js` path). Each placeholder carries
-# the project's `EvalBridge` + the app id under which the worker registered the
-# app on its `RemoteProxy` bridge (the ToolMsg only carries that id, like
-# `bt_show` carries a path).
-struct RemoteAppPlaceholder
-    bridge::Union{Nothing, EvalBridge}   # nothing if eval session not connected yet
-    app_id::String                       # registered with RemoteProxy.register_app! on the worker
+function Bonito.jsrender(session::Bonito.Session, p::EvalResultPlaceholder)
+    isempty(p.html) &&
+        return Bonito.jsrender(session, Bonito.DOM.div("(no result render)"; class = "bt-tool-empty"))
+    # Attach the bridge routing to the ROOT session that owns the tab's websocket
+    # — NOT `session`, which is the transient `dom_in_js` subsession the
+    # ToolRenderCommand renders the body in. `register_remote!` must live on the
+    # root so the host's `route_to_remote` forwards the eval subsession's OUTGOING
+    # frames (observable notifies from clicks) back to the worker; on the subsession
+    # they'd be ignored and interaction would be dead even though the bundle loaded.
+    # Uses root_session(host) + attach_bridge_host! to wire the bridge to the tab.
+    p.bridge === nothing || attach_bridge_host!(Bonito.root_session(session), p.bridge)
+    return Bonito.jsrender(session, HTML(p.html))
 end
 
-# Each mount embeds a FRESH worker subsession (its own sub_id / init bundle), so
-# repeated tool-body renders (auto-expand can fire more than once, and `dom_in_js`
-# makes a new subsession each time) never collide on a shared id — the obsolete
-# mounts self-clean when their DOM is removed (browser → `CloseSession` → worker).
-# The bridge's expensive host wiring (frame relay, routing, asset registry) is
-# attached once and shared, so a fresh mount is cheap.
-function Bonito.jsrender(session::Bonito.Session, p::RemoteAppPlaceholder)
-    p.bridge === nothing &&
-        return Bonito.jsrender(session, Bonito.DOM.div("(live app unavailable — eval session not connected)"))
-    return Bonito.jsrender(session, embed_remote_app(session, p.bridge, p.app_id))
-end
-
-# Build the placeholder for a `bonito_app` tool. `app_id` is the id the worker
-# registered the app under on its RemoteProxy bridge (via `RemoteProxy.register_app!`,
-# either through `bt_show_app` or `show_remote_app!`).
-function remote_app_placeholder(state::ServerState, tool_id::AbstractString,
-                                project_id::AbstractString, app_id::AbstractString)
-    eb = eval_bridge_for(state, project_id)   # read under state.lock (T11)
-    return RemoteAppPlaceholder(eb, String(app_id))
-end
-
-# `shown_app: <id>` reference left by the bt_show_app MCP tool, in tool content.
-function find_app_reference(content)
-    for c in content
-        if c isa AgentClientProtocol.TextContent
-            m = match(r"shown_app:\s*(\S+)", c.text)
-            m === nothing || return String(m.captures[1])
-        end
-    end
-    return nothing
-end
-
-"""
-    show_remote_app!(model::ChatModel, eb::EvalBridge, code::AbstractString; title=...) -> id
-
-Add a live interactive worker app to `model`'s chat as an auto-expanded tool
-bubble. `code` is Julia source that evaluates to a `Bonito.App`; it's shipped to
-the worker over a `register` control frame, `include_string`-d there, and
-registered via `RemoteProxy.register_app!`. Each browser tab embeds its own
-subsession of the bridge parent on expand. (The primary path is the `bt_show_app`
-MCP tool, which registers over BonitoMCP's own Malt link; this is the
-BonitoAgents-side convenience over the raw bridge.)
-"""
-function show_remote_app!(model::ChatModel, eb::EvalBridge, code::AbstractString; title::AbstractString="Interactive app")
-    id = string(Bonito.uuid4())
-    call_ctrl(eb, "register"; app = id, code = String(code))
-    # The app is registered under `id`, which is also this message's id — so the
-    # typed `BonitoAppMsg` carries its app id intrinsically (app_id = id).
-    send!(model, BonitoAppMsg(id, "bonito_app", String(title), "completed",
-                              "live app", time(), time(), "", id, nothing))
-    # auto-open the body (JS expands → ToolRenderCommand → render_tool_body)
-    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => id,
-        "status" => "completed", "title" => title, "summary" => "live app", "expand" => true))
-    return id
-end
-
-"""
-    show_remote_app_for_project!(model, code; title=...) -> id
-
-Like `show_remote_app!`, but uses the eval bridge that dialed back for this
-model's project.
-"""
-function show_remote_app_for_project!(model::ChatModel, code::AbstractString; title::AbstractString="Interactive app")
-    eb = eval_bridge_for(model.state, model.project_id)   # read under state.lock (T11)
-    eb === nothing && error("show_remote_app: no eval bridge dialed back for project $(model.project_id)")
-    return show_remote_app!(model, eb, code; title)
-end
+eval_result_placeholder(state::ServerState, html::AbstractString, project_id::AbstractString) =
+    EvalResultPlaceholder(eval_bridge_for(state, project_id), String(html))

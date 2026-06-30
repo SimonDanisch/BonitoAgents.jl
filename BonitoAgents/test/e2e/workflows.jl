@@ -97,8 +97,10 @@ function run_suite(server)
 
         @testset "tool call rendering: bash" begin
             turn(server, "run a bash command")
+            # Real claude-agent-acp titles a Bash pill "Terminal" on announce, then
+            # the COMMAND once rawInput streams (the mock mirrors this) — NOT "Bash".
             @test TK.wait_for(server, "bash tool",
-                "[...document.querySelectorAll('.bt-tool-title')].some(e => (e.innerText||'').trim() === 'Bash')"; timeout = 30) == true
+                "[...document.querySelectorAll('.bt-tool-title')].some(e => { const t=(e.innerText||'').trim(); return t === 'ls -la' || t === 'Terminal'; })"; timeout = 30) == true
             # expand the bash tool; its command/output shows in the body
             TK.eval_js(server, "(() => { const h=[...document.querySelectorAll('.bt-tool-header')].pop(); if(h)h.click(); return true; })()")
             @test TK.wait_for(server, "bash output",

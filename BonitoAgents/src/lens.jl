@@ -3,9 +3,9 @@
 # messages) and optionally applies an ACTION (expand / collapse) to matches.
 # It replaces the per-tool toolbar with something expressive:
 #
-#   /user_message "search string" + /bt_show_app expand
+#   /user_message "search string" + /bt_show expand
 #     → show user messages fuzzy-matching "search string", AND show every
-#       bt_show_app call expanded. Everything else is hidden.
+#       bt_show call expanded. Everything else is hidden.
 #
 # Grammar — a lens is signed clauses joined by ` + ` (include) / ` - ` (exclude):
 #
@@ -13,17 +13,17 @@
 #   clause := ['!'|'-'] [/]key [ params ]
 #   params := ( ACTION | "query" | word )*        ACTION := expand | collapse
 #
-#   • A bare `/bt_show_app` is ALREADY exclusive — it shows only that type,
+#   • A bare `/bt_show` is ALREADY exclusive — it shows only that type,
 #     everything else hidden. So `-` is not needed for the common filter.
 #   • <key>  a message-type key (user_message, agent, thought, plan) or a tool
-#            name (Bash, bt_show_app, bt_julia_eval, …) or `tools`; also the
+#            name (Bash, bt_show, bt_julia_eval, …) or `tools`; also the
 #            wildcard `all` / `*` (matches every message). Subsequence-matched,
 #            so `bt_eval` matches `bt_julia_eval`.
 #   • A leading `!` / `-`, or a ` - ` join, marks the clause EXCLUDE.
 #   • params: a fuzzy text filter ("quoted" or bare words) and/or an action.
 #            A bareword equal to a known ACTION is the action; anything else
 #            (and anything quoted) is the query. A leading `:` is accepted but
-#            optional (`/bt_show_app: expand` == `/bt_show_app expand`).
+#            optional (`/bt_show: expand` == `/bt_show expand`).
 #
 # Base rule (apply_lens):  visible = BASE \ ⋃(exclude matches), where
 # BASE = ⋃(include matches) if any include clause exists, else ALL messages.

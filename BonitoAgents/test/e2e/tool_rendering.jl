@@ -4,7 +4,6 @@
 # each correctly:
 #   * edit (multi)  -> a Monaco DiffEditor per file, wrapped in .bt-multi-diff
 #   * search        -> one .bt-search-row per grep hit + a "N matches" summary
-#   * other/eval    -> bt_julia_eval stdout/result sections (.bt-eval-section)
 #   * read          -> the file body rendered as code
 #   * move / fetch  -> header summary derived from content ("a → b", a domain)
 #   * execute       -> a status pill that walks pending -> in_progress ->
@@ -19,10 +18,12 @@ const TK = TestKit
 # tool that errors and an execute tool that fails. Kept in their own turn so
 # they're the most-recent (rendered) messages when we assert on them, rather
 # than recycled out of the virtual window behind the first turn's tools.
+# NOTE: bt_julia_eval rendering (the typed BtJuliaEval body: Code/Output sections,
+# the live result mount, colored stdout, error rendering, 20+ value types) is
+# covered end-to-end against the REAL eval chain in `e2e:bt_eval_types`. We don't
+# hand-build eval content here — it can't match the real `[code-echo, stdout,
+# html]` structure the typed render expects, and would just re-encode assumptions.
 agent_script(prompt) = occursin("error", lowercase(prompt)) ? [
-    TK.tool(kind = "other", title = "bt_julia_eval", id = "eval-err",
-            tool_name = "mcp__btworker__bt_julia_eval", status = "failed",
-            content = [TK.text_block("error:\nMethodError: no method matching foo(::Int64)")]),
     TK.tool(kind = "execute", title = "failed task", id = "exec-fail", tool_name = "Bash",
             status = "failed", content = [TK.text_block("exit code 1")]),
 ] : [
@@ -31,9 +32,6 @@ agent_script(prompt) = occursin("error", lowercase(prompt)) ? [
                        TK.diff_block("src/b.jl", "y = 1", "y = 3")]),
     TK.tool(kind = "search", title = "rg foo", id = "search-1", tool_name = "Grep",
             content = [TK.text_block("src/a.jl:1:hit one\nsrc/b.jl:2:hit two\nsrc/c.jl:3:hit three")]),
-    TK.tool(kind = "other", title = "bt_julia_eval", id = "eval-1",
-            tool_name = "mcp__btworker__bt_julia_eval",
-            content = [TK.text_block("stdout:\nhi there"), TK.text_block("result:\n42")]),
     TK.tool(kind = "read", title = "src/a.py", id = "read-1", tool_name = "Read",
             content = [TK.text_block("```python\nprint('hi')\n```")]),
     TK.tool(kind = "move", title = "mv", id = "mv-1", tool_name = "Bash",
@@ -102,23 +100,14 @@ function run_suite(server)
                 "$(body_has("search-1")).querySelector('.bt-search-row .bt-search-path').textContent") == "src/a.jl"
         end
 
-        @testset "bt_julia_eval renders stdout/result sections" begin
-            TK.eval_js(server, expand("eval-1"))
-            @test TK.wait_for(server, "two eval sections",
-                "$(body_has("eval-1")).querySelectorAll('.bt-eval-section').length === 2"; timeout = 8) == true
-            @test TK.eval_js(server,
-                "[...$(body_has("eval-1")).querySelectorAll('.bt-section-label')].map(l => l.textContent)") ==
-                ["STDOUT", "RESULT"]
-        end
-
         @testset "read renders the file body as code" begin
             TK.eval_js(server, expand("read-1"))
             @test TK.wait_for(server, "code body",
                 "/print\\('hi'\\)/.test(($(body_has("read-1")) || {}).textContent || '')"; timeout = 8) == true
         end
 
-        @testset "failure states: failed status pill + eval error section" begin
-            # A second turn so these are the most-recent (rendered) messages.
+        @testset "failure states: failed status pill" begin
+            # A second turn so this is a most-recent (rendered) message.
             TK.send_message(server, "now trigger an error")
             @test TK.wait_for(server, "failed status pill",
                 """(() => { for (const m of document.querySelectorAll('.bt-tool-msg')) {
@@ -126,9 +115,6 @@ function run_suite(server)
                         const s = m.querySelector('.bt-tool-status');
                         return !!(s && s.classList.contains('bt-status-failed')); } }
                     return false; })()"""; timeout = 10) == true
-            TK.eval_js(server, expand("eval-err"))
-            @test TK.wait_for(server, "eval error section",
-                "[...$(body_has("eval-err")).querySelectorAll('.bt-section-label')].some(l => l.textContent === 'ERROR')"; timeout = 8) == true
         end
     end
     return server

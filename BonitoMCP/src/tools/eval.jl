@@ -39,11 +39,19 @@ function running_response(env_path::Union{String,Nothing},
     )
 end
 
-completed_response(blocks, is_error::Bool, elapsed::Real) = Dict{String,Any}(
-    "content" => blocks,
-    "isError" => is_error,
-    "_meta"   => Dict("status" => "completed", "elapsed_s" => elapsed),
-)
+# `html` is the rendered result fragment (nothing outside a chat bridge). When
+# present it's appended as the FINAL content block: bt_julia_eval always renders,
+# so the chat's typed EvalMsg can mount "the last block" as the live result with
+# zero content sniffing (the tool name IS the type), and the agent sees it too.
+function completed_response(blocks, html, is_error::Bool, elapsed::Real)
+    content = copy(blocks)
+    html === nothing || push!(content, Dict{String,Any}("type" => "text", "text" => html))
+    return Dict{String,Any}(
+        "content" => content,
+        "isError" => is_error,
+        "_meta"   => Dict("status" => "completed", "elapsed_s" => elapsed),
+    )
+end
 
 # ── Handlers ────────────────────────────────────────────────────────────────
 function julia_eval_handler(args::AbstractDict)
@@ -69,6 +77,17 @@ function julia_eval_handler(args::AbstractDict)
         )
     end
 
+    # Bring up the proxy bridge so `format_value` can render the result to an
+    # HTML fragment on the worker (loads RemoteProxy worker-side + dials back to
+    # the BonitoAgents server). Best-effort: standalone MCP (no server) or a
+    # pre-v5 Bonito env just leaves the bridge down → the eval still returns its
+    # text/file result, only without the live render.
+    try
+        ensure_eval_dialed!(s)
+    catch e
+        @debug "bt_julia_eval: eval bridge unavailable; result will render text-only" exception = e
+    end
+
     timeout = effective_timeout(code, user_to)
 
     res = try
@@ -81,7 +100,7 @@ function julia_eval_handler(args::AbstractDict)
     end
 
     return res.status === :completed ?
-        completed_response(res.blocks, res.is_error, res.elapsed_s) :
+        completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
         running_response(env_path, res.partial, res.elapsed_s, res.code)
 end
 
@@ -113,7 +132,7 @@ function julia_continue_handler(args::AbstractDict)
         )
     end
     return res.status === :completed ?
-        completed_response(res.blocks, res.is_error, res.elapsed_s) :
+        completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
         running_response(env_path, res.partial, res.elapsed_s, res.code)
 end
 
@@ -140,7 +159,7 @@ function julia_interrupt_handler(args::AbstractDict)
         )
     end
     return res.status === :completed ?
-        completed_response(res.blocks, res.is_error, res.elapsed_s) :
+        completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
         running_response(env_path, res.partial, res.elapsed_s, res.code)
 end
 

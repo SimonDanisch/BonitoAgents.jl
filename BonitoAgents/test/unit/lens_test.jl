@@ -48,15 +48,15 @@ const BT = BonitoAgents
     @testset "apply_lens: union of clauses + per-index actions" begin
         U  = BT.UserMsg("please start a resource monitor")
         A  = BT.AgentMsg("a1", "here is the monitor")
-        app = BT.BonitoAppMsg("app1","bonito_app","Dashboard","completed","",
-                              time(),time(),"","",nothing)
+        app = BT.MCPToolMsg("app1","other","Dashboard","completed","",
+                            time(),time(),"btworker","bt_show",nothing)
         U2 = BT.UserMsg("show me the lissajous plot")
         bash = BT.BashToolMsg("b1","execute","loop","completed","",time(),nothing,
                               "sleep 9","Monitor",true,"/tmp/x",0,true,"",nothing)
         msgs = Any[U, A, app, U2, bash]
 
         vis, acts = BT.apply_lens(msgs, BT.parse_lens(
-            "/user_message \"monitor\" + /bt_show_app: expand"))
+            "/user_message \"monitor\" + /bt_show: expand"))
         @test vis == [0, 2]                  # U matches "monitor"; app shown
         @test acts == Dict(2 => "expand")    # app expanded; U has no action
         @test 3 ∉ vis                        # lissajous user msg hidden
@@ -73,8 +73,8 @@ const BT = BonitoAgents
     @testset "signed clauses: include / exclude / wildcard / base rule" begin
         U  = BT.UserMsg("please start a resource monitor")
         A  = BT.AgentMsg("a1", "here is the monitor")
-        app = BT.BonitoAppMsg("app1","bonito_app","Dashboard","completed","",
-                              time(),time(),"","",nothing)
+        app = BT.MCPToolMsg("app1","other","Dashboard","completed","",
+                            time(),time(),"btworker","bt_show",nothing)
         U2 = BT.UserMsg("show me the lissajous plot")
         bash = BT.BashToolMsg("b1","execute","loop","completed","",time(),nothing,
                               "sleep 9","Monitor",true,"/tmp/x",0,true,"",nothing)
@@ -82,7 +82,7 @@ const BT = BonitoAgents
         msgs = Any[U, A, app, U2, bash, Th]      # 0:U 1:A 2:app 3:U2 4:bash 5:Th
 
         # A bare positive clause is already exclusive.
-        @test BT.apply_lens(msgs, BT.parse_lens("/bt_show_app"))[1] == [2]
+        @test BT.apply_lens(msgs, BT.parse_lens("/bt_show"))[1] == [2]
 
         # `+` unions includes.
         @test sort(BT.apply_lens(msgs, BT.parse_lens("/user_message + /agent"))[1]) == [0,1,3]
@@ -105,17 +105,17 @@ const BT = BonitoAgents
         @test sort(BT.apply_lens(msgs, BT.parse_lens("monitor"))[1]) == [0,1,4,5]
 
         # Quoted query + expand + subsequence key match ("dash" ⊆ "Dashboard").
-        vis2, acts2 = BT.apply_lens(msgs, BT.parse_lens("/bt_show_app expand \"dash\""))
+        vis2, acts2 = BT.apply_lens(msgs, BT.parse_lens("/bt_show expand \"dash\""))
         @test vis2 == [2] && acts2 == Dict(2 => "expand")
     end
 
     @testset "parse: signs, wildcard, optional colon, full-text" begin
         c = only(BT.parse_lens("!/thought"))
         @test c.sign === :exclude && c.key == "thought"
-        c = only(BT.parse_lens("/bt_show_app: expand"))   # colon still accepted
-        @test c.key == "bt_show_app" && c.action == "expand"
-        c = only(BT.parse_lens("/bt_show_app expand"))     # colon optional
-        @test c.key == "bt_show_app" && c.action == "expand"
+        c = only(BT.parse_lens("/bt_show: expand"))   # colon still accepted
+        @test c.key == "bt_show" && c.action == "expand"
+        c = only(BT.parse_lens("/bt_show expand"))     # colon optional
+        @test c.key == "bt_show" && c.action == "expand"
         cs = BT.parse_lens("/all - /Bash")
         @test cs[1].sign === :include && cs[1].key == "all"
         @test cs[2].sign === :exclude && cs[2].key == "Bash"
@@ -127,10 +127,10 @@ const BT = BonitoAgents
 
     @testset "vocabulary = keys present in the chat" begin
         msgs = Any[BT.UserMsg("hi"),
-                   BT.BonitoAppMsg("a","bonito_app","D","completed","",time(),time(),"","",nothing)]
+                   BT.MCPToolMsg("a","other","D","completed","",time(),time(),"btworker","bt_show",nothing)]
         vocab = BT.lens_vocabulary(msgs)
         @test "user_message" in vocab
-        @test "bt_show_app" in vocab
+        @test "bt_show" in vocab
         @test "tools" in vocab
         @test !("thought" in vocab)          # no thoughts in this chat
     end

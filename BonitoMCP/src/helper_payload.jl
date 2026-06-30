@@ -39,27 +39,43 @@ containers are summarised. Always-text blocks use the `result:\\n<body>` shape
 so the chat-side renderer picks them up as labeled Monaco sections.
 """
 function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output::Bool)
-    val === nothing && return Dict{String,Any}[]   # suppress nothing-result
+    # A `nothing` result still gets an (empty) html result block so the chat's
+    # invariant holds — content ALWAYS ends with the result, and everything
+    # between the code echo and it is stdout/console. Without this, a
+    # `Pkg.status(); nothing` (output, no value) leaves no result block and the
+    # chat would mount the stdout block AS the result, hiding the Output section.
+    val === nothing && return (; blocks = Dict{String,Any}[], html = "")
 
+    # Rich render → ONE self-contained HTML fragment, when the proxy bridge is
+    # loaded (a chat context). `App(val)` + Bonito's MIME dispatch covers
+    # everything `try_save_rich` did: a plot/image becomes a `DOM.img` backed by
+    # a `BinaryAsset` URL served over the proxy (NOT base64 inline), text becomes
+    # text. When we get a fragment it IS the whole result — the chat mounts it
+    # and the agent reads it — so we emit NO text repr / file block: the content
+    # is a clean `[…, html]` the chat keys off by tool NAME, never by parsing.
+    html = nothing
+    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_eval_html)
+        html = try
+            Main.RemoteProxy.render_eval_html(val)
+        catch e
+            @warn "format_value: result HTML render failed; falling back to text/file preview" exception = (e, catch_backtrace())
+            nothing
+        end
+    end
+    html === nothing || return (; blocks = Dict{String,Any}[], html = html)
+
+    # No bridge (standalone MCP): fall back to a text repr + on-disk rich preview
+    # so the agent still has a readable result without a live render.
     blocks = Dict{String,Any}[]
-
-    # Always include a text representation first so the agent has SOMETHING
-    # readable about the result. Truncated to keep the response small.
     repr = !full_output && is_large_container(val) ?
         summarize_container(val) : sprint(show, "text/plain", val)
     push!(blocks, Dict{String,Any}(
         "type" => "text",
         "text" => "result:\n$(truncate_text(repr, max_bytes, full_output, "result"))",
     ))
-
-    # If the value supports a richer MIME, render it to a file alongside —
-    # the chat-side render_tool_body picks up the `shown:` reference and
-    # auto-displays the file as a collapsible preview, but the BYTES never
-    # leave the worker until the user actually expands the tool. The agent
-    # sees only the path + mime + size.
     show_block = try_save_rich(val, out_dir, max_bytes)
     show_block === nothing || push!(blocks, show_block)
-    return blocks
+    return (; blocks = blocks, html = nothing)
 end
 
 # Walk the MIME chain (PNG → SVG → HTML, plus PNGFiles for Colorant
@@ -176,10 +192,23 @@ function format_error(err, bt, max_bytes::Int, full_output::Bool)
         Base.show_backtrace(io, bt)
     end
     text = trim_backtrace(text)
-    return [Dict{String,Any}(
+    # Same `(; blocks, html)` shape as format_value. bt_julia_eval ALWAYS renders
+    # an HTML fragment (when the bridge is up) — errors included — so the chat's
+    # EvalMsg can uniformly mount "the result render" without ever testing block
+    # content. The error renders as the exception itself (App(err) → its repr);
+    # the full backtrace stays in the text block for the agent.
+    html = nothing
+    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_eval_html)
+        html = try
+            Main.RemoteProxy.render_eval_html(err)
+        catch
+            nothing
+        end
+    end
+    return (; blocks = [Dict{String,Any}(
         "type" => "text",
         "text" => "error:\n$(truncate_text(text, max_bytes, full_output, "error"))",
-    )]
+    )], html = html)
 end
 
 # ── Output discipline ──────────────────────────────────────────────────────

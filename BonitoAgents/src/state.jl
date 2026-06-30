@@ -215,7 +215,7 @@ mutable struct ServerState
     # is scoped to ONE server (a second server in the same process must not share
     # it) and dies with the server. All guarded by `lock` (the first field), the
     # same mutex their old globals were already taken under.
-    eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (bt_show_app dial-back)
+    eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (eval-result dial-back)
     mcp_ctrl           :: Dict{String,Any}              # project_id => live MCP control WS
     session_inflight   :: Dict{String,Task}             # project_id => in-flight ensure_project_session! task
     # Per-path serialization lock for fetched `bt_show` files (server_dst => lock);

@@ -1,0 +1,25 @@
+# Committed eval-worker project for the bt_julia_eval render-type e2e tests
+# (`e2e:bt_eval_types`). It is what an eval RUNS IN — a normal user-style project
+# with the packages those tests render (color images via ImageShow, tables via
+# DataFrames/Tables; Markdown + Pkg are stdlibs, reachable from @stdlib). Bonito
+# is path-pinned to the DEV checkout so the tests exercise our local Bonito (the
+# render fixes live there); the relative path resolves from this file's real
+# location (Pkg.test runs from the original tree, not a sandbox copy — verified).
+#
+# Instantiated once as a warmup in runtests.jl (the packages are precompiled in
+# the depot, so it's a cache hit). NEVER generate this env at runtime in a test.
+name = "evalenv"
+uuid = "e7a1d000-0000-4000-8000-000000000002"
+version = "0.0.1"
+
+[deps]
+Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+Colors = "5ae59095-9a9b-59fe-a467-6f913c188581"
+FixedPointNumbers = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+ImageShow = "4e3cecfd-b093-5904-9786-8bbb286a6a31"
+PNGFiles = "f57f5aa1-a3ce-4bc8-8ab9-96f992907883"
+
+[sources]
+Bonito = {path = "../../../../Bonito"}

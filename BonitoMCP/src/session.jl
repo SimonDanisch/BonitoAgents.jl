@@ -80,16 +80,16 @@ function seed_temp_env_with_bonito!(env_dir::AbstractString)
                      stdout = devnull, stderr = devnull))
         true
     catch e
-        @warn "seed_temp_env_with_bonito!: Pkg.resolve failed; bt_show_app may fail until env_path is given explicitly" env_dir exception = e
+        @warn "seed_temp_env_with_bonito!: Pkg.resolve failed; the live-render bridge may fail until env_path is given explicitly" env_dir exception = e
         false
     end
 end
 
-# The minimum Bonito version with the remote-app proxy API that bt_show_app's
+# The minimum Bonito version with the remote-app proxy API that the live-render
 # bridge needs. The eval worker uses the PROJECT's own Bonito (we never touch its
-# LOAD_PATH); if that Bonito is older, bt_show_app errors clearly and only
-# app-display is affected — plain `bt_julia_eval` is untouched.
-const MIN_SHOW_APP_BONITO = v"5"
+# LOAD_PATH); if that Bonito is older, the bridge setup errors clearly and only
+# live-render display is affected — plain `bt_julia_eval` text output is untouched.
+const MIN_BRIDGE_BONITO = v"5"
 
 # ── JuliaSession ────────────────────────────────────────────────────────────
 mutable struct JuliaSession
@@ -142,7 +142,12 @@ worker_env() = ["JULIA_LOAD_PATH" => DEFAULT_LOAD_PATH]
 
 # Build the exeflags vector. Handles juliaup `+channel` syntax + custom flags.
 function build_exeflags(env_path, julia_cmd)::Vector{String}
-    base = String["--threads=auto"]
+    # `--color=yes`: the worker's stdout is a Pipe (not a tty), so colored tools
+    # (`Pkg.status`, `printstyled`, error backtraces) would emit PLAIN text by
+    # default. Force color so captured stdout carries ANSI — the chat renders it
+    # as a colored terminal block (`render_text_block` → RichText). The value repr
+    # is already colored via the render io_context; this covers stdout.
+    base = String["--threads=auto", "--color=yes"]
     env_path === nothing || push!(base, "--project=$(abspath(env_path))")
     if julia_cmd !== nothing
         # julia_cmd is something like "julia +1.11" or "julia --check-bounds=yes"
@@ -164,9 +169,9 @@ bootstrap the worker-side proxy bridge and have the worker dial the server. This
 one Malt call (over BonitoMCP's OWN link to the worker) includes `RemoteProxy` +
 builds the bridge; the worker then opens the dial-back WebSocket and runs
 `RemoteProxy.serve_bridge`, which pipes the Bonito protocol over it RAW (no Malt
-on that socket — see RemoteProxy.jl). Lets the server drive this worker to render
-interactive Bonito apps into the chat. Idempotent + lazy (call when Bonito is
-loaded, e.g. from `bt_show_app`).
+on that socket — see RemoteProxy.jl). Lets the server render this worker's
+`bt_julia_eval` results (incl. interactive Bonito apps) live into the chat.
+Idempotent + lazy (called before an eval executes, once Bonito is loaded).
 """
 function ensure_eval_dialed!(s::JuliaSession)
     # `BONITOAGENTS_SERVER_URL` is set by the BonitoWorker daemon (the install
@@ -219,26 +224,26 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
         return s
     end
     try
-        # bt_show_app's bridge needs Bonito ≥ 5 (the remote-app proxy API). The
+        # The live-render bridge needs Bonito ≥ 5 (the remote-app proxy API). The
         # eval worker uses the PROJECT's OWN Bonito — we never touch its env or
         # LOAD_PATH. If that Bonito is too old, fail with a clear, actionable
         # message BEFORE the RemoteProxy include (which would otherwise throw a
-        # cryptic `UndefVarError: proxy_send`). Only app display is affected;
-        # plain bt_julia_eval works regardless of the Bonito version.
+        # cryptic `UndefVarError: proxy_send`). Only live-render display is
+        # affected; plain bt_julia_eval text output works regardless of version.
         ok, vstr = Malt.remote_eval_fetch(s.worker, quote
             using Bonito
             local v = pkgversion(Bonito)
-            (v !== nothing && v >= $(MIN_SHOW_APP_BONITO),
+            (v !== nothing && v >= $(MIN_BRIDGE_BONITO),
              v === nothing ? "unknown" : string(v))
         end)
         if !ok
-            s.dial_error = "bt_show_app needs Bonito ≥ $(MIN_SHOW_APP_BONITO) " *
+            s.dial_error = "the live-render bridge needs Bonito ≥ $(MIN_BRIDGE_BONITO) " *
                 "(the remote-app proxy API), but this chat's project env resolved " *
-                "Bonito v$(vstr). Add a Bonito ≥ $(MIN_SHOW_APP_BONITO) to the project " *
+                "Bonito v$(vstr). Add a Bonito ≥ $(MIN_BRIDGE_BONITO) to the project " *
                 "env (e.g. `[sources] Bonito = {path = \"…/dev/Bonito\"}` then " *
-                "`Pkg.resolve()`) and reopen the chat. Only live-app display is " *
-                "affected — bt_julia_eval works regardless."
-            @warn "BonitoMCP: bt_show_app needs Bonito ≥ $(MIN_SHOW_APP_BONITO); this project env has Bonito v$(vstr) — skipping bridge setup" project_env = s.env_path
+                "`Pkg.resolve()`) and reopen the chat. Only live-render display is " *
+                "affected — bt_julia_eval text output works regardless."
+            @warn "BonitoMCP: the live-render bridge needs Bonito ≥ $(MIN_BRIDGE_BONITO); this project env has Bonito v$(vstr) — skipping bridge setup" project_env = s.env_path
             return s
         end
         # Bootstrap over BonitoMCP's OWN Malt link: include RemoteProxy + build the
@@ -250,14 +255,14 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
             # Re-include if RemoteProxy is absent OR only PARTIALLY loaded. A failed
             # include (e.g. the resolved Bonito lacks the remote-app proxy API the
             # module touches at load time) leaves a PARTIAL module registered in
-            # Main — early defs present, late ones (`register_app!`, `render_embed`)
-            # missing — and the include THREW. The old bare `isdefined(Main,
-            # :RemoteProxy)` guard then skipped re-include forever, so the next call
-            # built a bridge on the broken module and the missing def surfaced later
-            # as a cryptic `register_app! not defined`. `render_embed` is the
-            # module's last def ⇒ its presence means a complete load; otherwise
-            # re-include, which re-throws the REAL load error if the env is wrong.
-            if !(isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_embed))
+            # Main — early defs present, late ones (`render_eval_html`) missing — and
+            # the include THREW. The old bare `isdefined(Main, :RemoteProxy)` guard
+            # then skipped re-include forever, so the next call built a bridge on the
+            # broken module and the missing def surfaced later as a cryptic
+            # `render_eval_html not defined`. `render_eval_html` is the module's last
+            # def ⇒ its presence means a complete load; otherwise re-include, which
+            # re-throws the REAL load error if the env is wrong.
+            if !(isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_eval_html))
                 include($(remote_proxy_path()))
             end
             Main.RemoteProxy.ensure_bridge!()
@@ -518,11 +523,15 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
     partial = cap_response_text(drain_output!(s))
 
     if istaskdone(f)
-        value_blocks, fetch_failed = try
+        # `format_value`/`format_error` return `(; blocks, html)` — the agent
+        # text blocks plus (in a chat context) the rendered result HTML fragment.
+        result, fetch_failed = try
             (fetch(f), false)
         catch e
-            (interrupt_blocks(e), true)
+            ((; blocks = interrupt_blocks(e), html = nothing), true)
         end
+        value_blocks = result.blocks
+        html         = result.html
         # M11: the task is done, but the worker's final `println`s may still be
         # in the OS pipe — the pump task hasn't necessarily flushed them into our
         # buffer by the time `fetch` returns. Without a settle, that trailing
@@ -554,7 +563,7 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
                                 "text" => "stdout:\n$partial"))
         end
         append!(blocks, value_blocks)
-        return (status = :completed, blocks = blocks,
+        return (status = :completed, blocks = blocks, html = html,
                 is_error = is_error, elapsed_s = elapsed)
     end
     return (status = :running, partial = partial, elapsed_s = elapsed,

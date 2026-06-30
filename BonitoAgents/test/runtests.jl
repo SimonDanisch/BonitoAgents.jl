@@ -5,6 +5,14 @@
 #     window per worker (the `SharedServer` @testsetup) and assert only on the
 #     rendered DOM.
 #
+# ⚠ E2E POLICY (STRICT — see CONVENTIONS.md "E2E tests — STRICT policy"): an
+# `e2e:*` item reproduces EXACTLY what a user hits — the REAL dev_server + a REAL
+# electron browser driven by URL, asserting ONLY on the rendered DOM. NO manual
+# setup: never hand-spawn Malt/eval workers, never call handlers /
+# `render_eval_html` / internals directly, never bypass the chat (importing `Malt`
+# or calling a `*_handler` in an e2e item is a bug). Eval packages → a committed
+# test env (like `test/evalenv`) + warmup, NOT a runtime-built tmp project.
+#
 # Subset selection via `Pkg.test(test_args=[...])`, matched against testitem
 # names: `["unit"]` (headless), `["e2e:media"]`, `["e2e"]`, etc. No args runs
 # everything (CI does this under xvfb). With `nworkers=4` at most four
@@ -16,20 +24,28 @@
 #     julia --project=. -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=["unit"])'
 using ReTestItems, BonitoAgents
 
-# The `e2e:*` app-embed items (`app_*`, `embedded_app`, `keyed_list`) mount a
-# live Bonito App through `bt_show_app`, which spins a Malt eval worker on the
-# `test/appenv` project. That env must be RESOLVED + PRECOMPILED before the
-# worker dials in — otherwise the worker re-resolves the heavy test env on
-# first touch and the app mount times out. `test/appenv` pins only dev Bonito
-# (v5), so this is a fast cache hit; do it once here, before the workers fork.
-let appenv = joinpath(@__DIR__, "appenv"), cur = Base.active_project()
+# `e2e:bt_eval_types` runs a Malt eval worker on the committed `test/evalenv`
+# project (dev Bonito + DataFrames/Colors/ImageShow/Tables for the render-type
+# cases). That env must be RESOLVED + PRECOMPILED before the worker dials in —
+# otherwise the worker re-resolves the heavy env on first touch and the
+# render/mount times out. The packages are precompiled in the depot, so this is a
+# fast cache hit; do it once here, before the workers fork.
+let cur = Base.active_project()
     import Pkg
-    try
-        Pkg.activate(appenv; io = devnull)
-        Pkg.instantiate(; io = devnull)
-    finally
-        Pkg.activate(cur; io = devnull)
+    for env in ("evalenv",)
+        path = joinpath(@__DIR__, env)
+        isdir(path) || continue
+        try
+            Pkg.activate(path; io = devnull)
+            Pkg.instantiate(; io = devnull)
+        catch e
+            # Best-effort warmup: a failure here only makes that env's e2e items
+            # re-resolve on first touch — it must NOT abort the whole suite (e.g.
+            # `e2e:bt_eval` uses neither env).
+            @warn "test/$env instantiate failed — its e2e items may be slow on first mount" exception = e
+        end
     end
+    cur === nothing || Pkg.activate(cur; io = devnull)
 end
 
 const NAME = isempty(ARGS) ? nothing : Regex(join(ARGS, "|"))

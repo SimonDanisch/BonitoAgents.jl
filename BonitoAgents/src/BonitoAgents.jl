@@ -50,8 +50,8 @@ include("plotpane.jl")         # PlotPane handle (window-scoped; built by instal
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("lens.jl")             # lens search: parse + fuzzy filter + saved lenses
-include("remote_app.jl")       # embed_remote_app — interactive worker Bonito apps in the browser
-include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + bt_show_app detach controller
+include("remote_app.jl")       # eval-result bridge — live worker Bonito results in the browser
+include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + app detach controller
 include("persistence.jl")
 include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)

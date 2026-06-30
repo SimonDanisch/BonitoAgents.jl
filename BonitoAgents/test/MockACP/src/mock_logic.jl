@@ -326,66 +326,58 @@ function run_dispatcher_prompt(prompt_id)
         elseif et == "thought"
             thought_chunk(String(ev["text"]))
         elseif et == "edit"
-            # Edit tool with one DiffContent. The chat side keys off
-            # `kind == "edit"` to route to the Monaco DiffEditor body.
+            # Edit tool. Faithful to real claude-agent-acp (captured acp.jsonl):
+            #   1. tool_call: rawInput {} (empty!), status "pending", GENERIC title
+            #      "Edit", kind "edit", content [].
+            #   2. tool_call_update: rawInput streams {file_path,old_string,
+            #      new_string,replace_all}, title becomes DESCRIPTIVE ("Edit <path>"),
+            #      and the diff content rides along. ACP merges the rawInput → the
+            #      ✎ editable path-link affordance materialises here, not upfront.
+            #   3. tool_call_update: status "completed".
             tid = String(get(ev, "id", "edit-$(next_tool_id)")); next_tool_id += 1
             path = String(get(ev, "path", "/unknown"))
             old_text = String(get(ev, "old", ""))
             new_text = String(get(ev, "new", ""))
-            # `tool_call` for the bubble header + a `tool_call_update` that
-            # ships the diff content and flips status to completed. Mirrors
-            # what real claude-agent-acp emits.
+            meta = Dict("claudeCode" => Dict("toolName" => "Edit"))
             upd("tool_call", Dict{String,Any}(
-                "toolCallId" => tid, "kind" => "edit",
-                "title"  => "Edit $(basename(path))",
-                "status" => "in_progress",
-                "_meta"  => Dict("claudeCode" => Dict("toolName" => "Edit"))))
+                "toolCallId" => tid, "kind" => "edit", "title" => "Edit",
+                "status" => "pending", "rawInput" => Dict{String,Any}(),
+                "content" => Any[], "_meta" => meta))
             upd("tool_call_update", Dict{String,Any}(
-                "toolCallId" => tid, "status" => "completed",
+                "toolCallId" => tid, "kind" => "edit",
+                "title" => "Edit $(basename(path))",
+                "rawInput" => Dict{String,Any}("file_path" => path,
+                    "old_string" => old_text, "new_string" => new_text,
+                    "replace_all" => false),
                 "content" => [Dict{String,Any}(
                     "type" => "diff", "path" => path,
-                    "oldText" => old_text, "newText" => new_text)]))
-        elseif et == "bash"
-            tid = String(get(ev, "id", "bash-$(next_tool_id)")); next_tool_id += 1
-            upd("tool_call", Dict{String,Any}(
-                "toolCallId" => tid, "kind" => "execute",
-                "title" => "Bash", "status" => "in_progress",
-                "_meta" => Dict("claudeCode" => Dict("toolName" => "Bash")),
-                "rawInput" => Dict("command" => String(get(ev, "command", "")))))
+                    "oldText" => old_text, "newText" => new_text)],
+                "_meta" => meta))
             upd("tool_call_update", Dict{String,Any}(
-                "toolCallId" => tid, "status" => "completed",
+                "toolCallId" => tid, "status" => "completed", "_meta" => meta))
+        elseif et == "bash"
+            # Bash tool. Faithful to real claude: tool_call opens with rawInput {},
+            # status "pending", GENERIC title "Terminal", kind "execute"; a
+            # tool_call_update streams rawInput {command,description}, the title
+            # becomes the COMMAND, and the output content rides along; then complete.
+            tid = String(get(ev, "id", "bash-$(next_tool_id)")); next_tool_id += 1
+            command = String(get(ev, "command", ""))
+            meta = Dict("claudeCode" => Dict("toolName" => "Bash"))
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "execute", "title" => "Terminal",
+                "status" => "pending", "rawInput" => Dict{String,Any}(),
+                "content" => Any[], "_meta" => meta))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "execute",
+                "title" => isempty(command) ? "Terminal" : command,
+                "rawInput" => Dict{String,Any}("command" => command, "description" => ""),
                 "content" => [Dict{String,Any}(
                     "type" => "content",
                     "content" => Dict("type" => "text",
-                                       "text" => String(get(ev, "output", ""))))]))
-        elseif et == "bt_show_app_result"
-            # MCP-style tool call: the toolName `mcp__btworker__bt_show_app`
-            # is what the ACP parser splits to `(server="btworker",
-            # tool_name="bt_show_app")` — which is what the chat's
-            # `is_bonito_app(::MCPCall)` checks to route this to the
-            # BonitoAppMsg lifecycle. Without the `mcp__` prefix the call
-            # would land as GenericTool and never auto-mount.
-            tid = String(ev["tool_id"])
-            code = String(ev["code"])
-            env_label = ev["env_path"] === nothing ? "<temp>" : String(ev["env_path"])
-            raw_input = Dict{String,Any}("code" => code)
-            ev["env_path"] === nothing || (raw_input["env_path"] = String(ev["env_path"]))
-            upd("tool_call", Dict{String,Any}(
-                "toolCallId" => tid, "kind" => "other",
-                "title"  => "bt_show_app ($(env_label))",
-                "status" => "in_progress",
-                "_meta"  => Dict("claudeCode" => Dict(
-                    "toolName"  => "mcp__btworker__bt_show_app",
-                    "toolInput" => raw_input)),
-                "rawInput" => raw_input))
-            packed = Any[]
-            for c in get(ev, "content", Any[])
-                push!(packed, Dict{String,Any}("type" => "content", "content" => c))
-            end
+                                       "text" => String(get(ev, "output", ""))))],
+                "_meta" => meta))
             upd("tool_call_update", Dict{String,Any}(
-                "toolCallId" => tid,
-                "status" => Bool(get(ev, "is_error", false)) ? "failed" : "completed",
-                "content" => packed))
+                "toolCallId" => tid, "status" => "completed", "_meta" => meta))
         elseif et == "bt_eval_result"
             # MCP returned its content blocks; wrap each in ACP's `type:"content"`
             # envelope (TextContent/ImageContent expect that shape). The chat
@@ -393,18 +385,29 @@ function run_dispatcher_prompt(prompt_id)
             # for the bt_julia_eval-specific rendering path; matches production.
             tid = String(ev["tool_id"])
             code = String(ev["code"])
-            env_label = ev["env_path"] === nothing ? "<temp>" : String(ev["env_path"])
             raw_input = Dict{String,Any}("code" => code)
             ev["env_path"] === nothing || (raw_input["env_path"] = String(ev["env_path"]))
+            # Mirror EXACTLY what real claude-agent-acp emits for an MCP tool
+            # (verified against captured acp.jsonl for `mcp__julia__julia_eval`):
+            #   1. tool_call: rawInput {} (empty!), status "pending", kind "other",
+            #      title = the RAW `mcp__<server>__<tool>` name (the chat prettifies
+            #      it), content [].  Claude does NOT know/ship the MCP args yet.
+            #   2. tool_call_update: rawInput streams the FULL args (code/env/…) —
+            #      ACP merges it into the live MCPCall (drives the eval extras).
+            #   3. tool_call_update: status "completed" (or "failed") + content.
+            # A title/kind/upfront-rawInput mock would mask the prettify + merge +
+            # finalize paths a real user exercises.
+            toolname = "mcp__btworker__bt_julia_eval"
+            meta = Dict("claudeCode" => Dict("toolName" => toolname))
             upd("tool_call", Dict{String,Any}(
-                "toolCallId" => tid, "kind" => "execute",
-                "title"  => "bt_julia_eval ($(env_label))",
-                "status" => "in_progress",
-                "_meta"  => Dict("claudeCode" => Dict(
-                    "toolName"  => "mcp__btworker__bt_julia_eval",
-                    "toolInput" => raw_input)),
-                "rawInput" => raw_input))
-            # Pack MCP content into the ACP `type:"content"` envelope.
+                "toolCallId" => tid, "kind" => "other",
+                "title" => toolname, "status" => "pending",
+                "rawInput" => Dict{String,Any}(), "content" => Any[],
+                "_meta" => meta))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid, "status" => "in_progress",
+                "rawInput" => raw_input, "title" => toolname, "kind" => "other",
+                "_meta" => meta))
             packed = Any[]
             for c in get(ev, "content", Any[])
                 push!(packed, Dict{String,Any}("type" => "content", "content" => c))
@@ -412,7 +415,7 @@ function run_dispatcher_prompt(prompt_id)
             upd("tool_call_update", Dict{String,Any}(
                 "toolCallId" => tid,
                 "status" => Bool(get(ev, "is_error", false)) ? "failed" : "completed",
-                "content" => packed))
+                "content" => packed, "_meta" => meta))
         elseif et == "tool"
             # Generic tool call of any kind (edit/search/execute/other). Opens
             # the bubble, then (unless complete=false) ships content + a final

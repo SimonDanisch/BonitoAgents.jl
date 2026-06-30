@@ -374,14 +374,17 @@ function append_tool(session::ChatSession, msg::ToolMsg)
             # 4th field: the resolved filter key (`tool_key`) — persisting it makes
             # the typed variants (Bash/Task/MCP…) reload with stable per-tool
             # filter identities even though reload lands as `GenericToolMsg`.
-            meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
+            # Header fields via the `tool_*` accessors — `BtJuliaEval` keeps them
+            # in `msg.header`, not inline, so direct `msg.id`/`msg.status` would
+            # error for it.
+            meta = "$(tool_kind(msg)) · $(tool_status(msg)) · $(tool_id(msg)) · $(tool_key(msg))"
             println(io, "!!! tool \"$meta\"")
-            println(io, "    `$(msg.title)`")
+            println(io, "    `$(tool_title(msg))`")
             # Brief summary on the collapsed header; full ACP body lives in
             # the chat-storage `tools/<id>.json` (see update_tool_file!).
-            if !isempty(msg.summary)
+            if !isempty(tool_summary(msg))
                 println(io, "")
-                println(io, "    $(msg.summary)")
+                println(io, "    $(tool_summary(msg))")
             end
             println(io)
         end

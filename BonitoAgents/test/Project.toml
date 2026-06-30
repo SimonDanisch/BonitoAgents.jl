@@ -36,7 +36,7 @@ MockACP = {path = "MockACP"}
 BonitoMCP = {path = "../../BonitoMCP"}
 BonitoWorker = {path = "../../BonitoWorker"}
 RemoteSync = {path = "../../RemoteSync"}
-Bonito = {url = "https://github.com/SimonDanisch/Bonito.jl.git", rev = "master"}
+Bonito = {path = "../../../Bonito"}
 ElectronCall = {url = "https://github.com/IanButterworth/ElectronCall.jl.git", rev = "sd/testsuite"}
 BonitoBook = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}
 BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
