@@ -50,6 +50,10 @@ N_CHUNKS::Int           = 3
 SESSION::String         = "s"
 CHUNK_MS::Int           = 0
 DISPATCHER_ADDR::String = ""
+# When set (BT_MOCK_ACP_IGNORE_CANCEL=1), dispatcher mode keeps streaming despite
+# a `session/cancel` — simulates a wedged agent that ignores cancel, so a test can
+# exercise the chat's re-cancel → force-close escalation.
+IGNORE_CANCEL::Bool     = false
 
 function _configure!()
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
@@ -57,6 +61,7 @@ function _configure!()
     global SESSION         = String(get(ENV, "BT_MOCK_ACP_SESSION", "s"))
     global CHUNK_MS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNK_MS", "0")))
     global DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
+    global IGNORE_CANCEL   = get(ENV, "BT_MOCK_ACP_IGNORE_CANCEL", "") == "1"
     return nothing
 end
 
@@ -307,7 +312,7 @@ function run_dispatcher_prompt(prompt_id)
         # reads the NEXT prompt line, and the follow-up turn would also read
         # this turn's stale tail. Draining keeps the persistent connection
         # clean for the next prompt.
-        if cancelled[]
+        if cancelled[] && !IGNORE_CANCEL
             stop_reason = "cancelled"
             while !eof(sock)
                 tail = try readline(sock) catch; break end
@@ -456,8 +461,12 @@ function run_dispatcher_prompt(prompt_id)
             # promptly (the cancel test streams chunk/`delay` pairs and yanks
             # the turn mid-way): bail out of the slice loop and let the
             # loop-top `cancelled[]` check resolve `stopReason: "cancelled"`.
+            # `IGNORE_CANCEL` (wedged-agent sim) also ignores cancel HERE — keep
+            # pacing the full delay so the turn stays genuinely open/busy after a
+            # cancel (otherwise cancel would make every delay bail and the stream
+            # races to `end_turn`, ending the turn instead of wedging).
             remaining = Float64(get(ev, "ms", 0)) / 1000
-            while remaining > 0 && !cancelled[]
+            while remaining > 0 && !(cancelled[] && !IGNORE_CANCEL)
                 slice = min(remaining, 0.05)
                 sleep(slice)
                 remaining -= slice

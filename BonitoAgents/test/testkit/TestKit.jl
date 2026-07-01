@@ -259,6 +259,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       port::Union{Int,Nothing} = nothing,
                       browser_width::Int  = 1280,
                       browser_height::Int = 820,
+                      ignore_cancel::Bool = false,
                       kwargs...)
     ensure_display!()
     agent_ref = Ref{Function}(agent)
@@ -294,6 +295,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
         "BT_MOCK_ACP_DISPATCHER" => "127.0.0.1:$(disp_port)",
         "BT_MOCK_PROJECT"        => test_env,
     )
+    # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
+    # test can drive the chat's re-cancel → force-close escalation.
+    ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
 
     h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking

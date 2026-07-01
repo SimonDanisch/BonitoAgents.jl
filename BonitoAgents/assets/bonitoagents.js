@@ -1446,6 +1446,15 @@ class BonitoChat {
     appendChunk(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        // A finalized node has already been painted with the authoritative html
+        // by `onAgentFinal` (which cleared the pending stream). Nodes are never
+        // removed from `nodeById`/`cache` (virtual scroll only detaches them
+        // from the DOM), so a finalized node lives forever — and message ids
+        // are unique per message, so a finalized id never legitimately gets
+        // more chunks. A LATE or duplicate `chunk` for it would repaint the
+        // older, shorter cumulative html; drop it. A NEW message uses a fresh
+        // node (fresh id), so this per-node flag never blocks live streaming.
+        if (node.__btFinal) return;
         // Server ships the FULL rendered html of the message-so-far each
         // chunk (CommonMark-rendered, so intraword `_`s don't italicize and
         // newlines/lists/headings format correctly while streaming). Each
@@ -1499,7 +1508,9 @@ class BonitoChat {
         if (node.__btStreamTimer != null) return;   // window open: coalesce
         const flush = () => {
             node.__btStreamTimer = null;
-            if (this.destroyed || node.__btStreamHtml == null) return;
+            // A final may have landed while this timer was pending; never let a
+            // trailing flush repaint an already-finalized bubble.
+            if (this.destroyed || node.__btFinal || node.__btStreamHtml == null) return;
             node.innerHTML = node.__btStreamHtml;
             node.__btStreamHtml = null;
             node.__btStreamTimer = setTimeout(flush, this.STREAM_APPLY_MS);
@@ -1519,11 +1530,39 @@ class BonitoChat {
 
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (node && msg.html) {
+        if (node) {
+            // ALWAYS clear the pending stream, even for an empty final: a
+            // throttled trailing flush queued by `_applyStreamHtml` would
+            // otherwise fire AFTER this and resurrect stale streamed text into
+            // an already-final bubble. For an empty final we also blank the
+            // node so the bubble reflects the authoritative (empty) message.
             this._clearPendingStream(node);
-            node.innerHTML = msg.html;
+            node.innerHTML = msg.html || '';
             linkifyPaths(node);
             decorateCodeBlocks(node);
+            // Mark the node final so a LATE/duplicate `chunk` for this id can't
+            // repaint the older, shorter cumulative html (see `appendChunk`).
+            node.__btFinal = true;
+            return;
+        }
+        // Node evicted / id mismatch: mirror `onSummaryFinal`'s DOM fallback so
+        // the authoritative final isn't silently dropped. Prefer a precise
+        // by-id lookup (agent nodes carry `data-msg-id`); fall back to the last
+        // agent bubble in the DOM.
+        let tgt = msg.id
+            ? this.container.querySelector(
+                `.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`)
+            : null;
+        if (!tgt) {
+            const nodes = this.container.querySelectorAll('.bt-agent-msg');
+            tgt = nodes[nodes.length - 1];
+        }
+        if (tgt) {
+            this._clearPendingStream(tgt);
+            tgt.innerHTML = msg.html || '';
+            linkifyPaths(tgt);
+            decorateCodeBlocks(tgt);
+            tgt.__btFinal = true;
         }
     }
 
@@ -2005,6 +2044,9 @@ class BonitoChat {
                 break;
             case 'agent':
                 div.className = 'bt-agent-msg';
+                // Carry the id so `onAgentFinal`'s DOM fallback can find this
+                // bubble by id when the node is missing from `nodeById`.
+                if (msg.id) div.dataset.msgId = msg.id;
                 if (msg.streaming) {
                     const span = document.createElement('span');
                     span.className = 'bt-stream-text';

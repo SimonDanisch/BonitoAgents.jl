@@ -130,29 +130,6 @@ mutable struct ChatModel
     # guard in `restart_chat_session!`.
     turns_active::Ref{Int}
 
-    # Authoritative live-tool counters (shared, like `turns_active`). They
-    # replace the two O(n) `msgs_store` scans `update_busy!` used to run:
-    #   • `live_fg_tools` — LIVE FOREGROUND tools: any `is_live` ToolMsg that is
-    #     NOT a running background bash (mirrors the old `fg_live` scan).
-    #   • `live_bg_tools` — LIVE BACKGROUND shells: a `BashToolMsg` with
-    #     `bg_running` (mirrors the old `bg_running` scan).
-    # Maintained at every tool live→closed / open→live transition via
-    # `sync_tool_liveness!`, which reconciles ONE tool's contribution against its
-    # last-recorded class in `tool_live` (delta-based, so double-calls are safe).
-    live_fg_tools::Ref{Int}
-    live_bg_tools::Ref{Int}
-    # Per-tool last-recorded liveness class (id => 0 none / 1 fg / 2 bg), the
-    # bookkeeping `sync_tool_liveness!` diffs against so each counter moves
-    # exactly once per real transition. Guarded by the shared `lock`.
-    tool_live::Dict{String,Int}
-
-    # `time()` of the last inbound stream activity (shared). With a live
-    # background shell the SDK holds the prompt open even after the agent
-    # goes idle (validated against the real agent: no idle event, no
-    # response, indefinitely) — so the busy spinner keys off THIS, not off
-    # prompt resolution. See `update_busy!`.
-    last_stream_at::Base.RefValue{Float64}
-
     # The taskbar's elapsed-time clock (shared). A Julia `Timer`
     # (`ensure_taskbar_clock!`) sets this to `time()` once a second while
     # items are live; the TaskBar's elapsed labels are `map(clock)` text
@@ -231,10 +208,6 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(TaskbarItem[]),  # taskbar_items (pin-board state)
         Ref(0),                     # turn_seq
         Ref(0),                     # turns_active
-        Ref(0),                     # live_fg_tools
-        Ref(0),                     # live_bg_tools
-        Dict{String,Int}(),         # tool_live (id => last-recorded class)
-        Ref(0.0),                   # last_stream_at
         Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
         Ref(false),                 # taskbar_clock_on
         # Provider observable tracks the AGENT (the source of truth): the kind
@@ -294,10 +267,6 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.taskbar_items),   # per-tab TaskBar bridge
             m.turn_seq,                # shared counter
             m.turns_active,            # shared counter
-            m.live_fg_tools,           # shared counter (authoritative busy input)
-            m.live_bg_tools,           # shared counter (authoritative busy input)
-            m.tool_live,               # shared bookkeeping (one class map per chat)
-            m.last_stream_at,          # shared timestamp
             map(identity, session, m.taskbar_clock),   # per-tab clock bridge
             m.taskbar_clock_on,        # shared guard
             any_bridge(session, m.provider),  # per-tab provider bridge (Any-typed: provider type varies across a switch)
@@ -635,47 +604,6 @@ is_turn_orphan(m::TodoListMsg) = is_live(m)
 # and skip the natural completion event — worse UX than letting the
 # poller settle it.
 is_turn_orphan(::ChatMsg)     = false
-
-# ── Authoritative live-tool counters ────────────────────────────────────────
-# The busy spinner's "is any real work still live?" question used to be answered
-# by two O(n) walks over `msgs_store` inside `update_busy!`. Those walks are
-# replaced by two shared counters (`live_fg_tools` / `live_bg_tools`) kept in
-# sync at the tool lifecycle edges. `tool_liveness_class` is the SINGLE source of
-# truth for a tool's contribution; it mirrors the old scan's classification
-# exactly:
-#   0 = none  — not live (finished / never-live / terminal status)
-#   1 = fg    — live and NOT a running background shell (the `fg_live` scan)
-#   2 = bg    — a running background bash (the `bg_running` scan)
-# A running background bash is class 2 (never double-counted as fg); every other
-# live tool — including a not-yet-backgrounded bash and a live background Task —
-# is class 1, exactly as the scan counted them (`!(m isa BashToolMsg && bg_running)`).
-tool_liveness_class(m::ToolMsg) =
-    (m isa BashToolMsg && m.bg_running) ? 2 : (is_live(m) ? 1 : 0)
-
-# Reconcile ONE tool's contribution to the counters against its last-recorded
-# class in `tool_live`. Delta-based, so calling it repeatedly (or after the tool
-# already left live) is a no-op — the "guard against double-dec" the design
-# calls for is structural: a class only moves the counters when it actually
-# changes. Called at EVERY site that can flip a tool's `status` / `bg_running` /
-# `finished_at` (creation, per-snap updates, close, bg finalize, orphan sweep,
-# per-tool stop). Runs under the shared lock (counters + dict are shared state).
-function sync_tool_liveness!(chat::ChatModel, m::ToolMsg)
-    s = shared(chat)
-    lock(s.lock) do
-        new = tool_liveness_class(m)
-        old = get(s.tool_live, m.id, 0)
-        old == new && return nothing
-        # Leave the old class.
-        old == 1 && (s.live_fg_tools[] -= 1)
-        old == 2 && (s.live_bg_tools[] -= 1)
-        # Enter the new class.
-        new == 1 && (s.live_fg_tools[] += 1)
-        new == 2 && (s.live_bg_tools[] += 1)
-        new == 0 ? delete!(s.tool_live, m.id) : (s.tool_live[m.id] = new)
-        return nothing
-    end
-    return nothing
-end
 
 # A background-or-streamy task that deserves a taskbar slot. Default false;
 # Bash with `run_in_background`, Task/Agent with `run_in_background`, and
@@ -2109,9 +2037,8 @@ Base.close(m::TodoListMsg) =
 # liveness off a plan whose entries are still pending.
 finalize_orphan!(m::AgentMsg)   = close(m)
 finalize_orphan!(m::ThoughtMsg) = close(m)
-# The orphan sweep force-finalizes a non-terminal tool; reconcile so its live
-# slot is released (fg/bg → none). `m.chat` is the shared parent for stored msgs.
-finalize_orphan!(m::ToolMsg)    = (close(m); m.chat === nothing || sync_tool_liveness!(m.chat, m); nothing)
+# The orphan sweep force-finalizes a non-terminal tool.
+finalize_orphan!(m::ToolMsg)    = (close(m); nothing)
 function finalize_orphan!(m::TodoListMsg)
     m.finished_at === nothing || return nothing
     m.finished_at = time()
@@ -2421,10 +2348,6 @@ end
 # header fields the update path touches.
 function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     pin_tool!(b.chat, b)
-    # Count this tool the instant it's rendered live (it was just `send!`ed):
-    # a tool that arrived already-terminal (a completed Read) classifies as
-    # `none` and never bumps a counter; a live one enters fg here.
-    sync_tool_liveness!(b.chat, b)
     try
         persist_tool_content!(b.chat.chat_dir, m)
         cache_tool_content!(b.chat, m.id, m.content)
@@ -2499,14 +2422,9 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             # missing affordances on the fly.
             snap_header_extras!(d, b)
             chat_emit(b.chat, d)
-            # This snap may have flipped `status` terminal — reconcile the
-            # tool's live class (fg → none) as soon as it happens, not only at
-            # close, so a still-draining channel doesn't leave a stale count.
-            sync_tool_liveness!(b.chat, b)
         end
     finally
         close(b)        # total: finalizes the bubble even if the loop body threw
-        sync_tool_liveness!(b.chat, b)   # authoritative leave-live (close forced terminal)
         unpin_task!(b.chat, b.id)
     end
     return nothing
@@ -2566,9 +2484,6 @@ end
 # exits. Non-background bashes fall through to the generic ToolMsg handling.
 function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
     pin_tool!(b.chat, b)
-    # Rendered live: a foreground bash enters fg here. It may flip to bg below
-    # (background launch detected) — the per-snap sync moves it fg → bg.
-    sync_tool_liveness!(b.chat, b)
     try
         persist_tool_content!(b.chat.chat_dir, m)
         for snap in m.updates
@@ -2630,10 +2545,6 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
                 d["finished_at"] = b.finished_at
             end
             chat_emit(b.chat, d)
-            # Reconcile after each snap: a foreground bash going terminal moves
-            # fg → none; a background launch moves fg → bg (so the spinner logic
-            # sees a live background shell, not a live foreground tool).
-            sync_tool_liveness!(b.chat, b)
         end
     finally
         # A live background task is finalized later (by `finalize_bg_task!` when the
@@ -2646,9 +2557,6 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
             close(b)
             unpin_task!(b.chat, b.id)
         end
-        # Reconcile once more: after `close` a foreground bash is `none`; a still
-        # `bg_running` shell stays `bg` (left for `finalize_bg_task!` to clear).
-        sync_tool_liveness!(b.chat, b)
     end
     return nothing
 end
@@ -2742,8 +2650,6 @@ function finalize_bg_task!(model::ChatModel, m::BashToolMsg)
     m.bg_running = false
     m.status = "completed"
     m.finished_at === nothing && (m.finished_at = time())
-    # Shell exited: the background shell leaves live (bg → none).
-    sync_tool_liveness!(model, m)
     write_bg_content!(model.chat_dir, m)
     try
         append_tool(model.chat_session, m)
@@ -3033,7 +2939,6 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     end
     cli === nothing && return nothing
     lock(() -> s.turns_active[] += 1, s.lock)
-    s.last_stream_at[] = time()
     s.busy_active[] || (s.busy_active[] = true)
     # Ship the turn's sequence number — a stop-click echoes it back so the
     # cancel can be scoped to THIS turn (see CancelCommand).
@@ -3044,9 +2949,12 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
             images=user_msg.images)
     catch e
         # Failed to even send: release the slot we claimed; surface the error
-        # like a failed turn would.
-        lock(() -> s.turns_active[] -= 1, s.lock)
-        update_busy!(chat)
+        # like a failed turn would. A failed start releases the last turn, so
+        # busy tracks `turns_active > 0` (false here).
+        lock(s.lock) do
+            s.turns_active[] -= 1
+            s.busy_active[] = (s.turns_active[] > 0)
+        end
         rethrow()
     end
 end
@@ -3061,33 +2969,24 @@ end
 
 function drain_turn!(chat::ChatModel, turn)
     s = shared(chat)
-    # Busy watchdog: with a live background shell the SDK holds this prompt
-    # open even after the agent goes idle (no idle event, no response —
-    # validated on the real wire), so the spinner must follow STREAM
-    # ACTIVITY, not prompt resolution. The watchdog flips busy off once the
-    # wire quiesces with only background work running; any later activity on
-    # this turn (e.g. the agent reacting to the shell finishing) flips it
-    # back on (every inbound frame bumps `last_stream_at` via the wire tap).
-    turn_done = Ref(false)
+    # Busy simply tracks `turns_active > 0`: the agent settles the turn with
+    # `end_turn` at the result (verified in claude-agent-acp — it deliberately
+    # does NOT hold the turn open waiting on detached background work), so a
+    # turn ends when the answer is done. A detached background task lives in the
+    # taskbar, not in a held-open turn, so there's no mid-turn dimming to do.
+    #
     # Track whether the turn produced ANY visible message, so a turn that ends
     # with nothing (e.g. a freshly-switched provider that isn't authenticated
     # and returns an empty `end_turn`) doesn't leave the user staring at
     # silence — we surface a hint below instead.
     nstore0 = lock(() -> length(s.msgs_store), s.lock)
     errored = false
-    Base.errormonitor(@async while !turn_done[]
-        update_busy!(chat)
-        sleep(2)
-    end)
     try
         for m in turn
-            s.last_stream_at[] = time()
-            # Re-arm after a quiesce (set-if-changed: every assignment fires
-            # the Observable, and the JS bridge doesn't need a busy event
-            # per message).
+            # Set-if-changed: every assignment fires the Observable, and the JS
+            # bridge doesn't need a busy event per message.
             s.busy_active[] || (s.busy_active[] = true)
             process!(chat, m)
-            s.last_stream_at[] = time()
         end
     catch e
         errored = true
@@ -3102,7 +3001,6 @@ function drain_turn!(chat::ChatModel, turn)
             close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, e))]")))
         end
     finally
-        turn_done[] = true
         # End-of-turn cleanup belongs to the LAST active turn only. On a
         # handoff (this turn resolved because a newer prompt took over the
         # stream) the conversation is still going: sweeping orphans here
@@ -3161,53 +3059,6 @@ function drain_turn!(chat::ChatModel, turn)
             end
         end
     end
-    return nothing
-end
-
-# Busy = "the agent is actually doing something we can see". With a live
-# background shell the SDK never resolves the prompt (it keeps the turn open
-# to deliver the shell's completion later), so an open turn alone must not
-# pin the spinner. Flip busy OFF only when ALL of:
-#   • the wire has been quiet for BG_IDLE_QUIESCE seconds (real agent work
-#     streams chunks/usage heartbeats; tool execution is covered next),
-#   • no live FOREGROUND tool (a long fg bash streams nothing while it runs),
-#   • at least one background shell is running (without one, a quiet open
-#     turn is either about to resolve or genuinely wedged — keep the honest
-#     spinner rather than mask it).
-const BG_IDLE_QUIESCE = 8.0
-
-# STAGE-1 CROSS-CHECK TOGGLE. While true, `update_busy!` computes BOTH the old
-# O(n) scan and the authoritative counters and `@warn "BUSY-DESYNC"` if they
-# disagree — the safety net that proves the counters track every lifecycle path
-# before the scan is removed. Set false (the default once verified) to run on the
-# counters alone. Leave the machinery here so a future stage-2 change can re-enable
-# it cheaply.
-const BUSY_CROSSCHECK = Ref(false)
-
-function update_busy!(chat::ChatModel)
-    s = shared(chat)
-    active, bg_count, fg_count, snapshot = lock(s.lock) do
-        s.turns_active[], s.live_bg_tools[], s.live_fg_tools[],
-            (BUSY_CROSSCHECK[] ? copy(s.msgs_store) : ChatMsg[])
-    end
-    if BUSY_CROSSCHECK[]
-        scan_bg = any(m -> m isa BashToolMsg && m.bg_running, snapshot)
-        scan_fg = any(snapshot) do m
-            m isa ToolMsg && is_live(m) && !(m isa BashToolMsg && m.bg_running)
-        end
-        (scan_bg == (bg_count > 0) && scan_fg == (fg_count > 0)) ||
-            @warn "BUSY-DESYNC scan vs counters" scan_bg scan_fg bg_count fg_count
-    end
-    busy = active > 0
-    if busy && time() - s.last_stream_at[] > BG_IDLE_QUIESCE
-        # Anything live that isn't a running background shell is foreground
-        # work — including a long bt_show_app render or an eval between
-        # checkpoints (their pills are status-live exactly while the call is
-        # in flight). Quiet wire + foreground work ⇒ still busy. The two
-        # authoritative counters replace the old `msgs_store` scans.
-        (bg_count > 0) && !(fg_count > 0) && (busy = false)
-    end
-    s.busy_active[] == busy || (s.busy_active[] = busy)
     return nothing
 end
 
@@ -3503,18 +3354,7 @@ function start_chat_client!(model::ChatModel)
     prev_session_id = model.chat_session.session_id
     # `on_frame` taps every raw ACP frame (both directions) into
     # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
-    start!(model.agent;
-           on_frame = let logger = acp_frame_logger(model.chat_dir),
-                          s = shared(model)
-               (dir, msg) -> begin
-                   # Every inbound frame counts as stream activity — the busy
-                   # heuristic (`update_busy!`) keys off this, and a minutes-long
-                   # streaming reply must not read as "quiet" just because the
-                   # turn loop sits inside one message.
-                   dir === :in && (s.last_stream_at[] = time())
-                   logger(dir, msg)
-               end
-           end)
+    start!(model.agent; on_frame = acp_frame_logger(model.chat_dir))
     cli = client(model.agent)
     replay_msgs = replay(model.agent)
     # Header metadata: typed views over the raw session-setup result. A future
@@ -4958,12 +4798,6 @@ function handle_command!(model::ChatModel, ::Session, cmd::SendCommand)
     return nothing
 end
 
-# A re-cancel only escalates to a force-close after the agent has had a real
-# chance to honor the first one. Set well past the worst observed cold-start
-# honor latency (warm ≈ 0.1s, cold-fresh ≈ 3.9s, cold-resumed ≈ 6–18s) so an
-# impatient double-click never force-closes a turn that's about to honor.
-const CANCEL_ESCALATE_WAIT = 20.0
-
 function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
@@ -4990,12 +4824,15 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # The hammer is reserved for a genuinely-wedged agent (resumed onto an
     # already-orphaned tool call, ignores cancel, connection still alive so no
     # `ConnectionClosed` fires) — and it's the USER's call: cancel AGAIN, after the
-    # agent's had a real chance (≥ CANCEL_ESCALATE_WAIT) and it's STILL busy. That
-    # distinguishes a deliberate "force it" from both an impatient double-click
-    # (< the wait → graceful re-send) and a slow-but-honoring cold cancel.
+    # agent's had a real chance (≥ 20 s) and it's STILL busy. That distinguishes a
+    # deliberate "force it" from both an impatient double-click (< the wait →
+    # graceful re-send) and a slow-but-honoring cold cancel.
     now      = time()
     first_at = (@atomic c.conn.cancel_at)              # 0.0 ⇒ first cancel this turn
-    escalate = first_at > 0 && (now - first_at) ≥ CANCEL_ESCALATE_WAIT && s.busy_active[]
+    # 20 s is well past the worst observed cold-start honor latency (warm ≈ 0.1s,
+    # cold-fresh ≈ 3.9s, cold-resumed ≈ 6–18s), so an impatient double-click never
+    # force-closes a turn that's about to honor.
+    escalate = first_at > 0 && (now - first_at) ≥ 20.0 && s.busy_active[]
     first_at > 0 || (@atomic c.conn.cancel_at = now)   # stamp the first cancel
     AgentClientProtocol.cancel!(c)                      # graceful (idempotent re-send)
     if escalate
@@ -5097,7 +4934,6 @@ end
 function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
     (t.is_background && is_live(t)) || return nothing
     close(t)
-    sync_tool_liveness!(model, t)   # user stopped it: leave live (fg → none)
     unpin_task!(model, t.id)
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => t.id,
         "status" => "completed", "summary" => "stopped"))

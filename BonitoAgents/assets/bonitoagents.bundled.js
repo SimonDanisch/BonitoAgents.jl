@@ -961,6 +961,7 @@ class BonitoChat {
     appendChunk(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        if (node.__btFinal) return;
         if (msg.html !== undefined) {
             this._applyStreamHtml(node, msg.html);
         } else if (msg.text !== undefined) {
@@ -990,7 +991,7 @@ class BonitoChat {
         if (node.__btStreamTimer != null) return;
         const flush = ()=>{
             node.__btStreamTimer = null;
-            if (this.destroyed || node.__btStreamHtml == null) return;
+            if (this.destroyed || node.__btFinal || node.__btStreamHtml == null) return;
             node.innerHTML = node.__btStreamHtml;
             node.__btStreamHtml = null;
             node.__btStreamTimer = setTimeout(flush, this.STREAM_APPLY_MS);
@@ -1006,11 +1007,28 @@ class BonitoChat {
     }
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (node && msg.html) {
+        if (node) {
             this._clearPendingStream(node);
-            node.innerHTML = msg.html;
+            node.innerHTML = msg.html || '';
             linkifyPaths(node);
             decorateCodeBlocks(node);
+            node.__btFinal = true;
+            return;
+        }
+        let tgt = msg.id
+            ? this.container.querySelector(
+                `.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`)
+            : null;
+        if (!tgt) {
+            const nodes = this.container.querySelectorAll('.bt-agent-msg');
+            tgt = nodes[nodes.length - 1];
+        }
+        if (tgt) {
+            this._clearPendingStream(tgt);
+            tgt.innerHTML = msg.html || '';
+            linkifyPaths(tgt);
+            decorateCodeBlocks(tgt);
+            tgt.__btFinal = true;
         }
     }
     onThoughtFinal(msg) {
@@ -1364,6 +1382,7 @@ class BonitoChat {
                 break;
             case 'agent':
                 div.className = 'bt-agent-msg';
+                if (msg.id) div.dataset.msgId = msg.id;
                 if (msg.streaming) {
                     const span = document.createElement('span');
                     span.className = 'bt-stream-text';

@@ -18,21 +18,39 @@ WorkerTransport() = WorkerTransport(Ref{Any}(nothing))
 function send(t::WorkerTransport, line::AbstractString)
     ws = t.ws[]
     ws === nothing && return nothing
-    # The worker session can end (ws write-closed) between a line being queued
-    # and delivered — e.g. a `session/cancel` notification arriving just after
-    # the agent's connection dropped ("ACP session ended"). A closed transport
-    # has nothing to deliver; the connection's death is detected on the recv
-    # side (returns ""), which tears down the read loop and fails any pending
-    # requests. So drop the write instead of throwing the bare HTTP
-    # `send() requires !(ws.writeclosed)` ArgumentError up through chat_dispatch!.
+    # FULLY closed transport (both halves): the worker session already ended —
+    # e.g. a `session/cancel` notification arriving just after the agent's
+    # connection dropped ("ACP session ended"). Teardown is already in motion
+    # (the recv side returns "" and `transport_eof` is true, which tears down the
+    # read loop and fails any pending requests), so there's nothing to deliver
+    # and nothing left to surface. Drop quietly rather than throwing the bare HTTP
+    # `send() requires !(ws.writeclosed)` ArgumentError. (`isclosed` is
+    # `readclosed && writeclosed` — a HALF-open write death does NOT match here;
+    # it falls through to the `send` below and is surfaced by the catch.)
     HTTP.WebSockets.isclosed(ws) && return nothing
     try
         HTTP.WebSockets.send(ws, rstrip(line, '\n'))
     catch e
-        # Race: write side closed between the isclosed check and the send.
+        # The write side closed AFTER the `isclosed` check above passed — a
+        # mid-write failure (HTTP's `send` throws `WebSocketError(1006, "websocket
+        # is closed")` on `ws.writeclosed`; a peer reset surfaces as `IOError`;
+        # `ArgumentError` is the older bare `!(ws.writeclosed)` guard). This is NOT
+        # the clean-shutdown case: a full `close(conn)` closes BOTH halves, so
+        # `isclosed(ws)` (readclosed && writeclosed) returns true at line 28 above
+        # and the write is dropped quietly BEFORE we ever reach this `send`. Only a
+        # HALF-open death (write dead, read possibly still blocked) lands here.
+        #
+        # Dropping this quietly would silently vanish an outbound frame — a
+        # `session/prompt` register a turn whose `updates`/`response` channels then
+        # wait forever for a reply the agent never got, hanging the turn until (if
+        # ever) the reader loop independently notices the read half died. Surface
+        # it instead: a torn-down write IS a dead session. `ConnectionClosed`
+        # propagates through `send_raw` → `prompt_updates`/`send_notification` up to
+        # the chat's `is_session_dead_error` path (which treats `ConnectionClosed`
+        # as dead), so the session is marked offline / torn down promptly rather
+        # than wedging.
         if e isa ArgumentError || e isa Base.IOError || e isa HTTP.WebSockets.WebSocketError
-            @debug "WorkerTransport.send: connection closed mid-write, dropping line" exception = e
-            return nothing
+            throw(ConnectionClosed("worker WS closed mid-write ($(typeof(e).name.name))"))
         end
         rethrow(e)
     end
