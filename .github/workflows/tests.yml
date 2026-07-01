@@ -189,9 +189,8 @@ jobs:
         # Run the suite's `@testitem` through runtests.jl (it owns the
         # SharedServer setup + ReTestItems harness); the bare `e2e/<suite>.jl`
         # is just the TestKit logic and isn't standalone-runnable. The arg is a
-        # name filter → `e2e:<suite>`. ONE worker = one dev_server (no fan-out).
-        env:
-          BT_TEST_NWORKERS: '1'
+        # name filter → `e2e:<suite>`. ONE worker = one dev_server (no fan-out),
+        # hardcoded in runtests.jl — no env knob.
         run: |
           timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '${{ matrix.suite }}'

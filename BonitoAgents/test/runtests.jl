@@ -7,8 +7,9 @@
 #
 # Subset selection via `Pkg.test(test_args=[...])`, matched against testitem
 # names: `["unit"]` (headless), `["e2e:media"]`, `["e2e"]`, etc. No args runs
-# everything (CI does this under xvfb). With `nworkers=4` at most four
-# dev_servers live at once, each soaking many e2e items to stress cleanup/leak.
+# everything (CI does this under xvfb). `nworkers` is hardcoded to 1 (not
+# configurable) — more than one dev_server at a time (each = electron + worker +
+# mock subprocesses) over-subscribes a normal box and fakes timing failures.
 #
 # Run locally via the system julia (the bundled Pkg mis-resolves the dev
 # `[sources]`):
@@ -39,5 +40,5 @@ const NAME = isempty(ARGS) ? nothing : Regex(join(ARGS, "|"))
 # deadlock, multi-pane selector leaks, SIGTERM-vs-load worker kill — found + fixed
 # once we stopped retrying). Don't add it back.
 ReTestItems.runtests(BonitoAgents;
-    nworkers = parse(Int, get(ENV, "BT_TEST_NWORKERS", "4")),
+    nworkers = 1,
     name = NAME)
