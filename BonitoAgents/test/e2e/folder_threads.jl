@@ -125,6 +125,30 @@ function run_suite(server)
                    document.body.innerText.indexOf('add tests for IO') !== -1"""; timeout = 5) == true
         end
 
+        @testset "a renamed chat's title shows in the discovered row" begin
+            # Regression: renaming a chat must reach the dashboard projects
+            # overview too. A (dismissed) project that resumes the 'Other'
+            # session pins a title; the discovered row must show THAT title —
+            # the same persisted `ProjectInfo.title` the sidebar/header read —
+            # not the first-prompt preview ("write the README").
+            BT = TK.BT
+            lock(state.lock) do
+                p = BT.ProjectInfo("renamed-other", "Other", wid,
+                                   "/work/Other", "/work/Other", BT.Dates.now())
+                p.resume_session_id = "cccc3333"
+                p.title = "Renamed Other Chat"
+                p.dismissed = true
+                state.projects[]["renamed-other"] = p
+            end
+            notify(state.projects)
+            TK.eval_js(server, "(() => { document.querySelectorAll('details.bt-group').forEach(g=>g.open=true); return true; })()")
+            @test TK.wait_for(server, "renamed title shown in discovered row",
+                "[...document.querySelectorAll('.bt-session-name-text')].some(e => (e.textContent||'').includes('Renamed Other Chat'))";
+                timeout = 10) == true
+            @test TK.eval_js(server,
+                "![...document.querySelectorAll('.bt-session-name-text')].some(e => (e.textContent||'').includes('write the README'))") == true
+        end
+
         @testset "switch to the active chat, then close it" begin
             # Click the running-chat row → main panel swaps to the chat.
             TK.eval_js(server,

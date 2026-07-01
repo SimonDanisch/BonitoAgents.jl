@@ -94,6 +94,7 @@ function serve(; host::String        = "0.0.0.0",
     state.base_url[] = rstrip(base_url, '/')
     add_install_routes!(srv, base_url, worker_secret)
     add_acp_log_routes!(srv, state)
+    add_download_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
 
     # The background-output poller is no longer a server-wide loop — it's
@@ -271,6 +272,65 @@ function acp_log_response(state::ServerState, project_id::AbstractString)
         ["Content-Type"  => "text/plain; charset=utf-8",
          "Cache-Control" => "no-cache"],
         body = read(path, String))
+end
+
+# /download/<pid>?path=<worker-abs-path> — stream a worker file back to the
+# browser as an attachment. The file tree's ⤓ button navigates here. The file
+# is fetched from the worker on demand (RemoteSync over the control WS), so it
+# works whether or not the project is synced to the server. The `path` MUST live
+# inside the project's worker tree — a normalized-prefix check blocks traversal /
+# arbitrary worker reads. The route regex captures only the pid; the path rides
+# in the query string (so slashes survive without extra encoding rules).
+const DOWNLOAD_ROUTE_RE = r"^/download/([A-Za-z0-9_-]+)"
+
+function add_download_routes!(srv::Bonito.Server, state::ServerState)
+    Bonito.route!(srv, DOWNLOAD_ROUTE_RE => function(context)
+        pid    = String(context.match.captures[1])
+        params = HTTP.queryparams(HTTP.URI(context.request.target))
+        download_response(state, pid, String(get(params, "path", "")))
+    end)
+end
+
+# Strip anything that could break (or smuggle a header into) the
+# Content-Disposition filename. Keep it plain.
+download_filename(name::AbstractString) =
+    replace(String(name), r"[\"\r\n\\/]" => "_")
+
+# Plain function (no live HTTP server needed) so tests can call it directly.
+function download_response(state::ServerState, project_id::AbstractString,
+                           path::AbstractString)
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid project id\n")
+    proj = get(state.projects[], project_id, nothing)
+    proj === nothing &&
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "unknown project '$project_id'\n")
+    isempty(path) &&
+        return HTTP.Response(400, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "missing ?path\n")
+    # Security: the requested path must resolve INSIDE the project's worker tree.
+    wroot = normpath(String(proj.worker_path))
+    npath = normpath(String(path))
+    (npath == wroot || startswith(npath, wroot * "/")) ||
+        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "path is outside the project\n")
+    tmp = tempname()
+    try
+        fetch_file_from_worker(state, proj.worker_id, npath, tmp; handoff_timeout = 120.0)
+        data = read(tmp)
+        return HTTP.Response(200,
+            ["Content-Type"        => "application/octet-stream",
+             "Content-Disposition" => "attachment; filename=\"$(download_filename(basename(npath)))\"",
+             "Cache-Control"       => "no-cache"],
+            body = data)
+    catch e
+        @warn "download: fetch from worker failed" project_id path exception = (e, catch_backtrace())
+        return HTTP.Response(502, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "could not fetch file from worker\n")
+    finally
+        rm(tmp; force = true)
+    end
 end
 
 esc_html(s::AbstractString) = replace(s,

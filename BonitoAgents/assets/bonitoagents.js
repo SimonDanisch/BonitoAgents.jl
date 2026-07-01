@@ -642,6 +642,9 @@ class BonitoChat {
                 // pop-in). Re-anchor.
                 this._queueScrollToBottom();
             }
+            // The jump-to-bottom pill tracks the read position directly: shown
+            // whenever we're off the bottom (plain), glowing only when unread.
+            this._updateScrollAffordance(atBot);
             this.refresh();
         };
         container.addEventListener('scroll', this._onScroll, { passive: true });
@@ -1520,6 +1523,7 @@ class BonitoChat {
             this._clearPendingStream(node);
             node.innerHTML = msg.html;
             linkifyPaths(node);
+            decorateCodeBlocks(node);
         }
     }
 
@@ -1622,11 +1626,22 @@ class BonitoChat {
         if (this.container.querySelector(
                 `.bt-permission-card[data-perm-key="${CSS.escape(msg.key)}"]`)) return;
         const card = document.createElement('div');
-        card.className = 'bt-permission-card';
+        // Keep `bt-permission-card` for the dedup selector + shared chrome; add
+        // `bt-question-card` so a question reads distinctly from a permission ask.
+        card.className = 'bt-permission-card bt-question-card';
         card.dataset.permKey = msg.key;
         const q = document.createElement('div');
-        q.className = 'bt-permission-question';
-        q.textContent = msg.message || 'The agent has a question';
+        q.className = 'bt-permission-question bt-question-prompt';
+        // A small "?" badge gives the card a clear "the agent is asking you"
+        // identity instead of looking like a generic panel.
+        const icon = document.createElement('span');
+        icon.className = 'bt-question-icon';
+        icon.textContent = '?';
+        icon.setAttribute('aria-hidden', 'true');
+        const qtext = document.createElement('span');
+        qtext.textContent = msg.message || 'The agent has a question';
+        q.appendChild(icon);
+        q.appendChild(qtext);
         card.appendChild(q);
 
         const selects = msg.fields.filter(f => f.kind === 'select' || f.kind === 'multiselect');
@@ -2001,6 +2016,7 @@ class BonitoChat {
                 } else {
                     div.innerHTML = msg.html || '';
                     linkifyPaths(div);
+                    decorateCodeBlocks(div);
                 }
                 break;
             case 'thought': {
@@ -3158,13 +3174,41 @@ class BonitoChat {
         this._showNewMessagePill();
     }
 
+    // The scroll-to-bottom affordance is visible whenever the user is NOT at the
+    // last message — not only when new content arrived. It GLOWS and reads "New
+    // messages" when there's unread content (a real nudge); otherwise it's the
+    // same pill without the glow, a plain "Move to bottom" jump button. Driven
+    // from the scroll handler (atBottom) so it tracks the read position exactly.
+    _updateScrollAffordance(atBot) {
+        if (atBot) {
+            this.unreadCount = 0;
+            this._hideNewMessagePill();
+        } else {
+            this._showNewMessagePill();
+        }
+    }
+
     _showNewMessagePill() {
         if (!this._pillEl) this._createNewMessagePill();
-        if (this._pillEl) this._pillEl.classList.add('bt-new-msg-pill-visible');
+        if (this._pillEl) {
+            this._pillEl.classList.add('bt-new-msg-pill-visible');
+            this._refreshPillContent();
+        }
     }
 
     _hideNewMessagePill() {
         if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
+    }
+
+    // Glow + "New messages" only while there's unread content; otherwise the
+    // plain "Move to bottom" form (same popup, no glow).
+    _refreshPillContent() {
+        if (!this._pillEl) return;
+        const hasUnread = this.unreadCount > 0;
+        this._pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        if (this._pillLabelEl) {
+            this._pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
+        }
     }
 
     // Pill lives inside .bt-app, absolutely positioned above the input
@@ -3177,8 +3221,14 @@ class BonitoChat {
         const pill = document.createElement('button');
         pill.type = 'button';
         pill.className = 'bt-new-msg-pill';
-        pill.innerHTML = '<span class="bt-new-msg-pill-arrow">↓</span>' +
-                          '<span>New messages</span>';
+        const arrow = document.createElement('span');
+        arrow.className = 'bt-new-msg-pill-arrow';
+        arrow.textContent = '↓';
+        const label = document.createElement('span');
+        label.className = 'bt-new-msg-pill-label';
+        label.textContent = 'Move to bottom';
+        pill.appendChild(arrow);
+        pill.appendChild(label);
         pill.addEventListener('click', (e) => {
             e.preventDefault();
             this.setFollowMode(true);
@@ -3186,6 +3236,7 @@ class BonitoChat {
         });
         app.appendChild(pill);
         this._pillEl = pill;
+        this._pillLabelEl = label;
     }
 }
 
@@ -3194,6 +3245,51 @@ class BonitoChat {
 // and not a URL. Bare names like `foo.jl` stay unlinked on purpose (too many
 // false positives: package names, "Project.toml" as a concept, …).
 const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+
+// Give every fenced code block (<pre>) in a rendered message a hover action row
+// (copy · download), Signal-style. The <pre> is wrapped in a positioned
+// `.bt-code-wrap` so the buttons can float top-right without disturbing layout.
+// Idempotent: re-running on a re-rendered message (streaming) won't double-wrap.
+function decorateCodeBlocks(rootEl) {
+    rootEl.querySelectorAll('pre').forEach((pre) => {
+        if (pre.dataset.btDecorated || pre.closest('.bt-code-wrap')) return;
+        pre.dataset.btDecorated = '1';
+        const wrap = document.createElement('div');
+        wrap.className = 'bt-code-wrap';
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
+        const codeText = () => (pre.innerText || '');
+        const mk = (cls, glyph, title, onClick) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'bt-code-action ' + cls;
+            b.title = title;
+            b.textContent = glyph;
+            b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); onClick(b); });
+            return b;
+        };
+        const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b) => {
+            if (!navigator.clipboard) return;
+            navigator.clipboard.writeText(codeText()).then(() => {
+                b.textContent = '✓';
+                setTimeout(() => { b.textContent = '⧉'; }, 1200);
+            }).catch(() => {});
+        });
+        const dlBtn = mk('bt-code-download', '⤓', 'Download', () => {
+            const blob = new Blob([codeText()], { type: 'text/plain' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'snippet.txt';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        });
+        const actions = document.createElement('div');
+        actions.className = 'bt-code-actions';
+        actions.appendChild(copyBtn);
+        actions.appendChild(dlBtn);
+        wrap.appendChild(actions);
+    });
+}
 
 // Turn path-looking inline `code` spans inside an agent message into
 // clickable path links (the delegated container listener opens them in the

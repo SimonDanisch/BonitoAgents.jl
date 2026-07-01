@@ -13,7 +13,19 @@ mutable struct SessionRow
     meta        :: String
     running     :: Bool     # confirmed alive via OS-level pid check
     row_key     :: String   # "path|session_id"
+    # Display title shown for the row. Defaults to the first-prompt preview, but
+    # `resolve_session_title!` overrides it with the renamed `ProjectInfo.title`
+    # when a project resumes THIS session id — so a user-renamed chat keeps that
+    # title here too (the same persisted source the sidebar/header read), live
+    # on rename and across worker/server restarts. Reactive so the cached row's
+    # DOM updates in place when the title changes.
+    title_obs   :: Observable{String}
 end
+
+# The preview-derived fallback title — what we show when no renamed project
+# pins a different one.
+session_preview_title(preview::AbstractString) =
+    isempty(preview) ? "Untitled session" : String(preview)
 
 function SessionRow(c::WorkerCard, r::AbstractDict)
     path       = String(get(r, "path", ""))
@@ -36,7 +48,26 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     # falls through silently.
     running = get(r, "running", nothing) === true
     row_key = string(path, '|', session_id)
-    SessionRow(c.worker_id, path, name, session_id, preview, meta, running, row_key)
+    SessionRow(c.worker_id, path, name, session_id, preview, meta, running, row_key,
+               Observable(session_preview_title(preview)))
+end
+
+# Point the row's display title at the renamed project's title when one resumes
+# this exact session id; otherwise fall back to the first-prompt preview. Set
+# only on change so we don't churn the bound observable on every rescan.
+function resolve_session_title!(sr::SessionRow, projects::AbstractDict)
+    want = session_preview_title(sr.preview)
+    if !isempty(sr.session_id)
+        for p in values(projects)
+            if p.resume_session_id == sr.session_id && p.title !== nothing &&
+               !isempty(strip(String(p.title)))
+                want = String(p.title)
+                break
+            end
+        end
+    end
+    sr.title_obs[] == want || (sr.title_obs[] = want)
+    return sr
 end
 
 Base.hash(s::SessionRow, h::UInt) = hash(s.row_key, hash(:SessionRow, h))
@@ -47,11 +78,10 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
     running_pill = s.running ?
         DOM.span("running"; class = "bt-pill bt-pill-online") :
         DOM.span()
-    # The folder is already in the group header, so the row LEADS with what the
-    # user actually typed (the cleaned first prompt) instead of repeating the
-    # folder name. Falls back to a neutral label when no prose was recoverable
-    # (e.g. a session whose only messages were tooling noise).
-    title = isempty(s.preview) ? "Untitled session" : s.preview
+    # The folder is already in the group header, so the row LEADS with the
+    # chat's title: the renamed `ProjectInfo.title` when one pins this session
+    # (resolved into `title_obs`), else the cleaned first prompt the user typed,
+    # else a neutral fallback. Reactive so a rename updates the row in place.
     # No inline `onclick` per row — that would queue N jscall-id-keyed setup
     # messages per dashboard render. The delegated listener at the panel level
     # (`render_discover_panel`) reads these `data-bt-*` attrs and notifies.
@@ -59,7 +89,7 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
         DOM.div(
             DOM.div(
                 # Wrap the title in a span so it ellipsizes when the row is narrow.
-                DOM.span(title; class = "bt-session-name-text"),
+                DOM.span(s.title_obs; class = "bt-session-name-text"),
                 running_pill;
                 class = "bt-session-name"),
             isempty(s.meta) ? DOM.span() : DOM.div(s.meta; class = "bt-session-meta");

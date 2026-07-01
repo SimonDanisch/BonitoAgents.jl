@@ -271,6 +271,17 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-header-sync:hover",
         "background" => "var(--bt-surface-2)"),
+    # Compact — same control-strip chrome as Sync/Restart; label only flips
+    # between "Compact" and a short status, so no width cap needed.
+    CSS(".bt-header-compact",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px", "cursor" => "pointer",
+        "white-space" => "nowrap", "transition" => "background 80ms"),
+    CSS(".bt-header-compact:hover", "background" => "var(--bt-surface-2)"),
     # Header-level restart: visually quieter than Sync (no wide stable
     # min-width — its label only flips between "Restart" and
     # "Restarting…", neither long), but the same chrome so the row reads
@@ -1002,14 +1013,34 @@ const ChatStyles = Bonito.Styles(
     # of the media and closes on backdrop click or Esc.
     CSS(".bt-media-wrap",
         "position" => "relative", "display" => "inline-block", "max-width" => "100%"),
-    CSS(".bt-media-enlarge",
+    # Hover action row (enlarge · copy · download), top-right of the media.
+    CSS(".bt-media-actions",
         "position" => "absolute", "top" => "6px", "right" => "6px",
+        "display" => "flex", "gap" => "4px",
+        "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-media-wrap:hover .bt-media-actions", "opacity" => "1"),
+    CSS(".bt-media-action",
         "appearance" => "none", "border" => "none",
         "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
         "font-size" => "14px", "line-height" => "1",
         "padding" => "4px 7px", "border-radius" => "6px",
-        "cursor" => "zoom-in", "opacity" => "0", "transition" => "opacity 80ms"),
-    CSS(".bt-media-wrap:hover .bt-media-enlarge", "opacity" => "1"),
+        "cursor" => "pointer"),
+    CSS(".bt-media-action:hover", "background" => "rgba(0,0,0,0.8)"),
+    CSS(".bt-media-enlarge", "cursor" => "zoom-in"),
+
+    # Code-block hover actions (copy · download), top-right of a fenced <pre>.
+    CSS(".bt-code-wrap", "position" => "relative"),
+    CSS(".bt-code-actions",
+        "position" => "absolute", "top" => "6px", "right" => "6px",
+        "display" => "flex", "gap" => "4px",
+        "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-code-wrap:hover .bt-code-actions", "opacity" => "1"),
+    CSS(".bt-code-action",
+        "appearance" => "none", "border" => "none",
+        "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
+        "font-size" => "13px", "line-height" => "1",
+        "padding" => "3px 6px", "border-radius" => "5px", "cursor" => "pointer"),
+    CSS(".bt-code-action:hover", "background" => "rgba(0,0,0,0.8)"),
     CSS(".bt-lightbox-overlay",
         "position" => "fixed", "inset" => "0", "z-index" => "9999",
         "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
@@ -1404,6 +1435,19 @@ const ChatStyles = Bonito.Styles(
         "padding-top" => "8px"),
     CSS(".bt-question-skip",
         "color" => "var(--bt-text-muted)"),
+    # Question identity: a round accent "?" badge beside the prompt so an
+    # AskUserQuestion reads as the agent asking YOU (vs a generic panel /
+    # permission ask). The prompt row aligns the badge to the first text line.
+    CSS(".bt-question-prompt",
+        "display" => "flex", "align-items" => "flex-start", "gap" => "9px"),
+    CSS(".bt-question-icon",
+        "flex" => "0 0 auto",
+        "width" => "22px", "height" => "22px",
+        "display" => "inline-flex", "align-items" => "center", "justify-content" => "center",
+        "border-radius" => "50%",
+        "background" => "var(--bt-accent)", "color" => "#fff",
+        "font-size" => "13px", "font-weight" => "700", "line-height" => "1",
+        "margin-top" => "1px"),
 
     # ── New-messages pill ────────────────────────────────────────────────────
     # Floats above the input area when followMode is off and new content
@@ -1428,10 +1472,13 @@ const ChatStyles = Bonito.Styles(
         "font-family" => "inherit", "font-size" => "13px",
         "font-weight" => "500",
         "cursor" => "pointer",
-        "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)",
-        "animation" => "bt-new-msg-pulse 2.5s ease-in-out infinite"),
+        "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)"),
     CSS(".bt-new-msg-pill.bt-new-msg-pill-visible",
         "display" => "inline-flex"),
+    # The pulse glow is a NEW-MESSAGES nudge only; the plain "Move to bottom"
+    # form (shown whenever scrolled away from the last message) stays static.
+    CSS(".bt-new-msg-pill.bt-new-msg-pill-glow",
+        "animation" => "bt-new-msg-pulse 2.5s ease-in-out infinite"),
     CSS(".bt-new-msg-pill:hover",
         "filter" => "brightness(1.08)"),
     CSS(".bt-new-msg-pill:active",

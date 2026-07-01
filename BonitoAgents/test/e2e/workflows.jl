@@ -133,17 +133,21 @@ function run_suite(server)
             @test TK.wait_for(server, "provider = Mock Agent 2",
                 "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent 2'; })()";
                 timeout = 10) == true
+            # Wait for the switch to FULLY settle BEFORE sending a turn: the header
+            # status clears to "" (from "Switching…") only after `switch_provider!`
+            # finishes the restart and the new session is alive — never "switch
+            # failed". Sending a turn before this races the half-torn-down session
+            # (the new backend spawn) and the turn errors ("connection torn down").
+            @test TK.wait_for(server, "switch settled (status cleared, not failed)",
+                "(() => { const s=document.querySelector('.bt-header-status'); return !!s && (s.innerText||'').trim() === ''; })()";
+                timeout = 30) == true
             # The real proof the switch SUCCEEDED: the new backend is LIVE and
             # answers a fresh turn. A failed switch leaves the old session dead and
             # no reply ever lands.
             turn(server, "after the switch")
             @test TK.wait_for(server, "reply from switched backend",
                 "[...document.querySelectorAll('.bt-agent-msg')].some(b => (b.innerText||'').includes('Echo: after the switch'))";
-                timeout = 20) == true
-            # And the transient status settled to "" (success), never "switch failed".
-            @test TK.wait_for(server, "switch status cleared",
-                "(() => { const s=document.querySelector('.bt-header-status'); return !!s && (s.innerText||'').trim() === ''; })()";
-                timeout = 10) == true
+                timeout = 30) == true
         end
     end
     return server

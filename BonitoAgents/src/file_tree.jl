@@ -90,7 +90,8 @@ end
 function tree_file_row(path, name, depth)
     DOM.div(
         DOM.span(""; class = "bt-tree-arrow"),
-        DOM.span(name; class = "bt-tree-label", title = name);
+        DOM.span(name; class = "bt-tree-label", title = name),
+        DOM.span("⤓"; class = "bt-tree-download", title = "Download to this computer");
         class = "bt-tree-row bt-tree-file",
         style = "padding-left:$(6 + depth * 12)px",
         dataPath = path, dataDir = "false")
@@ -102,7 +103,8 @@ function tree_search_row(worker_root, rel)
     dir  = dirname(rel)
     DOM.div(
         DOM.span(basename(rel); class = "bt-tree-label"),
-        isempty(dir) ? DOM.span("") : DOM.span(dir; class = "bt-tree-relpath");
+        isempty(dir) ? DOM.span("") : DOM.span(dir; class = "bt-tree-relpath"),
+        DOM.span("⤓"; class = "bt-tree-download", title = "Download to this computer");
         class = "bt-tree-row bt-tree-file",
         style = "padding-left:6px",
         dataPath = full, dataDir = "false", title = rel)
@@ -198,6 +200,7 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
         end
     end
 
+
     # First search keystroke pulls the index (if the tree was never expanded).
     on(session, search) do q
         isempty(strip(q)) || index_ready[] || load_index!()
@@ -252,10 +255,22 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
     # One delegated click listener. `stopPropagation` keeps tree clicks from
     # bubbling to the sidebar's aside handler (which would navigate current_view).
     Bonito.onload(session, root_node, js"""(root) => {
+        const pid = $(t.project_id);
         root.addEventListener('click', e => {
             e.stopPropagation();
             const row = e.target.closest('.bt-tree-row');
             if (!row) return;
+            // The ⤓ download affordance takes precedence over opening the file:
+            // hit the server's /download route, which streams the worker file
+            // back as an attachment (Content-Disposition). No eval bridge needed.
+            if (e.target.closest('.bt-tree-download')) {
+                const url = '/download/' + encodeURIComponent(pid) +
+                            '?path=' + encodeURIComponent(row.dataset.path || '');
+                const a = document.createElement('a');
+                a.href = url; a.download = '';
+                document.body.appendChild(a); a.click(); a.remove();
+                return;
+            }
             $(clicked).notify((row.dataset.dir || 'false') + '\t' + (row.dataset.path || ''));
         });
     }""")

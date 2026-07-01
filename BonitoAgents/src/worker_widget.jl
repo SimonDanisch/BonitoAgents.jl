@@ -367,7 +367,10 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         get!(session_rows, sr.row_key, sr)
     end
 
-    groups_obs = map(results_obs, imported_sids) do results, imported
+    # `state.projects` is a dependency too: a chat rename pins a new title on the
+    # matching project, and `resolve_session_title!` below reflects it onto the
+    # discovered row (live, and across restarts since the title is persisted).
+    groups_obs = map(results_obs, imported_sids, c.state.projects) do results, imported, projects
         by_path  = Dict{String, Vector{Any}}()
         latest_by_path = Dict{String, Float64}()
         for r in results
@@ -391,7 +394,10 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         for (p, rs) in by_path
             sort!(rs; by = r -> -Float64(get(r, "last_used", 0.0)))
             rows = SessionRow[get_session_row(r) for r in rs]
-            for sr in rows; push!(seen_row_keys, sr.row_key); end
+            for sr in rows
+                resolve_session_title!(sr, projects)   # renamed title pins here too
+                push!(seen_row_keys, sr.row_key)
+            end
             g = get!(session_groups, p) do
                 SessionGroup(p, basename(p),
                              Observable(rows), Observable(""),

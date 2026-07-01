@@ -701,6 +701,14 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-tree-relpath",
         "margin-left" => "6px", "font-size" => "11px", "color" => "var(--bt-text-muted)",
         "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    # ⤓ download affordance: right-anchored, revealed on row hover.
+    CSS(".bt-tree-download",
+        "flex" => "0 0 auto", "margin-left" => "auto",
+        "padding" => "0 4px", "font-size" => "12px", "line-height" => "1",
+        "color" => "var(--bt-text-muted)",
+        "opacity" => "0", "transition" => "opacity 80ms, color 80ms"),
+    CSS(".bt-tree-row:hover .bt-tree-download", "opacity" => "1"),
+    CSS(".bt-tree-download:hover", "color" => "var(--bt-accent)"),
     CSS(".bt-tree-empty",
         "padding" => "4px 12px", "font-size" => "11px", "color" => "var(--bt-text-muted)"),
     # No trees / hint in the collapsed icon rail.

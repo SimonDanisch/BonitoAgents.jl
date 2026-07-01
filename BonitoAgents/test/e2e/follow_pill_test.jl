@@ -15,9 +15,10 @@
 #   1. followMode starts true; no pill, unread 0.
 #   2. streaming while pinned at the bottom keeps followMode true, no pill.
 #   3. user scroll-to-top (wheel + scrollTop=0 + scroll event) → followMode
-#      false; pill still hidden (nothing unread yet).
-#   4. new chunks while disengaged → pill visible + unreadCount > 0, and the
-#      chunks DON'T yank follow back on.
+#      false; the pill shows as the PLAIN "Move to bottom" jump button (visible
+#      whenever off-bottom) but NOT glowing (nothing unread yet).
+#   4. new chunks while disengaged → pill GLOWS "New messages" + unreadCount > 0,
+#      and the chunks DON'T yank follow back on.
 #   5. clicking the pill → followMode true, pill hidden, unread cleared, viewport
 #      snapped to the bottom (scroll gap < 50).
 #   6. scrolling manually back to the very bottom auto-re-engages followMode.
@@ -63,12 +64,24 @@
     s.agent_fn[] = follow_agent
 
     # ── browser-state probes (read the UI's own client state) ────────────────
-    follow_mode() = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.followMode")
-    unread()      = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.unreadCount")
-    pill_visible() = TK.eval_js(s, """(() => {
-        const el = document.querySelector('.bt-new-msg-pill');
-        return el ? el.classList.contains('bt-new-msg-pill-visible') : false;
-    })()""")
+    # Every chat pane — including PRIOR soak-server chats kept hidden in the DOM —
+    # has its own `.bt-messages` and `.bt-new-msg-pill`. A global `querySelector`
+    # can hit a STALE hidden pane's element (this raced the pill asserts: the
+    # active pane's `unreadCount` said >0 while a different pane's pill said no
+    # glow). Scope every probe to the VISIBLE pane: `.bt-new-msg-pill` is
+    # `display:none` until `-visible`, and a backgrounded pane is `display:none`,
+    # so `offsetParent !== null` uniquely selects the active, shown element.
+    vis_msgs = "[...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent !== null)"
+    vis_pill = "[...document.querySelectorAll('.bt-new-msg-pill')].find(e => e.offsetParent !== null)"
+    follow_mode() = TK.eval_js(s, "(() => { const c = $vis_msgs; return c ? c.__bt_chat.followMode : null; })()")
+    unread()      = TK.eval_js(s, "(() => { const c = $vis_msgs; return c ? c.__bt_chat.unreadCount : 0; })()")
+    # A pill found via `offsetParent` is by definition displayed ⇒ `-visible`.
+    pill_visible() = TK.eval_js(s, "(() => { const el = $vis_pill; return !!el && el.classList.contains('bt-new-msg-pill-visible'); })()")
+    # The pill is visible whenever NOT at the bottom; it only GLOWS (the
+    # "New messages" nudge) when there's unread content. Off-bottom with nothing
+    # unread it's the plain "Move to bottom" jump button.
+    pill_glowing() = TK.eval_js(s, "(() => { const el = $vis_pill; return !!el && el.classList.contains('bt-new-msg-pill-glow'); })()")
+    pill_text() = TK.eval_js(s, "(() => { const el = $vis_pill; return el ? (el.textContent || '') : ''; })()")
 
     # Drive the scroll the way the legacy test did: a `wheel` event arms
     # `_pendingUserScroll`, then setting scrollTop + firing `scroll` makes the
@@ -122,12 +135,19 @@
             @test pill_visible() == false
         end
 
-        # ── 3. User scrolls to top → followMode off, pill stays hidden ──────
-        @testset "scroll-to-top disengages follow mode" begin
+        # ── 3. User scrolls to top → followMode off; a PLAIN jump pill appears ──
+        @testset "scroll-to-top disengages follow mode; plain jump pill shows" begin
             scroll_up_as_user!()
             @test follow_mode() == false
-            # Nothing new has arrived yet, so the pill is still hidden.
-            @test pill_visible() == false
+            # The pill is visible whenever we're off the bottom — but with nothing
+            # unread yet it's the plain "Move to bottom" form, NOT the glowing
+            # "New messages" nudge. Poll for visibility (the scroll→pill update can
+            # lag a fixed sleep when the shared browser is loaded) THEN read the
+            # plain-state sub-fields, which are set together with visibility.
+            @test TK.wait_for(s, "plain jump pill visible",
+                "(() => { const el = $vis_pill; return !!el; })()"; timeout = 6) == true
+            @test pill_glowing() == false
+            @test occursin("Move to bottom", String(pill_text()))
         end
 
         # ── 4. New chunks while disengaged → pill visible, unread > 0 ────────
@@ -137,25 +157,27 @@
             # (the user's own send doesn't move us — followMode is already off).
             TK.send_message(s, "burst while away")
             scroll_up_as_user!()       # ensure we're parked at the top as it streams
-            # Pill must surface once the held-back chunks arrive.
-            @test TK.wait_for(s, "pill visible",
-                "document.querySelector('.bt-new-msg-pill.bt-new-msg-pill-visible') !== null"; timeout = 6) == true
+            # Unread content → the pill GLOWS and reads "New messages". Poll for the
+            # GLOW class specifically (not just visibility): the unread registration
+            # that adds the glow lands a beat after the pill first becomes visible,
+            # so gating on `-visible` alone races the glow/text reads below.
+            @test TK.wait_for(s, "pill glowing (New messages)",
+                "(() => { const el = $vis_pill; return !!el && el.classList.contains('bt-new-msg-pill-glow'); })()"; timeout = 6) == true
             # The chunks didn't yank us back into follow mode...
             @test follow_mode() == false
             # ...and unread counted them.
             @test Int(unread()) > 0
+            @test pill_glowing() == true
+            @test occursin("New messages", String(pill_text()))
         end
 
         # ── 5. Click pill → followMode on, scroll to bottom, pill hides ─────
         @testset "clicking the pill re-engages, hides pill, jumps to bottom" begin
-            TK.eval_js(s, "document.querySelector('.bt-new-msg-pill.bt-new-msg-pill-visible').click()")
+            TK.eval_js(s, "(() => { const el = $vis_pill; el && el.click(); })()")
             @test TK.wait_for(s, "followMode re-engaged",
                 "document.querySelector('.bt-messages').__bt_chat.followMode === true"; timeout = 4) == true
             @test TK.wait_for(s, "pill hidden",
-                """(() => {
-                    const el = document.querySelector('.bt-new-msg-pill');
-                    return !el || !el.classList.contains('bt-new-msg-pill-visible');
-                })()"""; timeout = 4) == true
+                "(() => { return !($vis_pill); })()"; timeout = 4) == true
             @test Int(unread()) == 0
             # Scroll should settle to the bottom (rAF can be throttled offscreen,
             # so poll up to a couple seconds).
@@ -211,10 +233,12 @@
             @test follow_mode() == false
             scroll_top_before = TK.eval_js(s, "document.querySelector('.bt-messages').scrollTop")
             TK.send_message(s, "stay where I am")
-            sleep(0.8)
+            # The user's own send registers as unread → the pill stays visible.
+            # Poll for it (the unread→pill update can lag a fixed sleep when the
+            # shared browser is loaded — this raced intermittently as a bare sleep).
+            @test TK.wait_for(s, "pill stays visible after scrollback send",
+                "(() => { const el = $vis_pill; return !!el; })()"; timeout = 6) == true
             @test follow_mode() == false
-            # The user's own send registered as unread → pill stays visible.
-            @test pill_visible() == true
             # ScrollTop shouldn't have jumped to the bottom (generous tolerance
             # for any scroll-anchoring shift as new bottom nodes get added).
             scroll_top_after = TK.eval_js(s, "document.querySelector('.bt-messages').scrollTop")

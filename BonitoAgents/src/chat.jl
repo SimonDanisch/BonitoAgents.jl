@@ -130,6 +130,22 @@ mutable struct ChatModel
     # guard in `restart_chat_session!`.
     turns_active::Ref{Int}
 
+    # Authoritative live-tool counters (shared, like `turns_active`). They
+    # replace the two O(n) `msgs_store` scans `update_busy!` used to run:
+    #   • `live_fg_tools` — LIVE FOREGROUND tools: any `is_live` ToolMsg that is
+    #     NOT a running background bash (mirrors the old `fg_live` scan).
+    #   • `live_bg_tools` — LIVE BACKGROUND shells: a `BashToolMsg` with
+    #     `bg_running` (mirrors the old `bg_running` scan).
+    # Maintained at every tool live→closed / open→live transition via
+    # `sync_tool_liveness!`, which reconciles ONE tool's contribution against its
+    # last-recorded class in `tool_live` (delta-based, so double-calls are safe).
+    live_fg_tools::Ref{Int}
+    live_bg_tools::Ref{Int}
+    # Per-tool last-recorded liveness class (id => 0 none / 1 fg / 2 bg), the
+    # bookkeeping `sync_tool_liveness!` diffs against so each counter moves
+    # exactly once per real transition. Guarded by the shared `lock`.
+    tool_live::Dict{String,Int}
+
     # `time()` of the last inbound stream activity (shared). With a live
     # background shell the SDK holds the prompt open even after the agent
     # goes idle (validated against the real agent: no idle event, no
@@ -215,6 +231,9 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(TaskbarItem[]),  # taskbar_items (pin-board state)
         Ref(0),                     # turn_seq
         Ref(0),                     # turns_active
+        Ref(0),                     # live_fg_tools
+        Ref(0),                     # live_bg_tools
+        Dict{String,Int}(),         # tool_live (id => last-recorded class)
         Ref(0.0),                   # last_stream_at
         Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
         Ref(false),                 # taskbar_clock_on
@@ -275,6 +294,9 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.taskbar_items),   # per-tab TaskBar bridge
             m.turn_seq,                # shared counter
             m.turns_active,            # shared counter
+            m.live_fg_tools,           # shared counter (authoritative busy input)
+            m.live_bg_tools,           # shared counter (authoritative busy input)
+            m.tool_live,               # shared bookkeeping (one class map per chat)
             m.last_stream_at,          # shared timestamp
             map(identity, session, m.taskbar_clock),   # per-tab clock bridge
             m.taskbar_clock_on,        # shared guard
@@ -614,6 +636,47 @@ is_turn_orphan(m::TodoListMsg) = is_live(m)
 # poller settle it.
 is_turn_orphan(::ChatMsg)     = false
 
+# ── Authoritative live-tool counters ────────────────────────────────────────
+# The busy spinner's "is any real work still live?" question used to be answered
+# by two O(n) walks over `msgs_store` inside `update_busy!`. Those walks are
+# replaced by two shared counters (`live_fg_tools` / `live_bg_tools`) kept in
+# sync at the tool lifecycle edges. `tool_liveness_class` is the SINGLE source of
+# truth for a tool's contribution; it mirrors the old scan's classification
+# exactly:
+#   0 = none  — not live (finished / never-live / terminal status)
+#   1 = fg    — live and NOT a running background shell (the `fg_live` scan)
+#   2 = bg    — a running background bash (the `bg_running` scan)
+# A running background bash is class 2 (never double-counted as fg); every other
+# live tool — including a not-yet-backgrounded bash and a live background Task —
+# is class 1, exactly as the scan counted them (`!(m isa BashToolMsg && bg_running)`).
+tool_liveness_class(m::ToolMsg) =
+    (m isa BashToolMsg && m.bg_running) ? 2 : (is_live(m) ? 1 : 0)
+
+# Reconcile ONE tool's contribution to the counters against its last-recorded
+# class in `tool_live`. Delta-based, so calling it repeatedly (or after the tool
+# already left live) is a no-op — the "guard against double-dec" the design
+# calls for is structural: a class only moves the counters when it actually
+# changes. Called at EVERY site that can flip a tool's `status` / `bg_running` /
+# `finished_at` (creation, per-snap updates, close, bg finalize, orphan sweep,
+# per-tool stop). Runs under the shared lock (counters + dict are shared state).
+function sync_tool_liveness!(chat::ChatModel, m::ToolMsg)
+    s = shared(chat)
+    lock(s.lock) do
+        new = tool_liveness_class(m)
+        old = get(s.tool_live, m.id, 0)
+        old == new && return nothing
+        # Leave the old class.
+        old == 1 && (s.live_fg_tools[] -= 1)
+        old == 2 && (s.live_bg_tools[] -= 1)
+        # Enter the new class.
+        new == 1 && (s.live_fg_tools[] += 1)
+        new == 2 && (s.live_bg_tools[] += 1)
+        new == 0 ? delete!(s.tool_live, m.id) : (s.tool_live[m.id] = new)
+        return nothing
+    end
+    return nothing
+end
+
 # A background-or-streamy task that deserves a taskbar slot. Default false;
 # Bash with `run_in_background`, Task/Agent with `run_in_background`, and
 # TodoListMsg opt in.
@@ -727,7 +790,7 @@ const TOOL_ICONS = Dict(
     "delete" => "🗑️",
     "move" => "📦",
     "search" => "🔍",
-    "execute" => "▶",
+    "execute" => "⌨️",
     "think" => "💭",
     "fetch" => "🌐",
     "other" => "⚙",
@@ -1287,8 +1350,11 @@ function render_eval_body(content)
         elseif c isa DiffContent
             push!(rest, render_diff_block(c))
         elseif c isa ImageContent
-            push!(rest, DOM.img(src="data:$(c.mime_type);base64,$(c.data)",
-                style=Styles("max-width" => "100%")))
+            # Eval output images (the MCP renders 2-D arrays as PNG) get the same
+            # click-to-enlarge lightbox as Read / bt_show images — previously this
+            # was a bare <img> with no enlarge affordance.
+            push!(rest, media_element("data:$(c.mime_type);base64,$(c.data)",
+                c.mime_type, false))
         end
     end
     code === nothing && return nothing   # not eval-shaped — let caller handle it
@@ -1614,21 +1680,72 @@ event => {
 }
 """
 
+# Copy the image to the clipboard (Signal-style). PNG copies cleanly; other
+# types are re-encoded to PNG via a canvas so `ClipboardItem` accepts them.
+const COPY_MEDIA_JS = js"""
+event => {
+    event.stopPropagation();
+    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const media = wrap && wrap.querySelector('.bt-media');
+    const srcEl = media && (media.tagName === 'VIDEO' ? media.querySelector('source') : media);
+    const src = srcEl && (srcEl.currentSrc || srcEl.src || srcEl.getAttribute('src'));
+    if (!src || !navigator.clipboard || !window.ClipboardItem) return;
+    fetch(src).then(r => r.blob()).then(blob => {
+        if (blob.type === 'image/png') {
+            return navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
+        }
+        return createImageBitmap(blob).then(bmp => {
+            const cv = document.createElement('canvas');
+            cv.width = bmp.width; cv.height = bmp.height;
+            cv.getContext('2d').drawImage(bmp, 0, 0);
+            return new Promise(res => cv.toBlob(res, 'image/png'));
+        }).then(png => navigator.clipboard.write([new ClipboardItem({'image/png': png})]));
+    }).catch(() => {});
+}
+"""
+
+# Download the media file. Uses the wrap's `data-filename` (the source path's
+# basename) when present, else a generic name.
+const DOWNLOAD_MEDIA_JS = js"""
+event => {
+    event.stopPropagation();
+    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const media = wrap && wrap.querySelector('.bt-media');
+    const srcEl = media && (media.tagName === 'VIDEO' ? media.querySelector('source') : media);
+    const src = srcEl && (srcEl.currentSrc || srcEl.src || srcEl.getAttribute('src'));
+    if (!src) return;
+    const a = document.createElement('a');
+    a.href = src;
+    a.download = (wrap.getAttribute('data-filename') || 'download');
+    document.body.appendChild(a); a.click(); a.remove();
+}
+"""
+
 # A media element (image / video) with click-to-enlarge. `src` can be a streamed
 # proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
 # an <img>/<video> src. `mime` only matters for the <video><source> type. Images
 # enlarge on click; videos keep native controls for clicks and enlarge via the ⤢
 # button (so a frame click still plays/pauses).
-function media_element(src, mime::AbstractString, is_video::Bool)
+function media_element(src, mime::AbstractString, is_video::Bool; filename::AbstractString = "")
     inner = is_video ?
         DOM.video(DOM.source(; src, type = mime); controls = true, class = "bt-media",
             style = Styles("max-width" => "100%", "display" => "block")) :
         DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS,
             style = Styles("max-width" => "100%", "display" => "block", "cursor" => "zoom-in"))
-    return DOM.div(inner,
-        DOM.button("⤢"; class = "bt-media-enlarge", type = "button",
-            title = "Enlarge", onclick = LIGHTBOX_OPEN_JS);
-        class = "bt-media-wrap")
+    # Hover action row (Signal-style): enlarge · copy · download. Copy is
+    # image-only (no clipboard-image for video). All revealed on wrap hover.
+    actions = DOM.div(
+        DOM.button("⤢"; class = "bt-media-action bt-media-enlarge", type = "button",
+            title = "Enlarge", onclick = LIGHTBOX_OPEN_JS),
+        (is_video ? () :
+            (DOM.button("⧉"; class = "bt-media-action bt-media-copy", type = "button",
+                title = "Copy image", onclick = COPY_MEDIA_JS),))...,
+        DOM.button("⤓"; class = "bt-media-action bt-media-download", type = "button",
+            title = "Download", onclick = DOWNLOAD_MEDIA_JS);
+        class = "bt-media-actions")
+    return DOM.div(inner, actions;
+        class = "bt-media-wrap",
+        (isempty(filename) ? (;) : (; dataFilename = String(filename)))...)
 end
 
 # Source for a worker media file: a streamed proxied-asset url when the worker
@@ -1659,23 +1776,24 @@ tool_raw_input(m) = hasproperty(m, :raw_input) ? m.raw_input : Dict{String,Any}(
 function read_image_element(state::ServerState, project_id::AbstractString,
                             m::ToolMsg, c::ImageContent)
     fp = get(tool_raw_input(m), "file_path", nothing)
+    fname = fp === nothing ? "" : basename(String(fp))
     eb = isempty(project_id) ? nothing : eval_bridge_for(state, project_id)
     if fp !== nothing && eb !== nothing
         try
-            return media_element(worker_asset_url(eb, String(fp)), c.mime_type, false)
+            return media_element(worker_asset_url(eb, String(fp)), c.mime_type, false; filename = fname)
         catch e
             @warn "read image: stream via bridge failed; inlining base64" exception = (e, catch_backtrace())
         end
     end
-    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, false)
+    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, false; filename = fname)
 end
 
 function render_show_file(st::ShowTool)
     ext = lowercase(splitext(st.path)[2])
     if ext in SHOW_IMAGE_EXTS
-        return media_element(show_media_src(st), "", false)
+        return media_element(show_media_src(st), "", false; filename = basename(st.path))
     elseif haskey(SHOW_VIDEO_MIME, ext)
-        return media_element(show_media_src(st), SHOW_VIDEO_MIME[ext], true)
+        return media_element(show_media_src(st), SHOW_VIDEO_MIME[ext], true; filename = basename(st.path))
     end
     # Non-media: the bytes have to be on the server (Monaco / caption read them).
     path = fetch_show_file(st)
@@ -1991,7 +2109,9 @@ Base.close(m::TodoListMsg) =
 # liveness off a plan whose entries are still pending.
 finalize_orphan!(m::AgentMsg)   = close(m)
 finalize_orphan!(m::ThoughtMsg) = close(m)
-finalize_orphan!(m::ToolMsg)    = close(m)
+# The orphan sweep force-finalizes a non-terminal tool; reconcile so its live
+# slot is released (fg/bg → none). `m.chat` is the shared parent for stored msgs.
+finalize_orphan!(m::ToolMsg)    = (close(m); m.chat === nothing || sync_tool_liveness!(m.chat, m); nothing)
 function finalize_orphan!(m::TodoListMsg)
     m.finished_at === nothing || return nothing
     m.finished_at = time()
@@ -2301,6 +2421,10 @@ end
 # header fields the update path touches.
 function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     pin_tool!(b.chat, b)
+    # Count this tool the instant it's rendered live (it was just `send!`ed):
+    # a tool that arrived already-terminal (a completed Read) classifies as
+    # `none` and never bumps a counter; a live one enters fg here.
+    sync_tool_liveness!(b.chat, b)
     try
         persist_tool_content!(b.chat.chat_dir, m)
         cache_tool_content!(b.chat, m.id, m.content)
@@ -2375,9 +2499,14 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             # missing affordances on the fly.
             snap_header_extras!(d, b)
             chat_emit(b.chat, d)
+            # This snap may have flipped `status` terminal — reconcile the
+            # tool's live class (fg → none) as soon as it happens, not only at
+            # close, so a still-draining channel doesn't leave a stale count.
+            sync_tool_liveness!(b.chat, b)
         end
     finally
         close(b)        # total: finalizes the bubble even if the loop body threw
+        sync_tool_liveness!(b.chat, b)   # authoritative leave-live (close forced terminal)
         unpin_task!(b.chat, b.id)
     end
     return nothing
@@ -2437,6 +2566,9 @@ end
 # exits. Non-background bashes fall through to the generic ToolMsg handling.
 function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
     pin_tool!(b.chat, b)
+    # Rendered live: a foreground bash enters fg here. It may flip to bg below
+    # (background launch detected) — the per-snap sync moves it fg → bg.
+    sync_tool_liveness!(b.chat, b)
     try
         persist_tool_content!(b.chat.chat_dir, m)
         for snap in m.updates
@@ -2498,6 +2630,10 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
                 d["finished_at"] = b.finished_at
             end
             chat_emit(b.chat, d)
+            # Reconcile after each snap: a foreground bash going terminal moves
+            # fg → none; a background launch moves fg → bg (so the spinner logic
+            # sees a live background shell, not a live foreground tool).
+            sync_tool_liveness!(b.chat, b)
         end
     finally
         # A live background task is finalized later (by `finalize_bg_task!` when the
@@ -2510,6 +2646,9 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
             close(b)
             unpin_task!(b.chat, b.id)
         end
+        # Reconcile once more: after `close` a foreground bash is `none`; a still
+        # `bg_running` shell stays `bg` (left for `finalize_bg_task!` to clear).
+        sync_tool_liveness!(b.chat, b)
     end
     return nothing
 end
@@ -2603,6 +2742,8 @@ function finalize_bg_task!(model::ChatModel, m::BashToolMsg)
     m.bg_running = false
     m.status = "completed"
     m.finished_at === nothing && (m.finished_at = time())
+    # Shell exited: the background shell leaves live (bg → none).
+    sync_tool_liveness!(model, m)
     write_bg_content!(model.chat_dir, m)
     try
         append_tool(model.chat_session, m)
@@ -2804,6 +2945,18 @@ function run_chat!(chat::ChatModel)
             begin_turn!(chat, user_msg)
         catch e
             @error "starting chat turn failed" exception = (e, catch_backtrace())
+            # Don't drop silently: surface the failure the way `drain_turn!`
+            # does, so a turn that couldn't even start (e.g. the session died as
+            # we sent the prompt — a worker crash, or a restart we didn't catch
+            # in `begin_turn!`'s wait) shows an offline state / error instead of
+            # the user's already-rendered message vanishing with no reply.
+            ec = innermost_cause(e)
+            if is_session_dead_error(ec)
+                chat.session_alive[] = false
+                chat.last_error[] = sprint(showerror, ec)
+            else
+                close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, ec))]")))
+            end
             nothing
         end
         turn === nothing && continue
@@ -2855,6 +3008,20 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     # leak_cycle CI flake) and a stale `bound_lru` entry that never clears. The
     # bind_lock can't catch this: the turn fires entirely AFTER stop_session!.
     isopen(s.user_messages) || return nothing
+    # Don't start a turn into a session that's mid-restart/switch. While
+    # `restart_chat_session!` tears the old connection down and brings a new one
+    # up, `client(chat.agent)` hands back the dying connection and `prompt!`
+    # throws "connection torn down" — which `run_chat!` would catch and drop,
+    # losing the user's (already-rendered) message with no reply. Wait, bounded,
+    # for the bring-up to settle so we prompt on the LIVE client. Mirrors the
+    # non-worker wait in `restart_chat_session!`.
+    if lock(() -> s.restart_inflight[], s.restart_lock)
+        deadline = time() + 25.0
+        while time() < deadline && lock(() -> s.restart_inflight[], s.restart_lock)
+            sleep(0.02)
+        end
+        isopen(s.user_messages) || return nothing
+    end
     cli = client(chat.agent)
     if cli === nothing
         try
@@ -2927,7 +3094,7 @@ function drain_turn!(chat::ChatModel, turn)
         # `prompt!` runs the turn's producer in a bound task, so a dead session
         # surfaces as a TaskFailedException wrapping the real cause — unwrap it
         # before classifying.
-        e = e isa TaskFailedException ? e.task.result : e
+        e = innermost_cause(e)
         if is_session_dead_error(e)
             chat.session_alive[] = false
             chat.last_error[] = sprint(showerror, e)
@@ -3009,22 +3176,36 @@ end
 #     spinner rather than mask it).
 const BG_IDLE_QUIESCE = 8.0
 
+# STAGE-1 CROSS-CHECK TOGGLE. While true, `update_busy!` computes BOTH the old
+# O(n) scan and the authoritative counters and `@warn "BUSY-DESYNC"` if they
+# disagree — the safety net that proves the counters track every lifecycle path
+# before the scan is removed. Set false (the default once verified) to run on the
+# counters alone. Leave the machinery here so a future stage-2 change can re-enable
+# it cheaply.
+const BUSY_CROSSCHECK = Ref(false)
+
 function update_busy!(chat::ChatModel)
     s = shared(chat)
-    active, snapshot = lock(s.lock) do
-        s.turns_active[], copy(s.msgs_store)
+    active, bg_count, fg_count, snapshot = lock(s.lock) do
+        s.turns_active[], s.live_bg_tools[], s.live_fg_tools[],
+            (BUSY_CROSSCHECK[] ? copy(s.msgs_store) : ChatMsg[])
+    end
+    if BUSY_CROSSCHECK[]
+        scan_bg = any(m -> m isa BashToolMsg && m.bg_running, snapshot)
+        scan_fg = any(snapshot) do m
+            m isa ToolMsg && is_live(m) && !(m isa BashToolMsg && m.bg_running)
+        end
+        (scan_bg == (bg_count > 0) && scan_fg == (fg_count > 0)) ||
+            @warn "BUSY-DESYNC scan vs counters" scan_bg scan_fg bg_count fg_count
     end
     busy = active > 0
     if busy && time() - s.last_stream_at[] > BG_IDLE_QUIESCE
-        bg_running = any(m -> m isa BashToolMsg && m.bg_running, snapshot)
         # Anything live that isn't a running background shell is foreground
         # work — including a long bt_show_app render or an eval between
         # checkpoints (their pills are status-live exactly while the call is
-        # in flight). Quiet wire + foreground work ⇒ still busy.
-        fg_live = any(snapshot) do m
-            m isa ToolMsg && is_live(m) && !(m isa BashToolMsg && m.bg_running)
-        end
-        bg_running && !fg_live && (busy = false)
+        # in flight). Quiet wire + foreground work ⇒ still busy. The two
+        # authoritative counters replace the old `msgs_store` scans.
+        (bg_count > 0) && !(fg_count > 0) && (busy = false)
     end
     s.busy_active[] == busy || (s.busy_active[] = busy)
     return nothing
@@ -3066,6 +3247,23 @@ function sweep_turn_orphans!(chat::ChatModel)
         end
     end
     return nothing
+end
+
+# Unwrap nested task/composite wrappers to the innermost cause. A dead session
+# surfaced through `prompt!`'s bound producer arrives as a (sometimes MULTIPLY)
+# wrapped `TaskFailedException`; classifying the wrapper instead of the cause
+# mislabels a torn-down transport as a transient one-bad-turn error (cryptic
+# inline `[error: TaskFailedException(...)]`, no offline banner, stuck session).
+function innermost_cause(@nospecialize(e))
+    while true
+        if e isa TaskFailedException
+            e = e.task.result
+        elseif e isa CompositeException && !isempty(e.exceptions)
+            e = e.exceptions[1]
+        else
+            return e
+        end
+    end
 end
 
 # Classify a turn exception. "Session dead" ⇒ the transport is torn down and the
@@ -4145,6 +4343,34 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
 
+    # ── Compact button ─────────────────────────────────────────────────────
+    # Fires Claude's `/compact` as a turn: the agent summarizes the conversation
+    # so far (freeing up context) and replies with a summary boundary — which the
+    # chat already renders as a centered separator (see `SummaryMsg`). Only
+    # meaningful on a live session; the message rides the normal send path, so a
+    # turn in flight just queues it.
+    compact_status = Observable("")
+    compact_label  = map(s -> isempty(s) ? "Compact" : s, compact_status)
+    compact_button = DOM.button(compact_label;
+        class   = "bt-header-compact",
+        title   = "Summarize the conversation so far to free up context (/compact)",
+        onclick = js"event => $(compact_status).notify('__click__')")
+    on(session, compact_status) do s
+        s == "__click__" || return
+        compact_status[] = ""
+        isempty(project_id) && return
+        if !model.session_alive[]
+            safe_set!(compact_status, "no session")
+            return
+        end
+        try
+            send_message!(model, UserMsg("/compact"))
+        catch e
+            @warn "compact failed" exception = (e, catch_backtrace())
+            safe_set!(compact_status, "compact failed")
+        end
+    end
+
     # ── Provider switcher ──────────────────────────────────────────────────
     # Dropdown to switch between Claude Code, MiMo Code, and OpenCode per chat.
     # Changing the provider restarts the session with the new backend.
@@ -4223,6 +4449,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 provider_select,
                 xsync_control,
                 sync_button,
+                compact_button,
                 restart_button;
                 class="bt-header-actions"),
             class="bt-header-row"),
@@ -4301,6 +4528,10 @@ function chat_input_area(::Session, ::ChatModel)
             event.target.style.height = 'auto';
             event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
         }""")
+    # Send and Stop are SEPARATE, both always present: the user can submit a
+    # message at any time — even mid-turn — and it queues (see `send_message!`'s
+    # `queued` bubble). A single toggling button would hide Send during a turn
+    # and break that type-ahead/queue flow, so we deliberately keep two.
     send_btn = DOM.button(icon_img(send_icon(), "Send"); type="button",
         class="bt-send-btn", title="Send (Enter)")
     stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
@@ -4866,6 +5097,7 @@ end
 function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
     (t.is_background && is_live(t)) || return nothing
     close(t)
+    sync_tool_liveness!(model, t)   # user stopped it: leave live (fg → none)
     unpin_task!(model, t.id)
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => t.id,
         "status" => "completed", "summary" => "stopped"))

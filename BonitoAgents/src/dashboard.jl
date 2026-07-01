@@ -410,6 +410,24 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
                        mcp_servers = mcp,
                        agent       = agent)
     register_chat_model!(model)      # LAZY: register for viewing; bind on first turn
+
+    # A RESUMED chat keeps its conversation only in claude's session — it replays
+    # via `session/load` when the agent binds. Lazy binding defers that to the
+    # first turn, so a freshly imported chat (no server-side `chat.md` history
+    # yet) opens BLANK until the user types ("an old chat is sometimes empty").
+    # When we're resuming and have no local history to show, bind the agent NOW
+    # so the history replays straight away. Async so the chat view still mounts
+    # instantly; the replayed `msgs.count` fills it in. (A chat that already has
+    # `chat.md` history renders it immediately and needs no eager bind — and
+    # skipping it there also avoids a needless `reconcile_replay!`.)
+    if p.resume_session_id !== nothing && isempty(shared(model).msgs_store)
+        Base.errormonitor(@async try
+            restart_chat_session!(model)
+        catch e
+            @warn "eager history replay on open failed" project_id = p.id exception = (e, catch_backtrace())
+        end)
+    end
+
     fire_auto_prompt!(model)
     return model
 end
