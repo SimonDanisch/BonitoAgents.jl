@@ -116,6 +116,7 @@ class BonitoChat {
         this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
         this.followMode = true;
         this.unreadCount = 0;
+        this._pillShown = false;
         this.AT_BOTTOM_PX = 20;
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
@@ -2018,6 +2019,12 @@ class BonitoChat {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
         return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
+    lastMessageFullyOutOfView() {
+        if (this.totalCount === 0) return false;
+        const node = this.cache.get(this.totalCount - 1);
+        if (!node || !node.isConnected || node.offsetParent === null) return true;
+        return node.getBoundingClientRect().top >= this.container.getBoundingClientRect().bottom;
+    }
     _queueScrollToBottom() {
         if (this._scrollbarDrag) return;
         if (this._scrollQueued || this.destroyed) return;
@@ -2289,24 +2296,34 @@ class BonitoChat {
     }
     _registerUnread() {
         this.unreadCount++;
-        this._showNewMessagePill();
+        if (this.lastMessageFullyOutOfView()) {
+            this._showNewMessagePill();
+        } else {
+            this._refreshPillContent();
+        }
     }
     _updateScrollAffordance(atBot) {
         if (atBot) {
             this.unreadCount = 0;
             this._hideNewMessagePill();
-        } else {
+        } else if (this.lastMessageFullyOutOfView()) {
             this._showNewMessagePill();
+        } else {
+            this._hideNewMessagePill();
         }
     }
     _showNewMessagePill() {
         if (!this._pillEl) this._createNewMessagePill();
-        if (this._pillEl) {
+        if (!this._pillEl) return;
+        if (!this._pillShown) {
+            this._pillShown = true;
             this._pillEl.classList.add('bt-new-msg-pill-visible');
-            this._refreshPillContent();
         }
+        this._refreshPillContent();
     }
     _hideNewMessagePill() {
+        if (!this._pillShown) return;
+        this._pillShown = false;
         if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
     }
     _refreshPillContent() {

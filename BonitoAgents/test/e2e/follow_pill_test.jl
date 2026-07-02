@@ -122,6 +122,159 @@
             @test pill_visible() == false
         end
 
+        # ── 1b. Pill threshold: only when the LAST message is fully out of view ──
+        # The pill's visibility criterion is `lastMessageFullyOutOfView()`, NOT
+        # the tight AT_BOTTOM_PX check: while any pixel of the last message is
+        # still visible there is nothing hidden to jump to, so no pill. Append a
+        # SHORT echo bubble under the tall seed block (so there's plenty of
+        # scrollback above a small last message), then scroll up in two stages:
+        # (a) half the last bubble's off-bottom span — it stays partially
+        # visible → NO pill (though followMode disengages), (b) past its full
+        # height → pill appears, plain (no glow — nothing unread).
+        @testset "pill only when last message fully out of view" begin
+            TK.send_message(s, "make the last message short")
+            @test TK.wait_for(s, "short echo is the last message + turn done + pinned",
+                """(() => {
+                    const c = document.querySelector('.bt-messages');
+                    const chat = c.__bt_chat;
+                    const node = chat.cache.get(chat.totalCount - 1);
+                    if (!node || !node.isConnected) return false;
+                    if (!node.classList.contains('bt-agent-msg')) return false;
+                    if (!(node.textContent || '').includes('echo: make the last message short')) return false;
+                    if (c.querySelector('.bt-busy.bt-busy-active')) return false;
+                    return (c.scrollHeight - c.scrollTop - c.clientHeight) < 50;
+                })()"""; timeout = 20) == true
+            @test follow_mode() == true
+            @test pill_visible() == false
+            # `out` = how many px we must scroll UP from the bottom until the
+            # last bubble's top edge reaches the visible bottom (fully out).
+            out = Float64(TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                const node = chat.cache.get(chat.totalCount - 1);
+                return c.getBoundingClientRect().bottom - node.getBoundingClientRect().top;
+            })()"""))
+            # Tail (50px) + gap + the bubble itself: the halfway point sits
+            # beyond AT_BOTTOM_PX (20), so followMode genuinely disengages
+            # while the bubble is still partially visible.
+            @test out > 60
+            # (a) Scroll up HALF the way: clearly off the bottom (followMode
+            # off), but the bubble is still partially visible → no pill. Poll a
+            # short window so a lagging (wrong) pill update would be caught.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollTop - $(out / 2);
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            sleep(0.3)
+            @test follow_mode() == false
+            for _ in 1:5
+                @test pill_visible() == false
+                sleep(0.1)
+            end
+            @test Int(unread()) == 0
+            # (b) Scroll up past the bubble's full height (+margin): now not a
+            # single pixel of the last message is visible → plain pill.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollTop - ($(out / 2) + 60);
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            @test TK.wait_for(s, "pill visible once last message fully out",
+                "(() => { const el = $vis_pill; return !!el; })()"; timeout = 6) == true
+            @test follow_mode() == false
+            @test Int(unread()) == 0
+            @test pill_glowing() == false
+            @test occursin("Move to bottom", String(pill_text()))
+        end
+
+        # ── 1c. Flicker guard: layout jitter must not toggle the pill ───────
+        # Typing autosizes the composer, which shifts the messages container by
+        # ~a keystroke's worth of pixels and fires scroll events. The old
+        # razor-thin off-bottom criterion flipped the pill on/off per event.
+        # Simulate the jitter directly: bursts of no-op scroll events and small
+        # scrollTop wiggles (1px AND 25px — the latter crosses the old
+        # AT_BOTTOM_PX=20 boundary) while parked at the bottom → the pill must
+        # never show. Conversely, parked far up (pill showing), ±1px jitter must
+        # never hide it. The dispatches run synchronously, so sampling the class
+        # after each event catches even a single-event flicker.
+        @testset "scroll jitter never flickers the pill" begin
+            # Back to the bottom as a user scroll → followMode on, pill hidden.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollHeight - c.clientHeight;
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            sleep(0.4)
+            @test follow_mode() == true
+            @test pill_visible() == false
+            # Jitter burst at the bottom: the pill must never become visible.
+            flickered = TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const shown = () => {
+                    const els = [...document.querySelectorAll('.bt-new-msg-pill')];
+                    return els.some(e => e.classList.contains('bt-new-msg-pill-visible') && e.offsetParent !== null);
+                };
+                const max = c.scrollHeight - c.clientHeight;
+                let ever = false;
+                for (let i = 0; i < 40; i++) {
+                    const jitter = (i % 4 === 3) ? 25 : (i % 2);   // 0/1px + occasional 25px
+                    c.scrollTop = Math.max(0, max - jitter);
+                    c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                    if (shown()) ever = true;
+                }
+                c.scrollTop = max;
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return ever;
+            })()""")
+            @test flickered == false
+            sleep(0.3)
+            @test pill_visible() == false
+            @test follow_mode() == true
+            # Now park far up (pill visible) and jitter ±1px: must never hide.
+            scroll_up_as_user!()
+            @test TK.wait_for(s, "pill visible after scroll-up",
+                "(() => { const el = $vis_pill; return !!el; })()"; timeout = 6) == true
+            hidden_during_jitter = TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const shown = () => {
+                    const els = [...document.querySelectorAll('.bt-new-msg-pill')];
+                    return els.some(e => e.classList.contains('bt-new-msg-pill-visible') && e.offsetParent !== null);
+                };
+                const base = c.scrollTop;
+                let everHidden = false;
+                for (let i = 0; i < 40; i++) {
+                    c.scrollTop = Math.max(0, base + (i % 2));
+                    c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                    if (!shown()) everHidden = true;
+                }
+                return everHidden;
+            })()""")
+            @test hidden_during_jitter == false
+            @test pill_visible() == true
+            # Leave the pane pinned at the bottom with follow mode on — the
+            # streaming testset below starts from that state. Sleep past the
+            # 400ms user-driven classification window our synthetic wheel
+            # armed, so the next testset's send doesn't get its layout scroll
+            # misread as a user scroll landing off-bottom.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollHeight - c.clientHeight;
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            sleep(0.6)
+            @test follow_mode() == true
+            @test pill_visible() == false
+        end
+
         # ── 2. Streaming while at bottom — no pill ──────────────────────────
         @testset "streaming while at bottom doesn't show pill" begin
             TK.send_message(s, "burst at bottom")

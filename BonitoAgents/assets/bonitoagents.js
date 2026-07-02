@@ -239,6 +239,11 @@ class BonitoChat {
         // mode the user last chose.
         this.followMode = true;
         this.unreadCount = 0;
+        // Cached shown/hidden state of the jump pill. Scroll + resize
+        // handlers re-derive pill visibility constantly (every composer
+        // autosize fires one), so show/hide only touch the DOM on an
+        // actual flip — see _showNewMessagePill/_hideNewMessagePill.
+        this._pillShown = false;
         // "At bottom" is intentionally tight here (20px) — the loose
         // 200px threshold the old code used was a workaround for
         // chunked-text-during-burst race conditions. With explicit
@@ -643,7 +648,8 @@ class BonitoChat {
                 this._queueScrollToBottom();
             }
             // The jump-to-bottom pill tracks the read position directly: shown
-            // whenever we're off the bottom (plain), glowing only when unread.
+            // once the last message is completely out of view (plain), glowing
+            // only when unread. atBot still owns the unread-clear.
             this._updateScrollAffordance(atBot);
             this.refresh();
         };
@@ -2789,6 +2795,26 @@ class BonitoChat {
         return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
 
+    // The jump pill's visibility criterion: TRUE only when the LAST message
+    // is COMPLETELY out of the container's visible box (its top edge at or
+    // below the visible bottom — not a single pixel showing). Deliberately
+    // NOT the razor-thin atBottom() boundary: composer autosize shifts the
+    // container by ~a keystroke's worth of pixels, and a pill keyed on
+    // "off the bottom" flickered on/off while typing. A whole message
+    // height of hysteresis makes layout jitter invisible to the pill,
+    // while followMode / unread-clearing keep using atBottom().
+    lastMessageFullyOutOfView() {
+        if (this.totalCount === 0) return false;
+        const node = this.cache.get(this.totalCount - 1);
+        // Virtual scroll detaches nodes far outside the viewport (cache
+        // keeps them), and deep in scrollback the last message may not be
+        // fetched at all — a missing/detached/display:none node has no
+        // visible pixel by definition.
+        if (!node || !node.isConnected || node.offsetParent === null) return true;
+        return node.getBoundingClientRect().top >=
+            this.container.getBoundingClientRect().bottom;
+    }
+
     // rAF-batched scroll: multiple stream chunks arriving in the same
     // frame (or a chunk + a ResizeObserver callback) coalesce into ONE
     // scroll, run AFTER the browser has laid out the new content.
@@ -3216,36 +3242,57 @@ class BonitoChat {
         }
     }
 
-    // Bump unread + show pill. Called from appendNewMessage and
-    // appendChunk when followMode is off.
+    // Bump unread + surface the pill. Called from appendNewMessage and
+    // appendChunk when followMode is off. Appending only ever pushes the
+    // last message FURTHER down, so re-checking the criterion here can
+    // flip the pill ON (never off); while the freshly appended message is
+    // still partially visible there's no pill — just keep the glow/label
+    // fresh in case it's already showing.
     _registerUnread() {
         this.unreadCount++;
-        this._showNewMessagePill();
+        if (this.lastMessageFullyOutOfView()) {
+            this._showNewMessagePill();
+        } else {
+            this._refreshPillContent();
+        }
     }
 
-    // The scroll-to-bottom affordance is visible whenever the user is NOT at the
-    // last message — not only when new content arrived. It GLOWS and reads "New
-    // messages" when there's unread content (a real nudge); otherwise it's the
-    // same pill without the glow, a plain "Move to bottom" jump button. Driven
-    // from the scroll handler (atBottom) so it tracks the read position exactly.
+    // The scroll-to-bottom affordance is visible ONLY when the last message is
+    // completely out of view — while any pixel of it still shows there is
+    // nothing hidden to jump to (see lastMessageFullyOutOfView). It GLOWS and
+    // reads "New messages" when there's unread content (a real nudge);
+    // otherwise it's the same pill without the glow, a plain "Move to bottom"
+    // jump button. `atBot` (the tight AT_BOTTOM_PX check) keeps its OLD job
+    // here: clearing unread. In the in-between state — last message partially
+    // visible but not at the bottom — the pill hides, but unread is NOT
+    // cleared: the user hasn't actually reached the bottom.
     _updateScrollAffordance(atBot) {
         if (atBot) {
             this.unreadCount = 0;
             this._hideNewMessagePill();
-        } else {
+        } else if (this.lastMessageFullyOutOfView()) {
             this._showNewMessagePill();
+        } else {
+            this._hideNewMessagePill();
         }
     }
 
     _showNewMessagePill() {
         if (!this._pillEl) this._createNewMessagePill();
-        if (this._pillEl) {
+        if (!this._pillEl) return;
+        // Touch classList only on an actual hidden→shown flip (the scroll
+        // handler re-derives visibility on every event) — but ALWAYS refresh
+        // the glow/label: unread can arrive while the pill is already up.
+        if (!this._pillShown) {
+            this._pillShown = true;
             this._pillEl.classList.add('bt-new-msg-pill-visible');
-            this._refreshPillContent();
         }
+        this._refreshPillContent();
     }
 
     _hideNewMessagePill() {
+        if (!this._pillShown) return;
+        this._pillShown = false;
         if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
     }
 
