@@ -20,6 +20,13 @@ mutable struct SessionRow
     # on rename and across worker/server restarts. Reactive so the cached row's
     # DOM updates in place when the title changes.
     title_obs   :: Observable{String}
+    # True while a project resuming THIS session is open in the sidebar. The
+    # row is NOT hidden then (discover shows every session unconditionally) —
+    # it carries an "in sidebar" pill instead, and clicking it reuses the
+    # existing thread (`find_thread` dedup in `create_project_from_worker!`)
+    # rather than importing a duplicate. Reactive: rows are cached across
+    # rescans, so open/close must update the pill in place.
+    open_obs    :: Observable{Bool}
 end
 
 # The preview-derived fallback title — what we show when no renamed project
@@ -49,7 +56,7 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     running = get(r, "running", nothing) === true
     row_key = string(path, '|', session_id)
     SessionRow(c.worker_id, path, name, session_id, preview, meta, running, row_key,
-               Observable(session_preview_title(preview)))
+               Observable(session_preview_title(preview)), Observable(false))
 end
 
 # Point the row's display title at the renamed project's title when one resumes
@@ -70,6 +77,15 @@ function resolve_session_title!(sr::SessionRow, projects::AbstractDict)
     return sr
 end
 
+# Point the row's "in sidebar" pill at whether an OPEN chat currently resumes
+# this session (the caller passes the same in-sidebar sid set the old code used
+# to hide these rows). Set only on change, like `resolve_session_title!`.
+function resolve_session_open!(sr::SessionRow, imported::AbstractSet)
+    want = !isempty(sr.session_id) && sr.session_id in imported
+    sr.open_obs[] == want || (sr.open_obs[] = want)
+    return sr
+end
+
 Base.hash(s::SessionRow, h::UInt) = hash(s.row_key, hash(:SessionRow, h))
 Base.:(==)(a::SessionRow, b::SessionRow) = a.row_key == b.row_key
 
@@ -78,6 +94,11 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
     running_pill = s.running ?
         DOM.span("running"; class = "bt-pill bt-pill-online") :
         DOM.span()
+    # "in sidebar" pill: this session already has an open chat. The row stays
+    # visible (discover is unconditional); the pill just says where it lives,
+    # and Resume reuses that thread instead of duplicating it.
+    open_pill = DOM.span("in sidebar";
+        class = map(o -> o ? "bt-pill bt-pill-muted" : "bt-pill bt-hidden", s.open_obs))
     # The folder is already in the group header, so the row LEADS with the
     # chat's title: the renamed `ProjectInfo.title` when one pins this session
     # (resolved into `title_obs`), else the cleaned first prompt the user typed,
@@ -90,7 +111,8 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
             DOM.div(
                 # Wrap the title in a span so it ellipsizes when the row is narrow.
                 DOM.span(s.title_obs; class = "bt-session-name-text"),
-                running_pill;
+                running_pill,
+                open_pill;
                 class = "bt-session-name"),
             isempty(s.meta) ? DOM.span() : DOM.div(s.meta; class = "bt-session-meta");
             class = "bt-session-info"),

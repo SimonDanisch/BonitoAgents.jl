@@ -300,11 +300,11 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     end
 
     # Session ids that are an OPEN chat in the homebar on this worker (a project
-    # whose `resume_session_id` matches AND that `chat_in_sidebar` shows). Such a
-    # session already has a sidebar entry, so we drop its row from the discover
-    # list to avoid showing the same chat twice. A ✕-closed (`dismissed`) chat is
-    # NOT in the sidebar, so it intentionally REAPPEARS here — that's how the user
-    # reopens it (resuming clears `dismissed` and restores its title). Session-
+    # whose `resume_session_id` matches AND that `chat_in_sidebar` shows). Used
+    # to tag those discover rows with an "in sidebar" pill — the rows stay
+    # VISIBLE (discover is unconditional; hiding them made sessions look lost
+    # whenever sidebar state and discover disagreed). Clicking such a row reuses
+    # the existing thread (`find_thread` dedup), never a duplicate. Session-
     # scoped (`map(session, …)`) so the listener deregisters with the browser
     # session rather than leaking onto the long-lived `state.projects`.
     imported_sids = map(session, c.state.projects) do projects
@@ -380,10 +380,13 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             # subagents (e.g. older Claude Code versions that didn't persist the
             # parent jsonl) drops out of the list entirely.
             String(get(r, "kind", "session")) == "subagent" && continue
-            # Already imported (resumed into an open chat) → drop from discover.
-            sid = String(get(r, "session_id", ""))
-            (!isempty(sid) && sid in imported) && continue
             p = String(get(r, "path", ""))
+            # The ONLY drop condition: the project folder no longer exists.
+            # Discover is otherwise UNCONDITIONAL — a session that's already an
+            # open chat stays VISIBLE with an "in sidebar" pill (hiding it made
+            # sessions look lost whenever sidebar state and discover disagreed);
+            # clicking it reuses the existing thread (`find_thread` dedup).
+            isdir(p) || continue
             push!(get!(by_path, p, Any[]), r)
             ts = get(r, "last_used", 0.0)
             t = ts isa Number ? Float64(ts) : 0.0
@@ -396,6 +399,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             rows = SessionRow[get_session_row(r) for r in rs]
             for sr in rows
                 resolve_session_title!(sr, projects)   # renamed title pins here too
+                resolve_session_open!(sr, imported)    # "in sidebar" pill state
                 push!(seen_row_keys, sr.row_key)
             end
             g = get!(session_groups, p) do

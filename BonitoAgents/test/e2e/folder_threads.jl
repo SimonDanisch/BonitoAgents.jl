@@ -42,21 +42,27 @@ const TK = TestKit
 # Seed the worker's published discover scan: one folder (MyApp) with two sibling
 # threads, plus a second folder (Other). This is the sink a real worker's
 # ~/.claude scan writes to; the always-visible tree renders straight from it.
+# The folders are REAL temp dirs: discover drops entries whose folder no longer
+# exists (its only filter), so seeded paths must exist to render. Returns the
+# `(; myapp, other)` paths for the testsets that build projects on them.
 function seed_discovered!(server, wid)
     state = server.h.state
+    base   = mktempdir()
+    myapp  = mkpath(joinpath(base, "MyApp"))
+    other  = mkpath(joinpath(base, "Other"))
     lock(state.lock) do
         state.discovered[][wid] = [
-            Dict{String,Any}("session_id" => "aaaa1111", "path" => "/work/MyApp", "name" => "MyApp",
+            Dict{String,Any}("session_id" => "aaaa1111", "path" => myapp, "name" => "MyApp",
                              "first_prompt" => "refactor the parser", "last_used" => 1.70e9,
                              "kind" => "session", "running" => true),
-            Dict{String,Any}("session_id" => "bbbb2222", "path" => "/work/MyApp", "name" => "MyApp",
+            Dict{String,Any}("session_id" => "bbbb2222", "path" => myapp, "name" => "MyApp",
                              "first_prompt" => "add tests for IO", "last_used" => 1.69e9, "kind" => "session"),
-            Dict{String,Any}("session_id" => "cccc3333", "path" => "/work/Other", "name" => "Other",
+            Dict{String,Any}("session_id" => "cccc3333", "path" => other, "name" => "Other",
                              "first_prompt" => "write the README", "last_used" => 1.68e9, "kind" => "session"),
         ]
     end
     notify(state.discovered)
-    return server
+    return (; myapp, other)
 end
 
 # Open the (default-collapsed) discover panel so its contents land in innerText.
@@ -74,7 +80,7 @@ function run_suite(server)
 
     # Persist the discover scan, then return to the dashboard where the tree +
     # the active-chats sidebar both live.
-    seed_discovered!(server, wid)
+    seeded = seed_discovered!(server, wid)
     TK.to_dashboard(server)
 
     @testset "folder→threads browser + active chats (UI)" begin
@@ -134,7 +140,7 @@ function run_suite(server)
             BT = TK.BT
             lock(state.lock) do
                 p = BT.ProjectInfo("renamed-other", "Other", wid,
-                                   "/work/Other", "/work/Other", BT.Dates.now())
+                                   seeded.other, seeded.other, BT.Dates.now())
                 p.resume_session_id = "cccc3333"
                 p.title = "Renamed Other Chat"
                 p.dismissed = true
@@ -147,6 +153,49 @@ function run_suite(server)
                 timeout = 10) == true
             @test TK.eval_js(server,
                 "![...document.querySelectorAll('.bt-session-name-text')].some(e => (e.textContent||'').includes('write the README'))") == true
+        end
+
+        @testset "discover is unconditional: in-sidebar rows stay visible with a pill; missing folders are skipped" begin
+            BT = TK.BT
+            # Row helper: the cccc3333 row is the one titled "Renamed Other Chat"
+            # (pinned by the previous testset's project).
+            row_visible = "[...document.querySelectorAll('.bt-session-name-text')].some(e => (e.textContent||'').includes('Renamed Other Chat'))"
+            pill_shown  = "[...document.querySelectorAll('.bt-session-row .bt-pill')].some(e => (e.textContent||'') === 'in sidebar' && !e.classList.contains('bt-hidden'))"
+
+            # Un-dismiss the project → chat_in_sidebar(p) is true. The OLD code
+            # dropped the row here (the "chat is nowhere" bug); now it must stay
+            # visible and gain the "in sidebar" pill.
+            lock(state.lock) do
+                state.projects[]["renamed-other"].dismissed = false
+            end
+            notify(state.projects)
+            @test TK.wait_for(server, "in-sidebar row still visible", row_visible; timeout = 10) == true
+            @test TK.wait_for(server, "'in sidebar' pill shown", pill_shown; timeout = 10) == true
+
+            # Re-dismiss → the pill hides, the row remains.
+            lock(state.lock) do
+                state.projects[]["renamed-other"].dismissed = true
+            end
+            notify(state.projects)
+            @test TK.wait_for(server, "pill hidden after dismiss", "!($pill_shown)"; timeout = 10) == true
+            @test TK.eval_js(server, row_visible) == true
+
+            # A discovered entry whose folder no longer exists is the ONE thing
+            # discover drops. Append such an entry and assert it never renders
+            # (while the real rows are unaffected).
+            lock(state.lock) do
+                push!(state.discovered[][wid],
+                    Dict{String,Any}("session_id" => "dddd4444",
+                                     "path" => joinpath(tempdir(), "bt-gone-$(getpid())"),
+                                     "name" => "Gone",
+                                     "first_prompt" => "ghost session in a deleted folder",
+                                     "last_used" => 1.71e9, "kind" => "session"))
+            end
+            notify(state.discovered)
+            sleep(0.5)   # give the tree a paint cycle to (not) add it
+            @test TK.eval_js(server,
+                "![...document.querySelectorAll('.bt-session-name-text')].some(e => (e.textContent||'').includes('ghost session'))") == true
+            @test TK.eval_js(server, row_visible) == true
         end
 
         @testset "switch to the active chat, then close it" begin
