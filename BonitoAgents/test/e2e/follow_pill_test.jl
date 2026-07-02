@@ -51,6 +51,11 @@
         p = lowercase(prompt)
         if occursin("seed", p)
             return [TK.text(CODE)]
+        elseif occursin("medium", p)
+            # A ~12-line code block: tall enough (~300px) that the "last
+            # message partially visible" re-engage zone is genuinely wide,
+            # but well under one viewport (the cap never kicks in).
+            return [TK.text("```\n" * join(["reply row $(i)" for i in 1:12], "\n") * "\n```")]
         elseif occursin("burst", p)
             evs = Any[TK.delay(1600)]
             for _ in 1:8
@@ -396,6 +401,244 @@
             # for any scroll-anchoring shift as new bottom nodes get added).
             scroll_top_after = TK.eval_js(s, "document.querySelector('.bt-messages').scrollTop")
             @test abs(Int(round(scroll_top_after)) - Int(round(scroll_top_before))) < 200
+        end
+
+        # ── 7b. Generous downward re-engage: follow shares the pill boundary ─
+        # Re-engage is DIRECTION-AWARE and generous: while follow is off, a
+        # DOWNWARD user scroll re-engages the moment any pixel of the last
+        # message is visible (exactly when the pill hides — one shared
+        # boundary) AND less than one viewport remains to the bottom. The
+        # razor-thin AT_BOTTOM_PX disengage is untouched, so an UPWARD peek
+        # into the very same zone stays disengaged (asymmetry, tested in 7c).
+        @testset "downward scroll into the last-message zone re-engages" begin
+            # Let the scrollback-send turn from testset 7 finish so no late
+            # append races the hand-driven scrolls below.
+            @test TK.wait_for(s, "turn finished",
+                "(() => { const c = document.querySelector('.bt-messages'); return !c.querySelector('.bt-busy.bt-busy-active'); })()"; timeout = 20) == true
+            # Pin back to the bottom, then make the LAST message a ~300px code
+            # block so the "partially visible" zone is genuinely wide — a
+            # one-line echo bubble leaves only ~50px between the pill
+            # boundary and AT_BOTTOM_PX, too marginal to prove generosity.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollHeight - c.clientHeight;
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            sleep(0.4)
+            @test follow_mode() == true
+            TK.send_message(s, "a medium reply please")
+            @test TK.wait_for(s, "medium block is the last message + turn done + pinned",
+                """(() => {
+                    const c = document.querySelector('.bt-messages');
+                    const chat = c.__bt_chat;
+                    const node = chat.cache.get(chat.totalCount - 1);
+                    if (!node || !node.isConnected) return false;
+                    if (!node.querySelector('pre')) return false;
+                    if (!(node.textContent || '').includes('reply row 12')) return false;
+                    if (c.querySelector('.bt-busy.bt-busy-active')) return false;
+                    return (c.scrollHeight - c.scrollTop - c.clientHeight) < 50;
+                })()"""; timeout = 20) == true
+            # `out` = px to scroll up from the very bottom until the block's
+            # top reaches the visible bottom (same probe as testset 1b):
+            # landing at out/2 puts it half-visible, far beyond AT_BOTTOM_PX.
+            out = Float64(TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                const node = chat.cache.get(chat.totalCount - 1);
+                return c.getBoundingClientRect().bottom - node.getBoundingClientRect().top;
+            })()"""))
+            @test out > 100
+            # Park far up: follow off, pill visible.
+            scroll_up_as_user!()
+            @test follow_mode() == false
+            @test TK.wait_for(s, "pill visible while parked at top",
+                "(() => { const el = $vis_pill; return !!el; })()"; timeout = 6) == true
+            # Step 1 (still outside the zone): a downward user scroll landing
+            # one-viewport-plus above the bottom must NOT re-engage — the last
+            # message shows no pixel there and the gap exceeds the cap.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = (c.scrollHeight - c.clientHeight) - (c.clientHeight + 60);
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            sleep(0.3)
+            @test follow_mode() == false
+            # Step 2 (into the zone): downward again, landing where the last
+            # bubble is partially visible (gap = out/2 < one viewport). The
+            # old model needed atBottom (20px); the redesign re-engages here.
+            in_zone = TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = (c.scrollHeight - c.clientHeight) - $(out / 2);
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                // Precondition probes, sampled at the event: pixel visible + capped gap.
+                const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
+                return !chat.lastMessageFullyOutOfView() && gap < c.clientHeight && gap > chat.AT_BOTTOM_PX;
+            })()""")
+            @test in_zone == true
+            @test TK.wait_for(s, "followMode re-engaged by downward zone scroll",
+                "document.querySelector('.bt-messages').__bt_chat.followMode === true"; timeout = 4) == true
+            @test TK.wait_for(s, "pill hidden after re-engage",
+                "(() => { return !($vis_pill); })()"; timeout = 4) == true
+            # The queued chase pins the viewport to the bottom (fires once the
+            # user-input recency window lapses; poll, rAF can be throttled).
+            @test TK.wait_for(s, "chase settled to bottom after re-engage",
+                """(() => {
+                    const c = document.querySelector('.bt-messages');
+                    return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 50;
+                })()"""; timeout = 4) == true
+            @test Int(unread()) == 0
+        end
+
+        # ── 7c. Asymmetry: an upward peek into the same zone stays OFF ──────
+        # From the bottom, scroll UP so the last message is still partially
+        # visible (inside the re-engage zone, beyond AT_BOTTOM_PX): follow
+        # disengages exactly as before and must NOT snap back — the zone only
+        # pulls in scrolls moving DOWN. The pill stays hidden too (in-between
+        # state: a pixel of the last message still shows).
+        @testset "upward peek into the zone stays disengaged (no snap-back)" begin
+            @test follow_mode() == true       # pinned at bottom from 7b
+            out = Float64(TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                const node = chat.cache.get(chat.totalCount - 1);
+                return c.getBoundingClientRect().bottom - node.getBoundingClientRect().top;
+            })()"""))
+            @test out > 60
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollTop - $(out / 2);
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            sleep(0.3)
+            @test follow_mode() == false
+            # No snap-back: poll a window — the position must hold (a wrongly
+            # queued chase would yank the gap back under AT_BOTTOM_PX).
+            for _ in 1:5
+                @test follow_mode() == false
+                @test pill_visible() == false   # in-between: pixel visible, no pill
+                sleep(0.1)
+            end
+            gap = Float64(TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                return c.scrollHeight - c.scrollTop - c.clientHeight;
+            })()"""))
+            @test gap > 20
+        end
+
+        # ── 7d. Viewport cap: a multi-screen-tall last message can't snap ───
+        # With the tall seed block as the LAST message, a downward scroll that
+        # lands with the block partially visible but MORE than one viewport of
+        # gap must NOT re-engage — the cap keeps a snap from skipping content
+        # the user is reading. Scrolling further down, inside one viewport,
+        # re-engages as usual.
+        @testset "tall last message: gap > viewport blocks re-engage" begin
+            # 7c left follow OFF a peek above the bottom — pin back first so
+            # the seed below chases into view.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollHeight - c.clientHeight;
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            sleep(0.4)
+            @test follow_mode() == true
+            TK.send_message(s, "seed a tall last message")
+            @test TK.wait_for(s, "tall block is the last message + turn done",
+                """(() => {
+                    const c = document.querySelector('.bt-messages');
+                    const chat = c.__bt_chat;
+                    const node = chat.cache.get(chat.totalCount - 1);
+                    if (!node || !node.isConnected) return false;
+                    if (!node.querySelector('pre')) return false;
+                    if (c.querySelector('.bt-busy.bt-busy-active')) return false;
+                    return (c.scrollHeight - c.scrollTop - c.clientHeight) < 50;
+                })()"""; timeout = 30) == true
+            @test follow_mode() == true
+            # The block must be tall enough that "partially visible" and
+            # "gap > one viewport" can hold at once (top at mid-viewport ⇒
+            # gap ≈ height - viewport/2 + tail > viewport needs height >
+            # 1.5 viewports).
+            tall_enough = TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                const node = chat.cache.get(chat.totalCount - 1);
+                return node.getBoundingClientRect().height > 1.5 * c.clientHeight + 100;
+            })()""")
+            @test tall_enough == true
+            # Doc-coordinate of the tall block's top, measured while pinned at
+            # the bottom (the node is guaranteed rendered here — far away the
+            # virtual scroller may detach it and rects would read zero).
+            node_top_doc = Float64(TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                const node = chat.cache.get(chat.totalCount - 1);
+                return node.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop;
+            })()"""))
+            # Park far up first (follow off), then scroll DOWN to a position
+            # with the block's top half a viewport above the visible bottom:
+            # a pixel IS visible, but the gap exceeds one viewport → no
+            # re-engage, and a further small downward step doesn't either.
+            scroll_up_as_user!()
+            @test follow_mode() == false
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = $(node_top_doc) - c.clientHeight / 2;
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            # Sample the zone preconditions AFTER refresh has re-rendered the
+            # window at the new position (the block is partially visible now,
+            # so the helper must see a connected node).
+            sleep(0.3)
+            over_cap = TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
+                return !chat.lastMessageFullyOutOfView() && gap > c.clientHeight;
+            })()""")
+            @test over_cap == true
+            @test follow_mode() == false
+            # Small downward step, still beyond the cap → still no re-engage.
+            still_over = TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                const chat = c.__bt_chat;
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = c.scrollTop + 30;
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
+                return !chat.lastMessageFullyOutOfView() && gap > c.clientHeight;
+            })()""")
+            @test still_over == true
+            for _ in 1:5
+                @test follow_mode() == false
+                sleep(0.1)
+            end
+            # Inside the cap the zone applies again: downward to gap ≈ 0.6
+            # viewports (block still visible) → re-engage + chase to bottom.
+            TK.eval_js(s, """(() => {
+                const c = document.querySelector('.bt-messages');
+                c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+                c.scrollTop = (c.scrollHeight - c.clientHeight) - Math.floor(c.clientHeight * 0.6);
+                c.dispatchEvent(new Event('scroll', {bubbles: true}));
+                return true;
+            })()""")
+            @test TK.wait_for(s, "re-engaged once inside the viewport cap",
+                "document.querySelector('.bt-messages').__bt_chat.followMode === true"; timeout = 4) == true
+            @test TK.wait_for(s, "settled to bottom after capped re-engage",
+                """(() => {
+                    const c = document.querySelector('.bt-messages');
+                    return Math.round(c.scrollHeight - c.scrollTop - c.clientHeight) < 50;
+                })()"""; timeout = 4) == true
         end
 
         # ── 8. No JS errors during the whole exercise ───────────────────────

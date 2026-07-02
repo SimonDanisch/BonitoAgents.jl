@@ -251,6 +251,13 @@ class BonitoChat {
         // unconditionally, so being "at the bottom" means actually
         // there, not "near enough".
         this.AT_BOTTOM_PX = 20;
+        // Last processed scroll position — the delta against it gives a user
+        // scroll its DIRECTION (re-engage is downward-only, see
+        // _applyUserScroll). Kept fresh by the scroll handler and by every
+        // programmatic scrollTop write that may not fire a scroll event
+        // (offscreen renderers): scrollToBottom, the re-pin in updateVisible,
+        // onShown's restore, the lens reset, and the pan/momentum writes.
+        this._prevScrollTop = container.scrollTop;
 
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
@@ -502,7 +509,8 @@ class BonitoChat {
             const dt = 16;
             const delta = vel * dt;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            let newTop = this.container.scrollTop - delta;
+            const prevTop = this.container.scrollTop;
+            let newTop = prevTop - delta;
             let hitEdge = false;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + (-newTop) * PAN_BOUNCE_RESIST);
@@ -515,6 +523,13 @@ class BonitoChat {
             } else {
                 this.container.scrollTop = newTop;
             }
+            // The fling is the user's own gesture: classify the follow-mode
+            // transition at the write — offscreen renderers fire no scroll
+            // event for programmatic scrollTop writes, and when the event
+            // DOES fire it sees a zero delta against the synced
+            // _prevScrollTop and skips (never classified twice).
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             // Keep the user-input timestamp fresh so the scroll handler
             // continues classifying these programmatic scrollTop writes
             // as user-driven (= the fling the user threw). Without this
@@ -573,7 +588,8 @@ class BonitoChat {
             const stepDy = e.clientY - p.lastY;
             const stepDt = now - p.lastT;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            const newTop = this.container.scrollTop - stepDy;
+            const prevTop = this.container.scrollTop;
+            const newTop = prevTop - stepDy;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + (-newTop) * PAN_RESIST);
                 this.container.scrollTop = 0;
@@ -584,6 +600,13 @@ class BonitoChat {
                 if (this._overscroll !== 0) setOverscroll(0);
                 this.container.scrollTop = newTop;
             }
+            // A drag step is the user's own gesture — classify it at the
+            // write, exactly like the momentum step above (offscreen: no
+            // scroll event; onscreen: the trailing event is a zero-delta
+            // no-op). A downward re-engage never yanks mid-drag: the chase
+            // rAF re-arms while the input timestamp stays fresh.
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             if (stepDt > 0) {
                 // Exponentially-smoothed velocity (px/ms): noise-resistant
                 // and recency-biased so the release-instant velocity
@@ -635,12 +658,20 @@ class BonitoChat {
                 (performance.now() - this._lastUserInputT) < 400;
             this._pendingUserScroll = false;
             const atBot      = this.atBottom();
+            // Direction comes from the delta since the last processed
+            // position. A zero-delta event carries no movement — nothing to
+            // classify. That also makes the async scroll event trailing a
+            // pan/momentum scrollTop write (already classified at the write,
+            // which synced _prevScrollTop) a no-op instead of a double count.
+            const prevTop = this._prevScrollTop;
+            this._prevScrollTop = this.container.scrollTop;
             if (userDriven) {
-                // User-driven scroll → followMode reflects whether
-                // they landed at the bottom. Scrolling up → false,
-                // scrolling all the way back down → true.
-                this.setFollowMode(atBot);
-                if (!atBot) this._cancelPendingScroll();
+                // User-driven movement → the follow-mode transition lives in
+                // _applyUserScroll (razor-thin disengage; generous,
+                // downward-only re-engage at the pill's boundary).
+                if (this.container.scrollTop !== prevTop) {
+                    this._applyUserScroll(prevTop);
+                }
             } else if (this.followMode && !atBot) {
                 // Layout shift moved us off the bottom while in
                 // follow mode (viewport resize / attachment-bar
@@ -1092,6 +1123,10 @@ class BonitoChat {
         if (wasAtBottom && !userDriving &&
             this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
+            // Programmatic write, possibly event-less (offscreen): keep the
+            // direction baseline fresh so the next user scroll classifies
+            // against the real position (see _prevScrollTop).
+            this._prevScrollTop = this.container.scrollTop;
         }
     }
 
@@ -2807,7 +2842,8 @@ class BonitoChat {
             }
         }
         // Jump to the top of the filtered view so the first match is visible.
-        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this.refresh(); }
+        // (scrollTop write syncs _prevScrollTop: programmatic, possibly event-less.)
+        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this._prevScrollTop = 0; this.refresh(); }
     }
 
     onLensSaved(msg) {
@@ -2910,11 +2946,19 @@ class BonitoChat {
             // followMode, will queue a fresh chase here. Defensive
             // re-check: if the user gestured within the last 100 ms,
             // assume their scroll-down/up intent is still in flight and
-            // skip the chase. 100 ms covers the wheel→scroll-event
+            // don't yank mid-gesture. 100 ms covers the wheel→scroll-event
             // delay (typically one task ≪ 50 ms, generous for slow
             // devices) without locking out chase for the steady-state
-            // stream-while-at-bottom case.
-            if ((performance.now() - this._lastUserInputT) < 100) return;
+            // stream-while-at-bottom case. But follow mode SURVIVING to
+            // this point means nothing disengaged or cancelled us (a
+            // scroll-away lands in _applyUserScroll's disengage, which
+            // cancels through _cancelPendingScroll) — the chase must still
+            // land, e.g. after a downward re-engage mid-gesture. Re-arm
+            // until the input window lapses instead of dropping.
+            if ((performance.now() - this._lastUserInputT) < 100) {
+                if (this.followMode) this._queueScrollToBottom();
+                return;
+            }
             this.scrollToBottom();
         });
     }
@@ -2932,6 +2976,11 @@ class BonitoChat {
         if (anchor) {
             anchor.scrollIntoView({ block: 'end', behavior: 'auto' });
         }
+        // Keep the direction baseline honest where no scroll event may fire
+        // (see the offscreen note below): a chase leaving a stale, SMALLER
+        // _prevScrollTop would make the next upward peek read as "moving
+        // down" and wrongly re-engage.
+        this._prevScrollTop = this.container.scrollTop;
         // Don't rely on the `scroll` event to drive the post-scroll range
         // fetch — Electron's offscreen renderer (and a few other headless
         // browser configs) doesn't fire scroll events for programmatic
@@ -2993,6 +3042,9 @@ class BonitoChat {
                 if (this.followMode) this.scrollToBottom();
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
+                // Programmatic, possibly event-less write: sync the
+                // direction baseline (see _prevScrollTop).
+                this._prevScrollTop = this.container.scrollTop;
             }
         };
         apply();
@@ -3291,11 +3343,53 @@ class BonitoChat {
     }
 
     // ── Follow mode + unread pill ────────────────────────────────────────
+    // Classify ONE user-driven scroll movement (prevTop → current scrollTop)
+    // into the follow-mode transition. Called from the scroll handler AND
+    // directly at the pan/momentum scrollTop writes — offscreen renderers
+    // don't fire scroll events for programmatic writes (see scrollToBottom),
+    // and when the event DOES fire it sees a zero delta and skips, so the
+    // movement is never classified twice.
+    //
+    // DISENGAGE is razor-thin, direction-blind: any user scroll landing off
+    // the bottom (beyond AT_BOTTOM_PX) while following — even a small upward
+    // peek — turns follow off. RE-ENGAGE is generous but DOWNWARD-ONLY, and
+    // shares the jump-pill's boundary (pill visible ⟺ out of follow range):
+    // a downward scroll re-engages the moment any pixel of the last message
+    // is visible, capped at one viewport of remaining gap so a multi-screen-
+    // tall last message can't snap-skip content the user is still reading.
+    // Disengage runs first, so a continuous downward scroll THROUGH the zone
+    // doesn't flip-flop with event parity: every in-zone downward event
+    // lands on "following".
+    _applyUserScroll(prevTop) {
+        const { scrollTop, scrollHeight, clientHeight } = this.container;
+        const atBot = this.atBottom();
+        if (this.followMode && !atBot) {
+            this.setFollowMode(false);
+            this._cancelPendingScroll();
+        }
+        if (this.followMode) return;
+        if (atBot || (scrollTop > prevTop &&
+                      scrollHeight - scrollTop - clientHeight < clientHeight &&
+                      !this.lastMessageFullyOutOfView())) {
+            this.setFollowMode(true);
+            // Pin the viewport. The chase rAF defers while the gesture is
+            // still in flight and re-arms itself (see _queueScrollToBottom),
+            // so it lands right after the input window lapses — and a
+            // disengage meanwhile cancels it as always.
+            this._queueScrollToBottom();
+        } else {
+            // Off-bottom without re-engaging: any pending chase yields to
+            // the user's position (same cancel the old handler did).
+            this._cancelPendingScroll();
+        }
+    }
+
     // followMode is the one-bit "should new content auto-scroll" state.
     // It's set true when the user is at the bottom (within AT_BOTTOM_PX)
     // and the chat starts in this mode. Scrolling away → false. Sending
-    // a message, clicking the pill, or scrolling back to the bottom →
-    // true. Layout shifts never toggle it.
+    // a message, clicking the pill, or scrolling DOWN into the last-message
+    // zone (any pixel visible, less than a viewport to go) → true. Layout
+    // shifts never toggle it.
     setFollowMode(on) {
         if (this.followMode === on) return;
         this.followMode = on;

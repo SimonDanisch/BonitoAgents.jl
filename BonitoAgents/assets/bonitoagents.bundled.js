@@ -118,6 +118,7 @@ class BonitoChat {
         this.unreadCount = 0;
         this._pillShown = false;
         this.AT_BOTTOM_PX = 20;
+        this._prevScrollTop = container.scrollTop;
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.toolbarEl = (container.closest('.bt-app') || container.parentElement).querySelector('.bt-chat-toolbar');
@@ -263,7 +264,8 @@ class BonitoChat {
             if (this.destroyed) return;
             const delta = vel * 16;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            let newTop = this.container.scrollTop - delta;
+            const prevTop = this.container.scrollTop;
+            let newTop = prevTop - delta;
             let hitEdge = false;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + -newTop * 0.40);
@@ -276,6 +278,8 @@ class BonitoChat {
             } else {
                 this.container.scrollTop = newTop;
             }
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             this._lastUserInputT = performance.now();
             vel = hitEdge ? 0 : vel * PAN_FRICTION;
             if (Math.abs(vel) < 0.03) {
@@ -324,7 +328,8 @@ class BonitoChat {
             const stepDy = e.clientY - p.lastY;
             const stepDt = now - p.lastT;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            const newTop = this.container.scrollTop - stepDy;
+            const prevTop = this.container.scrollTop;
+            const newTop = prevTop - stepDy;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + -newTop * 0.55);
                 this.container.scrollTop = 0;
@@ -335,6 +340,8 @@ class BonitoChat {
                 if (this._overscroll !== 0) setOverscroll(0);
                 this.container.scrollTop = newTop;
             }
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             if (stepDt > 0) {
                 const instant = stepDy / stepDt;
                 p.velocity = 0.65 * instant + 0.35 * p.velocity;
@@ -372,9 +379,12 @@ class BonitoChat {
             const userDriven = this._scrollbarDrag || this._pendingUserScroll || performance.now() - this._lastUserInputT < 400;
             this._pendingUserScroll = false;
             const atBot = this.atBottom();
+            const prevTop = this._prevScrollTop;
+            this._prevScrollTop = this.container.scrollTop;
             if (userDriven) {
-                this.setFollowMode(atBot);
-                if (!atBot) this._cancelPendingScroll();
+                if (this.container.scrollTop !== prevTop) {
+                    this._applyUserScroll(prevTop);
+                }
             } else if (this.followMode && !atBot) {
                 this._queueScrollToBottom();
             }
@@ -717,6 +727,7 @@ class BonitoChat {
         const userDriving = this._scrollbarDrag || this._pendingUserScroll || performance.now() - this._lastUserInputT < 400;
         if (wasAtBottom && !userDriving && this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
+            this._prevScrollTop = this.container.scrollTop;
         }
     }
     onRange({ start , msgs  }) {
@@ -2032,6 +2043,7 @@ class BonitoChat {
         if (this.lensActive) {
             this.followMode = false;
             this.container.scrollTop = 0;
+            this._prevScrollTop = 0;
             this.refresh();
         }
     }
@@ -2084,7 +2096,10 @@ class BonitoChat {
             this._scrollQueued = false;
             this._scrollRafId = null;
             if (this.destroyed) return;
-            if (performance.now() - this._lastUserInputT < 100) return;
+            if (performance.now() - this._lastUserInputT < 100) {
+                if (this.followMode) this._queueScrollToBottom();
+                return;
+            }
             this.scrollToBottom();
         });
     }
@@ -2098,6 +2113,7 @@ class BonitoChat {
                 behavior: 'auto'
             });
         }
+        this._prevScrollTop = this.container.scrollTop;
         this.refresh();
     }
     onHidden() {
@@ -2118,6 +2134,7 @@ class BonitoChat {
                 if (this.followMode) this.scrollToBottom();
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
+                this._prevScrollTop = this.container.scrollTop;
             }
         };
         apply();
@@ -2329,6 +2346,21 @@ class BonitoChat {
         const app = this.app || this.container.closest('.bt-app');
         if (app) app.style.height = vv.height + 'px';
         if (this.followMode) this._queueScrollToBottom();
+    }
+    _applyUserScroll(prevTop) {
+        const { scrollTop , scrollHeight , clientHeight  } = this.container;
+        const atBot = this.atBottom();
+        if (this.followMode && !atBot) {
+            this.setFollowMode(false);
+            this._cancelPendingScroll();
+        }
+        if (this.followMode) return;
+        if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
+            this.setFollowMode(true);
+            this._queueScrollToBottom();
+        } else {
+            this._cancelPendingScroll();
+        }
     }
     setFollowMode(on) {
         if (this.followMode === on) return;
