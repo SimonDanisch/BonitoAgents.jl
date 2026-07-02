@@ -180,22 +180,11 @@ function run_suite(server)
             @test TK.wait_for(server, "pill hidden after dismiss", "!($pill_shown)"; timeout = 10) == true
             @test TK.eval_js(server, row_visible) == true
 
-            # A discovered entry whose folder no longer exists is the ONE thing
-            # discover drops. Append such an entry and assert it never renders
-            # (while the real rows are unaffected).
-            lock(state.lock) do
-                push!(state.discovered[][wid],
-                    Dict{String,Any}("session_id" => "dddd4444",
-                                     "path" => joinpath(tempdir(), "bt-gone-$(getpid())"),
-                                     "name" => "Gone",
-                                     "first_prompt" => "ghost session in a deleted folder",
-                                     "last_used" => 1.71e9, "kind" => "session"))
-            end
-            notify(state.discovered)
-            sleep(0.5)   # give the tree a paint cycle to (not) add it
-            @test TK.eval_js(server,
-                "![...document.querySelectorAll('.bt-session-name-text')].some(e => (e.textContent||'').includes('ghost session'))") == true
-            @test TK.eval_js(server, row_visible) == true
+            # NOTE: the "folder no longer exists" drop happens WORKER-side at
+            # scan time (`entry_from_jsonl`'s isdir — the paths live on the
+            # worker's disk, not the server's), so the server renders whatever
+            # the worker published. That filter is covered by the worker-scan
+            # unit test (unit:worker_scan), not here.
         end
 
         @testset "switch to the active chat, then close it" begin

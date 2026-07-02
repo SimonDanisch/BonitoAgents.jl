@@ -381,12 +381,14 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             # parent jsonl) drops out of the list entirely.
             String(get(r, "kind", "session")) == "subagent" && continue
             p = String(get(r, "path", ""))
-            # The ONLY drop condition: the project folder no longer exists.
-            # Discover is otherwise UNCONDITIONAL — a session that's already an
-            # open chat stays VISIBLE with an "in sidebar" pill (hiding it made
-            # sessions look lost whenever sidebar state and discover disagreed);
-            # clicking it reuses the existing thread (`find_thread` dedup).
-            isdir(p) || continue
+            # Discover renders the worker's scan UNCONDITIONALLY — a session
+            # that's already an open chat stays VISIBLE with an "in sidebar"
+            # pill (hiding it made sessions look lost whenever sidebar state
+            # and discover disagreed); clicking it reuses the existing thread
+            # (`find_thread` dedup). The only drop — "project folder no longer
+            # exists" — happens WORKER-side in `entry_from_jsonl` (the paths
+            # live on the worker's disk; an `isdir` here on the server box
+            # would wrongly drop every row of a remote worker).
             push!(get!(by_path, p, Any[]), r)
             ts = get(r, "last_used", 0.0)
             t = ts isa Number ? Float64(ts) : 0.0
