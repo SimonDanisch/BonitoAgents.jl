@@ -864,6 +864,23 @@ const ChatStyles = Bonito.Styles(
         "content" => "'✓ '",
         "color" => "var(--bt-success, #16a34a)"),
 
+    # Subagent Task pills: the current-activity one-liner between the label
+    # and the elapsed clock (taskbar.jl renders it from the Julia clock tick).
+    # `bt-task-stale` = no subagent event for the staleness window — the line
+    # turns amber and the :has() rule tints the whole pill.
+    CSS(".bt-taskbar-activity",
+        "flex" => "0 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "font-size" => "10.5px",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-taskbar-activity:empty", "display" => "none"),
+    CSS(".bt-taskbar-activity.bt-task-stale",
+        "color" => "var(--bt-warning)",
+        "font-weight" => "600"),
+    CSS(".bt-taskbar-slot:has(.bt-task-stale)",
+        "border-color" => "rgba(245,158,11,0.6)",
+        "background" => "rgba(245,158,11,0.08)"),
+
     # Mini stop button — the composer stop button's little sibling, shared
     # by taskbar slots and live tool pills: bordered circle, red rounded
     # square drawn via ::before. ALWAYS visible (no hover reveal — a stop
@@ -999,6 +1016,41 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-eval-preview-toggle:hover",
         "background" => "rgba(255,255,255,0.18)"),
+
+    # Subagent activity feed inside a Task tool bubble: a second collapsible
+    # section between the header and the lazy body (bonitoagents.js builds it
+    # from the header's `task_feed` snapshot + live `task_activity` events).
+    # Most-recent-last, auto-scrolled, bounded like the server-side window.
+    CSS(".bt-task-feed",
+        "border-top" => "1px solid var(--bt-border)"),
+    CSS(".bt-task-feed-head",
+        "display" => "flex", "align-items" => "center", "gap" => "6px",
+        "padding" => "3px 12px",
+        "font-size" => "11px",
+        "color" => "var(--bt-text-muted)",
+        "user-select" => "none"),
+    CSS(".bt-task-feed-count",
+        "color" => "var(--bt-text-faint)",
+        "font-family" => "ui-monospace, monospace"),
+    CSS(".bt-task-feed-list",
+        "max-height" => "180px",
+        "overflow-y" => "auto",
+        "padding" => "2px 12px 8px",
+        "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
+    CSS(".bt-task-feed-entry",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-task-feed-entry.bt-task-feed-tool",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px",
+        "color" => "var(--bt-text)"),
+    CSS(".bt-task-feed-entry.bt-task-feed-thought",
+        "font-style" => "italic",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-task-feed-entry.bt-feed-failed",
+        "color" => "var(--bt-error)"),
 
     CSS(".bt-tool-body",
         "padding" => "0 12px 10px",

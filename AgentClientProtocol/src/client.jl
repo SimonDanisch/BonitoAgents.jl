@@ -176,8 +176,15 @@ end
 # outlives the turn.
 #
 # `images` are appended after the text as ACP image content blocks.
+#
+# `on_subagent` is the turn's out-of-band sink for subagent-tagged updates
+# (`_meta.claudeCode.parentToolUseId`): called with each `SubagentActivity`
+# straight from the coalescer task, so a live parent-Task feed keeps moving
+# even while the message consumer is parked inside another message's drain.
+# `nothing` drops subagent updates (they never reach the message channel).
 function prompt!(client::Client, text::String;
-                 images::Vector{ImageAttachment} = ImageAttachment[])
+                 images::Vector{ImageAttachment} = ImageAttachment[],
+                 on_subagent::Union{Function,Nothing} = nothing)
     blocks = Any[Dict("type" => "text", "text" => text)]
     for img in images
         push!(blocks, Dict(
@@ -190,7 +197,7 @@ function prompt!(client::Client, text::String;
     updates, response = prompt_updates(client.conn, params)
     conn = client.conn
     return Channel{Message}(BUF) do messages
-        st = TurnState()
+        st = TurnState(on_subagent)
         try
             for u in updates
                 # Once cancel is issued, stop coalescing/rendering and just

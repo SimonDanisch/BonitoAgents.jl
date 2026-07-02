@@ -814,6 +814,7 @@ class BonitoChat {
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
+            case 'task_activity':return this.onTaskActivity(msg);
             case 'plan_update':  return this.onPlanUpdate(msg);
             case 'chunk':        return this.appendChunk(msg);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
@@ -1942,6 +1943,70 @@ class BonitoChat {
         }
     }
 
+    // ── Subagent activity feed (Task tool bubbles) ───────────────────────
+    // The server routes every parentToolUseId-tagged subagent update to its
+    // parent TaskToolMsg and mirrors it here as `task_activity` events; the
+    // bubble renders them as a bounded, most-recent-last, auto-scrolled feed
+    // in its own collapsible section between the header and the lazy body
+    // (same Collapsable behaviour the tool body / thought sections use).
+    // Remounts rebuild from the header's `task_feed` snapshot (createNode).
+
+    onTaskActivity(msg) {
+        const node = this.nodeById.get(msg.id);
+        if (!node || !msg.entry) return;
+        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry);
+    }
+
+    _ensureTaskFeed(node) {
+        let feed = node.querySelector('.bt-task-feed');
+        if (feed) return feed;
+        feed = document.createElement('div');
+        feed.className = 'bt-task-feed';
+        feed.innerHTML = `
+            <div class="bt-task-feed-head" data-expanded="false">
+                <span class="bt-tool-toggle">▶</span>
+                <span class="bt-task-feed-title">subagent activity</span>
+                <span class="bt-task-feed-count"></span>
+            </div>
+            <div class="bt-task-feed-list"></div>`;
+        node.querySelector('.bt-tool-header')?.insertAdjacentElement('afterend', feed) ||
+            node.appendChild(feed);
+        const list = feed.querySelector('.bt-task-feed-list');
+        feed._collapsable = new Collapsable(
+            feed.querySelector('.bt-task-feed-head'), list,
+            { toggleEl: feed.querySelector('.bt-task-feed-head .bt-tool-toggle') });
+        // Live task: open by default so the activity is visible as it
+        // streams; finished/replayed bubbles start collapsed (a click on
+        // the section head re-opens — the list is filled either way).
+        if (node.classList.contains('bt-tool-live')) {
+            feed._collapsable.setExpanded(true);
+        } else {
+            list.style.display = 'none';
+        }
+        return feed;
+    }
+
+    _upsertTaskFeedEntry(feed, e) {
+        const list = feed.querySelector('.bt-task-feed-list');
+        let row = e.eid != null ?
+            list.querySelector(`[data-eid="${CSS.escape(String(e.eid))}"]`) : null;
+        if (!row) {
+            row = document.createElement('div');
+            row.dataset.eid = String(e.eid ?? '');
+            list.appendChild(row);
+            // Bounded mirror of the server's feed window.
+            while (list.children.length > 50) list.removeChild(list.firstChild);
+        }
+        row.className = `bt-task-feed-entry bt-task-feed-${e.kind || 'text'}` +
+            (e.status ? ` bt-feed-${e.status}` : '');
+        row.textContent = e.kind === 'tool' ? `⚙ ${e.label || ''}` : (e.label || '');
+        if (e.kind === 'tool' && e.status) row.title = e.status;
+        const count = feed.querySelector('.bt-task-feed-count');
+        if (count) count.textContent = String(list.children.length);
+        // Most-recent-last + auto-scroll while the section is open.
+        if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
+    }
+
     // ── Message filter (toolbar below the composer) ──────────────────────
 
     // First occurrence of a filter key → add its show/hide checkbox to the
@@ -2121,6 +2186,12 @@ class BonitoChat {
                       editMode: isEdit,
                       fetchEachExpand: !isEdit, discardOnCollapse: !isEdit,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
+                // Subagent Task: rebuild the live activity feed from the
+                // header's snapshot (live growth rides task_activity events).
+                if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
+                    const feed = this._ensureTaskFeed(div);
+                    for (const e of msg.task_feed) this._upsertTaskFeedEntry(feed, e);
+                }
                 // Detach (bonito_app only): pop the embed into the floating
                 // window. Lives on the ⤢ header button — the conventional "open
                 // in a window" glyph, and where users expect detach. Routed

@@ -478,6 +478,26 @@ BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
 bash_display_title(b::BashToolMsg) =
     b.description === nothing || isempty(b.description) ? b.title : b.description
 
+# One line of a subagent's live activity, kept on its parent `TaskToolMsg`.
+# RAM-only: the feed is never persisted — `stamp_feed_summary!` leaves a
+# one-line "N steps, finished HH:MM" trace in the persisted summary instead.
+# `eid` is a per-feed sequence number the JS upserts by: consecutive text
+# chunks coalesce into one entry, and a subagent tool's status update rewrites
+# the entry that announced the tool (see note_activity!).
+struct TaskActivityEntry
+    eid::Int
+    kind::Symbol        # :text | :thought | :tool
+    tool_id::String     # subagent tool_call id ("" for text/thought)
+    label::String       # one-line rendered summary (tool title / truncated text)
+    status::String      # subagent tool status ("" for text/thought)
+    at::Float64         # epoch seconds of the entry's last change
+    # Raw accumulator behind `label` for coalescing text entries: `label` is
+    # stripped/flattened, so appending the next chunk to IT would lose the
+    # chunk-boundary whitespace. Capped a bit past the label limit — once the
+    # label is full, further chunks can't change it anyway.
+    raw::String
+end
+
 mutable struct TaskToolMsg <: ToolMsg
     id::String
     kind::String
@@ -490,7 +510,23 @@ mutable struct TaskToolMsg <: ToolMsg
     is_background::Bool
     task_name::Union{String,Nothing}      # SDK `name` — for SendMessage addressing
     chat::Union{ChatModel,Nothing}
+    # Live subagent feed (route_subagent_activity!), bounded to the most
+    # recent entries. `activity_seq` counts every entry EVER created (it
+    # outlives the bounded window and feeds the persisted "N steps" trace);
+    # `last_activity_at` drives the taskbar staleness state (taskbar_activity).
+    # All feed fields are guarded by the shared chat lock.
+    activity::Vector{TaskActivityEntry}
+    activity_seq::Int
+    last_activity_at::Float64
+    feed_summarized::Bool                 # stamp_feed_summary! ran (close is not once-only)
 end
+
+# Back-compat 11-arg form (pre-feed): the build/replay paths and test fixtures.
+TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
+            description, is_background, task_name, chat) =
+    TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
+                description, is_background, task_name, chat,
+                TaskActivityEntry[], 0, time(), false)
 
 mutable struct MCPToolMsg <: ToolMsg
     id::String
@@ -713,7 +749,31 @@ function tool_taskbar_item(chat::ChatModel, b::ToolMsg)
         i === nothing ? -1 : i - 1
     end
     TaskbarItem(b.id, :tool, tool_icon(b.kind), taskbar_label(b);
-                started = b.started_at, stoppable = true, msg_index = idx)
+                started = b.started_at, stoppable = true, msg_index = idx,
+                source = b)
+end
+
+# Taskbar current-activity hooks (declared in taskbar.jl, which is included
+# before this file): a pinned subagent Task pill shows the feed's latest
+# one-liner next to its elapsed clock, and flips to an amber "no activity Xm"
+# staleness state when the feed goes quiet.
+has_activity_feed(::TaskToolMsg) = true
+function taskbar_activity(m::TaskToolMsg, now::Float64)
+    is_live(m) || return nothing
+    last_at, label = if m.chat === nothing
+        (m.last_activity_at, isempty(m.activity) ? "" : last(m.activity).label)
+    else
+        lock(shared(m.chat).lock) do
+            (m.last_activity_at, isempty(m.activity) ? "" : last(m.activity).label)
+        end
+    end
+    idle = now - last_at
+    # 120 s without any subagent event flips the pill stale — long enough to
+    # ride out a slow tool run / model latency, short enough to answer "is it
+    # dead or just slow?" while the task is still worth waiting on.
+    idle > 120.0 &&
+        return (label = "no activity $(floor(Int, idle / 60))m", stale = true)
+    return (label = label, stale = false)
 end
 
 function pin_tool!(chat::ChatModel, b::ToolMsg)
@@ -921,6 +981,13 @@ function augment_header!(d::Dict, m::TaskToolMsg, chat_dir::AbstractString)
     m.is_background && (d["background"] = true)
     d["stoppable"] = true
     m.task_name === nothing || (d["task_name"] = m.task_name)
+    # Subagent-feed snapshot: a remounted / scrolled-back bubble rebuilds its
+    # activity section from the header alone (live growth rides the
+    # `task_activity` events). Copied under the shared lock — the feed is
+    # mutated on the turn's coalescer task.
+    entries = m.chat === nothing ? copy(m.activity) :
+        lock(() -> copy(m.activity), shared(m.chat).lock)
+    isempty(entries) || (d["task_feed"] = [entry_wire(e) for e in entries])
     augment_generic_header!(d, chat_dir)
 end
 # The BonitoMCP eval family. These get the live-code preview, the timeout
@@ -2079,7 +2146,30 @@ finalize_orphan!(::ChatMsg) = nothing
 # reload couldn't show the tool either). Callers should not need to satisfy a
 # precondition on `status` — that's exactly the "wrong-by-construction" shape
 # we're trying to avoid here.
+# Close-time hook: the subagent feed is RAM-only, but history keeps a
+# one-line trace — fold "N steps, finished HH:MM" into the summary BEFORE the
+# terminal emit/persist below. Guarded by `feed_summarized`: close is not
+# once-only for a Task pill (per-tool drain finally + user stop / orphan
+# sweep can each reach it), and the chat.md append must not double the note.
+stamp_feed_summary!(::ToolMsg) = nothing
+function stamp_feed_summary!(m::TaskToolMsg)
+    (m.feed_summarized || m.activity_seq == 0) && return nothing
+    m.feed_summarized = true
+    n = m.activity_seq
+    note = "$(n) step$(n == 1 ? "" : "s"), finished $(Dates.format(Dates.now(), "HH:MM"))"
+    m.summary = isempty(m.summary) ? note : "$(m.summary) · $note"
+    # The last snap's tool_update already shipped the pre-note summary;
+    # re-ship so the live header shows the trace without a reload. (The
+    # non-terminal branch of `close` below emits too, but a Task that
+    # completed normally never takes that branch.)
+    m.chat === nothing || chat_emit(m.chat, Dict{String,Any}(
+        "type" => "tool_update", "id" => m.id,
+        "status" => m.status, "summary" => m.summary))
+    return nothing
+end
+
 function Base.close(m::ToolMsg)
+    stamp_feed_summary!(m)
     if !(m.status in ("completed", "failed"))
         m.status = "failed"
         pretty_title, _ = pretty_tool_title(m.title)
@@ -2911,6 +3001,86 @@ function Base.close(model::ChatModel)
     return nothing
 end
 
+# ── Subagent activity routing ────────────────────────────────────────────────
+# Installed as `prompt!`'s `on_subagent` sink (see begin_turn!): every update a
+# running subagent streams — tagged `_meta.claudeCode.parentToolUseId` by
+# claude-agent-acp — lands here INSTEAD of the main transcript, feeding the
+# parent TaskToolMsg's bounded activity feed and the `task_activity` wire
+# event the bubble/taskbar render live. Unknown parent id (a nested
+# subagent's sub-tool, or the parent's tool_call still buffered ahead of the
+# message consumer) → DROP with a debug log; interleaving subagent prose into
+# the top-level reply is exactly the failure mode this routing removes.
+function route_subagent_activity!(chat::ChatModel,
+                                  act::AgentClientProtocol.SubagentActivity)
+    s = shared(chat)
+    entry = lock(s.lock) do
+        idx = findlast(m -> m isa TaskToolMsg && m.id == act.parent_id, s.msgs_store)
+        idx === nothing ? nothing : note_activity!(s.msgs_store[idx]::TaskToolMsg, act)
+    end
+    if entry === nothing
+        @debug "subagent activity dropped (no parent TaskToolMsg)" parent_id = act.parent_id kind = act.kind
+        return nothing
+    end
+    # Observable write OUTSIDE the lock (listener/JS-bridge rule, see pin_task!).
+    chat_emit(chat, Dict{String,Any}("type" => "task_activity",
+        "id" => act.parent_id, "entry" => entry_wire(entry),
+        "last_at" => entry.at))
+    return nothing
+end
+
+# One-line, length-capped feed label: subagent text chunks carry newlines and
+# stream long; the feed rows / taskbar line are single-line.
+function feed_label(s::AbstractString)
+    flat = replace(strip(s), r"\s+" => " ")
+    return length(flat) <= 140 ? String(flat) : first(flat, 139) * "…"
+end
+
+# Fold one SubagentActivity into the parent's bounded feed. Returns the
+# created/updated `TaskActivityEntry`. Caller holds the shared chat lock.
+function note_activity!(m::TaskToolMsg, act::AgentClientProtocol.SubagentActivity)
+    now_t = time()
+    m.last_activity_at = now_t
+    feed = m.activity
+    if act.kind === :tool && !isempty(act.tool_id)
+        # A tool_call_update rewrites the entry that announced the tool
+        # (status flip / late title) instead of spamming a new row.
+        i = findlast(e -> e.tool_id == act.tool_id, feed)
+        if i !== nothing
+            e = feed[i]
+            raw = isempty(act.label) ? e.raw : act.label
+            feed[i] = TaskActivityEntry(e.eid, :tool, e.tool_id,
+                feed_label(raw),
+                isempty(act.status) ? e.status : act.status, now_t, raw)
+            return feed[i]
+        end
+    elseif act.kind in (:text, :thought) && !isempty(feed) &&
+           last(feed).kind === act.kind
+        # Consecutive prose chunks coalesce into the tail entry — a feed line
+        # per streamed token fragment would be noise, not activity. Append to
+        # the RAW accumulator (capped: past the label limit more text can't
+        # change the rendering) and re-render the one-line label.
+        e = last(feed)
+        raw = length(e.raw) >= 160 ? e.raw : first(e.raw * act.label, 160)
+        feed[end] = TaskActivityEntry(e.eid, e.kind, "",
+            feed_label(raw), "", now_t, raw)
+        return feed[end]
+    end
+    m.activity_seq += 1
+    raw = first(act.label, 160)
+    entry = TaskActivityEntry(m.activity_seq, act.kind, act.tool_id,
+        feed_label(raw), act.kind === :tool ? act.status : "", now_t, raw)
+    push!(feed, entry)
+    # Bounded window: the feed answers "what is it doing NOW", not "what has
+    # it done" — keep the last 50 entries (the close-time summary keeps the
+    # total count via activity_seq).
+    length(feed) > 50 && popfirst!(feed)
+    return entry
+end
+
+entry_wire(e::TaskActivityEntry) = Dict{String,Any}(
+    "eid" => e.eid, "kind" => String(e.kind), "tool_id" => e.tool_id,
+    "label" => e.label, "status" => e.status, "at" => e.at)
+
 # One user turn: drive the prompt and render each whole message of the agent's
 # reply. The user bubble is ALREADY rendered + persisted — `send_message!` did
 # that synchronously when the user hit send, so the message appears in the
@@ -2965,8 +3135,12 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     seq = (s.turn_seq[] += 1)
     chat_emit(chat, Dict{String,Any}("type" => "turn_begin", "seq" => seq))
     try
+        # `on_subagent`: divert parentToolUseId-tagged updates (a running
+        # subagent's text/tool stream) into the parent TaskToolMsg's live
+        # feed — never into the main transcript.
         return AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
-            images=user_msg.images)
+            images=user_msg.images,
+            on_subagent = act -> route_subagent_activity!(chat, act))
     catch e
         # Failed to even send: release the slot we claimed; surface the error
         # like a failed turn would. A failed start releases the last turn, so

@@ -24,13 +24,25 @@ struct TaskbarItem
     # Todo lists only: every entry, rendered in full — finished ones are
     # crossed out, the in-progress one highlighted.
     entries   :: Vector{Tuple{String,String}} # (content, status)
+    # Live-source handle for pills that expose a current-activity line
+    # (the subagent `TaskToolMsg` feed — see `taskbar_activity` below and its
+    # chat.jl overloads). `Any` because the message types live in chat.jl,
+    # which is included AFTER this file. `nothing` for everything else.
+    source    :: Any
 end
 
 TaskbarItem(id, kind, icon, label; started = time(), stoppable = false,
-            msg_index = -1, entries = Tuple{String,String}[]) =
+            msg_index = -1, entries = Tuple{String,String}[], source = nothing) =
     TaskbarItem(String(id), kind, String(icon), String(label),
                 Float64(started), stoppable, Int(msg_index),
-                collect(Tuple{String,String}, entries))
+                collect(Tuple{String,String}, entries), source)
+
+# Current-activity affordance for slot sources with a live subagent feed.
+# chat.jl overloads both for `TaskToolMsg`; the fallbacks keep every other
+# slot unchanged. `taskbar_activity(source, now)` returns
+# `(label = <one-liner>, stale = <Bool>)` or `nothing` (no line).
+has_activity_feed(::Any) = false
+taskbar_activity(::Any, ::Float64) = nothing
 
 """
     TaskBar(items, clock) -> TaskBar
@@ -70,6 +82,21 @@ function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::Taskba
         DOM.span(item.label; class = "bt-taskbar-slot-label"),
         timer,
     ]
+    if has_activity_feed(item.source)
+        # Subagent current-activity one-liner + staleness, re-derived on the
+        # SAME 1 Hz Julia clock tick that drives the elapsed labels: while the
+        # feed moves it shows the latest entry; once it goes quiet past the
+        # staleness window the span turns amber (`bt-task-stale`, and the
+        # whole pill via the :has() rule) and reads "no activity Xm" — the
+        # "dead or just slow?" answer.
+        activity = map(session, bar.clock) do now
+            st = taskbar_activity(item.source, now)
+            st === nothing && return DOM.span(""; class = "bt-taskbar-activity")
+            DOM.span(st.label; class = st.stale ?
+                "bt-taskbar-activity bt-task-stale" : "bt-taskbar-activity")
+        end
+        insert!(head, 3, activity)   # between the label and the elapsed timer
+    end
     # Always-visible stop, styled like the composer's stop button
     # (.bt-stop-mini draws the red square).
     item.stoppable && push!(head, DOM.button(;

@@ -117,6 +117,13 @@ pack_tool_content(items) = Any[
                                                "text" => String(c["text"])))
     end for c in items]
 
+# The `_meta` envelope claude-agent-acp stamps on every forwarded SUBAGENT
+# update: the parent Task's tool_use id. Used by the sub_text / sub_tool
+# dispatcher events.
+sub_meta(ev::AbstractDict) =
+    Dict{String,Any}("claudeCode" =>
+        Dict{String,Any}("parentToolUseId" => String(ev["parent"])))
+
 resp(id, result) =
     emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
 
@@ -330,6 +337,33 @@ function run_dispatcher_prompt(prompt_id)
             agent_chunk(String(ev["text"]))
         elseif et == "thought"
             thought_chunk(String(ev["text"]))
+        elseif et == "sub_text"
+            # A SUBAGENT's prose: the same agent_message_chunk frame as
+            # `text`, but tagged with the parent Task's tool_use id via
+            # `_meta.claudeCode.parentToolUseId` — exactly how
+            # claude-agent-acp forwards subagent output (its acp-agent.js
+            # stamps every forwarded subagent update with that meta).
+            upd("agent_message_chunk", Dict{String,Any}(
+                "content" => Dict("type" => "text", "text" => String(ev["text"])),
+                "_meta"   => sub_meta(ev)))
+        elseif et == "sub_tool"
+            # A SUBAGENT's tool use: tool_call (announcement) or
+            # tool_call_update (status flip on the announced id), tagged
+            # like sub_text above.
+            tid = String(get(ev, "id", "subtool-$(next_tool_id)")); next_tool_id += 1
+            if Bool(get(ev, "update", false))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid,
+                    "status" => String(get(ev, "status", "completed")),
+                    "_meta"  => sub_meta(ev)))
+            else
+                upd("tool_call", Dict{String,Any}(
+                    "toolCallId" => tid,
+                    "kind"   => String(get(ev, "kind", "other")),
+                    "title"  => String(get(ev, "title", "tool")),
+                    "status" => String(get(ev, "status", "in_progress")),
+                    "_meta"  => sub_meta(ev)))
+            end
         elseif et == "edit"
             # Edit tool with one DiffContent. The chat side keys off
             # `kind == "edit"` to route to the Monaco DiffEditor body.

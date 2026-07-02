@@ -48,6 +48,7 @@ const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_f
 
 export TestServer, dev_server, add_worker!,
        text, thought, edit, bash, todo, delay, tool, tool_update,
+       sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn, bt_eval, bt_show_app,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
@@ -157,6 +158,36 @@ tool_update(id; status = nothing, content = nothing, raw_input = nothing) = begi
     status    === nothing || (d["status"]    = String(status))
     content   === nothing || (d["content"]   = content)
     raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
+    d
+end
+
+"""
+    sub_text(parent_id, s) -> Dict
+
+Agent event that emits the SAME `agent_message_chunk` frame as [`text`](@ref)
+but tagged `_meta.claudeCode.parentToolUseId = parent_id` — the way
+claude-agent-acp forwards a running SUBAGENT's prose. The chat must route it
+into the parent Task bubble's activity feed, never the main transcript.
+"""
+sub_text(parent_id, s::AbstractString) = Dict{String,Any}(
+    "type" => "sub_text", "parent" => String(parent_id), "text" => String(s))
+
+"""
+    sub_tool(parent_id; kind, title, status, id, update = false) -> Dict
+
+Agent event that emits a subagent TOOL frame tagged with
+`_meta.claudeCode.parentToolUseId = parent_id`: a `tool_call` announcement by
+default, or (with `update = true`) a `tool_call_update` that flips the
+already-announced sub-tool's status — mirroring the frames claude-agent-acp
+forwards for a subagent's tool use. Feeds the parent Task bubble's activity
+feed (one entry per sub-tool id, status rewritten in place).
+"""
+sub_tool(parent_id; kind = "other", title = "tool", status = "in_progress",
+         id = nothing, update = false) = begin
+    d = Dict{String,Any}("type" => "sub_tool", "parent" => String(parent_id),
+                         "kind" => String(kind), "title" => String(title),
+                         "status" => String(status), "update" => update)
+    id === nothing || (d["id"] = String(id))
     d
 end
 

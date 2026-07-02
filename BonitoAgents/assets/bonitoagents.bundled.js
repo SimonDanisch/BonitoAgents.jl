@@ -528,6 +528,8 @@ class BonitoChat {
                 return this.onThoughtBody(msg);
             case 'tool_update':
                 return this.onToolUpdate(msg);
+            case 'task_activity':
+                return this.onTaskActivity(msg);
             case 'plan_update':
                 return this.onPlanUpdate(msg);
             case 'chunk':
@@ -1319,6 +1321,51 @@ class BonitoChat {
             }
         }
     }
+    onTaskActivity(msg) {
+        const node = this.nodeById.get(msg.id);
+        if (!node || !msg.entry) return;
+        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry);
+    }
+    _ensureTaskFeed(node) {
+        let feed = node.querySelector('.bt-task-feed');
+        if (feed) return feed;
+        feed = document.createElement('div');
+        feed.className = 'bt-task-feed';
+        feed.innerHTML = `
+            <div class="bt-task-feed-head" data-expanded="false">
+                <span class="bt-tool-toggle">▶</span>
+                <span class="bt-task-feed-title">subagent activity</span>
+                <span class="bt-task-feed-count"></span>
+            </div>
+            <div class="bt-task-feed-list"></div>`;
+        node.querySelector('.bt-tool-header')?.insertAdjacentElement('afterend', feed) || node.appendChild(feed);
+        const list = feed.querySelector('.bt-task-feed-list');
+        feed._collapsable = new Collapsable(feed.querySelector('.bt-task-feed-head'), list, {
+            toggleEl: feed.querySelector('.bt-task-feed-head .bt-tool-toggle')
+        });
+        if (node.classList.contains('bt-tool-live')) {
+            feed._collapsable.setExpanded(true);
+        } else {
+            list.style.display = 'none';
+        }
+        return feed;
+    }
+    _upsertTaskFeedEntry(feed, e) {
+        const list = feed.querySelector('.bt-task-feed-list');
+        let row = e.eid != null ? list.querySelector(`[data-eid="${CSS.escape(String(e.eid))}"]`) : null;
+        if (!row) {
+            row = document.createElement('div');
+            row.dataset.eid = String(e.eid ?? '');
+            list.appendChild(row);
+            while(list.children.length > 50)list.removeChild(list.firstChild);
+        }
+        row.className = `bt-task-feed-entry bt-task-feed-${e.kind || 'text'}` + (e.status ? ` bt-feed-${e.status}` : '');
+        row.textContent = e.kind === 'tool' ? `⚙ ${e.label || ''}` : e.label || '';
+        if (e.kind === 'tool' && e.status) row.title = e.status;
+        const count = feed.querySelector('.bt-task-feed-count');
+        if (count) count.textContent = String(list.children.length);
+        if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
+    }
     noteKey(msg) {
         const key = filterKey(msg);
         if (!key || this.seenTypes.has(key)) return;
@@ -1431,6 +1478,10 @@ class BonitoChat {
                                 id
                             })
                     });
+                    if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
+                        const feed = this._ensureTaskFeed(div);
+                        for (const e of msg.task_feed)this._upsertTaskFeedEntry(feed, e);
+                    }
                     const detachBtn = div.querySelector('.bt-tool-detach');
                     if (detachBtn) detachBtn.addEventListener('click', (e)=>{
                         e.stopPropagation();

@@ -307,6 +307,106 @@ end
         @test timedwait(() -> !process_running(proc), 5.0) === :ok
     end
 
+    # ── Subagent tagging: `_meta.claudeCode.parentToolUseId` ─────────────────
+    # claude-agent-acp forwards every SUBAGENT session/update (its text chunks,
+    # tool_calls, tool_call_updates) tagged with the parent Task's tool_use id.
+    # The parser must surface the tag; the per-turn coalescer must divert such
+    # updates OUT of the main message stream (they'd otherwise interleave
+    # subagent prose into the top-level reply) and hand them to the turn's
+    # `on_subagent` sink — or drop them when no sink is installed.
+    @testset "parentToolUseId extraction (present / absent / malformed)" begin
+        chunk(meta...) = merge(
+            Dict{String,Any}("sessionUpdate" => "agent_message_chunk",
+                             "content" => Dict("type" => "text", "text" => "hi")),
+            Dict{String,Any}(meta...))
+
+        # Present: parse wraps the typed update in SubagentUpdate.
+        u = ACP.parse_session_update(chunk(
+            "_meta" => Dict("claudeCode" => Dict("parentToolUseId" => "task-1"))))
+        @test u isa ACP.SubagentUpdate
+        @test ACP.parent_tool_use_id(u) == "task-1"
+        @test u.update isa ACP.AgentMessageChunk
+        @test u.update.content.text == "hi"
+
+        # Absent: plain typed update, accessor says nothing.
+        u = ACP.parse_session_update(chunk())
+        @test u isa ACP.AgentMessageChunk
+        @test ACP.parent_tool_use_id(u) === nothing
+
+        # Malformed envelopes at every level must not throw and not tag.
+        for meta in (Dict("_meta" => "nope"),
+                     Dict("_meta" => Dict("claudeCode" => 42)),
+                     Dict("_meta" => Dict("claudeCode" => Dict())),
+                     Dict("_meta" => Dict("claudeCode" =>
+                          Dict("parentToolUseId" => 7))),
+                     Dict("_meta" => Dict("claudeCode" =>
+                          Dict("parentToolUseId" => ""))))
+            u = ACP.parse_session_update(chunk(meta...))
+            @test u isa ACP.AgentMessageChunk
+            @test ACP.parent_tool_use_id(u) === nothing
+        end
+
+        # A subagent tool_call keeps its claudeCode.toolName alongside the tag.
+        u = ACP.parse_session_update(Dict{String,Any}(
+            "sessionUpdate" => "tool_call",
+            "toolCallId" => "sub-1", "kind" => "search",
+            "title" => "Grep foo", "status" => "in_progress",
+            "_meta" => Dict("claudeCode" => Dict(
+                "toolName" => "Grep", "parentToolUseId" => "task-1"))))
+        @test u isa ACP.SubagentUpdate
+        @test ACP.parent_tool_use_id(u) == "task-1"
+        @test u.update isa ACP.ToolCallNotif
+        @test u.update.tool_name == "Grep"
+    end
+
+    @testset "parse_update! diverts subagent updates to the sink" begin
+        sub(pid, u) = ACP.SubagentUpdate(pid, u)
+        txt(s)  = ACP.AgentMessageChunk(ACP.TextContent(s))
+        tcall(id, title, status) = ACP.parse_session_update(Dict{String,Any}(
+            "sessionUpdate" => "tool_call", "toolCallId" => id,
+            "kind" => "search", "title" => title, "status" => status))
+
+        # With a sink: every tagged update becomes a SubagentActivity, the
+        # main stream (out + current_message + tools) stays untouched.
+        acts = ACP.SubagentActivity[]
+        st  = ACP.TurnState(act -> push!(acts, act))
+        out = Channel{ACP.Message}(32)
+        ACP.parse_update!(out, st, txt("main "))              # opens the main bubble
+        ACP.parse_update!(out, st, sub("task-1", txt("sub prose")))
+        ACP.parse_update!(out, st, sub("task-1", tcall("sub-t1", "Grep foo", "in_progress")))
+        ACP.parse_update!(out, st, sub("task-1", ACP.parse_session_update(Dict{String,Any}(
+            "sessionUpdate" => "tool_call_update",
+            "toolCallId" => "sub-t1", "status" => "completed"))))
+        ACP.parse_update!(out, st, txt("still main"))
+        close(st); close(out)
+
+        msgs = collect(out)
+        @test length(msgs) == 1                               # ONE main bubble, nothing else
+        @test msgs[1] isa ACP.AgentMessage
+        @test msgs[1].text * join(collect(msgs[1].updates)) == "main still main"
+        @test isempty(st.tools)                               # sub tool never tracked
+
+        @test length(acts) == 3
+        @test all(a -> a.parent_id == "task-1", acts)
+        @test acts[1].kind === :text && acts[1].label == "sub prose"
+        @test acts[2].kind === :tool && acts[2].tool_id == "sub-t1" &&
+              acts[2].label == "Grep foo" && acts[2].status == "in_progress"
+        @test acts[3].kind === :tool && acts[3].status == "completed"
+
+        # Without a sink (default TurnState): tagged updates are DROPPED —
+        # never interleaved into the main transcript, never tracked as tools.
+        st2  = ACP.TurnState()
+        out2 = Channel{ACP.Message}(32)
+        ACP.parse_update!(out2, st2, txt("main"))
+        ACP.parse_update!(out2, st2, sub("task-1", txt(" INTRUDER")))
+        ACP.parse_update!(out2, st2, sub("task-1", tcall("sub-t2", "Read bar", "pending")))
+        close(st2); close(out2)
+        msgs2 = collect(out2)
+        @test length(msgs2) == 1
+        @test msgs2[1].text * join(collect(msgs2[1].updates)) == "main"
+        @test isempty(st2.tools)
+    end
+
     # ── Regression: a long resumed history with an un-terminated tool must not
     # deadlock replay collection. Over the real wire: on `session/load` the mock
     # streams an un-terminated tool ("open", pending, never completed) followed
