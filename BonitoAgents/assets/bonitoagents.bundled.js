@@ -1015,10 +1015,7 @@ class BonitoChat {
             node.__btFinal = true;
             return;
         }
-        let tgt = msg.id
-            ? this.container.querySelector(
-                `.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`)
-            : null;
+        let tgt = msg.id ? this.container.querySelector(`.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`) : null;
         if (!tgt) {
             const nodes = this.container.querySelectorAll('.bt-agent-msg');
             tgt = nodes[nodes.length - 1];
@@ -1378,6 +1375,7 @@ class BonitoChat {
             case 'user':
                 div.className = 'bt-user-msg';
                 if (msg.queued) div.classList.add('bt-queued');
+                if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
                 break;
             case 'agent':
@@ -2246,7 +2244,8 @@ class BonitoChat {
     }
     async _submit() {
         const text = this.textInput.value;
-        if (text.trim() === '' && this.attachments.size === 0) return;
+        const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
+        if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
         const payload = [];
         for (const item of this.attachments.values()){
             const buf = await item.blob.arrayBuffer();

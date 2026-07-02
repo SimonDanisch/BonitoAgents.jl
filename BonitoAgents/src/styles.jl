@@ -525,6 +525,12 @@ const ChatStyles = Bonito.Styles(
         "letter-spacing" => "0.04em",
         "color" => "var(--bt-text-faint)",
         "text-transform" => "uppercase"),
+    # Yolo auto-continue nudge: an app-generated (not user) bubble. Muted so it
+    # reads as a system message — dimmer, desaturated accent, lighter weight.
+    CSS(".bt-user-msg.bt-user-msg-auto",
+        "opacity" => "0.6",
+        "background" => "color-mix(in srgb, var(--bt-accent) 45%, var(--bt-surface-2))",
+        "font-style" => "italic"),
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
@@ -1507,6 +1513,36 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%"),
+    # Button column right of the textarea: the Yolo toggle bar on top, the
+    # send/stop pair below. `stretch` makes the bar span the pair's width
+    # (wide-and-short) without hardcoding it.
+    CSS(".bt-input-controls",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "6px", "align-items" => "stretch",
+        "flex-shrink" => "0"),
+    CSS(".bt-input-btn-row",
+        "display" => "flex", "gap" => "8px", "align-items" => "flex-end"),
+    # Yolo toggle bar: quiet chrome when off; an armed amber accent when on so
+    # it's obvious the composer is in reminders mode and autonomy is engaged.
+    CSS(".bt-yolo-bar",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "11px", "line-height" => "1",
+        "padding" => "3px 0",
+        "border-radius" => "8px",
+        "cursor" => "pointer",
+        "white-space" => "nowrap",
+        "transition" => "background 80ms, color 80ms, border-color 80ms"),
+    CSS(".bt-yolo-bar:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-yolo-bar-on",
+        "border-color" => "var(--bt-warning)",
+        "background" => "color-mix(in srgb, var(--bt-warning) 18%, var(--bt-surface))",
+        "color" => "var(--bt-warning)",
+        "font-weight" => "600"),
+    CSS(".bt-yolo-bar-on:hover",
+        "background" => "color-mix(in srgb, var(--bt-warning) 26%, var(--bt-surface))"),
 
     # ── Chat toolbar (below the composer) ───────────────────────────────────
     # Hosts the message-type filter checkboxes (populated client-side by
@@ -1654,6 +1690,14 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-text-input:focus",
         "border-color" => "var(--bt-accent)",
         "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
+    # Yolo mode: the composer is the REMINDERS editor — a red-ish border +
+    # focus ring replaces the blue accent so the mode is unmistakable. Declared
+    # AFTER the base rules: same specificity, later wins.
+    CSS(".bt-text-input-yolo",
+        "border-color" => "color-mix(in srgb, var(--bt-error) 60%, var(--bt-border-strong))"),
+    CSS(".bt-text-input-yolo:focus",
+        "border-color" => "var(--bt-error)",
+        "box-shadow" => "0 0 0 3px rgba(239,68,68,0.18)"),
     # Thin, modern scrollbar instead of the Linux/Electron default with up/down
     # arrow buttons. Only visible when textarea grows past max-height.
     CSS(".bt-text-input",
@@ -1687,6 +1731,13 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-send-btn:active", "transform" => "scale(0.95)"),
     CSS(".bt-send-btn:disabled",
         "opacity" => "0.4", "cursor" => "not-allowed"),
+    # Lock-in variant while Yolo is armed: same circle, amber accent + check
+    # glyph — pressing it locks in the composer text as the reminders. Both
+    # rules AFTER their blue counterparts so they win at equal specificity.
+    CSS(".bt-send-btn-yolo",
+        "background" => "var(--bt-warning)"),
+    CSS(".bt-send-btn-yolo:hover",
+        "background" => "#d97706"),
     CSS(".bt-stop-btn",
         "background" => "var(--bt-surface)",
         "color" => "var(--bt-error)",

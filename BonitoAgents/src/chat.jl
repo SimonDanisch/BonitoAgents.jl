@@ -71,6 +71,18 @@ mutable struct ChatModel
     # class to this, so no separate busy_start/busy_end comm events are needed.
     busy_active::Observable{Bool}
 
+    # "Yolo mode": while true, the app auto-continues after each turn ends —
+    # nudging the agent to keep working autonomously until it answers `no`.
+    # A broadcast/per-tab observable like `busy_active`; `shared(m).yolo[]` is
+    # the source of truth (per-session copies bridge it via `map(identity, …)`).
+    yolo::Observable{Bool}
+
+    # User-editable "reminders" appended to the continue-prompt on every Yolo
+    # auto-continue, so the agent doesn't drift over many autonomous turns.
+    # Empty = none. Broadcast/per-tab like `yolo`; `shared(m).yolo_reminders[]`
+    # is the source of truth.
+    yolo_reminders::Observable{String}
+
     # Session metadata for the chat header: a heterogeneous list of TYPED
     # items rendered by `header_pill` dispatch. Today: the agent's
     # `ACP.ConfigOption`s (model / permission mode / effort) parsed from the
@@ -195,6 +207,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(true),
         Observable(""),
         busy_active,
+        Observable(false),          # yolo (auto-continue mode; off by default)
+        Observable(""),             # yolo_reminders (appended to each continue-prompt)
         Observable(Any[]),          # session_meta
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
         Ref{Union{Task,Nothing}}(nothing),   # poller_task
@@ -254,6 +268,8 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
             map(identity, session, m.busy_active),
+            map(identity, session, m.yolo),
+            map(identity, session, m.yolo_reminders),
             map(identity, session, m.session_meta),
             m.consumer_task,           # shared → only the parent runs the loop
             m.poller_task,             # shared → one poller per chat
@@ -294,10 +310,14 @@ mutable struct UserMsg <: ChatMsg
     # a "queued" badge. Cleared via the `user_unqueue` wire event when
     # `run_turn!` finally pops it off `user_messages`.
     queued::Bool
+    # `true` for an app-generated bubble (Yolo auto-continue nudge) rather than
+    # a real user submission — rendered dimmer (`.bt-user-msg-auto`) so it reads
+    # as a system message.
+    auto::Bool
     chat::Union{ChatModel,Nothing}
 end
-UserMsg(text::AbstractString) = UserMsg(String(text), false, nothing)
-UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), false, chat)
+UserMsg(text::AbstractString) = UserMsg(String(text), false, false, nothing)
+UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), false, false, chat)
 
 # A `/compact` session summary, rendered as a centered separator block — NOT a
 # user message. Claude Code persists it in its jsonl as a synthetic user record
@@ -1076,7 +1096,7 @@ end
 # all messages uniformly. The `cwd` argument is only consulted for ToolMsg
 # (to render the edit preview); other variants ignore it.
 msg_to_dict(m::UserMsg, _chat_dir::AbstractString="") =
-    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
+    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued, "auto" => m.auto)
 
 function msg_to_dict(m::AgentMsg, _chat_dir::AbstractString="")
     Dict{String,Any}("type" => "agent", "id" => m.id, "html" => ensure_html!(m))
@@ -2131,7 +2151,7 @@ wire_new(::ChatModel, m::AgentMsg) =
 # like a reloaded one (summary only, lazy body); `close` then ships the html.
 wire_new(::ChatModel, m::ThoughtMsg) = msg_to_dict(m)
 wire_new(::ChatModel, m::UserMsg) =
-    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
+    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued, "auto" => m.auto)
 wire_new(model::ChatModel, m::ToolMsg) = tool_header_dict(m, model.chat_dir)
 wire_new(model::ChatModel, m::TodoListMsg) = msg_to_dict(m, model.chat_dir)
 # Summary opens as a centered placeholder; `close` ships the rendered html
@@ -2967,6 +2987,28 @@ function run_turn!(chat::ChatModel, user_msg::UserMessage)
     return drain_turn!(chat, turn)
 end
 
+# ── Yolo mode (autonomous auto-continue) ────────────────────────────────────
+# The nudge sent after each turn while Yolo is on. The agent bails by replying
+# just `no`; anything else is treated as "still working" and re-continues.
+const YOLO_CONTINUE_PROMPT = "Is the work really done — or can you keep going? Reply `no` only if you're certain there's nothing more you can do on your own."
+
+# Composer placeholder while Yolo is armed — the message input doubles as the
+# reminders editor then (see `chat_input_area`).
+const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Enter to lock in"
+
+# The turn's final agent reply normalized to the bail signal.
+yolo_bail(text::AbstractString) = strip(replace(lowercase(strip(text)), r"[.!]+$" => "")) == "no"
+
+# The visible (dim/system-styled) auto-continue bubble the Yolo loop enqueues.
+# Appends the chat's user-editable reminders (if any) so the agent doesn't drift
+# over many autonomous turns.
+function yolo_user_msg(chat::ChatModel)
+    reminders = strip(shared(chat).yolo_reminders[])
+    text = isempty(reminders) ? YOLO_CONTINUE_PROMPT :
+        YOLO_CONTINUE_PROMPT * "\n\nKeep these in mind as you continue:\n" * reminders
+    return UserMsg(String(text), false, true, nothing)
+end
+
 function drain_turn!(chat::ChatModel, turn)
     s = shared(chat)
     # Busy simply tracks `turns_active > 0`: the agent settles the turn with
@@ -3056,6 +3098,26 @@ function drain_turn!(chat::ChatModel, turn)
                     "model may be unavailable on your plan, or the provider may " *
                     "need authentication — try picking a different model, or " *
                     "check the provider's login/credentials._")))
+            end
+            # Yolo mode: keep the agent going autonomously until it answers `no`.
+            if shared(chat).yolo[] && !errored && !cancelled
+                # This turn's messages are msgs_store[nstore0+1:end] (nstore0
+                # captured at turn start). Find the LAST AgentMsg among them =
+                # the agent's final reply.
+                reply = lock(s.lock) do
+                    idx = findlast(m -> m isa AgentMsg, @view s.msgs_store[(nstore0+1):end])
+                    idx === nothing ? "" : s.msgs_store[nstore0+idx].text
+                end
+                if !isempty(strip(reply)) && !yolo_bail(reply)
+                    # Real work / non-bail reply → auto-continue. (A bare `no`
+                    # bails: toggle stays on but we don't re-prompt; it re-arms
+                    # on the user's next message.)
+                    Base.errormonitor(@async try
+                        send_message!(chat, yolo_user_msg(chat))
+                    catch e
+                        @warn "yolo auto-continue send failed" project_id = chat.project_id exception = (e, catch_backtrace())
+                    end)
+                end
             end
         end
     end
@@ -3542,6 +3604,7 @@ function send_message!(model::ChatModel, msg::UserMsg;
     # If there's a turn in flight, the bubble joins the queue (visually dim).
     bubble = UserMsg(model, msg.text)
     bubble.queued = s.busy_active[]
+    bubble.auto = msg.auto   # preserve the Yolo auto-continue marker for dim styling
     close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
     # Refresh the lens vocabulary NOW that a user message exists, rather than
     # waiting for end-of-turn (drain_turn!'s emit_lens_vocab). Otherwise the
@@ -4211,6 +4274,10 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
 
+    # (The Yolo toggle lives in the composer — see `chat_input_area` — not in
+    # the header: it repurposes the message input as the reminders editor, so
+    # the control sits next to what it changes.)
+
     # ── Provider switcher ──────────────────────────────────────────────────
     # Dropdown to switch between Claude Code, MiMo Code, and OpenCode per chat.
     # Changing the provider restarts the session with the new backend.
@@ -4344,39 +4411,116 @@ end
 # Icons live as standalone SVG files under assets/icons/ and ship as
 # Bonito.Asset (hashed URL, served by the same machinery as bonitoagents.js).
 # Colors are baked into the SVGs since <img> doesn't inherit currentColor.
-send_icon() = bonito_asset("icons", "send.svg")
-stop_icon() = bonito_asset("icons", "stop.svg")
+send_icon()  = bonito_asset("icons", "send.svg")
+stop_icon()  = bonito_asset("icons", "stop.svg")
+check_icon() = bonito_asset("icons", "check.svg")
 icon_img(asset, alt) = DOM.img(src=asset, alt=alt, draggable="false",
     style=Styles("pointer-events" => "none",
         "user-select" => "none"))
 
-function chat_input_area(::Session, ::ChatModel)
-    # Pure DOM. The input widgets are entirely JS-owned: `BonitoChat`
-    # (assets/bonitoagents.js → `_setupInputs`) attaches capture-phase
-    # click + Enter listeners, reads the textarea on submit, posts a
-    # `{type: 'send', text, attachments}` event over `comm`, and clears
-    # the textarea locally. The stop button posts `{type: 'cancel'}`.
-    # On the Julia side, those land as `SendCommand` / `CancelCommand`
-    # in `chat_dispatch!` — there's no Observable round-trip for the
-    # textarea value or for clearing it, which removes a whole class of
-    # echo-bug ("server-echoed stale value overwrites user keystroke").
+function chat_input_area(session::Session, model::ChatModel)
+    # The input widgets are JS-owned: `BonitoChat` (assets/bonitoagents.js →
+    # `_setupInputs`) attaches capture-phase click + Enter listeners, reads
+    # the textarea on submit, posts a `{type: 'send', text, attachments}`
+    # event over `comm`, and clears the textarea locally. The stop button
+    # posts `{type: 'cancel'}`. On the Julia side, those land as
+    # `SendCommand` / `CancelCommand` in `chat_dispatch!` — there's no
+    # Observable round-trip for the textarea value or for clearing it, which
+    # removes a whole class of echo-bug ("server-echoed stale value
+    # overwrites user keystroke").
+    #
+    # Yolo mode REPURPOSES the composer: while `yolo` is on, the textarea is
+    # the reminders editor (red-ish accent, prefilled with the current
+    # reminders) and the send button is a lock-in button. The SAME wire event
+    # carries the lock-in — `handle_command!(…, ::SendCommand)` writes
+    # `yolo_reminders` instead of sending while yolo is armed — so no new
+    # command is needed and no user message can slip through server-side.
+    # Mode styling/labels bind reactively to the per-session bridged
+    # `model.yolo` (the header-button idiom); the prefill/draft swap is the
+    # small inline script below.
     text_input = DOM.textarea(
-        placeholder="Message…",
-        title="Enter to send  ·  Shift+Enter for newline",
-        class="bt-text-input", rows=1,
+        model.yolo[] ? model.yolo_reminders[] : "";
+        placeholder = map(y -> y ? YOLO_INPUT_PLACEHOLDER : "Message…", model.yolo),
+        title = map(y -> y ? "Enter to lock in the reminders" :
+                             "Enter to send  ·  Shift+Enter for newline", model.yolo),
+        class = map(y -> y ? "bt-text-input bt-text-input-yolo" : "bt-text-input",
+                    model.yolo),
+        rows = 1,
         oninput=js"""event => {
             event.target.style.height = 'auto';
             event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
         }""")
+    # Yolo toggle bar: a wide-and-short strip spanning the button column,
+    # right above the send/stop pair. Reads the per-session bridged child
+    # (`model.yolo`) for label/class; WRITES through the shared source of
+    # truth (`shared(model).yolo[]`) so every tab flips.
+    yolo_click = Observable("")
+    yolo_bar = DOM.button(map(y -> y ? "Yolo ●" : "Yolo", model.yolo);
+        type = "button",
+        class = map(y -> y ? "bt-yolo-bar bt-yolo-bar-on" : "bt-yolo-bar", model.yolo),
+        title = "Autonomous mode: auto-continue after each turn until the agent says it's done",
+        onclick = js"event => $(yolo_click).notify('__click__')")
+    on(session, yolo_click) do s
+        s == "__click__" || return
+        yolo_click[] = ""
+        shared(model).yolo[] = !shared(model).yolo[]
+    end
     # Send and Stop are SEPARATE, both always present: the user can submit a
     # message at any time — even mid-turn — and it queues (see `send_message!`'s
     # `queued` bubble). A single toggling button would hide Send during a turn
     # and break that type-ahead/queue flow, so we deliberately keep two.
-    send_btn = DOM.button(icon_img(send_icon(), "Send"); type="button",
-        class="bt-send-btn", title="Send (Enter)")
+    # While Yolo is armed, Send is the LOCK-IN button (check glyph, amber) —
+    # the base `bt-send-btn` class stays so the JS delegated click handler
+    # keeps matching.
+    send_btn = DOM.button(
+        map(y -> y ? icon_img(check_icon(), "Lock in") : icon_img(send_icon(), "Send"),
+            model.yolo);
+        type = "button",
+        class = map(y -> y ? "bt-send-btn bt-send-btn-yolo" : "bt-send-btn", model.yolo),
+        title = map(y -> y ? "Lock in reminders (Enter)" : "Send (Enter)", model.yolo))
     stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
         class="bt-stop-btn", title="Stop generation")
-    DOM.div(DOM.div(text_input, send_btn, stop_btn, class="bt-input-row");
+    # Prefill/draft swap for Yolo mode. Runs as an inline script child (the
+    # ES6Module/init-script idiom): `$(text_input)` is a direct node ref, the
+    # interpolated observables are live proxies. Toggle ON stashes the user's
+    # in-progress draft on the node and shows the current reminders (the
+    # composer IS the reminders editor while armed); toggle OFF restores the
+    # draft. While armed the composer mirrors the shared reminders: `_submit`
+    # clears the field optimistically, and the server's reminders write echoes
+    # the locked text back (which also syncs concurrent tabs).
+    yolo_mode_js = js"""
+        (() => {
+            const input = $(text_input);
+            const yolo = $(model.yolo);
+            const reminders = $(model.yolo_reminders);
+            const resize = () => {
+                input.style.height = 'auto';
+                input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+            };
+            yolo.on(on => {
+                if (on) {
+                    input.dataset.btDraft = input.value;
+                    input.value = reminders.value;
+                } else {
+                    input.value = input.dataset.btDraft ?? '';
+                    delete input.dataset.btDraft;
+                }
+                resize();
+            });
+            reminders.on(text => {
+                if (yolo.value) { input.value = text; resize(); }
+            });
+        })();
+    """
+    DOM.div(
+        DOM.div(
+            text_input,
+            DOM.div(
+                yolo_bar,
+                DOM.div(send_btn, stop_btn; class="bt-input-btn-row"),
+                class="bt-input-controls"),
+            class="bt-input-row"),
+        yolo_mode_js;
         class="bt-input-area")
 end
 
@@ -4775,7 +4919,19 @@ function handle_command!(model::ChatModel, ::Session, cmd::ThoughtRenderCommand)
     return nothing
 end
 
-function handle_command!(model::ChatModel, ::Session, cmd::SendCommand)
+function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
+    # (Session arg is unused — typed `::Any` so the send path is unit-testable
+    # without a Bonito.Session, like the CancelCommand handler.)
+    #
+    # Yolo mode: the composer is the REMINDERS editor, so the same wire event
+    # LOCKS IN the text as reminders instead of sending. Enforced HERE, not in
+    # the UI — no user message can slip through while the autonomous loop runs.
+    # The loop's own auto-continue calls `send_message!` directly (never
+    # SendCommand), so it is unaffected by this guard.
+    if shared(model).yolo[]
+        shared(model).yolo_reminders[] = String(strip(cmd.text))
+        return nothing
+    end
     # `process_attachments!` decodes user-supplied base64 and writes files
     # to disk. Any failure (bad mime, oversize image, IO error) becomes an
     # `attach_error` event the JS side shows inline — we deliberately

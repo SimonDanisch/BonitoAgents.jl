@@ -2040,6 +2040,8 @@ class BonitoChat {
             case 'user':
                 div.className = 'bt-user-msg';
                 if (msg.queued) div.classList.add('bt-queued');
+                // Yolo auto-continue nudge: dim/system-styled, not a real submit.
+                if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
                 break;
             case 'agent':
@@ -3150,7 +3152,12 @@ class BonitoChat {
         // Nothing to send → noop. (Pressing Enter on an empty textarea
         // shouldn't fire a request, and the user can have queued some
         // attachments without any text — the latter case still sends.)
-        if (text.trim() === '' && this.attachments.size === 0) return;
+        // EXCEPT in Yolo mode: the composer is the reminders editor and this
+        // same send path LOCKS IN the text server-side (SendCommand becomes a
+        // reminders write, never a send — see handle_command!). An empty
+        // lock-in is meaningful there: it clears the reminders.
+        const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
+        if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
         const payload = [];
         for (const item of this.attachments.values()) {
             const buf = await item.blob.arrayBuffer();
