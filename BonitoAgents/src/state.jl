@@ -321,6 +321,37 @@ function set_global_agents_md!(s::ServerState, text::AbstractString)
     return nothing
 end
 
+# Built-in house rules BonitoAgents itself appends to EVERY Claude session's
+# system prompt, ahead of the user's editable AGENTS.md. Product-level guidance
+# for footguns we keep seeing across agents — keep it short, it rides on every
+# session. (The dashboard textarea shows/edits only the user's AGENTS.md; these
+# rules are composed in at session bring-up via `agents_prompt_appendix`.)
+const BUILTIN_AGENT_RULES = """
+## Background commands
+Never start a long command detached (`&`/nohup) and then poll for it from a \
+second watcher task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, \
+and the like) — such monitors routinely never terminate (PID reuse keeps \
+`kill -0` succeeding) and pile up as zombie background tasks. Run the long \
+command itself as ONE background task (`run_in_background`) with any \
+post-processing (grep/summary) appended after it in the same command; you are \
+notified automatically when it completes.
+
+## Julia
+When running Julia code, always prefer the `bt_julia_eval` tool over \
+`julia -e ...`/scripts via Bash: it keeps a persistent session (loaded \
+packages, variables, and compiled methods carry over; Revise picks up source \
+edits), while every Bash `julia` call spawns a fresh process and pays full \
+startup + compile cost. Use `env_path` = the current project directory (the \
+pwd). Only fall back to Bash `julia` when a fresh process is genuinely \
+required (e.g. running a test suite entry point)."""
+
+# What actually rides on the `_meta.systemPrompt.append` for a session: the
+# built-in rules plus the user's AGENTS.md (when present).
+function agents_prompt_appendix(s::ServerState)
+    user = global_agents_md(s)
+    return isempty(user) ? BUILTIN_AGENT_RULES : BUILTIN_AGENT_RULES * "\n\n" * user
+end
+
 """
     derive_initials(name) -> String
 
