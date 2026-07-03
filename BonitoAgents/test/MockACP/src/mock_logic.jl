@@ -79,6 +79,8 @@ upd(kind::AbstractString, payload::AbstractDict) = emit(Dict(
 
 agent_chunk(text)   = upd("agent_message_chunk",
     Dict("content" => Dict("type" => "text", "text" => text)))
+user_chunk(text)    = upd("user_message_chunk",
+    Dict("content" => Dict("type" => "text", "text" => text)))
 thought_chunk(text) = upd("agent_thought_chunk",
     Dict("content" => Dict("type" => "text", "text" => text)))
 tool_call(status; id = "tc1", kind = "execute", title = "mock tool",
@@ -290,6 +292,41 @@ function ensure_dispatcher!()
     host, port_str = rsplit(DISPATCHER_ADDR, ":"; limit = 2)
     DISPATCHER_SOCK[] = Sockets.connect(host, parse(Int, port_str))
     return DISPATCHER_SOCK[]
+end
+
+# session/load replay via the dispatcher: ask the test process for the
+# session's scripted history ({"replay": sid}) and emit each event as one
+# session/update frame — user/agent turns land whole (one chunk per turn, the
+# shape `replay_history`'s coalescer expects between message-kind switches).
+# Terminated by the dispatcher's {"type":"end"} line; no prompt response here
+# (the caller acks session/load itself).
+function run_dispatcher_replay()
+    sock = ensure_dispatcher!()
+    println(sock, JSON.json(Dict("replay" => SESSION)))
+    flush(sock)
+    next_tool_id = 1
+    while !eof(sock)
+        line = try readline(sock) catch; break end
+        isempty(line) && continue
+        ev = try JSON.parse(line) catch; continue end
+        et = String(get(ev, "type", ""))
+        if et == "user"
+            user_chunk(String(ev["text"]))
+        elseif et == "text"
+            agent_chunk(String(ev["text"]))
+        elseif et == "thought"
+            thought_chunk(String(ev["text"]))
+        elseif et == "tool"
+            tool_call(String(get(ev, "status", "completed"));
+                      id    = String(get(ev, "id", "replay-tc$(next_tool_id)")),
+                      kind  = String(get(ev, "kind", "execute")),
+                      title = String(get(ev, "title", "replayed tool")))
+            next_tool_id += 1
+        elseif et == "end"
+            break
+        end
+    end
+    return nothing
 end
 
 function run_dispatcher_prompt(prompt_id)
@@ -555,6 +592,11 @@ function dispatch_loop()
         elseif method == "session/new" && id !== nothing
             resp(id, Dict("sessionId" => SESSION))
         elseif method == "session/load" && id !== nothing
+            # Dispatcher mode: re-stream the scripted history as session/update
+            # frames BEFORE the load response — exactly how real claude-agent-acp
+            # replays a resumed session's jsonl. Other scenarios keep the bare
+            # ack (no replay), which resume tests rely on.
+            SCENARIO == "dispatcher" && run_dispatcher_replay()
             resp(id, Dict("sessionId" => SESSION))
         elseif method == "session/prompt" && id !== nothing
             cancelled[] = false

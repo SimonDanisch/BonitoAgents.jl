@@ -498,6 +498,8 @@ class BonitoChat {
         switch(msg.type){
             case 'msgs.count':
                 return this.applyCount(msg.n);
+            case 'msgs.reload':
+                return this.onMsgsReload(msg.n);
             case 'turn_begin':
                 this.turnSeq = msg.seq;
                 return;
@@ -561,6 +563,22 @@ class BonitoChat {
                 return this.appendNewMessage(msg);
         }
     }
+    onMsgsReload(n) {
+        for (const node of this.cache.values()) node.remove();
+        this.cache.clear();
+        this.heights.clear();
+        this.rendered.clear();
+        this.nodeById.clear();
+        this.observed.clear();
+        this._requestedAt.clear();
+        this._cancelPendingScroll();
+        this.totalCount    = 0;
+        this._bootstrapped = false;
+        this.followMode    = true;
+        this.unreadCount   = 0;
+        this.applyCount(n);
+    }
+
     applyCount(n) {
         if (n <= 0) {
             this._startSettle();

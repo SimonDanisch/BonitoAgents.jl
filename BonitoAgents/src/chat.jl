@@ -54,6 +54,17 @@ mutable struct ChatModel
     # per-session views so every tab feeds the same queue.
     user_messages::Channel{UserMessage}
 
+    # User bubbles pushed into `msgs_store` whose prompt has NOT reached the
+    # agent yet (FIFO mirror of `user_messages`, tracking the rendered bubble
+    # objects). `send_message!` pushes; `begin_turn!` pops once `prompt!`
+    # actually delivered the text. `reconcile_replay!` needs this to tell the
+    # user's FRESH messages (which the agent can't know about, so they must
+    # stay at the store's END and must never anchor the replay merge) apart
+    # from history the agent has seen. Guarded by `lock` (the msgs_store lock);
+    # shared across per-session views. The type is `Any` only to dodge the
+    # UserMsg-not-yet-defined ordering here; every element is a UserMsg.
+    pending_sends::Vector{Any}
+
     # One-shot history prelude prepended to the next prompt after a session
     # change that lost claude's jsonl (see `arm_history_replay!`). Empty = none.
     pending_history_replay::Ref{String}
@@ -202,6 +213,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         actual_agent,
         collect(AgentClientProtocol.MCPServer, mcp_servers),
         Channel{UserMessage}(64),
+        Any[],                      # pending_sends (user bubbles not yet prompted)
         Ref(""),                    # pending_history_replay
         Observable(Dict{String,Any}()),
         Observable(true),
@@ -263,6 +275,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.chat_session, m.msgs_store,
             m.agent, m.mcp_servers,
             m.user_messages,           # shared queue → all sessions feed one consumer
+            m.pending_sends,           # shared → reconcile sees every tab's unsent bubbles
             m.pending_history_replay,
             map(identity, session, m.comm),
             map(identity, session, m.session_alive),
@@ -3138,9 +3151,18 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
         # `on_subagent`: divert parentToolUseId-tagged updates (a running
         # subagent's text/tool stream) into the parent TaskToolMsg's live
         # feed — never into the main transcript.
-        return AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
+        turn = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
             images=user_msg.images,
             on_subagent = act -> route_subagent_activity!(chat, act))
+        # The prompt is registered + on the wire: the oldest pending bubble
+        # (FIFO — matches the channel order under `send_message!`, same pairing
+        # `promote_queued_user_bubble!` relies on) has now been SEEN by the
+        # agent, so it stops counting as a fresh/unsent message for reconciles.
+        # On a throw below the bubble stays pending — the agent never got it.
+        lock(s.lock) do
+            isempty(s.pending_sends) || popfirst!(s.pending_sends)
+        end
+        return turn
     catch e
         # Failed to even send: release the slot we claimed; surface the error
         # like a failed turn would. A failed start releases the last turn, so
@@ -3780,6 +3802,10 @@ function send_message!(model::ChatModel, msg::UserMsg;
     bubble.queued = s.busy_active[]
     bubble.auto = msg.auto   # preserve the Yolo auto-continue marker for dim styling
     close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
+    # Track the bubble as "not yet seen by the agent" until `begin_turn!`
+    # delivers its prompt — a reconcile landing in between (the lazy bind on
+    # this very send) must keep it at the store's END and never anchor on it.
+    lock(() -> push!(s.pending_sends, bubble), model.lock)
     # Refresh the lens vocabulary NOW that a user message exists, rather than
     # waiting for end-of-turn (drain_turn!'s emit_lens_vocab). Otherwise the
     # `/user_message` key isn't suggestable until the agent's reply lands — the
@@ -4031,44 +4057,83 @@ function longest_matched_prefix(existing, candidates)
     return i - 1
 end
 
-# Persist + store one replayed message as history (chat === nothing; never emits
-# live UI events — the single `msgs.count` from `reconcile_replay!` covers it).
-function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.AgentMessage)
-    msg = AgentMsg(string(uuid4()), m.text)
-    lock(model.lock) do; push!(model.msgs_store, msg); end
-    finalize_agent(model.chat_session, msg)
-end
-function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.UserMessage)
-    if is_summary_text(m.text)
-        msg = SummaryMsg(m.text)
-        lock(model.lock) do; push!(model.msgs_store, msg); end
-        append_summary(model.chat_session, msg)
-    else
-        msg = UserMsg(m.text)
-        lock(model.lock) do; push!(model.msgs_store, msg); end
-        append_user(model.chat_session, msg)
+"""
+    plan_reconcile(existing, candidates, npending) -> (; mode, adopt, insert_at)
+
+Decide how a resumed session's replay merges into the stored history. Pure —
+takes a store snapshot, the `keep_in_history`-filtered replay, and the number
+of TRAILING store messages that are fresh user bubbles the agent hasn't seen
+yet (`pending_sends`); returns a plan, mutates nothing.
+
+- `mode == :noop`     — nothing to adopt (identical histories, or the replay is
+                        a strict prefix of ours: claude knows LESS than we do,
+                        e.g. a forked session — never truncate, never merge).
+- `mode == :append`   — `adopt` (replay messages, in order) splices in AFTER
+                        store index `insert_at` — i.e. after the known history,
+                        always BEFORE the pending user bubbles, which stay the
+                        last messages (the "my message is gone" invariant).
+- `mode == :diverged` — no anchor exists anywhere: the caller rebuilds from the
+                        replay (backing the old transcript up) instead of
+                        guessing a merge.
+
+Anchoring: the shared-prefix fast path first (the pre-compaction common case).
+When the replay's FRONT diverges — claude compacted, so the replay now opens
+with a summary we never stored — anchor on our LAST known messages instead:
+the longest run (up to 5) of them found as a contiguous match inside the
+replay, nearest the replay's end. Only what follows that run is adopted, so
+overlap can never duplicate.
+"""
+function plan_reconcile(existing::AbstractVector, candidates::AbstractVector,
+                        npending::Integer)
+    npend = clamp(Int(npending), 0, length(existing))
+    known = @view existing[1:(end - npend)]
+    insert_at = length(known)
+    if isempty(known)
+        return isempty(candidates) ? (; mode = :noop, adopt = candidates[1:0], insert_at) :
+                                     (; mode = :append, adopt = candidates, insert_at)
     end
+    p = longest_matched_prefix(known, candidates)
+    if p == length(known)
+        adopt = candidates[(p + 1):end]
+        return isempty(adopt) ? (; mode = :noop, adopt, insert_at) :
+                                (; mode = :append, adopt, insert_at)
+    end
+    # The whole replay matched but our history continues past it: claude has
+    # LESS than we do (forked/stale session). Nothing to adopt.
+    p == length(candidates) && return (; mode = :noop, adopt = candidates[1:0], insert_at)
+    # Suffix anchor: our newest known messages, found as a contiguous run in
+    # the replay (scanning for the run CLOSEST to the replay's end, so a text
+    # repeated earlier in the conversation can't hijack the anchor).
+    for k in min(5, length(known)):-1:1
+        run = @view known[(end - k + 1):end]
+        for j in (length(candidates) - k):-1:0
+            if all(msg_matches(run[i], candidates[j + i]) for i in 1:k)
+                adopt = candidates[(j + k + 1):end]
+                return isempty(adopt) ? (; mode = :noop, adopt, insert_at) :
+                                        (; mode = :append, adopt, insert_at)
+            end
+        end
+    end
+    return (; mode = :diverged, adopt = candidates, insert_at)
 end
-function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.ToolCall)
+
+# Convert one replayed ACP message into its stored ChatMsg form — NO store or
+# chat.md mutation here (the caller decides between the append fast path and
+# the splice/rewrite path). The only side effect is the id-keyed tool-content
+# file, which is position-independent.
+replayed_to_msg(model::ChatModel, m::AgentClientProtocol.AgentMessage) =
+    AgentMsg(string(uuid4()), m.text)
+replayed_to_msg(model::ChatModel, m::AgentClientProtocol.UserMessage) =
+    is_summary_text(m.text) ? SummaryMsg(m.text) : UserMsg(m.text)
+function replayed_to_msg(model::ChatModel, m::AgentClientProtocol.ToolCall)
     isempty(m.content) || persist_tool_content!(model.chat_dir, m)
-    # Pick the typed BonitoAgents variant per ACP subtype. Replay always lands
-    # as a finished call (no live updates afterwards), so `finished_at = now`.
-    msg = replayed_tool_msg(m)
-    lock(model.lock) do; push!(model.msgs_store, msg); end
-    msg.status in ("completed", "failed") && append_tool(model.chat_session, msg)
+    # Replay always lands as a finished call (no live updates afterwards).
+    return replayed_tool_msg(m)
 end
-function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.TodoWriteCall)
-    msg = TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries),
-                      time(), time(), nothing)
-    lock(model.lock) do; push!(model.msgs_store, msg); end
-    append_plan(model.chat_session, msg)
-end
-function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.Plan)
-    msg = TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries),
-                      time(), time(), nothing)
-    lock(model.lock) do; push!(model.msgs_store, msg); end
-    append_plan(model.chat_session, msg)
-end
+replayed_to_msg(model::ChatModel, m::AgentClientProtocol.TodoWriteCall) =
+    TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries), time(), time(), nothing)
+replayed_to_msg(model::ChatModel, m::AgentClientProtocol.Plan) =
+    TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries), time(), time(), nothing)
 
 # Mirror of `build_tool_msg` for the replay path: no `chat`, finished_at
 # stamped now so the timer doesn't tick. The typed variants persist their
@@ -4105,20 +4170,101 @@ replayed_tool_msg(tc::AgentClientProtocol.MCPCall) =
                time(), time(),
                tc.server, tc.tool_name, Dict{String,Any}(tc.raw_input), nothing)
 
+# ── Sync watermark ───────────────────────────────────────────────────────────
+# A per-chat stamp recording WHEN we last reconciled against claude's session.
+# `session_advanced_since_sync` compares it with the session jsonl's mtime from
+# the worker scan (`state.discovered`) so opening a chat whose session moved on
+# (continued in the Claude Code CLI, another server, …) triggers an eager
+# re-sync instead of showing a frozen snapshot until the first send.
+sync_stamp_path(chat_dir::AbstractString) = joinpath(chat_dir, "sync.stamp")
+
+function mark_history_synced!(model::ChatModel)
+    try
+        write(sync_stamp_path(model.chat_dir), string(time()))
+    catch e
+        @warn "sync stamp write failed" chat_dir = model.chat_dir exception = e
+    end
+    return nothing
+end
+
+function session_advanced_since_sync(state::ServerState, p::ProjectInfo)
+    p.resume_session_id === nothing && return false
+    stamp = try
+        parse(Float64, strip(read(sync_stamp_path(chat_storage_dir(state, p.id, p.server_path)), String)))
+    catch
+        0.0   # never synced (or unreadable stamp) → sync if the scan knows the session
+    end
+    for r in get(state.discovered[], p.worker_id, Dict{String,Any}[])
+        String(get(r, "session_id", "")) == p.resume_session_id || continue
+        t = get(r, "last_used", 0.0)
+        return (t isa Number ? Float64(t) : 0.0) > stamp
+    end
+    return false   # session unknown to the scan → don't force a bind
+end
+
 function reconcile_replay!(model::ChatModel, replay)
     candidates = filter(keep_in_history, replay)
-    adopt = lock(model.lock) do
+    # Mutate under the lock; collect what to EMIT and emit after (listeners —
+    # the JS bridges — must never run while we hold the lock).
+    event, adopted_n = lock(model.lock) do
         existing = model.msgs_store
-        isempty(existing) ? candidates :
-            candidates[(longest_matched_prefix(existing, candidates) + 1):end]
+        # Trailing store messages that are fresh user bubbles the agent hasn't
+        # seen (`pending_sends`, pushed by `send_message!`, popped once
+        # `begin_turn!` delivered the prompt). They never anchor the merge and
+        # adopted history must land BEFORE them — the user's just-typed message
+        # stays the LAST message even when the bind-triggered reconcile floods
+        # in hundreds of adopted turns.
+        npending = 0
+        for m in Iterators.reverse(existing)
+            any(p -> p === m, model.pending_sends) || break
+            npending += 1
+        end
+        plan = plan_reconcile(existing, candidates, npending)
+        plan.mode == :noop && return (nothing, 0)
+        adopted = ChatMsg[replayed_to_msg(model, m) for m in plan.adopt]
+        if plan.mode == :diverged
+            # Nothing anchors: the stored transcript and claude's session have
+            # genuinely diverged. The jsonl is the source of truth — rebuild
+            # the visible history from the replay, keep the old transcript on
+            # disk, and say so with a visible separator instead of guessing a
+            # merge (the poisoned-merge failure this replaces).
+            bak = backup_history!(model.chat_session)
+            sep = SummaryMsg("History reloaded from the live session — the stored " *
+                             "transcript had diverged" *
+                             (bak === nothing ? "." : " (previous transcript kept at $(basename(bak)))."))
+            pending_tail = collect(ChatMsg, existing[(end - npending + 1):end])
+            empty!(existing)
+            push!(existing, sep)
+            append!(existing, adopted)
+            append!(existing, pending_tail)
+            rewrite_history(model.chat_session, existing)
+            return (Dict{String,Any}("type" => "msgs.reload", "n" => length(existing)),
+                    length(adopted))
+        end
+        # :append — adopted history goes after the known prefix. With no
+        # pending bubbles that's the store END: plain append, exactly the old
+        # fast path (chat.md appends, count bump). With pending bubbles it's a
+        # SPLICE before them, and chat.md must be rebuilt in store order.
+        if plan.insert_at == length(existing)
+            append!(existing, adopted)
+            for msg in adopted
+                append_block(model.chat_session, msg)
+            end
+            return (Dict{String,Any}("type" => "msgs.count", "n" => length(existing)),
+                    length(adopted))
+        else
+            splice!(existing, (plan.insert_at + 1):plan.insert_at, adopted)
+            rewrite_history(model.chat_session, existing)
+            return (Dict{String,Any}("type" => "msgs.reload", "n" => length(existing)),
+                    length(adopted))
+        end
     end
-    isempty(adopt) && return nothing
-    for m in adopt
-        adopt_replayed!(model, m)
-    end
-    chat_emit(model, Dict{String,Any}(
-        "type" => "msgs.count", "n" => length(model.msgs_store)))
-    @info "reconciled claude history" project_id = model.project_id adopted = length(adopt)
+    # Stamp even on a no-op: "we checked against the session at time X" is the
+    # watermark `session_advanced_since_sync` compares the jsonl mtime against.
+    mark_history_synced!(model)
+    event === nothing && return nothing
+    chat_emit(model, event)
+    @info "reconciled claude history" project_id = model.project_id adopted = adopted_n mode = event["type"]
     return nothing
 end
 

@@ -235,14 +235,21 @@ function atomic_write_text(f, path::AbstractString)
     end
 end
 
+# The `+++` TOML front-matter block every chat.md starts with (the inverse of
+# `parse_session_meta`). Shared by the fresh-file, header-RMW and full-rewrite
+# writers.
+function print_front_matter(io::IO, session::ChatSession)
+    println(io, "+++")
+    println(io, "session_id = $(repr(session.session_id))")
+    println(io, "cwd = $(repr(session.cwd))")
+    println(io, "created = $(repr(string(session.created)))")
+    println(io, "+++")
+end
+
 function write_session_header(session::ChatSession)
     lock(chat_file_lock(session)) do
         atomic_write_text(session.path) do io
-            println(io, "+++")
-            println(io, "session_id = $(repr(session.session_id))")
-            println(io, "cwd = $(repr(session.cwd))")
-            println(io, "created = $(repr(string(session.created)))")
-            println(io, "+++")
+            print_front_matter(io, session)
             println(io)
         end
     end
@@ -262,11 +269,7 @@ function update_session_id!(session::ChatSession, new_id::String)
         # SAME lock — a fresh one would reopen the race this lock exists to close.
         new_session = ChatSession(new_id, session.cwd, session.created, path, session.write_lock)
         atomic_write_text(path) do io
-            println(io, "+++")
-            println(io, "session_id = $(repr(new_session.session_id))")
-            println(io, "cwd = $(repr(new_session.cwd))")
-            println(io, "created = $(repr(string(new_session.created)))")
-            println(io, "+++")
+            print_front_matter(io, new_session)
             print(io, body)
         end
     end
@@ -322,33 +325,93 @@ function first_user_prompt(chat_dir::AbstractString)::Union{String,Nothing}
     return nothing
 end
 
+# ── History block writers ────────────────────────────────────────────────────
+# One `history_block(io, msg)` method per persisted message type — the single
+# source of truth for chat.md's admonition shapes. Both the live append path
+# (`append_user`/`finalize_agent`/…) and the whole-file `rewrite_history`
+# (reconcile splice path) go through these, so the on-disk shape can't drift
+# between the two. Each writer mirrors its append counterpart's gating (empty
+# agent text / empty thought / non-terminal tool → no block).
+
+function history_block(io::IO, msg::UserMsg)
+    println(io, "!!! user \"$(now(UTC))\"")
+    for line in split(msg.text, '\n')
+        println(io, "    ", line)
+    end
+    println(io)
+end
+
+function history_block(io::IO, msg::AgentMsg)
+    isempty(msg.text) && return
+    println(io, "!!! assistant \"$(now(UTC))\"")
+    for line in split(msg.text, '\n')
+        println(io, "    ", line)
+    end
+    println(io)
+end
+
+function history_block(io::IO, msg::ThoughtMsg)
+    isempty(strip(msg.text)) && return
+    println(io, "!!! thought \"$(msg.id)\"")
+    for line in split(msg.text, '\n')
+        println(io, "    ", line)
+    end
+    println(io)
+end
+
+function history_block(io::IO, msg::ToolMsg)
+    # Only terminal tools are history (mirrors the `status in ("completed",
+    # "failed")` gate at the live append_tool call sites): a live/pending tool
+    # gets its block when it finalizes.
+    msg.status in ("completed", "failed") || return
+    # 4th field: the resolved filter key (`tool_key`) — persisting it makes
+    # the typed variants (Bash/Task/MCP…) reload with stable per-tool
+    # filter identities even though reload lands as `GenericToolMsg`.
+    meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
+    println(io, "!!! tool \"$meta\"")
+    println(io, "    `$(msg.title)`")
+    # Brief summary on the collapsed header; full ACP body lives in
+    # the chat-storage `tools/<id>.json` (see update_tool_file!).
+    if !isempty(msg.summary)
+        println(io, "")
+        println(io, "    $(msg.summary)")
+    end
+    println(io)
+end
+
+function history_block(io::IO, msg::TodoListMsg)
+    println(io, "!!! plan")
+    # Write as plain lines (not markdown list) so admonition_text can round-trip them
+    for e in msg.entries
+        mark = e.status == "completed" ? "x" : " "
+        println(io, "    [$mark] $(e.content)")
+    end
+    println(io)
+end
+
+function history_block(io::IO, msg::SummaryMsg)
+    isempty(strip(msg.text)) && return
+    println(io, "!!! summary \"$(now(UTC))\"")
+    for line in split(msg.text, '\n')
+        println(io, "    ", line)
+    end
+    println(io)
+end
+
 # Append messages
 # All `append_*` writers take the per-file lock (T13) so an append can't
 # interleave with `update_session_id!`'s read-modify-write (which would drop the
 # append) and concurrent appenders from different tasks stay whole.
-function append_user(session::ChatSession, msg::UserMsg)
+append_block(session::ChatSession, msg::ChatMsg) =
     lock(chat_file_lock(session)) do
-        open(session.path, "a") do io
-            println(io, "!!! user \"$(now(UTC))\"")
-            for line in split(msg.text, '\n')
-                println(io, "    ", line)
-            end
-            println(io)
-        end
+        open(io -> history_block(io, msg), session.path, "a")
     end
-end
+
+append_user(session::ChatSession, msg::UserMsg) = append_block(session, msg)
 
 function finalize_agent(session::ChatSession, msg::AgentMsg)
     isempty(msg.text) && return
-    lock(chat_file_lock(session)) do
-        open(session.path, "a") do io
-            println(io, "!!! assistant \"$(now(UTC))\"")
-            for line in split(msg.text, '\n')
-                println(io, "    ", line)
-            end
-            println(io)
-        end
-    end
+    append_block(session, msg)
 end
 
 # Appended on stream-finalize (a tool call / next message arrives after
@@ -357,63 +420,58 @@ end
 # replay edge cases) are skipped to keep chat.md clean.
 function append_thought(session::ChatSession, msg::ThoughtMsg)
     isempty(strip(msg.text)) && return
-    lock(chat_file_lock(session)) do
-        open(session.path, "a") do io
-            println(io, "!!! thought \"$(msg.id)\"")
-            for line in split(msg.text, '\n')
-                println(io, "    ", line)
-            end
-            println(io)
-        end
-    end
+    append_block(session, msg)
 end
 
-function append_tool(session::ChatSession, msg::ToolMsg)
-    lock(chat_file_lock(session)) do
-        open(session.path, "a") do io
-            # 4th field: the resolved filter key (`tool_key`) — persisting it makes
-            # the typed variants (Bash/Task/MCP…) reload with stable per-tool
-            # filter identities even though reload lands as `GenericToolMsg`.
-            meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
-            println(io, "!!! tool \"$meta\"")
-            println(io, "    `$(msg.title)`")
-            # Brief summary on the collapsed header; full ACP body lives in
-            # the chat-storage `tools/<id>.json` (see update_tool_file!).
-            if !isempty(msg.summary)
-                println(io, "")
-                println(io, "    $(msg.summary)")
-            end
-            println(io)
-        end
-    end
-end
+append_tool(session::ChatSession, msg::ToolMsg) = append_block(session, msg)
 
-function append_plan(session::ChatSession, msg::TodoListMsg)
-    lock(chat_file_lock(session)) do
-        open(session.path, "a") do io
-            println(io, "!!! plan")
-            # Write as plain lines (not markdown list) so admonition_text can round-trip them
-            for e in msg.entries
-                mark = e.status == "completed" ? "x" : " "
-                println(io, "    [$mark] $(e.content)")
-            end
-            println(io)
-        end
-    end
-end
+append_plan(session::ChatSession, msg::TodoListMsg) = append_block(session, msg)
 
 # `/compact` summary boundary, persisted under its own block so reload doesn't
 # have to re-classify by matching the verbatim Claude Code prefix every time.
 function append_summary(session::ChatSession, msg::SummaryMsg)
     isempty(strip(msg.text)) && return
+    append_block(session, msg)
+end
+
+"""
+    rewrite_history(session, msgs)
+
+Atomically rewrite the WHOLE chat.md from `msgs` (front-matter header + one
+`history_block` per message, in order). Used by `reconcile_replay!` when a
+resumed session's replay has to be SPLICED into the middle of the stored
+history (adopted messages land before the user's still-unsent bubbles) — an
+append can't express that, and chat.md is canonical, so the file must be
+rebuilt in store order. Runs under the per-file lock so live appends and the
+`update_session_id!` header RMW can't interleave with the rebuild.
+"""
+function rewrite_history(session::ChatSession, msgs::AbstractVector)
     lock(chat_file_lock(session)) do
-        open(session.path, "a") do io
-            println(io, "!!! summary \"$(now(UTC))\"")
-            for line in split(msg.text, '\n')
-                println(io, "    ", line)
-            end
+        atomic_write_text(session.path) do io
+            print_front_matter(io, session)
             println(io)
+            for m in msgs
+                history_block(io, m)
+            end
         end
+    end
+end
+
+"""
+    backup_history!(session) -> Union{String,Nothing}
+
+Preserve the current chat.md as `chat.md.bak` (overwriting an older backup).
+Called by the fully-diverged reconcile path right before the visible history is
+rebuilt from the live session's replay — the jsonl is the source of truth at
+that point, but the old canonical transcript must survive on disk. Returns the
+backup path, or `nothing` when there is no chat.md yet.
+"""
+function backup_history!(session::ChatSession)
+    lock(chat_file_lock(session)) do
+        isfile(session.path) || return nothing
+        bak = session.path * ".bak"
+        cp(session.path, bak; force = true)
+        return bak
     end
 end
 

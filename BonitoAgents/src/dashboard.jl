@@ -420,7 +420,15 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     # instantly; the replayed `msgs.count` fills it in. (A chat that already has
     # `chat.md` history renders it immediately and needs no eager bind — and
     # skipping it there also avoids a needless `reconcile_replay!`.)
-    if p.resume_session_id !== nothing && isempty(shared(model).msgs_store)
+    # ALSO bind eagerly when we DO have local history but the session's jsonl
+    # has advanced since our last reconcile (the user continued the session in
+    # the Claude Code CLI / another server): without this the chat shows a
+    # frozen snapshot until the first send — and the bind-triggered reconcile
+    # then floods the adopted history in around the user's message. The
+    # watermark is a per-chat stamp file updated after every reconcile; the
+    # session's freshness comes from the worker scan (`state.discovered`).
+    if p.resume_session_id !== nothing &&
+       (isempty(shared(model).msgs_store) || session_advanced_since_sync(state, p))
         Base.errormonitor(@async try
             restart_chat_session!(model)
         catch e

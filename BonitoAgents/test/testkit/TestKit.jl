@@ -47,7 +47,7 @@ import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
 
 export TestServer, dev_server, add_worker!,
-       text, thought, edit, bash, todo, delay, tool, tool_update,
+       text, user, thought, edit, bash, todo, delay, tool, tool_update, REPLAY_FN,
        sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn, bt_eval, bt_show_app,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
@@ -61,6 +61,15 @@ export TestServer, dev_server, add_worker!,
 # The mock binary's dispatcher loop maps these to ACP frames.
 
 text(s::AbstractString)                 = Dict("type" => "text",    "text"  => String(s))
+# A replayed USER turn — only meaningful inside a `REPLAY_FN` script (the
+# session/load history the mock re-streams); prompts never produce user events.
+user(s::AbstractString)                 = Dict("type" => "user",    "text"  => String(s))
+
+# Scripted `session/load` replay: `REPLAY_FN[]` maps a session id to the event
+# list (user/text/thought/tool) the mock re-streams as the resumed session's
+# history — how the real agent replays its jsonl. Default: no replay, which is
+# what every pre-existing resume test expects. Set per test, reset in `finally`.
+const REPLAY_FN = Ref{Function}(sid -> Any[])
 thought(s::AbstractString)              = Dict("type" => "thought", "text"  => String(s))
 edit(path, old, new; id = nothing)      = begin
     d = Dict{String,Any}("type" => "edit", "path" => String(path),
@@ -357,6 +366,21 @@ function handle_client(client, agent_ref::Ref{Function})
             line = try readline(client) catch; break end
             isempty(line) && continue
             msg = JSON.parse(line)
+            # session/load replay request: serve the scripted history for this
+            # session id (REPLAY_FN, default empty) and terminate the stream.
+            if haskey(msg, "replay")
+                events = try
+                    Base.invokelatest(REPLAY_FN[], String(msg["replay"]))
+                catch e
+                    @warn "TestKit REPLAY_FN threw" exception = e
+                    Any[]
+                end
+                for ev in events
+                    println(client, JSON.json(ev)); flush(client)
+                end
+                println(client, JSON.json(Dict("type" => "end"))); flush(client)
+                continue
+            end
             prompt = String(get(msg, "prompt", ""))
             # On a resumed session the server prepends a transcript of the prior
             # conversation, with the user's real new message after a "My new

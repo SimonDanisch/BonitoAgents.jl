@@ -818,6 +818,7 @@ class BonitoChat {
 
         switch (msg.type) {
             case 'msgs.count':   return this.applyCount(msg.n);
+            case 'msgs.reload':  return this.onMsgsReload(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
             case 'lens.vocab':   this.lensVocab = msg.keys || []; return;
             case 'lens.saved':   return this.onLensSaved(msg);
@@ -866,6 +867,27 @@ class BonitoChat {
     }
 
     // ── Range / virtual scroll ────────────────────────────────────────────
+
+    // Full re-sync: the server SPLICED or rebuilt the history (a resumed
+    // session's reconcile inserted messages mid-store), so every cached
+    // index → node mapping is invalid. Tear the rendered window down and
+    // re-run the initial mount cascade against the new total, pinned to the
+    // bottom — the newest messages are what a sync is for.
+    onMsgsReload(n) {
+        for (const node of this.cache.values()) node.remove();
+        this.cache.clear();
+        this.heights.clear();
+        this.rendered.clear();
+        this.nodeById.clear();
+        this.observed.clear();
+        this._requestedAt.clear();
+        this._cancelPendingScroll();
+        this.totalCount    = 0;      // applyCount below re-sets it
+        this._bootstrapped = false;  // re-arm the initial bottom-pin cascade
+        this.followMode    = true;
+        this.unreadCount   = 0;
+        this.applyCount(n);
+    }
 
     applyCount(n) {
         if (n <= 0) {
