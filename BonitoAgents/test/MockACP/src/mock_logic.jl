@@ -294,6 +294,37 @@ function ensure_dispatcher!()
     return DISPATCHER_SOCK[]
 end
 
+# One BETWEEN-TURN frame (the `post_turn` event's payload, emitted after the
+# prompt response — like the real agent streaming a bg subagent's activity and
+# its auto-wake announcement after end_turn). Supports the shapes the
+# between-turn wire actually carries (fixtures/bg_subagent_wire.jsonl):
+# untagged text, tagged sub_text/sub_tool.
+function emit_post_event(ev::AbstractDict)
+    et = String(get(ev, "type", ""))
+    if et == "text"
+        agent_chunk(String(ev["text"]))
+    elseif et == "sub_text"
+        upd("agent_message_chunk", Dict{String,Any}(
+            "content" => Dict("type" => "text", "text" => String(ev["text"])),
+            "_meta"   => sub_meta(ev)))
+    elseif et == "sub_tool"
+        tid = String(get(ev, "id", "post-subtool"))
+        if Bool(get(ev, "update", false))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid,
+                "status" => String(get(ev, "status", "completed")),
+                "_meta"  => sub_meta(ev)))
+        else
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => String(get(ev, "kind", "execute")),
+                "title" => String(get(ev, "title", "sub tool")),
+                "status" => String(get(ev, "status", "in_progress")),
+                "_meta"  => sub_meta(ev)))
+        end
+    end
+    return nothing
+end
+
 # session/load replay via the dispatcher: ask the test process for the
 # session's scripted history ({"replay": sid}) and emit each event as one
 # session/update frame — user/agent turns land whole (one chunk per turn, the
@@ -341,6 +372,7 @@ function run_dispatcher_prompt(prompt_id)
 
     stop_reason = "end_turn"
     next_tool_id = 1
+    post_blocks = Any[]   # `post_turn` events, emitted AFTER the prompt response
     while !eof(sock)
         # Cancel arriving mid-stream (set by the concurrently-running stdin
         # reader in `dispatch_loop`) ends the turn the way real claude does:
@@ -560,6 +592,11 @@ function run_dispatcher_prompt(prompt_id)
             # scenario (`exit(1)` after `session/prompt`).
             flush(stdout); flush(stderr)
             exit(1)
+        elseif et == "post_turn"
+            # Remember for AFTER the response: the real agent keeps streaming
+            # past end_turn (bg-subagent activity, the auto-wake completion
+            # announcement) — see emit_post_event.
+            push!(post_blocks, ev)
         elseif et == "end"
             stop_reason = String(get(ev, "stopReason", "end_turn"))
             break
@@ -568,6 +605,19 @@ function run_dispatcher_prompt(prompt_id)
         # new event types without churning the binary in lockstep.
     end
     resp(prompt_id, Dict("stopReason" => stop_reason))
+    # Between-turn emission: each post_turn block waits its delay, then streams
+    # its frames with NO turn open. Async so the dispatcher loop is free to
+    # read the next prompt — same concurrency the real agent has.
+    for pt in post_blocks
+        @async try
+            sleep(Float64(get(pt, "delay_ms", 300)) / 1000)
+            for ev in get(pt, "events", Any[])
+                ev isa AbstractDict && emit_post_event(ev)
+            end
+        catch e
+            @warn "post_turn emission failed" exception = e
+        end
+    end
 end
 
 # Most-recent prompt text — used by the dispatcher handler to know what

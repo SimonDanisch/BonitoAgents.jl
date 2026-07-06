@@ -48,6 +48,7 @@ const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_f
 
 export TestServer, dev_server, add_worker!,
        text, user, thought, edit, bash, todo, delay, tool, tool_update, REPLAY_FN,
+       post_turn,
        sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn, bt_eval, bt_show_app,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
@@ -64,6 +65,19 @@ text(s::AbstractString)                 = Dict("type" => "text",    "text"  => S
 # A replayed USER turn — only meaningful inside a `REPLAY_FN` script (the
 # session/load history the mock re-streams); prompts never produce user events.
 user(s::AbstractString)                 = Dict("type" => "user",    "text"  => String(s))
+
+"""
+    post_turn(events; delay_ms = 300) -> Dict
+
+Agent event carrying frames the mock emits BETWEEN TURNS — `delay_ms` after the
+prompt response, with no turn open. Mirrors the real wire (see
+test/fixtures/bg_subagent_wire.jsonl): a background subagent's tagged activity
+(`sub_text`/`sub_tool`) keeps flowing after end_turn, and the main agent's
+auto-wake completion announcement arrives as untagged `text`.
+"""
+post_turn(events::Vector; delay_ms = 300) =
+    Dict{String,Any}("type" => "post_turn", "events" => events,
+                     "delay_ms" => Float64(delay_ms))
 
 # Scripted `session/load` replay: `REPLAY_FN[]` maps a session id to the event
 # list (user/text/thought/tool) the mock re-streams as the resumed session's

@@ -61,7 +61,9 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                       name::Union{String,Nothing}          = nothing,
                       auto_open::Bool                      = false,
                       agent_bin::Union{String,Nothing}     = nothing,
-                      agent_env::Dict{String,String}       = Dict{String,String}())
+                      agent_env::Dict{String,String}       = Dict{String,String}(),
+                      heartbeat_interval::Real             = 15.0,
+                      heartbeat_deadline::Real             = 45.0)
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
     # writes the real port back to srv.port after start.
     chosen_port = port === nothing ? 0 : port
@@ -80,7 +82,9 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                     port          = chosen_port,
                     worker_secret = secret,
                     state_dir     = state_dir,
-                    working_dir   = working_dir)
+                    working_dir   = working_dir,
+                    heartbeat_interval = heartbeat_interval,
+                    heartbeat_deadline = heartbeat_deadline)
     server_url = "http://127.0.0.1:$(state.srv.port)"
 
     # Stand the worker up exactly like a real install: write the SAME

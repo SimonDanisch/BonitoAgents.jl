@@ -54,7 +54,9 @@ function serve(; host::String        = "0.0.0.0",
                  public_url::Union{String,Nothing}   = nothing,
                  worker_secret::String,
                  state_dir::Union{String,Nothing}   = nothing,
-                 working_dir::Union{String,Nothing} = nothing)
+                 working_dir::Union{String,Nothing} = nothing,
+                 heartbeat_interval::Real = 15.0,
+                 heartbeat_deadline::Real = 45.0)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
     isvalid(s) = s !== nothing && !isempty(String(s))
@@ -63,7 +65,9 @@ function serve(; host::String        = "0.0.0.0",
     wd = isvalid(working_dir) ? String(working_dir) :
          joinpath(homedir(), "bonitoagents-server")
 
-    state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret)
+    state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret,
+                          heartbeat_interval = heartbeat_interval,
+                          heartbeat_deadline = heartbeat_deadline)
 
     # Mark all loaded workers offline; they'll flip online when they re-dial.
     for w in values(state.workers[])

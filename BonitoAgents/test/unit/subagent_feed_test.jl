@@ -135,8 +135,12 @@ end
     @test st.stale
     @test st.label == "no activity 3m"
 
-    # Finished task: no activity affordance at all.
+    # Finished task: no activity affordance at all. A background subagent
+    # finishes via an explicit terminal UPDATE, which clears `task_running`
+    # (update_from_snap!(::TaskToolMsg)) — mirror that here; without it the
+    # bg liveness keeps the slot alive BY DESIGN (launch-ack ≠ finished).
     m.status = "completed"
+    m.task_running = false
     close(m)
     @test BT.taskbar_activity(m, time()) === nothing
 end

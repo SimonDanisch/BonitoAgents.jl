@@ -86,6 +86,15 @@ mutable struct Connection
     # (see `notify_frame`).
     on_frame::Union{Function,Nothing}
 
+    # Sink for session/updates arriving with NO turn in flight. The agent DOES
+    # stream between turns: a background subagent's parent-tagged activity
+    # keeps flowing after end_turn, and when the subagent finishes the main
+    # agent auto-wakes and streams an untagged completion message (captured
+    # live in BonitoAgents/test/fixtures/bg_subagent_wire.jsonl). Called as
+    # `on_orphan_update(update::SessionUpdate)` on the dispatcher task — keep
+    # it fast + non-throwing. `nothing` (default) = the old drop behavior.
+    on_orphan_update::Union{Function,Nothing}
+
     # The in-flight streaming turns, OLDEST FIRST. `prompt_updates` appends;
     # the dispatcher feeds every `session/update` into the FIRST entry's
     # channel and closes + removes an entry when its response arrives.
@@ -159,6 +168,7 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
                       Dict{Int,Channel{Any}}(), 0,
                       handler,
                       on_frame,
+                      nothing,                              # on_orphan_update (set post-bind)
                       Pair{Int,Channel{SessionUpdate}}[],   # active_turns
                       Channel{Any}(1024),
                       ReentrantLock(), nothing, nothing, false,
@@ -444,6 +454,17 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             end
             if ch !== nothing && !(@atomic conn.cancelling)
                 deliver_update!(conn, ch, update)
+            elseif ch === nothing && conn.on_orphan_update !== nothing &&
+                   !(@atomic conn.cancelling)
+                # No turn in flight — but the agent legitimately streams here:
+                # background-subagent activity and the auto-wake completion
+                # message (see the field doc). Hand it to the orphan sink;
+                # a throwing sink must never take the dispatcher down.
+                try
+                    conn.on_orphan_update(update)
+                catch e
+                    @warn "on_orphan_update threw" exception = (e, catch_backtrace())
+                end
             end
         end
         # Other notifications silently ignored.

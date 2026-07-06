@@ -157,6 +157,11 @@ class BonitoChat {
         this._spacerTopH   = -1;    // last written spacer px (skip no-op style writes)
         this._spacerBotH   = -1;
         this._requestedAt  = new Map(); // idx → time of in-flight msgs.request
+        // Bumped on msgs.reload (the server SPLICED history — all indices
+        // shifted). Every msgs.request carries it and the server echoes it
+        // back on msgs.range; a reply from before the reload is dropped in
+        // onRange instead of caching old-world nodes at new-world indices.
+        this._epoch        = 0;
         this.STREAM_APPLY_MS = 100; // min interval between streaming innerHTML applies
 
         // ONE shared ResizeObserver for every node in the render window.
@@ -882,6 +887,14 @@ class BonitoChat {
         this.observed.clear();
         this._requestedAt.clear();
         this._cancelPendingScroll();
+        // Indices shifted: invalidate every in-flight range reply (onRange
+        // drops mismatching epochs) and restart the history backfill against
+        // the new indices.
+        this._epoch++;
+        this._prefetchStarted = false;
+        this._prefetchCursor  = null;
+        this._prefetchPending = null;
+        clearTimeout(this._prefetchTimer);
         this.totalCount    = 0;      // applyCount below re-sets it
         this._bootstrapped = false;  // re-arm the initial bottom-pin cascade
         this.followMode    = true;
@@ -1012,6 +1025,7 @@ class BonitoChat {
 
     _prefetchTick() {
         if (this.destroyed) return;
+        if (this._prefetchPaused) return;   // hidden pane — onShown resumes
         // Highest missing index at or below the cursor.
         let e = -1;
         for (let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
@@ -1025,7 +1039,7 @@ class BonitoChat {
         // SILENT (cache-only): prefetch must not re-window/scroll per chunk
         // — that's a visible flicker storm right after mount.
         this._prefetchPending = [s, e];
-        this.comm.notify({type: 'msgs.request', range: [s, e]});
+        this.comm.notify({type: 'msgs.request', range: [s, e], epoch: this._epoch});
         // onRange reschedules the next tick when the response lands; this
         // timer is only the safety net for a lost/empty response.
         clearTimeout(this._prefetchTimer);
@@ -1130,7 +1144,8 @@ class BonitoChat {
             if (missing.length > 0) {
                 for (const i of missing) this._requestedAt.set(i, now);
                 this.comm.notify({type: 'msgs.request',
-                                  range: [missing[0], missing[missing.length - 1]]});
+                                  range: [missing[0], missing[missing.length - 1]],
+                                  epoch: this._epoch});
             }
         }
         this.updateDOM(s, e);
@@ -1152,7 +1167,13 @@ class BonitoChat {
         }
     }
 
-    onRange({ start, msgs }) {
+    onRange({ start, msgs, epoch }) {
+        // A reply computed BEFORE a msgs.reload carries the old epoch — its
+        // indices belong to the pre-splice world; caching them would put the
+        // wrong messages at the wrong positions. Drop it (the dedup expiry
+        // re-requests anything still missing). Servers that don't echo the
+        // epoch (older builds) send undefined → accepted, old behavior.
+        if (epoch !== undefined && epoch !== null && epoch !== this._epoch) return;
         const messages = msgs ?? [];          // tolerate the legacy `messages` field
         const fresh = [];
         messages.forEach((data, i) => {
@@ -1174,7 +1195,7 @@ class BonitoChat {
         // Any arriving range advances the background prefetch (pacing: one
         // chunk in flight at a time, ~30ms apart). Runs through drags too —
         // caching is the drag-safe part.
-        if (this._prefetchStarted) {
+        if (this._prefetchStarted && !this._prefetchPaused) {
             clearTimeout(this._prefetchTimer);
             this._prefetchTimer = setTimeout(() => this._prefetchTick(), 30);
         }
@@ -1278,8 +1299,54 @@ class BonitoChat {
         });
     }
 
+    // The topmost rendered, visible node at/under the current scrollTop and
+    // its offset from the viewport top. This is THE scroll anchor: geometry
+    // changes ABOVE the viewport (height corrections, prefetch measurements,
+    // EST_HEIGHT adaptation re-spacing the top spacer) must not move what the
+    // user is looking at — without it, every prefetch/retry tick snapped the
+    // view back while scrolling through unmeasured history ("scrolling is
+    // stuck: it resets to an earlier position every second").
+    _captureAnchor() {
+        const st = this.container.scrollTop;
+        for (const i of [...this.rendered].sort((a, b) => a - b)) {
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (n.offsetTop + n.offsetHeight > st) {
+                return { idx: i, off: n.offsetTop - st };
+            }
+        }
+        return null;
+    }
+
+    // Re-pin the anchor after DOM/spacer mutations. No-op when nothing above
+    // the viewport changed (|delta| ≤ 1px), so plain scroll ticks never write.
+    _restoreAnchor(a) {
+        if (!a) return;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        let want;
+        if (n && n.isConnected) {
+            want = n.offsetTop - a.off;
+        } else {
+            // The re-window EVICTED the anchor: a large estimate shift remaps
+            // scrollTop to different indices and the anchor can fall outside
+            // the newly computed range. Restore to its VIRTUAL position and
+            // queue a refresh so the window re-materializes around it.
+            want = this.cumHeight(0, a.idx) - a.off;
+            this._queueRefresh();
+        }
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            // Programmatic, possibly event-less write: keep the direction
+            // baseline fresh (see _prevScrollTop).
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
+
     updateDOM(s, e) {
         if (s > e) return;
+        // Anchor BEFORE any mutation; restored after the spacer writes below.
+        // Skipped during the initial mount cascade (scrollToBottom owns it).
+        const anchor = this.initialLoad ? null : this._captureAnchor();
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
                 const node = this.cache.get(idx);
@@ -1342,6 +1409,7 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
+        this._restoreAnchor(anchor);
         // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
         // (pin total at drag-start, absorb deltas in the spacers) turned
         // estimate-vs-real drift into PHANTOM BLANK at the end of the
@@ -3034,6 +3102,15 @@ class BonitoChat {
         if (this._setOverscroll) this._setOverscroll(0);
         this._savedScrollTop  = this.container.scrollTop;
         this._savedFollowMode = this.followMode;
+        // CONTENT anchor besides the pixel position: heights re-measured
+        // while hidden (or the backfill running meanwhile) change what a raw
+        // scrollTop points at — restoring to the anchored MESSAGE is what
+        // "keep my read position" actually means.
+        this._savedAnchor = this._captureAnchor();
+        // Hidden panes stop backfilling: every prefetch chunk is a server-side
+        // render broadcast to every tab — deferred until the user returns.
+        this._prefetchPaused = true;
+        clearTimeout(this._prefetchTimer);
     }
 
     // Called by the chat-pane visibility toggle whenever this pane goes
@@ -3057,17 +3134,34 @@ class BonitoChat {
         const followThen = !!this._savedFollowMode;
         const wantBottom = followNow || followThen;
         const savedTop   = this._savedScrollTop;
+        const anchor     = this._savedAnchor;
+
+        // Resume the paused history backfill (see onHidden).
+        this._prefetchPaused = false;
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(() => this._prefetchTick(), 600);
+        }
 
         const apply = () => {
             if (this.destroyed) return;
             if (wantBottom) {
                 if (this.followMode) this.scrollToBottom();
+                return;
+            }
+            // Prefer the CONTENT anchor: land on the message the user was
+            // reading, not on whatever pixel offset the re-measured heights
+            // now map to. Falls back to the raw scrollTop while the anchor
+            // node isn't rendered yet (a later cascade retry snaps it true).
+            const n = anchor && this.rendered.has(anchor.idx) ? this.cache.get(anchor.idx) : null;
+            if (n && n.isConnected) {
+                this.container.scrollTop = n.offsetTop - anchor.off;
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
-                // Programmatic, possibly event-less write: sync the
-                // direction baseline (see _prevScrollTop).
-                this._prevScrollTop = this.container.scrollTop;
             }
+            // Programmatic, possibly event-less write: sync the direction
+            // baseline (see _prevScrollTop).
+            this._prevScrollTop = this.container.scrollTop;
         };
         apply();
         requestAnimationFrame(apply);

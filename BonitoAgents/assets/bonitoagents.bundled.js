@@ -94,6 +94,7 @@ class BonitoChat {
         this._spacerTopH = -1;
         this._spacerBotH = -1;
         this._requestedAt = new Map();
+        this._epoch = 0;
         this.STREAM_APPLY_MS = 100;
         this._ro = new ResizeObserver((entries)=>{
             if (this.destroyed) return;
@@ -564,7 +565,7 @@ class BonitoChat {
         }
     }
     onMsgsReload(n) {
-        for (const node of this.cache.values()) node.remove();
+        for (const node of this.cache.values())node.remove();
         this.cache.clear();
         this.heights.clear();
         this.rendered.clear();
@@ -572,13 +573,17 @@ class BonitoChat {
         this.observed.clear();
         this._requestedAt.clear();
         this._cancelPendingScroll();
-        this.totalCount    = 0;
+        this._epoch++;
+        this._prefetchStarted = false;
+        this._prefetchCursor = null;
+        this._prefetchPending = null;
+        clearTimeout(this._prefetchTimer);
+        this.totalCount = 0;
         this._bootstrapped = false;
-        this.followMode    = true;
-        this.unreadCount   = 0;
+        this.followMode = true;
+        this.unreadCount = 0;
         this.applyCount(n);
     }
-
     applyCount(n) {
         if (n <= 0) {
             this._startSettle();
@@ -651,6 +656,7 @@ class BonitoChat {
     }
     _prefetchTick() {
         if (this.destroyed) return;
+        if (this._prefetchPaused) return;
         let e = -1;
         for(let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--){
             if (!this.cache.has(i)) {
@@ -671,7 +677,8 @@ class BonitoChat {
             range: [
                 s,
                 e
-            ]
+            ],
+            epoch: this._epoch
         });
         clearTimeout(this._prefetchTimer);
         this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 2000);
@@ -737,7 +744,8 @@ class BonitoChat {
                     range: [
                         missing[0],
                         missing[missing.length - 1]
-                    ]
+                    ],
+                    epoch: this._epoch
                 });
             }
         }
@@ -748,7 +756,8 @@ class BonitoChat {
             this._prevScrollTop = this.container.scrollTop;
         }
     }
-    onRange({ start , msgs  }) {
+    onRange({ start , msgs , epoch  }) {
+        if (epoch !== undefined && epoch !== null && epoch !== this._epoch) return;
         const messages = msgs ?? [];
         const fresh = [];
         messages.forEach((data, i)=>{
@@ -765,7 +774,7 @@ class BonitoChat {
             ]);
         });
         this._measureNodes(fresh);
-        if (this._prefetchStarted) {
+        if (this._prefetchStarted && !this._prefetchPaused) {
             clearTimeout(this._prefetchTimer);
             this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 30);
         }
@@ -835,8 +844,40 @@ class BonitoChat {
             if (!this.destroyed) this.refresh();
         });
     }
+    _captureAnchor() {
+        const st = this.container.scrollTop;
+        for (const i of [
+            ...this.rendered
+        ].sort((a, b)=>a - b)){
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (n.offsetTop + n.offsetHeight > st) {
+                return {
+                    idx: i,
+                    off: n.offsetTop - st
+                };
+            }
+        }
+        return null;
+    }
+    _restoreAnchor(a) {
+        if (!a) return;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        let want;
+        if (n && n.isConnected) {
+            want = n.offsetTop - a.off;
+        } else {
+            want = this.cumHeight(0, a.idx) - a.off;
+            this._queueRefresh();
+        }
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
     updateDOM(s, e) {
         if (s > e) return;
+        const anchor = this.initialLoad ? null : this._captureAnchor();
         for (const idx of [
             ...this.rendered
         ]){
@@ -882,6 +923,7 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
+        this._restoreAnchor(anchor);
     }
     touchApp(idx) {
         const i = this.appLru.indexOf(idx);
@@ -2140,20 +2182,34 @@ class BonitoChat {
         if (this._setOverscroll) this._setOverscroll(0);
         this._savedScrollTop = this.container.scrollTop;
         this._savedFollowMode = this.followMode;
+        this._savedAnchor = this._captureAnchor();
+        this._prefetchPaused = true;
+        clearTimeout(this._prefetchTimer);
     }
     onShown() {
         const followNow = !!this.followMode;
         const followThen = !!this._savedFollowMode;
         const wantBottom = followNow || followThen;
         const savedTop = this._savedScrollTop;
+        const anchor = this._savedAnchor;
+        this._prefetchPaused = false;
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 600);
+        }
         const apply = ()=>{
             if (this.destroyed) return;
             if (wantBottom) {
                 if (this.followMode) this.scrollToBottom();
+                return;
+            }
+            const n = anchor && this.rendered.has(anchor.idx) ? this.cache.get(anchor.idx) : null;
+            if (n && n.isConnected) {
+                this.container.scrollTop = n.offsetTop - anchor.off;
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
-                this._prevScrollTop = this.container.scrollTop;
             }
+            this._prevScrollTop = this.container.scrollTop;
         };
         apply();
         requestAnimationFrame(apply);

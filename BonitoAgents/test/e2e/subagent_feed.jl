@@ -143,6 +143,121 @@ function run_suite(server)
                 "document.querySelectorAll('.bt-task-feed-entry').length") == 2
         end
 
+        @testset "background subagent stays pinned past turn end; ⊗ stop unpins" begin
+            # A run_in_background Task's tool_call completes at LAUNCH (the
+            # ack) — the old behavior unpinned it there, leaving zero GUI
+            # feedback of the running subagent. It must now survive its own
+            # close AND the turn end (`task_running`, the bg_running twin),
+            # until the user stops it.
+            # The real launch-ack wire shape: ONE tool_call frame reporting
+            # "completed" and NO closing tool_update (`complete = false`) —
+            # a later terminal update is the explicit finish signal and WOULD
+            # clear task_running (update_from_snap!), which is its own path.
+            server.agent_fn[] = p -> Any[
+                TK.tool(kind = "other", title = "Background investigation",
+                        tool_name = "Task", id = "task-BG",
+                        complete = false, open_status = "completed",
+                        raw_input = Dict{String,Any}(
+                            "run_in_background" => true,
+                            "description"       => "bg work")),
+                TK.text("launched, moving on"), TK.end_turn()]
+            TK.send_message(server, "delegate in background")
+            BA    = TK.BT
+            model = server.h.state.chat_models[pid]
+            # Wait until the TURN is over (busy off) — the moment the old code
+            # would have unpinned the slot.
+            t0 = time()
+            while BA.shared(model).busy_active[] && time() - t0 < 30
+                sleep(0.2)
+            end
+            @test !BA.shared(model).busy_active[]
+            t = lock(BA.shared(model).lock) do
+                i = findlast(m -> m isa BA.TaskToolMsg && m.id == "task-BG",
+                             BA.shared(model).msgs_store)
+                i === nothing ? nothing : BA.shared(model).msgs_store[i]
+            end
+            @test t !== nothing
+            @test t.task_running
+            @test BA.is_live(t)
+            @test any(x -> x.id == "task-BG", BA.shared(model).taskbar_items[])
+            # The pill also survives in the DOM past turn end.
+            @test TK.wait_for(server, "bg task pill pinned after turn end",
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') !== null"; timeout = 10) == true
+            # ⊗ stop: liveness clears, slot unpins.
+            BA.request_tool_stop!(model, t)
+            @test !t.task_running
+            @test !BA.is_live(t)
+            @test TK.wait_for(server, "bg task pill unpinned after stop",
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') === null"; timeout = 10) == true
+        end
+
+        @testset "between-turn frames: feed stays live, auto-wake message renders, pill finalizes" begin
+            # The real wire (fixtures/bg_subagent_wire.jsonl): after end_turn
+            # the bg subagent's tagged activity keeps flowing, then the main
+            # agent auto-wakes with an untagged completion announcement. All
+            # of it used to be dropped. Now: feed updates after turn end, the
+            # announcement renders as a new agent bubble, and — single running
+            # bg task — the pill finalizes on the announcement.
+            server.agent_fn[] = p -> Any[
+                TK.tool(kind = "other", title = "Background research",
+                        tool_name = "Task", id = "task-BG2",
+                        complete = false, open_status = "completed",
+                        raw_input = Dict{String,Any}(
+                            "run_in_background" => true,
+                            "description"       => "bg research")),
+                TK.text("launched bg research"),
+                TK.post_turn(Any[
+                        Dict("type" => "sub_text", "parent" => "task-BG2",
+                             "text" => "POSTTURN-SUB scanning archives"),
+                        Dict("type" => "text",
+                             "text" => "The background agent completed and replied: DONE_MARKER_42")];
+                    delay_ms = 800),
+                TK.end_turn()]
+            TK.send_message(server, "research in background")
+            BA    = TK.BT
+            model = server.h.state.chat_models[pid]
+            t0 = time()
+            while BA.shared(model).busy_active[] && time() - t0 < 30
+                sleep(0.2)
+            end
+            @test !BA.shared(model).busy_active[]
+            t = lock(BA.shared(model).lock) do
+                i = findlast(m -> m isa BA.TaskToolMsg && m.id == "task-BG2",
+                             BA.shared(model).msgs_store)
+                i === nothing ? nothing : BA.shared(model).msgs_store[i]
+            end
+            @test t !== nothing && t.task_running   # pinned at turn end
+            # (1) The post-turn SUB activity lands in the feed (after end_turn!).
+            t0 = time()
+            while time() - t0 < 15
+                any(e -> occursin("POSTTURN-SUB", e.label), t.activity) && break
+                sleep(0.2)
+            end
+            @test any(e -> occursin("POSTTURN-SUB", e.label), t.activity)
+            # (2) The auto-wake announcement renders as a NEW agent bubble.
+            @test TK.wait_for(server, "auto-wake message rendered",
+                "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('DONE_MARKER_42'))";
+                timeout = 15) == true
+            # (3) Single running bg task → the announcement finalizes the pill.
+            t0 = time()
+            while t.task_running && time() - t0 < 10
+                sleep(0.2)
+            end
+            @test !t.task_running
+            @test TK.wait_for(server, "bg pill unpinned by auto-wake",
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG2\"]') === null"; timeout = 10) == true
+            # (4) The next prompt closes the between-turn bubble (persisted, final).
+            server.agent_fn[] = p -> Any[TK.text("ack"), TK.end_turn()]
+            TK.send_message(server, "thanks")
+            @test TK.wait_for(server, "follow-up turn done",
+                "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('ack'))";
+                timeout = 20) == true
+            orphan = lock(BA.shared(model).lock) do
+                BA.shared(model).orphan_agent_msg[]
+            end
+            @test orphan === nothing   # closed at begin_turn!
+        end
+
         @testset "no JS errors" begin
             @test isempty(TK.js_errors(server))
         end

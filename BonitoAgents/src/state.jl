@@ -158,6 +158,14 @@ mutable struct ServerState
     working_dir :: String
     # Auth
     worker_secret :: String
+    # Worker-link liveness (seconds). The server pings every worker control WS
+    # every `heartbeat_interval`; a pong-capable worker that hasn't ponged for
+    # `heartbeat_deadline` is a ZOMBIE (half-open TCP after a suspend / wifi
+    # drop — the socket stays ESTABLISHED but nothing flows) and its socket is
+    # closed, which runs the normal disconnect teardown. Configurable so tests
+    # can use sub-second values.
+    heartbeat_interval :: Float64
+    heartbeat_deadline :: Float64
     # Live Bonito server (set by serve() after construction)
     srv :: Union{Bonito.Server,Nothing}
 
@@ -235,11 +243,14 @@ Construct a fresh state, loading workers + projects from `state_dir`
 """
 function ServerState(; state_dir::String,
                        working_dir::String,
-                       worker_secret::String)
+                       worker_secret::String,
+                       heartbeat_interval::Real = 15.0,
+                       heartbeat_deadline::Real = 45.0)
     mkpath(working_dir)
     s = ServerState(
         ReentrantLock(),
         state_dir, working_dir, worker_secret,
+        Float64(heartbeat_interval), Float64(heartbeat_deadline),
         nothing,
         Observable(Dict{String,WorkerInfo}()),    # workers
         Observable(Dict{String,ProjectInfo}()),   # projects
@@ -275,6 +286,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
         ServerState(
             s.lock,
             s.state_dir, s.working_dir, s.worker_secret,
+            s.heartbeat_interval, s.heartbeat_deadline,
             s.srv,
             map(identity, session, s.workers),
             map(identity, session, s.projects),

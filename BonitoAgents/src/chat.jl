@@ -65,6 +65,14 @@ mutable struct ChatModel
     # UserMsg-not-yet-defined ordering here; every element is a UserMsg.
     pending_sends::Vector{Any}
 
+    # The open BETWEEN-TURN agent message (`Ref{Any}` for the same type-order
+    # reason; holds an AgentMsg or nothing). When a background subagent
+    # finishes, the main agent auto-wakes and streams its announcement with NO
+    # turn in flight (`Connection.on_orphan_update` → `handle_orphan_update!`);
+    # the chunks coalesce into this streaming bubble, closed by the next
+    # `begin_turn!`. Guarded by the shared lock.
+    orphan_agent_msg::Ref{Any}
+
     # One-shot history prelude prepended to the next prompt after a session
     # change that lost claude's jsonl (see `arm_history_replay!`). Empty = none.
     pending_history_replay::Ref{String}
@@ -214,6 +222,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         collect(AgentClientProtocol.MCPServer, mcp_servers),
         Channel{UserMessage}(64),
         Any[],                      # pending_sends (user bubbles not yet prompted)
+        Ref{Any}(nothing),          # orphan_agent_msg (open between-turn bubble)
         Ref(""),                    # pending_history_replay
         Observable(Dict{String,Any}()),
         Observable(true),
@@ -276,6 +285,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.agent, m.mcp_servers,
             m.user_messages,           # shared queue → all sessions feed one consumer
             m.pending_sends,           # shared → reconcile sees every tab's unsent bubbles
+            m.orphan_agent_msg,        # shared → one between-turn bubble per chat
             m.pending_history_replay,
             map(identity, session, m.comm),
             map(identity, session, m.session_alive),
@@ -532,14 +542,26 @@ mutable struct TaskToolMsg <: ToolMsg
     activity_seq::Int
     last_activity_at::Float64
     feed_summarized::Bool                 # stamp_feed_summary! ran (close is not once-only)
+    # A background subagent's tool_call "completes" at LAUNCH (the ack) but the
+    # subagent runs on — the Task twin of BashToolMsg.bg_running. While true,
+    # `is_live` keeps the bubble pulsing and the taskbar slot pinned (with the
+    # activity line + staleness badge). Cleared by the user's ⊗ stop; there is
+    # no reliable wire signal for a background subagent finishing (the SDK's
+    # task_* events are dropped upstream), so the slot outlives the turn by
+    # design and the staleness badge is the "is it still doing anything?" cue.
+    task_running::Bool
 end
 
 # Back-compat 11-arg form (pre-feed): the build/replay paths and test fixtures.
+# A freshly built background Task is RUNNING at launch (`task_running =
+# is_background`); the replay/reload path passes `task_running = false` — a
+# replayed call is history, not a live subagent.
 TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
-            description, is_background, task_name, chat) =
+            description, is_background, task_name, chat;
+            task_running = is_background) =
     TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
                 description, is_background, task_name, chat,
-                TaskActivityEntry[], 0, time(), false)
+                TaskActivityEntry[], 0, time(), false, task_running)
 
 mutable struct MCPToolMsg <: ToolMsg
     id::String
@@ -629,6 +651,13 @@ is_live(m::ToolMsg) =
 # (and its taskbar slot + timer stay) until the shell actually exits.
 function is_live(m::BashToolMsg)
     (m.is_background && !isempty(m.bg_output_path)) && return m.bg_running
+    return m.finished_at === nothing && !(m.status in ("completed", "failed"))
+end
+# A background SUBAGENT's tool_call completes at launch too — liveness is
+# `task_running` (cleared by the user's ⊗ stop), not the tool_call status, so
+# the bubble + taskbar slot stay while the subagent works (see the field doc).
+function is_live(m::TaskToolMsg)
+    m.is_background && m.task_running && return true
     return m.finished_at === nothing && !(m.status in ("completed", "failed"))
 end
 # `finished_at` flips to non-nothing inside `try_absorb_todo!` once the
@@ -1639,41 +1668,40 @@ end
 # fetch lands, re-checks isfile, and returns without a second transfer.
 # The per-destination lock registry lives on the SERVER (`state.show_fetch_inflight`,
 # server_dst => lock), not a module global — server-scoped, dies with the server.
-# It's pruned on SUCCESS (below): once the file is on disk every future caller
-# short-circuits on the top `isfile` check and never needs the lock, so keeping
-# it would just accumulate one ReentrantLock per distinct file ever shown. A
-# FAILED fetch keeps its lock so a retry still serializes against a concurrent
-# attempt (the two-writers-into-`<dst>.partial` race the lock exists to prevent).
+# Entries are NEVER pruned: `refresh=true` callers (the editor) re-fetch a file
+# that already exists on disk, so any two callers can race into the same
+# `<dst>.partial` at any time — an earlier prune-on-success optimization would
+# hand them two different locks. One ReentrantLock per distinct file ever
+# fetched is a trivial, bounded cost.
 
 # Resolve `st.path` to a file on the SERVER's disk, fetching it from the worker
 # if we don't already have it. Blocks for the transfer (multi-GB videos take
 # a while — receive_file streams into `<dst>.partial` and renames, so isfile
 # never sees a torso). Throws if it can't be obtained.
-function fetch_show_file(st::ShowTool)
+#
+# `refresh=true` re-fetches even when a mirror copy exists (#34): the agent
+# edits files ON THE WORKER, so for the file EDITOR the first-ever-fetched
+# copy is stale the moment a turn touches the file. Media previews keep the
+# cheap cache (tool outputs are new paths; multi-GB videos must not re-stream
+# per render). With no worker attached, refresh falls back to the existing
+# mirror copy rather than failing — stale beats nothing when offline.
+function fetch_show_file(st::ShowTool; refresh::Bool = false)
     server_dst = show_server_path(st)
-    isfile(server_dst) && return server_dst        # already mirrored or cached
+    !refresh && isfile(server_dst) && return server_dst   # already mirrored or cached
     dst_lock = lock(st.state.lock) do
         get!(ReentrantLock, st.state.show_fetch_inflight, server_dst)
     end
-    try
-        return lock(dst_lock) do
-            isfile(server_dst) && return server_dst    # the racer fetched it
-            proj = get(st.state.projects[], st.project_id, nothing)
-            proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
-            worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
-            mkpath(dirname(server_dst))
-            fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
-            return server_dst
+    return lock(dst_lock) do
+        !refresh && isfile(server_dst) && return server_dst    # the racer fetched it
+        proj = get(st.state.projects[], st.project_id, nothing)
+        if proj === nothing
+            refresh && isfile(server_dst) && return server_dst
+            error("bt_show: file not on server and no worker to fetch from: $(st.path)")
         end
-    finally
-        # Prune the lock once the file is on disk. Waiters already captured
-        # `dst_lock`, so deleting the dict entry can't strand them; new callers
-        # short-circuit on `isfile` before ever reaching the registry.
-        if isfile(server_dst)
-            lock(st.state.lock) do
-                delete!(st.state.show_fetch_inflight, server_dst)
-            end
-        end
+        worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
+        mkpath(dirname(server_dst))
+        fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
+        return server_dst
     end
 end
 
@@ -1852,7 +1880,20 @@ struct FileEditor
     project_id::String
     server_path::String    # absolute file path on the server (mirror/cache)
     worker_path::String    # absolute file path on the worker; "" ⇒ no push
+    # Julia → JS: replace the buffer with fresh worker content — but ONLY if
+    # the buffer is clean (getValue() === __btOriginal); unsaved edits win.
+    # Fired by `open_project_file!` when activating an already-open panel (#34).
+    reload::Observable{String}
+    # Julia → JS: a save reached the disk — the current buffer IS the new
+    # baseline. Kept separate from `reload` (no setValue) and only fired on
+    # save SUCCESS: a failed save must leave the buffer "dirty" so a later
+    # refresh can't clobber edits that never landed.
+    mark_clean::Observable{String}
 end
+FileEditor(state::ServerState, project_id::AbstractString, server_path::AbstractString,
+           worker_path::AbstractString) =
+    FileEditor(state, String(project_id), String(server_path), String(worker_path),
+               Observable(""), Observable(""))
 
 function Bonito.jsrender(session::Session, fe::FileEditor)
     isfile(fe.server_path) ||
@@ -1885,9 +1926,14 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
         fastScrollSensitivity = 5,
         wordWrap = "off",
         theme = Observable("vs"),   # light, matching the app
-        # Expose the live editor instance for the Save button + Ctrl-S.
+        # Expose the live editor instance for the Save button + Ctrl-S, and
+        # remember the on-disk baseline so refreshes can tell a clean buffer
+        # from unsaved edits (see the `reload` observable).
         js_init_func = js"""(me) => {
-            me.editor.then(ed => { me.editor_div.__btEditor = ed; });
+            me.editor.then(ed => {
+                me.editor_div.__btEditor = ed;
+                ed.__btOriginal = ed.getValue();
+            });
         }""")
     save_btn = DOM.button("Save";
         class = "bt-btn bt-btn-sm bt-file-editor-save",
@@ -1903,6 +1949,10 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
         try
             write(fe.server_path, content)
             pushed = push_editor_save_to_worker(fe)
+            # Only a save that REACHED the disk moves the clean baseline; a
+            # failed save leaves the buffer dirty so a refresh can't clobber
+            # edits that never landed.
+            safe_set!(fe.mark_clean, content)
             safe_set!(status, "saved $(Dates.format(now(), "HH:MM:SS"))" *
                               (pushed ? " · pushed to worker" : ""))
         catch e
@@ -1910,14 +1960,27 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
             safe_set!(status, "save failed: $(sprint(showerror, e))")
         end
     end
+    body_div = DOM.div(editor; class = "bt-file-editor-body")
+    # Refresh from the worker (panel re-activation, #34): replace ONLY a clean
+    # buffer — unsaved edits always win over whatever changed on the worker.
+    onjs(session, fe.reload, js"""(txt) => {
+        const ed = $(body_div).querySelector('.monaco-editor-div')?.__btEditor;
+        if (!ed || ed.getValue() !== ed.__btOriginal) return;   // dirty → keep edits
+        if (txt !== ed.getValue()) {
+            ed.setValue(txt);
+            ed.__btOriginal = txt;
+        }
+    }""")
+    onjs(session, fe.mark_clean, js"""(txt) => {
+        const ed = $(body_div).querySelector('.monaco-editor-div')?.__btEditor;
+        if (ed) ed.__btOriginal = txt;
+    }""")
     header = DOM.div(
         DOM.span(fe.server_path; class = "bt-file-editor-path", title = fe.server_path),
         DOM.span(status; class = "bt-file-editor-status"),
         save_btn;
         class = "bt-file-editor-header")
-    node = DOM.div(header,
-        DOM.div(editor; class = "bt-file-editor-body");
-        class = "bt-file-editor")
+    node = DOM.div(header, body_div; class = "bt-file-editor")
     # Ctrl+S inside the editor saves (capture phase beats Monaco's default).
     Bonito.onload(session, node, js"""(root) => {
         root.addEventListener('keydown', (e) => {
@@ -2547,8 +2610,14 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             chat_emit(b.chat, d)
         end
     finally
-        close(b)        # total: finalizes the bubble even if the loop body threw
-        unpin_task!(b.chat, b.id)
+        # A running background SUBAGENT outlives its launch-ack (same rule as
+        # the bg bash below): keep the bubble live + its taskbar slot pinned.
+        # It finalizes via the user's ⊗ stop or the chat's teardown — there is
+        # no wire signal for a background subagent finishing.
+        if !(b isa TaskToolMsg && b.is_background && b.task_running)
+            close(b)    # total: finalizes the bubble even if the loop body threw
+            unpin_task!(b.chat, b.id)
+        end
     end
     return nothing
 end
@@ -2579,6 +2648,18 @@ snap_header_extras!(::Dict, ::ToolMsg) = nothing
 snap_header_extras!(d::Dict, b::MCPToolMsg) = (eval_header_extras!(d, b); nothing)
 
 update_from_snap!(::ToolMsg, _snap) = nothing
+# A LATER terminal update on a background subagent is the agent's explicit
+# "the subagent finished" signal (its result was collected) — clear
+# `task_running` so the drain's finally closes + unpins the slot. The launch
+# ACK (the initial tool_call frame, which also reports "completed") never
+# reaches this loop: it builds the message before the update stream, so a
+# bg Task with no later updates stays pinned — exactly the visible-subagent
+# behavior this field exists for.
+function update_from_snap!(b::TaskToolMsg, _snap)
+    b.is_background && b.task_running && b.status in ("completed", "failed") &&
+        (b.task_running = false)
+    return nothing
+end
 function update_from_snap!(b::BonitoAppMsg, snap)
     isempty(b.app_id) || return
     ref = find_app_reference(snap.content)
@@ -3041,6 +3122,68 @@ function route_subagent_activity!(chat::ChatModel,
     return nothing
 end
 
+# ── Between-turn wire frames (Connection.on_orphan_update) ──────────────────
+# The agent streams AFTER end_turn: a background subagent's tagged activity
+# keeps flowing, and when it finishes the main agent AUTO-WAKES and streams an
+# untagged announcement ("The background agent completed and replied: …") —
+# captured live in test/fixtures/bg_subagent_wire.jsonl. Without this router
+# both were dropped: the Task pill froze (amber despite live work) and the
+# completion message never rendered anywhere.
+#
+# Runs on the ACP dispatcher task: mutate under the lock, emit outside, never
+# throw (the connection guards, but be a good citizen anyway).
+function handle_orphan_update!(chat::ChatModel, u)
+    s = shared(chat)
+    if u isa AgentClientProtocol.SubagentUpdate
+        # Same distill + feed path the in-turn sink uses.
+        act = AgentClientProtocol.subagent_activity(u.parent_tool_use_id, u.update)
+        act === nothing || route_subagent_activity!(chat, act)
+        return nothing
+    end
+    u isa AgentClientProtocol.AgentMessageChunk || return nothing  # usage etc.
+    t = AgentClientProtocol.text_of(u)
+    (t === nothing || isempty(t)) && return nothing
+    msg, created, finished_task = lock(s.lock) do
+        cur = s.orphan_agent_msg[]
+        cur !== nothing && return (cur, false, nothing)
+        # First chunk of an auto-wake message — the thing that wakes the agent
+        # between turns is a background subagent finishing. With exactly ONE
+        # running, this announcement IS its completion signal: finalize the
+        # pill. (Several running → ambiguous, leave them pinned; the amber
+        # staleness + ⊗ still cover it.)
+        running = TaskToolMsg[m for m in s.msgs_store
+                              if m isa TaskToolMsg && m.is_background && m.task_running]
+        ft = length(running) == 1 ? running[1] : nothing
+        ft === nothing || (ft.task_running = false)
+        fresh = AgentMsg(chat, "")     # streaming bubble (in_flight)
+        s.orphan_agent_msg[] = fresh
+        (fresh, true, ft)
+    end
+    if created
+        send!(chat, msg)               # push + wire_new: the bubble appears live
+        if finished_task !== nothing
+            close(finished_task)       # persists + finalizes ("N steps" trace)
+            unpin_task!(chat, finished_task.id)
+        end
+    end
+    append!(msg, t)                    # streams the chunk (wire_chunk)
+    return nothing
+end
+
+# Close the open between-turn bubble (idempotent). Called from `begin_turn!` —
+# a new prompt is the natural boundary of the auto-wake announcement (there is
+# no end_turn for it: no turn was open).
+function finish_orphan_msg!(chat::ChatModel)
+    s = shared(chat)
+    m = lock(s.lock) do
+        cur = s.orphan_agent_msg[]
+        s.orphan_agent_msg[] = nothing
+        cur
+    end
+    m === nothing || close(m)          # persists + emits agent_final
+    return nothing
+end
+
 # One-line, length-capped feed label: subagent text chunks carry newlines and
 # stream long; the feed rows / taskbar line are single-line.
 function feed_label(s::AbstractString)
@@ -3108,6 +3251,9 @@ entry_wire(e::TaskActivityEntry) = Dict{String,Any}(
 # for `drain_turn!`, or `nothing` when there's no client.
 function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     promote_queued_user_bubble!(chat)
+    # A new prompt is the boundary of any open between-turn auto-wake bubble:
+    # close it now so it persists + finalizes before the turn's own messages.
+    finish_orphan_msg!(chat)
     s = shared(chat)
     # A turn can still be drained from the channel AFTER the chat is closed:
     # `close(::ChatModel)` shuts `user_messages`, but the consumer keeps draining
@@ -3614,6 +3760,9 @@ function start_chat_client!(model::ChatModel)
     # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
     start!(model.agent; on_frame = acp_frame_logger(model.chat_dir))
     cli = client(model.agent)
+    # Between-turn frames (bg-subagent activity + the auto-wake completion
+    # message) route into this chat instead of being dropped by the dispatcher.
+    cli === nothing || (cli.conn.on_orphan_update = u -> handle_orphan_update!(model, u))
     replay_msgs = replay(model.agent)
     # Header metadata: typed views over the raw session-setup result. A future
     # agent kind extends this line with additional parsers over the same dict.
@@ -4162,7 +4311,8 @@ replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
     TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
                 content_summary(tc.kind, tc.content),
                 time(), time(),
-                tc.description, tc.run_in_background, tc.task_name, nothing)
+                tc.description, tc.run_in_background, tc.task_name, nothing;
+                task_running = false)   # replayed = history, not a live subagent
 replayed_tool_msg(tc::AgentClientProtocol.MCPCall) =
     is_bonito_app(tc) ? replayed_bonito_app_msg(tc, tc.server) :
     MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
@@ -4963,11 +5113,16 @@ struct LensQueryCommand <: ChatCommand;  query::String;  end
 struct LensSaveCommand   <: ChatCommand;  query::String;  end
 struct LensDeleteCommand <: ChatCommand;  query::String;  end
 
-# Wire `{type: "msgs.request", range: [s, e]}` — JS virtual-scroll wants
-# messages [s..e] (zero-based, inclusive) for the visible window.
+# Wire `{type: "msgs.request", range: [s, e], epoch}` — JS virtual-scroll
+# wants messages [s..e] (zero-based, inclusive) for the visible window.
+# `epoch` is the client's reload generation, echoed verbatim on the
+# `msgs.range` reply so a reply computed BEFORE a `msgs.reload` (indices
+# shifted by a reconcile splice) is dropped client-side instead of caching
+# old-world messages at new-world positions. -1 = absent (older client).
 struct MsgsRequestCommand <: ChatCommand
     s::Int
     e::Int
+    epoch::Int
 end
 
 # Wire `{type: "tool.render", id: <tool_id>}` — user expanded the tool
@@ -5058,7 +5213,8 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
     elseif type == "msgs.request"
         rng = get(msg, "range", nothing)
         rng isa AbstractVector && length(rng) == 2 || return UnknownCommand()
-        return MsgsRequestCommand(Int(rng[1]), Int(rng[2]))
+        ep = get(msg, "epoch", -1)
+        return MsgsRequestCommand(Int(rng[1]), Int(rng[2]), ep isa Number ? Int(ep) : -1)
     elseif type == "tool.render"
         return ToolRenderCommand(String(get(msg, "id", "")))
     elseif type == "thought.render"
@@ -5149,8 +5305,11 @@ function handle_command!(model::ChatModel, ::Session, cmd::MsgsRequestCommand)
     batch === nothing && return nothing
     s, slice = batch
     msgs = [msg_to_dict(m, model.chat_dir) for m in slice]
-    chat_emit(model, Dict{String,Any}(
-        "type" => "msgs.range", "start" => s, "msgs" => msgs))
+    reply = Dict{String,Any}("type" => "msgs.range", "start" => s, "msgs" => msgs)
+    # Echo the client's reload generation (see MsgsRequestCommand) so a reply
+    # that raced a msgs.reload is dropped instead of mis-cached.
+    cmd.epoch >= 0 && (reply["epoch"] = cmd.epoch)
+    chat_emit(model, reply)
     return nothing
 end
 
@@ -5409,6 +5568,7 @@ end
 # task-notification lands as its own turn.
 function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
     (t.is_background && is_live(t)) || return nothing
+    t.task_running = false   # else is_live stays true and the pill keeps pulsing
     close(t)
     unpin_task!(model, t.id)
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => t.id,
@@ -5493,7 +5653,9 @@ file_panel_content(model::ChatModel, path::AbstractString) =
 function file_panel_content(state::ServerState, project_id::AbstractString,
                             server_cwd::AbstractString, path::AbstractString)
     st = ShowTool(state, project_id, server_cwd, path)
-    server_file = fetch_show_file(st)
+    # refresh: the editor must show what's on the worker NOW, not the mirror
+    # copy from the first-ever open (#34 — "file open often opens an old file").
+    server_file = fetch_show_file(st; refresh = true)
     proj = get(state.projects[], project_id, nothing)
     worker_abs = proj === nothing ? "" :
         (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
@@ -5520,6 +5682,14 @@ function open_guard_reject_reason(state::ServerState, project_id::AbstractString
     info = try
         stat_worker_path(state, proj.worker_id, worker_src)
     catch e
+        # Fail CLOSED when the worker itself is unreachable (not connected, or
+        # the stat timed out — the zombie-link case): the follow-up fetch is
+        # then guaranteed to burn its full 60s doing nothing, which is exactly
+        # the "click does nothing for a minute, looks like a crash" incident.
+        # Any other stat error is a genuine worker-side hiccup → keep the old
+        # fail-open behavior and let the fetch report.
+        e isa WorkerUnreachableError &&
+            return "Can't open $name — worker not responding"
         @warn "open-guard stat failed; allowing the fetch to try" path exception = e
         return nothing                      # worker hiccup → don't block; fetch reports
     end
@@ -5573,8 +5743,27 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
     ws = pane.workspace[]
     ws === nothing && return nothing
     id = file_tab_id(path)
-    if any(p -> p.id == id, ws.panels[])
+    existing = findfirst(p -> p.id == id, ws.panels[])
+    if existing !== nothing
         BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
+        # The buffer was loaded when the panel first opened; the agent may
+        # have edited the file on the worker since (#34). Re-fetch and offer
+        # the fresh content to the editor — its JS side applies it only to a
+        # CLEAN buffer, so unsaved edits are never clobbered. Async: the
+        # activation must not wait on a worker round-trip.
+        fe = ws.panels[][existing].content
+        fe isa FileEditor && Base.errormonitor(@async try
+            # Same worker-liveness gate as a fresh open; an unreachable /
+            # invalid target just keeps showing what we already have.
+            reason = open_guard_reject_reason(state, project_id, path)
+            if reason === nothing
+                st = ShowTool(state, project_id, server_cwd, path)
+                fetch_show_file(st; refresh = true)
+                safe_set!(fe.reload, read(fe.server_path, String))
+            end
+        catch e
+            @warn "file editor refresh-on-activate failed" path exception = e
+        end)
         return nothing
     end
     # Fetch (worker transfer — can take seconds) off the event task, then add the
