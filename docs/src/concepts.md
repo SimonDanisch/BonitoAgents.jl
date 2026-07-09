@@ -32,8 +32,8 @@ its state intact.
 ## Workers
 
 A worker is a small Julia process on each machine with code on it. Workers
-**dial out** to the server over a WebSocket control channel — only the server
-needs a reachable address. Per machine the worker:
+**dial out** to the server over a WebSocket control channel, so only the
+server needs a reachable address. Per machine the worker:
 
 - registers under a **stable identity** (survives reinstalls and reboots),
 - spawns **one agent process per project** on demand and relays its protocol
@@ -45,14 +45,13 @@ needs a reachable address. Per machine the worker:
 
 ### Link liveness
 
-Real laptops suspend and switch networks, which can leave a TCP connection
-half-open: both ends think it is ESTABLISHED while nothing flows. BonitoAgents
-treats this as a first-class failure mode: the server pings every worker and
-kills the transport of any worker that goes silent past a deadline (marking it
-offline in the UI and failing pending requests fast); the worker likewise
-watches for the server's pings and re-dials over the current network when they
-stop. Sessions abandoned by a link loss are reaped on the worker so no agent
-processes leak.
+Laptops suspend and switch networks, which can leave a TCP connection
+half-open: both ends think it is ESTABLISHED while nothing flows. The server
+pings every worker and kills the transport of any worker that goes silent past
+a deadline, marking it offline in the UI and failing pending requests fast.
+The worker watches for the server's pings and re-dials over the current
+network when they stop. Sessions abandoned by a link loss are reaped on the
+worker so no agent processes leak.
 
 ## Projects
 
@@ -72,16 +71,15 @@ live agent processes in check).
 Agents speak the [Agent Client Protocol](https://agentclientprotocol.com)
 (ACP). The worker spawns the agent binary per project; the server bridges the
 protocol stream into the chat model that drives the UI. Providers are
-pluggable descriptors — see [Agent Providers](@ref). The same mechanism
-powers the deterministic mock agent the test suite and the scripted
-[walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl)
-use.
+pluggable descriptors (see [Agent Providers](@ref)). The same mechanism powers
+the deterministic mock agent used by the test suite and the scripted
+[walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl).
 
 ## Security
 
 Workers authenticate with a shared secret, generated at install time and
-embedded in the worker one-liner. The dashboard has no user accounts — treat
+embedded in the worker one-liner. The dashboard has no user accounts, so treat
 it like any internal tool: keep it on localhost, a VPN/Tailscale network, or
 behind reverse-proxy auth. Agents run with the OS permissions of the worker
-process; the chat's permission prompts (and the explicit Yolo toggle) decide
-how much they may do unattended.
+process; the chat's permission prompts and the Yolo toggle decide how much
+they may do unattended.
