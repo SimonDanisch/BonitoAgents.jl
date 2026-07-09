@@ -5,143 +5,149 @@
   </picture>
 </p>
 
-# BonitoAgents
+<h1 align="center">BonitoAgents</h1>
 
-Self-hosted multi-host orchestrator for agentic coding sessions. Architecture:
-[../BonitoAgents-Design.md](../BonitoAgents-Design.md). Conventions:
-[../CONVENTIONS.md](../CONVENTIONS.md). External SDK / MCP specs:
-[../docs/external/](../docs/external/).
+<p align="center">
+  A self-hosted dashboard for running coding agents on your own machines.
+</p>
 
-## Layout
+> [!WARNING]
+> Use at your own risk: there are no safeguards (yet) preventing an LLM driven
+> through BonitoAgents from wiping your entire PC or leaking all your secrets.
+
+<p align="center">
+  <img src="BonitoAgents/assets/screenshot-chat.png" alt="BonitoAgents dashboard" width="850">
+</p>
+
+A small worker process runs on every machine that has code on it. All workers
+connect out to one dashboard server, and you control every agent session from
+a single web UI, from any browser including your phone. Nothing runs in a
+cloud; the agents work directly on your checkouts with your Claude
+subscription.
 
 ```
-BonitoAgents/
-├── Project.toml                # Package deps
-├── README.md                   # this file
-├── src/
-│   ├── BonitoAgents.jl           # umbrella module
-│   └── MCP/                    # Julia stdio MCP server
-│       ├── MCP.jl
-│       ├── server.jl           # JSON-RPC 2.0 dispatch loop
-│       ├── output_discipline.jl # truncation, image detect, summary
-│       └── tools/
-│           └── eval.jl         # julia_eval, julia_restart, julia_list_sessions
-└── test/
-    └── smoke_mcp.jl            # in-process + subprocess smoke tests
+   browser / phone ──HTTP/WS──▶  dashboard server (Bonito web app)
+                                      ▲  ▲
+                     control WS +     │  │
+                     file transfer    │  │
+                          ┌───────────┘  └───────────┐
+                     worker (laptop)             worker (desktop)
+                     ├─ claude-code agent (ACP)  ├─ agent per project
+                     ├─ persistent Julia MCP     ├─ …
+                     └─ your project checkouts   └─ your project checkouts
 ```
 
-`Worker/` (thin claude-CLI adapter) and `Server/` (Bonito dashboard) come in
-later milestones (see Design doc).
+Agents are pluggable [ACP](https://agentclientprotocol.com) providers:
+Claude Code by default, with MiMo and OpenCode adapters included
+([`AgentProviders/`](AgentProviders/)).
 
-## First-time setup
+## Features
+
+- Chats stream in live, with Monaco diff viewers for edits, terminal output
+  for shell commands, inline images, and the agent's todo list pinned while
+  it works.
+- A file tree and Monaco editor per project. Files open fresh from the
+  worker and save back to it. Panels (chats, editors, app embeds) arrange
+  into tabs, splits and floating windows.
+- Agents get MCP tools backed by a persistent Julia session per project:
+  `julia_eval` with warm state and disciplined output, `bt_show` for media,
+  and `bt_show_app` to embed a running Bonito app whose interactions round
+  trip to Julia on the worker.
+- Chats persist on disk, browser reconnects resume where you left off, and
+  existing Claude Code sessions on a worker can be imported with their
+  history.
+- Dropped or half-open worker connections (suspend, network switch) are
+  detected by heartbeats on both ends and heal automatically.
+
+The full inventory lives in [`FEATURES.md`](FEATURES.md).
+
+## Quick start
+
+Requirements: [Julia](https://julialang.org/install/) 1.12+. For Claude Code
+agents also Node 20+,
+`npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp`,
+and a logged-in `claude`.
+
+### Everything on this machine
 
 ```bash
-cd /sim/Programmieren/ClaudeExperiments/BonitoAgents
-julia --project=. -e 'import Pkg; Pkg.instantiate()'
+git clone https://github.com/SimonDanisch/BonitoAgents.jl
+cd BonitoAgents.jl
+julia --project=BonitoAgentsApp -e 'using Pkg; Pkg.instantiate()'
+julia --project=BonitoAgentsApp -m BonitoAgentsApp
 ```
 
-This creates the Manifest.toml and downloads JSON.
+This starts the dashboard server plus a worker for the local machine and
+opens the UI in your browser. State persists across restarts under the
+platform data dir (`~/.local/share/BonitoAgents` on Linux). Flags:
+`--port=8038`, `--no-window`, `--data-dir=PATH`. Prebuilt bundles (snap /
+dmg / msix) are attached to
+[releases](https://github.com/SimonDanisch/BonitoAgents.jl/releases).
 
-## Use as standalone Julia MCP server (Claude Code)
+### One server, many machines
 
-After `Pkg.instantiate`, add this to Claude Code's MCP config (e.g. project-level
-`.mcp.json` or user `~/.claude/settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "bonitoagents": {
-      "command": "julia",
-      "args": ["--project=@bonito-agents", "--startup-file=no",
-               "-e", "using BonitoMCP; BonitoMCP.run_stdio()"]
-    }
-  }
-}
-```
-
-The server is a plain `julia` process with an argv array — no shell wrapper,
-so the same config works on Linux, macOS and Windows.
-
-Tools exposed (Milestone 2 set):
-
-- `julia_eval(code, env_path?, full_output?, max_response_bytes?)` — persistent
-  session per env_path; auto-truncates output, summarizes large containers,
-  returns 2-D color-arrays as image blocks. See output_discipline.jl for rules.
-- `julia_restart(env_path?)` — drop the persistent session for env_path
-- `julia_list_sessions()` — list active per-env sessions
-
-Coming in Milestone 2:
-- `julia_doc`, `julia_methods`, `code_typed`, `code_warntype`, `macro_expand`
-- `bonito_evaljs`, `bonito_screenshot`, `bonito_console_log`, `bonito_dom`
-- `makie_screenshot`, `makie_inject_mouse`, `makie_inject_key`, `makie_scene_state`
-
-## Running the smoke test
-
-After instantiate:
+Run the server somewhere always reachable:
 
 ```bash
-julia --project=. test/smoke_mcp.jl
+julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038
 ```
 
-Or interactively from this project's root via julia_eval:
-
-```julia
-import Pkg; Pkg.activate("/sim/Programmieren/ClaudeExperiments")
-include("/sim/Programmieren/ClaudeExperiments/BonitoAgents/src/MCP/MCP.jl")
-# in-process tests work without instantiating BonitoAgents env
-```
-
-The 9 in-process tests in [test/smoke_mcp.jl](test/smoke_mcp.jl) cover:
-initialize handshake, tools/list, simple eval, state persistence, stdout
-capture, error handling, output truncation, full_output bypass, large-container
-summarization. The subprocess test additionally drives the binary end-to-end
-over real stdio.
-
-## Desktop app (BonitoAgentsApp)
-
-[BonitoAgentsApp/](BonitoAgentsApp/) is the AppBundler-packaged desktop app:
-one process that starts the BonitoAgents server on loopback, registers this
-machine as a local worker, and opens the dashboard in an
-[ElectronCall](https://github.com/JuliaWeb/ElectronCall.jl) window. Closing
-the window shuts everything down. State persists across launches under the
-platform data dir (`~/.local/share/BonitoAgents` on Linux).
-
-Run from source:
+or install it as a systemd service with
+[`BonitoAgents/assets/install_server.sh`](BonitoAgents/assets/install_server.sh).
+Then, on each machine that should run agents, paste the one-liner from the
+dashboard's home screen:
 
 ```bash
-julia --project=BonitoAgentsApp -m BonitoAgentsApp            # Electron window
-julia --project=BonitoAgentsApp -m BonitoAgentsApp --no-window # server only
+curl -fsSL http://<your-server>:8038/install.sh | sh
 ```
 
-The package carries a `PrecompileTools.@compile_workload` that boots the
-server, renders the dashboard through a real HTTP request and performs a
-worker handshake, so most of the first-launch latency is precompiled into the
-bundle.
+It installs the worker pinned to the server's code revision, registers the
+machine under a stable identity, and sets up a systemd user service on
+Linux. Re-run it any time to update.
 
-## Release bundles (CI)
+## Tour
 
-[.github/workflows/build-app.yml](.github/workflows/build-app.yml) builds the
-app with [AppBundler](https://github.com/PeaceFounder/AppBundler.jl) for
-Linux (snap, x86_64 + aarch64), macOS (dmg, x86_64 + aarch64) and Windows
-(msix, x86_64):
+<p align="center">
+  <img src="BonitoAgents/assets/screenshot-workspace.png" alt="Chat beside the built-in editor in a split workspace" width="850">
+</p>
 
-- every push to `main` → bundles as workflow artifacts
-- every `v*` tag → a GitHub release is created for the tag and the bundles
-  are attached to it
+[`examples/walkthrough.jl`](examples/walkthrough.jl) records a scripted tour
+([`examples/walkthrough.mp4`](examples/walkthrough.mp4)) against a
+deterministic mock agent, so it needs no API key:
 
-Local build: `julia --project=BonitoAgentsApp/meta -m AppBundler build
-BonitoAgentsApp --build-dir=build`.
+```bash
+julia --project=BonitoAgents/test examples/walkthrough.jl
+```
 
-## Output discipline (enforced server-side)
+## Documentation
 
-LLM-prompt rules like "always end with `nothing`" are unreliable. Instead, this
-MCP server enforces output hygiene at the tool layer:
+Getting started, concepts, deployment and API docs live in [`docs/`](docs/):
 
-| Rule                                            | Behavior                                                             |
-|-------------------------------------------------|----------------------------------------------------------------------|
-| Total response > `max_response_bytes` (10 KB)   | Truncate with `[truncated: ...]` marker                              |
-| Return value is `Matrix{<:Colorant}`, Figure, ..| Return as MCP `image` block (PNG, base64), not text repr             |
-| Container with > 100 elements                   | Summarize: `Vector{Int} with 500 elements; first 10: [1, 2, ...]`    |
-| `full_output=true` argument                     | Bypass all of the above                                              |
+```bash
+julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+julia --project=docs docs/make.jl
+julia --project=docs docs/run.jl        # serve the built site locally
+```
 
-See [src/MCP/output_discipline.jl](src/MCP/output_discipline.jl).
+## Development
+
+```bash
+julia --project=BonitoAgents -e 'using BonitoAgents; BonitoAgents.wait!(dev_server(auto_open = true))'
+```
+
+`dev_server()` boots the same stack against throwaway tempdirs. The test
+suite drives it through headless Electron:
+
+```bash
+julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents")'                          # everything
+julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=["unit"])'      # fast, no browser
+julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=["e2e:media"])' # one suite
+```
+
+## Security model
+
+Workers authenticate to the server with a shared secret from the install
+one-liner. The dashboard has no user accounts, so keep it on localhost, a
+VPN, or behind reverse-proxy auth. Agents run with the permissions of the
+worker process; the chat's permission prompts and the Yolo toggle decide how
+much they may do unattended.

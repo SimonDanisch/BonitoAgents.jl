@@ -370,8 +370,11 @@ Resolves in order:
   2. The monorepo's checked-out branch (best-effort via `git rev-parse
      --abbrev-ref HEAD`; falls back to the exact sha when the repo is in
      detached-HEAD state).
-  3. Fallback `"main"` if we can't locate the monorepo (e.g. the package
-     was installed via `Pkg.add` from the registry — no git working tree).
+  3. No git working tree (a release bundle, or installed via `Pkg.add`):
+     the `v<version>` tag for a clean release version — a bundle is built
+     FROM that tag (build-app.yml), so workers land on exactly the code the
+     server runs. A prerelease/build-suffixed version (e.g. `0.2.0-DEV` on
+     `main` between releases) can only guess `"main"`.
 
 Called per request so a `git checkout` on the server side propagates to the
 next worker install without restarting.
@@ -381,13 +384,20 @@ function current_repo_rev()
     isempty(override) || return override
 
     pkg = pkgdir(@__MODULE__)
-    pkg === nothing && return "main"
+    pkg === nothing && return install_rev_for(pkgversion(@__MODULE__))
     # `pkgdir` returns `<monorepo>/BonitoAgents`; the monorepo (where `.git`
     # lives) is one level up. `.git` may be a directory (normal clone) or a
     # file (submodule / worktree); both count.
     repo_root = abspath(pkg, "..")
-    return _git_head_ref_of(repo_root, "main")
+    return _git_head_ref_of(repo_root, install_rev_for(pkgversion(@__MODULE__)))
 end
+
+# The install rev for a git-less deployment, from the running package version:
+# a clean release version maps to its `v<version>` tag (what release bundles
+# are built from); a prerelease/build suffix or unknown version means "not a
+# tagged release" — `main` is the only honest guess then.
+install_rev_for(v::Union{VersionNumber,Nothing}) =
+    v !== nothing && isempty(v.prerelease) && isempty(v.build) ? "v$(v)" : "main"
 
 # Helper: best-effort `(branch | sha)` for a working-tree path. Returns
 # `default` when the path isn't a git checkout or git refuses to answer.
