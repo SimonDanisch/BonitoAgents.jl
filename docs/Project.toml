@@ -11,6 +11,10 @@ BonitoBook = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
 BonitoMCP = "4a1c91af-1c90-46a4-8594-a3846516869d"
 BonitoWidgets = "62a4b9e4-7ee6-4bfa-b661-80bcb0a47665"
 BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
+# DocumenterBonito bundles the site's JS with Deno. It comes transitively via
+# Bonito, but list it explicitly (as Bonito's own docs do) so a future Bonito
+# that drops the transitive dep can't silently break the doc build.
+Deno_jll = "04572ae6-984a-583e-9378-9577a1c2574d"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
