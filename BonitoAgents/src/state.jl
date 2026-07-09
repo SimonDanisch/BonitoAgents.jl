@@ -100,6 +100,13 @@ mutable struct ProjectInfo
     # Without this, a chat with a title or a bound session id would stay pinned
     # to the homebar forever (those markers are persistent), so ✕ looked broken.
     dismissed::Bool
+    # Per-thread agent session-config overrides: configId → value (e.g.
+    # "mode"=>"bypassPermissions", "effort"=>"max", "model"=>"sonnet"). Empty =
+    # use the global defaults (DEFAULT_SESSION_CONFIG). claude does NOT persist
+    # permission mode / effort across resume (they reset to "default"), so we
+    # record what the user chose and re-assert it on every bring-up — see
+    # `apply_session_config!`. Persisted so resume restores the original settings.
+    desired_config::Dict{String,String}
     # Searchable file index (worker-derived, runtime-only). See ProjectFileIndex.
     file_index::ProjectFileIndex
 end
@@ -107,7 +114,7 @@ end
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
                 nothing, nothing, :unsynced, nothing, nothing, nothing, nothing,
-                false, ProjectFileIndex())
+                false, Dict{String,String}(), ProjectFileIndex())
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
 # call shape working for tests / fixtures that build a WorkerInfo by hand.
@@ -612,7 +619,8 @@ function save_projects!(s::ServerState)
                      "resume_session_id" => p.resume_session_id,
                      "auto_prompt"   => p.auto_prompt,
                      "title"         => p.title,
-                     "dismissed"     => p.dismissed)
+                     "dismissed"     => p.dismissed,
+                     "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
         atomic_write_json(projects_file(s), data)
     end
@@ -647,6 +655,12 @@ function load_projects!(s::ServerState)
             # Pre-`dismissed` projects.json entries default to shown (false), so
             # an upgrade doesn't suddenly hide anyone's existing open chats.
             p.dismissed = get(d, "dismissed", false) === true
+            dc = get(d, "desired_config", nothing)
+            if dc isa AbstractDict
+                for (k, v) in dc
+                    v isa AbstractString && (p.desired_config[String(k)] = String(v))
+                end
+            end
             s.projects[][p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e

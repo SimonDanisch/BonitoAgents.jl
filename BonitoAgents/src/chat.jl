@@ -2417,41 +2417,127 @@ function process!(chat::ChatModel, m::AgentClientProtocol.ModeUpdate)
     return nothing
 end
 
-# User clicked a model (or any other config option) in the header pill.
-# Send the `session/set_config_option` RPC and OPTIMISTICALLY patch
-# session_meta so the pill reflects the choice immediately — the agent's
-# follow-up `config_option_update` notification is the source of truth and
-# will reconcile (or revert) the value if needed. The RPC is sent off-task
-# so a slow agent can't freeze the click handler; failures log + revert.
+# Adopt the AUTHORITATIVE config state the agent returns in a session/new,
+# session/load, or session/set_config_option result. The `set_config_option`
+# RESPONSE carries the complete updated `configOptions` (verified on the wire,
+# claude-agent-acp 0.42.0 — it is NOT an empty object, and no separate
+# `config_option_update` notification arrives for model/effort), so reading it
+# back is the correct source of truth — it even reflects a value the agent
+# clamped or rejected. Replaces the ConfigOption items on `session_meta`,
+# preserving any other meta kinds. No-op (returns false) when the result has no
+# configOptions (e.g. the test mock returns `{}`), so callers fall back to the
+# optimistic single-field patch.
+function adopt_config_options!(model::ChatModel, result)
+    opts = AgentClientProtocol.parse_config_options(result)
+    isempty(opts) && return false
+    s = shared(model)
+    rest = [x for x in s.session_meta[] if !(x isa AgentClientProtocol.ConfigOption)]
+    s.session_meta[] = Any[opts..., rest...]
+    return true
+end
+
+# Optimistic single-field patch: swap `current_value` on one ConfigOption.
+function patch_config_value!(s, cfg_id::AbstractString, value::AbstractString)
+    s.session_meta[] = Any[map(s.session_meta[]) do x
+        x isa AgentClientProtocol.ConfigOption && x.id == cfg_id ?
+            AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
+                x.category, String(value), x.choices) : x
+    end...]
+    return nothing
+end
+
+# User clicked a config option (model / mode / effort) in the header pill.
+# Patch `session_meta` OPTIMISTICALLY so the pill reflects the choice at once,
+# then send `session/set_config_option` off-task (a slow agent mustn't freeze the
+# click handler) and reconcile to the AUTHORITATIVE state in the set response;
+# a failure logs and reverts to the previous value.
 function apply_config_pick!(model::ChatModel, cfg_id::AbstractString,
                             value::AbstractString)
     cli = client(model.agent)
     cli === nothing && return nothing
 
-    # Optimistic patch: swap `current_value` on the matching ConfigOption.
     s = shared(model)
     prev = nothing
-    s.session_meta[] = Any[map(s.session_meta[]) do x
-        if x isa AgentClientProtocol.ConfigOption && x.id == cfg_id
-            prev = x.current_value
-            AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
-                x.category, String(value), x.choices)
-        else
-            x
-        end
-    end...]
+    for x in s.session_meta[]
+        x isa AgentClientProtocol.ConfigOption && x.id == cfg_id && (prev = x.current_value)
+    end
+    patch_config_value!(s, cfg_id, value)
 
     @async try
-        AgentClientProtocol.set_config_option!(cli, cfg_id, value)
+        result = AgentClientProtocol.set_config_option!(cli, cfg_id, value)
+        adopt_config_options!(model, result)   # authoritative; falls back to the patch above
     catch e
         @warn "set_config_option failed; reverting" cfg_id value exception = e
         prev === nothing && return
-        s.session_meta[] = Any[map(s.session_meta[]) do x
-            x isa AgentClientProtocol.ConfigOption && x.id == cfg_id ?
-                AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
-                    x.category, prev, x.choices) : x
-        end...]
+        patch_config_value!(s, cfg_id, prev)
     end
+    return nothing
+end
+
+# ── Desired session config (permission mode / effort / model) ─────────────────
+# claude reports these as ACP config options, but we can neither trust nor rely
+# on them: on `session/load` (resume) claude-agent-acp reports mode/model/effort
+# ALL as "default" regardless of the session's real settings, and permission mode
+# + effort are per-invocation in claude (they reset to "default" on resume; the
+# `CLAUDE_PERMISSION_MODE` env is a no-op — claude ignores it). So we DRIVE them:
+# assert the desired config via `set_config_option` on every bring-up (fresh AND
+# resume), and persist per-thread picks so a resumed thread returns exactly as the
+# user left it. Verified against claude 2.1.195 / claude-agent-acp 0.42.0.
+const DEFAULT_PERMISSION_MODE = "default"
+const DEFAULT_EFFORT          = "xhigh"
+
+project_of(model::ChatModel) =
+    isempty(model.project_id) ? nothing :
+        get(model.state.projects[], model.project_id, nothing)
+
+# The config to assert at bring-up: global defaults overlaid with this thread's
+# persisted picks. Model carries NO global default — a fresh session keeps the
+# agent's own default model (which claude preserves across resume anyway); it's
+# only asserted here once the user has explicitly chosen one.
+function effective_session_config(model::ChatModel)
+    cfg = Dict{String,String}("mode" => DEFAULT_PERMISSION_MODE,
+                              "effort" => DEFAULT_EFFORT)
+    p = project_of(model)
+    p === nothing || merge!(cfg, p.desired_config)
+    return cfg
+end
+
+# Assert the desired config on the live session SYNCHRONOUSLY (so the turn's
+# first prompt runs under it) and optimistically patch `session_meta` so the
+# header pills show the asserted values at once. Only options the agent actually
+# advertises are set (a provider without `effort`/`mode` is skipped); a per-option
+# failure logs and continues — it must not abort bring-up.
+function apply_session_config!(model::ChatModel)
+    cli = client(model.agent); cli === nothing && return nothing
+    # Only set options the agent advertises, and skip ones already at the desired
+    # value (so e.g. mode default→default fires no RPC). `current` is keyed by id.
+    current = Dict(o.id => o.current_value
+                   for o in AgentClientProtocol.parse_config_options(cli.session_result))
+    s = shared(model)
+    for (id, val) in effective_session_config(model)
+        (isempty(val) || !haskey(current, id) || current[id] == val) && continue
+        # Patch the display NOW (so the pill shows the desired value immediately),
+        # but drive the agent OFF-TASK: `set_config_option` is a blocking RPC and
+        # bring-up runs in the chat-open path — a slow/large resume (where the
+        # response queues behind the history replay) would otherwise hang the chat
+        # from ever opening. The async task reconciles to the authoritative set
+        # response when it lands.
+        patch_config_value!(s, id, val)
+        @async try
+            result = AgentClientProtocol.set_config_option!(cli, id, val)
+            adopt_config_options!(model, result)
+        catch e
+            @warn "apply_session_config: set_config_option failed" id val exception = e
+        end
+    end
+    return nothing
+end
+
+# Remember a user's header-pill pick on the thread so resume restores it.
+function persist_desired_config!(model::ChatModel, cfg_id::AbstractString, value::AbstractString)
+    p = project_of(model); p === nothing && return nothing
+    p.desired_config[String(cfg_id)] = String(value)
+    save_projects!(model.state)
     return nothing
 end
 
@@ -3770,6 +3856,10 @@ function start_chat_client!(model::ChatModel)
     # `show_in_header`.)
     shared(model).session_meta[] =
         Any[AgentClientProtocol.parse_config_options(cli.session_result)...]
+    # Assert this thread's permission mode / effort / model on the live session —
+    # fresh OR resume — since claude doesn't remember them across resume. Synchronous
+    # so the first prompt of the turn runs under the asserted config.
+    apply_session_config!(model)
     new_session_id = cli.session_id
     if isempty(replay_msgs)
         # No replay (fresh session/new, or an agent without resume). If WE
@@ -4438,17 +4528,29 @@ end
 # `pick` is an Observable{Tuple{String,String}} ((configId, value)) the model
 # pill posts into on selection; nothing for the static (no-picker) rendering
 # path (e.g. unit tests of `header_meta_line` with a plain item list).
+# Config options the user can change live from the header (model, permission
+# mode, reasoning effort). All three drive the SAME `set_config_option` path —
+# verified to actually take effect mid-session (model switch flips the model used
+# for the next turn; mode/effort are accepted too).
+const SELECTABLE_CONFIG = ("model", "mode", "thought_level")
+
+# `lowercase_modes` lower-cases the PERMISSION-MODE labels (claude reports them
+# title-cased — "Default", "Bypass Permissions"); set for the Claude provider so
+# the mode pill reads in the same lower-case style as the underlying values.
 function header_pill(o::AgentClientProtocol.ConfigOption,
-                     pick::Union{Observable,Nothing} = nothing)
-    if pick !== nothing && o.category == "model" && length(o.choices) > 1
-        return model_select_pill(o, pick)
+                     pick::Union{Observable,Nothing} = nothing;
+                     lowercase_modes::Bool = false)
+    lc = lowercase_modes && o.category == "mode"
+    if pick !== nothing && o.category in SELECTABLE_CONFIG && length(o.choices) > 1
+        return config_select_pill(o, pick; lc = lc)
     end
-    DOM.span(o.category == "model" ? AgentClientProtocol.pill_label(o) :
-             "$(lowercase(o.name)): $(AgentClientProtocol.pill_label(o))";
-        class = "bt-header-meta-item", title = pill_tooltip(o))
+    label = AgentClientProtocol.pill_label(o)
+    lc && (label = lowercase(label))
+    # No name prefix — just the value; the option name lives in the tooltip.
+    DOM.span(label; class = "bt-header-meta-item", title = pill_tooltip(o))
 end
 # Fallback so an unknown meta kind degrades to its string form, not an error.
-header_pill(x, pick::Union{Observable,Nothing} = nothing) =
+header_pill(x, pick::Union{Observable,Nothing} = nothing; lowercase_modes::Bool = false) =
     DOM.span(string(x); class = "bt-header-meta-item")
 
 # A native <select> wrapped to look like the meta-item pill. The agent's
@@ -4457,9 +4559,11 @@ header_pill(x, pick::Union{Observable,Nothing} = nothing) =
 # the agent currently reports. `onchange` posts `(configId, value)` into
 # `pick`; the parent handler (registered ONCE in `chat_header`) translates
 # that into a `set_config_option!` RPC.
-function model_select_pill(o::AgentClientProtocol.ConfigOption, pick::Observable)
+function config_select_pill(o::AgentClientProtocol.ConfigOption, pick::Observable;
+                            lc::Bool = false)
     cfg_id = o.id
     cur    = o.current_value
+    lab(name) = lc ? lowercase(name) : name   # lower-case the option labels (mode)
     # Build each option separately so we can conditionally include the
     # `selected` attribute — Bonito's DOM renders `selected = nothing` as a
     # bare `selected` (boolean attribute is present, just empty), which then
@@ -4470,28 +4574,35 @@ function model_select_pill(o::AgentClientProtocol.ConfigOption, pick::Observable
         kwargs = c.value == cur ?
             (; value = c.value, title = title, selected = true) :
             (; value = c.value, title = title)
-        DOM.option(c.name; kwargs...)
+        DOM.option(lab(c.name); kwargs...)
     end
-    DOM.div(
-        DOM.select((mkopt(c) for c in o.choices)...;
+    sel = DOM.select((mkopt(c) for c in o.choices)...;
             class = "bt-header-meta-select",
-            onchange = js"event => $(pick).notify([$(cfg_id), event.target.value])"),
+            onchange = js"event => $(pick).notify([$(cfg_id), event.target.value])")
+    # No name prefix — each pill shows just its value; the full "Mode: …" /
+    # "Effort: …" label rides on the hover tooltip (`pill_tooltip`).
+    DOM.div(sel;
         class = "bt-header-meta-item bt-header-meta-pick",
         title = pill_tooltip(o))
 end
 
-# Display policy: which meta items make it into the header line. Of claude's
-# config options only the MODEL is shown — the agent reports mode/effort as
-# unhelpful "default"s (and we won't fire extra RPCs just to fix a label).
-# All of them stay parsed on `session_meta` for future use; future meta kinds
-# default to visible.
-show_in_header(o::AgentClientProtocol.ConfigOption) = o.category == "model"
+# Display policy: which meta items make it into the header line. We surface the
+# three controllable claude options — model, permission mode, reasoning effort —
+# as interactive pills. Their displayed values are now TRUSTWORTHY because we
+# assert them at bring-up (`apply_session_config!`) instead of passively echoing
+# claude's reported value (which is "default" on resume regardless of reality).
+# Future meta kinds default to visible.
+show_in_header(o::AgentClientProtocol.ConfigOption) = o.category in SELECTABLE_CONFIG
 show_in_header(::Any) = true
 
-# The most informative item (the model) leads the line.
-meta_order(x) = x isa AgentClientProtocol.ConfigOption && x.category == "model" ? 0 : 1
+# Lead with the model, then permission mode, then effort; other config kinds and
+# non-config meta trail.
+meta_order(x) = x isa AgentClientProtocol.ConfigOption ?
+    (x.category == "model" ? 0 : x.category == "mode" ? 1 :
+     x.category == "thought_level" ? 2 : 3) : 4
 
-function header_meta_line(items, pick::Union{Observable,Nothing} = nothing)
+function header_meta_line(items, pick::Union{Observable,Nothing} = nothing;
+                          lowercase_modes::Bool = false)
     shown = sort(filter(show_in_header, collect(Any, items)); by = meta_order)
     # Keep the `.bt-header-meta` element (and its `margin-left:auto`) even when
     # empty — e.g. while a provider switch has cleared `session_meta`. A bare,
@@ -4499,12 +4610,9 @@ function header_meta_line(items, pick::Union{Observable,Nothing} = nothing)
     # (provider/sync/restart) collapses leftward and snaps back when the new
     # model loads — a jarring header jump on every switch.
     isempty(shown) && return DOM.div(; class = "bt-header-meta")
-    parts = Any[]
-    for (i, x) in enumerate(shown)
-        i > 1 && push!(parts, " · ")
-        push!(parts, header_pill(x, pick))
-    end
-    DOM.div(parts...; class = "bt-header-meta")
+    # Each pill is a bordered button (see `.bt-header-meta-pick`); spacing comes
+    # from the flex `gap`, so no " · " text separators between them.
+    DOM.div((header_pill(x, pick; lowercase_modes) for x in shown)...; class = "bt-header-meta")
 end
 
 # Compact the per-file sync progress ("Sending 137/999: src/long/path.jl")
@@ -4591,12 +4699,19 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # session stays on whatever it defaulted to (e.g. a paid model that returns
     # empty turns). Hold the raw payload and normalize in the handler.
     config_pick = Observable{Any}(["", ""])
-    meta_line = map(items -> header_meta_line(items, config_pick), model.session_meta)
+    # Always lower-case the permission-mode labels (claude reports them
+    # title-cased — "Default", "Bypass Permissions"). Unconditional: the
+    # provider-gated version didn't reliably detect Claude at render time, and
+    # lower-case reads fine for any provider's mode option.
+    meta_line = map(items -> header_meta_line(items, config_pick; lowercase_modes = true),
+                    model.session_meta)
     on(session, config_pick) do pick
         (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
         cfg_id, value = String(pick[1]), String(pick[2])
         isempty(cfg_id) && return
         apply_config_pick!(model, cfg_id, value)
+        # Remember the pick on the thread so resume restores it (claude won't).
+        persist_desired_config!(model, cfg_id, value)
     end
 
     sync_status = Observable("")
@@ -4759,7 +4874,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # on the first option — "Claude Code" — regardless of the real provider, so
     # the header lied about the backend). Instead mark the current provider's
     # <option selected> and rebuild the select when `model.provider` changes —
-    # the same proven pattern as `model_select_pill`. The `selected` kwarg is
+    # the same proven pattern as `config_select_pill`. The `selected` kwarg is
     # splatted in only on the current option (Bonito renders `selected=nothing`
     # as a bare, always-on attribute, which would select every option).
     provider_status = Observable("")

@@ -298,10 +298,11 @@ end
 # Set one of the session's configurable options (model / mode / effort / …).
 # Wire method: `session/set_config_option` with `{sessionId, configId, value}`,
 # per the ACP SDK (zSetSessionConfigOptionRequest) and claude-agent-acp's
-# setSessionConfigOption handler. Returns whatever the agent responds with
-# (claude-agent-acp returns an empty object). Throws on rpc error; the caller
-# is expected to either rely on the agent's follow-up `config_option_update`
-# notification to confirm the new value, or surface the error to the user.
+# setSessionConfigOption handler. Returns the agent's response result, which —
+# for claude-agent-acp 0.42.0 — carries the COMPLETE updated `configOptions`
+# (the new value applied, or the actual value if the agent clamped/rejected the
+# request). So the response is the authoritative post-set state; callers should
+# read it back rather than assume the value took. Throws on rpc error.
 function set_config_option!(client::Client, config_id::AbstractString,
                             value::AbstractString)
     return send_request(client.conn, "session/set_config_option",

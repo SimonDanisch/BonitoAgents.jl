@@ -342,7 +342,11 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
                 for d in get(params, "configOptions", []) if d isa AbstractDict]
         return ConfigOptionUpdateNotif(opts)
     elseif kind == "current_mode_update"
-        return CurrentModeUpdateNotif(String(get(params, "modeId", "")))
+        # claude-agent-acp sends the new mode under `currentModeId` (verified on
+        # the wire, v0.42.0); the ACP spec's own field name is `modeId`. Read the
+        # claude form first, fall back to the spec form, so both agents work.
+        return CurrentModeUpdateNotif(
+            String(get(params, "currentModeId", get(params, "modeId", ""))))
     else
         return UnknownUpdate(kind, params)
     end

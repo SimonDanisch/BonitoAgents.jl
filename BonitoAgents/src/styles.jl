@@ -365,14 +365,14 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
-        # Sits left (after the title), content-width, growing rightward into the
-        # gap before the right-anchored `.bt-header-actions`. Min-width keeps the
-        # empty state (during a switch) from collapsing the layout; max-width
-        # ellipsizes a very long model name instead of squeezing the title.
-        "flex" => "0 1 auto", "min-width" => "0", "max-width" => "260px",
-        "white-space" => "nowrap",
-        "overflow" => "hidden",
-        "text-overflow" => "ellipsis"),
+        # ONE inline row of config pills (model · mode · effort), kept to the LEFT
+        # of the provider/sync/restart buttons. A flex row (not a text block) so
+        # the interactive <select> pills — which are block-level <div>s — line up
+        # horizontally instead of stacking vertically. No max-width/ellipsis: all
+        # three stay fully visible on a single line.
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "flex" => "0 1 auto", "min-width" => "0",
+        "white-space" => "nowrap"),
     # The right-anchored control cluster (provider switcher · sync · restart).
     # `margin-left:auto` pushes it to the right edge; because the model pill and
     # status text live OUTSIDE it (to its left), their width changes are absorbed
@@ -380,22 +380,41 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-actions",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
         "margin-left" => "auto", "flex" => "0 0 auto"),
+    # Config pills (model · mode · effort) share the SAME chrome as the
+    # provider/sync/restart buttons — a bordered pill on `--bt-surface`, 12px,
+    # 4px/10px padding, 6px radius — so the whole header reads as one uniform
+    # control strip. Interactive pills (`-pick`) wrap a chrome-stripped <select>
+    # (the pill carries the border, exactly like the bare provider <select>);
+    # static single-choice pills (`-item`) are the same pill without a select.
     CSS(".bt-header-meta-item",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "white-space" => "nowrap",
         "cursor" => "default"),
-
-    # Model picker — a native <select> styled as the meta-item pill. We strip
-    # the native chrome (no border / no system background / no arrow gap) so it
-    # reads as a clickable text label; only on hover does the box-shadow ring +
-    # the down-arrow hint that it's interactive. `currentColor` keeps the
-    # arrow matching the muted meta-text color.
     CSS(".bt-header-meta-pick",
-        "padding" => "0",                 # the <select> brings its own
+        # inline-flex so a prefix label ("mode:"/"effort:") and its <select> sit
+        # on the same baseline within the pill.
+        "display" => "inline-flex", "align-items" => "center",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "white-space" => "nowrap",
         "cursor" => "pointer",
-        "border-radius" => "3px",
-        "transition" => "background 80ms ease, box-shadow 80ms ease"),
+        "transition" => "background 80ms"),
     CSS(".bt-header-meta-pick:hover",
-        "background" => "var(--bt-surface-soft, rgba(127,127,127,0.08))",
-        "box-shadow" => "0 0 0 1px var(--bt-border, rgba(127,127,127,0.25))"),
+        "background" => "var(--bt-surface-2)"),
+    CSS(".bt-header-meta-pick:focus-within",
+        "outline" => "2px solid var(--bt-accent)",
+        "outline-offset" => "1px"),
+    # The <select> is chrome-stripped — the pill wrapper carries the
+    # border/background, matching the bare provider <select> (which has no arrow
+    # either, so they stay identical).
     CSS(".bt-header-meta-select",
         "appearance" => "none",
         "-webkit-appearance" => "none",
@@ -405,18 +424,9 @@ const ChatStyles = Bonito.Styles(
         "outline" => "0",
         "color" => "inherit",
         "font" => "inherit",
-        "padding" => "1px 14px 1px 4px",
-        "cursor" => "pointer",
-        # Tiny down-arrow rendered as an inline SVG background so the pill
-        # doesn't depend on a font-glyph being available.
-        "background-image" => "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><path fill='currentColor' d='M0 0l5 6 5-6z'/></svg>\")",
-        "background-repeat" => "no-repeat",
-        "background-position" => "right 3px center",
-        "background-size" => "7px 5px"),
-    CSS(".bt-header-meta-select:focus-visible",
-        "outline" => "1px solid var(--bt-accent, #3b82f6)",
-        "outline-offset" => "1px",
-        "border-radius" => "3px"),
+        "padding" => "0",
+        "margin" => "0",
+        "cursor" => "pointer"),
 
     # ── Status dot (online/offline/streaming) ────────────────────────────────
     # Shared liveness dot (chat header, dashboard). Same status palette as the
