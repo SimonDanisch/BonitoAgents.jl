@@ -28,10 +28,19 @@ mutable struct WorkerInfo
     mcp_path::String                   # MCP launch command on worker (the julia binary)
     mcp_args::Vector{String}           # MCP launch args on worker (--project=…, -e …)
     projects_root::String              # rsync destination root on worker
-    # runtime
-    status::Symbol                     # :unknown, :online, :offline
+    # runtime. `online` is the single source of truth for liveness: true while
+    # the control WS is connected. It's an Observable so it can be SHARED into
+    # this worker's ChatModels — a disconnect/reconnect then drives each chat's
+    # offline banner, send-gating and background poller WITHOUT evicting the
+    # model (the pane stays live and rebinds on reconnect). Stable across
+    # reconnects (the WorkerInfo is reused, not rebuilt). Query with `isopen(w)`.
+    online::Observable{Bool}
     last_check::DateTime
 end
+
+# A worker is "open" while its control WS is connected. Point read; bind to
+# `w.online` directly for live UI reactivity.
+Base.isopen(w::WorkerInfo) = w.online[]
 
 # Per-project searchable file index — a flat list of paths relative to the
 # project root, fetched from the worker (`list_project_files`) and cached here so
@@ -123,7 +132,12 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
 WorkerInfo(worker_id, name, url, secret, ssh_target, hostname, home,
            mcp_path, mcp_args, projects_root, status, last_check) =
     WorkerInfo(worker_id, name, nothing, url, secret, ssh_target, hostname, home,
-               mcp_path, mcp_args, projects_root, status, last_check)
+               mcp_path, mcp_args, projects_root,
+               # Accept the legacy `status::Symbol` (tests / fixtures pass
+               # `:online`/`:offline`/`:unknown`) or a ready Observable/Bool.
+               status isa Observable ? status :
+                   Observable(status === :online || status === true),
+               last_check)
 
 """
     ServerState

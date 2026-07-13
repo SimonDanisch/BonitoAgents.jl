@@ -82,7 +82,7 @@ function Bonito.jsrender(session::Bonito.Session, c::ProjectCard)
                      style = Styles("margin-left" => "6px"),
                      title = "active session on $(p.locked_by)")
 
-        online_workers = [w for w in values(workers) if w.status === :online]
+        online_workers = [w for w in values(workers) if isopen(w)]
         open_link = if c.current_view === nothing || isempty(online_workers)
             DOM.span("(no chat available)";
                 class = "bt-link", style = Styles("color" => "var(--bt-text-muted)"))

@@ -115,6 +115,7 @@ class BonitoChat {
         this.parked = new Set();
         this.appLru = [];
         this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
+        this.PAD_TOP = parseFloat(getComputedStyle(container).paddingTop) || 0;
         this.followMode = true;
         this.unreadCount = 0;
         this._pillShown = false;
@@ -867,7 +868,7 @@ class BonitoChat {
         if (n && n.isConnected) {
             want = n.offsetTop - a.off;
         } else {
-            want = this.cumHeight(0, a.idx) - a.off;
+            want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
             this._queueRefresh();
         }
         if (Math.abs(this.container.scrollTop - want) > 1) {
@@ -1311,6 +1312,17 @@ class BonitoChat {
         if (msg.command) {
             const h = node.querySelector('.bt-tool-header');
             if (h) h.title = msg.command;
+            let cp = node.querySelector('.bt-cmd-preview');
+            if (cp) {
+                cp.querySelector('pre').textContent = msg.command;
+            } else if (h) {
+                cp = document.createElement('div');
+                cp.className = 'bt-cmd-preview';
+                const pre = document.createElement('pre');
+                pre.textContent = msg.command;
+                cp.appendChild(pre);
+                h.insertAdjacentElement('afterend', cp);
+            }
         }
         if (msg.summary != null) {
             const s = node.querySelector('.bt-tool-summary');
@@ -1668,6 +1680,8 @@ class BonitoChat {
                 <button class="bt-eval-preview-toggle" type="button"
                         title="Enlarge">⌄</button>
             </div>` : '';
+        const cmdPreview = msg.command ? `
+            <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
         return `
             <div class="bt-tool-header" data-expanded="false"${msg.command ? ` title="${escapeAttr(msg.command)}"` : ''}>
                 <span class="bt-tool-toggle">▶</span>
@@ -1684,7 +1698,7 @@ class BonitoChat {
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}
+            ${evalPreview}${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
     onPlanUpdate(msg) {

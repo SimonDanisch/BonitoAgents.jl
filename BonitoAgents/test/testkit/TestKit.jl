@@ -888,6 +888,36 @@ function click_text(s::TestServer, label::AbstractString)
     return s
 end
 
+# Like `click_text` but RE-CLICKS the visible button labelled `label` until
+# `predicate` (a JS expression) is truthy — the text-matched twin of
+# `click_until`. Rides out the cold-mount race where Bonito wires a button's
+# onclick only AFTER it mounts, so the FIRST synthetic click lands before the
+# handler attaches and is silently dropped (a lone `click_text` then hangs on a
+# form that never opens); the re-click loop also absorbs a slow first
+# server-side render of the target UI. Returns the truthy value; errors if the
+# state never appears.
+function click_text_until(s::TestServer, label::AbstractString, predicate::AbstractString;
+                          timeout::Real = 30, interval::Real = 0.4)
+    t0 = time()
+    clickjs = """(() => {
+        const b = [...document.querySelectorAll('button')].filter($VIS)
+            .find(b => (b.innerText||'').trim() === $(json(String(label))));
+        if (b) b.click(); return true; })()"""
+    check = "(() => { try { return " * String(predicate) * "; } catch (e) { return false; } })()"
+    while time() - t0 < timeout
+        eval_js(s, clickjs)   # (re-)click if present; no-op if the button is gone
+        v = try
+            eval_js(s, check; timeout = min(Float64(timeout), 5.0))
+        catch e
+            e isa BridgeTimeout || rethrow()
+            nothing
+        end
+        v in (false, nothing) || return v
+        sleep(interval)
+    end
+    error("click_text_until: '$label' did not produce the expected state within $(timeout)s")
+end
+
 """
     set_input(s, selector, value; placeholder = nothing)
 
@@ -932,12 +962,14 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     name = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
     leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
     to_dashboard(s)
-    click_text(s, "+ New project")
-    # Form open once the name field is visible. Generous timeouts here: the
-    # FIRST new_chat against a fresh server compiles the whole new-project /
-    # folder-picker UI server-side, which is slow cold on a CI runner (warm
-    # it's instant). These waits gate on real DOM, so a true hang still fails.
-    wait_for(s, "new-project form",
+    # RE-CLICK "+ New project" until the name field shows. A lone click can be
+    # dropped on a cold/slow first render — Bonito wires the button's onclick
+    # only after it mounts, so the first synthetic click lands before the handler
+    # attaches and the form never opens (the exact race `click_until` fixes for
+    # the ✎ button below; a single `click_text` here left `new_chat` hanging on
+    # a cold isolated run). Generous timeout: the FIRST new_chat against a fresh
+    # server also compiles the whole new-project / folder-picker UI server-side.
+    click_text_until(s, "+ New project",
         "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
         timeout = 30)
     # Flip the breadcrumb to a text field. The ✎ button's onclick (notify

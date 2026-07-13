@@ -49,7 +49,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
 
     status_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w === nothing ? :unknown : w.status
+        w === nothing ? :unknown : (isopen(w) ? :online : :offline)
     end
     subtitle_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)

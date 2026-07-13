@@ -71,7 +71,7 @@ function serve(; host::String        = "0.0.0.0",
 
     # Mark all loaded workers offline; they'll flip online when they re-dial.
     for w in values(state.workers[])
-        w.status = :offline
+        w.online[] = false
     end
 
     # Survive long browser disconnects (phone goes into pocket, laptop sleeps,

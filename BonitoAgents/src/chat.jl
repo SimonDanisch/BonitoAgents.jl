@@ -65,17 +65,35 @@ mutable struct ChatModel
     # UserMsg-not-yet-defined ordering here; every element is a UserMsg.
     pending_sends::Vector{Any}
 
-    # The open BETWEEN-TURN agent message (`Ref{Any}` for the same type-order
-    # reason; holds an AgentMsg or nothing). When a background subagent
-    # finishes, the main agent auto-wakes and streams its announcement with NO
-    # turn in flight (`Connection.on_orphan_update` → `handle_orphan_update!`);
-    # the chunks coalesce into this streaming bubble, closed by the next
-    # `begin_turn!`. Guarded by the shared lock.
-    orphan_agent_msg::Ref{Any}
+    # The live BETWEEN-TURN sink (`Ref{Any}`; holds a NamedTuple
+    # `(; updates, msgs, coalescer, consumer)` or nothing). When the agent
+    # detaches a background task it resolves the turn with `end_turn`; when that
+    # task finishes the agent auto-wakes and streams a WHOLE turn of work — text,
+    # tools, plans — on the same session with NO `session/prompt` wrapping it
+    # (`Connection.on_orphan_update` → `handle_orphan_update!`). Those sink-less
+    # updates get a REAL sink here: the same `TurnState` coalescer + `process!`
+    # consumer a live `prompt!` turn uses, so message boundaries, tools and plans
+    # render identically instead of merging into one bubble with the tools
+    # dropped (#23). Spun up lazily on the first between-turn update, torn down by
+    # the next `begin_turn!`. Guarded by the shared lock.
+    between_turn::Ref{Any}
 
     # One-shot history prelude prepended to the next prompt after a session
     # change that lost claude's jsonl (see `arm_history_replay!`). Empty = none.
     pending_history_replay::Ref{String}
+
+    # Subagent activity that arrived before its parent Task tool_call was
+    # committed to `msgs_store` (parent_id → held SubagentActivity). Subagent
+    # activity is delivered OUT OF BAND (see `route_subagent_activity!`) because
+    # the message consumer parks draining the parent Task's own update channel
+    # for the whole subagent run — an in-band feed would show nothing until the
+    # subagent finished. The parent TaskToolMsg is committed by that same
+    # (async) consumer, so out-of-band activity can briefly precede its parent.
+    # Held here and replayed by `send!` when the matching TaskToolMsg lands; a
+    # parent id that never lands is evicted harmlessly (bounded). `Vector{Any}`
+    # for the same type-order reason as `pending_sends`; every element is an ACP
+    # `SubagentActivity`. Guarded by the shared `lock` (the msgs_store lock).
+    pending_subagent::Dict{String,Vector{Any}}
 
     # Single bidirectional channel between Julia and the browser BonitoChat.
     # Tagged-dict wire format; see chat_emit / chat_dispatch! below.
@@ -149,9 +167,6 @@ mutable struct ChatModel
     # Live todo list for the taskbar (shared via parent).
     live_todo::Ref{Any}
 
-    # TaskBar items for the pin-board (shared observable across session views).
-    taskbar_items::Observable{Vector{TaskbarItem}}
-
     # Turn sequence counter — bumped at the start of each prompt turn; used to
     # detect stale stream events from a previous turn (see `drain_turn!`).
     turn_seq::Ref{Int}
@@ -160,14 +175,6 @@ mutable struct ChatModel
     # possible when a restart races an in-flight prompt — bounded by the CAS
     # guard in `restart_chat_session!`.
     turns_active::Ref{Int}
-
-    # The taskbar's elapsed-time clock (shared). A Julia `Timer`
-    # (`ensure_taskbar_clock!`) sets this to `time()` once a second while
-    # items are live; the TaskBar's elapsed labels are `map(clock)` text
-    # bindings. This is the ONLY taskbar ticking mechanism — there is no JS
-    # poller. `taskbar_clock_on` guards the single timer.
-    taskbar_clock::Observable{Float64}
-    taskbar_clock_on::Base.RefValue{Bool}
 
     # Current provider for this chat — the singleton descriptor the worker spawns
     # (a `BinAgent`, e.g. the `ClaudeCodeAgent` singleton). Observable so the UI
@@ -187,6 +194,11 @@ mutable struct ChatModel
     # (old tool bodies fall back to disk) without ever dropping the live / recent
     # ones. Shared with the cache — same lifetime, same `lock`.
     tool_cache_order::Vector{String}
+
+    # The chat's single live-task board — the ONE source of truth for what's
+    # live (see taskbar.jl). Shared across session views; owns its own poll
+    # loop. Replaces the old `taskbar_items`/`taskbar_clock` + background poller.
+    taskbar::TaskBar
 end
 
 # The provider tracked by the `provider` observable: the singleton descriptor the
@@ -222,8 +234,9 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         collect(AgentClientProtocol.MCPServer, mcp_servers),
         Channel{UserMessage}(64),
         Any[],                      # pending_sends (user bubbles not yet prompted)
-        Ref{Any}(nothing),          # orphan_agent_msg (open between-turn bubble)
+        Ref{Any}(nothing),          # between_turn (lazy between-turn sink)
         Ref(""),                    # pending_history_replay
+        Dict{String,Vector{Any}}(), # pending_subagent (activity ahead of its parent Task)
         Observable(Dict{String,Any}()),
         Observable(true),
         Observable(""),
@@ -240,16 +253,14 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Dict{String,Vector}(),      # tool_content_cache
         nothing,                    # plotpane: window-scoped, set per session view
         Ref{Any}(nothing),          # live_todo
-        Observable(TaskbarItem[]),  # taskbar_items (pin-board state)
         Ref(0),                     # turn_seq
         Ref(0),                     # turns_active
-        Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
-        Ref(false),                 # taskbar_clock_on
         # Provider observable tracks the AGENT (the source of truth): the kind
         # the worker spawns for a WorkerAgent, the agent's own type locally.
         Observable{Any}(agent_kind(actual_agent)),
         Dict{String, Tuple{Channel, Any}}(),   # pending_asks
         String[],                              # tool_cache_order (LRU for the cache)
+        TaskBar(),                             # live-task board (owns its poll loop)
     )
 end
 
@@ -285,8 +296,9 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.agent, m.mcp_servers,
             m.user_messages,           # shared queue → all sessions feed one consumer
             m.pending_sends,           # shared → reconcile sees every tab's unsent bubbles
-            m.orphan_agent_msg,        # shared → one between-turn bubble per chat
+            m.between_turn,            # shared → one between-turn sink per chat
             m.pending_history_replay,
+            m.pending_subagent,        # shared → one activity buffer per chat
             map(identity, session, m.comm),
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
@@ -303,14 +315,12 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.tool_content_cache,      # shared Dict; per-tab views see same RAM cache
             nothing,                   # plotpane: per WINDOW — ChatPaneRef sets it
             m.live_todo,               # shared Ref — one live list per chat
-            map(identity, session, m.taskbar_items),   # per-tab TaskBar bridge
             m.turn_seq,                # shared counter
             m.turns_active,            # shared counter
-            map(identity, session, m.taskbar_clock),   # per-tab clock bridge
-            m.taskbar_clock_on,        # shared guard
             any_bridge(session, m.provider),  # per-tab provider bridge (Any-typed: provider type varies across a switch)
             m.pending_asks,            # shared → asks resolve against the parent
             m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
+            m.taskbar,                 # shared → one live-task board per chat
         )
     end
 end
@@ -424,36 +434,79 @@ end
 
 Abstract supertype for one tool-call bubble in the chat. Concrete subtypes:
 
-  • `GenericToolMsg` — fallback (Read, Edit, Grep, … plus any future tool)
-  • `BashToolMsg`    — Claude's Bash tool; carries `is_background`
-  • `TaskToolMsg`    — subagent `Task` / `Agent` tool; carries `task_name`
-  • `MCPToolMsg`     — `mcp__<server>__<tool>` calls (our `bt_*` tools, others)
-  • `BonitoAppMsg`   — a live worker Bonito app (`bt_show_app` / `show_remote_app!`)
+  • `BuiltinToolMsg`  — Claude's native tools, one type per ACP `kind`:
+        `EditToolMsg` / `ReadToolMsg` / `SearchToolMsg` / `MoveToolMsg` /
+        `FetchToolMsg`, and `GenericToolMsg` (fallback for other/think/… + any
+        future tool). Grep and Glob share `SearchToolMsg` (same rendering; told
+        apart by the `name` field, which is the filter identity).
+  • `BashToolMsg`     — Claude's Bash tool; carries `is_background`
+  • `TaskToolMsg`     — subagent `Task` / `Agent` tool; carries `task_name`
+  • `MCPToolMsg`      — `mcp__<server>__<tool>` calls (our `bt_*` tools, others):
+        `JuliaEvalToolMsg` / `JuliaContinueToolMsg` (the `JuliaEvalCall` pair) /
+        `JuliaInterruptToolMsg` / `JuliaRestartToolMsg` / `JuliaListSessionsToolMsg`
+        / `ShowToolMsg`, and `GenericMCPToolMsg` (any third-party server)
+  • `BonitoAppMsg`    — a live worker Bonito app (`bt_show_app` / `show_remote_app!`)
 
 All variants share `id` / `kind` / `title` / `status` / `summary`, plus
 `started_at` / `finished_at` epoch seconds used by the tool-pill timer.
 """
 abstract type ToolMsg <: ChatMsg end
 
-mutable struct GenericToolMsg <: ToolMsg
-    id::String
-    kind::String
-    name::String                          # ACP tool name ("Read", "ToolSearch", …); "" if the agent sent no meta
-    title::String
-    status::String
-    summary::String                       # cached header summary; full content on disk
-    started_at::Float64
-    finished_at::Union{Float64,Nothing}
-    chat::Union{ChatModel,Nothing}
-    # The call's arguments. Claude's native tools (Read/Edit/Write/…) carry
-    # the REAL file path here (`file_path`) — their titles are display
-    # strings like "Read CONVENTIONS.md", NOT paths. Arrives late (streamed
-    # input, see update_from_snap!), so it starts empty on real agents.
-    raw_input::Dict{String,Any}
+# The "built-in" tool family: Claude's native tools (Read/Edit/Grep/Glob/
+# WebFetch/…). One CONCRETE type per ACP `kind` — the axis that decides how the
+# body renders AND how the header summary reads — so all that is DISPATCH, never
+# a `kind ==` string test. The tool NAME (Read vs Grep) is pure data (the filter
+# identity, `tool_key`), so tools that render identically share a type: Grep and
+# Glob are both `SearchToolMsg`, told apart only by `name`. `GenericToolMsg` is
+# the fallback for kinds with no special rendering (think/delete/other) and for
+# unknown future tools. Bash (`execute`) is NOT here — it's `BashToolMsg`, which
+# carries the background lifecycle. Every variant shares the SAME field block; a
+# mutable struct can't inherit fields in Julia, so `@builtin_msg` stamps it.
+abstract type BuiltinToolMsg <: ToolMsg end
+
+macro builtin_msg(name)
+    esc(quote
+        mutable struct $name <: BuiltinToolMsg
+            id::String
+            kind::String                   # ACP kind, still shipped to JS (icon + gating)
+            name::String                   # ACP tool name ("Read"/"Grep"/…); "" if the agent sent no meta
+            title::String
+            status::String
+            summary::String                # cached header summary; full content on disk
+            started_at::Float64
+            finished_at::Union{Float64,Nothing}
+            chat::Union{ChatModel,Nothing}
+            # The call's arguments. Claude's native tools (Read/Edit/Write/…)
+            # carry the REAL file path here (`file_path`) — their titles are
+            # display strings like "Read CONVENTIONS.md", NOT paths. Arrives late
+            # (streamed input, see update_from_snap!), so it starts empty.
+            raw_input::Dict{String,Any}
+        end
+    end)
 end
 
-# Back-compat forms: 8-arg (pre-`name`) and 9-arg (pre-`raw_input`) — used
-# by test fixtures and history reload, which has no raw_input on disk.
+@builtin_msg GenericToolMsg   # fallback: think / delete / other / unknown tools
+@builtin_msg EditToolMsg      # kind "edit"   (Edit / Write / MultiEdit)
+@builtin_msg ReadToolMsg      # kind "read"   (Read)
+@builtin_msg SearchToolMsg    # kind "search" (Grep / Glob)
+@builtin_msg MoveToolMsg      # kind "move"
+@builtin_msg FetchToolMsg     # kind "fetch"  (WebFetch)
+
+# The ONE place a wire `kind` maps to a built-in type (build/replay), mirroring
+# `mcp_msg_type`. Kinds with no special rendering + anything unknown → the
+# generic fallback. Bash ("execute") never reaches here (it's a BashCall).
+const BUILTIN_MSG_TYPES = Dict{String,DataType}(
+    "edit"   => EditToolMsg,
+    "read"   => ReadToolMsg,
+    "search" => SearchToolMsg,
+    "move"   => MoveToolMsg,
+    "fetch"  => FetchToolMsg,
+)
+builtin_msg_type(kind::AbstractString) = get(BUILTIN_MSG_TYPES, kind, GenericToolMsg)
+
+# Back-compat forms: 8-arg (pre-`name`) and 9-arg (pre-`raw_input`) — used by
+# test fixtures and legacy call sites. Build a GenericToolMsg (the reload path
+# re-derives the specific type from `kind` via `builtin_msg_type`).
 GenericToolMsg(id, kind, title, status, summary, started_at, finished_at, chat) =
     GenericToolMsg(id, kind, "", title, status, summary, started_at, finished_at, chat)
 GenericToolMsg(id, kind, name, title, status, summary, started_at, finished_at, chat) =
@@ -477,24 +530,36 @@ mutable struct BashToolMsg <: ToolMsg
     is_background::Bool
     # Background-task streaming (`run_in_background`): the agent's tool_call
     # "completes" the moment the command is LAUNCHED, but the shell keeps running.
-    # The poller tails the agent's output file (`bg_output_path`, from byte
-    # `bg_offset`), accumulates into `bg_text`, and flips `bg_running` off when
-    # the file's fd closes (shell exited). `is_live` keys off `bg_running` so a
-    # launched-but-running task stays live instead of "finishing immediately".
+    # The TaskBar's poll loop tails the agent's output file (`bg_output_path`,
+    # from byte `bg_offset`), accumulates into `bg_text`, and `finished!`es the
+    # task when the file's fd closes (shell exited). There is NO `bg_running`
+    # flag — the task is live iff it's in the bar (`in_taskbar`/`task_bar`).
     bg_output_path::String
     bg_offset::Int
-    bg_running::Bool
     bg_text::String
     chat::Union{ChatModel,Nothing}
+    # The chat's TaskBar while this background bash is live; `nothing` otherwise.
+    # MEMBERSHIP IS LIVENESS — `push!`/`finished!` are the only mutators. Init
+    # nothing (foreground bashes never enter the bar).
+    task_bar::Union{TaskBar,Nothing}
 end
 
-# Back-compat 14-arg form (pre-`description`): test fixtures.
+# Full form without task_bar (defaults to nothing) — every existing call site
+# lands here since the auto inner constructor now takes the extra field.
 BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
-            command, is_background, bg_output_path, bg_offset, bg_running,
+            command, description, is_background, bg_output_path, bg_offset,
+            bg_text, chat) =
+    BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
+                command, description, is_background, bg_output_path, bg_offset,
+                bg_text, chat, nothing)
+
+# Back-compat form (pre-`description`): test fixtures.
+BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
+            command, is_background, bg_output_path, bg_offset,
             bg_text, chat) =
     BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
                 command, nothing, is_background, bg_output_path, bg_offset,
-                bg_running, bg_text, chat)
+                bg_text, chat)
 
 # What the pill/taskbar shows for a bash: the human-readable description
 # when claude sent one, else the ACP title (usually the raw command).
@@ -536,57 +601,93 @@ mutable struct TaskToolMsg <: ToolMsg
     # Live subagent feed (route_subagent_activity!), bounded to the most
     # recent entries. `activity_seq` counts every entry EVER created (it
     # outlives the bounded window and feeds the persisted "N steps" trace);
-    # `last_activity_at` drives the taskbar staleness state (taskbar_activity).
+    # `last_activity_at` records the last feed frame's time (bubble display).
     # All feed fields are guarded by the shared chat lock.
     activity::Vector{TaskActivityEntry}
     activity_seq::Int
     last_activity_at::Float64
     feed_summarized::Bool                 # stamp_feed_summary! ran (close is not once-only)
-    # A background subagent's tool_call "completes" at LAUNCH (the ack) but the
-    # subagent runs on — the Task twin of BashToolMsg.bg_running. While true,
-    # `is_live` keeps the bubble pulsing and the taskbar slot pinned (with the
-    # activity line + staleness badge). Cleared by the user's ⊗ stop; there is
-    # no reliable wire signal for a background subagent finishing (the SDK's
-    # task_* events are dropped upstream), so the slot outlives the turn by
-    # design and the staleness badge is the "is it still doing anything?" cue.
-    task_running::Bool
+    # Poll target for a background subagent: the transcript `outputFile` handed
+    # back by the async launch (captured in `update_from_snap!` from
+    # `TaskCall.output_file`). The TaskBar's loop tails it for the fd-close that
+    # marks the subagent ACTUALLY finished — the deterministic completion signal
+    # the wire otherwise lacks (the tool_call is `completed` at launch, a lie).
+    # "" until the launch ack; `bg_offset` is the read cursor. There is NO
+    # `task_running` flag — the subagent is live iff it's in the bar (`task_bar`).
+    bg_output_path::String
+    bg_offset::Int
+    # The chat's TaskBar while this background subagent is live; `nothing`
+    # otherwise. MEMBERSHIP IS LIVENESS (`push!`/`finished!` the only mutators).
+    # Init nothing.
+    task_bar::Union{TaskBar,Nothing}
 end
 
-# Back-compat 11-arg form (pre-feed): the build/replay paths and test fixtures.
-# A freshly built background Task is RUNNING at launch (`task_running =
-# is_background`); the replay/reload path passes `task_running = false` — a
-# replayed call is history, not a live subagent.
+# Back-compat short form (pre-feed): the build/replay paths and test fixtures.
 TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
-            description, is_background, task_name, chat;
-            task_running = is_background) =
+            description, is_background, task_name, chat) =
     TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
                 description, is_background, task_name, chat,
-                TaskActivityEntry[], 0, time(), false, task_running)
+                TaskActivityEntry[], 0, time(), false, "", 0, nothing)
 
-mutable struct MCPToolMsg <: ToolMsg
-    id::String
-    kind::String
-    title::String
-    status::String
-    summary::String
-    started_at::Float64
-    finished_at::Union{Float64,Nothing}
-    server::String                        # "bonitoagents" / "playwright" / …
-    tool_name::String                     # bare name (without `mcp__<server>__`)
-    # The call's raw arguments straight off the wire. For the eval family
-    # this carries `code` / `timeout` / `env_path` — what the live code
-    # preview, the timeout badge, and the per-tool interrupt need BEFORE the
-    # tool produces any result content.
-    raw_input::Dict{String,Any}
-    chat::Union{ChatModel,Nothing}
+# MCP tool calls (`mcp__<server>__<tool>`). One TYPE per BonitoMCP tool, so all
+# behavior dispatches on the type — the raw `tool_name` is consulted in exactly
+# ONE place (`mcp_msg_type`, at build time, like `is_bonito_app`), never at a call
+# site. `MCPToolMsg` is abstract; shared MCP behavior (server badge, tool_key,
+# path hint, streamed-input merge, the `executed`-input preview) dispatches on it.
+# `JuliaEvalCall` groups the two code-running eval tools that share the code/⊗/⏱
+# affordances. Concrete subtypes all carry the SAME fields — a mutable struct
+# can't inherit fields in Julia, so `@mcp_msg` stamps the identical field block.
+abstract type MCPToolMsg <: ToolMsg end
+abstract type JuliaEvalCall <: MCPToolMsg end   # bt_julia_eval / bt_julia_continue
+
+macro mcp_msg(name, super)
+    esc(quote
+        mutable struct $name <: $super
+            id::String
+            kind::String
+            title::String
+            status::String
+            summary::String
+            started_at::Float64
+            finished_at::Union{Float64,Nothing}
+            server::String                     # "bonitoagents" / "playwright" / …
+            tool_name::String                  # bare name (without `mcp__<server>__`)
+            raw_input::Dict{String,Any}        # `code`/`timeout`/`env_path`/`path`/…
+            chat::Union{ChatModel,Nothing}
+        end
+    end)
 end
 
-# Back-compat 10-arg form (pre-`raw_input`): used by test fixtures and any
-# caller without raw arguments to hand over.
+@mcp_msg GenericMCPToolMsg        MCPToolMsg     # third-party MCP tools + fallback
+@mcp_msg ShowToolMsg              MCPToolMsg     # bt_show
+@mcp_msg JuliaInterruptToolMsg    MCPToolMsg     # bt_julia_interrupt
+@mcp_msg JuliaRestartToolMsg      MCPToolMsg     # bt_julia_restart
+@mcp_msg JuliaListSessionsToolMsg MCPToolMsg     # bt_julia_list_sessions
+@mcp_msg JuliaEvalToolMsg         JuliaEvalCall  # bt_julia_eval
+@mcp_msg JuliaContinueToolMsg     JuliaEvalCall  # bt_julia_continue
+
+# The ONE place a raw MCP tool name maps to a message type (build/replay). Unknown
+# tools (any third-party MCP server) fall back to `GenericMCPToolMsg`.
+const MCP_MSG_TYPES = Dict{String,DataType}(
+    "bt_julia_eval"          => JuliaEvalToolMsg,
+    "bt_julia_continue"      => JuliaContinueToolMsg,
+    "bt_julia_interrupt"     => JuliaInterruptToolMsg,
+    "bt_julia_restart"       => JuliaRestartToolMsg,
+    "bt_julia_list_sessions" => JuliaListSessionsToolMsg,
+    "bt_show"                => ShowToolMsg,
+)
+mcp_msg_type(tool_name::AbstractString) = get(MCP_MSG_TYPES, tool_name, GenericMCPToolMsg)
+
+# Bare `MCPToolMsg(...)` builds a generic one (back-compat for callers/fixtures).
+# Both arities: the 11-field primary and the 10-arg pre-`raw_input` form.
+MCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
+           server, tool_name, raw_input, chat) =
+    GenericMCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
+                      server, tool_name, raw_input, chat)
 MCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
            server, tool_name, chat) =
-    MCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
-               server, tool_name, Dict{String,Any}(), chat)
+    GenericMCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
+                      server, tool_name, Dict{String,Any}(), chat)
 
 # A live worker Bonito app (its own type, NOT a generic/MCP tool — it renders an
 # interactive embed and offers Detach, see render_tool_body / augment_header!
@@ -634,7 +735,12 @@ mutable struct TodoListMsg <: ChatMsg
     started_at::Float64
     finished_at::Union{Float64,Nothing}
     chat::Union{ChatModel,Nothing}
+    # The chat's TaskBar while this list is live; `nothing` once finalized.
+    # MEMBERSHIP IS LIVENESS (`push!`/`finished!` the only mutators). Init nothing.
+    task_bar::Union{TaskBar,Nothing}
 end
+TodoListMsg(id, entries, started_at, finished_at, chat) =
+    TodoListMsg(id, entries, started_at, finished_at, chat, nothing)
 TodoListMsg(entries::Vector{PlanEntry}) =
     TodoListMsg(string(uuid4()), entries, time(), nothing, nothing)
 TodoListMsg(chat::ChatModel, entries) =
@@ -645,21 +751,16 @@ TodoListMsg(chat::ChatModel, entries) =
 # The tool pill's pulsing glow + the taskbar slot both subscribe to this.
 is_live(m::ToolMsg) =
     m.finished_at === nothing && !(m.status in ("completed", "failed"))
-# A background bash's tool_call "completes" at LAUNCH but the shell runs on. Once
-# we know its output file, liveness is the poller's `bg_running` (the output
-# file's fd still open), NOT the tool_call status — so the bubble keeps pulsing
-# (and its taskbar slot + timer stay) until the shell actually exits.
-function is_live(m::BashToolMsg)
-    (m.is_background && !isempty(m.bg_output_path)) && return m.bg_running
-    return m.finished_at === nothing && !(m.status in ("completed", "failed"))
-end
-# A background SUBAGENT's tool_call completes at launch too — liveness is
-# `task_running` (cleared by the user's ⊗ stop), not the tool_call status, so
-# the bubble + taskbar slot stay while the subagent works (see the field doc).
-function is_live(m::TaskToolMsg)
-    m.is_background && m.task_running && return true
-    return m.finished_at === nothing && !(m.status in ("completed", "failed"))
-end
+# A background bash's tool_call "completes" at LAUNCH but the shell runs on, so
+# liveness is NOT the tool_call status. Membership IS liveness: a Bash/Task
+# that's in the bar is live — the bubble keeps pulsing (taskbar slot + timer
+# stay) until the bar `finished!`es it on the output file's fd-close. The `||`
+# status clause covers the sub-second window before `push!` (and foreground
+# tools that never enter the bar) — when done: not in the bar AND terminal.
+is_live(m::BashToolMsg) = in_taskbar(m) ||
+    (m.finished_at === nothing && !(m.status in ("completed", "failed")))
+is_live(m::TaskToolMsg) = in_taskbar(m) ||
+    (m.finished_at === nothing && !(m.status in ("completed", "failed")))
 # `finished_at` flips to non-nothing inside `try_absorb_todo!` once the
 # absorbed entries become all-done — `is_live` checking that field is what
 # lets the next TodoWrite start a fresh bubble instead of absorbing into
@@ -691,7 +792,7 @@ is_turn_orphan(m::ThoughtMsg) = m.in_flight
 # instead of absorbing into the abandoned one. A plan whose entries are
 # all-done already has `finished_at` set; `is_live` is false; we skip.
 is_turn_orphan(m::TodoListMsg) = is_live(m)
-# NOTE: background `BashToolMsg` (status="completed" + bg_running=true) is
+# NOTE: a background `BashToolMsg` (status="completed", in the bar) is
 # DELIBERATELY NOT an orphan. The shell IS a child of the ACP subprocess
 # we just killed — it may or may not have died with its parent depending
 # on process-group / nohup setup. What's stable is the OUTPUT FILE
@@ -715,58 +816,179 @@ is_taskbar_item(::ChatMsg)      = false
 # All mutations go through these two: read-modify-write under the chat lock,
 # the Observable assignment OUTSIDE it (listeners — JS bridges — must never
 # run while we hold the lock).
-function pin_task!(chat::ChatModel, item::TaskbarItem)
-    s = shared(chat)
-    items = lock(s.lock) do
-        v = copy(s.taskbar_items[])
-        idx = findfirst(t -> t.id == item.id, v)
-        idx === nothing ? push!(v, item) : (v[idx] = item)
-        v
-    end
-    s.taskbar_items[] = items
-    ensure_taskbar_clock!(s)
-    return nothing
-end
+# ── Taskbar membership: the bar is the SINGLE source of truth for "live" ─────
+# `push!(taskbar, task)` and `finished!(task)` are the ONLY mutators. A task IS
+# live iff it's in the bar (`in_taskbar`); `task_bar` on the message is both the
+# membership marker and the handle it removes itself through. No pin/unpin, no
+# `msgs_store` scan — the TaskBar owns its own poll loop (see taskbar.jl), which
+# asks each task `isdone` and `finished!`es it.
+in_taskbar(::ChatMsg)      = false
+in_taskbar(m::BashToolMsg) = m.task_bar !== nothing
+in_taskbar(m::TaskToolMsg) = m.task_bar !== nothing
+in_taskbar(m::TodoListMsg) = m.task_bar !== nothing
 
-# The taskbar's elapsed-time ticker — IN JULIA, not a browser setInterval.
-# ONE `Timer` per chat ticks `taskbar_clock` once a second while items are
-# live, and stops itself when the bar empties (or the chat closes). The
-# TaskBar's labels are `map(clock)` text bindings, so a tick updates exactly
-# those text nodes. `taskbar_clock_on` guards against spawning a second timer.
-function ensure_taskbar_clock!(chat::ChatModel)
-    s = shared(chat)
-    start = lock(s.lock) do
-        (s.taskbar_clock_on[] || isempty(s.taskbar_items[])) ? false :
-            (s.taskbar_clock_on[] = true)
-    end
-    start || return nothing
-    Timer(1.0; interval = 1.0) do timer
-        stop = lock(s.lock) do
-            done = !isopen(s.user_messages) || isempty(s.taskbar_items[])
-            done && (s.taskbar_clock_on[] = false)
-            done
-        end
-        if stop
-            close(timer)
-        else
-            s.taskbar_clock[] = time()
-        end
-    end
-    return nothing
-end
-
-function unpin_task!(chat::ChatModel, id::AbstractString)
-    s = shared(chat)
-    items = lock(s.lock) do
-        v = s.taskbar_items[]
-        any(t -> t.id == id, v) ? filter(t -> t.id != id, v) : nothing
-    end
-    items === nothing || (s.taskbar_items[] = items)
-    return nothing
-end
-
+# The chat's single shared TaskBar (source of truth for what's live).
+chat_taskbar(chat::ChatModel) = shared(chat).taskbar
 is_pinned(chat::ChatModel, id::AbstractString) =
-    any(t -> t.id == id, shared(chat).taskbar_items[])
+    any(t -> t.id == id, shared(chat).taskbar.items[])
+
+# Enter the bar (become live): add to the live set, mark membership, make sure
+# the bar's poll loop is running.
+function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
+    lock(bar.lock) do
+        any(t -> t === m, bar.items[]) || (bar.items[] = push!(copy(bar.items[]), m))
+    end
+    m.task_bar = bar
+    ensure_running!(bar)
+    return m
+end
+
+# Leave the bar (become done): finalize the bubble (persist + emit, per type),
+# then drop from the live set and clear membership. Idempotent.
+function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
+    bar = m.task_bar
+    bar === nothing && return nothing
+    m.task_bar = nothing
+    try
+        finalize!(m)
+    catch e
+        @warn "finalize! failed" id = m.id exception = (e, catch_backtrace())
+    end
+    lock(bar.lock) do
+        bar.items[] = filter(t -> t !== m, bar.items[])
+    end
+    return nothing
+end
+
+taskbar_item_for(m::ToolMsg)     = tool_taskbar_item(m.chat, m)
+taskbar_item_for(m::TodoListMsg) = todo_taskbar_item(m)
+
+# ── isdone: each message type owns "what being done means" ───────────────────
+# The TaskBar's loop (taskbar.jl) calls this once a second per live task. Only
+# background tasks are ever IN the bar (see `is_taskbar_item`), so these read the
+# per-type DETERMINISTIC completion signal — never `is_background`, never a
+# `task_running`/`bg_running` flag (membership is the one liveness truth).
+isdone(m::TodoListMsg) = !any(e -> e.status in ("pending", "in_progress"), m.entries)
+# A background bash's `"completed"` is HONEST — the bg signal is the output file
+# ("Output is being written to: …"), so we tail it for the fd-close (shell exit).
+# No file yet ⇒ still launching (stay) unless it already reached a terminal
+# status (a failed/inline launch that produced no file) ⇒ done.
+isdone(m::BashToolMsg) =
+    isempty(m.bg_output_path) ? (m.status in ("completed", "failed")) :
+    poll_output_file!(m; stream = true)
+# A background subagent is done ONLY on a signal we can trust — no timeouts, no
+# staleness heuristic, no guessing. Verified against a live claude-agent-acp agent:
+#   • the parent tool_call goes `completed` ~1s after launch (the launch ACK,
+#     `pending → completed`) while its parentToolUseId ACTIVITY keeps flowing for
+#     dozens more frames — so `status`/`finished_at` are LIES here and are IGNORED;
+#   • the transcript `outputFile`'s fd is written APPEND-PER-LINE, so it reads
+#     "closed" between every write — an fd-close is NOT completion (it fires in the
+#     first inter-write gap while the subagent is very much alive).
+# The honest signal is the transcript CONTENT: the subagent's FINAL response ends
+# its turn with `"stop_reason":"end_turn"` (intermediate tool steps are "tool_use"),
+# and it lands EXACTLY when the subagent finishes (verified: end_turn appeared in
+# the outputFile ~2s before the main agent relayed the subagent's result). A
+# missing / still-streaming file, or a feed mid-tool-loop, has no end_turn ⇒ the
+# pill stays live (until end_turn or ⊗ stop). No `outputFile` at all ⇒ no wire
+# done-signal ⇒ stays until ⊗ stop.
+isdone(m::TaskToolMsg) = !isempty(m.bg_output_path) && subagent_transcript_done(m)
+
+# Read the subagent's transcript and report whether it has reached its final,
+# natural turn-end. `end_turn` appears once, on the FINAL assistant message (a
+# pure text response with no tool_use closes the subagent's turn) — so its
+# presence anywhere in the transcript is the deterministic "subagent finished".
+const SUBAGENT_DONE_MARKER = "\"stop_reason\":\"end_turn\""
+function subagent_transcript_done(m::TaskToolMsg)
+    m.chat === nothing && return false
+    state = m.chat.state
+    wid   = bg_worker_id(state, m.chat)
+    wid === nothing && return false
+    # Read the whole transcript (bounded) from the top each poll: `end_turn` sits
+    # at the END, and reading forward from a rolling offset could split the marker
+    # across two reads. Transcripts are small; the poll is 1 Hz and stops once done.
+    r = try
+        tail_worker_file(state, wid, m.bg_output_path; offset = 0,
+                         max_bytes = 4_000_000, timeout = 10.0)
+    catch e
+        @debug "subagent transcript read failed (will retry)" id = m.id exception = e
+        return false
+    end
+    return r.exists && occursin(SUBAGENT_DONE_MARKER, r.chunk)
+end
+
+# Tail a background task's output file on the worker: stream new bytes (bash),
+# advance the read cursor, and report whether the writer's fd has closed — the
+# deterministic done-signal for BOTH a background shell and an async subagent
+# (its transcript `outputFile`).
+function poll_output_file!(m::ToolMsg; stream::Bool)
+    m.chat === nothing && return false
+    state = m.chat.state
+    wid   = bg_worker_id(state, m.chat)
+    wid === nothing && return false
+    r = try
+        tail_worker_file(state, wid, m.bg_output_path; offset = m.bg_offset, timeout = 10.0)
+    catch e
+        @debug "taskbar tail failed (will retry)" id = m.id exception = e
+        return false
+    end
+    if r.exists && r.offset > m.bg_offset
+        stream && m isa BashToolMsg && (m.bg_text *= r.chunk; stream_bg_update!(m.chat, m))
+        m.bg_offset = r.offset
+    end
+    # Done ONLY when the file EXISTS and its writer fd has closed (Linux /proc
+    # scan) — the subagent / shell created its output, wrote it, and exited. A
+    # MISSING file is NEVER done: it either hasn't been created yet (the launch
+    # race — the `outputFile` path lands on the wire BEFORE the file is on disk,
+    # and finalizing on `!exists` would kill the pill a tick after launch) or was
+    # removed externally; absence is not a completion signal we can trust. When
+    # fd state is unknowable (non-Linux worker, `open_known == false`) we can't
+    # confirm a close either, so the pill stays until ⊗ stop rather than guess.
+    return r.exists && r.open_known && !r.open
+end
+
+# ── finalize!: persist + emit the final bubble state as a task leaves the bar ─
+# The subagent reached `end_turn` (or was ⊗-stopped) — it ENDED. We don't get its
+# exit status, so "completed" is the honest terminal. `close` stamps the feed's
+# "N steps" trace + persists; we then EMIT the real terminal `tool_update` so the
+# bubble flips from the in-progress state (the launch-ack `completed` was HIDDEN
+# while it ran, see `process_update!`) to completed. `request_tool_stop!` overrides
+# this with "stopped" right after.
+function finalize!(m::TaskToolMsg)
+    m.status in ("completed", "failed") || (m.status = "completed")
+    close(m)
+    m.chat === nothing || chat_emit(m.chat, Dict{String,Any}(
+        "type" => "tool_update", "id" => m.id, "status" => m.status,
+        "summary" => m.summary,
+        "finished_at" => m.finished_at === nothing ? time() : m.finished_at))
+    return nothing
+end
+function finalize!(m::BashToolMsg)
+    model = m.chat
+    model === nothing && return nothing
+    m.status = "completed"
+    m.finished_at === nothing && (m.finished_at = time())
+    write_bg_content!(model.chat_dir, m)
+    try
+        append_tool(model.chat_session, m)
+    catch e
+        @warn "append_tool for finished bg task failed" id = m.id exception = e
+    end
+    n = bg_line_count(m)
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+        "status" => "completed", "summary" => "done · $n line$(n == 1 ? "" : "s")",
+        "finished_at" => m.finished_at))
+    return nothing
+end
+function finalize!(m::TodoListMsg)
+    chat = m.chat
+    chat === nothing && return nothing
+    s = shared(chat)
+    s.live_todo[] === m && (s.live_todo[] = nothing)
+    m.finished_at === nothing && (m.finished_at = time())
+    send!(chat, m)                        # render the finalized list as history
+    append_plan(chat.chat_session, m)
+    return nothing
+end
 
 # Pin policy. Bash / Task / the eval family pin the moment they start
 # (they're what the bar is FOR); every other tool joins only if it's still
@@ -777,10 +999,35 @@ is_pinned(chat::ChatModel, id::AbstractString) =
 pin_immediately(::ToolMsg)      = false
 pin_immediately(::BashToolMsg)  = true
 pin_immediately(::TaskToolMsg)  = true
-pin_immediately(b::MCPToolMsg)  = b.tool_name in EVAL_TOOL_FAMILY
+pin_immediately(::JuliaEvalCall) = true  # runs code + offers ⊗ interrupt → show a pill at once
 
 taskbar_label(b::ToolMsg)     = first(pretty_tool_title(b.title))
 taskbar_label(b::BashToolMsg) = first(pretty_tool_title(bash_display_title(b)))
+
+# Live slot label (taskbar.jl calls this per clock tick): re-derive from the
+# message under the shared lock, so a bash's human description — which streams in
+# AFTER the pill is pinned — replaces the raw command without a re-pin. The bar's
+# 1 Hz clock is the tick; this is why `refresh_pin!` (a re-emit that KeyedList
+# ignored for same-key slots anyway) is gone.
+taskbar_slot_label(m::ToolMsg, _fallback) =
+    m.chat === nothing ? taskbar_label(m) : lock(() -> taskbar_label(m), shared(m.chat).lock)
+
+# `taskbar_dyn_key(msg)` — a cheap fingerprint of the slot's CHANGING content
+# (see taskbar.jl); folded into the KeyedList key so a change re-renders the slot
+# (clean remove+insert), while the elapsed timer (not here) stays JS-driven.
+taskbar_dyn_key(m::BashToolMsg) = taskbar_slot_label(m, "")
+# Subagent: the activity feed (count + latest label) — both facts off the wire.
+# Folding them into the key means the bar's 1 Hz `items` re-emit re-renders the
+# pill's activity one-liner whenever a new frame lands. The elapsed timer is NOT
+# here (it's the JS ticker; a key change every second would churn).
+taskbar_dyn_key(m::TaskToolMsg) =
+    m.chat === nothing ? string(length(m.activity)) :
+    lock(shared(m.chat).lock) do
+        string(length(m.activity), ":", isempty(m.activity) ? "" : last(m.activity).label)
+    end
+taskbar_dyn_key(m::TodoListMsg) =
+    m.chat === nothing ? "" :
+    lock(() -> join(("$(e.content)=$(e.status)" for e in m.entries), "|"), shared(m.chat).lock)
 
 function tool_taskbar_item(chat::ChatModel, b::ToolMsg)
     s = shared(chat)
@@ -795,43 +1042,32 @@ function tool_taskbar_item(chat::ChatModel, b::ToolMsg)
                 source = b)
 end
 
-# Taskbar current-activity hooks (declared in taskbar.jl, which is included
-# before this file): a pinned subagent Task pill shows the feed's latest
-# one-liner next to its elapsed clock, and flips to an amber "no activity Xm"
-# staleness state when the feed goes quiet.
+# Taskbar current-activity hook (declared in taskbar.jl, which is included before
+# this file): a pinned subagent Task pill shows the feed's latest one-liner next
+# to its elapsed clock — a FACT off the wire. Returns the label, or `nothing` when
+# the pill has no feed line to show. No staleness/"is it dead?" guess: with no
+# deterministic done-signal the pill just stays until fd-close or ⊗ stop.
 has_activity_feed(::TaskToolMsg) = true
-function taskbar_activity(m::TaskToolMsg, now::Float64)
+function taskbar_activity(m::TaskToolMsg, ::Float64)
     is_live(m) || return nothing
-    last_at, label = if m.chat === nothing
-        (m.last_activity_at, isempty(m.activity) ? "" : last(m.activity).label)
-    else
-        lock(shared(m.chat).lock) do
-            (m.last_activity_at, isempty(m.activity) ? "" : last(m.activity).label)
-        end
-    end
-    idle = now - last_at
-    # 120 s without any subagent event flips the pill stale — long enough to
-    # ride out a slow tool run / model latency, short enough to answer "is it
-    # dead or just slow?" while the task is still worth waiting on.
-    idle > 120.0 &&
-        return (label = "no activity $(floor(Int, idle / 60))m", stale = true)
-    return (label = label, stale = false)
+    label = m.chat === nothing ?
+        (isempty(m.activity) ? "" : last(m.activity).label) :
+        lock(() -> isempty(m.activity) ? "" : last(m.activity).label, shared(m.chat).lock)
+    isempty(label) ? nothing : label
 end
 
+# A background task enters the bar the moment it's recognized as one
+# (`is_taskbar_item` — background bash / subagent). `push!` is the only way in;
+# the bar's own loop takes it out. Foreground tools don't get a slot.
 function pin_tool!(chat::ChatModel, b::ToolMsg)
-    if pin_immediately(b)
-        pin_task!(chat, tool_taskbar_item(chat, b))
-    else
-        Timer(3) do _
-            is_live(b) && pin_task!(chat, tool_taskbar_item(chat, b))
-        end
-    end
+    is_taskbar_item(b) && push!(chat_taskbar(chat), b)
     return nothing
 end
 
-# Refresh a pinned slot's label (a bash's human description arrives late).
-refresh_pin!(chat::ChatModel, b::ToolMsg) =
-    (is_pinned(chat, b.id) && pin_task!(chat, tool_taskbar_item(chat, b)); nothing)
+# (No `refresh_pin!`: a late label change — a bash's human description — is
+# picked up by the slot's reactive label (`taskbar_slot_label`) on the next
+# clock tick. Re-emitting `items` did nothing anyway, since KeyedList keeps the
+# same slot instance for a survivor key.)
 
 # Tool kind → icon
 const TOOL_ICONS = Dict(
@@ -860,63 +1096,23 @@ function pretty_tool_title(title::AbstractString)
     return (String(m.captures[2]), String(m.captures[1]))
 end
 
-# Short summary shown on the collapsed tool header (before expand).
-# Per-kind summaries are tuned for at-a-glance comprehension:
+# Short summary shown on the collapsed tool header (before expand). The heuristic
+# keys on the ACP `kind` (a Bash call is kind "move"/"execute"/…, an MCP call is
+# "other", …), so it ALWAYS dispatches on `builtin_msg_type(kind)` — NOT the
+# message's own type (a Bash `mv` is a `BashToolMsg` but wants the move summary).
+# That type doubles as the "summary kind" tag; each kind that wants a tailored,
+# at-a-glance summary opts in, everything else falls to `content_summary_default`.
+# `content` may be empty (opening tool_call before any result streamed in).
 #   edit:   one file → "name · ±N lines";  many → "K files · ±N lines"
 #   search: count of result rows that look like grep hits
 #   move:   "src → dst" extracted from the content text
 #   fetch:  domain of the URL extracted from the content
-#   else:   line / byte count of the first text block
-function content_summary(kind::AbstractString, content::AbstractVector)
+#   else:   first ```julia line (eval calls), otherwise line / byte count
+function content_summary_default(content::AbstractVector)
     isempty(content) && return ""
-
-    if kind == "edit"
-        diffs = [c for c in content if c isa DiffContent]
-        if !isempty(diffs)
-            total_delta = 0
-            for d in diffs
-                total_delta += length(split(d.new_text, '\n')) -
-                               length(split(something(d.old_text, ""), '\n'))
-            end
-            sign_str = total_delta > 0 ? "+$total_delta" : string(total_delta)
-            line_word = abs(total_delta) == 1 ? "line" : "lines"
-            return length(diffs) == 1 ?
-                   "$(basename(diffs[1].path)) · $sign_str $line_word" :
-                   "$(length(diffs)) files · $sign_str $line_word"
-        end
-    end
-
-    if kind == "search"
-        text = join((c.text for c in content if c isa TextContent), "\n")
-        if !isempty(text)
-            hits = count(line -> match(r"^[^\s:]+:\d+[:\-]", line) !== nothing,
-                split(text, '\n'))
-            if hits > 0
-                return "$hits $(hits == 1 ? "match" : "matches")"
-            end
-        end
-    end
-
-    if kind == "move"
-        text = join((c.text for c in content if c isa TextContent), "\n")
-        m = match(r"([\S]+)\s*(?:->|→|to)\s*([\S]+)", text)
-        if m !== nothing
-            return "$(basename(m.captures[1])) → $(basename(m.captures[2]))"
-        end
-    end
-
-    if kind == "fetch"
-        text = join((c.text for c in content if c isa TextContent), "\n")
-        m = match(r"https?://([^/\s]+)", text)
-        if m !== nothing
-            return String(m.captures[1])
-        end
-    end
-
-    # MCP tools (kind=="other") whose first text block is a fenced ```julia
-    # code block — show the first code line as the summary so calls like
-    # bt_julia_eval show "x = 1 + 2" instead of "5 lines · 124 bytes".
-    if !isempty(content) && content[1] isa TextContent
+    # MCP eval tools whose first text block is a fenced ```julia code block —
+    # show the first code line (bt_julia_eval → "x = 1 + 2", not "5 lines · …").
+    if content[1] isa TextContent
         m = match(r"^\s*```julia\r?\n(.*?)\r?\n```"s, content[1].text)
         if m !== nothing
             first_line = strip(split(String(m.captures[1]), '\n')[1])
@@ -927,7 +1123,6 @@ function content_summary(kind::AbstractString, content::AbstractVector)
             end
         end
     end
-
     for c in content
         if c isa TextContent
             n = count('\n', c.text) + 1
@@ -938,6 +1133,45 @@ function content_summary(kind::AbstractString, content::AbstractVector)
         end
     end
     return ""
+end
+
+content_summary(::Type{<:ToolMsg}, content::AbstractVector) = content_summary_default(content)
+
+function content_summary(::Type{EditToolMsg}, content::AbstractVector)
+    diffs = [c for c in content if c isa DiffContent]
+    isempty(diffs) && return content_summary_default(content)
+    total_delta = 0
+    for d in diffs
+        total_delta += length(split(d.new_text, '\n')) -
+                       length(split(something(d.old_text, ""), '\n'))
+    end
+    sign_str = total_delta > 0 ? "+$total_delta" : string(total_delta)
+    line_word = abs(total_delta) == 1 ? "line" : "lines"
+    return length(diffs) == 1 ?
+           "$(basename(diffs[1].path)) · $sign_str $line_word" :
+           "$(length(diffs)) files · $sign_str $line_word"
+end
+
+function content_summary(::Type{SearchToolMsg}, content::AbstractVector)
+    text = join((c.text for c in content if c isa TextContent), "\n")
+    hits = isempty(text) ? 0 :
+           count(line -> match(r"^[^\s:]+:\d+[:\-]", line) !== nothing, split(text, '\n'))
+    hits == 0 && return content_summary_default(content)
+    return "$hits $(hits == 1 ? "match" : "matches")"
+end
+
+function content_summary(::Type{MoveToolMsg}, content::AbstractVector)
+    text = join((c.text for c in content if c isa TextContent), "\n")
+    m = match(r"([\S]+)\s*(?:->|→|to)\s*([\S]+)", text)
+    m === nothing && return content_summary_default(content)
+    return "$(basename(m.captures[1])) → $(basename(m.captures[2]))"
+end
+
+function content_summary(::Type{FetchToolMsg}, content::AbstractVector)
+    text = join((c.text for c in content if c isa TextContent), "\n")
+    m = match(r"https?://([^/\s]+)", text)
+    m === nothing && return content_summary_default(content)
+    return String(m.captures[1])
 end
 
 # Header info shipped to JS at message-create time. Full content is NOT
@@ -957,7 +1191,7 @@ end
 # groups by. The ACP tool NAME, not the title (a Bash title is the literal
 # command line). Reloads land as `GenericToolMsg` with the persisted key in
 # `name` (see `append_tool`); pre-name chats fall back to the ACP kind.
-tool_key(m::GenericToolMsg) = isempty(m.name) ? m.kind : m.name
+tool_key(m::BuiltinToolMsg) = isempty(m.name) ? m.kind : m.name
 tool_key(::BashToolMsg)     = "Bash"
 tool_key(::TaskToolMsg)     = "Task"
 tool_key(m::MCPToolMsg)     = m.tool_name          # bare name: "bt_show", "bt_julia_eval"
@@ -990,7 +1224,7 @@ function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
 end
 
 # Per-variant tweaks. The typed variants opt in to their extras here.
-function augment_header!(d::Dict, m::GenericToolMsg, chat_dir::AbstractString)
+function augment_header!(d::Dict, m::BuiltinToolMsg, chat_dir::AbstractString)
     # The real file path for claude's native tools (Read/Edit/Write title
     # display strings; the path is in raw_input.file_path) — feeds the ✎
     # editable derivation in augment_generic_header!.
@@ -1032,10 +1266,6 @@ function augment_header!(d::Dict, m::TaskToolMsg, chat_dir::AbstractString)
     isempty(entries) || (d["task_feed"] = [entry_wire(e) for e in entries])
     augment_generic_header!(d, chat_dir)
 end
-# The BonitoMCP eval family. These get the live-code preview, the timeout
-# badge, and (for the in-flight ones) the per-tool interrupt affordance.
-const EVAL_TOOL_FAMILY     = ("bt_julia_eval", "bt_julia_continue", "bt_julia_interrupt")
-const EVAL_STOPPABLE_TOOLS = ("bt_julia_eval", "bt_julia_continue")
 # Mirrors BonitoMCP's DEFAULT_TIMEOUT / Pkg auto-disable (session.jl) so the
 # badge shows what the server will actually do when no explicit timeout rides
 # on the call.
@@ -1046,24 +1276,40 @@ function eval_timeout_label(raw::AbstractDict)
     return occursin(r"\bPkg\.", String(code)) ? "no timeout" : "30s"
 end
 
-# The eval-family extras (code preview, timeout badge, ⊗ stop) keyed on the
-# call's raw_input. Factored out of `augment_header!` because claude-agent-acp
-# STREAMS tool input: the initial `tool_call` usually has an EMPTY rawInput
-# and the real arguments ride a later `tool_call_update` — so these extras
-# must also be derivable per-snap in `process_update!`, not only at header
-# build time.
-function eval_header_extras!(d::Dict, m::MCPToolMsg)
-    if m.tool_name in EVAL_TOOL_FAMILY && !isempty(m.raw_input)
-        # Ship the code being executed so the client can paint a compact
-        # preview while the eval is still running (the post-completion body
-        # renders the same code through the Monaco Code section instead).
-        code = get(m.raw_input, "code", nothing)
-        code isa AbstractString && !isempty(code) && (d["code"] = code)
-        d["timeout_s"] = eval_timeout_label(m.raw_input)
-        # The ⊗ interrupt affordance — only the calls that hold an eval in
-        # flight; `bt_julia_interrupt` itself is not stoppable.
-        m.tool_name in EVAL_STOPPABLE_TOOLS && (d["stoppable"] = true)
-    end
+# Per-type input affordances shipped to the client — dispatched on the TYPE.
+# claude-agent-acp STREAMS tool input, so `raw_input` is usually EMPTY on the
+# initial `tool_call` and the real arguments ride a later `tool_call_update`;
+# hence `mcp_input_extras!` is also called per-snap (`snap_header_extras!`), not
+# only at header build time.
+#
+# (1) The eval code/timeout/⊗ affordances — only `JuliaEvalCall` (eval + continue).
+eval_extras!(d::Dict, ::MCPToolMsg) = d
+function eval_extras!(d::Dict, m::JuliaEvalCall)
+    isempty(m.raw_input) && return d              # args not streamed in yet
+    # Ship the code being executed so the client paints a compact preview while
+    # the eval runs (the post-completion body renders the same code in Monaco).
+    code = get(m.raw_input, "code", nothing)      # `continue` has none — that's fine
+    code isa AbstractString && !isempty(code) && (d["code"] = code)
+    d["timeout_s"] = eval_timeout_label(m.raw_input)
+    d["stoppable"] = true                         # a JuliaEvalCall holds an eval in flight
+    return d
+end
+
+# (2) "What this tool is DOING", shown as the always-visible command preview
+# (same block as the bash command) — the control tools have no output to show
+# their action otherwise. Default: none. `env_path` streams in like every arg.
+executed_preview(::MCPToolMsg) = nothing
+mcp_env(m::MCPToolMsg) = (e = get(m.raw_input, "env_path", nothing);
+                          e isa AbstractString && !isempty(e) ? e : "the active session")
+executed_preview(m::JuliaInterruptToolMsg)   = "interrupt (SIGINT) " * mcp_env(m)
+executed_preview(m::JuliaRestartToolMsg)     = "restart (fresh process) " * mcp_env(m)
+executed_preview(::JuliaListSessionsToolMsg) = "list active Julia sessions"
+
+# Both (1) and (2), for the header build AND every later snap.
+function mcp_input_extras!(d::Dict, m::MCPToolMsg)
+    eval_extras!(d, m)
+    ex = executed_preview(m)
+    ex === nothing || (d["command"] = ex)
     return d
 end
 
@@ -1072,7 +1318,7 @@ function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
     # tool name (without `mcp__server__`) is more authoritative — prefer it.
     isempty(m.server)    || (d["server"] = m.server)
     isempty(m.tool_name) || (d["title"]  = m.tool_name)
-    eval_header_extras!(d, m)
+    mcp_input_extras!(d, m)
     # A path argument on the call (bt_show's `path`, …) feeds the ✎
     # editable derivation in augment_generic_header! below.
     hint = mcp_path_hint(m.raw_input)
@@ -1166,7 +1412,7 @@ end
 
 tool_path_hint(::ToolMsg)         = nothing
 tool_path_hint(m::MCPToolMsg)     = mcp_path_hint(m.raw_input)
-tool_path_hint(m::GenericToolMsg) = mcp_path_hint(m.raw_input)
+tool_path_hint(m::BuiltinToolMsg) = mcp_path_hint(m.raw_input)
 
 # The worker-side file path a tool's ✎ "open in editor" button should edit.
 # Sources, in priority order: a `bt_show` reference in the output, an edit
@@ -2045,43 +2291,15 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     eval_body = render_eval_body(content)
     eval_body === nothing || return eval_body
 
-    if m.kind == "edit"
-        # Render every diff (multi-edit calls used to silently drop all but
-        # the first). Stack with file-path headers between each. Each
-        # Monaco editor caps at `EDIT_BODY_COMPACT_PX` initially; the JS
-        # Collapsable's edit-mode swaps to `EDIT_BODY_EXPANDED_PX` in
-        # place by calling `setMaxHeight` on the editor's container,
-        # without re-mounting. The body is also auto-expanded on the
-        # first snap that carries a `DiffContent` (see `auto_expand_body`)
-        # so the user sees the compact diff under the header without a
-        # click.
-        diffs = [c for c in content if c isa DiffContent]
-        if !isempty(diffs)
-            return DOM.div(
-                (render_diff_block(d; max_height = EDIT_BODY_COMPACT_PX) for d in diffs)...;
-                class = length(diffs) > 1 ? "bt-multi-diff bt-edit-tool-body" : "bt-edit-tool-body",
-                dataEditTool = "1")
-        end
-    end
+    # Per-type body. Dispatched on the message TYPE (EditToolMsg / SearchToolMsg
+    # / ReadToolMsg / BashToolMsg / …), never a `kind ==` string test.
+    return render_tool_content(state, m, content, project_id)
+end
 
-    if m.kind == "search"
-        text = join((c.text for c in content if c isa TextContent), "\n")
-        if !isempty(text)
-            return render_search_results(text)
-        end
-    end
-
-    if m.kind in ("execute", "read")
-        text = join((c.text for c in content if c isa TextContent), "\n")
-        if !isempty(text)
-            lang = m.kind == "read" ? detect_language(m.title) : "shell"
-            return monaco_readonly(text, lang)
-        end
-    end
-
-    # Default / "think" / "other" / "fetch" / "move" / "delete" / mixed:
-    # text blocks that ARE a fenced code block become Monaco; prose stays
-    # markdown. Diff blocks (uncommon outside `edit`) render inline.
+# Default body: text blocks that ARE a fenced code block become Monaco; prose
+# stays markdown; diff blocks (uncommon outside edit) and images render inline.
+# The typed variants below fall back to this when their shape isn't present.
+function render_tool_parts(state::ServerState, m::ToolMsg, content, project_id::AbstractString)
     parts = []
     for c in content
         if c isa TextContent
@@ -2094,6 +2312,44 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     end
     isempty(parts) && return DOM.div("(empty)", class="bt-tool-empty")
     return DOM.div(parts...)
+end
+
+# Default / GenericToolMsg / "think" / "other" / "fetch" / "move" / "delete".
+render_tool_content(state::ServerState, m::ToolMsg, content, project_id::AbstractString) =
+    render_tool_parts(state, m, content, project_id)
+
+# Edit: render EVERY diff (multi-edit calls used to silently drop all but the
+# first). Stack with file-path headers. Each Monaco editor caps at
+# `EDIT_BODY_COMPACT_PX`; the JS Collapsable's edit-mode swaps to
+# `EDIT_BODY_EXPANDED_PX` in place via `setMaxHeight`, no re-mount. The body also
+# auto-expands on the first snap carrying a `DiffContent` (see `auto_expand_body`)
+# so the compact diff shows under the header without a click.
+function render_tool_content(state::ServerState, m::EditToolMsg, content, project_id::AbstractString)
+    diffs = [c for c in content if c isa DiffContent]
+    isempty(diffs) && return render_tool_parts(state, m, content, project_id)
+    return DOM.div(
+        (render_diff_block(d; max_height = EDIT_BODY_COMPACT_PX) for d in diffs)...;
+        class = length(diffs) > 1 ? "bt-multi-diff bt-edit-tool-body" : "bt-edit-tool-body",
+        dataEditTool = "1")
+end
+
+function render_tool_content(state::ServerState, m::SearchToolMsg, content, project_id::AbstractString)
+    text = join((c.text for c in content if c isa TextContent), "\n")
+    isempty(text) && return render_tool_parts(state, m, content, project_id)
+    return render_search_results(text)
+end
+
+# Read → Monaco with the language inferred from the (display) title; Bash
+# ("execute") → Monaco as shell. Both fall back to the default when text-empty.
+function render_tool_content(state::ServerState, m::ReadToolMsg, content, project_id::AbstractString)
+    text = join((c.text for c in content if c isa TextContent), "\n")
+    isempty(text) && return render_tool_parts(state, m, content, project_id)
+    return monaco_readonly(text, detect_language(m.title))
+end
+function render_tool_content(state::ServerState, m::BashToolMsg, content, project_id::AbstractString)
+    text = join((c.text for c in content if c isa TextContent), "\n")
+    isempty(text) && return render_tool_parts(state, m, content, project_id)
+    return monaco_readonly(text, "shell")
 end
 
 # ── The message is the streaming target ─────────────────────────────────────
@@ -2119,6 +2375,9 @@ function send!(model::ChatModel, m::ChatMsg)
     d = wire_new(model, m)
     d["n"] = n            # JS bumps totalCount from `n`; no separate broadcast
     chat_emit(model, d)
+    # A just-committed Task may have subagent activity that arrived ahead of it
+    # (out-of-band feed vs async parent commit) — replay it into the feed now.
+    m isa TaskToolMsg && replay_pending_subagent!(model, m)
     return m
 end
 
@@ -2565,35 +2824,36 @@ is_bonito_app(::AgentClientProtocol.ToolCall)      = false
 
 bonito_app_msg(tc, server, chat) =
     BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
-                 content_summary("bonito_app", tc.content),
+                 content_summary(builtin_msg_type("bonito_app"), tc.content),
                  time(), nothing, server,
                  something(find_app_reference(tc.content), ""), chat)
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool) =
     is_bonito_app(tc) ? bonito_app_msg(tc, "", chat) :
-    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
-                   content_summary(tc.kind, tc.content),
+    builtin_msg_type(tc.kind)(tc.id, tc.kind, tc.name, tc.title, tc.status,
+                   content_summary(builtin_msg_type(tc.kind), tc.content),
                    time(), nothing, chat, Dict{String,Any}(tc.raw_input))
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.BashCall) =
     BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(tc.kind, tc.content),
+                content_summary(builtin_msg_type(tc.kind), tc.content),
                 time(), nothing,
                 tc.command, tc.description, tc.run_in_background,
-                "", 0, false, "", chat)
+                "", 0, "", chat)
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall) =
     TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(tc.kind, tc.content),
+                content_summary(builtin_msg_type(tc.kind), tc.content),
                 time(), nothing,
                 tc.description, tc.run_in_background, tc.task_name, chat)
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall) =
     is_bonito_app(tc) ? bonito_app_msg(tc, tc.server, chat) :
-    MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
-               content_summary(tc.kind, tc.content),
-               time(), nothing,
-               tc.server, tc.tool_name, Dict{String,Any}(tc.raw_input), chat)
+    mcp_msg_type(tc.tool_name)(
+        tc.id, tc.kind, tc.title, tc.status,
+        content_summary(builtin_msg_type(tc.kind), tc.content),
+        time(), nothing,
+        tc.server, tc.tool_name, Dict{String,Any}(tc.raw_input), chat)
 
 # Default: stream the message's text deltas into the bubble, then finalize.
 function process_update!(b::ChatMsg, m::AgentClientProtocol.Message)
@@ -2652,19 +2912,38 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             prev_status = b.status
             b.status = snap.status
             b.title = snap.title
-            b.summary = content_summary(snap.kind, snap.content)
+            b.summary = content_summary(builtin_msg_type(snap.kind), snap.content)
             # Stamp `finished_at` on terminal-transition so the live timer freezes.
             prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
                 (b.finished_at = time())
             persist_tool_content!(b.chat.chat_dir, snap)
             cache_tool_content!(b.chat, snap.id, snap.content)
             # Per-type extraction from THIS snap (e.g. BonitoAppMsg pulls the
-            # worker-registered `shown_app: <id>` out of the result content).
+            # worker-registered `shown_app: <id>` out of the result content;
+            # TaskToolMsg flips `is_background` off a late run_in_background /
+            # outputFile). Re-`pin_tool!` after: a Task that JUST became a
+            # background subagent enters the bar now (the top-of-loop pin ran
+            # while `is_background` was still false). `pin_tool!`/`push!` are
+            # idempotent, so this is a no-op for everything already in/out.
             update_from_snap!(b, snap)
+            pin_tool!(b.chat, b)
             pretty_title, _ = pretty_tool_title(b.title)
             d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
                 "status" => b.status, "title" => pretty_title, "summary" => b.summary)
-            b.finished_at === nothing || (d["finished_at"] = b.finished_at)
+            # A background subagent: mark the bubble so the browser renders its
+            # background/taskbar affordance (the pill itself comes from the shared
+            # TaskBar observable via the `push!` above).
+            if is_taskbar_item(b)
+                d["background"] = true
+                d["taskbar"]   = true
+                # The launch-ack `completed` (and the `finished_at` it stamps) is a
+                # LIE while this is a LIVE background subagent/bash — it's still
+                # running in the bar. Show the bubble as in-progress, not completed;
+                # `finalize!` emits the REAL terminal state when it actually ends.
+                d["status"] = "in_progress"
+            end
+            (!is_taskbar_item(b) && b.finished_at !== nothing) &&
+                (d["finished_at"] = b.finished_at)
             # Auto-expand the body: live Bonito app once we've captured its
             # app_id, `bt_show` tool once content carries a `shown:` ref, or
             # an edit tool once its first DiffContent has landed (so the
@@ -2696,14 +2975,10 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             chat_emit(b.chat, d)
         end
     finally
-        # A running background SUBAGENT outlives its launch-ack (same rule as
-        # the bg bash below): keep the bubble live + its taskbar slot pinned.
-        # It finalizes via the user's ⊗ stop or the chat's teardown — there is
-        # no wire signal for a background subagent finishing.
-        if !(b isa TaskToolMsg && b.is_background && b.task_running)
-            close(b)    # total: finalizes the bubble even if the loop body threw
-            unpin_task!(b.chat, b.id)
-        end
+        # Foreground tools finalize here; a background task (in the bar) is
+        # finalized by the TaskBar's OWN loop (`isdone` → `finished!` →
+        # `finalize!`) off its output-file fd-close, so we leave it live/pinned.
+        in_taskbar(b) || close(b)
     end
     return nothing
 end
@@ -2720,8 +2995,7 @@ end
 #   • Everything else stays click-to-expand.
 auto_expand_body(::ToolMsg, snap_content) = false
 auto_expand_body(m::BonitoAppMsg, snap_content) = !isempty(m.app_id)
-auto_expand_body(m::GenericToolMsg, snap_content) =
-    m.kind == "edit" && any(c -> c isa DiffContent, snap_content)
+auto_expand_body(::EditToolMsg, snap_content) = any(c -> c isa DiffContent, snap_content)
 # Two-arg fallback for tests / call sites that don't have the snap yet.
 auto_expand_body(b::ToolMsg) = auto_expand_body(b, Any[])
 
@@ -2731,19 +3005,31 @@ auto_expand_body(b::ToolMsg) = auto_expand_body(b, Any[])
 # the browser receives the expand event on the SAME update that carried the
 # result, no second round-trip.
 snap_header_extras!(::Dict, ::ToolMsg) = nothing
-snap_header_extras!(d::Dict, b::MCPToolMsg) = (eval_header_extras!(d, b); nothing)
+snap_header_extras!(d::Dict, b::MCPToolMsg) = (mcp_input_extras!(d, b); nothing)
 
 update_from_snap!(::ToolMsg, _snap) = nothing
-# A LATER terminal update on a background subagent is the agent's explicit
-# "the subagent finished" signal (its result was collected) — clear
-# `task_running` so the drain's finally closes + unpins the slot. The launch
-# ACK (the initial tool_call frame, which also reports "completed") never
-# reaches this loop: it builds the message before the update stream, so a
-# bg Task with no later updates stays pinned — exactly the visible-subagent
-# behavior this field exists for.
-function update_from_snap!(b::TaskToolMsg, _snap)
-    b.is_background && b.task_running && b.status in ("completed", "failed") &&
-        (b.task_running = false)
+# Background-subagent detection + the async `outputFile`, BOTH of which arrive on
+# a LATER `tool_call_update`, never the initial `tool_call`: claude-agent-acp
+# STREAMS rawInput (so `run_in_background` shows up late — see `merge_late_input!`)
+# and the `async_launched` ack carries the transcript `outputFile` in
+# `_meta.claudeCode.toolResponse`. The generic tool loop — unlike the bash path
+# (`process_update!(::BashToolMsg)`) — doesn't propagate either to the message, so
+# we do it here: a `run_in_background` flag OR an `outputFile` means this IS a
+# background subagent. Flipping `is_background` is what lets `process_update!`
+# re-`pin_tool!` it (the top-of-loop pin ran while the flag was still false).
+#
+# The `outputFile` is the DETERMINISTIC completion handle: the TaskBar's loop
+# reads it (`isdone(::TaskToolMsg)`) for the subagent's final `end_turn` marker.
+# We do NOTHING with the tool_call's own `completed` status — that fires at
+# LAUNCH, not at real completion. So a launched subagent stays in the bar until
+# its transcript says done (or the user ⊗-stops it), never because the wire lies.
+function update_from_snap!(b::TaskToolMsg, snap)
+    snap isa AgentClientProtocol.TaskCall || return nothing
+    (snap.run_in_background || !isempty(snap.output_file)) && (b.is_background = true)
+    if isempty(b.bg_output_path) && !isempty(snap.output_file)
+        b.bg_output_path = snap.output_file
+        b.bg_offset      = 0
+    end
     return nothing
 end
 function update_from_snap!(b::BonitoAppMsg, snap)
@@ -2761,7 +3047,7 @@ function update_from_snap!(b::MCPToolMsg, snap)
     snap isa AgentClientProtocol.MCPCall && merge!(b.raw_input, snap.raw_input)
     return nothing
 end
-function update_from_snap!(b::GenericToolMsg, snap)
+function update_from_snap!(b::BuiltinToolMsg, snap)
     snap isa AgentClientProtocol.GenericTool && merge!(b.raw_input, snap.raw_input)
     return nothing
 end
@@ -2769,9 +3055,10 @@ end
 # Background bash (`run_in_background`): the agent "completes" the tool_call the
 # instant the command is LAUNCHED and hands back an output-file path; the shell
 # keeps running. We do the normal persist + header updates but, instead of
-# finalizing on "completed", capture the output path and go live (`bg_running`) —
-# the background-task poller then streams the file and finalizes when the shell
-# exits. Non-background bashes fall through to the generic ToolMsg handling.
+# finalizing on "completed", capture the output path and `push!` it into the
+# TaskBar (membership IS liveness) — the bar's own loop then streams the file and
+# `finished!`es it when the shell exits. Non-background bashes fall through to
+# the generic ToolMsg handling.
 function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
     pin_tool!(b.chat, b)
     try
@@ -2779,7 +3066,7 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
         for snap in m.updates
             b.status  = snap.status
             b.title   = snap.title
-            b.summary = content_summary(snap.kind, snap.content)
+            b.summary = content_summary(builtin_msg_type(snap.kind), snap.content)
             # Streamed tool input: command/description/run_in_background are
             # usually EMPTY on the initial tool_call and arrive on a later
             # update (ACP merges them into the live BashCall) — refresh.
@@ -2787,9 +3074,9 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
                 isempty(snap.command) || (b.command = snap.command)
                 snap.description === nothing || (b.description = snap.description)
                 snap.run_in_background && (b.is_background = true)
-                # The pin's label is the human description — refresh once it
-                # streams in.
-                refresh_pin!(b.chat, b)
+                # The pill's label re-derives from the message on the bar's clock
+                # tick (`taskbar_slot_label`), so the human description shows up
+                # once it streams in — no explicit re-pin needed.
             end
             persist_tool_content!(b.chat.chat_dir, snap)
             # Detect a background launch from the RESULT ("…running in background…
@@ -2805,12 +3092,13 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
                     b.is_background  = true
                     b.bg_output_path = path
                     b.bg_offset      = 0
-                    b.bg_running     = true       # the poller now owns its lifecycle
+                    push!(chat_taskbar(b.chat), b)   # enters the bar → the bar's loop owns it (membership IS liveness)
                 end
             end
             # Foreground bash (or a failed launch): stamp finished_at on terminal.
-            # A live background task is left unstamped — the poller finalizes it.
-            if !b.bg_running && b.status in ("completed", "failed")
+            # A live background task (in the bar) is left unstamped — the bar's
+            # loop finalizes it on the output file's fd-close.
+            if !in_taskbar(b) && b.status in ("completed", "failed")
                 b.finished_at === nothing && (b.finished_at = time())
             end
             # Claude's human-readable description beats the raw script as
@@ -2818,35 +3106,30 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
             # The command itself stays available in the body + tooltip.
             pretty_title, _ = pretty_tool_title(bash_display_title(b))
             d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
-                "status" => b.bg_running ? "in_progress" : b.status,
+                "status" => in_taskbar(b) ? "in_progress" : b.status,
                 "title" => pretty_title, "summary" => b.summary)
             # Description took over the title → the raw command rides as a
             # header tooltip.
             b.description === nothing || isempty(b.command) ||
                 (d["command"] = b.command)
-            if b.bg_running || b.is_background
+            if in_taskbar(b) || b.is_background
                 d["background"] = true
                 # `wire_new` shipped `taskbar=false` (is_background was still
                 # false — the streamed rawInput hadn't arrived); now that we
                 # know it IS a background task, flip the taskbar slot on.
                 d["taskbar"] = true
             end
-            if !b.bg_running && b.finished_at !== nothing
+            if !in_taskbar(b) && b.finished_at !== nothing
                 d["finished_at"] = b.finished_at
             end
             chat_emit(b.chat, d)
         end
     finally
-        # A live background task is finalized later (by `finalize_bg_task!` when the
-        # shell exits); only persist-to-chat.md here if it already terminated. The
-        # guard belongs inside `finally` so a thrown loop body doesn't accidentally
-        # close (= mark "failed") a still-running background shell. Same for
-        # the pin: a live bg shell keeps its taskbar slot until the poller
-        # finalizes it.
-        if !b.bg_running
-            close(b)
-            unpin_task!(b.chat, b.id)
-        end
+        # A foreground bash finalizes here; a background one (in the bar) is
+        # finalized by the TaskBar's own loop off its output-file fd-close, so we
+        # leave it live/pinned. The guard is inside `finally` so a thrown loop
+        # body can't close (= "failed") a still-running background shell.
+        in_taskbar(b) || close(b)
     end
     return nothing
 end
@@ -2893,22 +3176,8 @@ const BG_QUIESCE_SECS = 20.0
 # global cadence constant — the 1 s sleep is inline, the task's
 # lifetime is the chat's, and a closed chat takes its poller with it.
 #
-# The poller lives on `shared(model).poller_task` (a field), so its lifetime is
-# the chat's — no global registry pinning every chat alive and no per-teardown
-# hand-draining. Idempotent: a still-running poller is left alone; a finished one
-# (the chat closed and `background_poll_loop`'s `while isopen(user_messages)`
-# guard exited) is replaced. The check-and-set runs under the model lock so two
-# concurrent `start_chat_client!`s can't spawn two pollers.
-function start_background_poller!(state::ServerState, model::ChatModel)
-    s = shared(model)
-    lock(s.lock) do
-        existing = s.poller_task[]
-        existing === nothing || istaskdone(existing) || return  # already live
-        s.poller_task[] = Base.errormonitor(@async background_poll_loop(state, s))
-        return nothing
-    end
-    return nothing
-end
+# (`start_background_poller!` / `background_poll_loop` are gone — the TaskBar
+# owns its own poll loop now, started lazily on the first `push!`.)
 
 bg_worker_id(state::ServerState, model::ChatModel) =
     let pid = model.project_id
@@ -2936,95 +3205,11 @@ function stream_bg_update!(model::ChatModel, m::BashToolMsg)
     return nothing
 end
 
-function finalize_bg_task!(model::ChatModel, m::BashToolMsg)
-    m.bg_running = false
-    m.status = "completed"
-    m.finished_at === nothing && (m.finished_at = time())
-    write_bg_content!(model.chat_dir, m)
-    try
-        append_tool(model.chat_session, m)
-    catch e
-        @warn "append_tool for finished bg task failed" id = m.id exception = e
-    end
-    n = bg_line_count(m)
-    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
-        "status" => "completed", "summary" => "done · $n line$(n == 1 ? "" : "s")",
-        "finished_at" => m.finished_at))
-    unpin_task!(model, m.id)
-    return nothing
-end
-
-# Tail one task's output; stream new bytes to the bubble. Returns the worker's
-# tail result (or `nothing` on a transient error → retry next tick).
-function poll_background_task!(state::ServerState, model::ChatModel, m::BashToolMsg)
-    wid = bg_worker_id(state, model)
-    wid === nothing && return nothing
-    r = try
-        tail_worker_file(state, wid, m.bg_output_path; offset = m.bg_offset, timeout = 10.0)
-    catch e
-        @debug "tail_file failed (will retry)" id = m.id exception = e
-        return nothing
-    end
-    if r.exists && !isempty(r.chunk)
-        m.bg_text  *= r.chunk
-        m.bg_offset = r.offset
-        stream_bg_update!(model, m)
-    end
-    return r
-end
-
-function background_poll_loop(state::ServerState, model::ChatModel)
-    # Per-tool state lives in the loop's closure: `last_grew` tracks the
-    # last time each id's output file grew (only consulted for the non-
-    # Linux quiesce fallback). When a tool finalizes we drop its entry.
-    last_grew = Dict{String,Float64}()
-    # The loop's lifetime is the chat's: `close(::ChatModel)` closes
-    # `user_messages`, which both ends the `run_chat!` consumer and signals this
-    # poller to exit (T4). Before this guard the loop was `while true` with a
-    # catch-all, so a closed chat left an immortal 1 Hz poller holding a strong
-    # ref to the ChatModel forever.
-    while isopen(model.user_messages)
-        try
-            # Snapshot msgs_store ONCE per tick under `model.lock` — the single
-            # `run_chat!` consumer `push!`es to this Vector on another task, and a
-            # regrow mid-iteration is a data race (T8). We iterate the snapshot.
-            snapshot = lock(model.lock) do; copy(model.msgs_store); end
-            for m in snapshot
-                (m isa BashToolMsg && m.is_background && m.bg_running &&
-                    !isempty(m.bg_output_path)) || continue
-                before = m.bg_offset
-                r = poll_background_task!(state, model, m)
-                if m.bg_offset > before
-                    last_grew[m.id] = time()
-                end
-                lg = get(last_grew, m.id, time())
-                # Done when, per the worker's fd scan (open_known on Linux):
-                # the file exists but no longer has a writer (shell exited),
-                # OR the file is GONE entirely (exists=false) — a vanished
-                # output file means the task is over, NOT "still running".
-                # (The latter previously read as not-done, which — combined
-                # with the trailing-dot path bug — pinned pills forever.)
-                # Non-Linux: fall back to mtime quiescence.
-                done = r !== nothing &&
-                    (r.open_known ? (!r.exists || !r.open) :
-                                    (time() - lg > BG_QUIESCE_SECS))
-                if done
-                    finalize_bg_task!(model, m)
-                    delete!(last_grew, m.id)
-                end
-            end
-            # GC `last_grew` for ids that are no longer live (finalized
-            # on a previous tick or an orphan sweep cleared them).
-            for id in collect(keys(last_grew))
-                any(x -> x isa BashToolMsg && x.id == id && x.bg_running,
-                    snapshot) || delete!(last_grew, id)
-            end
-        catch e
-            @warn "background task poll loop tick failed" exception = e
-        end
-        sleep(1.0)
-    end
-end
+# (The old `finalize_bg_task!` / `poll_background_task!` / `poll_subagent_done!`
+# / `finalize_subagent!` / `background_poll_loop` are gone: the TaskBar owns its
+# poll loop now, and `isdone`/`poll_output_file!`/`finalize!` (above) replace
+# them. `bg_worker_id`, `write_bg_content!`, `bg_line_count`, `stream_bg_update!`
+# stay — they're used by `poll_output_file!` and `finalize!`.)
 
 # Todos are one-shot snapshots — nothing to stream, just finalize (persist).
 process_update!(b::TodoListMsg, ::AgentClientProtocol.Plan) = (close(b); nothing)
@@ -3051,10 +3236,23 @@ end
 process!(chat::ChatModel, m::AgentClientProtocol.Plan) =
     process_todo!(chat, m.entries)
 
+# `source = t` lets the slot re-derive its rows from the LIVE message on each
+# clock tick (`taskbar_todo_rows` below) — entries update in-place, so a static
+# snapshot would freeze the list; a KeyedList slot is never rebuilt by key.
 todo_taskbar_item(t::TodoListMsg) =
-    TaskbarItem(t.id, :todo, "📋", "Todos"; started = t.started_at,
+    TaskbarItem(t.id, :todo, "📋", "Todos"; started = t.started_at, source = t,
                 entries = Tuple{String,String}[(e.content, e.status)
                                                 for e in t.entries])
+
+# Live todo rows for the taskbar slot (the `::Any` fallback lives in taskbar.jl;
+# called from its :todo render on each `bar.clock` tick). Reads the current
+# entries under the shared lock so a newly-completed item shows within a tick —
+# same cadence as the elapsed labels.
+taskbar_todo_rows(t::TodoListMsg) =
+    t.chat === nothing ? [(e.content, e.status) for e in t.entries] :
+    lock(shared(t.chat).lock) do
+        [(e.content, e.status) for e in t.entries]
+    end
 
 function process_todo!(chat::ChatModel, entries)
     s = shared(chat)
@@ -3081,26 +3279,17 @@ function process_todo!(chat::ChatModel, entries)
         t = TodoListMsg(chat, new)
         s.live_todo[] = t
     end
-    if is_live(t)
-        pin_task!(chat, todo_taskbar_item(t))   # the taskbar IS the live view
-    else
-        finalize_todo!(chat, t)                 # all done → history bubble
-    end
+    # Always enter the bar — membership IS liveness. The bar's own loop finalizes
+    # it (`isdone(::TodoListMsg)` → all entries done) into a history bubble, on the
+    # same 1 Hz cadence as every other task; an already-in-bar todo whose entries
+    # were just updated in-place is a `push!` no-op (its slot re-derives its rows
+    # from the live message on the clock tick). A fresh all-done list (the dedup
+    # above let through) rides one tick and finalizes — no lost bubble.
+    push!(chat_taskbar(chat), t)
     return nothing
 end
-
-# Retire the live list: drop the pin and append the final state to the chat
-# history + chat.md. Statuses are kept as-is — a zombied list shows exactly
-# how far it got.
-function finalize_todo!(chat::ChatModel, t::TodoListMsg)
-    s = shared(chat)
-    s.live_todo[] === t && (s.live_todo[] = nothing)
-    t.finished_at === nothing && (t.finished_at = time())
-    unpin_task!(chat, t.id)
-    send!(chat, t)
-    t.chat === nothing || append_plan(t.chat.chat_session, t)
-    return nothing
-end
+# (`finalize_todo!` is gone — the bar's loop calls `finished!(t)` →
+# `finalize!(::TodoListMsg)` below, which does the send!+append_plan+clear-live_todo.)
 
 plan_update_dict(m::TodoListMsg) = merge(msg_to_dict(m),
     Dict{String,Any}("type" => "plan_update"))
@@ -3167,17 +3356,26 @@ end
 
 # Tear a ChatModel's long-lived tasks down (T4). Closing `user_messages` ends
 # the `run_chat!` consumer (its `for … in chat.user_messages` loop exits on a
-# closed channel) AND signals `background_poll_loop` to exit (its
-# `while isopen(model.user_messages)` guard) — so the 1 Hz poller stops and its
-# `model.poller_task` finishes, releasing the running task's ref to the model.
-# We resolve to the shared parent so a per-session view never half-closes the
-# real model.
+# closed channel); `close(s.taskbar)` stops the TaskBar's OWN 1 Hz poll loop
+# (which otherwise spins forever, holding the model via its live tasks). We
+# resolve to the shared parent so a per-session view never half-closes the real
+# model.
 #
 # Idempotent: closing an already-closed channel is a no-op (we guard `isopen`),
 # and `stop_session!` may run more than once for the same project.
 function Base.close(model::ChatModel)
     s = shared(model)
+    # Close `user_messages` FIRST — that's the "chat is dead" signal
+    # `ensure_between_turn_sink!` guards on, so a late orphan frame racing this
+    # teardown can't spin up a fresh (never-reaped) sink. THEN wind down any
+    # in-flight between-turn (auto-wake) sink so its coalescer + consumer tasks
+    # don't leak (no next prompt will ever call `finish_between_turn!`).
+    # Non-blocking: closing the update channel lets both tasks finish on their own.
     isopen(s.user_messages) && close(s.user_messages)
+    teardown_between_turn!(model)
+    # Stop the TaskBar's own poll loop and drop its live tasks — otherwise the
+    # 1 Hz loop spins forever, pinning the model (and its tasks) past teardown.
+    close(s.taskbar)
     return nothing
 end
 
@@ -3190,17 +3388,38 @@ end
 # subagent's sub-tool, or the parent's tool_call still buffered ahead of the
 # message consumer) → DROP with a debug log; interleaving subagent prose into
 # the top-level reply is exactly the failure mode this routing removes.
+# Bound the held buffer so a genuinely-orphan parent id (a nested subagent's
+# sub-tool whose id never becomes a top-level Task) can't grow without limit.
+# Foreground subagents claim their parent within milliseconds, so in practice
+# the buffer holds one short-lived key; these caps are a safety net. The
+# per-parent cap sits a little above the feed's own 50-entry window.
+const PENDING_SUBAGENT_MAX_PARENTS    = 32
+const PENDING_SUBAGENT_MAX_PER_PARENT = 64
+
 function route_subagent_activity!(chat::ChatModel,
                                   act::AgentClientProtocol.SubagentActivity)
     s = shared(chat)
     entry = lock(s.lock) do
         idx = findlast(m -> m isa TaskToolMsg && m.id == act.parent_id, s.msgs_store)
-        idx === nothing ? nothing : note_activity!(s.msgs_store[idx]::TaskToolMsg, act)
+        if idx === nothing
+            # Parent Task not committed yet. Subagent activity is delivered out
+            # of band (the consumer parks draining the parent Task's own update
+            # channel for the whole subagent run), while the parent TaskToolMsg
+            # is committed by that async consumer — so activity can briefly
+            # precede its parent. HOLD it; `send!` replays the instant the
+            # matching TaskToolMsg lands. (Dropping here lost the whole feed:
+            # the "subagents don't show up" bug.)
+            buf = get!(() -> Any[], s.pending_subagent, act.parent_id)
+            push!(buf, act)
+            length(buf) > PENDING_SUBAGENT_MAX_PER_PARENT && popfirst!(buf)
+            if length(s.pending_subagent) > PENDING_SUBAGENT_MAX_PARENTS
+                delete!(s.pending_subagent, first(keys(s.pending_subagent)))
+            end
+            return nothing
+        end
+        note_activity!(s.msgs_store[idx]::TaskToolMsg, act)
     end
-    if entry === nothing
-        @debug "subagent activity dropped (no parent TaskToolMsg)" parent_id = act.parent_id kind = act.kind
-        return nothing
-    end
+    entry === nothing && return nothing   # held until its parent lands
     # Observable write OUTSIDE the lock (listener/JS-bridge rule, see pin_task!).
     chat_emit(chat, Dict{String,Any}("type" => "task_activity",
         "id" => act.parent_id, "entry" => entry_wire(entry),
@@ -3208,65 +3427,127 @@ function route_subagent_activity!(chat::ChatModel,
     return nothing
 end
 
-# ── Between-turn wire frames (Connection.on_orphan_update) ──────────────────
-# The agent streams AFTER end_turn: a background subagent's tagged activity
-# keeps flowing, and when it finishes the main agent AUTO-WAKES and streams an
-# untagged announcement ("The background agent completed and replied: …") —
-# captured live in test/fixtures/bg_subagent_wire.jsonl. Without this router
-# both were dropped: the Task pill froze (amber despite live work) and the
-# completion message never rendered anywhere.
-#
-# Runs on the ACP dispatcher task: mutate under the lock, emit outside, never
-# throw (the connection guards, but be a good citizen anyway).
-function handle_orphan_update!(chat::ChatModel, u)
+# Replay any subagent activity that arrived before `m` (a just-committed Task)
+# existed in msgs_store — see the buffer note on `route_subagent_activity!`.
+# Called from `send!` on every TaskToolMsg commit.
+function replay_pending_subagent!(chat::ChatModel, m::TaskToolMsg)
     s = shared(chat)
-    if u isa AgentClientProtocol.SubagentUpdate
-        # Same distill + feed path the in-turn sink uses.
-        act = AgentClientProtocol.subagent_activity(u.parent_tool_use_id, u.update)
-        act === nothing || route_subagent_activity!(chat, act)
-        return nothing
+    held = lock(s.lock) do
+        pop!(s.pending_subagent, m.id, nothing)
     end
-    u isa AgentClientProtocol.AgentMessageChunk || return nothing  # usage etc.
-    t = AgentClientProtocol.text_of(u)
-    (t === nothing || isempty(t)) && return nothing
-    msg, created, finished_task = lock(s.lock) do
-        cur = s.orphan_agent_msg[]
-        cur !== nothing && return (cur, false, nothing)
-        # First chunk of an auto-wake message — the thing that wakes the agent
-        # between turns is a background subagent finishing. With exactly ONE
-        # running, this announcement IS its completion signal: finalize the
-        # pill. (Several running → ambiguous, leave them pinned; the amber
-        # staleness + ⊗ still cover it.)
-        running = TaskToolMsg[m for m in s.msgs_store
-                              if m isa TaskToolMsg && m.is_background && m.task_running]
-        ft = length(running) == 1 ? running[1] : nothing
-        ft === nothing || (ft.task_running = false)
-        fresh = AgentMsg(chat, "")     # streaming bubble (in_flight)
-        s.orphan_agent_msg[] = fresh
-        (fresh, true, ft)
+    held === nothing && return nothing
+    # Re-route OUTSIDE the lock (route_subagent_activity! takes it + emits): the
+    # parent now exists, so each entry feeds + ships its task_activity event.
+    for act in held
+        route_subagent_activity!(chat, act::AgentClientProtocol.SubagentActivity)
     end
-    if created
-        send!(chat, msg)               # push + wire_new: the bubble appears live
-        if finished_task !== nothing
-            close(finished_task)       # persists + finalizes ("N steps" trace)
-            unpin_task!(chat, finished_task.id)
-        end
-    end
-    append!(msg, t)                    # streams the chunk (wire_chunk)
     return nothing
 end
 
-# Close the open between-turn bubble (idempotent). Called from `begin_turn!` —
-# a new prompt is the natural boundary of the auto-wake announcement (there is
-# no end_turn for it: no turn was open).
-function finish_orphan_msg!(chat::ChatModel)
-    s = shared(chat)
-    m = lock(s.lock) do
-        cur = s.orphan_agent_msg[]
-        s.orphan_agent_msg[] = nothing
-        cur
+# ── Between-turn wire frames (Connection.on_orphan_update) ──────────────────
+# The agent streams a WHOLE turn of work BETWEEN turns: when it detaches a
+# background task it resolves the ACP prompt with `end_turn` (claude-agent-acp
+# deliberately does not hold a turn open for detached work), and when that task
+# finishes the agent AUTO-WAKES and streams text + tools + plans on the SAME
+# session with NO new `session/prompt` wrapping it. The ACP dispatcher, finding
+# no active turn, hands those sink-less updates here (`Connection.on_orphan_update`).
+#
+# They deserve the SAME sink a live turn gets. The old handler was a degenerate
+# half-sink — it appended every agent text chunk to ONE never-closed bubble and
+# DROPPED every tool_call / plan — so an auto-wake work session collapsed into a
+# single merged bubble with the tools erased (#23). Now the first update lazily
+# spins up a real coalescer + consumer (mirroring `prompt!` + `drain_turn!`) and
+# every update flows through it in wire order, so boundaries/tools/plans render
+# identically to a live turn. Runs on the ACP dispatcher task — never throw.
+function handle_orphan_update!(chat::ChatModel, u)
+    ch = ensure_between_turn_sink!(chat)
+    ch === nothing && return nothing              # chat closing / sink torn down
+    try
+        put!(ch, u)                               # bounded, in-order; coalescer drains
+    catch e
+        e isa InvalidStateException || rethrow()  # raced a concurrent teardown
     end
-    m === nothing || close(m)          # persists + emits agent_final
+    return nothing
+end
+
+# Lazily start the between-turn sink; returns its raw-update channel. Idempotent
+# under the shared lock: one sink per chat, reused until `finish_between_turn!`
+# tears it down at the next prompt.
+function ensure_between_turn_sink!(chat::ChatModel)
+    s = shared(chat)
+    return lock(s.lock) do
+        # Chat torn down (`close` shut `user_messages`): don't resurrect a sink no
+        # `begin_turn!` will ever reap — a late frame after close would leak it.
+        isopen(s.user_messages) || return nothing
+        bt = s.between_turn[]
+        bt === nothing || return bt.updates
+        updates = Channel{AgentClientProtocol.SessionUpdate}(AgentClientProtocol.BUF)
+        msgs    = Channel{AgentClientProtocol.Message}(AgentClientProtocol.BUF)
+        # Coalescer: the exact loop `prompt!` runs — a persistent `TurnState`
+        # turns the raw update stream into whole messages, closing each text
+        # bubble on a tool/plan boundary; subagent-tagged updates divert to the
+        # parent Task feed via the same `on_subagent` a live turn installs.
+        # `close(st)` at stream end seals the trailing bubble + any open tool.
+        coalescer = Base.errormonitor(@async begin
+            st = AgentClientProtocol.TurnState(act -> route_subagent_activity!(chat, act))
+            try
+                for up in updates
+                    AgentClientProtocol.parse_update!(msgs, st, up)
+                end
+            finally
+                close(st)              # Base.close(::TurnState): seals bubble + open tools
+                close(msgs)
+            end
+        end)
+        consumer = Base.errormonitor(@async between_turn_consumer!(chat, msgs))
+        s.between_turn[] = (; updates, msgs, coalescer, consumer)
+        return updates
+    end
+end
+
+# Render the between-turn message stream through the SAME per-message renderer a
+# live turn uses (`process!`), so text boundaries, tools and plans all appear as
+# separate bubbles. Subagent-pill completion is NO LONGER guessed here: the
+# background poller finishes each subagent deterministically off its transcript
+# `outputFile` (`finalize_subagent!`), so auto-wake just renders.
+function between_turn_consumer!(chat::ChatModel, msgs)
+    for m in msgs
+        process!(chat, m)
+    end
+    # Mirror `drain_turn!`'s end-of-turn cleanup: a live todo list the episode
+    # built is finalized into history now (the episode is over — there is no
+    # held-open turn to keep it live), exactly as the last real turn finalizes
+    # its list. Runs before `finish_between_turn!`'s barrier returns, so the list
+    # lands before the next turn's first message.
+    let t = shared(chat).live_todo[]
+        t isa TodoListMsg && finished!(t)
+    end
+    return nothing
+end
+
+# Grab + clear the between-turn sink and close its update channel, which winds
+# the coalescer down (→ `close(st)` seals the trailing bubble + any open tool →
+# `close(msgs)` → the consumer drains and exits). Non-blocking — the tasks finish
+# on their own. Returns the sink handle (or nothing) so the caller can decide
+# whether to WAIT for the consumer. Idempotent.
+function teardown_between_turn!(chat::ChatModel)
+    s = shared(chat)
+    bt = lock(s.lock) do
+        b = s.between_turn[]
+        s.between_turn[] = nothing
+        b
+    end
+    bt === nothing || close(bt.updates)
+    return bt
+end
+
+# At the next-prompt boundary (the natural end of an auto-wake continuation —
+# there is no end_turn for it, no turn was open): tear down AND wait, so every
+# between-turn message is fully rendered + persisted BEFORE the new turn's first
+# message (the store-order invariant). Idempotent.
+function finish_between_turn!(chat::ChatModel)
+    bt = teardown_between_turn!(chat)
+    bt === nothing || wait(bt.consumer)   # barrier: full render before the next turn
     return nothing
 end
 
@@ -3337,9 +3618,10 @@ entry_wire(e::TaskActivityEntry) = Dict{String,Any}(
 # for `drain_turn!`, or `nothing` when there's no client.
 function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     promote_queued_user_bubble!(chat)
-    # A new prompt is the boundary of any open between-turn auto-wake bubble:
-    # close it now so it persists + finalizes before the turn's own messages.
-    finish_orphan_msg!(chat)
+    # A new prompt is the boundary of any live between-turn auto-wake stream:
+    # tear its sink down now (barrier) so all its messages persist + finalize
+    # before the turn's own messages.
+    finish_between_turn!(chat)
     s = shared(chat)
     # A turn can still be drained from the channel AFTER the chat is closed:
     # `close(::ChatModel)` shuts `user_messages`, but the consumer keeps draining
@@ -3510,7 +3792,7 @@ function drain_turn!(chat::ChatModel, turn)
             # finalize it (zombied — the statuses show how far it got) into
             # the chat history; the taskbar slot drops.
             let t = s.live_todo[]
-                t isa TodoListMsg && finalize_todo!(chat, t)
+                t isa TodoListMsg && finished!(t)
             end
             # Empty turn: the agent resolved without emitting any message (no
             # text, tool, or thought) and it wasn't an error or a user cancel.
@@ -3900,7 +4182,8 @@ function register_chat_model!(model::ChatModel)
     if s.consumer_task[] === nothing
         s.consumer_task[] = Base.errormonitor(@async run_chat!(s))
     end
-    start_background_poller!(model.state, s)
+    # (No background poller to start — the chat's TaskBar owns its own poll loop,
+    # spun up lazily by the first `push!`.)
     if !isempty(model.project_id)
         @info "registering chat model" project_id = model.project_id
         lock(model.state.lock) do
@@ -4382,33 +4665,33 @@ replayed_to_msg(model::ChatModel, m::AgentClientProtocol.Plan) =
 # type-driven recognition as the live path (`is_bonito_app`).
 replayed_bonito_app_msg(tc, server) =
     BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
-                 content_summary("bonito_app", tc.content),
+                 content_summary(builtin_msg_type("bonito_app"), tc.content),
                  time(), time(), server,
                  something(find_app_reference(tc.content), ""), nothing)
 
 replayed_tool_msg(tc::AgentClientProtocol.GenericTool) =
     is_bonito_app(tc) ? replayed_bonito_app_msg(tc, "") :
-    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
-                   content_summary(tc.kind, tc.content),
+    builtin_msg_type(tc.kind)(tc.id, tc.kind, tc.name, tc.title, tc.status,
+                   content_summary(builtin_msg_type(tc.kind), tc.content),
                    time(), time(), nothing, Dict{String,Any}(tc.raw_input))
 replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
     BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(tc.kind, tc.content),
+                content_summary(builtin_msg_type(tc.kind), tc.content),
                 time(), time(),
                 tc.command, tc.description, tc.run_in_background,
-                "", 0, false, "", nothing)   # bg fields: history → already done
+                "", 0, "", nothing)   # bg fields: history → already done, never in the bar
 replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
     TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(tc.kind, tc.content),
+                content_summary(builtin_msg_type(tc.kind), tc.content),
                 time(), time(),
-                tc.description, tc.run_in_background, tc.task_name, nothing;
-                task_running = false)   # replayed = history, not a live subagent
+                tc.description, tc.run_in_background, tc.task_name, nothing)   # replayed = history, never in the bar
 replayed_tool_msg(tc::AgentClientProtocol.MCPCall) =
     is_bonito_app(tc) ? replayed_bonito_app_msg(tc, tc.server) :
-    MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
-               content_summary(tc.kind, tc.content),
-               time(), time(),
-               tc.server, tc.tool_name, Dict{String,Any}(tc.raw_input), nothing)
+    mcp_msg_type(tc.tool_name)(
+        tc.id, tc.kind, tc.title, tc.status,
+        content_summary(builtin_msg_type(tc.kind), tc.content),
+        time(), time(),
+        tc.server, tc.tool_name, Dict{String,Any}(tc.raw_input), nothing)
 
 # ── Sync watermark ───────────────────────────────────────────────────────────
 # A per-chat stamp recording WHEN we last reconciled against claude's session.
@@ -5663,7 +5946,7 @@ request_tool_stop!(::ChatModel, ::ToolMsg) = nothing
 #      (the exact "pill stuck in_progress forever" bug).
 # Idempotent: a second click on an already-finalized pill is a no-op.
 function request_tool_stop!(model::ChatModel, t::BashToolMsg)
-    (t.is_background && t.bg_running) || return nothing
+    in_taskbar(t) || return nothing   # in the bar ⇒ a live background bash
     wid = bg_worker_id(model.state, model)
     if wid !== nothing && !isempty(t.bg_output_path)
         try
@@ -5673,7 +5956,7 @@ function request_tool_stop!(model::ChatModel, t::BashToolMsg)
             @warn "kill_file_writers failed; finalizing pill anyway" tool_id = t.id exception = e
         end
     end
-    finalize_bg_task!(model, t)
+    finished!(t)   # finalize! (persist + emit done) + drop from the bar
     return nothing
 end
 
@@ -5682,10 +5965,8 @@ end
 # to finalize the pill — the user sees it stop, and the subagent's eventual
 # task-notification lands as its own turn.
 function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
-    (t.is_background && is_live(t)) || return nothing
-    t.task_running = false   # else is_live stays true and the pill keeps pulsing
-    close(t)
-    unpin_task!(model, t.id)
+    in_taskbar(t) || return nothing   # in the bar ⇒ a live background subagent
+    finished!(t)   # finalize! (close → feed trace) + drop from the bar
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => t.id,
         "status" => "completed", "summary" => "stopped"))
     return nothing
@@ -5698,8 +5979,7 @@ end
 # checkpoint then returns the InterruptException blocks and the TURN KEEPS
 # GOING — the agent sees the interrupt as a tool result and reacts to it,
 # unlike the chat-level cancel which kills the whole turn.
-function request_tool_stop!(model::ChatModel, t::MCPToolMsg)
-    t.tool_name in EVAL_STOPPABLE_TOOLS || return nothing
+function request_tool_stop!(model::ChatModel, t::JuliaEvalCall)
     is_live(t) || return nothing
     env_raw  = get(t.raw_input, "env_path", nothing)
     env_path = env_raw isa AbstractString && !isempty(env_raw) ? String(env_raw) : nothing
@@ -5730,8 +6010,12 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
     path = if !isempty(cmd.path)
         # Direct path-link click (diff header, search hit, agent-message
         # path). A trailing `:line` from grep-style hits is display sugar.
-        p = replace(String(cmd.path), r":\d+$" => "")
-        editor_openable(p) ? p : nothing
+        # Do NOT pre-filter on `editor_openable` here (#35): the user clicked a
+        # real link, so a binary / oversize / missing target must produce a
+        # TOAST via `open_project_file!`'s open-guard, not a silent no-op. The
+        # guard's `editor_openable` check runs first and toasts "not a text
+        # file" before any worker round-trip.
+        replace(String(cmd.path), r":\d+$" => "")
     else
         msg = lock(model.lock) do
             idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
@@ -5947,9 +6231,10 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     # so a tab that opens mid-prompt would otherwise miss the start.
     busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
 
-    # The pin-board (taskbar.jl): renders the Julia-owned item list; its ⊗
-    # routes through the same per-tool stop dispatch the old slots used.
-    taskbar = TaskBar(model.taskbar_items, model.taskbar_clock)
+    # The chat's single live-task board (taskbar.jl) — the shared source of
+    # truth. Its KeyedList bridges the shared `items` per session; its ⊗ routes
+    # through the same per-tool stop dispatch.
+    taskbar = shared(model).taskbar
     on(session, taskbar.stop_request) do id
         isempty(id) || handle_command!(model, session, StopToolCommand(id))
     end

@@ -87,6 +87,14 @@ mutable struct TaskCall <: ToolCall
     prompt::String
     run_in_background::Bool
     task_name::Union{String,Nothing}
+    # For an ASYNC (`run_in_background`) subagent, claude-agent-acp hands back an
+    # `outputFile` in the launch response's `_meta.claudeCode.toolResponse` (the
+    # subagent's transcript file on the worker). It's the ONLY deterministic
+    # completion signal for a detached subagent — the parent tool_call is marked
+    # `completed` at LAUNCH, never at real completion — so downstream polls this
+    # file (fd-close) exactly like a background bash's output file. "" until the
+    # async-launch update arrives.
+    output_file::String
 end
 
 mutable struct MCPCall <: ToolCall
@@ -203,8 +211,21 @@ for sdk_name in (:Task, :Agent)
             String(get(n.raw_input, "prompt", "")),
             get(n.raw_input, "run_in_background", false) === true,
             _opt_str(get(n.raw_input, "name", nothing)),
+            something(async_output_file(n.raw), ""),   # usually "" on the initial call
         )
     end
+end
+
+# The async subagent's transcript file, dug out of a tool_call(_update)'s
+# `_meta.claudeCode.toolResponse.outputFile` (present on the `async_launched`
+# result). `nothing` when absent (non-async tools, or before the launch ack).
+function async_output_file(raw)
+    raw isa AbstractDict || return nothing
+    meta = get(raw, "_meta", nothing); meta isa AbstractDict || return nothing
+    cc = get(meta, "claudeCode", nothing); cc isa AbstractDict || return nothing
+    tr = get(cc, "toolResponse", nothing); tr isa AbstractDict || return nothing
+    of = get(tr, "outputFile", nothing)
+    (of isa AbstractString && !isempty(of)) ? String(of) : nothing
 end
 
 # MCP tool names land here as `mcp__<server>__<tool>` (see the BonitoMCP
@@ -399,6 +420,15 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
     u.raw_input === nothing || merge_late_input!(tc, u.raw_input)
     u.tool_name === nothing || !(tc isa GenericTool) || (tc.name = u.tool_name)
     isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+    # Async subagent: the `async_launched` update carries the transcript
+    # `outputFile` in `_meta.claudeCode.toolResponse` — the only deterministic
+    # completion signal (the tool_call itself is `completed` at launch). Capture
+    # it onto the TaskCall so the snapshot below hands it downstream BEFORE the
+    # launch-ack `completed` closes the tool.
+    if tc isa TaskCall && isempty(tc.output_file)
+        of = async_output_file(u.raw)
+        of === nothing || (tc.output_file = of)
+    end
     push_snapshot!(tc.updates, tc)
     is_terminal(tc.status) && (close(tc); delete!(st.tools, tc.id))
     return nothing

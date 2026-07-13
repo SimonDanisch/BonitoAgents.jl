@@ -191,7 +191,7 @@ One of `:active`, `:online`, `:offline` — the sidebar LED state.
 """
 function chat_status(state::ServerState, p::ProjectInfo)
     w = get(state.workers[], p.worker_id, nothing)
-    (w === nothing || w.status !== :online) && return :offline
+    (w === nothing || !isopen(w)) && return :offline
     m = lock(state.lock) do; get(state.chat_models, p.id, nothing); end
     m === nothing && return :online
     return m.busy_active[] ? :active : :online
@@ -954,7 +954,7 @@ function project_loading_view(state::ServerState, pid::String,
                                         style = Styles("padding" => "40px"))
         w      = get(workers, p.worker_id, nothing)
         wname  = w === nothing ? p.worker_id : w.name
-        online = w !== nothing && w.status == :online
+        online = w !== nothing && isopen(w)
         if !online
             return DOM.div(
                 DOM.div("⚠"; class = "bt-loading-glyph"),

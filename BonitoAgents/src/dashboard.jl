@@ -463,9 +463,9 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         m
     end
     # close is idempotent + total now; a real error here is worth surfacing.
-    # `close(model)` (T4) closes `user_messages`, ending the `run_chat!` consumer
-    # AND the 1 Hz background poller — without it both leak forever, the running
-    # `poller_task` keeping the ChatModel referenced. Close the model BEFORE the
+    # `close(model)` (T4) closes `user_messages` (ending the `run_chat!` consumer)
+    # and the TaskBar's own 1 Hz poll loop — without it both leak forever, the
+    # running loops keeping the ChatModel referenced. Close the model BEFORE the
     # client so the consumer's `for … in user_messages` exits cleanly rather
     # than erroring on a torn-down client mid-turn.
     if model !== nothing
@@ -509,7 +509,7 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
     haskey(state.workers[], target_id) ||
         error("Unknown worker: $target_id")
     target_w = state.workers[][target_id]
-    target_w.status === :online ||
+    isopen(target_w) ||
         error("Worker '$(target_w.name)' is offline")
     target_id == p.worker_id && return p   # no-op
 
@@ -523,7 +523,7 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
     # this, any edits made on the source worker in an external editor
     # since the last "Sync to server" would be silently lost on the move.
     source_online = haskey(state.workers[], p.worker_id) &&
-                    state.workers[][p.worker_id].status === :online
+                    isopen(state.workers[][p.worker_id])
     if source_online
         source_name = state.workers[][p.worker_id].name
         notify_progress(progress, :phase,
@@ -618,7 +618,7 @@ function copy_to!(state::ServerState, p::ProjectInfo, target_worker_id::Abstract
     # 1. Pull source worker → server, so server has latest. Safe to skip
     # if source worker is offline — we still copy from whatever's on disk.
     if haskey(state.workers[], p.worker_id) &&
-       state.workers[][p.worker_id].status === :online
+       isopen(state.workers[][p.worker_id])
         notify_progress(progress, :phase,
             (msg = "Pulling latest from $(p.worker_id)…",))
         sync!(state, p; progress = progress)
@@ -2370,7 +2370,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # ── Stats strip ──────────────────────────────────────────────────────────
     # Stats touch both worker counts and project counts → listen to both.
     stats_strip = map(state.workers, state.projects) do workers, projects
-        online   = count(w -> w.status == :online, values(workers))
+        online   = count(isopen, values(workers))
         total    = length(workers)
         n_proj   = length(projects)
         n_active = count(p -> p.locked_by !== nothing, values(projects))

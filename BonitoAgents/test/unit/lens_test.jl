@@ -52,7 +52,7 @@ const BT = BonitoAgents
                               time(),time(),"","",nothing)
         U2 = BT.UserMsg("show me the lissajous plot")
         bash = BT.BashToolMsg("b1","execute","loop","completed","",time(),nothing,
-                              "sleep 9","Monitor",true,"/tmp/x",0,true,"",nothing)
+                              "sleep 9","Monitor",true,"/tmp/x",0,"",nothing)
         msgs = Any[U, A, app, U2, bash]
 
         vis, acts = BT.apply_lens(msgs, BT.parse_lens(
@@ -77,7 +77,7 @@ const BT = BonitoAgents
                               time(),time(),"","",nothing)
         U2 = BT.UserMsg("show me the lissajous plot")
         bash = BT.BashToolMsg("b1","execute","loop","completed","",time(),nothing,
-                              "sleep 9","Monitor",true,"/tmp/x",0,true,"",nothing)
+                              "sleep 9","Monitor",true,"/tmp/x",0,"",nothing)
         Th = BT.ThoughtMsg("t1","thinking about monitors")
         msgs = Any[U, A, app, U2, bash, Th]      # 0:U 1:A 2:app 3:U2 4:bash 5:Th
 

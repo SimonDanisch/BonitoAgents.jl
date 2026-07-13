@@ -25,6 +25,10 @@ write(joinpath(CWD, "second.jl"), "const SECOND = 42\n")
 # shared-FS short-circuit — the path a remote worker always takes.
 const OUTSIDE = mktempdir()
 write(joinpath(OUTSIDE, "remote.jl"), "const REMOTE_FETCHED = 99\n")
+# A binary file: the editor can't open it, so a direct path-link click must
+# TOAST ("not a text file") — never silently do nothing (the #35 bug).
+write(joinpath(CWD, "logo.png"),
+      UInt8[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, fill(0x00, 64)...])
 
 # The browser command a `.bt-path-link` click fires (same EditFileCommand path).
 open_file(path) = """(() => { document.querySelector('.bt-messages').__bt_chat.comm.notify(
@@ -111,6 +115,18 @@ function run_suite(server)
                 "(document.querySelector('$(panel_sel(abs)) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('REMOTE_FETCHED')"; timeout = 60) == true
             sleep(1.0)
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel(abs))').length") == 1
+        end
+
+        @testset "clicking a binary path link toasts, opens no panel" begin
+            # #35: a direct path-link click for a non-text file used to be a
+            # silent no-op (the handler pre-filtered on editor_openable and
+            # bailed before the open-guard). It must flash the refusal toast.
+            TK.eval_js(server, open_file("logo.png"))
+            @test TK.wait_for(server, "not-a-text-file toast for the binary",
+                "[...document.querySelectorAll('.bt-toast-text')].some(t => (t.textContent||'').includes('logo.png'))";
+                timeout = 15) == true
+            @test TK.eval_js(server,
+                "document.querySelectorAll('$(panel_sel("logo.png"))').length") == 0
         end
 
         @testset "a real .bt-path-link click opens the editor" begin

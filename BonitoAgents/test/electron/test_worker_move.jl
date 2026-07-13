@@ -122,7 +122,7 @@ function wait_for_worker(state, name; timeout = 5.0)
     deadline = time() + timeout
     while time() < deadline
         if haskey(state.workers[], name) &&
-           state.workers[][name].status === :online
+           state.workers[][name].online[]
             return state.workers[][name]
         end
         sleep(0.05)
@@ -295,12 +295,12 @@ try
         let deadline = time() + 5
             while time() < deadline
                 w = get(server_state.workers[], "worker-a", nothing)
-                w !== nothing && w.status === :offline && break
+                w !== nothing && !w.online[] && break
                 sleep(0.1)
             end
         end
         record("worker-a is offline",
-               @TH.test_eq server_state.workers[]["worker-a"].status :offline)
+               @TH.test_eq server_state.workers[]["worker-a"].online[] false)
 
         # Note: we don't try to chat / start the session here (would hit
         # `claim_project!` which needs a worker context). We only verify

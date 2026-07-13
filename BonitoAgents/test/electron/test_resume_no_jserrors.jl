@@ -47,7 +47,7 @@ end)
 deadline = time() + 15
 while time() < deadline
     haskey(state.workers[], "resume-test-worker-id") &&
-        state.workers[]["resume-test-worker-id"].status == :online && break
+        state.workers[]["resume-test-worker-id"].online[] && break
     sleep(0.2)
 end
 @assert haskey(state.workers[], "resume-test-worker-id") "worker never connected"

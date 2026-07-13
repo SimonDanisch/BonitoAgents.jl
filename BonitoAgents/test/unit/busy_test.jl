@@ -9,7 +9,7 @@
 # the taskbar, not in a held-open turn.
 #
 # These tests drive the real tool lifecycle functions (`process_update!`,
-# `finalize_bg_task!`) headlessly — no worker, no live agent, no Electron — plus
+# `finished!`) headlessly — no worker, no live agent, no Electron — plus
 # the `begin_turn!`/`drain_turn!` turn accounting, and assert:
 #   • busy is true while a turn is open, false once the turn ends,
 #   • the KEY change: busy STAYS true while a turn is held open even with a live
@@ -31,7 +31,7 @@ function headless_model()
 end
 
 # Feed a background BashCall through the real render+update path so the tool ends
-# up `bg_running` (a live background shell) exactly as the wire would produce it.
+# up IN THE TASKBAR (a live background shell) exactly as the wire would produce it.
 function launch_bg_bash!(model, id)
     ch = Channel{ACP.ToolCall}(2)
     bc = ACP.BashCall(id, "execute", "monitor loop", "in_progress",
@@ -72,7 +72,7 @@ end
         model = headless_model()
         # A live background shell exists...
         m = launch_bg_bash!(model, "bg1")
-        @test m.bg_running == true
+        @test BT.in_taskbar(m) == true       # in the bar ⇒ a live background shell
         @test BT.is_live(m) == true
 
         # ...and a turn is open (the agent is blocked on foreground work while the
@@ -83,7 +83,7 @@ end
         @test model.busy_active[] == true
 
         # The bg shell finishing does not touch busy; only the turn ending does.
-        BT.finalize_bg_task!(model, m)
+        BT.finished!(m)                      # bar's loop calls this when the fd closes
         @test model.busy_active[] == true    # turn still open ⇒ still busy
 
         # Turn ends → spinner clears, even though a taskbar task may linger.
@@ -100,7 +100,7 @@ end
         m = launch_bg_bash!(model, "bg2")
         @test model.turns_active[] == 0
         @test model.busy_active[] == false
-        @test m.bg_running == true
+        @test BT.in_taskbar(m) == true       # membership IS liveness
         @test BT.is_taskbar_item(m) == true
     end
 

@@ -7,7 +7,7 @@ using Bonito
 
 state = TH.make_state(; n_workers = 10, n_projects = 6)
 for (i, w) in enumerate(values(state.workers[]))
-    w.status = isodd(i) ? :online : :offline
+    w.online[] = isodd(i)
 end
 
 # Slow-streaming scripted response so test 4 can navigate home/back while

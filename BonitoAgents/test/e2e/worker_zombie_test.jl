@@ -29,7 +29,7 @@
             timeout = 90) == true
 
         wid = only(collect(keys(z.h.state.worker_control_ws)))
-        @test z.h.state.workers[][wid].status == :online
+        @test z.h.state.workers[][wid].online[] == true
 
         freeze!()
 
@@ -49,7 +49,7 @@
         @testset "heartbeat flips the zombie worker offline" begin
             # interval 0.5s + deadline 2.5s → the reaper must fire well within 10s.
             flipped = timedwait(10.0; pollint = 0.2) do
-                z.h.state.workers[][wid].status == :offline
+                z.h.state.workers[][wid].online[] == false
             end
             @test flipped == :ok
             # Teardown ran: the control socket registration is gone.
@@ -61,15 +61,15 @@
             # The worker finds its socket closed by the server and re-dials.
             back = timedwait(60.0; pollint = 0.5) do
                 haskey(z.h.state.worker_control_ws, wid) &&
-                    z.h.state.workers[][wid].status == :online
+                    z.h.state.workers[][wid].online[] == true
             end
             @test back == :ok
         end
 
         @testset "recovery leaves no stray agent process" begin
-            # The server abandoned every session of this worker at teardown
-            # (chat models evicted), so no agent may survive into the fresh
-            # registration. NOTE this is a weak invariant here: over healthy
+            # #28 keeps the chat model, but still tears down its DEAD ACP session
+            # (`stop!(m.agent)`), so no worker-side agent subprocess may survive
+            # into the fresh registration. NOTE this is a weak invariant here: over healthy
             # loopback the relay teardown already reaps (the server's session
             # close is deliverable), so this does NOT distinguish
             # `reap_all_sessions!` from the relay path — a real network wedge
@@ -80,26 +80,23 @@
             @test timedwait(() -> agent_count() == 0, 30.0; pollint = 0.5) == :ok
         end
 
-        @testset "the chat works again after recovery" begin
-            # The eviction tears down the OPEN pane; re-opening currently
-            # requires selecting the chat again (auto-rebind of open panes on
-            # worker reconnect is #28). After the click, a fresh turn must
-            # lazily re-open the session (new agent, same cwd) and stream a
-            # reply — recovery is only real if the user can keep chatting.
-            @test TK.wait_for(z, "evicted pane torn down",
-                "[...document.querySelectorAll('.bt-messages')].filter(e=>e.offsetParent).length === 0";
-                timeout = 15) == true
-            TK.eval_js(z, """(() => {
-                [...document.querySelectorAll('.bt-side-name')]
-                    .find(e => (e.innerText||'').trim() === 'hello')?.click();
-                return true;
-            })()""")
-            @test TK.wait_for(z, "chat pane rebound with history",
+        @testset "the chat stays live through the wedge and rebinds on the next message (#28)" begin
+            # #28: a worker disconnect DELIBERATELY KEEPS the chat model AND its
+            # open pane (it used to evict the model + tear the pane down — see
+            # worker_client.jl "chats kept for reconnect"). Through the wedge the
+            # pane renders offline; no chat vanishes from the sidebar. So there is
+            # nothing to re-open and NO re-click: the pane is still here, and the
+            # next message after the worker returns rebinds a fresh session in
+            # place and streams a reply. Recovery is only real if the user can
+            # keep chatting in the SAME pane.
+            @test TK.wait_for(z, "open pane kept live through the wedge (never evicted)",
                 "[...document.querySelectorAll('.bt-messages')].filter(e=>e.offsetParent).length === 1 && " *
                 "[...document.querySelectorAll('textarea')].some(e=>e.offsetParent)";
-                timeout = 60) == true
+                timeout = 15) == true
+            # No re-click — send straight into the kept pane; the reconnect
+            # rebinds on this message.
             TK.send_message(z, "back again")
-            @test TK.wait_for(z, "post-recovery reply",
+            @test TK.wait_for(z, "post-recovery reply (rebound in place)",
                 "[...document.querySelectorAll('.bt-agent-msg')].filter(e=>e.offsetParent).some(n => n.innerText.includes('echo: back again'))";
                 timeout = 90) == true
         end

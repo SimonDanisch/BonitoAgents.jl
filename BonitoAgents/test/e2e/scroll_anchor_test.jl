@@ -77,16 +77,61 @@
     })()"""
 
     @testset "height churn above the viewport must not move the view" begin
+        # Churn heights in the top spacer (below the rendered window) LARGER than
+        # their estimate — the same shape as a background prefetch re-measuring
+        # unrendered rows taller. When the map-based visibleRange() shifts off the
+        # DOM's real top-visible node the anchor gets EVICTED, and _restoreAnchor
+        # then used a cumHeight() virtual position that omitted the container
+        # padding + gap-after-spacer, landing ~a row short — so the follow-up
+        # refresh re-anchored the NEIGHBOUR and the view jumped ~1 row (stuck).
         scroll_frac!(0.55)
         before = TK.eval_js(s, TOP_PROBE)
         @test before !== nothing
         inflated = TK.eval_js(s, INFLATE)
         @test Int(inflated) > 3          # the churn genuinely hit rows above
-        sleep(0.5)
-        after = TK.eval_js(s, TOP_PROBE)
+        # Poll until the top marker STABILISES (the compensation is a synchronous
+        # bump plus a few async correction passes; all settle well under 1s even
+        # under load), then assert the view didn't move. No fixed-sleep gamble —
+        # and because the drift landed on a STABLE wrong row, waiting for
+        # stability still catches a regression.
+        prev = nothing; after = nothing
+        for _ in 1:40          # up to ~2s
+            sleep(0.05)
+            after = TK.eval_js(s, TOP_PROBE)
+            if prev !== nothing && after !== nothing &&
+               after["text"] == prev["text"] && abs(Int(after["off"]) - Int(prev["off"])) <= 1
+                break
+            end
+            prev = after
+        end
         @test after !== nothing
         @test after["text"] == before["text"]
         @test abs(Int(after["off"]) - Int(before["off"])) <= 3
+    end
+
+    @testset "evicted-anchor restore lands the node at its offset (#32)" begin
+        # Deterministic (no load/timing) guard for the coordinate bug: force the
+        # EVICT branch of _restoreAnchor and require the anchored node to end up
+        # exactly at the requested offset once the queued refresh re-materialises
+        # it. Pre-fix, the virtual restore used cumHeight() WITHOUT PAD_TOP +
+        # ITEM_GAP, so scrollTop landed ~a row short (node ~26px off) → the
+        # follow-up refresh re-anchored the neighbour (the stuck ~1-row jump).
+        idx = TK.eval_js(s, "(() => { const ch=$CH; " *
+            "const r=[...ch.rendered].sort((a,b)=>a-b); return r[Math.floor(r.length/2)]; })()")
+        @test idx !== nothing
+        TK.eval_js(s, """(() => {
+            const ch = $CH;
+            ch.rendered.delete($idx);          // simulate the re-window eviction
+            ch._restoreAnchor({idx: $idx, off: -20});
+            return true; })()""")
+        @test TK.wait_for(s, "evicted anchor restored to off=-20",
+            """(() => {
+                const ch = $CH;
+                const n = ch.cache.get($idx);
+                if (!n || !n.isConnected || !ch.rendered.has($idx)) return false;
+                return Math.abs((n.offsetTop - ch.container.scrollTop) - (-20)) <= 2;
+            })()"""; timeout = 3) == true
+        TK.eval_js(s, "(() => { ($CH).refresh(); })()")   # settle state for the next testset
     end
 
     @testset "a msgs.range reply from before a reload must not be cached" begin

@@ -230,10 +230,15 @@ function handle_worker_control(state::ServerState, ws)
 
         # Build / refresh the WorkerInfo from the hello frame. Preserve a
         # user-set `initials` override across reconnects (the worker doesn't
-        # know about it; it lives entirely on the server side).
-        prev_initials = let existing = get(state.workers[], worker_id, nothing)
-            existing === nothing ? nothing : existing.initials
+        # know about it; it lives entirely on the server side), and REUSE the
+        # existing `online` Observable so chats bound to it (the shared liveness
+        # signal) see this reconnect flip true — the WorkerInfo object is
+        # rebuilt each connect, but the observable's identity must survive.
+        prev_initials, online_obs = let existing = get(state.workers[], worker_id, nothing)
+            existing === nothing ? (nothing, Observable(true)) :
+                (existing.initials, existing.online)
         end
+        online_obs[] = true
         w = WorkerInfo(
             worker_id,
             display_name,
@@ -246,7 +251,7 @@ function handle_worker_control(state::ServerState, ws)
             String(get(hello, "mcp_path", "")),
             Vector{String}(get(hello, "mcp_args", String[])),
             String(get(hello, "projects_root", "")),
-            :online,
+            online_obs,
             now(UTC),
         )
         # All shared-state writes for this worker's registration go in one
@@ -423,46 +428,50 @@ identity check is the guard.
 """
 function teardown_worker_control!(state::ServerState, worker_id::AbstractString, ws)
     affected = String[]
-    evicted  = ChatModel[]
+    kept     = ChatModel[]
     is_current = lock(state.lock) do
         current = get(state.worker_control_ws, worker_id, nothing)
         current === ws || return false           # superseded — leave the live one alone
         delete!(state.worker_control_ws, worker_id)
-        if haskey(state.workers[], worker_id)
-            state.workers[][worker_id].status = :offline
-        end
         for p in values(state.projects[])
             if p.worker_id == worker_id
                 m = get(state.chat_models, p.id, nothing)
-                m === nothing || push!(evicted, m)
-                delete!(state.chat_models, p.id)
+                m === nothing || push!(kept, m)
                 push!(affected, p.id)
+                # #28: chat_models[p.id] is DELIBERATELY KEPT (it used to be
+                # evicted here). The model, its msgs_store and its pane stay
+                # live; only the dead agent session is torn down below. The
+                # worker's shared `online` observable drives the offline banner
+                # + send-gating, and a reconnect rebinds on the next message —
+                # no re-click, and no chat vanishes from the sidebar.
             end
         end
         return true
     end
     if is_current
-        # CLOSE the evicted chat models — dropping them from `chat_models` is NOT
-        # enough: each leaves a `run_chat!` consumer AND a 1 Hz background poller
-        # alive (a running `poller_task` keeps the model referenced), leaking on every
-        # worker disconnect. `close(model)` closes `user_messages`, ending both;
-        # `stop!(agent)` tears down the (already-dead) worker ACP session. Outside
-        # the lock — these signal tasks / do I/O.
-        for m in evicted
-            try; close(m); stop!(m.agent); catch e
-                @warn "evicting chat model on worker disconnect" exception=e
+        # Liveness + per-chat offline flips OUTSIDE the lock (observable writes /
+        # JS bridge). The worker's `online` observable is SHARED into every one
+        # of its ChatModels, so this single flip pauses their background pollers
+        # and (via `session_alive`) shows the banner + disables send everywhere.
+        haskey(state.workers[], worker_id) && (state.workers[][worker_id].online[] = false)
+        for m in kept
+            # Tear down the DEAD ACP session (frees the worker-side agent
+            # subprocess), but KEEP the model: begin_turn! rebinds a fresh
+            # session on the next message after reconnect.
+            try; stop!(m.agent); catch e
+                @warn "stopping agent on worker disconnect" project_id = m.project_id exception = e
             end
+            shared(m).session_alive[] = false
         end
         # The worker host is gone → its eval workers (and their bridges) are gone.
-        # Tear them down explicitly outside the lock (close asset host is I/O); a
-        # WS drop alone no longer does this — the bridge follows the worker session.
         for pid in affected
             teardown_eval_bridge!(state, pid)
         end
         safe_notify!(state.workers)
-        notify_chats!(state)    # evicted chats drop out of the active-chats sidebar
+        # NOT notify_chats!: the chats are kept, so the active-chats list is
+        # unchanged — they just render offline until the worker returns.
         release_projects_for_worker!(state, worker_id)
-        @info "Worker disconnected" worker_id=worker_id
+        @info "Worker disconnected (chats kept for reconnect)" worker_id=worker_id
     else
         @info "Worker control socket closed but superseded; keeping live registration" worker_id=worker_id
     end

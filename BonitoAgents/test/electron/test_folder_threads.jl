@@ -8,7 +8,7 @@
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
 state = TH.make_state(; n_workers = 1, n_projects = 1)
-state.workers[]["w-1"].status = :online
+state.workers[]["w-1"].online[] = true
 
 # A running chat so the active-chats sidebar has something to list.
 let proj = state.projects[]["p-1"]

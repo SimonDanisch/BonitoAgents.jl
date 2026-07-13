@@ -169,7 +169,8 @@ end
     # process, or a reconnect that re-registered before the old socket's
     # `finally` ran) must not destroy each other. The stale socket's teardown
     # must be a no-op; only the socket that is STILL the registered one tears
-    # down the worker + evicts its chat models.
+    # down the worker. Per #28 the chat model is KEPT for reconnect (only the
+    # dead agent session is torn down) — it must NOT be evicted.
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
                           working_dir = joinpath(dir, "work"),
@@ -198,14 +199,16 @@ end
     # registration → must be a no-op: live socket, worker, and chat model intact.
     @test BT.teardown_worker_control!(st, wid, ws_old) == false
     @test st.worker_control_ws[wid] === ws_new
-    @test st.workers[][wid].status == :online
+    @test st.workers[][wid].online[] == true
     @test haskey(st.chat_models, "pp")
 
-    # The NEW (current) socket dropping DOES tear down.
+    # The NEW (current) socket dropping DOES tear down: the worker goes offline
+    # and its registration is dropped, but the chat model is KEPT (#28) so the
+    # chat survives the disconnect and rebinds on the worker's next reconnect.
     @test BT.teardown_worker_control!(st, wid, ws_new) == true
     @test !haskey(st.worker_control_ws, wid)
-    @test st.workers[][wid].status == :offline
-    @test !haskey(st.chat_models, "pp")
+    @test st.workers[][wid].online[] == false
+    @test haskey(st.chat_models, "pp")            # #28: kept for reconnect, not evicted
 end
 
 end

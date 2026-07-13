@@ -850,6 +850,11 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-taskbar-todo-head",
         "display" => "flex", "align-items" => "center", "gap" => "6px",
         "font-weight" => "600"),
+    # The rows live in their own reactive wrapper (re-derived from the live
+    # message each clock tick), so the 4px inter-item spacing the outer slot's
+    # `gap` used to give the items when they were direct children now lives here.
+    CSS(".bt-taskbar-todo-rows",
+        "display" => "flex", "flex-direction" => "column", "gap" => "4px"),
     CSS(".bt-taskbar-todo-item",
         "font-size" => "11.5px",
         "color" => "var(--bt-text-muted)",
@@ -874,22 +879,15 @@ const ChatStyles = Bonito.Styles(
         "content" => "'✓ '",
         "color" => "var(--bt-success, #16a34a)"),
 
-    # Subagent Task pills: the current-activity one-liner between the label
-    # and the elapsed clock (taskbar.jl renders it from the Julia clock tick).
-    # `bt-task-stale` = no subagent event for the staleness window — the line
-    # turns amber and the :has() rule tints the whole pill.
+    # Subagent Task pills: the current-activity one-liner between the label and
+    # the elapsed clock (taskbar.jl re-renders it via the KeyedList key as new
+    # feed frames land) — a fact off the wire, no staleness tint.
     CSS(".bt-taskbar-activity",
         "flex" => "0 1 auto", "min-width" => "0",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "font-size" => "10.5px",
         "color" => "var(--bt-text-faint)"),
     CSS(".bt-taskbar-activity:empty", "display" => "none"),
-    CSS(".bt-taskbar-activity.bt-task-stale",
-        "color" => "var(--bt-warning)",
-        "font-weight" => "600"),
-    CSS(".bt-taskbar-slot:has(.bt-task-stale)",
-        "border-color" => "rgba(245,158,11,0.6)",
-        "background" => "rgba(245,158,11,0.08)"),
 
     # Mini stop button — the composer stop button's little sibling, shared
     # by taskbar slots and live tool pills: bordered circle, red rounded
@@ -1026,6 +1024,22 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-eval-preview-toggle:hover",
         "background" => "rgba(255,255,255,0.18)"),
+
+    # The command a Bash tool ran — ALWAYS visible (unlike the eval preview there
+    # is no Monaco "Code" section afterwards to fall back on), same dark code look,
+    # scrolls for long scripts. "What ran" must never be hidden behind a tooltip.
+    CSS(".bt-cmd-preview",
+        "border-top" => "1px solid var(--bt-border)",
+        "background" => "#0f172a",
+        "max-height" => "180px",
+        "overflow-y" => "auto"),
+    CSS(".bt-cmd-preview pre",
+        "margin" => "0",
+        "padding" => "8px 12px",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "1.5",
+        "color" => "#e2e8f0",
+        "white-space" => "pre-wrap", "word-break" => "break-word"),
 
     # Subagent activity feed inside a Task tool bubble: a second collapsible
     # section between the header and the lazy body (bonitoagents.js builds it

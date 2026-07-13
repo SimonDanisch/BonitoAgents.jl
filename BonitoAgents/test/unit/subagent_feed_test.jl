@@ -27,7 +27,7 @@ end
 
 task_call(id) = ACP.TaskCall(id, "other", "Investigate", "in_progress",
     ACP.ToolContent[], Channel{ACP.ToolCall}(4),
-    "Investigate the thing", "go do it", true, nothing)
+    "Investigate the thing", "go do it", true, nothing, "")
 
 act_text(pid, s)              = ACP.SubagentActivity(pid, :text, "", s, "")
 act_tool(pid, tid, tl, st)    = ACP.SubagentActivity(pid, :tool, tid, tl, st)
@@ -116,33 +116,71 @@ end
     @test !occursin("steps, finished", m2.summary)
 end
 
-@testset "taskbar_activity: current line + staleness on the clock tick" begin
+@testset "taskbar_activity: the feed's current one-liner (a fact, no staleness)" begin
     model = headless_model()
     m = BT.send!(model, BT.to_message(model, task_call("task-4")))
 
-    # Fresh task, no activity yet: live, not stale, empty line.
-    st = BT.taskbar_activity(m, time())
-    @test st !== nothing && !st.stale && st.label == ""
+    # Fresh task, no activity yet: nothing to show.
+    @test BT.taskbar_activity(m, time()) === nothing
 
     BT.route_subagent_activity!(model, act_text("task-4", "compiling shaders"))
-    st = BT.taskbar_activity(m, time())
-    @test !st.stale
-    @test st.label == "compiling shaders"
+    @test BT.taskbar_activity(m, time()) == "compiling shaders"
 
-    # Backdate the feed (the way the e2e test does) → next tick flips stale.
+    # A quiet feed does NOT flip anything — no staleness guess, no timeout. The
+    # line stays the latest fact off the wire (backdating changes nothing).
     m.last_activity_at = time() - 200.0
-    st = BT.taskbar_activity(m, time())
-    @test st.stale
-    @test st.label == "no activity 3m"
+    @test BT.taskbar_activity(m, time()) == "compiling shaders"
 
-    # Finished task: no activity affordance at all. A background subagent
-    # finishes via an explicit terminal UPDATE, which clears `task_running`
-    # (update_from_snap!(::TaskToolMsg)) — mirror that here; without it the
-    # bg liveness keeps the slot alive BY DESIGN (launch-ack ≠ finished).
+    # Finished task: no activity affordance at all. This `m` was never pushed
+    # into the bar (foreground path), so `close(m)` (terminal status +
+    # finished_at) makes `is_live` false and the affordance disappears. A
+    # background subagent instead leaves via `finished!` (fd-close / ⊗ stop);
+    # membership IS liveness, there is no `task_running` flag to clear.
     m.status = "completed"
-    m.task_running = false
     close(m)
     @test BT.taskbar_activity(m, time()) === nothing
+end
+
+@testset "activity arriving BEFORE its parent Task is held, then replayed" begin
+    # The foreground-subagent race: claude tags the subagent's chunks with
+    # `parentToolUseId` and streams them the instant the Task launches, but the
+    # parent Task tool_call is still queued in the async message consumer, so
+    # NO parent TaskToolMsg exists in msgs_store yet. Subagent activity is
+    # delivered out of band (the consumer parks draining the parent Task's own
+    # update channel for the whole run), so it can precede the parent's commit.
+    # Dropping here lost the whole feed — the "subagents don't show up" bug.
+    model = headless_model()
+    wire = Dict{String,Any}[]
+    on(d -> d["type"] == "task_activity" && push!(wire, copy(d)), model.comm)
+
+    BT.route_subagent_activity!(model, act_text("task-race", "scanning "))
+    BT.route_subagent_activity!(model, act_text("task-race", "the repo"))
+    BT.route_subagent_activity!(model,
+        act_tool("task-race", "s1", "Grep parse_update", "in_progress"))
+    # Held, not dropped: nothing interleaved into the transcript, no wire event
+    # yet (there is nothing to attach to).
+    @test all(msg -> !(msg isa BT.AgentMsg), model.msgs_store)
+    @test isempty(wire)
+
+    # The parent Task tool_call finally drains through the consumer.
+    m = BT.send!(model, BT.to_message(model, task_call("task-race")))
+    @test m isa BT.TaskToolMsg
+
+    # The held activity replays into the feed IN ORDER: the two prose chunks
+    # coalesce into one text entry, the sub-tool keeps its own entry. One wire
+    # event per replayed activity (matching the live path).
+    @test length(m.activity) == 2
+    @test m.activity[1].kind === :text
+    @test m.activity[1].label == "scanning the repo"
+    @test m.activity[2].kind === :tool
+    @test m.activity[2].label == "Grep parse_update"
+    @test length(wire) == 3
+
+    # A parent id that NEVER lands is still harmless: held, never emitted,
+    # never interleaved.
+    BT.route_subagent_activity!(model, act_text("ghost", "INTRUDER"))
+    @test length(wire) == 3
+    @test all(msg -> !(msg isa BT.AgentMsg), model.msgs_store)
 end
 
 end

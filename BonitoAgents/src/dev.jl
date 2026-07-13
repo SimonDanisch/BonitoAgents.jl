@@ -262,8 +262,14 @@ function Base.close(h::DevHandle)
     return h
 end
 
-# Block until Ctrl+C. Useful from scripts and bin wrappers; from the
-# REPL just keep the handle and run other code in parallel.
+"""
+    wait!(handle)
+
+Block until `Ctrl+C`, then return so the caller's cleanup runs. Useful from
+scripts and `bin` wrappers that start a [`dev_server`](@ref) and should stay up
+until interrupted; from the REPL just keep the handle and run other code in
+parallel instead.
+"""
 function wait!(h::DevHandle)
     try
         # Long sleep on the main task; Ctrl+C delivers InterruptException

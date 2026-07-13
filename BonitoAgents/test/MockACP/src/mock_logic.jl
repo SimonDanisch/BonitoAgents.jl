@@ -199,7 +199,7 @@ function handle_prompt(prompt_id, scenario::AbstractString)
         # stays open, then a `tool_call_update` ships the "completed"
         # status WITH the "Running in background, output written to: …"
         # content snap — that's what the chat-side update loop iterates
-        # to flip `bg_running=true`. (One frame with status=completed
+        # to push the bash into the taskbar. (One frame with status=completed
         # closes the channel synchronously with no snap delivered, so the
         # detection loop never runs.) Then hang without finishing the
         # prompt — restart must leave the bg bubble intact (worker owns

@@ -229,6 +229,13 @@ class BonitoChat {
         // "bounces" away while scrolling down. Read it from the computed
         // style so a CSS change can't silently re-introduce the drift.
         this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
+        // A rendered node's real offsetTop = cumHeight(0, idx) + PAD_TOP + one
+        // ITEM_GAP: the container's top padding, plus the flex row-gap between the
+        // (always-present) top spacer and the first node — every OTHER gap is
+        // already folded into effHeight, and they telescope so this constant is
+        // window-position-independent. `_restoreAnchor`'s virtual fallback needs
+        // it to convert a cumHeight() position into a real scrollTop.
+        this.PAD_TOP = parseFloat(getComputedStyle(container).paddingTop) || 0;
 
         // ── Scroll UX state ────────────────────────────────────────────
         // followMode: when true, new messages auto-scroll the viewport
@@ -1327,11 +1334,18 @@ class BonitoChat {
         if (n && n.isConnected) {
             want = n.offsetTop - a.off;
         } else {
-            // The re-window EVICTED the anchor: a large estimate shift remaps
-            // scrollTop to different indices and the anchor can fall outside
-            // the newly computed range. Restore to its VIRTUAL position and
-            // queue a refresh so the window re-materializes around it.
-            want = this.cumHeight(0, a.idx) - a.off;
+            // The re-window EVICTED the anchor: a large estimate shift (e.g. a
+            // background prefetch re-measuring unrendered rows ABOVE the viewport
+            // taller) remaps scrollTop to different indices and the anchor falls
+            // outside the newly computed range. Restore to its VIRTUAL position
+            // and queue a refresh so the window re-materialises around it.
+            //
+            // cumHeight() lives in a padding-less coordinate; a rendered node's
+            // real offsetTop is cumHeight(0, idx) + PAD_TOP + one ITEM_GAP (see
+            // the constructor). Omitting that constant left `want` ~a row short,
+            // so the queued refresh's _captureAnchor picked the NEIGHBOURING row
+            // and the view jumped ~1 row — a stuck drift on above-viewport churn.
+            want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
             this._queueRefresh();
         }
         if (Math.abs(this.container.scrollTop - want) > 1) {
@@ -1969,11 +1983,25 @@ class BonitoChat {
             const t = node.querySelector('.bt-tool-title');
             if (t) t.textContent = msg.title;
         }
-        // Bash: the raw command rides as a header tooltip once known (the
-        // visible title is claude's human-readable description).
+        // Bash: the command that ran must be VISIBLE (the visible title is
+        // claude's human-readable description; the raw command used to hide in a
+        // header tooltip). Render a persistent preview block under the header —
+        // the command streams in on a later update for real agents, so create it
+        // on demand if createNode didn't have it yet. Keep the tooltip too.
         if (msg.command) {
             const h = node.querySelector('.bt-tool-header');
             if (h) h.title = msg.command;
+            let cp = node.querySelector('.bt-cmd-preview');
+            if (cp) {
+                cp.querySelector('pre').textContent = msg.command;
+            } else if (h) {
+                cp = document.createElement('div');
+                cp.className = 'bt-cmd-preview';
+                const pre = document.createElement('pre');
+                pre.textContent = msg.command;
+                cp.appendChild(pre);
+                h.insertAdjacentElement('afterend', cp);
+            }
         }
         if (msg.summary != null) {
             const s = node.querySelector('.bt-tool-summary');
@@ -2494,6 +2522,12 @@ class BonitoChat {
                 <button class="bt-eval-preview-toggle" type="button"
                         title="Enlarge">⌄</button>
             </div>` : '';
+        // "What ran", ALWAYS visible (persists past completion — there's no Monaco
+        // "Code" section afterwards) and never hidden in a tooltip: the bash command,
+        // OR a control MCP tool's action (interrupt/restart/list its target session).
+        // A tool ships either `code` (eval preview above) or `command` (this).
+        const cmdPreview = msg.command ? `
+            <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
         // Elapsed timer — empty until the pill finishes, then filled ONCE
         // with the final duration by `_writeToolElapsed` (on creation of an
         // already-finished pill, and on the completion update). Live elapsed
@@ -2521,7 +2555,7 @@ class BonitoChat {
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}
+            ${evalPreview}${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
 

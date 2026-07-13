@@ -117,7 +117,7 @@ stop_xsync_worker!(mw::XSyncWorker) = (try mw.ws !== nothing && close(mw.ws) cat
 function wait_xsync_worker(state, name; timeout = 5.0)
     deadline = time() + timeout
     while time() < deadline
-        haskey(state.workers[], name) && state.workers[][name].status === :online && return
+        haskey(state.workers[], name) && state.workers[][name].online[] && return
         sleep(0.05)
     end
     error("worker '$name' never came online")

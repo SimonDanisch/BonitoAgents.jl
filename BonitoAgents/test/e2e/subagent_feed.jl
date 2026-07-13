@@ -11,12 +11,11 @@
 #   * A sub-tool's status update rewrites its feed entry in place.
 #   * The pinned taskbar pill shows the CURRENT activity one-liner next to
 #     the elapsed clock.
-#   * Staleness: once `last_activity_at` is old (backdated server-side, like
-#     cancel_escalation backdates `cancel_at` — no real 2-minute wait), the
-#     next 1 Hz clock tick flips the pill's activity line to the amber
-#     `bt-task-stale` "no activity Xm" state.
-#   * Turn end finalizes the Task pill with the persisted one-line feed
-#     trace ("N steps, finished HH:MM") — and no JS errors anywhere.
+#   * Deterministic completion: a background subagent's `completed` tool_update
+#     is the launch-ack lie (no `outputFile` ⇒ no wire done-signal), so the pill
+#     STAYS pinned through it — no timeout, no staleness guess — and leaves only
+#     on ⊗ stop (fd-close finalization is covered by e2e:subagent_poll). No JS
+#     errors anywhere.
 #
 using Test
 isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
@@ -24,9 +23,9 @@ using .TestKit
 const TK = TestKit
 
 # The scripted turn. The long tail `delay` holds the Task live so the feed /
-# taskbar / staleness assertions run against a pinned, in-flight pill; the
-# closing tool_update + text give the finalize assertions a terminal
-# transition. (`delay` never shortcuts, so the turn ends after ~27 s.)
+# taskbar assertions run against a pinned, in-flight pill; the closing
+# tool_update reports `completed` (the launch-ack lie, which must NOT finalize
+# the pill). (`delay` never shortcuts, so the turn ends after ~27 s.)
 agent_script(_prompt) = [
     TK.text("Delegating to a subagent."),
     TK.tool(kind = "other", title = "Investigate the code", tool_name = "Task",
@@ -109,36 +108,42 @@ function run_suite(server)
                 "(document.querySelector('.bt-taskbar-slot .bt-taskbar-activity')?.textContent || '').includes('Grep parse_update')"; timeout = 10) == true
         end
 
-        @testset "staleness flips the pill on the next clock tick" begin
+        @testset "live subagent: pill AND bubble both say running — NOT completed-in-chat while pinned" begin
+            # task-A's closing tool_update reports `completed`, but for a background
+            # subagent that's the launch-ack LIE, not a done-signal. The pill stays
+            # pinned (no outputFile ⇒ no end_turn to read ⇒ stays until ⊗ stop). The
+            # CONSISTENCY that matters: while the pill is pinned/running the chat
+            # bubble must NOT show `completed` either — a task shown running in the
+            # taskbar but completed in the chat at the same time was the bug.
             state = server.h.state
             model = nothing
             @test poll_until(timeout = 10) do
                 model = get(state.chat_models, pid, nothing)
                 model !== nothing
             end
+            # Wait for the mock's closing "All done." text — that lands AFTER the
+            # `tool_update completed`, so once it shows we KNOW the client processed
+            # the launch-ack `completed`.
+            @test TK.wait_for(server, "turn's closing text",
+                "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('All done'))"; timeout = 40) == true
             task = lock(model.lock) do
                 idx = findfirst(m -> m isa BA.TaskToolMsg && m.id == "task-A",
                                 model.msgs_store)
                 idx === nothing ? nothing : model.msgs_store[idx]
             end
             @test task isa BA.TaskToolMsg
-            # Backdate the feed server-side (mirrors cancel_escalation's
-            # cancel_at backdating) — the pill must go amber on the next tick.
-            lock(() -> (task.last_activity_at = time() - 200.0), model.lock)
-            @test TK.wait_for(server, "stale class on the pill",
-                "document.querySelector('.bt-taskbar-slot .bt-task-stale') !== null"; timeout = 10) == true
+            @test BA.in_taskbar(task)                                  # completed ≠ done
+            # The pill is pinned AND the bubble is NOT `completed` — they agree.
+            @test TK.wait_for(server, "pill still pinned",
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-A\"]') !== null"; timeout = 5) == true
             @test TK.eval_js(server,
-                "document.querySelector('.bt-taskbar-slot .bt-task-stale').textContent") == "no activity 3m"
-        end
-
-        @testset "turn end finalizes the pill with the feed trace" begin
-            @test TK.wait_for(server, "task pill completed",
-                "document.querySelector('.bt-tool-msg .bt-tool-status')?.textContent === 'completed'"; timeout = 40) == true
-            @test TK.wait_for(server, "persisted one-line feed summary",
-                "/\\d+ steps, finished \\d\\d:\\d\\d/.test(document.querySelector('.bt-tool-msg .bt-tool-summary')?.textContent || '')"; timeout = 10) == true
-            # The pill unpins with the tool; the feed section stays in the bubble.
-            @test TK.wait_for(server, "pin dropped",
-                "document.querySelector('.bt-taskbar-slot[data-task-id]') === null"; timeout = 10) == true
+                "document.querySelector('.bt-tool-msg .bt-tool-status')?.textContent") != "completed"
+            # ⊗ stop → the only exit here (no outputFile): the pill unpins and the
+            # feed section stays in the bubble.
+            BA.request_tool_stop!(model, task)
+            @test !BA.in_taskbar(task)
+            @test TK.wait_for(server, "pin dropped after ⊗ stop",
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-A\"]') === null"; timeout = 10) == true
             @test TK.eval_js(server,
                 "document.querySelectorAll('.bt-task-feed-entry').length") == 2
         end
@@ -147,12 +152,12 @@ function run_suite(server)
             # A run_in_background Task's tool_call completes at LAUNCH (the
             # ack) — the old behavior unpinned it there, leaving zero GUI
             # feedback of the running subagent. It must now survive its own
-            # close AND the turn end (`task_running`, the bg_running twin),
+            # close AND the turn end (membership IS liveness — it's in the bar),
             # until the user stops it.
             # The real launch-ack wire shape: ONE tool_call frame reporting
-            # "completed" and NO closing tool_update (`complete = false`) —
-            # a later terminal update is the explicit finish signal and WOULD
-            # clear task_running (update_from_snap!), which is its own path.
+            # "completed" and NO closing tool_update (`complete = false`). With
+            # no outputFile there is no deterministic done-signal, so the bar's
+            # loop leaves it pinned (`isdone(::TaskToolMsg)` is false).
             server.agent_fn[] = p -> Any[
                 TK.tool(kind = "other", title = "Background investigation",
                         tool_name = "Task", id = "task-BG",
@@ -177,15 +182,15 @@ function run_suite(server)
                 i === nothing ? nothing : BA.shared(model).msgs_store[i]
             end
             @test t !== nothing
-            @test t.task_running
+            @test BA.in_taskbar(t)
             @test BA.is_live(t)
-            @test any(x -> x.id == "task-BG", BA.shared(model).taskbar_items[])
+            @test any(x -> x.id == "task-BG", BA.shared(model).taskbar.items[])
             # The pill also survives in the DOM past turn end.
             @test TK.wait_for(server, "bg task pill pinned after turn end",
                 "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') !== null"; timeout = 10) == true
             # ⊗ stop: liveness clears, slot unpins.
             BA.request_tool_stop!(model, t)
-            @test !t.task_running
+            @test !BA.in_taskbar(t)
             @test !BA.is_live(t)
             @test TK.wait_for(server, "bg task pill unpinned after stop",
                 "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') === null"; timeout = 10) == true
@@ -226,7 +231,7 @@ function run_suite(server)
                              BA.shared(model).msgs_store)
                 i === nothing ? nothing : BA.shared(model).msgs_store[i]
             end
-            @test t !== nothing && t.task_running   # pinned at turn end
+            @test t !== nothing && BA.in_taskbar(t)   # pinned at turn end = in the bar
             # (1) The post-turn SUB activity lands in the feed (after end_turn!).
             t0 = time()
             while time() - t0 < 15
@@ -238,24 +243,25 @@ function run_suite(server)
             @test TK.wait_for(server, "auto-wake message rendered",
                 "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('DONE_MARKER_42'))";
                 timeout = 15) == true
-            # (3) Single running bg task → the announcement finalizes the pill.
-            t0 = time()
-            while t.task_running && time() - t0 < 10
-                sleep(0.2)
-            end
-            @test !t.task_running
-            @test TK.wait_for(server, "bg pill unpinned by auto-wake",
-                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG2\"]') === null"; timeout = 10) == true
-            # (4) The next prompt closes the between-turn bubble (persisted, final).
+            # (3) The auto-wake does NOT guess the pill's completion (the old
+            # "exactly one running → done" heuristic is gone). This mock task has
+            # no transcript `outputFile`, so the poller has no done-signal — the
+            # pill stays live/pinned. Deterministic finalization off a real file
+            # is covered by e2e:subagent_poll.
+            sleep(2)
+            @test BA.in_taskbar(t) == true
+            @test TK.eval_js(server,
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG2\"]') !== null") == true
+            # (4) The next prompt tears the between-turn sink down (persisted, final).
             server.agent_fn[] = p -> Any[TK.text("ack"), TK.end_turn()]
             TK.send_message(server, "thanks")
             @test TK.wait_for(server, "follow-up turn done",
                 "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('ack'))";
                 timeout = 20) == true
-            orphan = lock(BA.shared(model).lock) do
-                BA.shared(model).orphan_agent_msg[]
+            bt = lock(BA.shared(model).lock) do
+                BA.shared(model).between_turn[]
             end
-            @test orphan === nothing   # closed at begin_turn!
+            @test bt === nothing   # torn down at begin_turn!
         end
 
         @testset "no JS errors" begin
