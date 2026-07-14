@@ -254,6 +254,14 @@ mutable struct ServerState
     # binding past the cap closes the oldest idle session (reaps its agent; lazy
     # ACP re-binds it from disk history on the next turn). Bounds agent processes.
     bound_lru          :: Vector{String}
+    # Server-wide default session config (model/mode/effort) set from the home
+    # "Defaults" control; overlaid UNDER each project's `desired_config` (per-chat
+    # picks win). Persisted to settings.json. Observable so open home views react.
+    default_session_config :: Observable{Dict{String,String}}
+    # The last non-empty `ConfigOption`s any of this server's sessions reported,
+    # so the home Defaults selects have real (agent-reported) choice lists even
+    # before a chat is open. Empty until the first session reports.
+    last_config_options :: Observable{Vector{Any}}
 end
 
 """
@@ -286,10 +294,13 @@ function ServerState(; state_dir::String,
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
         String[],                                 # bound_lru
+        Observable(Dict{String,String}()),        # default_session_config (load_settings! below)
+        Observable(Any[]),                        # last_config_options
     )
     load_workers!(s)
     load_projects!(s)
     load_discovered!(s)
+    load_settings!(s)
     return s
 end
 
@@ -322,6 +333,12 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.session_inflight,
             s.show_fetch_inflight,
             s.bound_lru,               # shared registry — one per server
+            # SHARED (not bridged): the home writes these and
+            # `effective_session_config` reads them off the parent at bring-up, so
+            # all sessions must see the SAME observable. Rendered session-scoped
+            # via `map(session, …)`, which tears its callback down on tab close.
+            s.default_session_config,
+            s.last_config_options,
         )
     end
 end
@@ -330,6 +347,34 @@ workers_file(s::ServerState)    = joinpath(s.state_dir, "workers.json")
 projects_file(s::ServerState)   = joinpath(s.state_dir, "projects.json")
 discovered_file(s::ServerState) = joinpath(s.state_dir, "discovered.json")
 agents_md_file(s::ServerState)  = joinpath(s.state_dir, "AGENTS.md")
+settings_file(s::ServerState)   = joinpath(s.state_dir, "settings.json")
+
+# Persist the server-wide defaults (the home "Defaults" control). Snapshot under
+# the lock, atomic write — same shape as `save_projects!`.
+function save_settings!(s::ServerState)
+    data = lock(s.lock) do
+        Dict{String,Any}("default_session_config" => copy(s.default_session_config[]))
+    end
+    atomic_write_json(settings_file(s), data)
+    return nothing
+end
+
+# Load settings.json into `default_session_config` on construct. Tolerant: a
+# missing/corrupt file just leaves the defaults empty (fall back to the hardcoded
+# DEFAULT_* — see `effective_session_config`). Never throws.
+function load_settings!(s::ServerState)
+    d = load_json_tolerant(settings_file(s), "settings.json")
+    d isa AbstractDict || return nothing
+    dc = get(d, "default_session_config", nothing)
+    if dc isa AbstractDict
+        cfg = Dict{String,String}()
+        for (k, v) in dc
+            v isa AbstractString && !isempty(v) && (cfg[String(k)] = String(v))
+        end
+        s.default_session_config[] = cfg
+    end
+    return nothing
+end
 
 """
     global_agents_md(state) -> String

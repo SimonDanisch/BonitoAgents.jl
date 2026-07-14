@@ -427,6 +427,28 @@ const ChatStyles = Bonito.Styles(
         "padding" => "0",
         "margin" => "0",
         "cursor" => "pointer"),
+    # Muted category prefix ("model:" / "permissions:" / "effort:") on each pill.
+    CSS(".bt-header-meta-cat",
+        "color" => "var(--bt-text-muted)",
+        "user-select" => "none"),
+
+    # ── Home "Defaults" control ───────────────────────────────────────────────
+    # A labelled row of the same config pills, wired to the server-wide defaults.
+    # Lives in the home "Defaults" section; the pills reuse `.bt-header-meta*`.
+    CSS(".bt-defaults",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "flex-wrap" => "wrap"),
+    CSS(".bt-defaults-label",
+        "font-size" => "13px", "color" => "var(--bt-text-muted)",
+        "user-select" => "none"),
+    # The pill row: same flex chrome as the header meta strip, but allowed to wrap
+    # (the home has room, unlike the single-line chat header).
+    CSS(".bt-defaults-bar",
+        "flex-wrap" => "wrap"),
+    # One-line explainer under the "Defaults" heading.
+    CSS(".bt-defaults-hint",
+        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "margin" => "0 0 8px 0"),
 
     # ── Status dot (online/offline/streaming) ────────────────────────────────
     # Shared liveness dot (chat header, dashboard). Same status palette as the

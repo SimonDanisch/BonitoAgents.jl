@@ -205,24 +205,27 @@ current_choice(o::ConfigOption)::Union{ConfigOptionChoice,Nothing} =
      i === nothing ? nothing : o.choices[i])
 
 """
-    pill_label(o::ConfigOption) -> String
+    choice_label(o, c) -> String
 
-Short display label for the option's current value. For the MODEL option,
-"default" is an ALIAS in claude-agent-acp — the substance lives in the
-resolved choice's description ("Opus 4.7 with 1M context · Most capable for
-complex work"), so we surface its first segment instead of the word
-"Default". Everything else (mode, effort, …) shows its plain choice name —
-their descriptions are explanations, not values.
+Display label for ONE choice. For the MODEL option, "default" is an ALIAS in
+claude-agent-acp — the real model lives in the resolved choice's description
+("Opus 4.8 with 1M context · Best for everyday, complex tasks"), so we surface
+its first segment instead of the word "Default". "(recommended)" is redundant
+noise once the real model shows, so strip it. Every other option (mode, effort,
+explicit models) shows its plain choice name — their descriptions are
+explanations, not values. Cross-agent: reads only standard ACP choice fields.
 """
-function pill_label(o::ConfigOption)::String
-    c = current_choice(o)
-    c === nothing && return o.current_value
-    if c.value == "default" && o.category == "model" &&
+function choice_label(o::ConfigOption, c::ConfigOptionChoice)::String
+    if o.category == "model" && c.value == "default" &&
        c.description !== nothing && !isempty(strip(c.description))
         return String(strip(first(split(c.description, '·'))))
     end
-    return c.name
+    return String(strip(replace(c.name, r"\s*\(recommended\)\s*$"i => "")))
 end
+
+# Short display label for the option's CURRENT value (see `choice_label`).
+pill_label(o::ConfigOption)::String =
+    (c = current_choice(o); c === nothing ? o.current_value : choice_label(o, c))
 
 # ── Parsing helpers ───────────────────────────────────────────────────────────
 

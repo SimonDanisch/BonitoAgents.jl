@@ -2610,7 +2610,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             new_proj_btn,
             gh_btn;
             class = "bt-section"),
-        form_block;
+        form_block,
+
+        DOM.div(
+            DOM.h2("Defaults"),
+            DOM.div("Applied to new & unconfigured chats; a chat's own picks override.";
+                    class = "bt-defaults-hint"),
+            session_defaults_bar(session, state);
+            class = "bt-section");
 
         class = "bt-dash")
 end
