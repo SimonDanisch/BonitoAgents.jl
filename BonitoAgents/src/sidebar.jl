@@ -191,7 +191,7 @@ One of `:active`, `:online`, `:offline` — the sidebar LED state.
 """
 function chat_status(state::ServerState, p::ProjectInfo)
     w = get(state.workers[], p.worker_id, nothing)
-    (w === nothing || w.status !== :online) && return :offline
+    (w === nothing || !isopen(w)) && return :offline
     m = lock(state.lock) do; get(state.chat_models, p.id, nothing); end
     m === nothing && return :online
     return m.busy_active[] ? :active : :online
@@ -529,9 +529,10 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-sidebar.bt-collapsed .bt-side-empty", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-header", "justify-content" => "center", "padding" => "0 0 6px"),
     CSS(".bt-side-item",
-        # `align-items: flex-start` keeps the icon at the top of two-line
-        # titles instead of jumping down to vertical-center the row.
-        "display" => "flex", "align-items" => "flex-start", "gap" => "8px",
+        # Vertically center the label against the icon — reads as a normal
+        # inline `[icon] text` row. For a two-line title the icon centers to
+        # the text block, which is what you want too.
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "6px 10px",
         "cursor" => "pointer",
         "border-left" => "3px solid transparent",
@@ -620,16 +621,32 @@ const SidebarStyles = Bonito.Styles(
         "overflow-wrap" => "anywhere",
         "text-overflow" => "ellipsis"),
     # Close (✕) on an active-chat row: reveal on row hover, red on its own hover.
+    # Pinned to the row's TOP-RIGHT corner — the two hover affordances split the
+    # right edge: ✕ top-right, "▾ files" (.bt-side-tree-hint) bottom-right, so
+    # they never compete for the same spot. Anchored to .bt-side-item's own
+    # `position: relative`, which works both with and without the chat-row
+    # wrapper. Same legibility backdrop trick as the files hint (the glyph can
+    # overlay a long two-line title). `pointer-events: none` while hidden — an
+    # INVISIBLE close target that tears a chat down on a stray corner click
+    # would be a trap.
     CSS(".bt-side-close",
-        "margin-left" => "auto", "flex-shrink" => "0",
+        "position" => "absolute", "top" => "3px", "right" => "6px",
         "color" => "var(--bt-text-faint)",
         "font-size" => "12px", "line-height" => "1",
         "padding" => "2px 4px", "border-radius" => "var(--bt-radius-sm)",
-        "opacity" => "0",
+        "background" => "var(--bt-surface-2)",
+        "opacity" => "0", "pointer-events" => "none",
         "transition" => "opacity 80ms, background 80ms, color 80ms"),
-    CSS(".bt-side-item:hover .bt-side-close", "opacity" => "1"),
+    # Reveal on the row wrapper too: the files hint is a SIBLING overlaying the
+    # item, so hovering IT un-hovers the item — without the wrapper selector the
+    # ✕ would flicker away while the pointer crosses the hint.
+    CSS(".bt-side-item:hover .bt-side-close, .bt-side-chat-row:hover .bt-side-close",
+        "opacity" => "1", "pointer-events" => "auto"),
     CSS(".bt-side-close:hover",
         "background" => "rgba(239,68,68,0.14)", "color" => "var(--bt-error)"),
+    # The icons-only rail has no titles — a corner ✕ would overlay the icon
+    # itself and misclicks would close chats; the rail is for switching only.
+    CSS(".bt-sidebar.bt-collapsed .bt-side-close", "display" => "none"),
     # Shown when no chats are open yet.
     CSS(".bt-side-empty",
         "padding" => "10px 12px", "font-size" => "12px",
@@ -656,10 +673,13 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-tree-hint",
         "position" => "absolute", "right" => "6px", "bottom" => "3px",
         "display" => "flex", "align-items" => "center", "gap" => "3px",
-        "padding" => "0 2px",
-        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.2",
+        "padding" => "0 3px",
+        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.3",
         "white-space" => "nowrap",
         "color" => "var(--bt-text-muted)",
+        # Subtle backdrop so the floating label stays legible when it overlays
+        # the title's text — matches the row's hover/open tint so it blends in.
+        "background" => "var(--bt-surface-2)",
         "border-radius" => "var(--bt-radius-sm)",
         "cursor" => "pointer", "user-select" => "none",
         "opacity" => "0", "pointer-events" => "none",
@@ -697,6 +717,14 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-tree-relpath",
         "margin-left" => "6px", "font-size" => "11px", "color" => "var(--bt-text-muted)",
         "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    # ⤓ download affordance: right-anchored, revealed on row hover.
+    CSS(".bt-tree-download",
+        "flex" => "0 0 auto", "margin-left" => "auto",
+        "padding" => "0 4px", "font-size" => "12px", "line-height" => "1",
+        "color" => "var(--bt-text-muted)",
+        "opacity" => "0", "transition" => "opacity 80ms, color 80ms"),
+    CSS(".bt-tree-row:hover .bt-tree-download", "opacity" => "1"),
+    CSS(".bt-tree-download:hover", "color" => "var(--bt-accent)"),
     CSS(".bt-tree-empty",
         "padding" => "4px 12px", "font-size" => "11px", "color" => "var(--bt-text-muted)"),
     # No trees / hint in the collapsed icon rail.
@@ -942,7 +970,7 @@ function project_loading_view(state::ServerState, pid::String,
                                         style = Styles("padding" => "40px"))
         w      = get(workers, p.worker_id, nothing)
         wname  = w === nothing ? p.worker_id : w.name
-        online = w !== nothing && w.status == :online
+        online = w !== nothing && isopen(w)
         if !online
             return DOM.div(
                 DOM.div("⚠"; class = "bt-loading-glyph"),

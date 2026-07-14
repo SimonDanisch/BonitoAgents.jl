@@ -271,6 +271,17 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-header-sync:hover",
         "background" => "var(--bt-surface-2)"),
+    # Compact — same control-strip chrome as Sync/Restart; label only flips
+    # between "Compact" and a short status, so no width cap needed.
+    CSS(".bt-header-compact",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px", "cursor" => "pointer",
+        "white-space" => "nowrap", "transition" => "background 80ms"),
+    CSS(".bt-header-compact:hover", "background" => "var(--bt-surface-2)"),
     # Header-level restart: visually quieter than Sync (no wide stable
     # min-width — its label only flips between "Restart" and
     # "Restarting…", neither long), but the same chrome so the row reads
@@ -354,14 +365,14 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
-        # Sits left (after the title), content-width, growing rightward into the
-        # gap before the right-anchored `.bt-header-actions`. Min-width keeps the
-        # empty state (during a switch) from collapsing the layout; max-width
-        # ellipsizes a very long model name instead of squeezing the title.
-        "flex" => "0 1 auto", "min-width" => "0", "max-width" => "260px",
-        "white-space" => "nowrap",
-        "overflow" => "hidden",
-        "text-overflow" => "ellipsis"),
+        # ONE inline row of config pills (model · mode · effort), kept to the LEFT
+        # of the provider/sync/restart buttons. A flex row (not a text block) so
+        # the interactive <select> pills — which are block-level <div>s — line up
+        # horizontally instead of stacking vertically. No max-width/ellipsis: all
+        # three stay fully visible on a single line.
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "flex" => "0 1 auto", "min-width" => "0",
+        "white-space" => "nowrap"),
     # The right-anchored control cluster (provider switcher · sync · restart).
     # `margin-left:auto` pushes it to the right edge; because the model pill and
     # status text live OUTSIDE it (to its left), their width changes are absorbed
@@ -369,22 +380,41 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-actions",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
         "margin-left" => "auto", "flex" => "0 0 auto"),
+    # Config pills (model · mode · effort) share the SAME chrome as the
+    # provider/sync/restart buttons — a bordered pill on `--bt-surface`, 12px,
+    # 4px/10px padding, 6px radius — so the whole header reads as one uniform
+    # control strip. Interactive pills (`-pick`) wrap a chrome-stripped <select>
+    # (the pill carries the border, exactly like the bare provider <select>);
+    # static single-choice pills (`-item`) are the same pill without a select.
     CSS(".bt-header-meta-item",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "white-space" => "nowrap",
         "cursor" => "default"),
-
-    # Model picker — a native <select> styled as the meta-item pill. We strip
-    # the native chrome (no border / no system background / no arrow gap) so it
-    # reads as a clickable text label; only on hover does the box-shadow ring +
-    # the down-arrow hint that it's interactive. `currentColor` keeps the
-    # arrow matching the muted meta-text color.
     CSS(".bt-header-meta-pick",
-        "padding" => "0",                 # the <select> brings its own
+        # inline-flex so a prefix label ("mode:"/"effort:") and its <select> sit
+        # on the same baseline within the pill.
+        "display" => "inline-flex", "align-items" => "center",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "white-space" => "nowrap",
         "cursor" => "pointer",
-        "border-radius" => "3px",
-        "transition" => "background 80ms ease, box-shadow 80ms ease"),
+        "transition" => "background 80ms"),
     CSS(".bt-header-meta-pick:hover",
-        "background" => "var(--bt-surface-soft, rgba(127,127,127,0.08))",
-        "box-shadow" => "0 0 0 1px var(--bt-border, rgba(127,127,127,0.25))"),
+        "background" => "var(--bt-surface-2)"),
+    CSS(".bt-header-meta-pick:focus-within",
+        "outline" => "2px solid var(--bt-accent)",
+        "outline-offset" => "1px"),
+    # The <select> is chrome-stripped — the pill wrapper carries the
+    # border/background, matching the bare provider <select> (which has no arrow
+    # either, so they stay identical).
     CSS(".bt-header-meta-select",
         "appearance" => "none",
         "-webkit-appearance" => "none",
@@ -394,18 +424,31 @@ const ChatStyles = Bonito.Styles(
         "outline" => "0",
         "color" => "inherit",
         "font" => "inherit",
-        "padding" => "1px 14px 1px 4px",
-        "cursor" => "pointer",
-        # Tiny down-arrow rendered as an inline SVG background so the pill
-        # doesn't depend on a font-glyph being available.
-        "background-image" => "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><path fill='currentColor' d='M0 0l5 6 5-6z'/></svg>\")",
-        "background-repeat" => "no-repeat",
-        "background-position" => "right 3px center",
-        "background-size" => "7px 5px"),
-    CSS(".bt-header-meta-select:focus-visible",
-        "outline" => "1px solid var(--bt-accent, #3b82f6)",
-        "outline-offset" => "1px",
-        "border-radius" => "3px"),
+        "padding" => "0",
+        "margin" => "0",
+        "cursor" => "pointer"),
+    # Muted category prefix ("model:" / "permissions:" / "effort:") on each pill.
+    CSS(".bt-header-meta-cat",
+        "color" => "var(--bt-text-muted)",
+        "user-select" => "none"),
+
+    # ── Home "Defaults" control ───────────────────────────────────────────────
+    # A labelled row of the same config pills, wired to the server-wide defaults.
+    # Lives in the home "Defaults" section; the pills reuse `.bt-header-meta*`.
+    CSS(".bt-defaults",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "flex-wrap" => "wrap"),
+    CSS(".bt-defaults-label",
+        "font-size" => "13px", "color" => "var(--bt-text-muted)",
+        "user-select" => "none"),
+    # The pill row: same flex chrome as the header meta strip, but allowed to wrap
+    # (the home has room, unlike the single-line chat header).
+    CSS(".bt-defaults-bar",
+        "flex-wrap" => "wrap"),
+    # One-line explainer under the "Defaults" heading.
+    CSS(".bt-defaults-hint",
+        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "margin" => "0 0 8px 0"),
 
     # ── Status dot (online/offline/streaming) ────────────────────────────────
     # Shared liveness dot (chat header, dashboard). Same status palette as the
@@ -514,6 +557,35 @@ const ChatStyles = Bonito.Styles(
         "letter-spacing" => "0.04em",
         "color" => "var(--bt-text-faint)",
         "text-transform" => "uppercase"),
+    # Yolo auto-continue nudge: an app-generated (not user) bubble. Muted so it
+    # reads as a system message — dimmer, desaturated accent, lighter weight.
+    CSS(".bt-user-msg.bt-user-msg-auto",
+        "opacity" => "0.6",
+        "background" => "color-mix(in srgb, var(--bt-accent) 45%, var(--bt-surface-2))",
+        "font-style" => "italic"),
+    # Inline attachment gallery under the user's text (createNode's `user`
+    # case builds it from the wire `attachments` list). Thumbs are bounded —
+    # the lightbox is the full-size view — and sit on the accent bubble, so a
+    # translucent white seam separates image edges from the blue.
+    CSS(".bt-user-attachments",
+        "display" => "flex", "flex-wrap" => "wrap", "gap" => "6px",
+        "margin-top" => "8px"),
+    CSS(".bt-user-att-img",
+        "max-width" => "220px", "max-height" => "180px",
+        # Floor keeps a tiny image (a pasted icon) visible and clickable as a
+        # chip; object-fit centers it without stretching.
+        "min-width" => "40px", "min-height" => "40px",
+        "object-fit" => "contain",
+        "background" => "rgba(255,255,255,0.15)",
+        "border-radius" => "8px",
+        "border" => "1px solid rgba(255,255,255,0.35)",
+        "cursor" => "zoom-in",
+        "display" => "block"),
+    # Fallback when the file is gone (project moved / cleaned): the name in
+    # small type instead of a broken-image icon.
+    CSS(".bt-user-att-missing",
+        "font-size" => "11px", "opacity" => "0.8",
+        "font-family" => "ui-monospace, monospace"),
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
@@ -823,6 +895,11 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-taskbar-todo-head",
         "display" => "flex", "align-items" => "center", "gap" => "6px",
         "font-weight" => "600"),
+    # The rows live in their own reactive wrapper (re-derived from the live
+    # message each clock tick), so the 4px inter-item spacing the outer slot's
+    # `gap` used to give the items when they were direct children now lives here.
+    CSS(".bt-taskbar-todo-rows",
+        "display" => "flex", "flex-direction" => "column", "gap" => "4px"),
     CSS(".bt-taskbar-todo-item",
         "font-size" => "11.5px",
         "color" => "var(--bt-text-muted)",
@@ -846,6 +923,16 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-taskbar-todo-item.bt-todo-done::before",
         "content" => "'✓ '",
         "color" => "var(--bt-success, #16a34a)"),
+
+    # Subagent Task pills: the current-activity one-liner between the label and
+    # the elapsed clock (taskbar.jl re-renders it via the KeyedList key as new
+    # feed frames land) — a fact off the wire, no staleness tint.
+    CSS(".bt-taskbar-activity",
+        "flex" => "0 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "font-size" => "10.5px",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-taskbar-activity:empty", "display" => "none"),
 
     # Mini stop button — the composer stop button's little sibling, shared
     # by taskbar slots and live tool pills: bordered circle, red rounded
@@ -983,6 +1070,63 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-eval-preview-toggle:hover",
         "background" => "rgba(255,255,255,0.18)"),
 
+    # The command a Bash tool ran — ALWAYS visible (unlike the eval preview there
+    # is no Monaco "Code" section afterwards to fall back on), same dark code look,
+    # scrolls for long scripts. "What ran" must never be hidden behind a tooltip.
+    CSS(".bt-cmd-preview",
+        "border-top" => "1px solid var(--bt-border)",
+        "background" => "#0f172a",
+        "max-height" => "180px",
+        "overflow-y" => "auto"),
+    CSS(".bt-cmd-preview pre",
+        "margin" => "0",
+        "padding" => "8px 12px",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "1.5",
+        "color" => "#e2e8f0",
+        "white-space" => "pre-wrap", "word-break" => "break-word"),
+
+    # Subagent activity feed inside a Task tool bubble: a second collapsible
+    # section between the header and the lazy body (bonitoagents.js builds it
+    # from the header's `task_feed` snapshot + live `task_activity` events).
+    # Most-recent-last, auto-scrolled, bounded like the server-side window.
+    CSS(".bt-task-feed",
+        "border-top" => "1px solid var(--bt-border)"),
+    CSS(".bt-task-feed-head",
+        "display" => "flex", "align-items" => "center", "gap" => "6px",
+        "padding" => "3px 12px",
+        "font-size" => "11px",
+        "color" => "var(--bt-text-muted)",
+        "user-select" => "none"),
+    CSS(".bt-task-feed-count",
+        "color" => "var(--bt-text-faint)",
+        "font-family" => "ui-monospace, monospace"),
+    CSS(".bt-task-feed-list",
+        "max-height" => "180px",
+        "overflow-y" => "auto",
+        "padding" => "2px 12px 8px",
+        "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
+    CSS(".bt-task-feed-entry",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        # The list is a flex column with a 180px max-height. Flex items default
+        # to `flex-shrink: 1`, so once the entries overflow that cap the browser
+        # SQUISHES each row toward 0px instead of letting the list scroll — a
+        # long subagent feed collapsed to ~2px rows and rendered blank. Pin the
+        # rows to their content height so the list scrolls (overflow-y: auto).
+        "flex-shrink" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-task-feed-entry.bt-task-feed-tool",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px",
+        "color" => "var(--bt-text)"),
+    CSS(".bt-task-feed-entry.bt-task-feed-thought",
+        "font-style" => "italic",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-task-feed-entry.bt-feed-failed",
+        "color" => "var(--bt-error)"),
+
     CSS(".bt-tool-body",
         "padding" => "0 12px 10px",
         "border-top" => "1px solid var(--bt-border)"),
@@ -1002,14 +1146,34 @@ const ChatStyles = Bonito.Styles(
     # of the media and closes on backdrop click or Esc.
     CSS(".bt-media-wrap",
         "position" => "relative", "display" => "inline-block", "max-width" => "100%"),
-    CSS(".bt-media-enlarge",
+    # Hover action row (enlarge · copy · download), top-right of the media.
+    CSS(".bt-media-actions",
         "position" => "absolute", "top" => "6px", "right" => "6px",
+        "display" => "flex", "gap" => "4px",
+        "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-media-wrap:hover .bt-media-actions", "opacity" => "1"),
+    CSS(".bt-media-action",
         "appearance" => "none", "border" => "none",
         "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
         "font-size" => "14px", "line-height" => "1",
         "padding" => "4px 7px", "border-radius" => "6px",
-        "cursor" => "zoom-in", "opacity" => "0", "transition" => "opacity 80ms"),
-    CSS(".bt-media-wrap:hover .bt-media-enlarge", "opacity" => "1"),
+        "cursor" => "pointer"),
+    CSS(".bt-media-action:hover", "background" => "rgba(0,0,0,0.8)"),
+    CSS(".bt-media-enlarge", "cursor" => "zoom-in"),
+
+    # Code-block hover actions (copy · download), top-right of a fenced <pre>.
+    CSS(".bt-code-wrap", "position" => "relative"),
+    CSS(".bt-code-actions",
+        "position" => "absolute", "top" => "6px", "right" => "6px",
+        "display" => "flex", "gap" => "4px",
+        "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-code-wrap:hover .bt-code-actions", "opacity" => "1"),
+    CSS(".bt-code-action",
+        "appearance" => "none", "border" => "none",
+        "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
+        "font-size" => "13px", "line-height" => "1",
+        "padding" => "3px 6px", "border-radius" => "5px", "cursor" => "pointer"),
+    CSS(".bt-code-action:hover", "background" => "rgba(0,0,0,0.8)"),
     CSS(".bt-lightbox-overlay",
         "position" => "fixed", "inset" => "0", "z-index" => "9999",
         "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
@@ -1404,6 +1568,19 @@ const ChatStyles = Bonito.Styles(
         "padding-top" => "8px"),
     CSS(".bt-question-skip",
         "color" => "var(--bt-text-muted)"),
+    # Question identity: a round accent "?" badge beside the prompt so an
+    # AskUserQuestion reads as the agent asking YOU (vs a generic panel /
+    # permission ask). The prompt row aligns the badge to the first text line.
+    CSS(".bt-question-prompt",
+        "display" => "flex", "align-items" => "flex-start", "gap" => "9px"),
+    CSS(".bt-question-icon",
+        "flex" => "0 0 auto",
+        "width" => "22px", "height" => "22px",
+        "display" => "inline-flex", "align-items" => "center", "justify-content" => "center",
+        "border-radius" => "50%",
+        "background" => "var(--bt-accent)", "color" => "#fff",
+        "font-size" => "13px", "font-weight" => "700", "line-height" => "1",
+        "margin-top" => "1px"),
 
     # ── New-messages pill ────────────────────────────────────────────────────
     # Floats above the input area when followMode is off and new content
@@ -1428,10 +1605,13 @@ const ChatStyles = Bonito.Styles(
         "font-family" => "inherit", "font-size" => "13px",
         "font-weight" => "500",
         "cursor" => "pointer",
-        "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)",
-        "animation" => "bt-new-msg-pulse 2.5s ease-in-out infinite"),
+        "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)"),
     CSS(".bt-new-msg-pill.bt-new-msg-pill-visible",
         "display" => "inline-flex"),
+    # The pulse glow is a NEW-MESSAGES nudge only; the plain "Move to bottom"
+    # form (shown whenever scrolled away from the last message) stays static.
+    CSS(".bt-new-msg-pill.bt-new-msg-pill-glow",
+        "animation" => "bt-new-msg-pulse 2.5s ease-in-out infinite"),
     CSS(".bt-new-msg-pill:hover",
         "filter" => "brightness(1.08)"),
     CSS(".bt-new-msg-pill:active",
@@ -1460,6 +1640,36 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%"),
+    # Button column right of the textarea: the Yolo toggle bar on top, the
+    # send/stop pair below. `stretch` makes the bar span the pair's width
+    # (wide-and-short) without hardcoding it.
+    CSS(".bt-input-controls",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "6px", "align-items" => "stretch",
+        "flex-shrink" => "0"),
+    CSS(".bt-input-btn-row",
+        "display" => "flex", "gap" => "8px", "align-items" => "flex-end"),
+    # Yolo toggle bar: quiet chrome when off; an armed amber accent when on so
+    # it's obvious the composer is in reminders mode and autonomy is engaged.
+    CSS(".bt-yolo-bar",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "11px", "line-height" => "1",
+        "padding" => "3px 0",
+        "border-radius" => "8px",
+        "cursor" => "pointer",
+        "white-space" => "nowrap",
+        "transition" => "background 80ms, color 80ms, border-color 80ms"),
+    CSS(".bt-yolo-bar:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-yolo-bar-on",
+        "border-color" => "var(--bt-warning)",
+        "background" => "color-mix(in srgb, var(--bt-warning) 18%, var(--bt-surface))",
+        "color" => "var(--bt-warning)",
+        "font-weight" => "600"),
+    CSS(".bt-yolo-bar-on:hover",
+        "background" => "color-mix(in srgb, var(--bt-warning) 26%, var(--bt-surface))"),
 
     # ── Chat toolbar (below the composer) ───────────────────────────────────
     # Hosts the message-type filter checkboxes (populated client-side by
@@ -1594,7 +1804,14 @@ const ChatStyles = Bonito.Styles(
         "border-radius" => "20px",
         "padding" => "10px 14px",
         "font-size" => "16px",                          # iOS no-zoom threshold
-        "min-height" => "40px", "max-height" => "120px",
+        # min-height matches the FULL controls column beside it: send/stop 40px
+        # + 6px gap + the Yolo bar (~18px) = 64px. With the old 40px the
+        # textarea only lined up with the button pair and the Yolo strip's
+        # height was dead space above it. min-height (not height) because the
+        # auto-resize oninput writes an explicit style.height from scrollHeight:
+        # CSS min-height clamps that inline value, so the box grows past 64 up
+        # to the 120 cap and shrinks back to 64 — without touching the JS.
+        "min-height" => "64px", "max-height" => "120px",
         "font-family" => "inherit",
         "color" => "var(--bt-text)",
         "background" => "var(--bt-bg)",
@@ -1607,6 +1824,14 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-text-input:focus",
         "border-color" => "var(--bt-accent)",
         "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
+    # Yolo mode: the composer is the REMINDERS editor — a red-ish border +
+    # focus ring replaces the blue accent so the mode is unmistakable. Declared
+    # AFTER the base rules: same specificity, later wins.
+    CSS(".bt-text-input-yolo",
+        "border-color" => "color-mix(in srgb, var(--bt-error) 60%, var(--bt-border-strong))"),
+    CSS(".bt-text-input-yolo:focus",
+        "border-color" => "var(--bt-error)",
+        "box-shadow" => "0 0 0 3px rgba(239,68,68,0.18)"),
     # Thin, modern scrollbar instead of the Linux/Electron default with up/down
     # arrow buttons. Only visible when textarea grows past max-height.
     CSS(".bt-text-input",
@@ -1640,6 +1865,13 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-send-btn:active", "transform" => "scale(0.95)"),
     CSS(".bt-send-btn:disabled",
         "opacity" => "0.4", "cursor" => "not-allowed"),
+    # Lock-in variant while Yolo is armed: same circle, amber accent + check
+    # glyph — pressing it locks in the composer text as the reminders. Both
+    # rules AFTER their blue counterparts so they win at equal specificity.
+    CSS(".bt-send-btn-yolo",
+        "background" => "var(--bt-warning)"),
+    CSS(".bt-send-btn-yolo:hover",
+        "background" => "#d97706"),
     CSS(".bt-stop-btn",
         "background" => "var(--bt-surface)",
         "color" => "var(--bt-error)",

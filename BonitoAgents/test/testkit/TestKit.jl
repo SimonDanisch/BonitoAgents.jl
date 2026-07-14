@@ -55,7 +55,9 @@ import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
 
 export TestServer, dev_server, add_worker!,
-       text, thought, edit, bash, todo, delay, tool, tool_update,
+       text, user, thought, edit, bash, todo, delay, tool, tool_update, REPLAY_FN,
+       post_turn,
+       sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn, bt_eval,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
@@ -68,6 +70,28 @@ export TestServer, dev_server, add_worker!,
 # The mock binary's dispatcher loop maps these to ACP frames.
 
 text(s::AbstractString)                 = Dict("type" => "text",    "text"  => String(s))
+# A replayed USER turn — only meaningful inside a `REPLAY_FN` script (the
+# session/load history the mock re-streams); prompts never produce user events.
+user(s::AbstractString)                 = Dict("type" => "user",    "text"  => String(s))
+
+"""
+    post_turn(events; delay_ms = 300) -> Dict
+
+Agent event carrying frames the mock emits BETWEEN TURNS — `delay_ms` after the
+prompt response, with no turn open. Mirrors the real wire (see
+test/fixtures/bg_subagent_wire.jsonl): a background subagent's tagged activity
+(`sub_text`/`sub_tool`) keeps flowing after end_turn, and the main agent's
+auto-wake completion announcement arrives as untagged `text`.
+"""
+post_turn(events::Vector; delay_ms = 300) =
+    Dict{String,Any}("type" => "post_turn", "events" => events,
+                     "delay_ms" => Float64(delay_ms))
+
+# Scripted `session/load` replay: `REPLAY_FN[]` maps a session id to the event
+# list (user/text/thought/tool) the mock re-streams as the resumed session's
+# history — how the real agent replays its jsonl. Default: no replay, which is
+# what every pre-existing resume test expects. Set per test, reset in `finally`.
+const REPLAY_FN = Ref{Function}(sid -> Any[])
 thought(s::AbstractString)              = Dict("type" => "thought", "text"  => String(s))
 edit(path, old, new; id = nothing)      = begin
     d = Dict{String,Any}("type" => "edit", "path" => String(path),
@@ -150,6 +174,36 @@ tool_update(id; status = nothing, content = nothing, raw_input = nothing) = begi
     status    === nothing || (d["status"]    = String(status))
     content   === nothing || (d["content"]   = content)
     raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
+    d
+end
+
+"""
+    sub_text(parent_id, s) -> Dict
+
+Agent event that emits the SAME `agent_message_chunk` frame as [`text`](@ref)
+but tagged `_meta.claudeCode.parentToolUseId = parent_id` — the way
+claude-agent-acp forwards a running SUBAGENT's prose. The chat must route it
+into the parent Task bubble's activity feed, never the main transcript.
+"""
+sub_text(parent_id, s::AbstractString) = Dict{String,Any}(
+    "type" => "sub_text", "parent" => String(parent_id), "text" => String(s))
+
+"""
+    sub_tool(parent_id; kind, title, status, id, update = false) -> Dict
+
+Agent event that emits a subagent TOOL frame tagged with
+`_meta.claudeCode.parentToolUseId = parent_id`: a `tool_call` announcement by
+default, or (with `update = true`) a `tool_call_update` that flips the
+already-announced sub-tool's status — mirroring the frames claude-agent-acp
+forwards for a subagent's tool use. Feeds the parent Task bubble's activity
+feed (one entry per sub-tool id, status rewritten in place).
+"""
+sub_tool(parent_id; kind = "other", title = "tool", status = "in_progress",
+         id = nothing, update = false) = begin
+    d = Dict{String,Any}("type" => "sub_tool", "parent" => String(parent_id),
+                         "kind" => String(kind), "title" => String(title),
+                         "status" => String(status), "update" => update)
+    id === nothing || (d["id"] = String(id))
     d
 end
 
@@ -252,6 +306,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       port::Union{Int,Nothing} = nothing,
                       browser_width::Int  = 1280,
                       browser_height::Int = 820,
+                      ignore_cancel::Bool = false,
                       kwargs...)
     ensure_display!()
     agent_ref = Ref{Function}(agent)
@@ -287,6 +342,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
         "BT_MOCK_ACP_DISPATCHER" => "127.0.0.1:$(disp_port)",
         "BT_MOCK_PROJECT"        => test_env,
     )
+    # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
+    # test can drive the chat's re-cancel → force-close escalation.
+    ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
 
     h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
@@ -314,6 +372,21 @@ function handle_client(client, agent_ref::Ref{Function})
             line = try readline(client) catch; break end
             isempty(line) && continue
             msg = JSON.parse(line)
+            # session/load replay request: serve the scripted history for this
+            # session id (REPLAY_FN, default empty) and terminate the stream.
+            if haskey(msg, "replay")
+                events = try
+                    Base.invokelatest(REPLAY_FN[], String(msg["replay"]))
+                catch e
+                    @warn "TestKit REPLAY_FN threw" exception = e
+                    Any[]
+                end
+                for ev in events
+                    println(client, JSON.json(ev)); flush(client)
+                end
+                println(client, JSON.json(Dict("type" => "end"))); flush(client)
+                continue
+            end
             prompt = String(get(msg, "prompt", ""))
             # On a resumed session the server prepends a transcript of the prior
             # conversation, with the user's real new message after a "My new
@@ -776,6 +849,36 @@ function click_text(s::TestServer, label::AbstractString)
     return s
 end
 
+# Like `click_text` but RE-CLICKS the visible button labelled `label` until
+# `predicate` (a JS expression) is truthy — the text-matched twin of
+# `click_until`. Rides out the cold-mount race where Bonito wires a button's
+# onclick only AFTER it mounts, so the FIRST synthetic click lands before the
+# handler attaches and is silently dropped (a lone `click_text` then hangs on a
+# form that never opens); the re-click loop also absorbs a slow first
+# server-side render of the target UI. Returns the truthy value; errors if the
+# state never appears.
+function click_text_until(s::TestServer, label::AbstractString, predicate::AbstractString;
+                          timeout::Real = 30, interval::Real = 0.4)
+    t0 = time()
+    clickjs = """(() => {
+        const b = [...document.querySelectorAll('button')].filter($VIS)
+            .find(b => (b.innerText||'').trim() === $(json(String(label))));
+        if (b) b.click(); return true; })()"""
+    check = "(() => { try { return " * String(predicate) * "; } catch (e) { return false; } })()"
+    while time() - t0 < timeout
+        eval_js(s, clickjs)   # (re-)click if present; no-op if the button is gone
+        v = try
+            eval_js(s, check; timeout = min(Float64(timeout), 5.0))
+        catch e
+            e isa BridgeTimeout || rethrow()
+            nothing
+        end
+        v in (false, nothing) || return v
+        sleep(interval)
+    end
+    error("click_text_until: '$label' did not produce the expected state within $(timeout)s")
+end
+
 """
     set_input(s, selector, value; placeholder = nothing)
 
@@ -820,12 +923,14 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     name = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
     leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
     to_dashboard(s)
-    click_text(s, "+ New project")
-    # Form open once the name field is visible. Generous timeouts here: the
-    # FIRST new_chat against a fresh server compiles the whole new-project /
-    # folder-picker UI server-side, which is slow cold on a CI runner (warm
-    # it's instant). These waits gate on real DOM, so a true hang still fails.
-    wait_for(s, "new-project form",
+    # RE-CLICK "+ New project" until the name field shows. A lone click can be
+    # dropped on a cold/slow first render — Bonito wires the button's onclick
+    # only after it mounts, so the first synthetic click lands before the handler
+    # attaches and the form never opens (the exact race `click_until` fixes for
+    # the ✎ button below; a single `click_text` here left `new_chat` hanging on
+    # a cold isolated run). Generous timeout: the FIRST new_chat against a fresh
+    # server also compiles the whole new-project / folder-picker UI server-side.
+    click_text_until(s, "+ New project",
         "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
         timeout = 30)
     # Flip the breadcrumb to a text field. The ✎ button's onclick (notify

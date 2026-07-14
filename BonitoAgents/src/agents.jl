@@ -95,7 +95,6 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     haskey(a.state.worker_control_ws, a.worker_id) ||
         error("Worker '$(a.worker_id)' is not connected")
 
-    sid, ch = register_rpc!(a.state)
     mcp_list = mcp_list_payload(a.mcp)
 
     # Find the project this session belongs to (cosmetic — worker log line).
@@ -106,6 +105,12 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     end
 
     pname = provider_name(a)
+    # Only Claude honours the `_meta.systemPrompt.preset` append. The appendix
+    # is the BUILT-IN house rules + the user's editable AGENTS.md.
+    prompt_meta = a.provider isa ClaudeCodeAgent ?
+        system_prompt_meta(agents_prompt_appendix(a.state)) : Dict{String,Any}()
+
+    sid, ch = register_rpc!(a.state)
     send_command(a.state, a.worker_id, Dict(
         "type"       => "open_session",
         "sid"        => sid,
@@ -135,8 +140,6 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     # notifications; `replay_history` captures them). Fresh → `session/new`, no
     # replay. The response carries the session-config blocks either way. Only
     # Claude honours the `_meta.systemPrompt.preset` AGENTS.md append.
-    prompt_meta = a.provider isa ClaudeCodeAgent ?
-        system_prompt_meta(global_agents_md(a.state)) : Dict{String,Any}()
     session_id, msgs, result = if a.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=a.worker_path resume=a.resume_session_id
         rmsgs, load_result = ACP.replay_history(conn, merge(Dict(

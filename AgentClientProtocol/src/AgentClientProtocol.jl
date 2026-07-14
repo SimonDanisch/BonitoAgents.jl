@@ -16,6 +16,9 @@ export Handler, DiscardHandler
 export ConnectionClosed
 export SessionUpdate, AgentMessageChunk, UserMessageChunk, AgentThoughtChunk
 export ToolCallNotif, ToolCallUpdateNotif, PlanUpdate, UnknownUpdate
+# Subagent visibility: the tagged wire wrapper + the distilled activity events
+# a turn's `on_subagent` sink receives (see `prompt!`).
+export SubagentUpdate, SubagentActivity, parent_tool_use_id
 export TextContent, ImageContent, DiffContent, ToolCallLocation, PlanEntry
 export parse_tool_content_item, parse_session_update, parse_location
 # Typed tool-call family — downstream consumers dispatch on these instead of

@@ -28,10 +28,19 @@ mutable struct WorkerInfo
     mcp_path::String                   # MCP launch command on worker (the julia binary)
     mcp_args::Vector{String}           # MCP launch args on worker (--project=…, -e …)
     projects_root::String              # rsync destination root on worker
-    # runtime
-    status::Symbol                     # :unknown, :online, :offline
+    # runtime. `online` is the single source of truth for liveness: true while
+    # the control WS is connected. It's an Observable so it can be SHARED into
+    # this worker's ChatModels — a disconnect/reconnect then drives each chat's
+    # offline banner, send-gating and background poller WITHOUT evicting the
+    # model (the pane stays live and rebinds on reconnect). Stable across
+    # reconnects (the WorkerInfo is reused, not rebuilt). Query with `isopen(w)`.
+    online::Observable{Bool}
     last_check::DateTime
 end
+
+# A worker is "open" while its control WS is connected. Point read; bind to
+# `w.online` directly for live UI reactivity.
+Base.isopen(w::WorkerInfo) = w.online[]
 
 # Per-project searchable file index — a flat list of paths relative to the
 # project root, fetched from the worker (`list_project_files`) and cached here so
@@ -100,6 +109,13 @@ mutable struct ProjectInfo
     # Without this, a chat with a title or a bound session id would stay pinned
     # to the homebar forever (those markers are persistent), so ✕ looked broken.
     dismissed::Bool
+    # Per-thread agent session-config overrides: configId → value (e.g.
+    # "mode"=>"bypassPermissions", "effort"=>"max", "model"=>"sonnet"). Empty =
+    # use the global defaults (DEFAULT_SESSION_CONFIG). claude does NOT persist
+    # permission mode / effort across resume (they reset to "default"), so we
+    # record what the user chose and re-assert it on every bring-up — see
+    # `apply_session_config!`. Persisted so resume restores the original settings.
+    desired_config::Dict{String,String}
     # Searchable file index (worker-derived, runtime-only). See ProjectFileIndex.
     file_index::ProjectFileIndex
 end
@@ -107,7 +123,7 @@ end
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
                 nothing, nothing, :unsynced, nothing, nothing, nothing, nothing,
-                false, ProjectFileIndex())
+                false, Dict{String,String}(), ProjectFileIndex())
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
 # call shape working for tests / fixtures that build a WorkerInfo by hand.
@@ -116,7 +132,12 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
 WorkerInfo(worker_id, name, url, secret, ssh_target, hostname, home,
            mcp_path, mcp_args, projects_root, status, last_check) =
     WorkerInfo(worker_id, name, nothing, url, secret, ssh_target, hostname, home,
-               mcp_path, mcp_args, projects_root, status, last_check)
+               mcp_path, mcp_args, projects_root,
+               # Accept the legacy `status::Symbol` (tests / fixtures pass
+               # `:online`/`:offline`/`:unknown`) or a ready Observable/Bool.
+               status isa Observable ? status :
+                   Observable(status === :online || status === true),
+               last_check)
 
 """
     ServerState
@@ -158,6 +179,14 @@ mutable struct ServerState
     working_dir :: String
     # Auth
     worker_secret :: String
+    # Worker-link liveness (seconds). The server pings every worker control WS
+    # every `heartbeat_interval`; a pong-capable worker that hasn't ponged for
+    # `heartbeat_deadline` is a ZOMBIE (half-open TCP after a suspend / wifi
+    # drop — the socket stays ESTABLISHED but nothing flows) and its socket is
+    # closed, which runs the normal disconnect teardown. Configurable so tests
+    # can use sub-second values.
+    heartbeat_interval :: Float64
+    heartbeat_deadline :: Float64
     # Live Bonito server (set by serve() after construction)
     srv :: Union{Bonito.Server,Nothing}
 
@@ -225,7 +254,27 @@ mutable struct ServerState
     # binding past the cap closes the oldest idle session (reaps its agent; lazy
     # ACP re-binds it from disk history on the next turn). Bounds agent processes.
     bound_lru          :: Vector{String}
+    # Server-wide default session config (model/mode/effort) set from the home
+    # "Defaults" control; overlaid UNDER each project's `desired_config` (per-chat
+    # picks win). Persisted to settings.json. Observable so open home views react.
+    default_session_config :: Observable{Dict{String,String}}
+    # The last non-empty `ConfigOption`s any of this server's sessions reported,
+    # so the home Defaults selects have real (agent-reported) choice lists even
+    # before a chat is open. Empty until the first session reports.
+    last_config_options :: Observable{Vector{Any}}
+
+    # The parent state a per-session `copy(state, session)` was derived from;
+    # `nothing` on the root itself. The Observable bridges above are ONE-WAY
+    # (root → session child), so GLOBAL notifications must be raised on the
+    # ROOT to fan out to every session — `root_state`/`notify_chats!` route
+    # through this. Without it, a hook holding a session view (e.g. the
+    # ChatModel busy hook created from a UI handler) notified only the one
+    # session that happened to create the model.
+    root :: Union{Nothing,ServerState}
 end
+
+"The root ServerState `s` derives from (identity for the root itself)."
+root_state(s::ServerState) = s.root === nothing ? s : s.root
 
 """
     ServerState(; state_dir, working_dir, worker_secret) → ServerState
@@ -235,11 +284,14 @@ Construct a fresh state, loading workers + projects from `state_dir`
 """
 function ServerState(; state_dir::String,
                        working_dir::String,
-                       worker_secret::String)
+                       worker_secret::String,
+                       heartbeat_interval::Real = 15.0,
+                       heartbeat_deadline::Real = 45.0)
     mkpath(working_dir)
     s = ServerState(
         ReentrantLock(),
         state_dir, working_dir, worker_secret,
+        Float64(heartbeat_interval), Float64(heartbeat_deadline),
         nothing,
         Observable(Dict{String,WorkerInfo}()),    # workers
         Observable(Dict{String,ProjectInfo}()),   # projects
@@ -254,10 +306,14 @@ function ServerState(; state_dir::String,
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
         String[],                                 # bound_lru
+        Observable(Dict{String,String}()),        # default_session_config (load_settings! below)
+        Observable(Any[]),                        # last_config_options
+        nothing,                                  # root (this IS the root)
     )
     load_workers!(s)
     load_projects!(s)
     load_discovered!(s)
+    load_settings!(s)
     return s
 end
 
@@ -275,6 +331,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
         ServerState(
             s.lock,
             s.state_dir, s.working_dir, s.worker_secret,
+            s.heartbeat_interval, s.heartbeat_deadline,
             s.srv,
             map(identity, session, s.workers),
             map(identity, session, s.projects),
@@ -289,6 +346,13 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.session_inflight,
             s.show_fetch_inflight,
             s.bound_lru,               # shared registry — one per server
+            # SHARED (not bridged): the home writes these and
+            # `effective_session_config` reads them off the parent at bring-up, so
+            # all sessions must see the SAME observable. Rendered session-scoped
+            # via `map(session, …)`, which tears its callback down on tab close.
+            s.default_session_config,
+            s.last_config_options,
+            root_state(s),             # copies of copies still point at the true root
         )
     end
 end
@@ -297,6 +361,34 @@ workers_file(s::ServerState)    = joinpath(s.state_dir, "workers.json")
 projects_file(s::ServerState)   = joinpath(s.state_dir, "projects.json")
 discovered_file(s::ServerState) = joinpath(s.state_dir, "discovered.json")
 agents_md_file(s::ServerState)  = joinpath(s.state_dir, "AGENTS.md")
+settings_file(s::ServerState)   = joinpath(s.state_dir, "settings.json")
+
+# Persist the server-wide defaults (the home "Defaults" control). Snapshot under
+# the lock, atomic write — same shape as `save_projects!`.
+function save_settings!(s::ServerState)
+    data = lock(s.lock) do
+        Dict{String,Any}("default_session_config" => copy(s.default_session_config[]))
+    end
+    atomic_write_json(settings_file(s), data)
+    return nothing
+end
+
+# Load settings.json into `default_session_config` on construct. Tolerant: a
+# missing/corrupt file just leaves the defaults empty (fall back to the hardcoded
+# DEFAULT_* — see `effective_session_config`). Never throws.
+function load_settings!(s::ServerState)
+    d = load_json_tolerant(settings_file(s), "settings.json")
+    d isa AbstractDict || return nothing
+    dc = get(d, "default_session_config", nothing)
+    if dc isa AbstractDict
+        cfg = Dict{String,String}()
+        for (k, v) in dc
+            v isa AbstractString && !isempty(v) && (cfg[String(k)] = String(v))
+        end
+        s.default_session_config[] = cfg
+    end
+    return nothing
+end
 
 """
     global_agents_md(state) -> String
@@ -319,6 +411,37 @@ function set_global_agents_md!(s::ServerState, text::AbstractString)
     mkpath(dirname(f))
     write(f, String(text))
     return nothing
+end
+
+# Built-in house rules BonitoAgents itself appends to EVERY Claude session's
+# system prompt, ahead of the user's editable AGENTS.md. Product-level guidance
+# for footguns we keep seeing across agents — keep it short, it rides on every
+# session. (The dashboard textarea shows/edits only the user's AGENTS.md; these
+# rules are composed in at session bring-up via `agents_prompt_appendix`.)
+const BUILTIN_AGENT_RULES = """
+## Background commands
+Never start a long command detached (`&`/nohup) and then poll for it from a \
+second watcher task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, \
+and the like) — such monitors routinely never terminate (PID reuse keeps \
+`kill -0` succeeding) and pile up as zombie background tasks. Run the long \
+command itself as ONE background task (`run_in_background`) with any \
+post-processing (grep/summary) appended after it in the same command; you are \
+notified automatically when it completes.
+
+## Julia
+When running Julia code, always prefer the `bt_julia_eval` tool over \
+`julia -e ...`/scripts via Bash: it keeps a persistent session (loaded \
+packages, variables, and compiled methods carry over; Revise picks up source \
+edits), while every Bash `julia` call spawns a fresh process and pays full \
+startup + compile cost. Use `env_path` = the current project directory (the \
+pwd). Only fall back to Bash `julia` when a fresh process is genuinely \
+required (e.g. running a test suite entry point)."""
+
+# What actually rides on the `_meta.systemPrompt.append` for a session: the
+# built-in rules plus the user's AGENTS.md (when present).
+function agents_prompt_appendix(s::ServerState)
+    user = global_agents_md(s)
+    return isempty(user) ? BUILTIN_AGENT_RULES : BUILTIN_AGENT_RULES * "\n\n" * user
 end
 
 """
@@ -436,13 +559,13 @@ function safe_notify!(obs::Observable)
     return nothing
 end
 
-# Signal that `chat_models` changed (a chat opened or closed) so the active-
-# chats sidebar re-renders. Call with the SAME state the mutation used: a
-# worker handler / async task holds the parent state (fans out to every
-# session's bridged `chat_signal`); a UI handler holds its per-session view
-# (updates that session). Mirrors how the existing `safe_notify!(state.projects)`
-# calls are threaded.
-notify_chats!(s::ServerState) = safe_notify!(s.chat_signal)
+# Signal that chat state changed (a chat opened/closed, or a turn started/
+# finished via the ChatModel busy hook) so chat-list consumers (sidebar,
+# recent-chats overview) re-render. Always raised on the ROOT: the per-session
+# Observable bridges are one-way (root → child), so notifying a session view
+# would reach only that one session — the old behaviour, which left every
+# OTHER tab (and any tab opened later) stale until an unrelated global event.
+notify_chats!(s::ServerState) = safe_notify!(root_state(s).chat_signal)
 
 # ── Persistence ───────────────────────────────────────────────────────────
 # Atomic JSON write: serialise to a UNIQUE sibling temp file first, then rename
@@ -569,7 +692,8 @@ function save_projects!(s::ServerState)
                      "resume_session_id" => p.resume_session_id,
                      "auto_prompt"   => p.auto_prompt,
                      "title"         => p.title,
-                     "dismissed"     => p.dismissed)
+                     "dismissed"     => p.dismissed,
+                     "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
         atomic_write_json(projects_file(s), data)
     end
@@ -604,6 +728,12 @@ function load_projects!(s::ServerState)
             # Pre-`dismissed` projects.json entries default to shown (false), so
             # an upgrade doesn't suddenly hide anyone's existing open chats.
             p.dismissed = get(d, "dismissed", false) === true
+            dc = get(d, "desired_config", nothing)
+            if dc isa AbstractDict
+                for (k, v) in dc
+                    v isa AbstractString && (p.desired_config[String(k)] = String(v))
+                end
+            end
             s.projects[][p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e

@@ -53,6 +53,7 @@ include("lens.jl")             # lens search: parse + fuzzy filter + saved lense
 include("remote_app.jl")       # eval-result bridge — live worker Bonito results in the browser
 include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + app detach controller
 include("persistence.jl")
+include("overview.jl")         # recent-chats overview cards (dashboard header)
 include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)
 include("session_widget.jl")   # SessionRow widget (one row per discovered Claude Code session)

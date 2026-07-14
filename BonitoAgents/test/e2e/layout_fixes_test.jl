@@ -184,6 +184,44 @@
             "document.querySelector('.bt-busy.bt-busy-active') === null"; timeout = 12) == true
     end
 
+    @testset "composer textarea spans the full controls column (yolo strip included)" begin
+        # Regression: `.bt-text-input` had min-height 40px — the send/stop pair's
+        # height only — while the controls column beside it is ~64px (Yolo bar +
+        # gap + buttons). With the row bottom-aligned, the Yolo strip's height
+        # was dead space above the textarea. The fix pins the textarea's
+        # min-height to the full column height; the auto-resize JS still grows
+        # it to the 120px cap and shrinks back to the floor, never below.
+        geo = TK.eval_js(s, """
+            (() => {
+                const p  = [...document.querySelectorAll('.bt-chatpane')].find(x => x.offsetParent !== null);
+                if (!p) return null;
+                const ta = p.querySelector('.bt-text-input');
+                const c  = p.querySelector('.bt-input-controls');
+                const tb = ta.getBoundingClientRect(), cb = c.getBoundingClientRect();
+                return { taH: Math.round(tb.height), ctrH: Math.round(cb.height),
+                         topDelta: Math.round(Math.abs(tb.top - cb.top)) };
+            })()""")
+        @test geo !== nothing
+        @test geo["taH"] >= geo["ctrH"] - 2     # textarea covers the whole column…
+        @test geo["topDelta"] <= 1              # …from the very top (no dead strip)
+
+        # Auto-resize still works around the new floor: grow toward the cap,
+        # then shrink BACK to the column height (not below) when cleared.
+        TK.set_input(s, ".bt-text-input", join(["line $(i)" for i in 1:8], "\n"))
+        sleep(0.4)
+        grown = TK.eval_js(s, """
+            (() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null);
+                     return Math.round(p.querySelector('.bt-text-input').getBoundingClientRect().height); })()""")
+        @test grown > geo["taH"]                # grew past the floor
+        @test grown <= 122                      # …capped at max-height
+        TK.set_input(s, ".bt-text-input", "")
+        sleep(0.4)
+        cleared = TK.eval_js(s, """
+            (() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null);
+                     return Math.round(p.querySelector('.bt-text-input').getBoundingClientRect().height); })()""")
+        @test abs(cleared - geo["ctrH"]) <= 2   # settles back to the column height
+    end
+
     # Restore the default echo agent + normal viewport for the next soak suite.
     s.agent_fn[] = prompt -> [TK.text("echo: $(prompt)"), TK.end_turn()]
     TK.set_window_size(s, 1280, 820)

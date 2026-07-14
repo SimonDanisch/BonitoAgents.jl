@@ -90,6 +90,27 @@ struct UnknownUpdate <: SessionUpdate
     raw::AbstractDict
 end
 
+# claude-agent-acp forwards every SUBAGENT session/update (text chunks,
+# tool_calls, tool_call_updates of a running Task/Agent tool) as a normal
+# update whose `_meta.claudeCode.parentToolUseId` names the parent Task's
+# tool_use id; top-level updates carry no such tag. The parser wraps tagged
+# updates so the per-turn coalescer (messages.jl) can divert them out of the
+# main message stream instead of interleaving subagent prose/tools into the
+# top-level reply.
+struct SubagentUpdate <: SessionUpdate
+    parent_tool_use_id::String
+    update::SessionUpdate
+end
+
+"""
+    parent_tool_use_id(u::SessionUpdate) -> Union{String,Nothing}
+
+The parent Task tool_use id a subagent-originated update is tagged with
+(`_meta.claudeCode.parentToolUseId`), or `nothing` for top-level updates.
+"""
+parent_tool_use_id(::SessionUpdate) = nothing
+parent_tool_use_id(u::SubagentUpdate) = u.parent_tool_use_id
+
 # ── Session config options ────────────────────────────────────────────────────
 # ACP "Session Config Options": the session-setup response MAY carry a list of
 # select-type options (`configOptions`) with their current values; the agent
@@ -184,24 +205,27 @@ current_choice(o::ConfigOption)::Union{ConfigOptionChoice,Nothing} =
      i === nothing ? nothing : o.choices[i])
 
 """
-    pill_label(o::ConfigOption) -> String
+    choice_label(o, c) -> String
 
-Short display label for the option's current value. For the MODEL option,
-"default" is an ALIAS in claude-agent-acp — the substance lives in the
-resolved choice's description ("Opus 4.7 with 1M context · Most capable for
-complex work"), so we surface its first segment instead of the word
-"Default". Everything else (mode, effort, …) shows its plain choice name —
-their descriptions are explanations, not values.
+Display label for ONE choice. For the MODEL option, "default" is an ALIAS in
+claude-agent-acp — the real model lives in the resolved choice's description
+("Opus 4.8 with 1M context · Best for everyday, complex tasks"), so we surface
+its first segment instead of the word "Default". "(recommended)" is redundant
+noise once the real model shows, so strip it. Every other option (mode, effort,
+explicit models) shows its plain choice name — their descriptions are
+explanations, not values. Cross-agent: reads only standard ACP choice fields.
 """
-function pill_label(o::ConfigOption)::String
-    c = current_choice(o)
-    c === nothing && return o.current_value
-    if c.value == "default" && o.category == "model" &&
+function choice_label(o::ConfigOption, c::ConfigOptionChoice)::String
+    if o.category == "model" && c.value == "default" &&
        c.description !== nothing && !isempty(strip(c.description))
         return String(strip(first(split(c.description, '·'))))
     end
-    return c.name
+    return String(strip(replace(c.name, r"\s*\(recommended\)\s*$"i => "")))
 end
+
+# Short display label for the option's CURRENT value (see `choice_label`).
+pill_label(o::ConfigOption)::String =
+    (c = current_choice(o); c === nothing ? o.current_value : choice_label(o, c))
 
 # ── Parsing helpers ───────────────────────────────────────────────────────────
 
@@ -256,7 +280,27 @@ function parse_claude_meta(params::AbstractDict)
     return (name, rinput_d)
 end
 
+# Defensive extraction of the subagent tag: the `_meta` envelope is optional
+# and any level may be missing or malformed — everything short of a non-empty
+# string id means "top-level update".
+function parse_parent_tool_use_id(params::AbstractDict)::Union{String,Nothing}
+    meta = get(params, "_meta", nothing)
+    meta isa AbstractDict || return nothing
+    cc = get(meta, "claudeCode", nothing)
+    cc isa AbstractDict || return nothing
+    v = get(cc, "parentToolUseId", nothing)
+    return v isa AbstractString && !isempty(v) ? String(v) : nothing
+end
+
 function parse_session_update(params::AbstractDict)::SessionUpdate
+    u = parse_session_update_kind(params)
+    pid = parse_parent_tool_use_id(params)
+    return pid === nothing ? u : SubagentUpdate(pid, u)
+end
+
+# The kind-discriminated body (untagged view). Split from the public entry so
+# the SubagentUpdate wrap happens in exactly one place.
+function parse_session_update_kind(params::AbstractDict)::SessionUpdate
     kind = get(params, "sessionUpdate", "")
     if kind == "agent_message_chunk"
         return AgentMessageChunk(parse_content_block(get(params, "content", Dict())))
@@ -301,7 +345,11 @@ function parse_session_update(params::AbstractDict)::SessionUpdate
                 for d in get(params, "configOptions", []) if d isa AbstractDict]
         return ConfigOptionUpdateNotif(opts)
     elseif kind == "current_mode_update"
-        return CurrentModeUpdateNotif(String(get(params, "modeId", "")))
+        # claude-agent-acp sends the new mode under `currentModeId` (verified on
+        # the wire, v0.42.0); the ACP spec's own field name is `modeId`. Read the
+        # claude form first, fall back to the spec form, so both agents work.
+        return CurrentModeUpdateNotif(
+            String(get(params, "currentModeId", get(params, "modeId", ""))))
     else
         return UnknownUpdate(kind, params)
     end

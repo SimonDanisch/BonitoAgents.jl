@@ -55,7 +55,7 @@ end
 
 # Pid of a *live, other* worker holding the pidfile, or `nothing` if the slot is
 # free (no file, stale file pointing at a dead pid, or it's our own pid). A
-# `process_running` result of `nothing` (can't determine) is treated as "not
+# `pid_running` result of `nothing` (can't determine) is treated as "not
 # confirmed running" so an unverifiable stale file never permanently blocks
 # startup — the failure mode of a false-free is a duplicate (caught server-side
 # by the identity guard), which is better than a worker that refuses to boot.
@@ -63,7 +63,7 @@ function running_worker_pid(path::AbstractString = pidfile_path())
     pid = read_pidfile(path)
     pid === nothing && return nothing
     pid == getpid() && return nothing
-    process_running(pid) === true ? pid : nothing
+    pid_running(pid) === true ? pid : nothing
 end
 
 # Claim the pidfile for this process and arrange to release it on exit. Best
@@ -272,19 +272,19 @@ function stop_running_worker!(; grace::Real = 10.0)
     pid = read_pidfile()
     pid === nothing && return
     pid == getpid() && return
-    if process_running(pid) === true
+    if pid_running(pid) === true
         signal_worker_graceful(pid)
         deadline = time() + grace
         while time() < deadline
-            process_running(pid) === true || break
+            pid_running(pid) === true || break
             sleep(0.1)
         end
         # Still alive? Escalate.
-        if process_running(pid) === true
+        if pid_running(pid) === true
             @warn "BonitoWorker: graceful stop timed out; force-killing" pid grace
             signal_worker_force(pid)
             for _ in 1:30
-                process_running(pid) === true || break
+                pid_running(pid) === true || break
                 sleep(0.1)
             end
         end
@@ -679,20 +679,25 @@ function connect_and_serve(; server_url::String,
             e isa InterruptException && rethrow()
             @error "BonitoWorker: control session crashed; reconnecting" exception=(e, catch_backtrace())
         end
+        # The control link is down ⇒ the server has torn down this worker's
+        # registration and evicted its chat models — every live session here is
+        # already abandoned on the other end. Reap agents + session transports
+        # NOW so nothing leaks across the reconnect (the fresh registration
+        # lazily re-opens sessions on the next user turn).
+        reap_all_sessions!("control link lost")
         @info "BonitoWorker: reconnecting in $(retry_delay)s"
         sleep(retry_delay)
     end
 end
 
-# NOTE: there is deliberately NO idle/heartbeat watchdog here. An earlier
-# version closed the control WS after N seconds without an inbound frame to
-# guard against a half-open TCP (laptop suspend / NAT drop with no RST). That
-# was wrong: the server does NOT send periodic pings, so a perfectly healthy
-# but idle control connection receives no frames and the watchdog would kill
-# it — and in dev mode `run_control_session` runs without a reconnect loop, so
-# the worker never came back. A correct half-open guard needs either TCP
-# keepalive on the socket or a real bidirectional server→worker ping; until
-# one exists we let the connection sit idle (the common, healthy case).
+# The receive-watchdog below is armed ONLY when the server's hello-ack
+# advertises `heartbeat_interval` (it pings on that cadence). An earlier,
+# unconditional idle-watchdog was a bug: against a server that never pings, a
+# perfectly healthy but idle control connection receives no frames and the
+# watchdog killed it. With advertised pings, "no frame for several intervals"
+# really does mean a half-open TCP link (laptop suspend / NAT drop with no
+# RST) — the case where blocked sends wedge the relay forever and only a
+# close + re-dial recovers.
 
 # Control WS lifecycle
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
@@ -721,7 +726,29 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
         end
         @info "BonitoWorker: registered with server" name=name
 
+        last_rx  = Ref(time())
+        hb_alive = Ref(true)
+        hb = get(ack, "heartbeat_interval", nothing)
+        if hb isa Number && hb > 0
+            Base.errormonitor(@async while hb_alive[]
+                sleep(Float64(hb))
+                hb_alive[] || break
+                if time() - last_rx[] > 4 * Float64(hb)
+                    @warn "BonitoWorker: no server traffic for 4 heartbeat intervals — killing zombie control WS"
+                    # Kill the TRANSPORT, not close(ws): the polite close writes a
+                    # CLOSE frame under ws.sendlock — on a wedged link (interface
+                    # switch: WLAN→LAN) a blocked relay send already HOLDS that
+                    # lock, so close(ws) would deadlock behind it. The transport
+                    # close wakes all blocked readers/writers; the retry loop then
+                    # re-dials over the new interface.
+                    try ws.close_transport!() catch end
+                    break
+                end
+            end)
+        end
+
         for frame in ws
+            last_rx[] = time()
             cmd = JSON.parse(String(frame))
             t = get(cmd, "type", "")
             if t == "open_session"
@@ -752,6 +779,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @warn "BonitoWorker: unknown control frame" type=t
             end
         end
+        hb_alive[] = false
         @info "BonitoWorker: control WS closed by server"
     end
 end
@@ -774,12 +802,37 @@ function report_open_session_failed(ws, sid::AbstractString, reason::AbstractStr
     return nothing
 end
 
-# Live agent subprocesses keyed by their cwd (= the server's `worker_path`, one
-# per chat). Lets a `close_session` control message reap the proc EXPLICITLY when
-# the acp dial-back ws goes half-open in a bind-vs-close race and the relay never
-# reaches its kill (see `handle_close_session`).
-const _SESSION_PROCS = Dict{String,Any}()
+# Live agent sessions keyed by their cwd (= the server's `worker_path`, one per
+# chat): `(proc, ws)` — the agent subprocess and its acp dial-back socket (`ws`
+# is `nothing` until the dial completes). Lets a `close_session` control message
+# — or a control-link loss (`reap_all_sessions!`) — reap the session EXPLICITLY
+# when the dial-back ws is half-open and the relay never reaches its own kill:
+# killing the proc unblocks a relay parked READING it, force-closing the ws
+# transport unblocks relays parked on the SOCKET (a wedged send holds
+# `ws.sendlock`, so only a transport kill gets through — see the server's
+# `force_close_ws!` for the full story).
+const _SESSION_PROCS = Dict{String,NamedTuple{(:proc, :ws),Tuple{Any,Any}}}()
 const _SESSION_PROCS_LOCK = ReentrantLock()
+
+# Reap EVERY live session: control-link loss means the server has already
+# evicted this worker's chat models and abandoned their sessions — an agent we
+# keep running serves nobody, and its lazy re-opened successor (same cwd, fresh
+# proc) would coexist with it. Kill the procs and kill the session transports
+# so relays wedged on half-open sockets (the WLAN→LAN incident) unwind too.
+function reap_all_sessions!(reason::AbstractString)
+    entries = lock(_SESSION_PROCS_LOCK) do
+        snap = collect(_SESSION_PROCS)
+        empty!(_SESSION_PROCS)
+        snap
+    end
+    isempty(entries) && return nothing
+    @info "BonitoWorker: reaping all agent sessions" n=length(entries) reason
+    for (cwd, e) in entries
+        kill_proc!(e.proc)
+        e.ws === nothing || try e.ws.close_transport!() catch end
+    end
+    return nothing
+end
 
 function handle_open_session(ws, server_url::String, secret::String, agent_bin::String,
                               cmd::AbstractDict;
@@ -856,8 +909,9 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     @info "BonitoWorker: ACP session started" sid cwd pid=getpid() provider=provider_str
     # Register the proc BEFORE the acp dial-back so a `close_session` (server's
     # reliable reap over the control ws) can always find it, even if the dial /
-    # ack races with the server tearing the session down.
-    lock(_SESSION_PROCS_LOCK) do; _SESSION_PROCS[cwd] = proc end
+    # ack races with the server tearing the session down. The ws slot is filled
+    # once the dial completes.
+    lock(_SESSION_PROCS_LOCK) do; _SESSION_PROCS[cwd] = (proc = proc, ws = nothing) end
 
     acp_url = ws_url(server_url, "/worker-acp")
     # Outer try/finally guarantees the agent process is reaped on EVERY exit
@@ -872,6 +926,13 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
             ack = JSON.parse(String(WebSockets.receive(ws)))
             get(ack, "ok", false) ||
                 error("server rejected ACP session: $(get(ack, "error", "unknown"))")
+            # Fill the registry's ws slot (only if this session still owns the
+            # entry) so a reap can kill the transport under a wedged relay.
+            lock(_SESSION_PROCS_LOCK) do
+                e = get(_SESSION_PROCS, cwd, nothing)
+                e !== nothing && e.proc === proc &&
+                    (_SESSION_PROCS[cwd] = (proc = proc, ws = ws))
+            end
 
             ws_to_proc = @async relay_ws_to_proc(ws, proc)
             proc_to_ws = @async relay_proc_to_ws(proc, ws)
@@ -893,7 +954,8 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         # Deregister (only if still us — a fast reopen on the same cwd may have
         # replaced the entry) so a late close_session can't kill a newer session.
         lock(_SESSION_PROCS_LOCK) do
-            get(_SESSION_PROCS, cwd, nothing) === proc && delete!(_SESSION_PROCS, cwd)
+            e = get(_SESSION_PROCS, cwd, nothing)
+            e !== nothing && e.proc === proc && delete!(_SESSION_PROCS, cwd)
         end
         # Backstop reap: covers the paths the inner finally never reaches — dial
         # failure, rejected ack, or any throw before the relays start. Idempotent
@@ -912,10 +974,13 @@ end
 function handle_close_session(cmd)
     cwd = String(get(cmd, "cwd", ""))
     isempty(cwd) && return
-    proc = lock(_SESSION_PROCS_LOCK) do; get(_SESSION_PROCS, cwd, nothing) end
-    proc === nothing && return
+    entry = lock(_SESSION_PROCS_LOCK) do; get(_SESSION_PROCS, cwd, nothing) end
+    entry === nothing && return
     @info "BonitoWorker: close_session — reaping agent" cwd
-    kill_proc!(proc)
+    kill_proc!(entry.proc)
+    # Also kill the dial-back transport: a relay parked on a half-open socket
+    # (send holds ws.sendlock) is unreachable by the proc kill alone.
+    entry.ws === nothing || try entry.ws.close_transport!() catch end
 end
 
 # Kill + close an agent process, tolerating an already-dead/closed one.
@@ -1815,7 +1880,7 @@ function entry_from_jsonl(jsonl::AbstractString, pid_map::Dict{String,Int})
     pid     = nothing
     if !is_subagent && haskey(pid_map, sid)
         pid_candidate = pid_map[sid]
-        live = process_running(pid_candidate)
+        live = pid_running(pid_candidate)
         if live === true
             running, pid = true, pid_candidate
         elseif live === false
@@ -1876,7 +1941,7 @@ end
 #   `nothing` — the OS-level check couldn't determine (always show no badge).
 @static if Sys.iswindows()
     const _PROCESS_QUERY_LIMITED_INFORMATION = UInt32(0x1000)
-    function process_running(pid::Integer)
+    function pid_running(pid::Integer)
         try
             h = ccall((:OpenProcess, "kernel32"), Ptr{Cvoid},
                       (UInt32, Cint, UInt32),
@@ -1894,7 +1959,7 @@ end
         end
     end
 else
-    function process_running(pid::Integer)
+    function pid_running(pid::Integer)
         try
             r = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0))
             r == 0 && return true

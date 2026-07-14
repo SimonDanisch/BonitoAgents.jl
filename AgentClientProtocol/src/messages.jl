@@ -87,6 +87,14 @@ mutable struct TaskCall <: ToolCall
     prompt::String
     run_in_background::Bool
     task_name::Union{String,Nothing}
+    # For an ASYNC (`run_in_background`) subagent, claude-agent-acp hands back an
+    # `outputFile` in the launch response's `_meta.claudeCode.toolResponse` (the
+    # subagent's transcript file on the worker). It's the ONLY deterministic
+    # completion signal for a detached subagent — the parent tool_call is marked
+    # `completed` at LAUNCH, never at real completion — so downstream polls this
+    # file (fd-close) exactly like a background bash's output file. "" until the
+    # async-launch update arrives.
+    output_file::String
 end
 
 mutable struct MCPCall <: ToolCall
@@ -203,8 +211,21 @@ for sdk_name in (:Task, :Agent)
             String(get(n.raw_input, "prompt", "")),
             get(n.raw_input, "run_in_background", false) === true,
             _opt_str(get(n.raw_input, "name", nothing)),
+            something(async_output_file(n.raw), ""),   # usually "" on the initial call
         )
     end
+end
+
+# The async subagent's transcript file, dug out of a tool_call(_update)'s
+# `_meta.claudeCode.toolResponse.outputFile` (present on the `async_launched`
+# result). `nothing` when absent (non-async tools, or before the launch ack).
+function async_output_file(raw)
+    raw isa AbstractDict || return nothing
+    meta = get(raw, "_meta", nothing); meta isa AbstractDict || return nothing
+    cc = get(meta, "claudeCode", nothing); cc isa AbstractDict || return nothing
+    tr = get(cc, "toolResponse", nothing); tr isa AbstractDict || return nothing
+    of = get(tr, "outputFile", nothing)
+    (of isa AbstractString && !isempty(of)) ? String(of) : nothing
 end
 
 # MCP tool names land here as `mcp__<server>__<tool>` (see the BonitoMCP
@@ -260,6 +281,21 @@ GenericTool(id::AbstractString, kind::AbstractString, title::AbstractString,
                 Vector{ToolContent}(content), updates,
                 "", Dict{String,Any}())
 
+# ── Subagent activity ────────────────────────────────────────────────────────
+# One subagent event, distilled from a `SubagentUpdate` for the turn's
+# `on_subagent` sink. NOT a `Message`: it is delivered out-of-band (a direct
+# sink call from the parse loop), never through the turn's message channel —
+# the sequential message consumer can be parked inside a long-running tool's
+# snapshot drain, which would starve a channel-delivered feed of exactly the
+# live updates it exists to show.
+struct SubagentActivity
+    parent_id::String    # the parent Task's tool_use id
+    kind::Symbol         # :text | :thought | :tool
+    tool_id::String      # subagent tool_call id; "" for text/thought
+    label::String        # chunk text, or the subagent tool's title
+    status::String       # subagent tool status; "" for text/thought
+end
+
 # ── Per-turn parser ─────────────────────────────────────────────────────────
 # State local to a single prompt loop: the text message currently being
 # streamed (if any) plus the set of tools still awaiting completion.
@@ -269,8 +305,16 @@ mutable struct TurnState
     # Everything the current text message has received so far — used by
     # `text!` to drop claude-agent-acp's handoff duplicate (see there).
     acc::String
+    # Out-of-band sink for subagent-tagged updates (`SubagentUpdate`), called
+    # with each `SubagentActivity` from the parse loop. `nothing` (the
+    # default) drops them — they must NEVER fall through into the main
+    # message stream. Must be fast and non-throwing; it runs on the turn's
+    # coalescer task.
+    on_subagent::Union{Function,Nothing}
 end
-TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "")
+TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "", nothing)
+TurnState(on_subagent::Union{Function,Nothing}) =
+    TurnState(nothing, Dict{String,ToolCall}(), "", on_subagent)
 
 # Closing the turn finishes the trailing message and any still-open tools.
 #
@@ -376,6 +420,15 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
     u.raw_input === nothing || merge_late_input!(tc, u.raw_input)
     u.tool_name === nothing || !(tc isa GenericTool) || (tc.name = u.tool_name)
     isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+    # Async subagent: the `async_launched` update carries the transcript
+    # `outputFile` in `_meta.claudeCode.toolResponse` — the only deterministic
+    # completion signal (the tool_call itself is `completed` at launch). Capture
+    # it onto the TaskCall so the snapshot below hands it downstream BEFORE the
+    # launch-ack `completed` closes the tool.
+    if tc isa TaskCall && isempty(tc.output_file)
+        of = async_output_file(u.raw)
+        of === nothing || (tc.output_file = of)
+    end
     push_snapshot!(tc.updates, tc)
     is_terminal(tc.status) && (close(tc); delete!(st.tools, tc.id))
     return nothing
@@ -392,6 +445,37 @@ end
 # which are content boundaries).
 parse_update!(out, st, u::ConfigOptionUpdateNotif) = (put!(out, ConfigUpdate(u.options)); nothing)
 parse_update!(out, st, u::CurrentModeUpdateNotif)  = (put!(out, ModeUpdate(u.mode_id)); nothing)
+
+# Subagent-tagged updates: NEVER coalesced into the main stream (no
+# current_message touch, no st.tools entry, nothing put! on `out`) — that
+# interleaving is exactly the bug this arm exists to prevent. Distill the
+# update into a `SubagentActivity` and hand it to the turn's sink; without a
+# sink (or for update kinds that carry no feed signal — plans, config, user
+# echoes) the update is dropped.
+function parse_update!(out, st, u::SubagentUpdate)
+    act = subagent_activity(u.parent_tool_use_id, u.update)
+    if act === nothing || st.on_subagent === nothing
+        @debug "ACP: dropping subagent update (no sink / no feed signal)" parent_tool_use_id = u.parent_tool_use_id typeof(u.update)
+        return nothing
+    end
+    st.on_subagent(act)
+    return nothing
+end
+
+# What a subagent update contributes to its parent's activity feed. Text /
+# thought chunks carry their text; tool notifications the tool's title +
+# status. Everything else (plan, config/mode, user echo, unknown) is `nothing`.
+function subagent_activity(pid::String, u::Union{AgentMessageChunk,AgentThoughtChunk})
+    t = text_of(u)
+    t === nothing || isempty(t) ? nothing :
+        SubagentActivity(pid, u isa AgentThoughtChunk ? :thought : :text, "", t, "")
+end
+subagent_activity(pid::String, u::ToolCallNotif) =
+    SubagentActivity(pid, :tool, u.tool_call_id, u.title, u.status)
+subagent_activity(pid::String, u::ToolCallUpdateNotif) =
+    SubagentActivity(pid, :tool, u.tool_call_id,
+                     something(u.title, ""), something(u.status, ""))
+subagent_activity(::String, ::SessionUpdate) = nothing
 
 parse_update!(::Any, ::Any, ::SessionUpdate) = nothing   # UnknownUpdate: ignore, don't disturb the stream
 

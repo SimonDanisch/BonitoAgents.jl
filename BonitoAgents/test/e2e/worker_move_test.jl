@@ -91,7 +91,7 @@
             # project's `worker_id` is the dict key of the worker it was created
             # on; pick a DIFFERENT online worker as the move target.
             worker_a_id = p.worker_id
-            online_ids  = [w.worker_id for w in values(state.workers[]) if w.status === :online]
+            online_ids  = [w.worker_id for w in values(state.workers[]) if w.online[]]
             target_id   = first(filter(!=(worker_a_id), online_ids))
             worker_b    = state.workers[][target_id]
             worker_a    = state.workers[][worker_a_id]

@@ -81,7 +81,11 @@ mkpath(RESUME_SHOT_DIR)
             any(p -> p.resume_session_id == sid, values(state.projects[]))
         end
 
-        # ── 3. The resumed session is gone from the discover list (the fix) ────
+        # ── 3. The resumed session STAYS in the discover list, pilled ──────────
+        # Discover is unconditional now (hiding imported rows made sessions look
+        # lost whenever sidebar state and discover disagreed): the row remains
+        # visible, tagged with an "in sidebar" pill, and re-clicking it reuses
+        # the existing thread (`find_thread` dedup) rather than duplicating.
         TK.eval_js(s, """(() => {
             const h = [...document.querySelectorAll('.bt-side-item')].find(e => /Home/i.test(e.innerText));
             if (h) h.click();
@@ -89,8 +93,15 @@ mkpath(RESUME_SHOT_DIR)
         TK.wait_for(s, "back on dashboard",
             "document.querySelector('.bt-worker-cell, .bt-card') !== null"; timeout = 10)
         TK.eval_js(s, "document.querySelectorAll('details').forEach(d=>d.open=true); true")
-        sleep(0.5)
-        @test TK.eval_js(s, """document.querySelectorAll('[data-bt-session-id="$sid"]').length""") == 0
+        @test TK.wait_for(s, "resumed row still in discover",
+            """document.querySelectorAll('[data-bt-session-id="$sid"]').length >= 1"""; timeout = 10) == true
+        @test TK.wait_for(s, "row carries the 'in sidebar' pill",
+            """(() => {
+                const btn = document.querySelector('[data-bt-session-id="$sid"]');
+                const row = btn && btn.closest('.bt-session-row');
+                return !!row && [...row.querySelectorAll('.bt-pill')].some(p =>
+                    (p.textContent||'') === 'in sidebar' && !p.classList.contains('bt-hidden'));
+            })()"""; timeout = 10) == true
     finally
         close(s)
     end

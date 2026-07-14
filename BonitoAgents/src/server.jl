@@ -54,7 +54,9 @@ function serve(; host::String        = "0.0.0.0",
                  public_url::Union{String,Nothing}   = nothing,
                  worker_secret::String,
                  state_dir::Union{String,Nothing}   = nothing,
-                 working_dir::Union{String,Nothing} = nothing)
+                 working_dir::Union{String,Nothing} = nothing,
+                 heartbeat_interval::Real = 15.0,
+                 heartbeat_deadline::Real = 45.0)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
     isvalid(s) = s !== nothing && !isempty(String(s))
@@ -63,11 +65,13 @@ function serve(; host::String        = "0.0.0.0",
     wd = isvalid(working_dir) ? String(working_dir) :
          joinpath(homedir(), "bonitoagents-server")
 
-    state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret)
+    state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret,
+                          heartbeat_interval = heartbeat_interval,
+                          heartbeat_deadline = heartbeat_deadline)
 
     # Mark all loaded workers offline; they'll flip online when they re-dial.
     for w in values(state.workers[])
-        w.status = :offline
+        w.online[] = false
     end
 
     # Survive long browser disconnects (phone goes into pocket, laptop sleeps,
@@ -94,6 +98,7 @@ function serve(; host::String        = "0.0.0.0",
     state.base_url[] = rstrip(base_url, '/')
     add_install_routes!(srv, base_url, worker_secret)
     add_acp_log_routes!(srv, state)
+    add_download_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
 
     # The background-output poller is no longer a server-wide loop — it's
@@ -273,6 +278,108 @@ function acp_log_response(state::ServerState, project_id::AbstractString)
         body = read(path, String))
 end
 
+# /download/<pid>?path=<worker-abs-path> — stream a worker file back to the
+# browser as an attachment. The file tree's ⤓ button navigates here. The file
+# is fetched from the worker on demand (RemoteSync over the control WS), so it
+# works whether or not the project is synced to the server. The `path` MUST live
+# inside the project's worker tree — a normalized-prefix check blocks traversal /
+# arbitrary worker reads. The route regex captures only the pid; the path rides
+# in the query string (so slashes survive without extra encoding rules).
+const DOWNLOAD_ROUTE_RE = r"^/download/([A-Za-z0-9_-]+)"
+
+function add_download_routes!(srv::Bonito.Server, state::ServerState)
+    Bonito.route!(srv, DOWNLOAD_ROUTE_RE => function(context)
+        pid    = String(context.match.captures[1])
+        params = HTTP.queryparams(HTTP.URI(context.request.target))
+        download_response(state, pid, String(get(params, "path", "")))
+    end)
+    Bonito.route!(srv, ATTACHMENT_ROUTE_RE => function(context)
+        pid    = String(context.match.captures[1])
+        params = HTTP.queryparams(HTTP.URI(context.request.target))
+        attachment_response(state, pid, String(get(params, "file", "")))
+    end)
+end
+
+# /attachment/<pid>?file=<name> — serve a pasted/dropped image from the
+# project's `.bt-attachments/` dir so user bubbles can render it INLINE
+# (`msg_to_dict(::UserMsg)` builds these URLs). Unlike /download this reads
+# the SERVER mirror directly — `save_attachment` wrote the file there, so no
+# worker round-trip — and serves inline with the real image mime. `file` must
+# be a bare filename; anything path-like is rejected (the attachment dir is
+# the whole exposed surface). Filenames are timestamp+uuid — immutable — so
+# the response is cacheable forever.
+const ATTACHMENT_ROUTE_RE = r"^/attachment/([A-Za-z0-9_-]+)"
+
+function attachment_response(state::ServerState, project_id::AbstractString,
+                             file::AbstractString)
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid project id\n")
+    proj = get(state.projects[], project_id, nothing)
+    proj === nothing &&
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "unknown project '$project_id'\n")
+    # Bare, well-formed filename only — no separators, no dot-dot, one of the
+    # extensions `save_attachment` can produce.
+    occursin(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9]+$", file) ||
+        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid attachment name\n")
+    mime = get(ATTACHMENT_MIME_BY_EXT, lowercase(lstrip(splitext(file)[2], '.')), nothing)
+    mime === nothing &&
+        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "unsupported attachment type\n")
+    path = joinpath(proj.server_path, ATTACHMENT_DIR_NAME, file)
+    isfile(path) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "no such attachment\n")
+    return HTTP.Response(200,
+        ["Content-Type"  => mime,
+         "Cache-Control" => "public, max-age=31536000, immutable"],
+        body = read(path))
+end
+
+# Strip anything that could break (or smuggle a header into) the
+# Content-Disposition filename. Keep it plain.
+download_filename(name::AbstractString) =
+    replace(String(name), r"[\"\r\n\\/]" => "_")
+
+# Plain function (no live HTTP server needed) so tests can call it directly.
+function download_response(state::ServerState, project_id::AbstractString,
+                           path::AbstractString)
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid project id\n")
+    proj = get(state.projects[], project_id, nothing)
+    proj === nothing &&
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "unknown project '$project_id'\n")
+    isempty(path) &&
+        return HTTP.Response(400, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "missing ?path\n")
+    # Security: the requested path must resolve INSIDE the project's worker tree.
+    wroot = normpath(String(proj.worker_path))
+    npath = normpath(String(path))
+    (npath == wroot || startswith(npath, wroot * "/")) ||
+        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "path is outside the project\n")
+    tmp = tempname()
+    try
+        fetch_file_from_worker(state, proj.worker_id, npath, tmp; handoff_timeout = 120.0)
+        data = read(tmp)
+        return HTTP.Response(200,
+            ["Content-Type"        => "application/octet-stream",
+             "Content-Disposition" => "attachment; filename=\"$(download_filename(basename(npath)))\"",
+             "Cache-Control"       => "no-cache"],
+            body = data)
+    catch e
+        @warn "download: fetch from worker failed" project_id path exception = (e, catch_backtrace())
+        return HTTP.Response(502, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "could not fetch file from worker\n")
+    finally
+        rm(tmp; force = true)
+    end
+end
+
 esc_html(s::AbstractString) = replace(s,
     "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\"" => "&quot;")
 
@@ -306,8 +413,11 @@ Resolves in order:
   2. The monorepo's checked-out branch (best-effort via `git rev-parse
      --abbrev-ref HEAD`; falls back to the exact sha when the repo is in
      detached-HEAD state).
-  3. Fallback `"main"` if we can't locate the monorepo (e.g. the package
-     was installed via `Pkg.add` from the registry — no git working tree).
+  3. No git working tree (a release bundle, or installed via `Pkg.add`):
+     the `v<version>` tag for a clean release version — a bundle is built
+     FROM that tag (build-app.yml), so workers land on exactly the code the
+     server runs. A prerelease/build-suffixed version (e.g. `0.2.0-DEV` on
+     `main` between releases) can only guess `"main"`.
 
 Called per request so a `git checkout` on the server side propagates to the
 next worker install without restarting.
@@ -317,13 +427,20 @@ function current_repo_rev()
     isempty(override) || return override
 
     pkg = pkgdir(@__MODULE__)
-    pkg === nothing && return "main"
+    pkg === nothing && return install_rev_for(pkgversion(@__MODULE__))
     # `pkgdir` returns `<monorepo>/BonitoAgents`; the monorepo (where `.git`
     # lives) is one level up. `.git` may be a directory (normal clone) or a
     # file (submodule / worktree); both count.
     repo_root = abspath(pkg, "..")
-    return _git_head_ref_of(repo_root, "main")
+    return _git_head_ref_of(repo_root, install_rev_for(pkgversion(@__MODULE__)))
 end
+
+# The install rev for a git-less deployment, from the running package version:
+# a clean release version maps to its `v<version>` tag (what release bundles
+# are built from); a prerelease/build suffix or unknown version means "not a
+# tagged release" — `main` is the only honest guess then.
+install_rev_for(v::Union{VersionNumber,Nothing}) =
+    v !== nothing && isempty(v.prerelease) && isempty(v.build) ? "v$(v)" : "main"
 
 # Helper: best-effort `(branch | sha)` for a working-tree path. Returns
 # `default` when the path isn't a git checkout or git refuses to answer.

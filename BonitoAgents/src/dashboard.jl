@@ -410,6 +410,32 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
                        mcp_servers = mcp,
                        agent       = agent)
     register_chat_model!(model)      # LAZY: register for viewing; bind on first turn
+
+    # A RESUMED chat keeps its conversation only in claude's session — it replays
+    # via `session/load` when the agent binds. Lazy binding defers that to the
+    # first turn, so a freshly imported chat (no server-side `chat.md` history
+    # yet) opens BLANK until the user types ("an old chat is sometimes empty").
+    # When we're resuming and have no local history to show, bind the agent NOW
+    # so the history replays straight away. Async so the chat view still mounts
+    # instantly; the replayed `msgs.count` fills it in. (A chat that already has
+    # `chat.md` history renders it immediately and needs no eager bind — and
+    # skipping it there also avoids a needless `reconcile_replay!`.)
+    # ALSO bind eagerly when we DO have local history but the session's jsonl
+    # has advanced since our last reconcile (the user continued the session in
+    # the Claude Code CLI / another server): without this the chat shows a
+    # frozen snapshot until the first send — and the bind-triggered reconcile
+    # then floods the adopted history in around the user's message. The
+    # watermark is a per-chat stamp file updated after every reconcile; the
+    # session's freshness comes from the worker scan (`state.discovered`).
+    if p.resume_session_id !== nothing &&
+       (isempty(shared(model).msgs_store) || session_advanced_since_sync(state, p))
+        Base.errormonitor(@async try
+            restart_chat_session!(model)
+        catch e
+            @warn "eager history replay on open failed" project_id = p.id exception = (e, catch_backtrace())
+        end)
+    end
+
     fire_auto_prompt!(model)
     return model
 end
@@ -437,9 +463,9 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         m
     end
     # close is idempotent + total now; a real error here is worth surfacing.
-    # `close(model)` (T4) closes `user_messages`, ending the `run_chat!` consumer
-    # AND the 1 Hz background poller — without it both leak forever, the running
-    # `poller_task` keeping the ChatModel referenced. Close the model BEFORE the
+    # `close(model)` (T4) closes `user_messages` (ending the `run_chat!` consumer)
+    # and the TaskBar's own 1 Hz poll loop — without it both leak forever, the
+    # running loops keeping the ChatModel referenced. Close the model BEFORE the
     # client so the consumer's `for … in user_messages` exits cleanly rather
     # than erroring on a torn-down client mid-turn.
     if model !== nothing
@@ -483,7 +509,7 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
     haskey(state.workers[], target_id) ||
         error("Unknown worker: $target_id")
     target_w = state.workers[][target_id]
-    target_w.status === :online ||
+    isopen(target_w) ||
         error("Worker '$(target_w.name)' is offline")
     target_id == p.worker_id && return p   # no-op
 
@@ -497,7 +523,7 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
     # this, any edits made on the source worker in an external editor
     # since the last "Sync to server" would be silently lost on the move.
     source_online = haskey(state.workers[], p.worker_id) &&
-                    state.workers[][p.worker_id].status === :online
+                    isopen(state.workers[][p.worker_id])
     if source_online
         source_name = state.workers[][p.worker_id].name
         notify_progress(progress, :phase,
@@ -592,7 +618,7 @@ function copy_to!(state::ServerState, p::ProjectInfo, target_worker_id::Abstract
     # 1. Pull source worker → server, so server has latest. Safe to skip
     # if source worker is offline — we still copy from whatever's on disk.
     if haskey(state.workers[], p.worker_id) &&
-       state.workers[][p.worker_id].status === :online
+       isopen(state.workers[][p.worker_id])
         notify_progress(progress, :phase,
             (msg = "Pulling latest from $(p.worker_id)…",))
         sync!(state, p; progress = progress)
@@ -703,8 +729,11 @@ const DashboardStyles = Bonito.Styles(
         "display" => "flex", "flex-direction" => "column", "gap" => "4px"),
 
     # ── Header + tagline ─────────────────────────────────────────────────────
+    # `wrap` so the recent-chats overview (flex-basis 100%, overview.jl) drops
+    # onto its own full-width line under the wordmark + tagline row.
     CSS(".bt-header",
         "display" => "flex", "align-items" => "baseline",
+        "flex-wrap" => "wrap",
         "justify-content" => "space-between", "gap" => "16px",
         "margin-bottom" => "4px"),
     CSS(".bt-header h1",
@@ -2314,7 +2343,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.select(
             # Show w.name (mutable display label) but submit w.worker_id
             # (stable UUID, the dict key into state.workers).
+            # The class is a stable hook: tests / tooling target THIS select —
+            # "first visible <select>" broke once the dashboard grew the
+            # session-config pills (also native selects).
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
+            class = "bt-np-worker-select",
             onchange = js"event => $(np_worker).notify(event.target.value)"),
         # Form action row — the global progress card is the visual feedback
         # for the in-flight submit; click handlers guard against double-fire.
@@ -2332,6 +2365,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.label("Worker"),
         DOM.select(
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
+            class = "bt-gh-worker-select",
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
         DOM.div(gh_cancel, gh_submit, class = "bt-form-actions"),
         class = "bt-form")
@@ -2344,7 +2378,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # ── Stats strip ──────────────────────────────────────────────────────────
     # Stats touch both worker counts and project counts → listen to both.
     stats_strip = map(state.workers, state.projects) do workers, projects
-        online   = count(w -> w.status == :online, values(workers))
+        online   = count(isopen, values(workers))
         total    = length(workers)
         n_proj   = length(projects)
         n_active = count(p -> p.locked_by !== nothing, values(projects))
@@ -2568,7 +2602,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                         draggable = "false"),
                 "BonitoAgents"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";
-                    class = "bt-tagline");
+                    class = "bt-tagline"),
+            # Recent-chats overview — the header IS the landing overview: the
+            # last 6 chats as clickable cards (title, count, last prompts,
+            # last image), kept fresh via chat_signal/projects (overview.jl).
+            recent_chats_dom(session, state, current_view);
             class = "bt-header"),
         stats_strip,
         error_block,
@@ -2584,7 +2622,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             new_proj_btn,
             gh_btn;
             class = "bt-section"),
-        form_block;
+        form_block,
+
+        DOM.div(
+            DOM.h2("Defaults"),
+            DOM.div("Applied to new & unconfigured chats; a chat's own picks override.";
+                    class = "bt-defaults-hint"),
+            session_defaults_bar(session, state);
+            class = "bt-section");
 
         class = "bt-dash")
 end

@@ -38,6 +38,13 @@ agent_script(prompt) = occursin("error", lowercase(prompt)) ? [
             content = [TK.text_block("renamed src/old.jl -> src/new.jl")]),
     TK.tool(kind = "fetch", title = "fetch", id = "fetch-1", tool_name = "WebFetch",
             content = [TK.text_block("Fetched https://example.com/docs/page ok")]),
+    # A control MCP tool (bt_julia_interrupt): no output reveals WHAT it acted
+    # on, so it must ship its `executed_preview` as an always-visible command
+    # preview. `env_path` rides rawInput.
+    TK.tool(kind = "other", title = "bt_julia_interrupt", id = "int-1",
+            tool_name = "mcp__btworker__bt_julia_interrupt",
+            raw_input = Dict{String,Any}("env_path" => "/tmp/proj-x"),
+            content = [TK.text_block("interrupted")]),
     # Execute tool that stays live so the status pill is observable mid-flight.
     TK.tool(kind = "execute", title = "long task", id = "prog-1", open_status = "pending",
             complete = false),
@@ -98,6 +105,26 @@ function run_suite(server)
                 "$(body_has("search-1")).querySelectorAll('.bt-search-row').length === 3"; timeout = 8) == true
             @test TK.eval_js(server,
                 "$(body_has("search-1")).querySelector('.bt-search-row .bt-search-path').textContent") == "src/a.jl"
+        end
+
+        # NOTE: bt_julia_eval body rendering (typed Code/Output sections + the
+        # live result fragment) is covered end-to-end against the REAL eval chain
+        # in `e2e:bt_eval` / `e2e:bt_eval_types` — hand-built eval content can't
+        # match the real `[code-echo, stdout, html]` structure the typed render
+        # expects, so no fixture-driven eval-body test here.
+
+        @testset "control MCP tool always shows what it executes (.bt-cmd-preview)" begin
+            # bt_julia_interrupt renders no output that reveals its target, so
+            # the header ships `executed_preview` → an always-visible command
+            # preview (the same block bash uses). Dispatched on the message TYPE
+            # (JuliaInterruptToolMsg), never a tool-name/kind string match.
+            @test TK.wait_for(server, "interrupt action preview visible",
+                """(() => { for (const m of document.querySelectorAll('.bt-tool-msg')) {
+                    if (m.querySelector('.bt-tool-body[data-tool-id="int-1"]')) {
+                        const p = m.querySelector('.bt-cmd-preview pre');
+                        return !!p && p.textContent.indexOf('interrupt (SIGINT)') !== -1
+                                  && p.textContent.indexOf('/tmp/proj-x') !== -1; } }
+                    return false; })()"""; timeout = 8) == true
         end
 
         @testset "read renders the file body as code" begin

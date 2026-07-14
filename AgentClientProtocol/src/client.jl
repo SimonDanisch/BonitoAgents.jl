@@ -176,8 +176,15 @@ end
 # outlives the turn.
 #
 # `images` are appended after the text as ACP image content blocks.
+#
+# `on_subagent` is the turn's out-of-band sink for subagent-tagged updates
+# (`_meta.claudeCode.parentToolUseId`): called with each `SubagentActivity`
+# straight from the coalescer task, so a live parent-Task feed keeps moving
+# even while the message consumer is parked inside another message's drain.
+# `nothing` drops subagent updates (they never reach the message channel).
 function prompt!(client::Client, text::String;
-                 images::Vector{ImageAttachment} = ImageAttachment[])
+                 images::Vector{ImageAttachment} = ImageAttachment[],
+                 on_subagent::Union{Function,Nothing} = nothing)
     blocks = Any[Dict("type" => "text", "text" => text)]
     for img in images
         push!(blocks, Dict(
@@ -190,7 +197,7 @@ function prompt!(client::Client, text::String;
     updates, response = prompt_updates(client.conn, params)
     conn = client.conn
     return Channel{Message}(BUF) do messages
-        st = TurnState()
+        st = TurnState(on_subagent)
         try
             for u in updates
                 # Once cancel is issued, stop coalescing/rendering and just
@@ -291,10 +298,11 @@ end
 # Set one of the session's configurable options (model / mode / effort / …).
 # Wire method: `session/set_config_option` with `{sessionId, configId, value}`,
 # per the ACP SDK (zSetSessionConfigOptionRequest) and claude-agent-acp's
-# setSessionConfigOption handler. Returns whatever the agent responds with
-# (claude-agent-acp returns an empty object). Throws on rpc error; the caller
-# is expected to either rely on the agent's follow-up `config_option_update`
-# notification to confirm the new value, or surface the error to the user.
+# setSessionConfigOption handler. Returns the agent's response result, which —
+# for claude-agent-acp 0.42.0 — carries the COMPLETE updated `configOptions`
+# (the new value applied, or the actual value if the agent clamped/rejected the
+# request). So the response is the authoritative post-set state; callers should
+# read it back rather than assume the value took. Throws on rpc error.
 function set_config_option!(client::Client, config_id::AbstractString,
                             value::AbstractString)
     return send_request(client.conn, "session/set_config_option",

@@ -94,6 +94,7 @@ class BonitoChat {
         this._spacerTopH = -1;
         this._spacerBotH = -1;
         this._requestedAt = new Map();
+        this._epoch = 0;
         this.STREAM_APPLY_MS = 100;
         this._ro = new ResizeObserver((entries)=>{
             if (this.destroyed) return;
@@ -114,9 +115,12 @@ class BonitoChat {
         this.parked = new Set();
         this.appLru = [];
         this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
+        this.PAD_TOP = parseFloat(getComputedStyle(container).paddingTop) || 0;
         this.followMode = true;
         this.unreadCount = 0;
+        this._pillShown = false;
         this.AT_BOTTOM_PX = 20;
+        this._prevScrollTop = container.scrollTop;
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.toolbarEl = (container.closest('.bt-app') || container.parentElement).querySelector('.bt-chat-toolbar');
@@ -262,7 +266,8 @@ class BonitoChat {
             if (this.destroyed) return;
             const delta = vel * 16;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            let newTop = this.container.scrollTop - delta;
+            const prevTop = this.container.scrollTop;
+            let newTop = prevTop - delta;
             let hitEdge = false;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + -newTop * 0.40);
@@ -275,6 +280,8 @@ class BonitoChat {
             } else {
                 this.container.scrollTop = newTop;
             }
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             this._lastUserInputT = performance.now();
             vel = hitEdge ? 0 : vel * PAN_FRICTION;
             if (Math.abs(vel) < 0.03) {
@@ -323,7 +330,8 @@ class BonitoChat {
             const stepDy = e.clientY - p.lastY;
             const stepDt = now - p.lastT;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            const newTop = this.container.scrollTop - stepDy;
+            const prevTop = this.container.scrollTop;
+            const newTop = prevTop - stepDy;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + -newTop * 0.55);
                 this.container.scrollTop = 0;
@@ -334,6 +342,8 @@ class BonitoChat {
                 if (this._overscroll !== 0) setOverscroll(0);
                 this.container.scrollTop = newTop;
             }
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             if (stepDt > 0) {
                 const instant = stepDy / stepDt;
                 p.velocity = 0.65 * instant + 0.35 * p.velocity;
@@ -371,12 +381,16 @@ class BonitoChat {
             const userDriven = this._scrollbarDrag || this._pendingUserScroll || performance.now() - this._lastUserInputT < 400;
             this._pendingUserScroll = false;
             const atBot = this.atBottom();
+            const prevTop = this._prevScrollTop;
+            this._prevScrollTop = this.container.scrollTop;
             if (userDriven) {
-                this.setFollowMode(atBot);
-                if (!atBot) this._cancelPendingScroll();
+                if (this.container.scrollTop !== prevTop) {
+                    this._applyUserScroll(prevTop);
+                }
             } else if (this.followMode && !atBot) {
                 this._queueScrollToBottom();
             }
+            this._updateScrollAffordance(atBot);
             this.refresh();
         };
         container.addEventListener('scroll', this._onScroll, {
@@ -486,6 +500,8 @@ class BonitoChat {
         switch(msg.type){
             case 'msgs.count':
                 return this.applyCount(msg.n);
+            case 'msgs.reload':
+                return this.onMsgsReload(msg.n);
             case 'turn_begin':
                 this.turnSeq = msg.seq;
                 return;
@@ -526,6 +542,8 @@ class BonitoChat {
                 return this.onThoughtBody(msg);
             case 'tool_update':
                 return this.onToolUpdate(msg);
+            case 'task_activity':
+                return this.onTaskActivity(msg);
             case 'plan_update':
                 return this.onPlanUpdate(msg);
             case 'chunk':
@@ -546,6 +564,26 @@ class BonitoChat {
             case 'summary':
                 return this.appendNewMessage(msg);
         }
+    }
+    onMsgsReload(n) {
+        for (const node of this.cache.values())node.remove();
+        this.cache.clear();
+        this.heights.clear();
+        this.rendered.clear();
+        this.nodeById.clear();
+        this.observed.clear();
+        this._requestedAt.clear();
+        this._cancelPendingScroll();
+        this._epoch++;
+        this._prefetchStarted = false;
+        this._prefetchCursor = null;
+        this._prefetchPending = null;
+        clearTimeout(this._prefetchTimer);
+        this.totalCount = 0;
+        this._bootstrapped = false;
+        this.followMode = true;
+        this.unreadCount = 0;
+        this.applyCount(n);
     }
     applyCount(n) {
         if (n <= 0) {
@@ -619,6 +657,7 @@ class BonitoChat {
     }
     _prefetchTick() {
         if (this.destroyed) return;
+        if (this._prefetchPaused) return;
         let e = -1;
         for(let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--){
             if (!this.cache.has(i)) {
@@ -639,7 +678,8 @@ class BonitoChat {
             range: [
                 s,
                 e
-            ]
+            ],
+            epoch: this._epoch
         });
         clearTimeout(this._prefetchTimer);
         this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 2000);
@@ -705,7 +745,8 @@ class BonitoChat {
                     range: [
                         missing[0],
                         missing[missing.length - 1]
-                    ]
+                    ],
+                    epoch: this._epoch
                 });
             }
         }
@@ -713,9 +754,11 @@ class BonitoChat {
         const userDriving = this._scrollbarDrag || this._pendingUserScroll || performance.now() - this._lastUserInputT < 400;
         if (wasAtBottom && !userDriving && this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
+            this._prevScrollTop = this.container.scrollTop;
         }
     }
-    onRange({ start , msgs  }) {
+    onRange({ start , msgs , epoch  }) {
+        if (epoch !== undefined && epoch !== null && epoch !== this._epoch) return;
         const messages = msgs ?? [];
         const fresh = [];
         messages.forEach((data, i)=>{
@@ -732,7 +775,7 @@ class BonitoChat {
             ]);
         });
         this._measureNodes(fresh);
-        if (this._prefetchStarted) {
+        if (this._prefetchStarted && !this._prefetchPaused) {
             clearTimeout(this._prefetchTimer);
             this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 30);
         }
@@ -802,8 +845,41 @@ class BonitoChat {
             if (!this.destroyed) this.refresh();
         });
     }
+    _captureAnchor(excludeKey = null) {
+        const st = this.container.scrollTop;
+        for (const i of [
+            ...this.rendered
+        ].sort((a, b)=>a - b)){
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (excludeKey && n.dataset.filterKey === excludeKey) continue;
+            if (n.offsetTop + n.offsetHeight > st) {
+                return {
+                    idx: i,
+                    off: n.offsetTop - st
+                };
+            }
+        }
+        return null;
+    }
+    _restoreAnchor(a) {
+        if (!a) return;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        let want;
+        if (n && n.isConnected) {
+            want = n.offsetTop - a.off;
+        } else {
+            want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
+            this._queueRefresh();
+        }
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
     updateDOM(s, e) {
         if (s > e) return;
+        const anchor = this.initialLoad ? null : this._captureAnchor();
         for (const idx of [
             ...this.rendered
         ]){
@@ -849,6 +925,7 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
+        this._restoreAnchor(anchor);
     }
     touchApp(idx) {
         const i = this.appLru.indexOf(idx);
@@ -960,6 +1037,7 @@ class BonitoChat {
     appendChunk(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        if (node.__btFinal) return;
         if (msg.html !== undefined) {
             this._applyStreamHtml(node, msg.html);
         } else if (msg.text !== undefined) {
@@ -989,7 +1067,7 @@ class BonitoChat {
         if (node.__btStreamTimer != null) return;
         const flush = ()=>{
             node.__btStreamTimer = null;
-            if (this.destroyed || node.__btStreamHtml == null) return;
+            if (this.destroyed || node.__btFinal || node.__btStreamHtml == null) return;
             node.innerHTML = node.__btStreamHtml;
             node.__btStreamHtml = null;
             node.__btStreamTimer = setTimeout(flush, this.STREAM_APPLY_MS);
@@ -1005,10 +1083,25 @@ class BonitoChat {
     }
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (node && msg.html) {
+        if (node) {
             this._clearPendingStream(node);
-            node.innerHTML = msg.html;
+            node.innerHTML = msg.html || '';
             linkifyPaths(node);
+            decorateCodeBlocks(node);
+            node.__btFinal = true;
+            return;
+        }
+        let tgt = msg.id ? this.container.querySelector(`.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`) : null;
+        if (!tgt) {
+            const nodes = this.container.querySelectorAll('.bt-agent-msg');
+            tgt = nodes[nodes.length - 1];
+        }
+        if (tgt) {
+            this._clearPendingStream(tgt);
+            tgt.innerHTML = msg.html || '';
+            linkifyPaths(tgt);
+            decorateCodeBlocks(tgt);
+            tgt.__btFinal = true;
         }
     }
     onThoughtFinal(msg) {
@@ -1072,11 +1165,18 @@ class BonitoChat {
         if (!msg.key || !Array.isArray(msg.fields)) return;
         if (this.container.querySelector(`.bt-permission-card[data-perm-key="${CSS.escape(msg.key)}"]`)) return;
         const card = document.createElement('div');
-        card.className = 'bt-permission-card';
+        card.className = 'bt-permission-card bt-question-card';
         card.dataset.permKey = msg.key;
         const q = document.createElement('div');
-        q.className = 'bt-permission-question';
-        q.textContent = msg.message || 'The agent has a question';
+        q.className = 'bt-permission-question bt-question-prompt';
+        const icon = document.createElement('span');
+        icon.className = 'bt-question-icon';
+        icon.textContent = '?';
+        icon.setAttribute('aria-hidden', 'true');
+        const qtext = document.createElement('span');
+        qtext.textContent = msg.message || 'The agent has a question';
+        q.appendChild(icon);
+        q.appendChild(qtext);
         card.appendChild(q);
         const selects = msg.fields.filter((f)=>f.kind === 'select' || f.kind === 'multiselect');
         const texts = msg.fields.filter((f)=>f.kind === 'text');
@@ -1213,6 +1313,17 @@ class BonitoChat {
         if (msg.command) {
             const h = node.querySelector('.bt-tool-header');
             if (h) h.title = msg.command;
+            let cp = node.querySelector('.bt-cmd-preview');
+            if (cp) {
+                cp.querySelector('pre').textContent = msg.command;
+            } else if (h) {
+                cp = document.createElement('div');
+                cp.className = 'bt-cmd-preview';
+                const pre = document.createElement('pre');
+                pre.textContent = msg.command;
+                cp.appendChild(pre);
+                h.insertAdjacentElement('afterend', cp);
+            }
         }
         if (msg.summary != null) {
             const s = node.querySelector('.bt-tool-summary');
@@ -1294,6 +1405,51 @@ class BonitoChat {
             }
         }
     }
+    onTaskActivity(msg) {
+        const node = this.nodeById.get(msg.id);
+        if (!node || !msg.entry) return;
+        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry);
+    }
+    _ensureTaskFeed(node) {
+        let feed = node.querySelector('.bt-task-feed');
+        if (feed) return feed;
+        feed = document.createElement('div');
+        feed.className = 'bt-task-feed';
+        feed.innerHTML = `
+            <div class="bt-task-feed-head" data-expanded="false">
+                <span class="bt-tool-toggle">▶</span>
+                <span class="bt-task-feed-title">subagent activity</span>
+                <span class="bt-task-feed-count"></span>
+            </div>
+            <div class="bt-task-feed-list"></div>`;
+        node.querySelector('.bt-tool-header')?.insertAdjacentElement('afterend', feed) || node.appendChild(feed);
+        const list = feed.querySelector('.bt-task-feed-list');
+        feed._collapsable = new Collapsable(feed.querySelector('.bt-task-feed-head'), list, {
+            toggleEl: feed.querySelector('.bt-task-feed-head .bt-tool-toggle')
+        });
+        if (node.classList.contains('bt-tool-live')) {
+            feed._collapsable.setExpanded(true);
+        } else {
+            list.style.display = 'none';
+        }
+        return feed;
+    }
+    _upsertTaskFeedEntry(feed, e) {
+        const list = feed.querySelector('.bt-task-feed-list');
+        let row = e.eid != null ? list.querySelector(`[data-eid="${CSS.escape(String(e.eid))}"]`) : null;
+        if (!row) {
+            row = document.createElement('div');
+            row.dataset.eid = String(e.eid ?? '');
+            list.appendChild(row);
+            while(list.children.length > 50)list.removeChild(list.firstChild);
+        }
+        row.className = `bt-task-feed-entry bt-task-feed-${e.kind || 'text'}` + (e.status ? ` bt-feed-${e.status}` : '');
+        row.textContent = e.kind === 'tool' ? `⚙ ${e.label || ''}` : e.label || '';
+        if (e.kind === 'tool' && e.status) row.title = e.status;
+        const count = feed.querySelector('.bt-task-feed-count');
+        if (count) count.textContent = String(list.children.length);
+        if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
+    }
     noteKey(msg) {
         const key = filterKey(msg);
         if (!key || this.seenTypes.has(key)) return;
@@ -1329,6 +1485,7 @@ class BonitoChat {
         this.refresh();
     }
     setKeyHidden(key, hidden) {
+        const anchor = this.followMode ? null : this._captureAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache){
             if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
@@ -1336,6 +1493,7 @@ class BonitoChat {
         if (key === 'agent') this._updateWaiting();
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
+        else if (anchor) this._restoreAnchor(anchor);
     }
     _updateWaiting() {
         if (!this.waitingEl) return;
@@ -1351,10 +1509,34 @@ class BonitoChat {
             case 'user':
                 div.className = 'bt-user-msg';
                 if (msg.queued) div.classList.add('bt-queued');
+                if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
+                if (Array.isArray(msg.attachments) && msg.attachments.length) {
+                    const gallery = document.createElement('div');
+                    gallery.className = 'bt-user-attachments';
+                    for (const a of msg.attachments){
+                        const img = document.createElement('img');
+                        img.className = 'bt-user-att-img';
+                        img.src = a.url;
+                        img.alt = a.name || 'attachment';
+                        img.loading = 'lazy';
+                        img.addEventListener('click', ()=>openLightbox(img));
+                        img.addEventListener('error', ()=>{
+                            const miss = document.createElement('span');
+                            miss.className = 'bt-user-att-missing';
+                            miss.textContent = a.name || 'attachment';
+                            img.replaceWith(miss);
+                        }, {
+                            once: true
+                        });
+                        gallery.appendChild(img);
+                    }
+                    div.appendChild(gallery);
+                }
                 break;
             case 'agent':
                 div.className = 'bt-agent-msg';
+                if (msg.id) div.dataset.msgId = msg.id;
                 if (msg.streaming) {
                     const span = document.createElement('span');
                     span.className = 'bt-stream-text';
@@ -1363,6 +1545,7 @@ class BonitoChat {
                 } else {
                     div.innerHTML = msg.html || '';
                     linkifyPaths(div);
+                    decorateCodeBlocks(div);
                 }
                 break;
             case 'thought':
@@ -1403,6 +1586,10 @@ class BonitoChat {
                                 id
                             })
                     });
+                    if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
+                        const feed = this._ensureTaskFeed(div);
+                        for (const e of msg.task_feed)this._upsertTaskFeedEntry(feed, e);
+                    }
                     const detachBtn = div.querySelector('.bt-tool-detach');
                     if (detachBtn) detachBtn.addEventListener('click', (e)=>{
                         e.stopPropagation();
@@ -1518,6 +1705,8 @@ class BonitoChat {
                 <button class="bt-eval-preview-toggle" type="button"
                         title="Enlarge">⌄</button>
             </div>` : '';
+        const cmdPreview = msg.command ? `
+            <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
         return `
             <div class="bt-tool-header" data-expanded="false"${msg.command ? ` title="${escapeAttr(msg.command)}"` : ''}>
                 <span class="bt-tool-toggle">▶</span>
@@ -1534,7 +1723,7 @@ class BonitoChat {
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}
+            ${evalPreview}${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
     onPlanUpdate(msg) {
@@ -1924,6 +2113,7 @@ class BonitoChat {
     }
     onLensResult(msg) {
         if (msg.q !== this.lensQuery) return;
+        const holdAnchor = this.lensActive && !msg.active && !this.followMode ? this._captureAnchor() : null;
         if (!msg.active) {
             this.lensActive = false;
             this.lensVisible = null;
@@ -1953,8 +2143,9 @@ class BonitoChat {
         if (this.lensActive) {
             this.followMode = false;
             this.container.scrollTop = 0;
+            this._prevScrollTop = 0;
             this.refresh();
-        }
+        } else if (holdAnchor) this._restoreAnchor(holdAnchor);
     }
     onLensSaved(msg) {
         this.savedLenses = msg.lenses || [];
@@ -1991,6 +2182,12 @@ class BonitoChat {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
         return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
+    lastMessageFullyOutOfView() {
+        if (this.totalCount === 0) return false;
+        const node = this.cache.get(this.totalCount - 1);
+        if (!node || !node.isConnected || node.offsetParent === null) return true;
+        return node.getBoundingClientRect().top >= this.container.getBoundingClientRect().bottom;
+    }
     _queueScrollToBottom() {
         if (this._scrollbarDrag) return;
         if (this._scrollQueued || this.destroyed) return;
@@ -1999,7 +2196,10 @@ class BonitoChat {
             this._scrollQueued = false;
             this._scrollRafId = null;
             if (this.destroyed) return;
-            if (performance.now() - this._lastUserInputT < 100) return;
+            if (performance.now() - this._lastUserInputT < 100) {
+                if (this.followMode) this._queueScrollToBottom();
+                return;
+            }
             this.scrollToBottom();
         });
     }
@@ -2013,6 +2213,7 @@ class BonitoChat {
                 behavior: 'auto'
             });
         }
+        this._prevScrollTop = this.container.scrollTop;
         this.refresh();
     }
     onHidden() {
@@ -2021,19 +2222,34 @@ class BonitoChat {
         if (this._setOverscroll) this._setOverscroll(0);
         this._savedScrollTop = this.container.scrollTop;
         this._savedFollowMode = this.followMode;
+        this._savedAnchor = this._captureAnchor();
+        this._prefetchPaused = true;
+        clearTimeout(this._prefetchTimer);
     }
     onShown() {
         const followNow = !!this.followMode;
         const followThen = !!this._savedFollowMode;
         const wantBottom = followNow || followThen;
         const savedTop = this._savedScrollTop;
+        const anchor = this._savedAnchor;
+        this._prefetchPaused = false;
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 600);
+        }
         const apply = ()=>{
             if (this.destroyed) return;
             if (wantBottom) {
                 if (this.followMode) this.scrollToBottom();
+                return;
+            }
+            const n = anchor && this.rendered.has(anchor.idx) ? this.cache.get(anchor.idx) : null;
+            if (n && n.isConnected) {
+                this.container.scrollTop = n.offsetTop - anchor.off;
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
             }
+            this._prevScrollTop = this.container.scrollTop;
         };
         apply();
         requestAnimationFrame(apply);
@@ -2217,7 +2433,8 @@ class BonitoChat {
     }
     async _submit() {
         const text = this.textInput.value;
-        if (text.trim() === '' && this.attachments.size === 0) return;
+        const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
+        if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
         const payload = [];
         for (const item of this.attachments.values()){
             const buf = await item.blob.arrayBuffer();
@@ -2244,6 +2461,21 @@ class BonitoChat {
         if (app) app.style.height = vv.height + 'px';
         if (this.followMode) this._queueScrollToBottom();
     }
+    _applyUserScroll(prevTop) {
+        const { scrollTop , scrollHeight , clientHeight  } = this.container;
+        const atBot = this.atBottom();
+        if (this.followMode && !atBot) {
+            this.setFollowMode(false);
+            this._cancelPendingScroll();
+        }
+        if (this.followMode) return;
+        if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
+            this.setFollowMode(true);
+            this._queueScrollToBottom();
+        } else {
+            this._cancelPendingScroll();
+        }
+    }
     setFollowMode(on) {
         if (this.followMode === on) return;
         this.followMode = on;
@@ -2261,14 +2493,43 @@ class BonitoChat {
     }
     _registerUnread() {
         this.unreadCount++;
-        this._showNewMessagePill();
+        if (this.lastMessageFullyOutOfView()) {
+            this._showNewMessagePill();
+        } else {
+            this._refreshPillContent();
+        }
+    }
+    _updateScrollAffordance(atBot) {
+        if (atBot) {
+            this.unreadCount = 0;
+            this._hideNewMessagePill();
+        } else if (this.lastMessageFullyOutOfView()) {
+            this._showNewMessagePill();
+        } else {
+            this._hideNewMessagePill();
+        }
     }
     _showNewMessagePill() {
         if (!this._pillEl) this._createNewMessagePill();
-        if (this._pillEl) this._pillEl.classList.add('bt-new-msg-pill-visible');
+        if (!this._pillEl) return;
+        if (!this._pillShown) {
+            this._pillShown = true;
+            this._pillEl.classList.add('bt-new-msg-pill-visible');
+        }
+        this._refreshPillContent();
     }
     _hideNewMessagePill() {
+        if (!this._pillShown) return;
+        this._pillShown = false;
         if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
+    }
+    _refreshPillContent() {
+        if (!this._pillEl) return;
+        const hasUnread = this.unreadCount > 0;
+        this._pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        if (this._pillLabelEl) {
+            this._pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
+        }
     }
     _createNewMessagePill() {
         const app = this.container?.closest('.bt-app') || this.container?.parentElement;
@@ -2276,7 +2537,14 @@ class BonitoChat {
         const pill = document.createElement('button');
         pill.type = 'button';
         pill.className = 'bt-new-msg-pill';
-        pill.innerHTML = '<span class="bt-new-msg-pill-arrow">↓</span>' + '<span>New messages</span>';
+        const arrow = document.createElement('span');
+        arrow.className = 'bt-new-msg-pill-arrow';
+        arrow.textContent = '↓';
+        const label = document.createElement('span');
+        label.className = 'bt-new-msg-pill-label';
+        label.textContent = 'Move to bottom';
+        pill.appendChild(arrow);
+        pill.appendChild(label);
         pill.addEventListener('click', (e)=>{
             e.preventDefault();
             this.setFollowMode(true);
@@ -2284,9 +2552,62 @@ class BonitoChat {
         });
         app.appendChild(pill);
         this._pillEl = pill;
+        this._pillLabelEl = label;
     }
 }
 const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+function decorateCodeBlocks(rootEl) {
+    rootEl.querySelectorAll('pre').forEach((pre)=>{
+        if (pre.dataset.btDecorated || pre.closest('.bt-code-wrap')) return;
+        pre.dataset.btDecorated = '1';
+        const wrap = document.createElement('div');
+        wrap.className = 'bt-code-wrap';
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
+        const codeText = ()=>pre.innerText || '';
+        const mk = (cls, glyph, title, onClick)=>{
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'bt-code-action ' + cls;
+            b.title = title;
+            b.textContent = glyph;
+            b.addEventListener('click', (e)=>{
+                e.preventDefault();
+                e.stopPropagation();
+                onClick(b);
+            });
+            return b;
+        };
+        const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b)=>{
+            if (!navigator.clipboard) return;
+            navigator.clipboard.writeText(codeText()).then(()=>{
+                b.textContent = '✓';
+                setTimeout(()=>{
+                    b.textContent = '⧉';
+                }, 1200);
+            }).catch(()=>{});
+        });
+        const dlBtn = mk('bt-code-download', '⤓', 'Download', ()=>{
+            const blob = new Blob([
+                codeText()
+            ], {
+                type: 'text/plain'
+            });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'snippet.txt';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+        });
+        const actions = document.createElement('div');
+        actions.className = 'bt-code-actions';
+        actions.appendChild(copyBtn);
+        actions.appendChild(dlBtn);
+        wrap.appendChild(actions);
+    });
+}
 function linkifyPaths(rootEl) {
     rootEl.querySelectorAll('code').forEach((el)=>{
         if (el.closest('pre') || el.closest('a')) return;
@@ -2295,6 +2616,25 @@ function linkifyPaths(rootEl) {
         el.classList.add('bt-path-link');
         el.dataset.path = text;
     });
+}
+function openLightbox(media) {
+    const overlay = document.createElement('div');
+    overlay.className = 'bt-lightbox-overlay';
+    const big = media.cloneNode(true);
+    big.classList.add('bt-lightbox-media');
+    overlay.appendChild(big);
+    const close = ()=>{
+        overlay.remove();
+        document.removeEventListener('keydown', onkey);
+    };
+    const onkey = (e)=>{
+        if (e.key === 'Escape') close();
+    };
+    overlay.addEventListener('click', (e)=>{
+        if (e.target === overlay) close();
+    });
+    document.addEventListener('keydown', onkey);
+    document.body.appendChild(overlay);
 }
 function escapeHTML(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

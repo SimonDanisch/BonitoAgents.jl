@@ -1,0 +1,38 @@
+# Build (and, on main, deploy) the BonitoAgents documentation — the
+# DocumenterBonito site under docs/. The docs env (docs/Project.toml) already
+# pins every unregistered package: the monorepo subpackages by relative path
+# and the forks (Bonito/BonitoBook/BonitoWidgets/MsgPack) by git url+rev, so a
+# plain `instantiate` resolves the whole tree — no `Pkg.develop` needed.
+name: Documentation
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push the built site to gh-pages
+      pull-requests: write    # push_preview comments on PRs
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - name: Instantiate docs env
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+      - name: Build and deploy
+        run: julia --project=docs docs/make.jl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}

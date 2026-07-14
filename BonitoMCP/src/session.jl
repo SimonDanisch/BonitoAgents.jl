@@ -108,7 +108,7 @@ mutable struct JuliaSession
     lock::ReentrantLock                 # serialises eval/continue/interrupt
     log_path::Union{String,Nothing}
     dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
-    dial_error::String                  # last eval-bridge setup/connect failure, surfaced by bt_show_app
+    dial_error::String                  # last eval-bridge setup/connect failure (live-render bridge)
     closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
 end
 

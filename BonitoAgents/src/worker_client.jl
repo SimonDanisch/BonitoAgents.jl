@@ -67,6 +67,38 @@ function close_ws_safe(ws)
     return nothing
 end
 
+# Kill the underlying transport, deliberately NOT `close(ws)`: the polite close
+# writes a CLOSE frame under `ws.sendlock` — and on the zombie socket this is
+# for, a wedged send is typically already BLOCKED holding that very lock (the
+# production incident's backtrace: `relay_proc_to_ws → _flush_ws_output_locked!
+# → waitwrite`), so `close(ws)` would deadlock behind it and the teardown would
+# never run. Closing the transport needs no locks and wakes every blocked
+# reader AND writer (Reseau `evict!` wakes all waiters) into their normal
+# error paths — which is exactly the recovery chain we want.
+function force_close_ws!(ws)
+    try
+        ws.close_transport!()
+    catch e
+        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+    end
+    return nothing
+end
+
+"""
+    WorkerUnreachableError(op, detail)
+
+A worker RPC failed because the worker cannot be reached: the control socket is
+gone ("not connected") or the RPC hit its deadline ("timed out" — the zombie
+link case: the socket LOOKS open but nothing flows). Callers that gate a user
+action on worker liveness (the editor open-guard) match on this TYPE to fail
+closed immediately, instead of parsing message strings.
+"""
+struct WorkerUnreachableError <: Exception
+    op     :: String
+    detail :: String
+end
+Base.showerror(io::IO, e::WorkerUnreachableError) = print(io, e.op, " ", e.detail)
+
 # Register a pending RPC: returns (request_id, channel). Caller sends the
 # command (with `request_id`/`sync_id`/`sid` set to the returned id) and waits
 # on the channel via `take_pending!`. The matching control-frame handler /
@@ -130,7 +162,8 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
     finally
         close(timer)
     end
-    val === nothing && error("$op_name timed out after $(timeout)s — worker may be offline or stuck")
+    val === nothing && throw(WorkerUnreachableError(String(op_name),
+        "timed out after $(timeout)s — worker may be offline or stuck"))
     # M9/M13: the worker can report a definitive failure (e.g. open_session_failed)
     # by delivering an Exception, so we fail fast instead of waiting out the timeout.
     val isa Exception && throw(val)
@@ -186,16 +219,26 @@ function handle_worker_control(state::ServerState, ws)
                         state.workers[][worker_id].name : nothing
         display_name  = existing_name === nothing ? name : existing_name
 
+        # `heartbeat_interval` advertises the server→worker ping cadence so the
+        # worker can arm its own receive-watchdog (no frame for several
+        # intervals ⇒ half-open link ⇒ close + re-dial). Workers predating the
+        # field simply ignore it.
         WebSockets.send(ws, JSON.json(Dict("ok" => true,
                                             "registered_as" => display_name,
-                                            "worker_id"     => worker_id)))
+                                            "worker_id"     => worker_id,
+                                            "heartbeat_interval" => state.heartbeat_interval)))
 
         # Build / refresh the WorkerInfo from the hello frame. Preserve a
         # user-set `initials` override across reconnects (the worker doesn't
-        # know about it; it lives entirely on the server side).
-        prev_initials = let existing = get(state.workers[], worker_id, nothing)
-            existing === nothing ? nothing : existing.initials
+        # know about it; it lives entirely on the server side), and REUSE the
+        # existing `online` Observable so chats bound to it (the shared liveness
+        # signal) see this reconnect flip true — the WorkerInfo object is
+        # rebuilt each connect, but the observable's identity must survive.
+        prev_initials, online_obs = let existing = get(state.workers[], worker_id, nothing)
+            existing === nothing ? (nothing, Observable(true)) :
+                (existing.initials, existing.online)
         end
+        online_obs[] = true
         w = WorkerInfo(
             worker_id,
             display_name,
@@ -208,7 +251,7 @@ function handle_worker_control(state::ServerState, ws)
             String(get(hello, "mcp_path", "")),
             Vector{String}(get(hello, "mcp_args", String[])),
             String(get(hello, "projects_root", "")),
-            :online,
+            online_obs,
             now(UTC),
         )
         # All shared-state writes for this worker's registration go in one
@@ -258,6 +301,52 @@ function handle_worker_control(state::ServerState, ws)
             end
         end
 
+        # Zombie-link watchdog (#33). A suspend / wifi drop can leave this
+        # socket half-open: ESTABLISHED on both ends, nothing flowing. The
+        # frame loop below then blocks in `receive` FOREVER, the worker stays
+        # registered, and every RPC against it burns its full timeout (the
+        # production incident: 20+ minutes of 5s stats / 60s fetches / 30s
+        # binds that read as "the server crashed"). We ping every
+        # `heartbeat_interval`; a worker that has EVER ponged and then goes
+        # `heartbeat_deadline` without one is dead — close its socket, which
+        # unblocks the frame loop into the normal disconnect teardown AND
+        # (via RST) unwedges the worker's blocked sends so it re-dials.
+        #
+        # Two tasks, not one: `send` on a wedged socket can itself block
+        # forever, so the task that SENDS pings must not be the task that
+        # decides death. The reaper does no socket I/O except `close`.
+        # Pong-gating keeps ancient workers without the pong branch on the
+        # old no-liveness behavior instead of reaping every idle one.
+        last_pong    = Threads.Atomic{Float64}(time())
+        pong_seen    = Threads.Atomic{Bool}(false)
+        last_ping_ok = Threads.Atomic{Float64}(time())
+        hb_alive     = Threads.Atomic{Bool}(true)
+        Base.errormonitor(@async while hb_alive[]
+            sleep(state.heartbeat_interval)
+            hb_alive[] || break
+            try
+                WebSockets.send(ws, JSON.json(Dict("type" => "ping")))
+                last_ping_ok[] = time()
+            catch
+                break   # socket is gone — the frame loop is already tearing down
+            end
+        end)
+        Base.errormonitor(@async while hb_alive[]
+            sleep(state.heartbeat_interval)
+            hb_alive[] || break
+            # Two independent death signals: a pong-capable worker went silent,
+            # or our OWN ping send is stuck (kernel send buffer full — the
+            # interface-switch wedge fills it with retransmit-limbo bytes).
+            # The stuck-send signal needs no pong capability at all.
+            pong_lost  = pong_seen[] && time() - last_pong[]    > state.heartbeat_deadline
+            send_stuck = time() - last_ping_ok[] > state.heartbeat_deadline + state.heartbeat_interval
+            if pong_lost || send_stuck
+                @warn "Worker heartbeat lost — killing zombie control socket" worker_id pong_lost send_stuck
+                force_close_ws!(ws)
+                break
+            end
+        end)
+
         # Process inbound frames from the worker. Every typed reply maps
         # back to a pending RPC by request_id; deliver_rpc_response! is a
         # no-op if the id is unknown (caller already timed out).
@@ -275,7 +364,10 @@ function handle_worker_control(state::ServerState, ws)
                     cmd = JSON.parse(String(frame))
                     t   = get(cmd, "type", "")
                     rid = String(get(cmd, "request_id", ""))
-                    if t == "list_dir_response"
+                    if t == "pong"
+                        last_pong[] = time()
+                        pong_seen[] = true
+                    elseif t == "list_dir_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "stat_path_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
@@ -312,6 +404,9 @@ function handle_worker_control(state::ServerState, ws)
                 @warn "Worker control loop ended" worker_id=worker_id exception=(e, catch_backtrace())
         end
     finally
+        # `hb_alive` only exists once registration reached the watchdog block —
+        # a rejected/failed hello lands here without it.
+        @isdefined(hb_alive) && (hb_alive[] = false)
         teardown_worker_control!(state, worker_id, ws)
     end
 end
@@ -333,46 +428,50 @@ identity check is the guard.
 """
 function teardown_worker_control!(state::ServerState, worker_id::AbstractString, ws)
     affected = String[]
-    evicted  = ChatModel[]
+    kept     = ChatModel[]
     is_current = lock(state.lock) do
         current = get(state.worker_control_ws, worker_id, nothing)
         current === ws || return false           # superseded — leave the live one alone
         delete!(state.worker_control_ws, worker_id)
-        if haskey(state.workers[], worker_id)
-            state.workers[][worker_id].status = :offline
-        end
         for p in values(state.projects[])
             if p.worker_id == worker_id
                 m = get(state.chat_models, p.id, nothing)
-                m === nothing || push!(evicted, m)
-                delete!(state.chat_models, p.id)
+                m === nothing || push!(kept, m)
                 push!(affected, p.id)
+                # #28: chat_models[p.id] is DELIBERATELY KEPT (it used to be
+                # evicted here). The model, its msgs_store and its pane stay
+                # live; only the dead agent session is torn down below. The
+                # worker's shared `online` observable drives the offline banner
+                # + send-gating, and a reconnect rebinds on the next message —
+                # no re-click, and no chat vanishes from the sidebar.
             end
         end
         return true
     end
     if is_current
-        # CLOSE the evicted chat models — dropping them from `chat_models` is NOT
-        # enough: each leaves a `run_chat!` consumer AND a 1 Hz background poller
-        # alive (a running `poller_task` keeps the model referenced), leaking on every
-        # worker disconnect. `close(model)` closes `user_messages`, ending both;
-        # `stop!(agent)` tears down the (already-dead) worker ACP session. Outside
-        # the lock — these signal tasks / do I/O.
-        for m in evicted
-            try; close(m); stop!(m.agent); catch e
-                @warn "evicting chat model on worker disconnect" exception=e
+        # Liveness + per-chat offline flips OUTSIDE the lock (observable writes /
+        # JS bridge). The worker's `online` observable is SHARED into every one
+        # of its ChatModels, so this single flip pauses their background pollers
+        # and (via `session_alive`) shows the banner + disables send everywhere.
+        haskey(state.workers[], worker_id) && (state.workers[][worker_id].online[] = false)
+        for m in kept
+            # Tear down the DEAD ACP session (frees the worker-side agent
+            # subprocess), but KEEP the model: begin_turn! rebinds a fresh
+            # session on the next message after reconnect.
+            try; stop!(m.agent); catch e
+                @warn "stopping agent on worker disconnect" project_id = m.project_id exception = e
             end
+            shared(m).session_alive[] = false
         end
         # The worker host is gone → its eval workers (and their bridges) are gone.
-        # Tear them down explicitly outside the lock (close asset host is I/O); a
-        # WS drop alone no longer does this — the bridge follows the worker session.
         for pid in affected
             teardown_eval_bridge!(state, pid)
         end
         safe_notify!(state.workers)
-        notify_chats!(state)    # evicted chats drop out of the active-chats sidebar
+        # NOT notify_chats!: the chats are kept, so the active-chats list is
+        # unchanged — they just render offline until the worker returns.
         release_projects_for_worker!(state, worker_id)
-        @info "Worker disconnected" worker_id=worker_id
+        @info "Worker disconnected (chats kept for reconnect)" worker_id=worker_id
     else
         @info "Worker control socket closed but superseded; keeping live registration" worker_id=worker_id
     end
@@ -739,7 +838,7 @@ Throws if the worker is disconnected or the RPC errors.
 function stat_worker_path(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
     haskey(state.worker_control_ws, worker_name) ||
-        error("Worker '$worker_name' is not connected")
+        throw(WorkerUnreachableError("stat_path on '$worker_name'", "worker is not connected"))
 
     rid, ch = register_rpc!(state)
     resp = try

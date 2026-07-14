@@ -49,7 +49,7 @@ const BT = BonitoAgents
             sleep(0.5)
         end
         @test registered
-        @test BonitoWorker.process_running(wpid) === true
+        @test BonitoWorker.pid_running(wpid) === true
 
         dirs = (h.state_dir, h.working_dir, h.worker_root, h.worker_config)
     finally
@@ -60,7 +60,7 @@ const BT = BonitoAgents
 
     # (3) close() killed the worker and removed every tempdir.
     @test process_exited(h.worker_proc)
-    @test BonitoWorker.process_running(wpid) === false
+    @test BonitoWorker.pid_running(wpid) === false
     for d in dirs
         @test !isdir(d)
     end

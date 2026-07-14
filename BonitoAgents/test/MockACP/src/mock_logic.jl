@@ -50,6 +50,10 @@ N_CHUNKS::Int           = 3
 SESSION::String         = "s"
 CHUNK_MS::Int           = 0
 DISPATCHER_ADDR::String = ""
+# When set (BT_MOCK_ACP_IGNORE_CANCEL=1), dispatcher mode keeps streaming despite
+# a `session/cancel` — simulates a wedged agent that ignores cancel, so a test can
+# exercise the chat's re-cancel → force-close escalation.
+IGNORE_CANCEL::Bool     = false
 
 function _configure!()
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
@@ -57,6 +61,7 @@ function _configure!()
     global SESSION         = String(get(ENV, "BT_MOCK_ACP_SESSION", "s"))
     global CHUNK_MS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNK_MS", "0")))
     global DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
+    global IGNORE_CANCEL   = get(ENV, "BT_MOCK_ACP_IGNORE_CANCEL", "") == "1"
     return nothing
 end
 
@@ -73,6 +78,8 @@ upd(kind::AbstractString, payload::AbstractDict) = emit(Dict(
                       "update"    => merge(Dict("sessionUpdate" => kind), payload))))
 
 agent_chunk(text)   = upd("agent_message_chunk",
+    Dict("content" => Dict("type" => "text", "text" => text)))
+user_chunk(text)    = upd("user_message_chunk",
     Dict("content" => Dict("type" => "text", "text" => text)))
 thought_chunk(text) = upd("agent_thought_chunk",
     Dict("content" => Dict("type" => "text", "text" => text)))
@@ -111,6 +118,13 @@ pack_tool_content(items) = Any[
                              "content" => Dict("type" => "text",
                                                "text" => String(c["text"])))
     end for c in items]
+
+# The `_meta` envelope claude-agent-acp stamps on every forwarded SUBAGENT
+# update: the parent Task's tool_use id. Used by the sub_text / sub_tool
+# dispatcher events.
+sub_meta(ev::AbstractDict) =
+    Dict{String,Any}("claudeCode" =>
+        Dict{String,Any}("parentToolUseId" => String(ev["parent"])))
 
 resp(id, result) =
     emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
@@ -185,7 +199,7 @@ function handle_prompt(prompt_id, scenario::AbstractString)
         # stays open, then a `tool_call_update` ships the "completed"
         # status WITH the "Running in background, output written to: …"
         # content snap — that's what the chat-side update loop iterates
-        # to flip `bg_running=true`. (One frame with status=completed
+        # to push the bash into the taskbar. (One frame with status=completed
         # closes the channel synchronously with no snap delivered, so the
         # detection loop never runs.) Then hang without finishing the
         # prompt — restart must leave the bg bubble intact (worker owns
@@ -280,6 +294,72 @@ function ensure_dispatcher!()
     return DISPATCHER_SOCK[]
 end
 
+# One BETWEEN-TURN frame (the `post_turn` event's payload, emitted after the
+# prompt response — like the real agent streaming a bg subagent's activity and
+# its auto-wake announcement after end_turn). Supports the shapes the
+# between-turn wire actually carries (fixtures/bg_subagent_wire.jsonl):
+# untagged text, tagged sub_text/sub_tool.
+function emit_post_event(ev::AbstractDict)
+    et = String(get(ev, "type", ""))
+    if et == "text"
+        agent_chunk(String(ev["text"]))
+    elseif et == "sub_text"
+        upd("agent_message_chunk", Dict{String,Any}(
+            "content" => Dict("type" => "text", "text" => String(ev["text"])),
+            "_meta"   => sub_meta(ev)))
+    elseif et == "sub_tool"
+        tid = String(get(ev, "id", "post-subtool"))
+        if Bool(get(ev, "update", false))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid,
+                "status" => String(get(ev, "status", "completed")),
+                "_meta"  => sub_meta(ev)))
+        else
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => String(get(ev, "kind", "execute")),
+                "title" => String(get(ev, "title", "sub tool")),
+                "status" => String(get(ev, "status", "in_progress")),
+                "_meta"  => sub_meta(ev)))
+        end
+    end
+    return nothing
+end
+
+# session/load replay via the dispatcher: ask the test process for the
+# session's scripted history ({"replay": sid}) and emit each event as one
+# session/update frame — user/agent turns land whole (one chunk per turn, the
+# shape `replay_history`'s coalescer expects between message-kind switches).
+# Terminated by the dispatcher's {"type":"end"} line; no prompt response here
+# (the caller acks session/load itself).
+function run_dispatcher_replay()
+    sock = ensure_dispatcher!()
+    println(sock, JSON.json(Dict("replay" => SESSION)))
+    flush(sock)
+    next_tool_id = 1
+    while !eof(sock)
+        line = try readline(sock) catch; break end
+        isempty(line) && continue
+        ev = try JSON.parse(line) catch; continue end
+        et = String(get(ev, "type", ""))
+        if et == "user"
+            user_chunk(String(ev["text"]))
+        elseif et == "text"
+            agent_chunk(String(ev["text"]))
+        elseif et == "thought"
+            thought_chunk(String(ev["text"]))
+        elseif et == "tool"
+            tool_call(String(get(ev, "status", "completed"));
+                      id    = String(get(ev, "id", "replay-tc$(next_tool_id)")),
+                      kind  = String(get(ev, "kind", "execute")),
+                      title = String(get(ev, "title", "replayed tool")))
+            next_tool_id += 1
+        elseif et == "end"
+            break
+        end
+    end
+    return nothing
+end
+
 function run_dispatcher_prompt(prompt_id)
     sock = ensure_dispatcher!()
     # Pull the user's prompt text out of the original message — the
@@ -292,6 +372,7 @@ function run_dispatcher_prompt(prompt_id)
 
     stop_reason = "end_turn"
     next_tool_id = 1
+    post_blocks = Any[]   # `post_turn` events, emitted AFTER the prompt response
     while !eof(sock)
         # Cancel arriving mid-stream (set by the concurrently-running stdin
         # reader in `dispatch_loop`) ends the turn the way real claude does:
@@ -307,7 +388,7 @@ function run_dispatcher_prompt(prompt_id)
         # reads the NEXT prompt line, and the follow-up turn would also read
         # this turn's stale tail. Draining keeps the persistent connection
         # clean for the next prompt.
-        if cancelled[]
+        if cancelled[] && !IGNORE_CANCEL
             stop_reason = "cancelled"
             while !eof(sock)
                 tail = try readline(sock) catch; break end
@@ -325,6 +406,33 @@ function run_dispatcher_prompt(prompt_id)
             agent_chunk(String(ev["text"]))
         elseif et == "thought"
             thought_chunk(String(ev["text"]))
+        elseif et == "sub_text"
+            # A SUBAGENT's prose: the same agent_message_chunk frame as
+            # `text`, but tagged with the parent Task's tool_use id via
+            # `_meta.claudeCode.parentToolUseId` — exactly how
+            # claude-agent-acp forwards subagent output (its acp-agent.js
+            # stamps every forwarded subagent update with that meta).
+            upd("agent_message_chunk", Dict{String,Any}(
+                "content" => Dict("type" => "text", "text" => String(ev["text"])),
+                "_meta"   => sub_meta(ev)))
+        elseif et == "sub_tool"
+            # A SUBAGENT's tool use: tool_call (announcement) or
+            # tool_call_update (status flip on the announced id), tagged
+            # like sub_text above.
+            tid = String(get(ev, "id", "subtool-$(next_tool_id)")); next_tool_id += 1
+            if Bool(get(ev, "update", false))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid,
+                    "status" => String(get(ev, "status", "completed")),
+                    "_meta"  => sub_meta(ev)))
+            else
+                upd("tool_call", Dict{String,Any}(
+                    "toolCallId" => tid,
+                    "kind"   => String(get(ev, "kind", "other")),
+                    "title"  => String(get(ev, "title", "tool")),
+                    "status" => String(get(ev, "status", "in_progress")),
+                    "_meta"  => sub_meta(ev)))
+            end
         elseif et == "edit"
             # Edit tool. Faithful to real claude-agent-acp (captured acp.jsonl):
             #   1. tool_call: rawInput {} (empty!), status "pending", GENERIC title
@@ -459,8 +567,12 @@ function run_dispatcher_prompt(prompt_id)
             # promptly (the cancel test streams chunk/`delay` pairs and yanks
             # the turn mid-way): bail out of the slice loop and let the
             # loop-top `cancelled[]` check resolve `stopReason: "cancelled"`.
+            # `IGNORE_CANCEL` (wedged-agent sim) also ignores cancel HERE — keep
+            # pacing the full delay so the turn stays genuinely open/busy after a
+            # cancel (otherwise cancel would make every delay bail and the stream
+            # races to `end_turn`, ending the turn instead of wedging).
             remaining = Float64(get(ev, "ms", 0)) / 1000
-            while remaining > 0 && !cancelled[]
+            while remaining > 0 && !(cancelled[] && !IGNORE_CANCEL)
                 slice = min(remaining, 0.05)
                 sleep(slice)
                 remaining -= slice
@@ -483,6 +595,11 @@ function run_dispatcher_prompt(prompt_id)
             # scenario (`exit(1)` after `session/prompt`).
             flush(stdout); flush(stderr)
             exit(1)
+        elseif et == "post_turn"
+            # Remember for AFTER the response: the real agent keeps streaming
+            # past end_turn (bg-subagent activity, the auto-wake completion
+            # announcement) — see emit_post_event.
+            push!(post_blocks, ev)
         elseif et == "end"
             stop_reason = String(get(ev, "stopReason", "end_turn"))
             break
@@ -491,6 +608,19 @@ function run_dispatcher_prompt(prompt_id)
         # new event types without churning the binary in lockstep.
     end
     resp(prompt_id, Dict("stopReason" => stop_reason))
+    # Between-turn emission: each post_turn block waits its delay, then streams
+    # its frames with NO turn open. Async so the dispatcher loop is free to
+    # read the next prompt — same concurrency the real agent has.
+    for pt in post_blocks
+        @async try
+            sleep(Float64(get(pt, "delay_ms", 300)) / 1000)
+            for ev in get(pt, "events", Any[])
+                ev isa AbstractDict && emit_post_event(ev)
+            end
+        catch e
+            @warn "post_turn emission failed" exception = e
+        end
+    end
 end
 
 # Most-recent prompt text — used by the dispatcher handler to know what
@@ -515,6 +645,11 @@ function dispatch_loop()
         elseif method == "session/new" && id !== nothing
             resp(id, Dict("sessionId" => SESSION))
         elseif method == "session/load" && id !== nothing
+            # Dispatcher mode: re-stream the scripted history as session/update
+            # frames BEFORE the load response — exactly how real claude-agent-acp
+            # replays a resumed session's jsonl. Other scenarios keep the bare
+            # ack (no replay), which resume tests rely on.
+            SCENARIO == "dispatcher" && run_dispatcher_replay()
             resp(id, Dict("sessionId" => SESSION))
         elseif method == "session/prompt" && id !== nothing
             cancelled[] = false

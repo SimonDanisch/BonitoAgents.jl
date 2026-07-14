@@ -157,6 +157,11 @@ class BonitoChat {
         this._spacerTopH   = -1;    // last written spacer px (skip no-op style writes)
         this._spacerBotH   = -1;
         this._requestedAt  = new Map(); // idx → time of in-flight msgs.request
+        // Bumped on msgs.reload (the server SPLICED history — all indices
+        // shifted). Every msgs.request carries it and the server echoes it
+        // back on msgs.range; a reply from before the reload is dropped in
+        // onRange instead of caching old-world nodes at new-world indices.
+        this._epoch        = 0;
         this.STREAM_APPLY_MS = 100; // min interval between streaming innerHTML applies
 
         // ONE shared ResizeObserver for every node in the render window.
@@ -224,6 +229,13 @@ class BonitoChat {
         // "bounces" away while scrolling down. Read it from the computed
         // style so a CSS change can't silently re-introduce the drift.
         this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
+        // A rendered node's real offsetTop = cumHeight(0, idx) + PAD_TOP + one
+        // ITEM_GAP: the container's top padding, plus the flex row-gap between the
+        // (always-present) top spacer and the first node — every OTHER gap is
+        // already folded into effHeight, and they telescope so this constant is
+        // window-position-independent. `_restoreAnchor`'s virtual fallback needs
+        // it to convert a cumHeight() position into a real scrollTop.
+        this.PAD_TOP = parseFloat(getComputedStyle(container).paddingTop) || 0;
 
         // ── Scroll UX state ────────────────────────────────────────────
         // followMode: when true, new messages auto-scroll the viewport
@@ -239,6 +251,11 @@ class BonitoChat {
         // mode the user last chose.
         this.followMode = true;
         this.unreadCount = 0;
+        // Cached shown/hidden state of the jump pill. Scroll + resize
+        // handlers re-derive pill visibility constantly (every composer
+        // autosize fires one), so show/hide only touch the DOM on an
+        // actual flip — see _showNewMessagePill/_hideNewMessagePill.
+        this._pillShown = false;
         // "At bottom" is intentionally tight here (20px) — the loose
         // 200px threshold the old code used was a workaround for
         // chunked-text-during-burst race conditions. With explicit
@@ -246,6 +263,13 @@ class BonitoChat {
         // unconditionally, so being "at the bottom" means actually
         // there, not "near enough".
         this.AT_BOTTOM_PX = 20;
+        // Last processed scroll position — the delta against it gives a user
+        // scroll its DIRECTION (re-engage is downward-only, see
+        // _applyUserScroll). Kept fresh by the scroll handler and by every
+        // programmatic scrollTop write that may not fire a scroll event
+        // (offscreen renderers): scrollToBottom, the re-pin in updateVisible,
+        // onShown's restore, the lens reset, and the pan/momentum writes.
+        this._prevScrollTop = container.scrollTop;
 
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
@@ -497,7 +521,8 @@ class BonitoChat {
             const dt = 16;
             const delta = vel * dt;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            let newTop = this.container.scrollTop - delta;
+            const prevTop = this.container.scrollTop;
+            let newTop = prevTop - delta;
             let hitEdge = false;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + (-newTop) * PAN_BOUNCE_RESIST);
@@ -510,6 +535,13 @@ class BonitoChat {
             } else {
                 this.container.scrollTop = newTop;
             }
+            // The fling is the user's own gesture: classify the follow-mode
+            // transition at the write — offscreen renderers fire no scroll
+            // event for programmatic scrollTop writes, and when the event
+            // DOES fire it sees a zero delta against the synced
+            // _prevScrollTop and skips (never classified twice).
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             // Keep the user-input timestamp fresh so the scroll handler
             // continues classifying these programmatic scrollTop writes
             // as user-driven (= the fling the user threw). Without this
@@ -568,7 +600,8 @@ class BonitoChat {
             const stepDy = e.clientY - p.lastY;
             const stepDt = now - p.lastT;
             const maxScroll = this.container.scrollHeight - this.container.clientHeight;
-            const newTop = this.container.scrollTop - stepDy;
+            const prevTop = this.container.scrollTop;
+            const newTop = prevTop - stepDy;
             if (newTop < 0) {
                 setOverscroll(this._overscroll + (-newTop) * PAN_RESIST);
                 this.container.scrollTop = 0;
@@ -579,6 +612,13 @@ class BonitoChat {
                 if (this._overscroll !== 0) setOverscroll(0);
                 this.container.scrollTop = newTop;
             }
+            // A drag step is the user's own gesture — classify it at the
+            // write, exactly like the momentum step above (offscreen: no
+            // scroll event; onscreen: the trailing event is a zero-delta
+            // no-op). A downward re-engage never yanks mid-drag: the chase
+            // rAF re-arms while the input timestamp stays fresh.
+            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
+            this._prevScrollTop = this.container.scrollTop;
             if (stepDt > 0) {
                 // Exponentially-smoothed velocity (px/ms): noise-resistant
                 // and recency-biased so the release-instant velocity
@@ -630,18 +670,30 @@ class BonitoChat {
                 (performance.now() - this._lastUserInputT) < 400;
             this._pendingUserScroll = false;
             const atBot      = this.atBottom();
+            // Direction comes from the delta since the last processed
+            // position. A zero-delta event carries no movement — nothing to
+            // classify. That also makes the async scroll event trailing a
+            // pan/momentum scrollTop write (already classified at the write,
+            // which synced _prevScrollTop) a no-op instead of a double count.
+            const prevTop = this._prevScrollTop;
+            this._prevScrollTop = this.container.scrollTop;
             if (userDriven) {
-                // User-driven scroll → followMode reflects whether
-                // they landed at the bottom. Scrolling up → false,
-                // scrolling all the way back down → true.
-                this.setFollowMode(atBot);
-                if (!atBot) this._cancelPendingScroll();
+                // User-driven movement → the follow-mode transition lives in
+                // _applyUserScroll (razor-thin disengage; generous,
+                // downward-only re-engage at the pill's boundary).
+                if (this.container.scrollTop !== prevTop) {
+                    this._applyUserScroll(prevTop);
+                }
             } else if (this.followMode && !atBot) {
                 // Layout shift moved us off the bottom while in
                 // follow mode (viewport resize / attachment-bar
                 // pop-in). Re-anchor.
                 this._queueScrollToBottom();
             }
+            // The jump-to-bottom pill tracks the read position directly: shown
+            // once the last message is completely out of view (plain), glowing
+            // only when unread. atBot still owns the unread-clear.
+            this._updateScrollAffordance(atBot);
             this.refresh();
         };
         container.addEventListener('scroll', this._onScroll, { passive: true });
@@ -778,6 +830,7 @@ class BonitoChat {
 
         switch (msg.type) {
             case 'msgs.count':   return this.applyCount(msg.n);
+            case 'msgs.reload':  return this.onMsgsReload(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
             case 'lens.vocab':   this.lensVocab = msg.keys || []; return;
             case 'lens.saved':   return this.onLensSaved(msg);
@@ -805,6 +858,7 @@ class BonitoChat {
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
+            case 'task_activity':return this.onTaskActivity(msg);
             case 'plan_update':  return this.onPlanUpdate(msg);
             case 'chunk':        return this.appendChunk(msg);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
@@ -825,6 +879,35 @@ class BonitoChat {
     }
 
     // ── Range / virtual scroll ────────────────────────────────────────────
+
+    // Full re-sync: the server SPLICED or rebuilt the history (a resumed
+    // session's reconcile inserted messages mid-store), so every cached
+    // index → node mapping is invalid. Tear the rendered window down and
+    // re-run the initial mount cascade against the new total, pinned to the
+    // bottom — the newest messages are what a sync is for.
+    onMsgsReload(n) {
+        for (const node of this.cache.values()) node.remove();
+        this.cache.clear();
+        this.heights.clear();
+        this.rendered.clear();
+        this.nodeById.clear();
+        this.observed.clear();
+        this._requestedAt.clear();
+        this._cancelPendingScroll();
+        // Indices shifted: invalidate every in-flight range reply (onRange
+        // drops mismatching epochs) and restart the history backfill against
+        // the new indices.
+        this._epoch++;
+        this._prefetchStarted = false;
+        this._prefetchCursor  = null;
+        this._prefetchPending = null;
+        clearTimeout(this._prefetchTimer);
+        this.totalCount    = 0;      // applyCount below re-sets it
+        this._bootstrapped = false;  // re-arm the initial bottom-pin cascade
+        this.followMode    = true;
+        this.unreadCount   = 0;
+        this.applyCount(n);
+    }
 
     applyCount(n) {
         if (n <= 0) {
@@ -949,6 +1032,7 @@ class BonitoChat {
 
     _prefetchTick() {
         if (this.destroyed) return;
+        if (this._prefetchPaused) return;   // hidden pane — onShown resumes
         // Highest missing index at or below the cursor.
         let e = -1;
         for (let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
@@ -962,7 +1046,7 @@ class BonitoChat {
         // SILENT (cache-only): prefetch must not re-window/scroll per chunk
         // — that's a visible flicker storm right after mount.
         this._prefetchPending = [s, e];
-        this.comm.notify({type: 'msgs.request', range: [s, e]});
+        this.comm.notify({type: 'msgs.request', range: [s, e], epoch: this._epoch});
         // onRange reschedules the next tick when the response lands; this
         // timer is only the safety net for a lost/empty response.
         clearTimeout(this._prefetchTimer);
@@ -1067,7 +1151,8 @@ class BonitoChat {
             if (missing.length > 0) {
                 for (const i of missing) this._requestedAt.set(i, now);
                 this.comm.notify({type: 'msgs.request',
-                                  range: [missing[0], missing[missing.length - 1]]});
+                                  range: [missing[0], missing[missing.length - 1]],
+                                  epoch: this._epoch});
             }
         }
         this.updateDOM(s, e);
@@ -1082,10 +1167,20 @@ class BonitoChat {
         if (wasAtBottom && !userDriving &&
             this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
+            // Programmatic write, possibly event-less (offscreen): keep the
+            // direction baseline fresh so the next user scroll classifies
+            // against the real position (see _prevScrollTop).
+            this._prevScrollTop = this.container.scrollTop;
         }
     }
 
-    onRange({ start, msgs }) {
+    onRange({ start, msgs, epoch }) {
+        // A reply computed BEFORE a msgs.reload carries the old epoch — its
+        // indices belong to the pre-splice world; caching them would put the
+        // wrong messages at the wrong positions. Drop it (the dedup expiry
+        // re-requests anything still missing). Servers that don't echo the
+        // epoch (older builds) send undefined → accepted, old behavior.
+        if (epoch !== undefined && epoch !== null && epoch !== this._epoch) return;
         const messages = msgs ?? [];          // tolerate the legacy `messages` field
         const fresh = [];
         messages.forEach((data, i) => {
@@ -1107,7 +1202,7 @@ class BonitoChat {
         // Any arriving range advances the background prefetch (pacing: one
         // chunk in flight at a time, ~30ms apart). Runs through drags too —
         // caching is the drag-safe part.
-        if (this._prefetchStarted) {
+        if (this._prefetchStarted && !this._prefetchPaused) {
             clearTimeout(this._prefetchTimer);
             this._prefetchTimer = setTimeout(() => this._prefetchTick(), 30);
         }
@@ -1211,8 +1306,65 @@ class BonitoChat {
         });
     }
 
+    // The topmost rendered, visible node at/under the current scrollTop and
+    // its offset from the viewport top. This is THE scroll anchor: geometry
+    // changes ABOVE the viewport (height corrections, prefetch measurements,
+    // EST_HEIGHT adaptation re-spacing the top spacer) must not move what the
+    // user is looking at — without it, every prefetch/retry tick snapped the
+    // view back while scrolling through unmeasured history ("scrolling is
+    // stuck: it resets to an earlier position every second").
+    // The top-visible rendered node + its offset from scrollTop. `excludeKey`
+    // skips rows of a filter type that's about to be hidden — they won't survive
+    // the toggle, so anchoring on one would lose the read position (setKeyHidden).
+    _captureAnchor(excludeKey = null) {
+        const st = this.container.scrollTop;
+        for (const i of [...this.rendered].sort((a, b) => a - b)) {
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (excludeKey && n.dataset.filterKey === excludeKey) continue;
+            if (n.offsetTop + n.offsetHeight > st) {
+                return { idx: i, off: n.offsetTop - st };
+            }
+        }
+        return null;
+    }
+
+    // Re-pin the anchor after DOM/spacer mutations. No-op when nothing above
+    // the viewport changed (|delta| ≤ 1px), so plain scroll ticks never write.
+    _restoreAnchor(a) {
+        if (!a) return;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        let want;
+        if (n && n.isConnected) {
+            want = n.offsetTop - a.off;
+        } else {
+            // The re-window EVICTED the anchor: a large estimate shift (e.g. a
+            // background prefetch re-measuring unrendered rows ABOVE the viewport
+            // taller) remaps scrollTop to different indices and the anchor falls
+            // outside the newly computed range. Restore to its VIRTUAL position
+            // and queue a refresh so the window re-materialises around it.
+            //
+            // cumHeight() lives in a padding-less coordinate; a rendered node's
+            // real offsetTop is cumHeight(0, idx) + PAD_TOP + one ITEM_GAP (see
+            // the constructor). Omitting that constant left `want` ~a row short,
+            // so the queued refresh's _captureAnchor picked the NEIGHBOURING row
+            // and the view jumped ~1 row — a stuck drift on above-viewport churn.
+            want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
+            this._queueRefresh();
+        }
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            // Programmatic, possibly event-less write: keep the direction
+            // baseline fresh (see _prevScrollTop).
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
+
     updateDOM(s, e) {
         if (s > e) return;
+        // Anchor BEFORE any mutation; restored after the spacer writes below.
+        // Skipped during the initial mount cascade (scrollToBottom owns it).
+        const anchor = this.initialLoad ? null : this._captureAnchor();
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
                 const node = this.cache.get(idx);
@@ -1275,6 +1427,7 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
+        this._restoreAnchor(anchor);
         // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
         // (pin total at drag-start, absorb deltas in the spacers) turned
         // estimate-vs-real drift into PHANTOM BLANK at the end of the
@@ -1443,6 +1596,15 @@ class BonitoChat {
     appendChunk(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        // A finalized node has already been painted with the authoritative html
+        // by `onAgentFinal` (which cleared the pending stream). Nodes are never
+        // removed from `nodeById`/`cache` (virtual scroll only detaches them
+        // from the DOM), so a finalized node lives forever — and message ids
+        // are unique per message, so a finalized id never legitimately gets
+        // more chunks. A LATE or duplicate `chunk` for it would repaint the
+        // older, shorter cumulative html; drop it. A NEW message uses a fresh
+        // node (fresh id), so this per-node flag never blocks live streaming.
+        if (node.__btFinal) return;
         // Server ships the FULL rendered html of the message-so-far each
         // chunk (CommonMark-rendered, so intraword `_`s don't italicize and
         // newlines/lists/headings format correctly while streaming). Each
@@ -1496,7 +1658,9 @@ class BonitoChat {
         if (node.__btStreamTimer != null) return;   // window open: coalesce
         const flush = () => {
             node.__btStreamTimer = null;
-            if (this.destroyed || node.__btStreamHtml == null) return;
+            // A final may have landed while this timer was pending; never let a
+            // trailing flush repaint an already-finalized bubble.
+            if (this.destroyed || node.__btFinal || node.__btStreamHtml == null) return;
             node.innerHTML = node.__btStreamHtml;
             node.__btStreamHtml = null;
             node.__btStreamTimer = setTimeout(flush, this.STREAM_APPLY_MS);
@@ -1516,10 +1680,39 @@ class BonitoChat {
 
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (node && msg.html) {
+        if (node) {
+            // ALWAYS clear the pending stream, even for an empty final: a
+            // throttled trailing flush queued by `_applyStreamHtml` would
+            // otherwise fire AFTER this and resurrect stale streamed text into
+            // an already-final bubble. For an empty final we also blank the
+            // node so the bubble reflects the authoritative (empty) message.
             this._clearPendingStream(node);
-            node.innerHTML = msg.html;
+            node.innerHTML = msg.html || '';
             linkifyPaths(node);
+            decorateCodeBlocks(node);
+            // Mark the node final so a LATE/duplicate `chunk` for this id can't
+            // repaint the older, shorter cumulative html (see `appendChunk`).
+            node.__btFinal = true;
+            return;
+        }
+        // Node evicted / id mismatch: mirror `onSummaryFinal`'s DOM fallback so
+        // the authoritative final isn't silently dropped. Prefer a precise
+        // by-id lookup (agent nodes carry `data-msg-id`); fall back to the last
+        // agent bubble in the DOM.
+        let tgt = msg.id
+            ? this.container.querySelector(
+                `.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`)
+            : null;
+        if (!tgt) {
+            const nodes = this.container.querySelectorAll('.bt-agent-msg');
+            tgt = nodes[nodes.length - 1];
+        }
+        if (tgt) {
+            this._clearPendingStream(tgt);
+            tgt.innerHTML = msg.html || '';
+            linkifyPaths(tgt);
+            decorateCodeBlocks(tgt);
+            tgt.__btFinal = true;
         }
     }
 
@@ -1622,11 +1815,22 @@ class BonitoChat {
         if (this.container.querySelector(
                 `.bt-permission-card[data-perm-key="${CSS.escape(msg.key)}"]`)) return;
         const card = document.createElement('div');
-        card.className = 'bt-permission-card';
+        // Keep `bt-permission-card` for the dedup selector + shared chrome; add
+        // `bt-question-card` so a question reads distinctly from a permission ask.
+        card.className = 'bt-permission-card bt-question-card';
         card.dataset.permKey = msg.key;
         const q = document.createElement('div');
-        q.className = 'bt-permission-question';
-        q.textContent = msg.message || 'The agent has a question';
+        q.className = 'bt-permission-question bt-question-prompt';
+        // A small "?" badge gives the card a clear "the agent is asking you"
+        // identity instead of looking like a generic panel.
+        const icon = document.createElement('span');
+        icon.className = 'bt-question-icon';
+        icon.textContent = '?';
+        icon.setAttribute('aria-hidden', 'true');
+        const qtext = document.createElement('span');
+        qtext.textContent = msg.message || 'The agent has a question';
+        q.appendChild(icon);
+        q.appendChild(qtext);
         card.appendChild(q);
 
         const selects = msg.fields.filter(f => f.kind === 'select' || f.kind === 'multiselect');
@@ -1783,11 +1987,25 @@ class BonitoChat {
             const t = node.querySelector('.bt-tool-title');
             if (t) t.textContent = msg.title;
         }
-        // Bash: the raw command rides as a header tooltip once known (the
-        // visible title is claude's human-readable description).
+        // Bash: the command that ran must be VISIBLE (the visible title is
+        // claude's human-readable description; the raw command used to hide in a
+        // header tooltip). Render a persistent preview block under the header —
+        // the command streams in on a later update for real agents, so create it
+        // on demand if createNode didn't have it yet. Keep the tooltip too.
         if (msg.command) {
             const h = node.querySelector('.bt-tool-header');
             if (h) h.title = msg.command;
+            let cp = node.querySelector('.bt-cmd-preview');
+            if (cp) {
+                cp.querySelector('pre').textContent = msg.command;
+            } else if (h) {
+                cp = document.createElement('div');
+                cp.className = 'bt-cmd-preview';
+                const pre = document.createElement('pre');
+                pre.textContent = msg.command;
+                cp.appendChild(pre);
+                h.insertAdjacentElement('afterend', cp);
+            }
         }
         if (msg.summary != null) {
             const s = node.querySelector('.bt-tool-summary');
@@ -1882,6 +2100,70 @@ class BonitoChat {
         }
     }
 
+    // ── Subagent activity feed (Task tool bubbles) ───────────────────────
+    // The server routes every parentToolUseId-tagged subagent update to its
+    // parent TaskToolMsg and mirrors it here as `task_activity` events; the
+    // bubble renders them as a bounded, most-recent-last, auto-scrolled feed
+    // in its own collapsible section between the header and the lazy body
+    // (same Collapsable behaviour the tool body / thought sections use).
+    // Remounts rebuild from the header's `task_feed` snapshot (createNode).
+
+    onTaskActivity(msg) {
+        const node = this.nodeById.get(msg.id);
+        if (!node || !msg.entry) return;
+        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry);
+    }
+
+    _ensureTaskFeed(node) {
+        let feed = node.querySelector('.bt-task-feed');
+        if (feed) return feed;
+        feed = document.createElement('div');
+        feed.className = 'bt-task-feed';
+        feed.innerHTML = `
+            <div class="bt-task-feed-head" data-expanded="false">
+                <span class="bt-tool-toggle">▶</span>
+                <span class="bt-task-feed-title">subagent activity</span>
+                <span class="bt-task-feed-count"></span>
+            </div>
+            <div class="bt-task-feed-list"></div>`;
+        node.querySelector('.bt-tool-header')?.insertAdjacentElement('afterend', feed) ||
+            node.appendChild(feed);
+        const list = feed.querySelector('.bt-task-feed-list');
+        feed._collapsable = new Collapsable(
+            feed.querySelector('.bt-task-feed-head'), list,
+            { toggleEl: feed.querySelector('.bt-task-feed-head .bt-tool-toggle') });
+        // Live task: open by default so the activity is visible as it
+        // streams; finished/replayed bubbles start collapsed (a click on
+        // the section head re-opens — the list is filled either way).
+        if (node.classList.contains('bt-tool-live')) {
+            feed._collapsable.setExpanded(true);
+        } else {
+            list.style.display = 'none';
+        }
+        return feed;
+    }
+
+    _upsertTaskFeedEntry(feed, e) {
+        const list = feed.querySelector('.bt-task-feed-list');
+        let row = e.eid != null ?
+            list.querySelector(`[data-eid="${CSS.escape(String(e.eid))}"]`) : null;
+        if (!row) {
+            row = document.createElement('div');
+            row.dataset.eid = String(e.eid ?? '');
+            list.appendChild(row);
+            // Bounded mirror of the server's feed window.
+            while (list.children.length > 50) list.removeChild(list.firstChild);
+        }
+        row.className = `bt-task-feed-entry bt-task-feed-${e.kind || 'text'}` +
+            (e.status ? ` bt-feed-${e.status}` : '');
+        row.textContent = e.kind === 'tool' ? `⚙ ${e.label || ''}` : (e.label || '');
+        if (e.kind === 'tool' && e.status) row.title = e.status;
+        const count = feed.querySelector('.bt-task-feed-count');
+        if (count) count.textContent = String(list.children.length);
+        // Most-recent-last + auto-scroll while the section is open.
+        if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
+    }
+
     // ── Message filter (toolbar below the composer) ──────────────────────
 
     // First occurrence of a filter key → add its show/hide checkbox to the
@@ -1951,6 +2233,14 @@ class BonitoChat {
     // the real (collapsed) layout exactly. Nodes created later pick up the
     // current state in createNode.
     setKeyHidden(key, hidden) {
+        // Hold the read position across the toggle. Applying visibility reflows
+        // the transcript (matching rows collapse to / expand from 0px), which
+        // moves the viewport BEFORE refresh's own anchor runs — refresh then
+        // faithfully preserves the ALREADY-jumped spot, throwing the reader to a
+        // different message. So capture the top-visible SURVIVING row now (before
+        // the reflow, excluding the type being toggled) and re-pin it after
+        // refresh has trued up the spacers/window.
+        const anchor = this.followMode ? null : this._captureAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache) {
             // applyVisibility, not a raw display write: un-hiding a key must
@@ -1962,6 +2252,7 @@ class BonitoChat {
         if (key === 'agent') this._updateWaiting();
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
+        else if (anchor) this._restoreAnchor(anchor);
     }
 
     // The idle "waiting for your next instruction" line only makes sense
@@ -1986,10 +2277,40 @@ class BonitoChat {
             case 'user':
                 div.className = 'bt-user-msg';
                 if (msg.queued) div.classList.add('bt-queued');
+                // Yolo auto-continue nudge: dim/system-styled, not a real submit.
+                if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
+                // Attached images render inline (the server split the raw
+                // "[attached files …]" suffix into this list — see
+                // msg_to_dict(::UserMsg)). Click → the shared lightbox. A file
+                // the route can no longer serve (project moved, cleanup) falls
+                // back to its name instead of a broken-image icon.
+                if (Array.isArray(msg.attachments) && msg.attachments.length) {
+                    const gallery = document.createElement('div');
+                    gallery.className = 'bt-user-attachments';
+                    for (const a of msg.attachments) {
+                        const img = document.createElement('img');
+                        img.className = 'bt-user-att-img';
+                        img.src = a.url;
+                        img.alt = a.name || 'attachment';
+                        img.loading = 'lazy';
+                        img.addEventListener('click', () => openLightbox(img));
+                        img.addEventListener('error', () => {
+                            const miss = document.createElement('span');
+                            miss.className = 'bt-user-att-missing';
+                            miss.textContent = a.name || 'attachment';
+                            img.replaceWith(miss);
+                        }, { once: true });
+                        gallery.appendChild(img);
+                    }
+                    div.appendChild(gallery);
+                }
                 break;
             case 'agent':
                 div.className = 'bt-agent-msg';
+                // Carry the id so `onAgentFinal`'s DOM fallback can find this
+                // bubble by id when the node is missing from `nodeById`.
+                if (msg.id) div.dataset.msgId = msg.id;
                 if (msg.streaming) {
                     const span = document.createElement('span');
                     span.className = 'bt-stream-text';
@@ -2001,6 +2322,7 @@ class BonitoChat {
                 } else {
                     div.innerHTML = msg.html || '';
                     linkifyPaths(div);
+                    decorateCodeBlocks(div);
                 }
                 break;
             case 'thought': {
@@ -2055,6 +2377,12 @@ class BonitoChat {
                       editMode: isEdit,
                       fetchEachExpand: !isEdit, discardOnCollapse: !isEdit,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
+                // Subagent Task: rebuild the live activity feed from the
+                // header's snapshot (live growth rides task_activity events).
+                if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
+                    const feed = this._ensureTaskFeed(div);
+                    for (const e of msg.task_feed) this._upsertTaskFeedEntry(feed, e);
+                }
                 // Detach (bonito_app only): pop the embed into the floating
                 // window. Lives on the ⤢ header button — the conventional "open
                 // in a window" glyph, and where users expect detach. Routed
@@ -2232,6 +2560,12 @@ class BonitoChat {
                 <button class="bt-eval-preview-toggle" type="button"
                         title="Enlarge">⌄</button>
             </div>` : '';
+        // "What ran", ALWAYS visible (persists past completion — there's no Monaco
+        // "Code" section afterwards) and never hidden in a tooltip: the bash command,
+        // OR a control MCP tool's action (interrupt/restart/list its target session).
+        // A tool ships either `code` (eval preview above) or `command` (this).
+        const cmdPreview = msg.command ? `
+            <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
         // Elapsed timer — empty until the pill finishes, then filled ONCE
         // with the final duration by `_writeToolElapsed` (on creation of an
         // already-finished pill, and on the completion update). Live elapsed
@@ -2259,7 +2593,7 @@ class BonitoChat {
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}
+            ${evalPreview}${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
 
@@ -2644,6 +2978,11 @@ class BonitoChat {
         // Only apply results for the query THIS tab currently has pending
         // (the channel is shared across tabs — see the server handler).
         if (msg.q !== this.lensQuery) return;
+        // Clearing an active lens un-hides rows (a reflow that would jump the
+        // view before refresh's anchor runs) — hold the read position like
+        // setKeyHidden. Activating scrolls to the first match below, so no anchor.
+        const holdAnchor = (this.lensActive && !msg.active && !this.followMode)
+            ? this._captureAnchor() : null;
         if (!msg.active) {
             this.lensActive = false; this.lensVisible = null; this.lensActions = null;
         } else {
@@ -2670,7 +3009,9 @@ class BonitoChat {
             }
         }
         // Jump to the top of the filtered view so the first match is visible.
-        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this.refresh(); }
+        // (scrollTop write syncs _prevScrollTop: programmatic, possibly event-less.)
+        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this._prevScrollTop = 0; this.refresh(); }
+        else if (holdAnchor) this._restoreAnchor(holdAnchor);   // clearing: hold the read position
     }
 
     onLensSaved(msg) {
@@ -2729,6 +3070,26 @@ class BonitoChat {
         return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
 
+    // The jump pill's visibility criterion: TRUE only when the LAST message
+    // is COMPLETELY out of the container's visible box (its top edge at or
+    // below the visible bottom — not a single pixel showing). Deliberately
+    // NOT the razor-thin atBottom() boundary: composer autosize shifts the
+    // container by ~a keystroke's worth of pixels, and a pill keyed on
+    // "off the bottom" flickered on/off while typing. A whole message
+    // height of hysteresis makes layout jitter invisible to the pill,
+    // while followMode / unread-clearing keep using atBottom().
+    lastMessageFullyOutOfView() {
+        if (this.totalCount === 0) return false;
+        const node = this.cache.get(this.totalCount - 1);
+        // Virtual scroll detaches nodes far outside the viewport (cache
+        // keeps them), and deep in scrollback the last message may not be
+        // fetched at all — a missing/detached/display:none node has no
+        // visible pixel by definition.
+        if (!node || !node.isConnected || node.offsetParent === null) return true;
+        return node.getBoundingClientRect().top >=
+            this.container.getBoundingClientRect().bottom;
+    }
+
     // rAF-batched scroll: multiple stream chunks arriving in the same
     // frame (or a chunk + a ResizeObserver callback) coalesce into ONE
     // scroll, run AFTER the browser has laid out the new content.
@@ -2753,11 +3114,19 @@ class BonitoChat {
             // followMode, will queue a fresh chase here. Defensive
             // re-check: if the user gestured within the last 100 ms,
             // assume their scroll-down/up intent is still in flight and
-            // skip the chase. 100 ms covers the wheel→scroll-event
+            // don't yank mid-gesture. 100 ms covers the wheel→scroll-event
             // delay (typically one task ≪ 50 ms, generous for slow
             // devices) without locking out chase for the steady-state
-            // stream-while-at-bottom case.
-            if ((performance.now() - this._lastUserInputT) < 100) return;
+            // stream-while-at-bottom case. But follow mode SURVIVING to
+            // this point means nothing disengaged or cancelled us (a
+            // scroll-away lands in _applyUserScroll's disengage, which
+            // cancels through _cancelPendingScroll) — the chase must still
+            // land, e.g. after a downward re-engage mid-gesture. Re-arm
+            // until the input window lapses instead of dropping.
+            if ((performance.now() - this._lastUserInputT) < 100) {
+                if (this.followMode) this._queueScrollToBottom();
+                return;
+            }
             this.scrollToBottom();
         });
     }
@@ -2775,6 +3144,11 @@ class BonitoChat {
         if (anchor) {
             anchor.scrollIntoView({ block: 'end', behavior: 'auto' });
         }
+        // Keep the direction baseline honest where no scroll event may fire
+        // (see the offscreen note below): a chase leaving a stale, SMALLER
+        // _prevScrollTop would make the next upward peek read as "moving
+        // down" and wrongly re-engage.
+        this._prevScrollTop = this.container.scrollTop;
         // Don't rely on the `scroll` event to drive the post-scroll range
         // fetch — Electron's offscreen renderer (and a few other headless
         // browser configs) doesn't fire scroll events for programmatic
@@ -2806,6 +3180,15 @@ class BonitoChat {
         if (this._setOverscroll) this._setOverscroll(0);
         this._savedScrollTop  = this.container.scrollTop;
         this._savedFollowMode = this.followMode;
+        // CONTENT anchor besides the pixel position: heights re-measured
+        // while hidden (or the backfill running meanwhile) change what a raw
+        // scrollTop points at — restoring to the anchored MESSAGE is what
+        // "keep my read position" actually means.
+        this._savedAnchor = this._captureAnchor();
+        // Hidden panes stop backfilling: every prefetch chunk is a server-side
+        // render broadcast to every tab — deferred until the user returns.
+        this._prefetchPaused = true;
+        clearTimeout(this._prefetchTimer);
     }
 
     // Called by the chat-pane visibility toggle whenever this pane goes
@@ -2829,14 +3212,34 @@ class BonitoChat {
         const followThen = !!this._savedFollowMode;
         const wantBottom = followNow || followThen;
         const savedTop   = this._savedScrollTop;
+        const anchor     = this._savedAnchor;
+
+        // Resume the paused history backfill (see onHidden).
+        this._prefetchPaused = false;
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(() => this._prefetchTick(), 600);
+        }
 
         const apply = () => {
             if (this.destroyed) return;
             if (wantBottom) {
                 if (this.followMode) this.scrollToBottom();
+                return;
+            }
+            // Prefer the CONTENT anchor: land on the message the user was
+            // reading, not on whatever pixel offset the re-measured heights
+            // now map to. Falls back to the raw scrollTop while the anchor
+            // node isn't rendered yet (a later cascade retry snaps it true).
+            const n = anchor && this.rendered.has(anchor.idx) ? this.cache.get(anchor.idx) : null;
+            if (n && n.isConnected) {
+                this.container.scrollTop = n.offsetTop - anchor.off;
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
             }
+            // Programmatic, possibly event-less write: sync the direction
+            // baseline (see _prevScrollTop).
+            this._prevScrollTop = this.container.scrollTop;
         };
         apply();
         requestAnimationFrame(apply);
@@ -3092,7 +3495,12 @@ class BonitoChat {
         // Nothing to send → noop. (Pressing Enter on an empty textarea
         // shouldn't fire a request, and the user can have queued some
         // attachments without any text — the latter case still sends.)
-        if (text.trim() === '' && this.attachments.size === 0) return;
+        // EXCEPT in Yolo mode: the composer is the reminders editor and this
+        // same send path LOCKS IN the text server-side (SendCommand becomes a
+        // reminders write, never a send — see handle_command!). An empty
+        // lock-in is meaningful there: it clears the reminders.
+        const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
+        if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
         const payload = [];
         for (const item of this.attachments.values()) {
             const buf = await item.blob.arrayBuffer();
@@ -3129,11 +3537,53 @@ class BonitoChat {
     }
 
     // ── Follow mode + unread pill ────────────────────────────────────────
+    // Classify ONE user-driven scroll movement (prevTop → current scrollTop)
+    // into the follow-mode transition. Called from the scroll handler AND
+    // directly at the pan/momentum scrollTop writes — offscreen renderers
+    // don't fire scroll events for programmatic writes (see scrollToBottom),
+    // and when the event DOES fire it sees a zero delta and skips, so the
+    // movement is never classified twice.
+    //
+    // DISENGAGE is razor-thin, direction-blind: any user scroll landing off
+    // the bottom (beyond AT_BOTTOM_PX) while following — even a small upward
+    // peek — turns follow off. RE-ENGAGE is generous but DOWNWARD-ONLY, and
+    // shares the jump-pill's boundary (pill visible ⟺ out of follow range):
+    // a downward scroll re-engages the moment any pixel of the last message
+    // is visible, capped at one viewport of remaining gap so a multi-screen-
+    // tall last message can't snap-skip content the user is still reading.
+    // Disengage runs first, so a continuous downward scroll THROUGH the zone
+    // doesn't flip-flop with event parity: every in-zone downward event
+    // lands on "following".
+    _applyUserScroll(prevTop) {
+        const { scrollTop, scrollHeight, clientHeight } = this.container;
+        const atBot = this.atBottom();
+        if (this.followMode && !atBot) {
+            this.setFollowMode(false);
+            this._cancelPendingScroll();
+        }
+        if (this.followMode) return;
+        if (atBot || (scrollTop > prevTop &&
+                      scrollHeight - scrollTop - clientHeight < clientHeight &&
+                      !this.lastMessageFullyOutOfView())) {
+            this.setFollowMode(true);
+            // Pin the viewport. The chase rAF defers while the gesture is
+            // still in flight and re-arms itself (see _queueScrollToBottom),
+            // so it lands right after the input window lapses — and a
+            // disengage meanwhile cancels it as always.
+            this._queueScrollToBottom();
+        } else {
+            // Off-bottom without re-engaging: any pending chase yields to
+            // the user's position (same cancel the old handler did).
+            this._cancelPendingScroll();
+        }
+    }
+
     // followMode is the one-bit "should new content auto-scroll" state.
     // It's set true when the user is at the bottom (within AT_BOTTOM_PX)
     // and the chat starts in this mode. Scrolling away → false. Sending
-    // a message, clicking the pill, or scrolling back to the bottom →
-    // true. Layout shifts never toggle it.
+    // a message, clicking the pill, or scrolling DOWN into the last-message
+    // zone (any pixel visible, less than a viewport to go) → true. Layout
+    // shifts never toggle it.
     setFollowMode(on) {
         if (this.followMode === on) return;
         this.followMode = on;
@@ -3151,20 +3601,69 @@ class BonitoChat {
         }
     }
 
-    // Bump unread + show pill. Called from appendNewMessage and
-    // appendChunk when followMode is off.
+    // Bump unread + surface the pill. Called from appendNewMessage and
+    // appendChunk when followMode is off. Appending only ever pushes the
+    // last message FURTHER down, so re-checking the criterion here can
+    // flip the pill ON (never off); while the freshly appended message is
+    // still partially visible there's no pill — just keep the glow/label
+    // fresh in case it's already showing.
     _registerUnread() {
         this.unreadCount++;
-        this._showNewMessagePill();
+        if (this.lastMessageFullyOutOfView()) {
+            this._showNewMessagePill();
+        } else {
+            this._refreshPillContent();
+        }
+    }
+
+    // The scroll-to-bottom affordance is visible ONLY when the last message is
+    // completely out of view — while any pixel of it still shows there is
+    // nothing hidden to jump to (see lastMessageFullyOutOfView). It GLOWS and
+    // reads "New messages" when there's unread content (a real nudge);
+    // otherwise it's the same pill without the glow, a plain "Move to bottom"
+    // jump button. `atBot` (the tight AT_BOTTOM_PX check) keeps its OLD job
+    // here: clearing unread. In the in-between state — last message partially
+    // visible but not at the bottom — the pill hides, but unread is NOT
+    // cleared: the user hasn't actually reached the bottom.
+    _updateScrollAffordance(atBot) {
+        if (atBot) {
+            this.unreadCount = 0;
+            this._hideNewMessagePill();
+        } else if (this.lastMessageFullyOutOfView()) {
+            this._showNewMessagePill();
+        } else {
+            this._hideNewMessagePill();
+        }
     }
 
     _showNewMessagePill() {
         if (!this._pillEl) this._createNewMessagePill();
-        if (this._pillEl) this._pillEl.classList.add('bt-new-msg-pill-visible');
+        if (!this._pillEl) return;
+        // Touch classList only on an actual hidden→shown flip (the scroll
+        // handler re-derives visibility on every event) — but ALWAYS refresh
+        // the glow/label: unread can arrive while the pill is already up.
+        if (!this._pillShown) {
+            this._pillShown = true;
+            this._pillEl.classList.add('bt-new-msg-pill-visible');
+        }
+        this._refreshPillContent();
     }
 
     _hideNewMessagePill() {
+        if (!this._pillShown) return;
+        this._pillShown = false;
         if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
+    }
+
+    // Glow + "New messages" only while there's unread content; otherwise the
+    // plain "Move to bottom" form (same popup, no glow).
+    _refreshPillContent() {
+        if (!this._pillEl) return;
+        const hasUnread = this.unreadCount > 0;
+        this._pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        if (this._pillLabelEl) {
+            this._pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
+        }
     }
 
     // Pill lives inside .bt-app, absolutely positioned above the input
@@ -3177,8 +3676,14 @@ class BonitoChat {
         const pill = document.createElement('button');
         pill.type = 'button';
         pill.className = 'bt-new-msg-pill';
-        pill.innerHTML = '<span class="bt-new-msg-pill-arrow">↓</span>' +
-                          '<span>New messages</span>';
+        const arrow = document.createElement('span');
+        arrow.className = 'bt-new-msg-pill-arrow';
+        arrow.textContent = '↓';
+        const label = document.createElement('span');
+        label.className = 'bt-new-msg-pill-label';
+        label.textContent = 'Move to bottom';
+        pill.appendChild(arrow);
+        pill.appendChild(label);
         pill.addEventListener('click', (e) => {
             e.preventDefault();
             this.setFollowMode(true);
@@ -3186,6 +3691,7 @@ class BonitoChat {
         });
         app.appendChild(pill);
         this._pillEl = pill;
+        this._pillLabelEl = label;
     }
 }
 
@@ -3194,6 +3700,51 @@ class BonitoChat {
 // and not a URL. Bare names like `foo.jl` stay unlinked on purpose (too many
 // false positives: package names, "Project.toml" as a concept, …).
 const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+
+// Give every fenced code block (<pre>) in a rendered message a hover action row
+// (copy · download), Signal-style. The <pre> is wrapped in a positioned
+// `.bt-code-wrap` so the buttons can float top-right without disturbing layout.
+// Idempotent: re-running on a re-rendered message (streaming) won't double-wrap.
+function decorateCodeBlocks(rootEl) {
+    rootEl.querySelectorAll('pre').forEach((pre) => {
+        if (pre.dataset.btDecorated || pre.closest('.bt-code-wrap')) return;
+        pre.dataset.btDecorated = '1';
+        const wrap = document.createElement('div');
+        wrap.className = 'bt-code-wrap';
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
+        const codeText = () => (pre.innerText || '');
+        const mk = (cls, glyph, title, onClick) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'bt-code-action ' + cls;
+            b.title = title;
+            b.textContent = glyph;
+            b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); onClick(b); });
+            return b;
+        };
+        const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b) => {
+            if (!navigator.clipboard) return;
+            navigator.clipboard.writeText(codeText()).then(() => {
+                b.textContent = '✓';
+                setTimeout(() => { b.textContent = '⧉'; }, 1200);
+            }).catch(() => {});
+        });
+        const dlBtn = mk('bt-code-download', '⤓', 'Download', () => {
+            const blob = new Blob([codeText()], { type: 'text/plain' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'snippet.txt';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        });
+        const actions = document.createElement('div');
+        actions.className = 'bt-code-actions';
+        actions.appendChild(copyBtn);
+        actions.appendChild(dlBtn);
+        wrap.appendChild(actions);
+    });
+}
 
 // Turn path-looking inline `code` spans inside an agent message into
 // clickable path links (the delegated container listener opens them in the
@@ -3207,6 +3758,22 @@ function linkifyPaths(rootEl) {
         el.classList.add('bt-path-link');
         el.dataset.path = text;
     });
+}
+
+// Click-to-enlarge for JS-created media (user-bubble attachment images).
+// Mirrors the Julia-side LIGHTBOX_OPEN_JS (chat.jl) used by bt_show / Read
+// previews: clone into a fullscreen overlay, Esc or backdrop click closes.
+function openLightbox(media) {
+    const overlay = document.createElement('div');
+    overlay.className = 'bt-lightbox-overlay';
+    const big = media.cloneNode(true);
+    big.classList.add('bt-lightbox-media');
+    overlay.appendChild(big);
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
+    const onkey = e => { if (e.key === 'Escape') close(); };
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', onkey);
+    document.body.appendChild(overlay);
 }
 
 function escapeHTML(str) {
