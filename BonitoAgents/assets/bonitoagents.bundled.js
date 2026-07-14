@@ -845,13 +845,14 @@ class BonitoChat {
             if (!this.destroyed) this.refresh();
         });
     }
-    _captureAnchor() {
+    _captureAnchor(excludeKey = null) {
         const st = this.container.scrollTop;
         for (const i of [
             ...this.rendered
         ].sort((a, b)=>a - b)){
             const n = this.cache.get(i);
             if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (excludeKey && n.dataset.filterKey === excludeKey) continue;
             if (n.offsetTop + n.offsetHeight > st) {
                 return {
                     idx: i,
@@ -1484,6 +1485,7 @@ class BonitoChat {
         this.refresh();
     }
     setKeyHidden(key, hidden) {
+        const anchor = this.followMode ? null : this._captureAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache){
             if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
@@ -1491,6 +1493,7 @@ class BonitoChat {
         if (key === 'agent') this._updateWaiting();
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
+        else if (anchor) this._restoreAnchor(anchor);
     }
     _updateWaiting() {
         if (!this.waitingEl) return;
@@ -2088,6 +2091,7 @@ class BonitoChat {
     }
     onLensResult(msg) {
         if (msg.q !== this.lensQuery) return;
+        const holdAnchor = this.lensActive && !msg.active && !this.followMode ? this._captureAnchor() : null;
         if (!msg.active) {
             this.lensActive = false;
             this.lensVisible = null;
@@ -2119,7 +2123,7 @@ class BonitoChat {
             this.container.scrollTop = 0;
             this._prevScrollTop = 0;
             this.refresh();
-        }
+        } else if (holdAnchor) this._restoreAnchor(holdAnchor);
     }
     onLensSaved(msg) {
         this.savedLenses = msg.lenses || [];

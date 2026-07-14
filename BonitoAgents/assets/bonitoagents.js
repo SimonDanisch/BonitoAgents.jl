@@ -1313,11 +1313,15 @@ class BonitoChat {
     // user is looking at — without it, every prefetch/retry tick snapped the
     // view back while scrolling through unmeasured history ("scrolling is
     // stuck: it resets to an earlier position every second").
-    _captureAnchor() {
+    // The top-visible rendered node + its offset from scrollTop. `excludeKey`
+    // skips rows of a filter type that's about to be hidden — they won't survive
+    // the toggle, so anchoring on one would lose the read position (setKeyHidden).
+    _captureAnchor(excludeKey = null) {
         const st = this.container.scrollTop;
         for (const i of [...this.rendered].sort((a, b) => a - b)) {
             const n = this.cache.get(i);
             if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (excludeKey && n.dataset.filterKey === excludeKey) continue;
             if (n.offsetTop + n.offsetHeight > st) {
                 return { idx: i, off: n.offsetTop - st };
             }
@@ -2229,6 +2233,14 @@ class BonitoChat {
     // the real (collapsed) layout exactly. Nodes created later pick up the
     // current state in createNode.
     setKeyHidden(key, hidden) {
+        // Hold the read position across the toggle. Applying visibility reflows
+        // the transcript (matching rows collapse to / expand from 0px), which
+        // moves the viewport BEFORE refresh's own anchor runs — refresh then
+        // faithfully preserves the ALREADY-jumped spot, throwing the reader to a
+        // different message. So capture the top-visible SURVIVING row now (before
+        // the reflow, excluding the type being toggled) and re-pin it after
+        // refresh has trued up the spacers/window.
+        const anchor = this.followMode ? null : this._captureAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache) {
             // applyVisibility, not a raw display write: un-hiding a key must
@@ -2240,6 +2252,7 @@ class BonitoChat {
         if (key === 'agent') this._updateWaiting();
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
+        else if (anchor) this._restoreAnchor(anchor);
     }
 
     // The idle "waiting for your next instruction" line only makes sense
@@ -2940,6 +2953,11 @@ class BonitoChat {
         // Only apply results for the query THIS tab currently has pending
         // (the channel is shared across tabs — see the server handler).
         if (msg.q !== this.lensQuery) return;
+        // Clearing an active lens un-hides rows (a reflow that would jump the
+        // view before refresh's anchor runs) — hold the read position like
+        // setKeyHidden. Activating scrolls to the first match below, so no anchor.
+        const holdAnchor = (this.lensActive && !msg.active && !this.followMode)
+            ? this._captureAnchor() : null;
         if (!msg.active) {
             this.lensActive = false; this.lensVisible = null; this.lensActions = null;
         } else {
@@ -2968,6 +2986,7 @@ class BonitoChat {
         // Jump to the top of the filtered view so the first match is visible.
         // (scrollTop write syncs _prevScrollTop: programmatic, possibly event-less.)
         if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this._prevScrollTop = 0; this.refresh(); }
+        else if (holdAnchor) this._restoreAnchor(holdAnchor);   // clearing: hold the read position
     }
 
     onLensSaved(msg) {
