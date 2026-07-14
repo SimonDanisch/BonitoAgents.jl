@@ -323,12 +323,22 @@ function bound_for_render(s::AbstractString)
 end
 bound_for_render(@nospecialize x) = x
 
+# A returned String renders through Bonito's plain-text child path
+# (`jsrender(::Session, ::String)` returns the string as-is), which never hits
+# the `render_mime` ANSI handling — so a result string carrying ANSI codes
+# (e.g. from `sprint` with color) would show raw escapes while the SAME text on
+# stdout renders as a colored terminal block. Route ANSI strings through
+# `RichText` so both paths display alike.
+display_value(@nospecialize x) = x
+display_value(s::AbstractString) =
+    Bonito.has_ansi_codes(String(s)) ? Bonito.RichText(String(s)) : s
+
 function render_eval_html(value)
     parent = get_parent_session()
     render1(v) = (io = IOBuffer();
                   Bonito.show_html(io, Bonito.App(v); parent = parent);
                   String(take!(io)))
-    html = render1(bound_for_render(value))
+    html = render1(display_value(bound_for_render(value)))
     if ncodeunits(html) > MAX_RENDER_BYTES
         html = render1(string(typeof(value), ": rendered output too large (",
                               ncodeunits(html), " bytes) — display suppressed"))
