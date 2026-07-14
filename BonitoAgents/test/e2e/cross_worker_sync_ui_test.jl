@@ -89,17 +89,14 @@
             # select carries one <option value=worker_id>name</option> per worker;
             # set its value + fire change so `np_worker` updates before Create.
             picked = TK.eval_js(s, """(() => {
-                const sels = [...document.querySelectorAll('select')].filter(e => e.offsetParent !== null);
-                for (const sel of sels) {
-                    const opt = [...sel.options].find(o => o.value === $(TK.json(worker_id)));
-                    if (opt) {
-                        sel.value = opt.value;
-                        sel.dispatchEvent(new Event('input', {bubbles: true}));
-                        sel.dispatchEvent(new Event('change', {bubbles: true}));
-                        return true;
-                    }
-                }
-                return false; })()""")
+                const sel = document.querySelector('.bt-np-worker-select');
+                if (!sel) return false;
+                const opt = [...sel.options].find(o => o.value === $(TK.json(worker_id)));
+                if (!opt) return false;
+                sel.value = opt.value;
+                sel.dispatchEvent(new Event('input', {bubbles: true}));
+                sel.dispatchEvent(new Event('change', {bubbles: true}));
+                return true; })()""")
             picked === true || error("create_on_worker: no Worker <option> for $worker_id")
             TK.click_text(s, "Create")
             # Chat view renders after the ACP session binds (mock-agent cold
@@ -122,11 +119,15 @@
 
         TK.to_dashboard(server)
         TK.click_text(server, "+ New project")
+        # Target the form's worker select by ITS class — "first visible select
+        # with ≥2 options" picked up the dashboard's session-config pills
+        # (also native selects: mode/effort) and read their option labels as
+        # worker names.
         TK.wait_for(server, "form for id lookup",
-            "[...document.querySelectorAll('select')].some(s => s.offsetParent !== null && s.options.length >= 2)";
+            "(() => { const s = document.querySelector('.bt-np-worker-select'); return !!s && s.offsetParent !== null && s.options.length >= 2; })()";
             timeout = 30)
         ids = TK.eval_js(server, """(() => {
-            const sel = [...document.querySelectorAll('select')].filter(s => s.offsetParent !== null && s.options.length >= 2)[0];
+            const sel = document.querySelector('.bt-np-worker-select');
             if (!sel) return null;
             const byName = {};
             for (const o of sel.options) byName[(o.textContent||'').trim()] = o.value;

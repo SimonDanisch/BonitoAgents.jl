@@ -2343,7 +2343,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.select(
             # Show w.name (mutable display label) but submit w.worker_id
             # (stable UUID, the dict key into state.workers).
+            # The class is a stable hook: tests / tooling target THIS select —
+            # "first visible <select>" broke once the dashboard grew the
+            # session-config pills (also native selects).
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
+            class = "bt-np-worker-select",
             onchange = js"event => $(np_worker).notify(event.target.value)"),
         # Form action row — the global progress card is the visual feedback
         # for the in-flight submit; click handlers guard against double-fire.
@@ -2361,6 +2365,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.label("Worker"),
         DOM.select(
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
+            class = "bt-gh-worker-select",
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
         DOM.div(gh_cancel, gh_submit, class = "bt-form-actions"),
         class = "bt-form")
