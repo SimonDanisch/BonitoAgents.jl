@@ -2711,6 +2711,16 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     return nothing
 end
 
+# Remember the last non-empty `ConfigOption` set any session reported, so the home
+# "Defaults" selects have real (agent-reported) choice lists before a chat is
+# open. Server-wide cache (one observable per server); the model's `state` here is
+# the parent, so all bridged home views update.
+function cache_config_options!(model::ChatModel, opts)
+    cfgs = Any[x for x in opts if x isa AgentClientProtocol.ConfigOption]
+    isempty(cfgs) || (model.state.last_config_options[] = cfgs)
+    return nothing
+end
+
 # Session-config changes mid-turn: pure header metadata — update the shared
 # observable, no chat bubble, no persistence (config is ephemeral per
 # connection; the next bring-up resets it from the session-setup result).
@@ -2720,6 +2730,7 @@ function process!(chat::ChatModel, m::AgentClientProtocol.ConfigUpdate)
     # items, preserve any other meta kinds a future parser may have added.
     rest = [x for x in s.session_meta[] if !(x isa AgentClientProtocol.ConfigOption)]
     s.session_meta[] = Any[m.options..., rest...]
+    cache_config_options!(chat, m.options)
     return nothing
 end
 
@@ -2749,6 +2760,7 @@ function adopt_config_options!(model::ChatModel, result)
     s = shared(model)
     rest = [x for x in s.session_meta[] if !(x isa AgentClientProtocol.ConfigOption)]
     s.session_meta[] = Any[opts..., rest...]
+    cache_config_options!(model, opts)
     return true
 end
 
@@ -2813,8 +2825,9 @@ project_of(model::ChatModel) =
 function effective_session_config(model::ChatModel)
     cfg = Dict{String,String}("mode" => DEFAULT_PERMISSION_MODE,
                               "effort" => DEFAULT_EFFORT)
+    merge!(cfg, model.state.default_session_config[])   # user's home "Defaults" (may add model)
     p = project_of(model)
-    p === nothing || merge!(cfg, p.desired_config)
+    p === nothing || merge!(cfg, p.desired_config)       # per-chat picks win
     return cfg
 end
 
@@ -4887,6 +4900,16 @@ end
 # for the next turn; mode/effort are accepted too).
 const SELECTABLE_CONFIG = ("model", "mode", "thought_level")
 
+# Friendly category prefix shown on each pill so two "default" values aren't
+# ambiguous — "[permissions: default] [model: Opus 4.8 …]" instead of
+# "[default] [default]". The permission-mode category reads "permissions" (the
+# user-facing word), not "mode".
+pill_category_label(o::AgentClientProtocol.ConfigOption) =
+    o.category == "model"         ? "model" :
+    o.category == "mode"          ? "permissions" :
+    o.category == "thought_level" ? "effort" :
+    lowercase(o.name)
+
 # `lowercase_modes` lower-cases the PERMISSION-MODE labels (claude reports them
 # title-cased — "Default", "Bypass Permissions"); set for the Claude provider so
 # the mode pill reads in the same lower-case style as the underlying values.
@@ -4899,8 +4922,10 @@ function header_pill(o::AgentClientProtocol.ConfigOption,
     end
     label = AgentClientProtocol.pill_label(o)
     lc && (label = lowercase(label))
-    # No name prefix — just the value; the option name lives in the tooltip.
-    DOM.span(label; class = "bt-header-meta-item", title = pill_tooltip(o))
+    # Category prefix + the (resolved) value, so the pill reads e.g.
+    # "model: Opus 4.8 with 1M context".
+    DOM.span(DOM.span(pill_category_label(o) * ": "; class = "bt-header-meta-cat"), label;
+             class = "bt-header-meta-item", title = pill_tooltip(o))
 end
 # Fallback so an unknown meta kind degrades to its string form, not an error.
 header_pill(x, pick::Union{Observable,Nothing} = nothing; lowercase_modes::Bool = false) =
@@ -4927,16 +4952,79 @@ function config_select_pill(o::AgentClientProtocol.ConfigOption, pick::Observabl
         kwargs = c.value == cur ?
             (; value = c.value, title = title, selected = true) :
             (; value = c.value, title = title)
-        DOM.option(lab(c.name); kwargs...)
+        # Resolved label (e.g. model "default" → "Opus 4.8 …", "(recommended)"
+        # stripped) so the collapsed select shows the real value, not "default".
+        DOM.option(lab(AgentClientProtocol.choice_label(o, c)); kwargs...)
     end
     sel = DOM.select((mkopt(c) for c in o.choices)...;
             class = "bt-header-meta-select",
             onchange = js"event => $(pick).notify([$(cfg_id), event.target.value])")
-    # No name prefix — each pill shows just its value; the full "Mode: …" /
-    # "Effort: …" label rides on the hover tooltip (`pill_tooltip`).
-    DOM.div(sel;
+    # Category prefix outside the <select> (a native select can't prefix only the
+    # collapsed value), so the pill reads "permissions: default" / "model: Opus 4.8".
+    DOM.div(DOM.span(pill_category_label(o) * ": "; class = "bt-header-meta-cat"), sel;
         class = "bt-header-meta-item bt-header-meta-pick",
         title = pill_tooltip(o))
+end
+
+# ── Home "Defaults" control ──────────────────────────────────────────────────
+# Server-wide default model / permission mode / effort for NEW & unconfigured
+# chats. Overlaid UNDER each chat's own picks (see `effective_session_config`).
+# Reuses the header pill picker. Choice lists come from the last config options
+# any session reported (`state.last_config_options`); mode/effort carry a built-in
+# fallback so the control is usable before any chat is open (model needs a live
+# agent to enumerate, so it only appears once one has reported).
+const DEFAULTS_FALLBACK = AgentClientProtocol.ConfigOption[
+    AgentClientProtocol.ConfigOption("mode", "Mode", nothing, "mode", "default",
+        [AgentClientProtocol.ConfigOptionChoice("default", "Default", "Standard behavior, prompts for dangerous operations"),
+         AgentClientProtocol.ConfigOptionChoice("acceptEdits", "Accept Edits", "Auto-accept file edit operations"),
+         AgentClientProtocol.ConfigOptionChoice("bypassPermissions", "Bypass Permissions", "Bypass all permission checks"),
+         AgentClientProtocol.ConfigOptionChoice("plan", "Plan Mode", "Planning mode, no actual tool execution")]),
+    AgentClientProtocol.ConfigOption("effort", "Effort", nothing, "thought_level", "default",
+        [AgentClientProtocol.ConfigOptionChoice(v, titlecase(v), nothing)
+         for v in ("default", "low", "medium", "high", "xhigh", "max")]),
+]
+
+# The options to offer in the Defaults bar, header order (model first), using the
+# agent-reported option where available, else the built-in fallback.
+function defaults_options(reported)
+    by_id = Dict{String,Any}(o.id => o for o in reported
+                             if o isa AgentClientProtocol.ConfigOption)
+    rows = AgentClientProtocol.ConfigOption[]
+    haskey(by_id, "model") && push!(rows, by_id["model"])
+    for fb in DEFAULTS_FALLBACK
+        push!(rows, get(by_id, fb.id, fb))
+    end
+    return rows
+end
+
+# `state` must be the SHARED state (default_session_config / last_config_options
+# are shared, not bridged — see `Base.copy`), so a pick reaches every session +
+# `effective_session_config`.
+function session_defaults_bar(session::Bonito.Session, state::ServerState)
+    pick = Observable(["", ""])
+    on(session, pick) do sel
+        (sel isa AbstractVector && length(sel) == 2 && !isempty(String(sel[1]))) || return
+        cfg_id, value = String(sel[1]), String(sel[2])
+        pick[] = ["", ""]                       # reset so the same pill can re-fire
+        lock(state.lock) do
+            d = copy(state.default_session_config[])
+            d[cfg_id] = value
+            state.default_session_config[] = d  # shared → all home views + bring-ups
+        end
+        save_settings!(state)
+    end
+    bar = map(session, state.last_config_options, state.default_session_config) do reported, defs
+        rows = defaults_options(reported)
+        pills = [begin
+            cur = get(defs, base.id, base.current_value)
+            o = AgentClientProtocol.ConfigOption(base.id, base.name, base.description,
+                                                 base.category, String(cur), base.choices)
+            config_select_pill(o, pick; lc = o.category == "mode")
+        end for base in rows]
+        DOM.div(pills...; class = "bt-header-meta bt-defaults-bar")
+    end
+    DOM.div(DOM.span("Session defaults"; class = "bt-defaults-label"), bar;
+            class = "bt-defaults")
 end
 
 # Display policy: which meta items make it into the header line. We surface the

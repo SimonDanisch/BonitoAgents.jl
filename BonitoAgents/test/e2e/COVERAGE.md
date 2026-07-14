@@ -5,10 +5,11 @@ only the `claude-agent-acp` binary swapped for the mock) through a headless
 Electron window via `ElectronCall.Testing`. They assert against the rendered
 DOM only — no internal-API calls.
 
-They replace the legacy `../electron/` harness, which booted `unified_app(state)`
-directly (an internal API). Each `../electron/` test is deleted once a suite
-here covers its behaviour; what is still listed in `../electron/runtests.jl`
-is the remaining backlog.
+They replaced the legacy `../electron/` harness (now **removed** in full), which
+booted `unified_app(state)` directly (an internal API) and drove a hand-rolled
+`MockTransport` ChatModel. Every behaviour that harness covered now lives in a
+suite here or a headless `../unit/` testitem; the sections below record where each
+one landed, plus the few that can't be reproduced in a headless window.
 
 ## Runner guarantees (`run_all.jl`)
 
@@ -78,37 +79,36 @@ it, so it covers the working path; the inactive-close fix is still open.
 `test_lens.jl` (the UI test) → `lens.jl` (the root `test/test_lens.jl` lens-core
 unit test stays — it is headless, not a UI test).
 
-## Backlog (still in `../electron/`, not yet ported)
+## Former `../electron/` backlog — now ported (tier removed)
 
-Portable with the mock, just not done yet:
+- `test_streamed_tool_input.jl` → `streamed_tool_input_test.jl` (partial `rawInput`).
+- `test_chat_errors.jl` → inline `[error: …]` in `errors.jl`; the transport-DEATH
+  path (agent dies → `session_alive` false) is asserted by `cancel_escalation_test.jl`.
+- `test_virtual_scroll.jl` → `virtual_scroll_test.jl`; `test_keyed_list.jl` →
+  `keyed_list_test.jl`; `test_chat_remount.jl` → `chat_remount_test.jl`;
+  `test_chat_controls.jl` → `chat_controls_test.jl`; `test_auto_prompt.jl` →
+  `auto_prompt_test.jl`; `test_folder_threads.jl` → `folder_threads_test.jl`;
+  `test_chat_show*.jl` → `chat_show_test.jl` / `chat_show_extras_test.jl`;
+  `test_chat_background_tab.jl` → `background_tab_test.jl`; `test_layout_fixes.jl` →
+  `layout_fixes_test.jl`; `test_resume_no_jserrors.jl` → `resume_no_jserrors_test.jl`.
+- `test_follow_pill.jl` → `follow_pill_test.jl`; `test_scroll_chase.jl` →
+  `scroll_chase_test.jl` (black-box, driving the real scroller — the legacy tests
+  poked internal state; the ports keep the load-bearing invariant black-box).
+- `test_chat_attach.jl` → `chat_attach_test.jl` (synthetic ClipboardEvent, no OS dialog).
+- `test_chat_cancel.jl` → `chat_cancel_test.jl` / `cancel_escalation_test.jl`.
+- `test_worker_move.jl` → `worker_move_test.jl`; `test_cross_worker_sync_ui.jl` →
+  `cross_worker_sync_ui_test.jl`; the backend reconcile (`same_name_siblings` /
+  `compare_projects` / `sync_across_workers!`) → headless `../unit/cross_worker_sync_test.jl`.
+- `test_remotesync.jl` → headless `../unit/remotesync_test.jl`.
+- `test_chat_stress.jl` → the real-`serve()` render path is exercised by every
+  dev_server suite (`smoke_test.jl`, `chat_features.jl`, `workflows.jl`).
 
-- `test_streamed_tool_input.jl` — partial `rawInput` streaming; needs the mock
-  to emit partial tool-input frames.
-- `test_chat_errors.jl` — the inline `[error: …]` path is covered by `errors.jl`;
-  what remains is the transport-DEATH path (agent process dies → session_alive
-  false → header restart button "dead"), which depends on `is_session_dead_error`
-  classification and overlaps the restart suite.
-- `test_virtual_scroll.jl`, `test_keyed_list.jl`, `test_chat_remount.jl`,
-  `test_chat_controls.jl`, `test_auto_prompt.jl`, `test_folder_threads.jl`,
-  `test_chat_show*.jl` — assorted UI behaviours.
+## Headless limitations (intentional gaps, NOT missing ports)
 
-Acknowledged gaps that are NOT a simple port:
-
-- `test_follow_pill.jl`, `test_scroll_chase.jl`, `test_scroll_stress.jl` — the
-  "scroll up to read history disengages follow-mode, click the pill to
-  re-engage" flow. The chat uses a custom wheel/pan/spring scroller that does
-  not respond to a synthetic `wheel`/`scrollTop` change OR to a real
-  `webContents.sendInputEvent` mouseWheel in a headless `show=false` window
-  (verified three ways — see the header of `scroll_persist.jl`). Needs real
-  hardware input on a visible window.
-- `test_chat_attach.jl` — attachments go through the OS file-picker dialog,
-  which is not drivable in the headless harness.
-- `test_worker_move.jl`, `test_cross_worker_sync.jl` — cross-worker project
-  *move*. The move control (`.bt-open-on-select`, `project_widget.jl`) does not
-  render in the chat view or the Home dashboard in the harness, and new-project
-  worker assignment is non-deterministic (`first(keys(workers))`). Needs
-  locating where `project_widget` mounts before it can be driven. Registration
-  + disconnect across workers IS covered by `cross_worker.jl`.
-- `test_chat_cancel.jl` — cancelling a turn. Meaningless against a scripted
-  mock agent; needs a real agent to interrupt.
-- `test_remotesync.jl` — RemoteSync file-sync unit, not a UI behaviour.
+- The exhaustive scroll-stress *matrix* (former `test_scroll_stress.jl` — keyboard ×
+  streaming × thoughts × tools × attach × user-scroll combinations): its
+  load-bearing invariants live in `scroll_chase_test.jl`, but the full matrix needs
+  real hardware wheel input on a VISIBLE window — a headless `show=false` window
+  ignores synthetic `wheel`/`scrollTop` and even `webContents.sendInputEvent`
+  mouseWheel (verified three ways; see `scroll_persist.jl`'s header). `profile_scroll.jl`
+  (the old profiling harness) went with the tier.

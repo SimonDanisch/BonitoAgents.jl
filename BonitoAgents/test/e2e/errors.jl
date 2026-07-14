@@ -6,8 +6,8 @@
 #
 # NOT covered here: the transport-DEATH path (agent process dies mid-turn ->
 # session_alive=false -> the header restart button goes "dead"). That depends
-# on the transport error being classified by `is_session_dead_error`, and
-# overlaps the restart suite — left in ../electron/test_chat_errors.jl.
+# on the transport error being classified by `is_session_dead_error`, and is
+# asserted by the restart suite (`cancel_escalation_test.jl` → session_alive==false).
 #
 using Test
 isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
