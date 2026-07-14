@@ -28,12 +28,16 @@
 
     CH = "[...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent).__bt_chat"
     # Top-visible MARKER number (a text bubble; skip the tool rows so a hidden
-    # tool sitting at the very top isn't itself counted as a "jump").
+    # tool sitting at the very top isn't itself counted as a "jump"). The 4px
+    # bottom-overhang tolerance keeps a row whose last couple of pixels hang
+    # into the viewport from being counted as "the top row": an anchor-held
+    # toggle can legitimately land ±1px, which used to flip the reported
+    # marker to the neighbour above (off-by-one) even though the view held.
     MARKER = """(() => {
         const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
         const st = c.scrollTop;
         const nodes = [...c.querySelectorAll('.bt-agent-msg')].filter(n=>n.offsetParent).sort((a,b)=>a.offsetTop-b.offsetTop);
-        for (const n of nodes) if (n.offsetTop + n.offsetHeight > st + 1) {
+        for (const n of nodes) if (n.offsetTop + n.offsetHeight > st + 4) {
             const m = (n.innerText||'').match(/number (\\d+)/);
             return {mk: m?+m[1]:-1, off: Math.round(n.offsetTop - st)};
         }
@@ -47,7 +51,20 @@
         c.scrollTop = Math.round(c.scrollHeight * 0.5);
         c.dispatchEvent(new Event('scroll', {bubbles:true}));
     })()""")
-    sleep(0.6)
+    # Wait for the virtual-scroll GEOMETRY TO SETTLE before capturing the
+    # reference: scrolling into uncached history triggers range fetches +
+    # ResizeObserver re-measures that shift the transcript by hundreds of px
+    # for a while (estimates → real heights). Toggling mid-settle makes
+    # "hold the view" ill-defined — the view is moving regardless — and under
+    # full-suite load the settle takes well over the old fixed sleep. Stable ≡
+    # scrollHeight AND scrollTop unchanged across 4 consecutive polls.
+    @test TK.wait_for(s, "geometry settled", """(() => {
+        const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
+        const key = c.scrollHeight + '|' + Math.round(c.scrollTop);
+        window.__fsN = (window.__fsPrev === key) ? (window.__fsN || 0) + 1 : 0;
+        window.__fsPrev = key;
+        return window.__fsN >= 4;
+    })()"""; timeout = 30, interval = 0.25) == true
     before = TK.eval_js(s, MARKER)
     @test before !== nothing && before["mk"] > 0
 

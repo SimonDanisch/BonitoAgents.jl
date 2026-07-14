@@ -877,9 +877,55 @@ class BonitoChat {
             this._prevScrollTop = this.container.scrollTop;
         }
     }
+    _captureKeyAnchor(excludeKey) {
+        const st = this.container.scrollTop;
+        let vi = this.indexAt(st);
+        while(vi < this.totalCount && (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0))vi++;
+        if (vi >= this.totalCount) return null;
+        const n = this.rendered.has(vi) ? this.cache.get(vi) : null;
+        if (n && n.isConnected && n.style.display !== 'none') {
+            return {
+                idx: vi,
+                off: n.offsetTop - st,
+                dom: true
+            };
+        }
+        return {
+            idx: vi,
+            dom: false,
+            off: this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, vi) - st
+        };
+    }
+    _restoreKeyAnchor(a) {
+        if (!a) return;
+        let want;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        if (a.dom && n && n.isConnected && n.style.display !== 'none') {
+            want = n.offsetTop - a.off;
+        } else if (a.dom) {
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        } else {
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        }
+        want = Math.max(0, want);
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
+    _activeKeyAnchor() {
+        const a = this._keyAnchor;
+        if (!a) return null;
+        if (performance.now() > a.until || this._lastUserInputT > a.setAt) {
+            this._keyAnchor = null;
+            return null;
+        }
+        return a;
+    }
     updateDOM(s, e) {
         if (s > e) return;
-        const anchor = this.initialLoad ? null : this._captureAnchor();
+        const sticky = this._activeKeyAnchor();
+        const anchor = this.initialLoad || sticky ? null : this._captureAnchor();
         for (const idx of [
             ...this.rendered
         ]){
@@ -925,7 +971,8 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
-        this._restoreAnchor(anchor);
+        if (sticky) this._restoreKeyAnchor(sticky);
+        else this._restoreAnchor(anchor);
     }
     touchApp(idx) {
         const i = this.appLru.indexOf(idx);
@@ -1485,15 +1532,22 @@ class BonitoChat {
         this.refresh();
     }
     setKeyHidden(key, hidden) {
-        const anchor = this.followMode ? null : this._captureAnchor(key);
+        const anchor = this.followMode ? null : this._captureKeyAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache){
             if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
         }
         if (key === 'agent') this._updateWaiting();
+        if (anchor) {
+            this._keyAnchor = {
+                ...anchor,
+                setAt: performance.now(),
+                until: performance.now() + 1500
+            };
+        }
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
-        else if (anchor) this._restoreAnchor(anchor);
+        else if (anchor) this._restoreKeyAnchor(anchor);
     }
     _updateWaiting() {
         if (!this.waitingEl) return;

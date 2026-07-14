@@ -1360,11 +1360,90 @@ class BonitoChat {
         }
     }
 
+    // ── Key-toggle anchor (setKeyHidden) — VIRTUAL and STICKY ───────────────
+    //
+    // The DOM-based `_captureAnchor` is wrong for a type toggle, twice over:
+    //   1. The rendered window can have HOLES around the viewport (rows still
+    //      being fetched after a scroll), so the first *rendered* surviving row
+    //      may sit far below the top — and every to-be-hidden row between the
+    //      real top and that anchor collapses, so pinning it cannot hold the
+    //      view (observed: anchor picked ~1000px below, view landed a row off).
+    //   2. A single restore doesn't survive the ASYNC settle that follows the
+    //      reflow (range fetches + ResizeObserver re-measures): each subsequent
+    //      `updateDOM` re-anchored on the CURRENT top row, faithfully
+    //      preserving the drift the collapse just caused.
+    // So the toggle anchor is (a) computed in the VIRTUAL coordinate
+    // (indexAt/cumHeight — immune to holes), and (b) kept STICKY: `updateDOM`
+    // re-pins IT for the settle window instead of re-capturing, until it
+    // expires or the user scrolls.
+    _captureKeyAnchor(excludeKey) {
+        const st = this.container.scrollTop;
+        // The row to hold is the FIRST surviving row at/below the viewport top
+        // in VIRTUAL order — anchoring any row further down cannot preserve
+        // the reading position when toggled rows above it collapse/expand.
+        let vi = this.indexAt(st);
+        while (vi < this.totalCount &&
+               (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0)) vi++;
+        if (vi >= this.totalCount) return null;
+        // When THAT row is rendered, its DOM offset is ground truth (immune to
+        // the height estimates unrendered rows above carry). Otherwise anchor
+        // it virtually — previously-rendered rows keep their measured heights,
+        // so cumHeight is exact for them and only never-rendered rows
+        // contribute estimate error; the sticky re-pins converge as the
+        // re-window materializes the row.
+        const n = this.rendered.has(vi) ? this.cache.get(vi) : null;
+        if (n && n.isConnected && n.style.display !== 'none') {
+            return { idx: vi, off: n.offsetTop - st, dom: true };
+        }
+        return { idx: vi, dom: false,
+                 off: this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, vi) - st };
+    }
+
+    // Re-pin the sticky anchor at its captured viewport offset. A DOM-captured
+    // anchor restores against the row's REAL offset whenever it is rendered
+    // (exact); the virtual fallback covers an evicted/unmaterialized anchor
+    // (effHeight already reflects the toggled hiddenTypes).
+    _restoreKeyAnchor(a) {
+        if (!a) return;
+        let want;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        if (a.dom && n && n.isConnected && n.style.display !== 'none') {
+            want = n.offsetTop - a.off;
+        } else if (a.dom) {
+            // DOM anchor currently evicted: hold its virtual position until the
+            // re-window brings it back (the next sticky re-pin is exact again).
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        } else {
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        }
+        want = Math.max(0, want);
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
+
+    // The live sticky anchor, or null. Expires by time, and immediately on any
+    // user scroll input AFTER the toggle (the user owns the position again).
+    _activeKeyAnchor() {
+        const a = this._keyAnchor;
+        if (!a) return null;
+        if (performance.now() > a.until || this._lastUserInputT > a.setAt) {
+            this._keyAnchor = null;
+            return null;
+        }
+        return a;
+    }
+
     updateDOM(s, e) {
         if (s > e) return;
         // Anchor BEFORE any mutation; restored after the spacer writes below.
         // Skipped during the initial mount cascade (scrollToBottom owns it).
-        const anchor = this.initialLoad ? null : this._captureAnchor();
+        // While a key-toggle sticky anchor is live, use IT instead of a fresh
+        // DOM capture — re-capturing mid-settle would faithfully preserve the
+        // drift the toggle reflow just caused (see _captureKeyAnchor).
+        const sticky = this._activeKeyAnchor();
+        const anchor = (this.initialLoad || sticky) ? null : this._captureAnchor();
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
                 const node = this.cache.get(idx);
@@ -1427,7 +1506,8 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
-        this._restoreAnchor(anchor);
+        if (sticky) this._restoreKeyAnchor(sticky);
+        else this._restoreAnchor(anchor);
         // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
         // (pin total at drag-start, absorb deltas in the spacers) turned
         // estimate-vs-real drift into PHANTOM BLANK at the end of the
@@ -2240,7 +2320,7 @@ class BonitoChat {
         // different message. So capture the top-visible SURVIVING row now (before
         // the reflow, excluding the type being toggled) and re-pin it after
         // refresh has trued up the spacers/window.
-        const anchor = this.followMode ? null : this._captureAnchor(key);
+        const anchor = this.followMode ? null : this._captureKeyAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache) {
             // applyVisibility, not a raw display write: un-hiding a key must
@@ -2250,9 +2330,18 @@ class BonitoChat {
         // Hiding the agent stream also hides the idle "waiting" line that
         // would otherwise dangle under messages that aren't there.
         if (key === 'agent') this._updateWaiting();
+        if (anchor) {
+            // Sticky through the async settle (range fetches, re-measures) that
+            // follows the reflow — updateDOM keeps re-pinning THIS anchor
+            // instead of re-capturing the already-drifted top (see
+            // _captureKeyAnchor). Set BEFORE refresh so the refresh's own
+            // updateDOM already honors it.
+            this._keyAnchor = { ...anchor, setAt: performance.now(),
+                                until: performance.now() + 1500 };
+        }
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
-        else if (anchor) this._restoreAnchor(anchor);
+        else if (anchor) this._restoreKeyAnchor(anchor);
     }
 
     // The idle "waiting for your next instruction" line only makes sense
