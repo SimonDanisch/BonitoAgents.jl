@@ -1511,6 +1511,28 @@ class BonitoChat {
                 if (msg.queued) div.classList.add('bt-queued');
                 if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
+                if (Array.isArray(msg.attachments) && msg.attachments.length) {
+                    const gallery = document.createElement('div');
+                    gallery.className = 'bt-user-attachments';
+                    for (const a of msg.attachments){
+                        const img = document.createElement('img');
+                        img.className = 'bt-user-att-img';
+                        img.src = a.url;
+                        img.alt = a.name || 'attachment';
+                        img.loading = 'lazy';
+                        img.addEventListener('click', ()=>openLightbox(img));
+                        img.addEventListener('error', ()=>{
+                            const miss = document.createElement('span');
+                            miss.className = 'bt-user-att-missing';
+                            miss.textContent = a.name || 'attachment';
+                            img.replaceWith(miss);
+                        }, {
+                            once: true
+                        });
+                        gallery.appendChild(img);
+                    }
+                    div.appendChild(gallery);
+                }
                 break;
             case 'agent':
                 div.className = 'bt-agent-msg';
@@ -2594,6 +2616,25 @@ function linkifyPaths(rootEl) {
         el.classList.add('bt-path-link');
         el.dataset.path = text;
     });
+}
+function openLightbox(media) {
+    const overlay = document.createElement('div');
+    overlay.className = 'bt-lightbox-overlay';
+    const big = media.cloneNode(true);
+    big.classList.add('bt-lightbox-media');
+    overlay.appendChild(big);
+    const close = ()=>{
+        overlay.remove();
+        document.removeEventListener('keydown', onkey);
+    };
+    const onkey = (e)=>{
+        if (e.key === 'Escape') close();
+    };
+    overlay.addEventListener('click', (e)=>{
+        if (e.target === overlay) close();
+    });
+    document.addEventListener('keydown', onkey);
+    document.body.appendChild(overlay);
 }
 function escapeHTML(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

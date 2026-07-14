@@ -2280,6 +2280,31 @@ class BonitoChat {
                 // Yolo auto-continue nudge: dim/system-styled, not a real submit.
                 if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
+                // Attached images render inline (the server split the raw
+                // "[attached files …]" suffix into this list — see
+                // msg_to_dict(::UserMsg)). Click → the shared lightbox. A file
+                // the route can no longer serve (project moved, cleanup) falls
+                // back to its name instead of a broken-image icon.
+                if (Array.isArray(msg.attachments) && msg.attachments.length) {
+                    const gallery = document.createElement('div');
+                    gallery.className = 'bt-user-attachments';
+                    for (const a of msg.attachments) {
+                        const img = document.createElement('img');
+                        img.className = 'bt-user-att-img';
+                        img.src = a.url;
+                        img.alt = a.name || 'attachment';
+                        img.loading = 'lazy';
+                        img.addEventListener('click', () => openLightbox(img));
+                        img.addEventListener('error', () => {
+                            const miss = document.createElement('span');
+                            miss.className = 'bt-user-att-missing';
+                            miss.textContent = a.name || 'attachment';
+                            img.replaceWith(miss);
+                        }, { once: true });
+                        gallery.appendChild(img);
+                    }
+                    div.appendChild(gallery);
+                }
                 break;
             case 'agent':
                 div.className = 'bt-agent-msg';
@@ -3733,6 +3758,22 @@ function linkifyPaths(rootEl) {
         el.classList.add('bt-path-link');
         el.dataset.path = text;
     });
+}
+
+// Click-to-enlarge for JS-created media (user-bubble attachment images).
+// Mirrors the Julia-side LIGHTBOX_OPEN_JS (chat.jl) used by bt_show / Read
+// previews: clone into a fullscreen overlay, Esc or backdrop click closes.
+function openLightbox(media) {
+    const overlay = document.createElement('div');
+    overlay.className = 'bt-lightbox-overlay';
+    const big = media.cloneNode(true);
+    big.classList.add('bt-lightbox-media');
+    overlay.appendChild(big);
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
+    const onkey = e => { if (e.key === 'Escape') close(); };
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', onkey);
+    document.body.appendChild(overlay);
 }
 
 function escapeHTML(str) {

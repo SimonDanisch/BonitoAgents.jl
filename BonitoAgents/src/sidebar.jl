@@ -621,16 +621,32 @@ const SidebarStyles = Bonito.Styles(
         "overflow-wrap" => "anywhere",
         "text-overflow" => "ellipsis"),
     # Close (✕) on an active-chat row: reveal on row hover, red on its own hover.
+    # Pinned to the row's TOP-RIGHT corner — the two hover affordances split the
+    # right edge: ✕ top-right, "▾ files" (.bt-side-tree-hint) bottom-right, so
+    # they never compete for the same spot. Anchored to .bt-side-item's own
+    # `position: relative`, which works both with and without the chat-row
+    # wrapper. Same legibility backdrop trick as the files hint (the glyph can
+    # overlay a long two-line title). `pointer-events: none` while hidden — an
+    # INVISIBLE close target that tears a chat down on a stray corner click
+    # would be a trap.
     CSS(".bt-side-close",
-        "margin-left" => "auto", "flex-shrink" => "0",
+        "position" => "absolute", "top" => "3px", "right" => "6px",
         "color" => "var(--bt-text-faint)",
         "font-size" => "12px", "line-height" => "1",
         "padding" => "2px 4px", "border-radius" => "var(--bt-radius-sm)",
-        "opacity" => "0",
+        "background" => "var(--bt-surface-2)",
+        "opacity" => "0", "pointer-events" => "none",
         "transition" => "opacity 80ms, background 80ms, color 80ms"),
-    CSS(".bt-side-item:hover .bt-side-close", "opacity" => "1"),
+    # Reveal on the row wrapper too: the files hint is a SIBLING overlaying the
+    # item, so hovering IT un-hovers the item — without the wrapper selector the
+    # ✕ would flicker away while the pointer crosses the hint.
+    CSS(".bt-side-item:hover .bt-side-close, .bt-side-chat-row:hover .bt-side-close",
+        "opacity" => "1", "pointer-events" => "auto"),
     CSS(".bt-side-close:hover",
         "background" => "rgba(239,68,68,0.14)", "color" => "var(--bt-error)"),
+    # The icons-only rail has no titles — a corner ✕ would overlay the icon
+    # itself and misclicks would close chats; the rail is for switching only.
+    CSS(".bt-sidebar.bt-collapsed .bt-side-close", "display" => "none"),
     # Shown when no chats are open yet.
     CSS(".bt-side-empty",
         "padding" => "10px 12px", "font-size" => "12px",

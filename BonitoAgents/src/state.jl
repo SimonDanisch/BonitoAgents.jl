@@ -262,7 +262,19 @@ mutable struct ServerState
     # so the home Defaults selects have real (agent-reported) choice lists even
     # before a chat is open. Empty until the first session reports.
     last_config_options :: Observable{Vector{Any}}
+
+    # The parent state a per-session `copy(state, session)` was derived from;
+    # `nothing` on the root itself. The Observable bridges above are ONE-WAY
+    # (root → session child), so GLOBAL notifications must be raised on the
+    # ROOT to fan out to every session — `root_state`/`notify_chats!` route
+    # through this. Without it, a hook holding a session view (e.g. the
+    # ChatModel busy hook created from a UI handler) notified only the one
+    # session that happened to create the model.
+    root :: Union{Nothing,ServerState}
 end
+
+"The root ServerState `s` derives from (identity for the root itself)."
+root_state(s::ServerState) = s.root === nothing ? s : s.root
 
 """
     ServerState(; state_dir, working_dir, worker_secret) → ServerState
@@ -296,6 +308,7 @@ function ServerState(; state_dir::String,
         String[],                                 # bound_lru
         Observable(Dict{String,String}()),        # default_session_config (load_settings! below)
         Observable(Any[]),                        # last_config_options
+        nothing,                                  # root (this IS the root)
     )
     load_workers!(s)
     load_projects!(s)
@@ -339,6 +352,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             # via `map(session, …)`, which tears its callback down on tab close.
             s.default_session_config,
             s.last_config_options,
+            root_state(s),             # copies of copies still point at the true root
         )
     end
 end
@@ -545,13 +559,13 @@ function safe_notify!(obs::Observable)
     return nothing
 end
 
-# Signal that `chat_models` changed (a chat opened or closed) so the active-
-# chats sidebar re-renders. Call with the SAME state the mutation used: a
-# worker handler / async task holds the parent state (fans out to every
-# session's bridged `chat_signal`); a UI handler holds its per-session view
-# (updates that session). Mirrors how the existing `safe_notify!(state.projects)`
-# calls are threaded.
-notify_chats!(s::ServerState) = safe_notify!(s.chat_signal)
+# Signal that chat state changed (a chat opened/closed, or a turn started/
+# finished via the ChatModel busy hook) so chat-list consumers (sidebar,
+# recent-chats overview) re-render. Always raised on the ROOT: the per-session
+# Observable bridges are one-way (root → child), so notifying a session view
+# would reach only that one session — the old behaviour, which left every
+# OTHER tab (and any tab opened later) stale until an unrelated global event.
+notify_chats!(s::ServerState) = safe_notify!(root_state(s).chat_signal)
 
 # ── Persistence ───────────────────────────────────────────────────────────
 # Atomic JSON write: serialise to a UNIQUE sibling temp file first, then rename
