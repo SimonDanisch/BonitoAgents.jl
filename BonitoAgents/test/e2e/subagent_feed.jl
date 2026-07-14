@@ -127,7 +127,7 @@ function run_suite(server)
             @test TK.wait_for(server, "turn's closing text",
                 "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('All done'))"; timeout = 40) == true
             task = lock(model.lock) do
-                idx = findfirst(m -> m isa BA.TaskToolMsg && m.id == "task-A",
+                idx = findfirst(m -> m isa BA.TaskToolMsg && BA.tool_id(m) == "task-A",
                                 model.msgs_store)
                 idx === nothing ? nothing : model.msgs_store[idx]
             end
@@ -177,14 +177,14 @@ function run_suite(server)
             end
             @test !BA.shared(model).busy_active[]
             t = lock(BA.shared(model).lock) do
-                i = findlast(m -> m isa BA.TaskToolMsg && m.id == "task-BG",
+                i = findlast(m -> m isa BA.TaskToolMsg && BA.tool_id(m) == "task-BG",
                              BA.shared(model).msgs_store)
                 i === nothing ? nothing : BA.shared(model).msgs_store[i]
             end
             @test t !== nothing
             @test BA.in_taskbar(t)
             @test BA.is_live(t)
-            @test any(x -> x.id == "task-BG", BA.shared(model).taskbar.items[])
+            @test any(x -> BA.msg_id(x) == "task-BG", BA.shared(model).taskbar.items[])
             # The pill also survives in the DOM past turn end.
             @test TK.wait_for(server, "bg task pill pinned after turn end",
                 "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') !== null"; timeout = 10) == true
@@ -227,7 +227,7 @@ function run_suite(server)
             end
             @test !BA.shared(model).busy_active[]
             t = lock(BA.shared(model).lock) do
-                i = findlast(m -> m isa BA.TaskToolMsg && m.id == "task-BG2",
+                i = findlast(m -> m isa BA.TaskToolMsg && BA.tool_id(m) == "task-BG2",
                              BA.shared(model).msgs_store)
                 i === nothing ? nothing : BA.shared(model).msgs_store[i]
             end

@@ -28,8 +28,10 @@ function run_suite(server)
         @test !isfile(outpath)
 
         # A background subagent pill whose poll target is that (missing) file.
-        task = BA.TaskToolMsg("sub-poll-1", "other", "Investigate", "in_progress",
-                              "", time(), nothing, "dig around", true, nothing, model)
+        task = BA.TaskToolMsg(
+            BA.Message("sub-poll-1", "other", "", "Investigate", "in_progress",
+                       "", time(), nothing, model);
+            description = "dig around", is_background = true)
         task.bg_output_path = outpath
         BA.push!(BA.chat_taskbar(model), task)
         lock(BA.shared(model).lock) do; push!(BA.shared(model).msgs_store, task); end
@@ -64,7 +66,7 @@ function run_suite(server)
         end
         @test done
         @test !BA.in_taskbar(task)
-        @test task.finished_at !== nothing
+        @test BA.tool_finished_at(task) !== nothing
         @test !BA.is_pinned(model, "sub-poll-1")
     end
     return server

@@ -47,7 +47,7 @@ bg_task_call(id) = ACP.TaskCall(id, "other", "Run tests", "in_progress",
     @test store[1] isa BT.AgentMsg
     @test store[1].text == "First paragraph. Still first paragraph."
     @test store[2] isa BT.ToolMsg                       # the tool survived
-    @test store[2].title == "grep something"
+    @test BT.tool_title(store[2]) == "grep something"
     @test store[3] isa BT.AgentMsg
     @test store[3].text == "Second paragraph after the tool."
     # Both bubbles are finalized (not stuck streaming) after the barrier.

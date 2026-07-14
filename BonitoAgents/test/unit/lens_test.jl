@@ -48,11 +48,13 @@ const BT = BonitoAgents
     @testset "apply_lens: union of clauses + per-index actions" begin
         U  = BT.UserMsg("please start a resource monitor")
         A  = BT.AgentMsg("a1", "here is the monitor")
-        app = BT.MCPToolMsg("app1","other","Dashboard","completed","",
-                            time(),time(),"btworker","bt_show",nothing)
+        app = BT.ShowToolMsg(BT.Message("app1","other","","Dashboard","completed","",
+                                        time(),time(),nothing), "btworker")
         U2 = BT.UserMsg("show me the lissajous plot")
-        bash = BT.BashToolMsg("b1","execute","loop","completed","",time(),nothing,
-                              "sleep 9","Monitor",true,"/tmp/x",0,"",nothing)
+        bash = BT.BashToolMsg(BT.Message("b1","execute","","loop","completed","",
+                                         time(),nothing,nothing);
+                              command = "sleep 9", description = "Monitor",
+                              is_background = true)
         msgs = Any[U, A, app, U2, bash]
 
         vis, acts = BT.apply_lens(msgs, BT.parse_lens(
@@ -73,11 +75,13 @@ const BT = BonitoAgents
     @testset "signed clauses: include / exclude / wildcard / base rule" begin
         U  = BT.UserMsg("please start a resource monitor")
         A  = BT.AgentMsg("a1", "here is the monitor")
-        app = BT.MCPToolMsg("app1","other","Dashboard","completed","",
-                            time(),time(),"btworker","bt_show",nothing)
+        app = BT.ShowToolMsg(BT.Message("app1","other","","Dashboard","completed","",
+                                        time(),time(),nothing), "btworker")
         U2 = BT.UserMsg("show me the lissajous plot")
-        bash = BT.BashToolMsg("b1","execute","loop","completed","",time(),nothing,
-                              "sleep 9","Monitor",true,"/tmp/x",0,"",nothing)
+        bash = BT.BashToolMsg(BT.Message("b1","execute","","loop","completed","",
+                                         time(),nothing,nothing);
+                              command = "sleep 9", description = "Monitor",
+                              is_background = true)
         Th = BT.ThoughtMsg("t1","thinking about monitors")
         msgs = Any[U, A, app, U2, bash, Th]      # 0:U 1:A 2:app 3:U2 4:bash 5:Th
 
@@ -127,7 +131,8 @@ const BT = BonitoAgents
 
     @testset "vocabulary = keys present in the chat" begin
         msgs = Any[BT.UserMsg("hi"),
-                   BT.MCPToolMsg("a","other","D","completed","",time(),time(),"btworker","bt_show",nothing)]
+                   BT.ShowToolMsg(BT.Message("a","other","","D","completed","",
+                                              time(),time(),nothing), "btworker")]
         vocab = BT.lens_vocabulary(msgs)
         @test "user_message" in vocab
         @test "bt_show" in vocab

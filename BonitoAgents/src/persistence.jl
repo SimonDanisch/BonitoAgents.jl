@@ -363,18 +363,18 @@ function history_block(io::IO, msg::ToolMsg)
     # Only terminal tools are history (mirrors the `status in ("completed",
     # "failed")` gate at the live append_tool call sites): a live/pending tool
     # gets its block when it finalizes.
-    msg.status in ("completed", "failed") || return
+    tool_status(msg) in ("completed", "failed") || return
     # 4th field: the resolved filter key (`tool_key`) — persisting it makes
     # the typed variants (Bash/Task/MCP…) reload with stable per-tool
     # filter identities even though reload lands as `GenericToolMsg`.
-    meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
+    meta = "$(tool_kind(msg)) · $(tool_status(msg)) · $(tool_id(msg)) · $(tool_key(msg))"
     println(io, "!!! tool \"$meta\"")
-    println(io, "    `$(msg.title)`")
+    println(io, "    `$(tool_title(msg))`")
     # Brief summary on the collapsed header; full ACP body lives in
     # the chat-storage `tools/<id>.json` (see update_tool_file!).
-    if !isempty(msg.summary)
+    if !isempty(tool_summary(msg))
         println(io, "")
-        println(io, "    $(msg.summary)")
+        println(io, "    $(tool_summary(msg))")
     end
     println(io)
 end
@@ -548,9 +548,9 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
             # subtype-specific fields (background flag, MCP server, …) no
             # longer drive any live UX. New tool calls in the resumed session
             # come through the typed dispatcher again.
-            push!(msgs, GenericToolMsg(string(id), string(kind), string(name),
-                                       tool_title, string(status), summary,
-                                       time(), time(), nothing))
+            push!(msgs, GenericToolMsg(Message(string(id), string(kind),
+                                       string(name), tool_title, string(status),
+                                       summary, time(), time(), nothing)))
         elseif category == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')

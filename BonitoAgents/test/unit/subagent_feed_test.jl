@@ -103,17 +103,17 @@ end
     BT.route_subagent_activity!(model, act_text("task-2", "working"))
     BT.route_subagent_activity!(model,
         act_tool("task-2", "s1", "Read foo.jl", "completed"))
-    m.status = "completed"
+    m.message.status = "completed"
     close(m)
-    @test occursin(r"2 steps, finished \d\d:\d\d", m.summary)
+    @test occursin(r"2 steps, finished \d\d:\d\d", m.message.summary)
     close(m)                                            # double close (stop + drain finally)
-    @test length(collect(eachmatch(r"steps, finished", m.summary))) == 1
+    @test length(collect(eachmatch(r"steps, finished", m.message.summary))) == 1
 
     # No activity → no note.
     m2 = BT.send!(model, BT.to_message(model, task_call("task-3")))
-    m2.status = "completed"
+    m2.message.status = "completed"
     close(m2)
-    @test !occursin("steps, finished", m2.summary)
+    @test !occursin("steps, finished", m2.message.summary)
 end
 
 @testset "taskbar_activity: the feed's current one-liner (a fact, no staleness)" begin
@@ -136,7 +136,7 @@ end
     # finished_at) makes `is_live` false and the affordance disappears. A
     # background subagent instead leaves via `finished!` (fd-close / ⊗ stop);
     # membership IS liveness, there is no `task_running` flag to clear.
-    m.status = "completed"
+    m.message.status = "completed"
     close(m)
     @test BT.taskbar_activity(m, time()) === nothing
 end

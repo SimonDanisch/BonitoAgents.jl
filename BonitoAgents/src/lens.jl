@@ -153,16 +153,15 @@ msg_search_text(m::ThoughtMsg)  = m.text
 msg_search_text(m::SummaryMsg)  = m.text
 msg_search_text(m::TodoListMsg) = join((e.content for e in m.entries), " ")
 function msg_search_text(m::ToolMsg)
-    parts = String[m.title, m.summary]
+    parts = String[tool_title(m), tool_summary(m)]
     if m isa BashToolMsg
         isempty(m.command) || push!(parts, m.command)
         m.description === nothing || push!(parts, m.description)
     elseif m isa TaskToolMsg
         m.task_name === nothing || push!(parts, m.task_name)
     elseif m isa MCPToolMsg
-        push!(parts, m.tool_name)
-        c = get(m.raw_input, "code", nothing)
-        c isa AbstractString && push!(parts, c)
+        push!(parts, tool_key(m))
+        m isa JuliaEvalCall && !isempty(m.code) && push!(parts, m.code)
     end
     return join(filter(!isempty, parts), " ")
 end

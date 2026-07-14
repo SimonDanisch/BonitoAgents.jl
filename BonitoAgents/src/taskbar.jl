@@ -205,7 +205,7 @@ function Bonito.jsrender(session::Bonito.Session, bar::TaskBar)
     slots = map(session, bar.items) do tasks
         [TaskbarSlot(bar, t) for t in tasks]
     end
-    list = KeyedList(slots; key = s -> string(s.task.id, "#", hash(taskbar_dyn_key(s.task))))
+    list = KeyedList(slots; key = s -> string(msg_id(s.task), "#", hash(taskbar_dyn_key(s.task))))
     container = DOM.div(list; class = "bt-taskbar bt-taskbar-slots")
     # ONE ticker for ALL slots: just the elapsed labels, read off `data-started`
     # (too fast for a Julia re-render). Staleness + all other content are

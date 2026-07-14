@@ -36,8 +36,10 @@ end
 
 @testset "update_from_snap! captures outputFile; launch `completed` is NOT done" begin
     model = headless_model()
-    task = BT.TaskToolMsg("t1", "other", "Investigate", "in_progress", "",
-                          time(), nothing, "desc", true, nothing, model)
+    task = BT.TaskToolMsg(
+        BT.Message("t1", "other", "", "Investigate", "in_progress", "",
+                   time(), nothing, model);
+        description = "desc", is_background = true)
     @test isempty(task.bg_output_path)
     # The async-launch snapshot carries the outputFile (and status `completed` —
     # the launch ack, which must NOT be read as the subagent finishing).
@@ -59,9 +61,11 @@ end
     # terminal-status TRANSITION (finished_at stays nothing) there is no wire
     # completion signal, so it stays live until the user ⊗-stops it.
     model = headless_model()
-    launched = BT.TaskToolMsg("t5", "other", "Investigate", "completed", "",
-                              time(), nothing, "desc", true, nothing, model)
-    @test isempty(launched.bg_output_path) && launched.finished_at === nothing
+    launched = BT.TaskToolMsg(
+        BT.Message("t5", "other", "", "Investigate", "completed", "",
+                   time(), nothing, model);
+        description = "desc", is_background = true)
+    @test isempty(launched.bg_output_path) && BT.tool_finished_at(launched) === nothing
     @test BT.isdone(launched) == false                  # launch-ack `completed` ≠ done
 
     # Drive the bar's OWN poll loop: push it, let the loop tick several times, and
@@ -73,7 +77,7 @@ end
 
     # The only ways out (no outputFile): a ⊗ stop, here via `finished!`.
     BT.finished!(launched)
-    @test !BT.in_taskbar(launched) && launched.finished_at !== nothing
+    @test !BT.in_taskbar(launched) && BT.tool_finished_at(launched) !== nothing
 end
 
 @testset "no outputFile: NEVER auto-finalizes — not finished_at, not a quiet feed" begin
@@ -82,12 +86,14 @@ end
     # `finished_at`) and NO amount of silence retires the pill. It stays until the
     # transcript's `end_turn` marker or a ⊗ stop. No timeout, no staleness guess.
     model = headless_model()
-    task = BT.TaskToolMsg("t6", "other", "Investigate", "in_progress", "",
-                          time(), nothing, "desc", true, nothing, model)
+    task = BT.TaskToolMsg(
+        BT.Message("t6", "other", "", "Investigate", "in_progress", "",
+                   time(), nothing, model);
+        description = "desc", is_background = true)
     push!(BT.chat_taskbar(model), task)
     @test BT.in_taskbar(task) && BT.isdone(task) == false
     # The launch-ack stamps finished_at while the subagent runs on — ignored.
-    task.finished_at = time()
+    task.message.finished_at = time()
     @test BT.isdone(task) == false
     # Even a long-silent feed does NOT finalize it (no quiet-timeout guessing).
     task.last_activity_at = time() - 100_000.0
@@ -144,16 +150,18 @@ end
 
 @testset "finished! is the deterministic end (bar's loop off the file's fd-close)" begin
     model = headless_model()
-    task = BT.TaskToolMsg("t2", "other", "Investigate", "in_progress", "",
-                          time(), nothing, "desc", true, nothing, model)
+    task = BT.TaskToolMsg(
+        BT.Message("t2", "other", "", "Investigate", "in_progress", "",
+                   time(), nothing, model);
+        description = "desc", is_background = true)
     task.bg_output_path = "/tmp/agent2.output"
     push!(BT.chat_taskbar(model), task)                 # enter the bar (membership = liveness)
     push!(BT.shared(model).msgs_store, task)
     @test BT.is_pinned(model, "t2")
     @test BT.in_taskbar(task)
     BT.finished!(task)                                  # what the bar's loop calls when isdone
-    @test task.finished_at !== nothing
-    @test task.status in ("completed", "failed")        # fd-close ⇒ terminal (not left in_progress)
+    @test BT.tool_finished_at(task) !== nothing
+    @test BT.tool_status(task) in ("completed", "failed")        # fd-close ⇒ terminal (not left in_progress)
     @test !BT.is_pinned(model, "t2")
     @test !BT.in_taskbar(task)
 end

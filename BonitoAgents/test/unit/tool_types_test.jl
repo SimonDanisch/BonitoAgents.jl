@@ -21,10 +21,15 @@ const CV        = Union{ACP.DiffContent, ACP.ImageContent, ACP.TextContent}
 gt(kind, name, title; content = CV[]) =
     BT.replayed_tool_msg(ACP.GenericTool("id_$name", kind, title, "completed",
         collect(CV, content), Channel{ACP.ToolCall}(0), name, Dict{String,Any}()))
-# An MCP tool message of the type `tool_name` routes to.
-mcp(tool_name; raw = Dict{String,Any}()) =
-    BT.mcp_msg_type(tool_name)("id", "other", tool_name, "completed", "",
-        time(), nothing, "btworker", tool_name, raw, nothing)
+# An MCP tool message of the type `tool_name` routes to, arguments parsed
+# from `raw` exactly like the live path (`apply_input!`).
+function mcp(tool_name; raw = Dict{String,Any}())
+    m = BT.build_mcp_msg(BT.mcp_msg_type(tool_name),
+        BT.Message("id", "other", "", tool_name, "completed", "",
+                   time(), nothing, nothing), "btworker", tool_name)
+    BT.apply_input!(m, raw)
+    return m
+end
 
 @testset "builtin_msg_type: one wire→type routing point" begin
     @test BT.builtin_msg_type("edit")    === BT.EditToolMsg

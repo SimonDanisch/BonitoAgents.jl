@@ -140,15 +140,15 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
                                   ACP.ToolContent[ACP.TextContent("shown: /x/v.mp4 (video/mp4, 1MB)")],
                                   Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(chat_dir, showtc)
-        @test BT.tool_header_dict(BT.GenericToolMsg("tid","other","bt_show","completed","",
-                                                     0.0, 0.0, nothing), chat_dir)["expand"] == true
+        @test BT.tool_header_dict(BT.GenericToolMsg(BT.Message("tid","other","","bt_show","completed","",
+                                                     0.0, 0.0, nothing)), chat_dir)["expand"] == true
 
         readtc = ACP.GenericTool("tid2", "read", "cat", "completed",
                                   ACP.ToolContent[ACP.TextContent("plain file contents")],
                                   Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(chat_dir, readtc)
-        @test !haskey(BT.tool_header_dict(BT.GenericToolMsg("tid2","read","cat","completed","",
-                                                              0.0, 0.0, nothing), chat_dir), "expand")
+        @test !haskey(BT.tool_header_dict(BT.GenericToolMsg(BT.Message("tid2","read","","cat","completed","",
+                                                              0.0, 0.0, nothing)), chat_dir), "expand")
     end
 
     @testset "show_mime on the wire (native-image toggle)" begin
@@ -167,8 +167,8 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
                                  ACP.ToolContent[ACP.TextContent("shown: /p/plot.png (image/png, 34 KB)")],
                                  Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(chat_dir, imgtc)
-        d = BT.tool_header_dict(BT.GenericToolMsg("img1","other","bt_show","completed","",
-                                                   0.0, 0.0, nothing), chat_dir)
+        d = BT.tool_header_dict(BT.GenericToolMsg(BT.Message("img1","other","","bt_show","completed","",
+                                                   0.0, 0.0, nothing)), chat_dir)
         @test d["expand"] == true
         @test d["show_mime"] == "image/png"
 
@@ -177,8 +177,8 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
                                    ACP.ToolContent[ACP.TextContent("file contents")],
                                    Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(chat_dir, plaintc)
-        @test !haskey(BT.tool_header_dict(BT.GenericToolMsg("p1","read","cat","completed","",
-                                                              0.0, 0.0, nothing), chat_dir), "show_mime")
+        @test !haskey(BT.tool_header_dict(BT.GenericToolMsg(BT.Message("p1","read","","cat","completed","",
+                                                              0.0, 0.0, nothing)), chat_dir), "show_mime")
 
         # Inline image content (e.g. Read on a PNG) ships its mime too —
         # but does NOT auto-expand (that's bt_show's behavior only).
@@ -186,8 +186,8 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
                                    ACP.ToolContent[ACP.ImageContent("aGk=", "image/png")],
                                    Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(chat_dir, imgread)
-        d2 = BT.tool_header_dict(BT.GenericToolMsg("r1","read","Read x.png","completed","",
-                                                    0.0, 0.0, nothing), chat_dir)
+        d2 = BT.tool_header_dict(BT.GenericToolMsg(BT.Message("r1","read","","Read x.png","completed","",
+                                                    0.0, 0.0, nothing)), chat_dir)
         @test d2["show_mime"] == "image/png"
         @test !haskey(d2, "expand")
 

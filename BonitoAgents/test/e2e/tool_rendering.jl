@@ -18,7 +18,7 @@ const TK = TestKit
 # tool that errors and an execute tool that fails. Kept in their own turn so
 # they're the most-recent (rendered) messages when we assert on them, rather
 # than recycled out of the virtual window behind the first turn's tools.
-# NOTE: bt_julia_eval rendering (the typed BtJuliaEval body: Code/Output sections,
+# NOTE: bt_julia_eval rendering (the typed JuliaEvalCall body: Code/Output sections,
 # the live result mount, colored stdout, error rendering, 20+ value types) is
 # covered end-to-end against the REAL eval chain in `e2e:bt_eval_types`. We don't
 # hand-build eval content here — it can't match the real `[code-echo, stdout,

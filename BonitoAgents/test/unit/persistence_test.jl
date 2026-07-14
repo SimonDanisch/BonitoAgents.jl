@@ -85,17 +85,17 @@ end
     end
 
     @testset "tool message round-trips (kind/status/id/title/summary)" begin
-        loaded = roundtrip([BonitoAgents.GenericToolMsg("t1", "execute", "ls -la",
-                                                      "completed", "12 files",
-                                                      0.0, 0.0, nothing)])
+        loaded = roundtrip([BonitoAgents.GenericToolMsg(
+            BonitoAgents.Message("t1", "execute", "", "ls -la", "completed",
+                                 "12 files", 0.0, 0.0, nothing))])
         @test length(loaded) == 1
         t = loaded[1]
         @test t isa BonitoAgents.ToolMsg
-        @test t.id == "t1"
-        @test t.kind == "execute"
-        @test t.title == "ls -la"
-        @test t.status == "completed"
-        @test t.summary == "12 files"
+        @test BonitoAgents.tool_id(t) == "t1"
+        @test BonitoAgents.tool_kind(t) == "execute"
+        @test BonitoAgents.tool_title(t) == "ls -la"
+        @test BonitoAgents.tool_status(t) == "completed"
+        @test BonitoAgents.tool_summary(t) == "12 files"
     end
 
     @testset "plan message round-trips" begin
@@ -113,8 +113,9 @@ end
     @testset "mixed conversation preserves order" begin
         loaded = roundtrip([
             BonitoAgents.UserMsg("hi"),
-            BonitoAgents.GenericToolMsg("t1", "execute", "ls", "completed", "ok",
-                                      0.0, 0.0, nothing),
+            BonitoAgents.GenericToolMsg(
+                BonitoAgents.Message("t1", "execute", "", "ls", "completed", "ok",
+                                     0.0, 0.0, nothing)),
             BonitoAgents.AgentMsg("a1", "## Result\n\nAll done."),
         ])
         @test length(loaded) == 3
