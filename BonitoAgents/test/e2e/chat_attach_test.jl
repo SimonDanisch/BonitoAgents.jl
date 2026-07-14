@@ -231,5 +231,49 @@
     @test occursin("plain text after attachments", last_text)
     @test !occursin("[attached files in this message]", last_text)
 
+    # ── Attached image renders INLINE in the bubble (not the path-list text) ──
+    # A VALID 1×1 PNG this time (the earlier TINY_PNG_HEX is a truncated header
+    # that can't decode — fine for the queue/save plumbing above, useless for
+    # asserting an <img> actually renders). Contract: the bubble shows the typed
+    # text + a `.bt-user-att-img` loaded from the /attachment/<pid> route, and
+    # never the raw "[attached files …]" suffix.
+    TK.eval_js(s, """(() => {
+        const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+        const bin = atob(b64); const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const file = new File([bytes], 'inline-probe.png', {type: 'image/png'});
+        document.querySelector('$(P).bt-messages').__bt_chat
+            ._attachAddBlob(file, file.type, file.name);
+        return true;
+    })()""")
+    @test TK.wait_for(s, "probe thumb queued",
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 1"; timeout = 5)
+    TK.send_message(s, "inline image probe")
+    @test TK.wait_for(s, "bubble with inline gallery",
+        """(() => {
+            const b = [...document.querySelectorAll('$(P).bt-user-msg')]
+                .find(e => (e.textContent||'').includes('inline image probe'));
+            return !!(b && b.querySelector('.bt-user-att-img'));
+        })()"""; timeout = 10)
+    gallery = TK.eval_js(s, """(() => {
+        const b = [...document.querySelectorAll('$(P).bt-user-msg')]
+            .find(e => (e.textContent||'').includes('inline image probe'));
+        const img = b.querySelector('.bt-user-att-img');
+        return { raw: (b.textContent||'').includes('[attached files'),
+                 route: img.getAttribute('src').startsWith('/attachment/'),
+                 n: b.querySelectorAll('.bt-user-att-img').length };
+    })()""")
+    @test gallery["raw"] == false           # suffix text never shows
+    @test gallery["route"] == true          # served via the attachment route
+    @test gallery["n"] == 1
+    # The image DECODES (route 200 + real mime). Poll: decode is async.
+    @test TK.wait_for(s, "inline image decodes",
+        """(() => {
+            const b = [...document.querySelectorAll('$(P).bt-user-msg')]
+                .find(e => (e.textContent||'').includes('inline image probe'));
+            const img = b && b.querySelector('.bt-user-att-img');
+            return !!(img && img.complete && img.naturalWidth > 0);
+        })()"""; timeout = 10)
+
     @test isempty(TK.js_errors(s))
 end

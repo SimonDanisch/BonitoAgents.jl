@@ -225,7 +225,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     # anchored to `busy_active` itself (lives as long as the ChatModel
     # does, GCed with it), so there's no leak.
     on(busy_active) do _; notify_chats!(state); end
-    return ChatModel(
+    model = ChatModel(
         ReentrantLock(),
         state, String(cwd), String(project_id),
         chat_dir,
@@ -262,6 +262,16 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         String[],                              # tool_cache_order (LRU for the cache)
         TaskBar(),                             # live-task board (owns its poll loop)
     )
+    # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
+    # with `chat = nothing` (the model doesn't exist yet while parsing), but
+    # the wire form needs the back-ref to resolve the project's /attachment
+    # URLs — without it, a chat reopened AFTER A SERVER RESTART rendered the
+    # raw "[attached files …]" suffix instead of the inline image gallery
+    # (a page reload didn't hit this: the live store's messages kept their ref).
+    for m in msgs_store
+        m isa UserMsg && m.chat === nothing && (m.chat = model)
+    end
+    return model
 end
 
 # Per-tab bridge for a POLYMORPHIC observable. A plain `map(identity, session,
@@ -1447,11 +1457,57 @@ function editable_path_from(d::AbstractDict, content)
     return String(p)
 end
 
+# Split a UserMsg's text into (display_text, attachment_rel_paths) around the
+# "[attached files in this message]" suffix `process_attachments!` appends.
+# Deriving the list from the TEXT (rather than a struct field) means replayed
+# history from chat.md — where the suffix is the persisted form — renders
+# inline images exactly like a live send, with no migration.
+function split_attachment_suffix(text::AbstractString)
+    marker = "[attached files in this message]"
+    r = findlast(marker, text)
+    r === nothing && return (String(text), String[])
+    rels = String[]
+    for line in split(text[last(r)+1:end], '\n')
+        l = strip(line)
+        startswith(l, "- ") && push!(rels, String(strip(l[3:end])))
+    end
+    isempty(rels) && return (String(text), String[])
+    # prevind, not first(r)-1: the byte before '[' may be the tail of a
+    # multi-byte character when user prose ends right at the marker.
+    head = first(r) == 1 ? "" : text[1:prevind(text, first(r))]
+    return (String(rstrip(head)), rels)
+end
+
 # Same shape used by msg_to_dict so the JS virtual-scroll renderer treats
 # all messages uniformly. The `cwd` argument is only consulted for ToolMsg
 # (to render the edit preview); other variants ignore it.
-msg_to_dict(m::UserMsg, _chat_dir::AbstractString="") =
-    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued, "auto" => m.auto)
+function msg_to_dict(m::UserMsg, _chat_dir::AbstractString="")
+    d = Dict{String,Any}("type" => "user", "text" => m.text,
+                         "queued" => m.queued, "auto" => m.auto)
+    # Attached images render INLINE in the bubble: swap the raw suffix block
+    # for an `attachments` list the JS gallery understands. The full text (with
+    # the suffix) still goes to the agent prompt and chat.md untouched — only
+    # the wire/display form is split. Files the route can't serve (foreign
+    # extension) stay in the text form.
+    m.chat === nothing && return d
+    pid = m.chat.project_id
+    isempty(pid) && return d
+    display, rels = split_attachment_suffix(m.text)
+    atts = Any[]
+    for rel in rels
+        bn = basename(rel)
+        mime = get(ATTACHMENT_MIME_BY_EXT, lowercase(lstrip(splitext(bn)[2], '.')), nothing)
+        mime === nothing && continue
+        push!(atts, Dict{String,Any}(
+            "url"  => "/attachment/$(pid)?file=$(HTTP.escapeuri(bn))",
+            "name" => bn, "mime" => mime))
+    end
+    if !isempty(atts) && length(atts) == length(rels)
+        d["text"] = display
+        d["attachments"] = atts
+    end
+    return d
+end
 
 function msg_to_dict(m::AgentMsg, _chat_dir::AbstractString="")
     Dict{String,Any}("type" => "agent", "id" => m.id, "html" => ensure_html!(m))
@@ -2575,8 +2631,9 @@ wire_new(::ChatModel, m::AgentMsg) =
 # A thought is committed whole (see `process!(::Thought)`): render it collapsed
 # like a reloaded one (summary only, lazy body); `close` then ships the html.
 wire_new(::ChatModel, m::ThoughtMsg) = msg_to_dict(m)
-wire_new(::ChatModel, m::UserMsg) =
-    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued, "auto" => m.auto)
+# Delegates to msg_to_dict so a live send gets the same inline-attachment
+# split as a history reload.
+wire_new(::ChatModel, m::UserMsg) = msg_to_dict(m)
 wire_new(model::ChatModel, m::ToolMsg) = tool_header_dict(m, model.chat_dir)
 wire_new(model::ChatModel, m::TodoListMsg) = msg_to_dict(m, model.chat_dir)
 # Summary opens as a centered placeholder; `close` ships the rendered html
@@ -3575,6 +3632,16 @@ function note_activity!(m::TaskToolMsg, act::AgentClientProtocol.SubagentActivit
                 feed_label(raw),
                 isempty(act.status) ? e.status : act.status, now_t, raw)
             return feed[i]
+        elseif isempty(act.label)
+            # A title-less tool update (ACP `tool_call_update` carries status but
+            # no title) whose announcing entry is GONE — evicted by the bounded
+            # window on a long feed, or never seen. It has nothing to display, so
+            # do NOT open a new row for it: on a >50-activity subagent every such
+            # orphan completion spawned an empty row, and each spawn evicted a
+            # titled entry, cascading until the whole feed rendered blank. Drop
+            # it (last_activity_at is already bumped); a titled frame still opens
+            # a row via the fall-through below.
+            return nothing
         end
     elseif act.kind in (:text, :thought) && !isempty(feed) &&
            last(feed).kind === act.kind
@@ -4645,8 +4712,11 @@ end
 # file, which is position-independent.
 replayed_to_msg(model::ChatModel, m::AgentClientProtocol.AgentMessage) =
     AgentMsg(string(uuid4()), m.text)
+# The UserMsg carries the chat back-ref so its wire dict can resolve the
+# project's /attachment URLs (msg_to_dict) — a parentless UserMsg renders
+# the raw "[attached files …]" suffix instead of the inline gallery.
 replayed_to_msg(model::ChatModel, m::AgentClientProtocol.UserMessage) =
-    is_summary_text(m.text) ? SummaryMsg(m.text) : UserMsg(m.text)
+    is_summary_text(m.text) ? SummaryMsg(m.text) : UserMsg(shared(model), m.text)
 function replayed_to_msg(model::ChatModel, m::AgentClientProtocol.ToolCall)
     isempty(m.content) || persist_tool_content!(model.chat_dir, m)
     # Replay always lands as a finished call (no live updates afterwards).
@@ -5417,6 +5487,17 @@ const ATTACHMENT_EXTENSIONS = Dict(
     "image/gif" => "gif",
     "image/webp" => "webp",
     "image/svg+xml" => "svg",
+)
+
+# Reverse direction: extension (as saved on disk) → the mime the attachment
+# route serves it with. Keyed by the canonical extensions above ("jpg", not
+# "jpeg" — attachment_ext never saves a ".jpeg").
+const ATTACHMENT_MIME_BY_EXT = Dict(
+    "png" => "image/png",
+    "jpg" => "image/jpeg",
+    "gif" => "image/gif",
+    "webp" => "image/webp",
+    "svg" => "image/svg+xml",
 )
 
 # 5 MB per image. ACP / claude will balk much later than this, but we want

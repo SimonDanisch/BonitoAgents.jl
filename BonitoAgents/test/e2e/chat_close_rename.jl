@@ -129,6 +129,36 @@ function run_suite(server)
             @test torn_down                                         # session torn down
         end
 
+        # ── ✕ placement: top-right corner, clear of the files hint ──────────
+        @testset "✕ pins to the row's top-right; ▾ files owns the bottom-right" begin
+            pid = TK.new_chat(server; title = "Placement")
+            @test TK.wait_for(server, "chat row present",
+                "[...document.querySelectorAll('.bt-side-chat-row')].some(r => r.querySelector('.bt-side-item')?.getAttribute('data-project-id') === $(repr(pid)))";
+                timeout = 10) == true
+            geo = TK.eval_js(server, """(() => {
+                const row = [...document.querySelectorAll('.bt-side-chat-row')]
+                    .find(r => r.querySelector('.bt-side-item')?.getAttribute('data-project-id') === $(repr(pid)));
+                const it = row.querySelector('.bt-side-item');
+                const x  = row.querySelector('.bt-side-close');
+                const h  = row.querySelector('.bt-side-tree-hint');
+                const ib = it.getBoundingClientRect(), xb = x.getBoundingClientRect();
+                const hb = h ? h.getBoundingClientRect() : null;
+                return { xTop: Math.round(xb.top - ib.top),
+                         xRight: Math.round(ib.right - xb.right),
+                         gap: hb ? Math.round(hb.top - xb.bottom) : null,
+                         hidden: getComputedStyle(x).pointerEvents === 'none' }; })()""")
+            @test geo["xTop"] <= 6              # top-anchored, not vertically centered
+            @test geo["xRight"] <= 10           # right-anchored
+            geo["gap"] === nothing || @test geo["gap"] >= 0   # never overlaps ▾ files
+            # Hidden ✕ must not be an invisible click target (stray corner click
+            # closing a chat) — pointer-events off until the row reveals it.
+            @test geo["hidden"] == true
+            @test click_close(server, pid) == "clicked"   # cleanup: close the probe chat
+            @test TK.wait_for(server, "placement probe closed",
+                "![...document.querySelectorAll('.bt-side-item')].some(e => e.getAttribute('data-project-id') === $(repr(pid)))";
+                timeout = 10) == true
+        end
+
         # ── Closing one chat leaves the others ──────────────────────────────
         @testset "closing one chat leaves the others" begin
             pidA = TK.new_chat(server; title = "Keep-A"); TK.send_message(server, "alpha msg")

@@ -541,6 +541,29 @@ const ChatStyles = Bonito.Styles(
         "opacity" => "0.6",
         "background" => "color-mix(in srgb, var(--bt-accent) 45%, var(--bt-surface-2))",
         "font-style" => "italic"),
+    # Inline attachment gallery under the user's text (createNode's `user`
+    # case builds it from the wire `attachments` list). Thumbs are bounded —
+    # the lightbox is the full-size view — and sit on the accent bubble, so a
+    # translucent white seam separates image edges from the blue.
+    CSS(".bt-user-attachments",
+        "display" => "flex", "flex-wrap" => "wrap", "gap" => "6px",
+        "margin-top" => "8px"),
+    CSS(".bt-user-att-img",
+        "max-width" => "220px", "max-height" => "180px",
+        # Floor keeps a tiny image (a pasted icon) visible and clickable as a
+        # chip; object-fit centers it without stretching.
+        "min-width" => "40px", "min-height" => "40px",
+        "object-fit" => "contain",
+        "background" => "rgba(255,255,255,0.15)",
+        "border-radius" => "8px",
+        "border" => "1px solid rgba(255,255,255,0.35)",
+        "cursor" => "zoom-in",
+        "display" => "block"),
+    # Fallback when the file is gone (project moved / cleaned): the name in
+    # small type instead of a broken-image icon.
+    CSS(".bt-user-att-missing",
+        "font-size" => "11px", "opacity" => "0.8",
+        "font-family" => "ui-monospace, monospace"),
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
@@ -1065,6 +1088,12 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "11.5px",
         "color" => "var(--bt-text-muted)",
         "white-space" => "nowrap",
+        # The list is a flex column with a 180px max-height. Flex items default
+        # to `flex-shrink: 1`, so once the entries overflow that cap the browser
+        # SQUISHES each row toward 0px instead of letting the list scroll — a
+        # long subagent feed collapsed to ~2px rows and rendered blank. Pin the
+        # rows to their content height so the list scrolls (overflow-y: auto).
+        "flex-shrink" => "0",
         "overflow" => "hidden", "text-overflow" => "ellipsis"),
     CSS(".bt-task-feed-entry.bt-task-feed-tool",
         "font-family" => "ui-monospace, monospace",
@@ -1753,7 +1782,14 @@ const ChatStyles = Bonito.Styles(
         "border-radius" => "20px",
         "padding" => "10px 14px",
         "font-size" => "16px",                          # iOS no-zoom threshold
-        "min-height" => "40px", "max-height" => "120px",
+        # min-height matches the FULL controls column beside it: send/stop 40px
+        # + 6px gap + the Yolo bar (~18px) = 64px. With the old 40px the
+        # textarea only lined up with the button pair and the Yolo strip's
+        # height was dead space above it. min-height (not height) because the
+        # auto-resize oninput writes an explicit style.height from scrollHeight:
+        # CSS min-height clamps that inline value, so the box grows past 64 up
+        # to the 120 cap and shrinks back to 64 — without touching the JS.
+        "min-height" => "64px", "max-height" => "120px",
         "font-family" => "inherit",
         "color" => "var(--bt-text)",
         "background" => "var(--bt-bg)",

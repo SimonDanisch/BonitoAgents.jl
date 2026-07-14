@@ -264,6 +264,71 @@ function run_suite(server)
             @test bt === nothing   # torn down at begin_turn!
         end
 
+        @testset "long feed (>50 activities) stays readable, never blank" begin
+            # Regression: a long subagent used to render its feed BLANK. Two bugs
+            # compounded: (1) `.bt-task-feed-list` is a flex column with a 180px
+            # cap, and its rows defaulted to `flex-shrink: 1`, so once the entries
+            # overflowed the cap the browser squished every row toward ~2px
+            # (blank) instead of scrolling; (2) a title-less `tool_call_update`
+            # (the ACP completion frame carries no title) for a tool whose
+            # announcement row had already been EVICTED by the feed's own 50-entry
+            # window spawned a new EMPTY row — cascading until the whole feed was
+            # empty labels. Drive the real shape: announce 55 titled sub-tools,
+            # THEN complete them title-less (so the early ones are evicted before
+            # their completion lands).
+            server.agent_fn[] = p -> begin
+                evs = Any[TK.text("Delegating."),
+                    TK.tool(kind = "other", title = "Long subagent", tool_name = "Task",
+                            id = "task-LONG", open_status = "in_progress", complete = false,
+                            raw_input = Dict{String,Any}("description" => "Long subagent",
+                                                          "prompt" => "work"))]
+                push!(evs, TK.delay(500))
+                for i in 1:55
+                    push!(evs, TK.sub_tool("task-LONG"; id = "lng-$i", kind = "search",
+                                           title = "grep pattern$i src/chat.jl", status = "pending"))
+                end
+                push!(evs, TK.delay(150))
+                for i in 1:55                                   # title-less completions
+                    push!(evs, TK.sub_tool("task-LONG"; id = "lng-$i", status = "completed", update = true))
+                end
+                push!(evs, TK.tool_update("task-LONG"; status = "completed",
+                                          content = [TK.text_block("done")]))
+                push!(evs, TK.text("Long feed done."))
+                evs
+            end
+            TK.send_message(server, "run a long subagent")
+            @test TK.wait_for(server, "long feed turn done",
+                "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('Long feed done'))";
+                timeout = 60) == true
+            # Expand the (finished, collapsed) feed for THIS bubble.
+            TK.eval_js(server, raw"""(() => {
+                const heads = [...document.querySelectorAll('.bt-task-feed-head')];
+                const h = heads[heads.length - 1];
+                if (h && h.dataset.expanded !== 'true') (h.querySelector('.bt-tool-toggle')||h).click();
+                return true; })()""")
+            sleep(0.4)
+            # The feed is bounded to 50 rows, none empty (the orphan-completion
+            # fix), and each row keeps its content height (the flex-shrink fix) so
+            # the list SCROLLS rather than squishing rows to an unreadable sliver.
+            # Scope everything to the NEWEST feed: `.bt-task-feed-*` is not in the
+            # harness pane-scope shim, and this suite's earlier Task bubbles
+            # (task-A, task-BG2) contribute their own feed entries globally.
+            metrics = TK.eval_js(server, raw"""(() => {
+                const feeds = [...document.querySelectorAll('.bt-task-feed')];
+                const feed = feeds[feeds.length - 1];
+                if (!feed) return { rows: -1 };
+                const list = feed.querySelector('.bt-task-feed-list');
+                const rows = [...feed.querySelectorAll('.bt-task-feed-entry')];
+                const empty = rows.filter(r => ((r.textContent||'').trim()) === '').length;
+                const minH = Math.min(...rows.slice(0, 10).map(r => r.getBoundingClientRect().height));
+                return { rows: rows.length, empty, minH,
+                         scrolls: list ? (list.scrollHeight > list.clientHeight + 5) : false }; })()""")
+            @test metrics["rows"] == 50
+            @test metrics["empty"] == 0            # no blank rows
+            @test metrics["minH"] >= 8             # rows not squished to a sliver (was ~2px)
+            @test metrics["scrolls"] == true       # overflow scrolls instead of shrinking
+        end
+
         @testset "no JS errors" begin
             @test isempty(TK.js_errors(server))
         end

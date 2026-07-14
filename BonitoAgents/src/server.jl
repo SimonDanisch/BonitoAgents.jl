@@ -293,6 +293,49 @@ function add_download_routes!(srv::Bonito.Server, state::ServerState)
         params = HTTP.queryparams(HTTP.URI(context.request.target))
         download_response(state, pid, String(get(params, "path", "")))
     end)
+    Bonito.route!(srv, ATTACHMENT_ROUTE_RE => function(context)
+        pid    = String(context.match.captures[1])
+        params = HTTP.queryparams(HTTP.URI(context.request.target))
+        attachment_response(state, pid, String(get(params, "file", "")))
+    end)
+end
+
+# /attachment/<pid>?file=<name> — serve a pasted/dropped image from the
+# project's `.bt-attachments/` dir so user bubbles can render it INLINE
+# (`msg_to_dict(::UserMsg)` builds these URLs). Unlike /download this reads
+# the SERVER mirror directly — `save_attachment` wrote the file there, so no
+# worker round-trip — and serves inline with the real image mime. `file` must
+# be a bare filename; anything path-like is rejected (the attachment dir is
+# the whole exposed surface). Filenames are timestamp+uuid — immutable — so
+# the response is cacheable forever.
+const ATTACHMENT_ROUTE_RE = r"^/attachment/([A-Za-z0-9_-]+)"
+
+function attachment_response(state::ServerState, project_id::AbstractString,
+                             file::AbstractString)
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid project id\n")
+    proj = get(state.projects[], project_id, nothing)
+    proj === nothing &&
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "unknown project '$project_id'\n")
+    # Bare, well-formed filename only — no separators, no dot-dot, one of the
+    # extensions `save_attachment` can produce.
+    occursin(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9]+$", file) ||
+        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid attachment name\n")
+    mime = get(ATTACHMENT_MIME_BY_EXT, lowercase(lstrip(splitext(file)[2], '.')), nothing)
+    mime === nothing &&
+        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "unsupported attachment type\n")
+    path = joinpath(proj.server_path, ATTACHMENT_DIR_NAME, file)
+    isfile(path) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "no such attachment\n")
+    return HTTP.Response(200,
+        ["Content-Type"  => mime,
+         "Cache-Control" => "public, max-age=31536000, immutable"],
+        body = read(path))
 end
 
 # Strip anything that could break (or smuggle a header into) the

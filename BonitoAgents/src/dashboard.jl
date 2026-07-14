@@ -729,8 +729,11 @@ const DashboardStyles = Bonito.Styles(
         "display" => "flex", "flex-direction" => "column", "gap" => "4px"),
 
     # ── Header + tagline ─────────────────────────────────────────────────────
+    # `wrap` so the recent-chats overview (flex-basis 100%, overview.jl) drops
+    # onto its own full-width line under the wordmark + tagline row.
     CSS(".bt-header",
         "display" => "flex", "align-items" => "baseline",
+        "flex-wrap" => "wrap",
         "justify-content" => "space-between", "gap" => "16px",
         "margin-bottom" => "4px"),
     CSS(".bt-header h1",
@@ -2594,7 +2597,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                         draggable = "false"),
                 "BonitoAgents"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";
-                    class = "bt-tagline");
+                    class = "bt-tagline"),
+            # Recent-chats overview — the header IS the landing overview: the
+            # last 6 chats as clickable cards (title, count, last prompts,
+            # last image), kept fresh via chat_signal/projects (overview.jl).
+            recent_chats_dom(session, state, current_view);
             class = "bt-header"),
         stats_strip,
         error_block,
