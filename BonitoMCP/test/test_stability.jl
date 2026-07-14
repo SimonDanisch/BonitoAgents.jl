@@ -216,3 +216,31 @@ Base.show(io::IO, ::MIME"image/png", ::BigPng) = write(io, fill(0x41, 50_000))
         @test filesize(joinpath(dir, pngs[1])) == 50_000
     end
 end
+
+# ── text/html is NOT a rich output ──────────────────────────────────────────
+# An html show method is ubiquitous on values whose text/plain form (already in
+# the response) is perfectly readable — method lists, DataFrames — and the chat
+# renders html show files as raw SOURCE (see e2e:chat_show_extras). The old
+# text/html arm turned a `methods(...)` eval result into a Monaco wall of
+# markup. Only genuinely visual mimes (PNG/SVG) produce `shown:` files.
+struct HtmlOnly end
+Base.showable(::MIME"text/html", ::HtmlOnly) = true
+Base.show(io::IO, ::MIME"text/html", ::HtmlOnly) = print(io, "<ul><li>hi</li></ul>")
+
+@testset "try_save_rich ignores text/html-only values" begin
+    mktempdir() do dir
+        @test Helper.try_save_rich(HtmlOnly(), dir, 10_000) === nothing
+        # The real-world case: a method list (html-showable in Base).
+        @test Helper.try_save_rich(methods(push!), dir, 10_000) === nothing
+        @test isempty(filter(f -> endswith(f, ".html"), readdir(dir)))
+    end
+    # format_value still ships the readable text repr for such values — one
+    # text block, no `shown:` reference, no markup.
+    mktempdir() do dir
+        blocks = Helper.format_value(methods(push!), dir, 10_000, false)
+        @test length(blocks) == 1
+        @test startswith(blocks[1]["text"], "result:")
+        @test occursin("push!", blocks[1]["text"])
+        @test !occursin("<li>", blocks[1]["text"])
+    end
+end

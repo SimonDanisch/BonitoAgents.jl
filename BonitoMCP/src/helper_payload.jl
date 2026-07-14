@@ -11,7 +11,7 @@ using Base64
 const DEFAULT_MAX_RESPONSE_BYTES = 10_000
 const LARGE_CONTAINER_THRESHOLD  = 100      # array / dict elements
 
-# On-disk cap for rich-output files (PNG/SVG/HTML written by try_save_rich).
+# On-disk cap for rich-output files (PNG/SVG written by try_save_rich).
 # This is SEPARATE from `max_bytes` (the per-block RESPONSE cap, 10KB default):
 # the rendered bytes go to a FILE on the worker, never into the MCP response —
 # only the path + mime + size do. Gating the file on the tiny response cap meant
@@ -62,12 +62,20 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
     return blocks
 end
 
-# Walk the MIME chain (PNG → SVG → HTML, plus PNGFiles for Colorant
-# matrices) and write the first match to disk. Returns a `shown: <relpath>
+# Walk the IMAGE MIME chain (PNG → SVG, plus PNGFiles for Colorant matrices)
+# and write the first match to disk. Returns a `shown: <relpath>
 # (<mime>, <size>)` text block that the chat-side render_tool_body
 # detects and previews inline. nothing if no rich MIME was renderable.
 # `max_bytes` is accepted for call-site compatibility but the file-size gate uses
 # the generous RICH_FILE_CAP_BYTES — the bytes go to disk, not the response (M14).
+#
+# Deliberately NO text/html arm: an html show method is ubiquitous on values
+# whose text/plain form (already in the response) is perfectly readable —
+# `Vector{Method}`, DataFrames, … — and the chat renders html show files as
+# read-only SOURCE (never a live document; see render_show_file +
+# e2e:chat_show_extras), so an html rich file could only ever degrade the
+# display to a wall of raw markup. Rich files are for genuinely VISUAL
+# values, i.e. images.
 function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
     val === nothing && return nothing
     mkpath(out_dir)
@@ -95,13 +103,6 @@ function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
         svg = sprint_mime(val, MIME"image/svg+xml"())
         if !isempty(svg) && length(svg) <= cap
             return write_show_file(out_dir, base, ".svg", "image/svg+xml", svg, val)
-        end
-    end
-
-    if showable_safe(MIME"text/html"(), val)
-        html = sprint_mime(val, MIME"text/html"())
-        if !isempty(html) && length(html) <= cap
-            return write_show_file(out_dir, base, ".html", "text/html", html, val)
         end
     end
 
