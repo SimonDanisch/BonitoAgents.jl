@@ -665,7 +665,13 @@ function load_workers!(s::ServerState)
                            get(d, "mcp_path", ""),
                            Vector{String}(get(d, "mcp_args", String[])),
                            get(d, "projects_root", ""),
-                           :unknown, now(UTC))
+                           # Offline until its control WS dials in. The raw
+                           # 13-arg ctor takes the Observable field directly —
+                           # the legacy `:unknown` Symbol only worked through
+                           # the 12-arg shim's coercion and silently DROPPED
+                           # every persisted worker here once `online` became
+                           # an Observable ("skipping malformed worker entry").
+                           Observable(false), now(UTC))
             s.workers[][wid] = w
         catch e
             @warn "skipping malformed worker entry" entry=d exception=e

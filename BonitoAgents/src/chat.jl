@@ -199,6 +199,16 @@ mutable struct ChatModel
     # live (see taskbar.jl). Shared across session views; owns its own poll
     # loop. Replaces the old `taskbar_items`/`taskbar_clock` + background poller.
     taskbar::TaskBar
+
+    # Per-tool render serialization: tool_id → (render lock, latest generation).
+    # ToolRenderCommand handlers run async, and for a `bonito_app` body two
+    # CONCURRENT renders each delegate a worker subsession — the interleaved
+    # supersede bookkeeping could close the NEWER sub while the stale render's
+    # html won the slot (a dead embed stuck on its spinner). Renders for one
+    # tool hold the lock across render + ship; a render that is no longer the
+    # latest generation at its turn skips entirely. Guarded by `model.lock`
+    # for the get!/increment; entries are few (one per rendered tool).
+    tool_renders::Dict{String, Tuple{ReentrantLock, Ref{Int}}}
 end
 
 # The provider tracked by the `provider` observable: the singleton descriptor the
@@ -261,6 +271,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Dict{String, Tuple{Channel, Any}}(),   # pending_asks
         String[],                              # tool_cache_order (LRU for the cache)
         TaskBar(),                             # live-task board (owns its poll loop)
+        Dict{String, Tuple{ReentrantLock, Ref{Int}}}(),  # tool_renders (serialize + latest-wins)
     )
     # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
     # with `chat = nothing` (the model doesn't exist yet while parsing), but
@@ -331,6 +342,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.pending_asks,            # shared → asks resolve against the parent
             m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
             m.taskbar,                 # shared → one live-task board per chat
+            m.tool_renders,            # shared → renders serialize across every tab
         )
     end
 end
@@ -5897,28 +5909,49 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     # other chat event for this tab (scroll fetches, sends, tab switches) until
     # the timeout — multiple stuck tools compound to minutes of frozen UI.
     #
-    # Each render is fire-and-forget — no return value the comm handler needs.
-    # Concurrent renders are safe: `call_ctrl` uses per-request channels +
-    # serial WS writes under `eb.wlock`, and `dom_in_js` opens its own
-    # subsession per call. The catch keeps a stale tool id / dead bridge from
-    # leaking out as an uncaught task error.
+    # Renders for the SAME tool serialize (latest wins): auto-expand can fire
+    # more than once, and for a `bonito_app` body two CONCURRENT renders each
+    # delegate their own worker subsession — the interleaved supersede
+    # bookkeeping (`swap_mount!` + `close_remote_sub!`) could close the NEWER
+    # sub while the STALE render's html won the slot, leaving a dead embed on
+    # its spinner forever (hit reproducibly on remounts after a page reload).
+    # Each request bumps the tool's render generation; the async task takes
+    # the tool's render lock and SKIPS if it's no longer the newest — so at
+    # most one render is in flight per tool and the last request's html ships
+    # last. The catch keeps a stale tool id / dead bridge from leaking out as
+    # an uncaught task error.
+    # Keyed per (page, tool): each browser page ships into its own slot, so
+    # only renders for the SAME page supersede each other — another tab's
+    # request must not cancel ours. (Entries are tiny and per rendered tool;
+    # dead pages leave a few behind until the chat closes — acceptable.)
+    render_key = string(Bonito.root_session(session).id, '|', cmd.tool_id)
+    render_lock, gen_ref = lock(model.lock) do
+        get!(() -> (ReentrantLock(), Ref(0)), shared(model).tool_renders, render_key)
+    end
+    my_gen = lock(model.lock) do
+        gen_ref[] += 1
+    end
     Base.errormonitor(@async try
-        body = render_tool_body(model.state, msg,
-            model.cwd, model.chat_dir; project_id=model.project_id)
-        # `toolSlot` (a ChatLib module export — no window.* global) also
-        # finds slots on nodes the virtual scroll holds DETACHED (cache
-        # window / prefetch) — a plain document.querySelector misses those
-        # and the body would be stuck on "loading…".
-        Bonito.dom_in_js(
-            session,
-            body,
-            js"""(elem) => {
+        lock(render_lock) do
+            # A newer request superseded us while we waited — it will ship.
+            lock(() -> gen_ref[], model.lock) == my_gen || return
+            body = render_tool_body(model.state, msg,
+                model.cwd, model.chat_dir; project_id=model.project_id)
+            # `toolSlot` (a ChatLib module export — no window.* global) also
+            # finds slots on nodes the virtual scroll holds DETACHED (cache
+            # window / prefetch) — a plain document.querySelector misses those
+            # and the body would be stuck on "loading…".
+            Bonito.dom_in_js(
+                session,
+                body,
+                js"""(elem) => {
     $(ChatLib).then(lib => {
         const slot = lib.toolSlot($(cmd.tool_id));
         if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
     });
 }"""
-        )
+            )
+        end
     catch e
         @warn "tool render failed" tool_id = cmd.tool_id exception = e
         # Replace the stale "loading…" with a visible failure so the user knows

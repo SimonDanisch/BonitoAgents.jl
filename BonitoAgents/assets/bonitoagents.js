@@ -88,7 +88,16 @@ export class Collapsable {
                 this.body.style.display = expanded ? '' : 'none';
             }
         }
-        if (expanded && !this.editMode) {
+        // Lazy body fetch. editMode pills normally keep their streamed-in
+        // body across toggles and only resize Monaco — but a HISTORY-REPLAYED
+        // edit pill starts with an EMPTY body (its diff lives server-side
+        // until a tool.render round trip), so gating the fetch on
+        // `!editMode` alone made replayed Edit pills permanently
+        // unexpandable: the arrow flipped, `_applyEditHeight` sized zero
+        // Monaco divs, and nothing ever appeared. Fetch whenever the body
+        // has nothing to show.
+        const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
+        if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
                 this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
                 this.onExpand && this.onExpand();

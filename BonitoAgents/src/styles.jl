@@ -680,6 +680,11 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-msg.bt-tool-wide-active",
         "align-self" => "stretch",
         "max-width" => "100%"),
+    # Live app embeds get a wider default cap than text pills: the visuals ARE
+    # the content, and a responsive (resize_to = :parent) canvas will actually
+    # use the room.
+    CSS(".bt-tool-msg:has(.bt-embed)",
+        "max-width" => "min(98%, 1100px)"),
     # Detach button in the tool header (rendered only for bonito_app tools).
     # ⤢ is the conventional "open in a window" glyph; clicking pops the embed
     # into the floating window. Small, neutral, sits at the right of the header.

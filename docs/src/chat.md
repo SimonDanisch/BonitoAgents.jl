@@ -1,6 +1,6 @@
 # The Chat
 
-![Chat with a streamed diff, terminal output and a live app](assets/screenshot-chat.png)
+![Chat with a streamed Monaco diff from a real refactor](assets/screenshot-chat.png)
 
 ## The transcript
 
@@ -44,7 +44,7 @@ The main area is a VSCode-style workspace
 file editors and detached app embeds are panels you drag into tab groups,
 split horizontally or vertically, float as windows, and dock back.
 
-![Chat and editor side by side](assets/screenshot-workspace.png)
+![The live app docked beside the chat and the built-in editor](assets/screenshot-workspace.png)
 
 ## Media and live apps
 

@@ -303,24 +303,50 @@ end
 const SERVER_CONTEXT = Ref{Union{Nothing, NamedTuple{(:url, :secret, :project_id), Tuple{String, String, Ref{String}}}}}(nothing)
 
 """
+    scrub_mock_env!()
+
+Remove a previous mock `dev_server`'s ENV leftovers from this process. The
+mock knobs are only meaningful to the mock provider, EXCEPT
+`BT_DEFAULT_PROVIDER`, which is a general knob — only remove it when it holds
+a value the mock path itself set (a user's own `BT_DEFAULT_PROVIDER=MiMoCode`
+stays untouched).
+"""
+function scrub_mock_env!()
+    for k in ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
+              "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
+              "BT_MOCK_ACP_IGNORE_CANCEL")
+        delete!(ENV, k)
+    end
+    get(ENV, "BT_DEFAULT_PROVIDER", "") in ("MockCode", "MockCode2") &&
+        delete!(ENV, "BT_DEFAULT_PROVIDER")
+    return nothing
+end
+
+"""
     dev_server(; agent = msg -> end_turn(), port = nothing, kwargs...) -> TestServer
 
 Start a real BonitoAgents dev server, swap the worker's `claude-agent-acp`
 with the mock script, and route every prompt back to `agent`. The
 returned `TestServer` is the handle every helper takes as its first arg.
+
+`mock = false` keeps the worker on its REAL default provider (an actual
+`claude-agent-acp` from PATH / `CLAUDE_AGENT_ACP`) while still returning a
+`TestServer` with all the browser/eval helpers — used to seed genuine agent
+sessions (e.g. the docs-walkthrough rig); `agent` is then ignored.
 """
 function dev_server(; agent::Function = (_msg -> end_turn()),
                       port::Union{Int,Nothing} = nothing,
                       browser_width::Int  = 1280,
                       browser_height::Int = 820,
                       ignore_cancel::Bool = false,
+                      mock::Bool = true,
                       kwargs...)
     ensure_display!()
     agent_ref = Ref{Function}(agent)
 
     # 1. Stand up the TCP dispatcher BEFORE we start the dev server, so the
     #    moment the worker spawns a mock agent for the first chat it can
-    #    connect back without retry.
+    #    connect back without retry. (Harmlessly idle when mock = false.)
     sock = listen(Sockets.IPv4(0x7f000001), 0)   # 127.0.0.1:<auto>
     disp_port = Sockets.getsockname(sock)[2]
     dispatcher_task = Base.errormonitor(@async begin
@@ -342,13 +368,21 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     #    because `dev_server` writes `agent_env` into `ENV` before spawning the
     #    worker, which inherits it (and the spawned MockACP inherits it in turn).
     test_env = abspath(joinpath(@__DIR__, ".."))   # .../BonitoAgents/test — where MockACP is a dep
-    agent_env = Dict{String,String}(
+    agent_env = mock ? Dict{String,String}(
         "BT_ENABLE_MOCK_AGENT"   => "1",
         "BT_DEFAULT_PROVIDER"    => "MockCode",
         "BT_MOCK_ACP_SCENARIO"   => "dispatcher",
         "BT_MOCK_ACP_DISPATCHER" => "127.0.0.1:$(disp_port)",
         "BT_MOCK_PROJECT"        => test_env,
-    )
+    ) : Dict{String,String}()
+    # `BT.dev_server` copies `agent_env` into the PROCESS ENV (so the worker
+    # subprocess inherits it) — which means a prior mock dev_server in this
+    # same Julia process left all of the above behind. A later `mock = false`
+    # server must not inherit that: its chats would default to MockCode and
+    # the spawned MockACP would dial the DEAD dispatcher port of the closed
+    # mock server ("ACP connection closed" on every bind, no agent stderr
+    # anywhere near the failure). Scrub the mock leftovers before starting.
+    mock || scrub_mock_env!()
     # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")

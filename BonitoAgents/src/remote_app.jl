@@ -633,7 +633,12 @@ function embed_remote_app(host::Bonito.Session, eb::EvalBridge, app_id::Abstract
     # One control round-trip: the worker renders a fresh subsession, packs its init
     # bundle as a BinaryAsset (which fires `asset_add` control frames the relay loop
     # registers on `eb.asset_host`), and replies with (sub_id, html, init_url).
-    sub_id, html, init_url = call_ctrl(eb, "delegate"; app = String(app_id))
+    # `page` names THIS browser page (its root session id): the worker resets its
+    # serialization dedup cache when the page changes, so a bundle built for a
+    # previous page (whose browser object cache is gone — reload, new tab) is
+    # never assumed to be resolvable here (RemoteProxy.switch_page!).
+    sub_id, html, init_url = call_ctrl(eb, "delegate"; app = String(app_id),
+                                       page = root.id)
     sub_id = String(sub_id); html = String(html); init_url = String(init_url)
     # The worker sends `asset_add` BEFORE the delegate reply (same socket, in order),
     # so the init bundle is normally already registered; this is just a safety net.

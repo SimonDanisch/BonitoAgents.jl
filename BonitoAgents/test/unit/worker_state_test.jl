@@ -211,4 +211,31 @@ end
     @test haskey(st.chat_models, "pp")            # #28: kept for reconnect, not evicted
 end
 
+@testset "workers.json round-trips (persistent rig restart)" begin
+    # Regression: after `online` became an Observable, `load_workers!` still
+    # fed the legacy `:unknown` Symbol to the RAW 13-arg constructor and threw
+    # convert(Bool, ::Symbol) — every persisted worker was silently dropped as
+    # a "malformed worker entry" on restart. On a persistent dev rig
+    # (`dev_server(dir = ...)`) that orphaned all projects until the local
+    # worker happened to re-register.
+    dir = mktempdir()
+    st = BT.ServerState(; state_dir = dir,
+                          working_dir = joinpath(dir, "work"),
+                          worker_secret = "s")
+    wid = "worker-roundtrip-1"
+    st.workers[][wid] = BT.WorkerInfo(wid, "Studio", "<inbound-ws>", "s", nothing,
+                                      "host", "/home/u", "julia", String["--project"],
+                                      "/home/u/projects", :online, now(UTC))
+    BT.save_workers!(st)
+
+    st2 = BT.ServerState(; state_dir = dir,
+                           working_dir = joinpath(dir, "work"),
+                           worker_secret = "s")
+    @test haskey(st2.workers[], wid)              # NOT dropped as malformed
+    w = st2.workers[][wid]
+    @test w.name == "Studio"
+    @test w.projects_root == "/home/u/projects"
+    @test w.online[] == false                     # offline until the WS dials in
+end
+
 end

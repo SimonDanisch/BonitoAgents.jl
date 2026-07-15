@@ -196,4 +196,83 @@ end
         @test startswith(sub_id, b.parent.id * "/")
         close(cap2); wait(t2)
     end
+
+    @testset "page change resets the dedup cache (reload -> self-contained bundle)" begin
+        # Regression: the bridge parent is a long-lived ROOT session, and
+        # Bonito's serialization dedups against its `session_objects`, sending
+        # bare TrackingOnly references for anything already shipped. That
+        # assumption holds per browser PAGE, not per bridge: after a reload the
+        # page's global object cache is empty, so a re-mounted embed got
+        # references to objects it never received — DOM up, observables alive,
+        # but every cached payload missing (the eternal-spinner WGLMakie embed).
+        # `delegate` now names the page and `switch_page!` resets the cache on
+        # a page change, making the first bundle per page self-contained.
+        b, cap = fresh_bridge!()
+        marker = "PAGE_CACHE_MARKER_" * "x"^64
+        payload = Observable(marker)
+        RP.register_app!("pg", App(s -> (onjs(s, payload, js"(x)=>{}");
+                                         DOM.div(DOM.span("app")))))
+
+        bundle_bytes(init_url) = begin
+            key = first(split(last(split(init_url, '/')), '?'))
+            Bonito.read_proxy_asset(b.parent.asset_server.registry, String(key))
+        end
+        has_marker(bytes) = occursin(marker, String(copy(bytes)))
+
+        # Page 1, first mount: the bundle carries the observable's VALUE.
+        _, _, url1 = RP.render_embed(b, "pg", "page-1")
+        @test has_marker(bundle_bytes(url1))
+        # Page 1, second mount: dedup is correct within a page — no re-ship.
+        _, _, url2 = RP.render_embed(b, "pg", "page-1")
+        @test !has_marker(bundle_bytes(url2))
+        # Page 2 = a reload: the bundle must be self-contained again (this is
+        # exactly the assertion that failed before switch_page!).
+        _, _, url3 = RP.render_embed(b, "pg", "page-2")
+        @test has_marker(bundle_bytes(url3))
+        @test b.page == "page-2"
+        # A prerendered bundle from the old page must never be served across a
+        # page switch: it was built against the old cache state.
+        RP.prerender_app("pg")                      # built for page-2's cache
+        _, _, url4 = RP.render_embed(b, "pg", "page-3")
+        @test has_marker(bundle_bytes(url4))
+        # No page named (old host) -> no reset, dedup persists (back-compat).
+        _, _, url5 = RP.render_embed(b, "pg")
+        @test !has_marker(bundle_bytes(url5))
+
+        # JS module imports are page-scoped emission too: `session_dom`
+        # dedupes them against `root.imports` "for the page's lifetime", so a
+        # NEW page's fragment must re-ship the <script type=module> tag — the
+        # original failure mode was a WGLMakie embed whose module script was
+        # omitted after a reload (module never loads, scene never builds,
+        # spinner forever, no error anywhere).
+        js_file = joinpath(mktempdir(), "probemod.js")
+        write(js_file, "export function probe() { return 42; }\n")
+        probemod = Bonito.ES6Module(js_file)
+        RP.register_app!("imp", App(s -> DOM.div(Bonito.jsrender(s,
+            js"\$(probemod).then(m => m.probe())"))))
+        _, html1, _ = RP.render_embed(b, "imp", "page-4")
+        @test occursin("probemod", html1)             # first page ships the module
+        _, html2, _ = RP.render_embed(b, "imp", "page-4")
+        @test !occursin("probemod", html2)            # same page: deduped
+        _, html3, _ = RP.render_embed(b, "imp", "page-5")
+        @test occursin("probemod", html3)             # new page ships it AGAIN
+
+        # Root METADATA is page-lifetime state too: integrations keep counters
+        # there that mirror module-level JS state, which a reload resets.
+        # WGLMakie's `get_order!` is the canonical case: it increments
+        # `:wglmakie_scene_order` on the root, and the JS `orderedExecutor`
+        # (fresh per page, nextExpected = 1) queues every scene init until the
+        # counter it expects arrives. A remount shipping order N>1 to a fresh
+        # page therefore waits forever — `setup_scene_init` never runs, the
+        # canvas is never measured, no scene is ever requested: a black canvas
+        # with zero errors anywhere. A page switch must drop root metadata so
+        # per-page counters restart in lockstep with the page's JS.
+        Bonito.set_metadata!(b.parent, :wglmakie_scene_order, 7)
+        RP.render_embed(b, "imp", "page-6")
+        @test Bonito.get_metadata(b.parent, :wglmakie_scene_order, 1) == 1
+        # Same page: metadata persists (in-page renders must keep counting up).
+        Bonito.set_metadata!(b.parent, :wglmakie_scene_order, 3)
+        RP.render_embed(b, "imp", "page-6")
+        @test Bonito.get_metadata(b.parent, :wglmakie_scene_order, 1) == 3
+    end
 end

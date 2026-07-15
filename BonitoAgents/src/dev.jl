@@ -24,6 +24,10 @@ mutable struct DevHandle
     working_dir   :: String
     worker_root   :: String
     worker_config :: String                       # throwaway BonitoWorker config dir (removed on close)
+    # false ⇒ the dirs above were caller-supplied (`dir = ...`) and survive
+    # `close` — a PERSISTENT rig (e.g. the docs-walkthrough state) that the
+    # next `dev_server(dir = ...)` picks up with all projects/chats intact.
+    ephemeral     :: Bool
     closed        :: Threads.Atomic{Bool}
 end
 
@@ -63,15 +67,37 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                       agent_bin::Union{String,Nothing}     = nothing,
                       agent_env::Dict{String,String}       = Dict{String,String}(),
                       heartbeat_interval::Real             = 15.0,
-                      heartbeat_deadline::Real             = 45.0)
+                      heartbeat_deadline::Real             = 45.0,
+                      dir::Union{String,Nothing}           = nothing)
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
     # writes the real port back to srv.port after start.
     chosen_port = port === nothing ? 0 : port
     secret      = randstring(64)
-    state_dir   = mktempdir(; prefix = "bonitoagents-dev-state-")
-    working_dir = mktempdir(; prefix = "bonitoagents-dev-work-")
-    worker_root = mktempdir(; prefix = "bonitoagents-dev-worker-")
-    worker_id   = "dev-" * randstring(8)
+    # `dir` makes the rig PERSISTENT: all four state dirs live under it, the
+    # worker id is pinned once and reused, and `close` keeps everything on
+    # disk — the next `dev_server(dir = ...)` resumes the same projects/chats.
+    # (Used by the docs walkthrough so its seeded demo chats aren't re-paid
+    # on every re-record.) Default stays the throwaway tempdir rig.
+    ephemeral = dir === nothing
+    local state_dir, working_dir, worker_root, worker_config
+    if ephemeral
+        state_dir   = mktempdir(; prefix = "bonitoagents-dev-state-")
+        working_dir = mktempdir(; prefix = "bonitoagents-dev-work-")
+        worker_root = mktempdir(; prefix = "bonitoagents-dev-worker-")
+        worker_config = mktempdir(; prefix = "bonitoagents-dev-wcfg-")
+    else
+        root = abspath(String(dir))
+        state_dir     = joinpath(root, "state")
+        working_dir   = joinpath(root, "working")
+        worker_root   = joinpath(root, "worker")
+        worker_config = joinpath(root, "worker-config")
+        foreach(mkpath, (state_dir, working_dir, worker_root, worker_config))
+    end
+    # Stable worker identity for a persistent rig: reuse the pinned id so
+    # projects.json's worker_id foreign keys stay valid across relaunches.
+    id_file   = joinpath(worker_config, "worker_id")
+    worker_id = isfile(id_file) ? strip(read(id_file, String)) :
+                                  "dev-" * randstring(8)
     # Route through `default_worker_name` so a machine whose
     # `friendly_hostname()` is empty (no `hostnamectl --pretty` configured,
     # `gethostname()` = "localhost") falls back to `<user>-<4 chars>` —
@@ -97,9 +123,8 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # agent (CLAUDE_AGENT_ACP + agent_env) reach it and the BonitoMCP it spawns.
     resolved_agent_bin = agent_bin === nothing ? BonitoWorker.find_agent_bin() :
                           String(agent_bin)
-    worker_config = mktempdir(; prefix = "bonitoagents-dev-wcfg-")
     ENV["BONITOAGENTS_CONFIG_DIR"] = worker_config
-    write(joinpath(worker_config, "worker_id"), worker_id)   # pin the ephemeral dev id
+    write(id_file, worker_id)   # pin the dev id (reused on a persistent rig)
     resolved_agent_bin === nothing || (ENV["CLAUDE_AGENT_ACP"] = resolved_agent_bin)
     for (k, v) in agent_env; ENV[k] = v; end
     # Build the provider singleton list ONCE here, on the uncontended startup path
@@ -135,14 +160,15 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # `closed` guards close() idempotency (the worker lifecycle is the process).
     closed = Threads.Atomic{Bool}(false)
     handle = DevHandle(server_url, secret, state, worker_proc,
-                       state_dir, working_dir, worker_root, worker_config, closed)
+                       state_dir, working_dir, worker_root, worker_config,
+                       ephemeral, closed)
 
     # Best-effort cleanup if the Julia process exits without explicit close.
     Base.atexit(() -> close(handle))
 
     println()
     @info "BonitoAgents dev server running" url=server_url worker_name=actual_name
-    println("  State dirs (auto-cleaned on close):")
+    println("  State dirs ($(ephemeral ? "auto-cleaned on close" : "PERSISTENT — kept on close")):")
     println("    state    $state_dir")
     println("    working  $working_dir")
     println("    worker   $worker_root")
@@ -252,11 +278,14 @@ function Base.close(h::DevHandle)
     # `force = true` already makes "doesn't exist" a no-op, so the only
     # remaining failure modes are permission / filesystem errors — those
     # we DO want surfaced rather than silently dropping the tempdir.
-    for d in (h.state_dir, h.working_dir, h.worker_root, h.worker_config)
-        try
-            rm(d; recursive = true, force = true)
-        catch e
-            @warn "dev_server: cleanup rm failed" path=d exception=e
+    # A persistent rig (`dir = ...`) keeps its dirs: that's its whole point.
+    if h.ephemeral
+        for d in (h.state_dir, h.working_dir, h.worker_root, h.worker_config)
+            try
+                rm(d; recursive = true, force = true)
+            catch e
+                @warn "dev_server: cleanup rm failed" path=d exception=e
+            end
         end
     end
     return h

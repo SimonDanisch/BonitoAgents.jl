@@ -71,6 +71,10 @@ mutable struct RemoteBridge
     parent::Bonito.Session
     driver::BridgeDriver
     routes::Bonito.Routes
+    # The browser PAGE (the host's root-session id) that `parent`'s
+    # serialization cache currently reflects — see `switch_page!`. "" until
+    # the first delegate names one.
+    page::String
 end
 
 const BRIDGE = Ref{Union{Nothing, RemoteBridge}}(nothing)
@@ -95,7 +99,7 @@ function RemoteBridge(; compression::Bool = false)
     # writes reach the browser through the host relay — mark it ready so
     # `close`ing a subsession can emit `free_session` through the bridge.
     isready(parent.connection_ready) || put!(parent.connection_ready, true)
-    return RemoteBridge(parent, driver, Bonito.Routes())
+    return RemoteBridge(parent, driver, Bonito.Routes(), "")
 end
 
 """
@@ -204,7 +208,10 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
     id = get(msg, "id", nothing)
     try
         if op == "delegate"
-            sub_id, html, init_url = render_embed(b, String(msg["app"]))
+            # `page` = the host's root session id (absent from old hosts → "",
+            # which keeps today's single-page behavior).
+            sub_id, html, init_url = render_embed(b, String(msg["app"]),
+                                                  String(get(msg, "page", "")))
             send_control(d, Dict("op" => "reply", "id" => id,
                                  "val" => Any[sub_id, html, init_url]))
         elseif op == "asset_read"
@@ -298,9 +305,89 @@ function prerender_app(id::AbstractString)
     return nothing
 end
 
+"""
+    switch_page!(b, page) -> Bool
+
+Reset the bridge's serialization state when the browser PAGE changes.
+
+The bridge parent is a long-lived ROOT session that serves many pages over
+its lifetime (reloads, later tabs). Bonito's serialization dedups against the
+root's `session_objects` and ships a bare `TrackingOnly` reference for
+anything already sent — an assumption that holds per PAGE, not per bridge:
+after a reload the browser's global object cache is empty, so a bundle built
+against the old cache references objects the page never received. The DOM
+still mounts (it rides in the html fragment), observables still round-trip,
+but every CACHED payload — plot buffers, textures, attribute dicts — is
+silently missing; a re-mounted WGLMakie embed shows an eternal spinner with
+no error anywhere.
+
+So each `delegate` names the page (the host's root session id); when it
+differs from the page the cache reflects, we close the previous page's
+subsessions (their browser side is gone) and drop ALL of the parent's
+page-lifetime state — object cache, asset/style emission dedup, root
+metadata — so the next bundle ships full values against a blank page again.
+
+Known limitation: two pages alternating over ONE bridge reset each other's
+cache and close each other's live subs — the fix for that is a per-page
+parent session, which needs Bonito-side support. Before this function, a
+second page never worked at all, so this is strictly an improvement.
+"""
+function switch_page!(b::RemoteBridge, page::AbstractString)
+    (isempty(page) || page == b.page) && return false
+    if isempty(b.page)
+        # First page this bridge serves: the cache state (and any prerendered
+        # bundle from registration time) was built FOR whichever page mounts
+        # first — adopt it, don't wipe. Only a real page→page transition
+        # invalidates the browser-cache assumption.
+        b.page = String(page)
+        return false
+    end
+    for (id, child) in collect(b.parent.children)
+        try
+            close(child)
+        catch e
+            @warn "RemoteProxy: closing stale page subsession failed" id exception = e
+        end
+    end
+    root = b.parent
+    lock(root.deletion_lock) do
+        for key in collect(keys(root.session_objects))
+            Bonito.force_delete!(root, key)
+        end
+        # Asset emission dedupes at the root "for the page's lifetime": once a
+        # sub ships a `<script type=module>` / stylesheet, the asset lands in
+        # `root.imports` / `root.global_stylesheets` and later subs' fragments
+        # OMIT it (session_dom's setdiff). Bonito clears these when the root
+        # closes — but this root is a BRIDGE, not a page, and outlives many
+        # pages. Without clearing, a new page's embed fragment omits e.g. the
+        # WGLMakie module script: the module never loads, `$(WGL).then(...)`
+        # pends forever, and the scene silently never builds (black canvas,
+        # eternal spinner, zero errors anywhere).
+        empty!(root.imports)
+        empty!(root.global_stylesheets)
+        # Root metadata is page-lifetime state too: integrations persist
+        # browser-mirrored counters here. WGLMakie's `get_order!` keeps
+        # `:wglmakie_scene_order` on the root, mirrored by a module-level
+        # `orderedExecutor.nextExpected` counter in its JS — which a reload
+        # resets to 1. A remount then ships order N>1 and `execute_in_order`
+        # waits forever for the N-1 slots that died with the old page:
+        # `setup_scene_init` never runs, the canvas is never measured, no
+        # `real_size` notify, no scene (black canvas, zero errors).
+        empty!(root.metadata)
+    end
+    # Prerendered bundles were built against the old cache state — void now.
+    empty!(PRERENDERED)
+    b.page = String(page)
+    return true
+end
+
 # Render-or-reuse for the host's `delegate` call: cached bundle if any
-# (consumed by this delegate), otherwise render fresh.
-function render_embed(b::RemoteBridge, app_id::AbstractString)
+# (consumed by this delegate), otherwise render fresh. `page` identifies the
+# requesting browser page; a page change resets the dedup cache first (which
+# also discards prerendered bundles, so a stale one can never be served to a
+# page whose object cache doesn't match it).
+function render_embed(b::RemoteBridge, app_id::AbstractString, page::AbstractString = "")
+    switch_page!(b, page)
     cached = pop!(PRERENDERED, String(app_id), nothing)
     return cached === nothing ? render_and_pack(b, String(app_id)) : cached
 end
