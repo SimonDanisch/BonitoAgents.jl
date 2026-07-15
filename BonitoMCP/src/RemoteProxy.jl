@@ -354,15 +354,14 @@ function switch_page!(b::RemoteBridge, page::AbstractString)
         for key in collect(keys(root.session_objects))
             Bonito.force_delete!(root, key)
         end
-        # Asset emission dedupes at the root "for the page's lifetime": once a
-        # sub ships a `<script type=module>` / stylesheet, the asset lands in
-        # `root.imports` / `root.global_stylesheets` and later subs' fragments
-        # OMIT it (session_dom's setdiff). Bonito clears these when the root
-        # closes — but this root is a BRIDGE, not a page, and outlives many
-        # pages. Without clearing, a new page's embed fragment omits e.g. the
-        # WGLMakie module script: the module never loads, `$(WGL).then(...)`
-        # pends forever, and the scene silently never builds (black canvas,
-        # eternal spinner, zero errors anywhere).
+        # Asset emission: pre-#406 Bonito deduped sub emissions against
+        # `root.imports` "for the page's lifetime" — on a BRIDGE root that
+        # outlives many pages, a new page's embed fragment then omitted e.g.
+        # the WGLMakie module script (module never loads, `$(WGL).then(...)`
+        # pends forever, black canvas, zero errors). Bonito#406 made subs
+        # re-emit their own imports (no union into root), so these sets stay
+        # empty for subs — clearing is now belt-and-suspenders for anything
+        # the root itself emitted and for older Bonito semantics.
         empty!(root.imports)
         empty!(root.global_stylesheets)
         # Root metadata is page-lifetime state too: integrations persist

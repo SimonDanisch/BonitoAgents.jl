@@ -239,12 +239,17 @@ end
         _, _, url5 = RP.render_embed(b, "pg")
         @test !has_marker(bundle_bytes(url5))
 
-        # JS module imports are page-scoped emission too: `session_dom`
-        # dedupes them against `root.imports` "for the page's lifetime", so a
-        # NEW page's fragment must re-ship the <script type=module> tag — the
-        # original failure mode was a WGLMakie embed whose module script was
-        # omitted after a reload (module never loads, scene never builds,
-        # spinner forever, no error anywhere).
+        # JS module emission: every embed fragment must be SELF-CONTAINED —
+        # the <script type=module> tag has to ride along wherever the
+        # fragment mounts. The original failure mode was a WGLMakie embed
+        # whose module script was omitted after a reload because pre-#406
+        # Bonito deduped emission against `root.imports` "for the page's
+        # lifetime" while the bridge root outlived the page (module never
+        # loads, scene never builds, spinner forever, no error anywhere).
+        # Bonito#406 changed the model — subs re-emit their own imports and
+        # never union into the root — so we assert per-page self-containment
+        # only, NOT same-page dedup (version-dependent, and duplicate module
+        # tags are idempotent in the browser's module registry anyway).
         js_file = joinpath(mktempdir(), "probemod.js")
         write(js_file, "export function probe() { return 42; }\n")
         probemod = Bonito.ES6Module(js_file)
@@ -252,10 +257,8 @@ end
             js"\$(probemod).then(m => m.probe())"))))
         _, html1, _ = RP.render_embed(b, "imp", "page-4")
         @test occursin("probemod", html1)             # first page ships the module
-        _, html2, _ = RP.render_embed(b, "imp", "page-4")
-        @test !occursin("probemod", html2)            # same page: deduped
         _, html3, _ = RP.render_embed(b, "imp", "page-5")
-        @test occursin("probemod", html3)             # new page ships it AGAIN
+        @test occursin("probemod", html3)             # a NEW page ships it too
 
         # Root METADATA is page-lifetime state too: integrations keep counters
         # there that mirror module-level JS state, which a reload resets.
