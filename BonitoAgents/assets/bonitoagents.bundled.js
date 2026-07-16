@@ -882,11 +882,30 @@ class BonitoChat {
         let vi = this.indexAt(st);
         while(vi < this.totalCount && (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0))vi++;
         if (vi >= this.totalCount) return null;
-        const n = this.rendered.has(vi) ? this.cache.get(vi) : null;
-        if (n && n.isConnected && n.style.display !== 'none') {
+        let di = -1, doff = 0;
+        for (const i of [
+            ...this.rendered
+        ].sort((a, b)=>a - b)){
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (this.keyByIdx.get(i) === excludeKey) continue;
+            if (n.offsetTop + n.offsetHeight > st + 4) {
+                di = i;
+                doff = n.offsetTop - st;
+                break;
+            }
+        }
+        this._anchorDebug = {
+            st,
+            vi,
+            di,
+            doff,
+            pickedDom: di >= 0 && di <= vi
+        };
+        if (di >= 0 && di <= vi) {
             return {
-                idx: vi,
-                off: n.offsetTop - st,
+                idx: di,
+                off: doff,
                 dom: true
             };
         }
@@ -1346,7 +1365,15 @@ class BonitoChat {
             }
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
-            if (!live) node.querySelector('.bt-eval-preview')?.remove();
+            if (!live) {
+                node.querySelector('.bt-eval-stream')?.remove();
+                if (node.dataset.compactBody === '1' && node.collapsable && node.collapsable.loaded && node.isConnected) {
+                    this.comm.notify({
+                        type: 'tool.render',
+                        id: msg.id
+                    });
+                }
+            }
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -1376,6 +1403,14 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
+        if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
+            const c = node.collapsable;
+            c.editMode = true;
+            c.compactHeight = 110;
+            c.fetchEachExpand = false;
+            c.discardOnCollapse = false;
+            node.dataset.compactBody = '1';
+        }
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
         if (this._wantsNative(node)) {
             this._applyNative(node);
@@ -1393,6 +1428,20 @@ class BonitoChat {
                     node.dataset.btAutoMount = '1';
                 }
             } else if (node.isConnected) {
+                node.collapsable.setExpanded(true);
+            } else {
+                node.dataset.btAutoExpand = '1';
+            }
+        }
+        if (msg.expand_full && node.collapsable) {
+            if (node.isConnected) {
+                if (!node.collapsable.loaded) {
+                    node.collapsable.loaded = true;
+                    this.comm.notify({
+                        type: 'tool.render',
+                        id: msg.id
+                    });
+                }
                 node.collapsable.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
@@ -1425,24 +1474,15 @@ class BonitoChat {
             });
             headerEl.insertBefore(sb, headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
-        if (msg.code && stillLive && headerEl && !node.querySelector('.bt-eval-preview')) {
-            const pv = document.createElement('div');
-            pv.className = 'bt-eval-preview';
-            const pre = document.createElement('pre');
-            pre.textContent = msg.code;
-            const tg = document.createElement('button');
-            tg.type = 'button';
-            tg.className = 'bt-eval-preview-toggle';
-            tg.title = 'Enlarge';
-            tg.textContent = '⌄';
-            tg.addEventListener('click', (e)=>{
-                e.stopPropagation();
-                const full = pv.classList.toggle('bt-eval-preview-full');
-                tg.textContent = full ? '⌃' : '⌄';
-                tg.title = full ? 'Collapse' : 'Enlarge';
-            });
-            pv.append(pre, tg);
-            headerEl.insertAdjacentElement('afterend', pv);
+        if (msg.stream_tail != null && stillLive && headerEl) {
+            let sp = node.querySelector('.bt-eval-stream');
+            if (!sp) {
+                sp = document.createElement('pre');
+                sp.className = 'bt-eval-stream';
+                headerEl.insertAdjacentElement('afterend', sp);
+            }
+            sp.textContent = msg.stream_tail;
+            sp.scrollTop = sp.scrollHeight;
         }
         if (msg.editable && msg.edit_path && headerEl) {
             const t = headerEl.querySelector('.bt-tool-title');
@@ -1629,12 +1669,14 @@ class BonitoChat {
                     const liveTool = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
                     if (liveTool) div.classList.add('bt-tool-live');
                     const id = msg.id;
-                    const isEdit = msg.kind === 'edit';
+                    const compactBody = msg.kind === 'edit' || msg.compact_body === true;
+                    if (msg.compact_body === true) div.dataset.compactBody = '1';
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
-                        editMode: isEdit,
-                        fetchEachExpand: !isEdit,
-                        discardOnCollapse: !isEdit,
+                        editMode: compactBody,
+                        compactHeight: msg.compact_body === true ? 110 : undefined,
+                        fetchEachExpand: !compactBody,
+                        discardOnCollapse: !compactBody,
                         onExpand: ()=>this.comm.notify({
                                 type: 'tool.render',
                                 id
@@ -1666,15 +1708,6 @@ class BonitoChat {
                             type: 'stop_tool',
                             id
                         });
-                    });
-                    const pvToggle = div.querySelector('.bt-eval-preview-toggle');
-                    if (pvToggle) pvToggle.addEventListener('click', (e)=>{
-                        e.stopPropagation();
-                        const pv = div.querySelector('.bt-eval-preview');
-                        if (!pv) return;
-                        const full = pv.classList.toggle('bt-eval-preview-full');
-                        pvToggle.textContent = full ? '⌃' : '⌄';
-                        pvToggle.title = full ? 'Collapse' : 'Enlarge';
                     });
                     if (msg.show_mime) div.dataset.showMime = msg.show_mime;
                     if (this._wantsNative(div)) {
@@ -1752,13 +1785,7 @@ class BonitoChat {
         const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini" type="button"
                      title="Stop"></button>` : '';
         const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
-        const live = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
-        const evalPreview = msg.code && live ? `
-            <div class="bt-eval-preview">
-                <pre>${escapeHTML(msg.code)}</pre>
-                <button class="bt-eval-preview-toggle" type="button"
-                        title="Enlarge">⌄</button>
-            </div>` : '';
+        !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
         const cmdPreview = msg.command ? `
             <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
         return `
@@ -1777,7 +1804,7 @@ class BonitoChat {
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}${cmdPreview}
+            ${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
     onPlanUpdate(msg) {

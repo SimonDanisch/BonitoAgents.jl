@@ -1385,15 +1385,41 @@ class BonitoChat {
         while (vi < this.totalCount &&
                (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0)) vi++;
         if (vi >= this.totalCount) return null;
-        // When THAT row is rendered, its DOM offset is ground truth (immune to
-        // the height estimates unrendered rows above carry). Otherwise anchor
-        // it virtually — previously-rendered rows keep their measured heights,
-        // so cumHeight is exact for them and only never-rendered rows
-        // contribute estimate error; the sticky re-pins converge as the
-        // re-window materializes the row.
-        const n = this.rendered.has(vi) ? this.cache.get(vi) : null;
-        if (n && n.isConnected && n.style.display !== 'none') {
-            return { idx: vi, off: n.offsetTop - st, dom: true };
+        // Two candidates, because both sources can lie in different ways:
+        //  * vi (above) — the first survivor in VIRTUAL order. The right row
+        //    inside a rendered HOLE (previously-rendered rows keep measured
+        //    heights), but `indexAt` runs on height ESTIMATES, which drift
+        //    under load and can land one row too far DOWN.
+        //  * di — the first RENDERED, visible survivor whose REAL bottom
+        //    hangs below the viewport top. Ground truth where it exists, but
+        //    blind to evicted rows: on a SHOW toggle the true first survivor
+        //    may not be rendered, and di would sit BELOW re-appearing rows.
+        // Rule: a DOM candidate at/above the virtual pick means the virtual
+        // pick was estimate-drifted — trust the DOM. All rendered survivors
+        // BELOW vi means vi is in a hole — anchor it virtually; the sticky
+        // re-pins converge as the re-window materializes it.
+        // A row whose last couple of pixels hang into the viewport is NOT the
+        // reading position — anchoring such a sliver (observed: a row at
+        // st-41 with 3px overhang) pins the view one row above what the user
+        // sees, and the sliver's own reflow arithmetic then drifts the view
+        // by a full row. Same 4px tolerance the top-marker probes use.
+        const OVERHANG = 4;
+        let di = -1, doff = 0;
+        for (const i of [...this.rendered].sort((a, b) => a - b)) {
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (this.keyByIdx.get(i) === excludeKey) continue;
+            if (n.offsetTop + n.offsetHeight > st + OVERHANG) {
+                di = i; doff = n.offsetTop - st;
+                break;
+            }
+        }
+        // Stash the decision for post-mortems (the filter_scroll e2e dumps it
+        // on failure): a tiny overwritten object, no rolling log.
+        this._anchorDebug = { st, vi, di, doff,
+                              pickedDom: di >= 0 && di <= vi };
+        if (di >= 0 && di <= vi) {
+            return { idx: di, off: doff, dom: true };
         }
         return { idx: vi, dom: false,
                  off: this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, vi) - st };
@@ -2053,9 +2079,19 @@ class BonitoChat {
             // class. Terminal status sheds it; mid-flight gets it.
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
-            // The live code preview's job ends with the eval — the completed
-            // body renders the same code as its Monaco "Code" section.
-            if (!live) node.querySelector('.bt-eval-preview')?.remove();
+            // The live stdout tail's job ends with the eval — the completed
+            // body renders the full output in its "Output" section.
+            if (!live) {
+                node.querySelector('.bt-eval-stream')?.remove();
+                // Compact-body evals mount their body DURING the run (Code
+                // only — no output/result exists yet) and editMode never
+                // re-fetches on expand, so the completed content would stay
+                // stale forever. Re-render once at terminal status.
+                if (node.dataset.compactBody === '1' && node.collapsable &&
+                    node.collapsable.loaded && node.isConnected) {
+                    this.comm.notify({ type: 'tool.render', id: msg.id });
+                }
+            }
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -2091,6 +2127,18 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
+        // Eval compact-body mode can arrive LATE (claude streams tool input;
+        // the typed extras ride a later update). Flip the Collapsable into
+        // editMode BEFORE the expand handling below so the eager-mount takes
+        // the compact path.
+        if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
+            const c = node.collapsable;
+            c.editMode = true;
+            c.compactHeight = 110;
+            c.fetchEachExpand = false;
+            c.discardOnCollapse = false;
+            node.dataset.compactBody = '1';
+        }
         // bt_show: the completion update is when we learn it's a "show me
         // this" tool (and its mime). Native-media mode takes precedence:
         // chrome off + body mounted; otherwise auto-expand the pill
@@ -2116,6 +2164,21 @@ class BonitoChat {
                     node.dataset.btAutoMount = '1';
                 }
             } else if (node.isConnected) {
+                node.collapsable.setExpanded(true);
+            } else {
+                node.dataset.btAutoExpand = '1';
+            }
+        }
+        // FULL uncollapse (server-typed, e.g. a completed eval whose result is
+        // non-empty): mount if needed, then actually flip expanded — unlike
+        // `expand`, which in compact-body mode only eager-mounts at compact
+        // height.
+        if (msg.expand_full && node.collapsable) {
+            if (node.isConnected) {
+                if (!node.collapsable.loaded) {
+                    node.collapsable.loaded = true;
+                    this.comm.notify({ type: 'tool.render', id: msg.id });
+                }
                 node.collapsable.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
@@ -2149,24 +2212,19 @@ class BonitoChat {
             headerEl.insertBefore(sb,
                 headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
-        if (msg.code && stillLive && headerEl && !node.querySelector('.bt-eval-preview')) {
-            const pv = document.createElement('div');
-            pv.className = 'bt-eval-preview';
-            const pre = document.createElement('pre');
-            pre.textContent = msg.code;
-            const tg = document.createElement('button');
-            tg.type = 'button';
-            tg.className = 'bt-eval-preview-toggle';
-            tg.title = 'Enlarge';
-            tg.textContent = '⌄';
-            tg.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const full = pv.classList.toggle('bt-eval-preview-full');
-                tg.textContent = full ? '⌃' : '⌄';
-                tg.title = full ? 'Collapse' : 'Enlarge';
-            });
-            pv.append(pre, tg);
-            headerEl.insertAdjacentElement('afterend', pv);
+        // Live stdout tail of a RUNNING eval: a small auto-scrolled pane
+        // under the header, fed by `stream_tail` updates (the server tails
+        // the eval session's log). Removed at terminal status — the full
+        // output then lives in the body's "Output" section.
+        if (msg.stream_tail != null && stillLive && headerEl) {
+            let sp = node.querySelector('.bt-eval-stream');
+            if (!sp) {
+                sp = document.createElement('pre');
+                sp.className = 'bt-eval-stream';
+                headerEl.insertAdjacentElement('afterend', sp);
+            }
+            sp.textContent = msg.stream_tail;
+            sp.scrollTop = sp.scrollHeight;   // always show the newest lines
         }
         // The file path usually arrives with a later update (the initial
         // header has no arguments/content yet) — turn the title into a
@@ -2458,13 +2516,19 @@ class BonitoChat {
                 // header eagerly (no click required). The Collapsable's
                 // editMode keeps the body mounted across collapse — toggle
                 // just calls Monaco.setMaxHeight to swap compact↔full.
-                const isEdit = msg.kind === 'edit';
+                // Eval tools opt into the same compact-body mode via
+                // `compact_body` (server-typed): the body — whose first
+                // section is the full Monaco Code editor — stays mounted and
+                // collapse is a HEIGHT cap of ~4 code lines.
+                const compactBody = msg.kind === 'edit' || msg.compact_body === true;
+                if (msg.compact_body === true) div.dataset.compactBody = '1';
                 div.collapsable = new Collapsable(
                     div.querySelector('.bt-tool-header'),
                     div.querySelector('.bt-tool-body'),
                     { toggleEl: div.querySelector('.bt-tool-toggle'),
-                      editMode: isEdit,
-                      fetchEachExpand: !isEdit, discardOnCollapse: !isEdit,
+                      editMode: compactBody,
+                      compactHeight: msg.compact_body === true ? 110 : undefined,
+                      fetchEachExpand: !compactBody, discardOnCollapse: !compactBody,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
                 // Subagent Task: rebuild the live activity feed from the
                 // header's snapshot (live growth rides task_activity events).
@@ -2503,17 +2567,6 @@ class BonitoChat {
                 if (stopBtn2) stopBtn2.addEventListener('click', (e) => {
                     e.stopPropagation();
                     this.comm.notify({ type: 'stop_tool', id });
-                });
-                // Live code preview enlarge/collapse — same small-preview →
-                // grow interaction as the diff view, no re-fetch.
-                const pvToggle = div.querySelector('.bt-eval-preview-toggle');
-                if (pvToggle) pvToggle.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const pv = div.querySelector('.bt-eval-preview');
-                    if (!pv) return;
-                    const full = pv.classList.toggle('bt-eval-preview-full');
-                    pvToggle.textContent = full ? '⌃' : '⌄';
-                    pvToggle.title = full ? 'Collapse' : 'Enlarge';
                 });
                 // The show's mime (bt_show results) — the native-media
                 // toggles key on it.
@@ -2643,12 +2696,9 @@ class BonitoChat {
             ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
         const live = !(msg.status === 'completed' || msg.status === 'failed') &&
                      msg.finished_at == null;
-        const evalPreview = (msg.code && live) ? `
-            <div class="bt-eval-preview">
-                <pre>${escapeHTML(msg.code)}</pre>
-                <button class="bt-eval-preview-toggle" type="button"
-                        title="Enlarge">⌄</button>
-            </div>` : '';
+        // (The old <pre> eval code preview is gone: eval cards mount their
+        // BODY compactly instead — the real Monaco Code editor capped at ~4
+        // lines via Collapsable compact-body mode, see `msg.compact_body`.)
         // "What ran", ALWAYS visible (persists past completion — there's no Monaco
         // "Code" section afterwards) and never hidden in a tooltip: the bash command,
         // OR a control MCP tool's action (interrupt/restart/list its target session).
@@ -2682,7 +2732,7 @@ class BonitoChat {
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}${cmdPreview}
+            ${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
 

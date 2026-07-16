@@ -3,7 +3,7 @@
 # arguments (`rawInput`) usually arrive on a `tool_call_update` AFTER the
 # initial `tool_call`. The DOM must grow the late affordances:
 #
-#   • bt_julia_eval: the live code preview (.bt-eval-preview), the ⏱ timeout
+#   • bt_julia_eval: the compact Monaco body eager-mount, the ⏱ timeout
 #     badge (.bt-tool-timeout) and the ⊗ stop button (.bt-tool-stop) appear on
 #     the in-flight UPDATE (the opening header carried an EMPTY rawInput), the
 #     pill stays live (.bt-tool-live) while it runs, and the preview is removed
@@ -34,7 +34,7 @@
     s.agent_fn[] = function (_prompt)
         return [
             # ── eval: announce with EMPTY rawInput, then stream the args while
-            #    running (code preview + ⏱ + ⊗ must appear on THIS update),
+            #    running (compact body + ⏱ + ⊗ must appear on THIS update),
             #    hold it live, then complete (preview must be removed). ──
             TK.tool(kind = "other", title = EVALNAME, tool_name = EVALNAME,
                     id = "ev1", open_status = "pending", complete = false,
@@ -73,16 +73,20 @@
     # The .bt-tool-msg card that owns the body for `id` (the pill node).
     card(id)      = "[...document.querySelectorAll('.bt-tool-msg')].find(m => m.querySelector('.bt-tool-body[data-tool-id=\"$(id)\"]'))"
 
-    @testset "bt_julia_eval: code preview + ⏱ + ⊗ stream in on the args update" begin
+    @testset "bt_julia_eval: compact body + ⏱ + ⊗ stream in on the args update" begin
         # The eval pill arrives (the tool title carries the bare tool name).
         @test TK.wait_for(s, "eval pill arrives",
             "[...document.querySelectorAll('.bt-tool-title')].some(t => (t.innerText||'').indexOf('bt_julia_eval') !== -1)";
             timeout = 30) == true
 
-        # The args update inserts the live code preview WHILE running.
-        @test TK.wait_for(s, "live code preview appears on the args update",
-            "(() => { const pv = document.querySelector('.bt-eval-preview pre'); " *
-            "return pv && pv.innerText.indexOf('sleep(2)') !== -1; })()";
+        # The args update eager-mounts the COMPACT body WHILE running — the
+        # "preview" is the real Monaco Code editor (height-capped by the
+        # Collapsable's compact-body mode), not a separate element.
+        @test TK.wait_for(s, "compact Monaco body mounts on the args update",
+            "(() => { const n = $(card("ev1")); " *
+            "const b = n && n.querySelector('.bt-eval-body'); " *
+            "return !!b && (b.innerText || '').indexOf('sleep(2)') !== -1 && " *
+            "n.querySelector('.bt-tool-header')?.dataset.expanded === 'false'; })()";
             timeout = 15) == true
 
         # The ⏱ timeout badge inserted late (60s from rawInput.timeout).
@@ -124,20 +128,17 @@
             timeout = 10) == true
     end
 
-    @testset "streamed rawInput resolves: eval completes and the preview is removed" begin
-        # On completion the live preview's job ends (the completed body renders
-        # the code as its Monaco Code section instead) and the pill sheds live.
-        @test TK.wait_for(s, "preview removed on completion",
+    @testset "streamed rawInput resolves: eval completes, auto-expands with the result" begin
+        # On completion: the stream pane (if any) is gone, and a non-nothing
+        # result AUTO-EXPANDS the body (`expand_full`) — the result must be
+        # visible WITHOUT any click.
+        @test TK.wait_for(s, "completed + auto-expanded, no stream pane",
             "(() => { const n = $(card("ev1")); " *
             "const st = n && n.querySelector('.bt-tool-status'); " *
             "return !!st && st.textContent === 'completed' && " *
-            "document.querySelector('.bt-eval-preview') === null; })()";
+            "n.querySelector('.bt-eval-stream') === null && " *
+            "n.querySelector('.bt-tool-header')?.dataset.expanded === 'true'; })()";
             timeout = 20) == true
-        # And the completed eval body carries the result (expand it first — the
-        # eval body is click-to-open).
-        TK.eval_js(s, "(() => { const n = $(card("ev1")); " *
-            "const h = n && n.querySelector('.bt-tool-header'); " *
-            "if (h && h.dataset.expanded === 'false') h.click(); return true; })()")
         @test TK.wait_for(s, "eval result rendered in body",
             "(($(body("ev1")) || {}).textContent || '').indexOf('42') !== -1";
             timeout = 15) == true

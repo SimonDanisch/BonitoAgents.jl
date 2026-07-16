@@ -486,6 +486,27 @@ function run_dispatcher_prompt(prompt_id)
                 "_meta" => meta))
             upd("tool_call_update", Dict{String,Any}(
                 "toolCallId" => tid, "status" => "completed", "_meta" => meta))
+        elseif et == "bt_eval_open"
+            # The dispatcher announces the eval BEFORE running it (mirrors real
+            # claude: the tool opens, args stream in, and in_progress lasts as
+            # long as the MCP call). `bt_eval_result` below arrives when the
+            # eval finishes and carries `opened => true` so the open frames
+            # aren't repeated.
+            tid = String(ev["tool_id"])
+            code = String(get(ev, "code", ""))
+            raw_input = Dict{String,Any}("code" => code)
+            ev["env_path"] === nothing || (raw_input["env_path"] = String(ev["env_path"]))
+            toolname = "mcp__btworker__bt_julia_eval"
+            meta = Dict("claudeCode" => Dict("toolName" => toolname))
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "other",
+                "title" => toolname, "status" => "pending",
+                "rawInput" => Dict{String,Any}(), "content" => Any[],
+                "_meta" => meta))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid, "status" => "in_progress",
+                "rawInput" => raw_input, "title" => toolname, "kind" => "other",
+                "_meta" => meta))
         elseif et == "bt_eval_result"
             # MCP returned its content blocks; wrap each in ACP's `type:"content"`
             # envelope (TextContent/ImageContent expect that shape). The chat
@@ -507,15 +528,17 @@ function run_dispatcher_prompt(prompt_id)
             # finalize paths a real user exercises.
             toolname = "mcp__btworker__bt_julia_eval"
             meta = Dict("claudeCode" => Dict("toolName" => toolname))
-            upd("tool_call", Dict{String,Any}(
-                "toolCallId" => tid, "kind" => "other",
-                "title" => toolname, "status" => "pending",
-                "rawInput" => Dict{String,Any}(), "content" => Any[],
-                "_meta" => meta))
-            upd("tool_call_update", Dict{String,Any}(
-                "toolCallId" => tid, "status" => "in_progress",
-                "rawInput" => raw_input, "title" => toolname, "kind" => "other",
-                "_meta" => meta))
+            if !Bool(get(ev, "opened", false))
+                upd("tool_call", Dict{String,Any}(
+                    "toolCallId" => tid, "kind" => "other",
+                    "title" => toolname, "status" => "pending",
+                    "rawInput" => Dict{String,Any}(), "content" => Any[],
+                    "_meta" => meta))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => "in_progress",
+                    "rawInput" => raw_input, "title" => toolname, "kind" => "other",
+                    "_meta" => meta))
+            end
             packed = Any[]
             for c in get(ev, "content", Any[])
                 push!(packed, Dict{String,Any}("type" => "content", "content" => c))

@@ -467,6 +467,17 @@ function invoke_bt_eval(client, ev::AbstractDict)
     haskey(ev, "max_response_bytes") && (args["max_response_bytes"] = ev["max_response_bytes"])
     haskey(ev, "full_output") && (args["full_output"] = ev["full_output"])
 
+    tool_id = String(get(ev, "id", "te_$(rand(UInt32))"))
+    # Real claude opens the tool bubble BEFORE the MCP call runs (pending ->
+    # in_progress with streamed rawInput), so the in_progress phase lasts as
+    # long as the eval - that's what the chat's live affordances (compact code
+    # preview, stdout stream tail, stop button) key on. Announce first, run after.
+    open_ev = Dict{String,Any}(
+        "type" => "bt_eval_open", "tool_id" => tool_id,
+        "code" => String(get(ev, "code", "")),
+        "env_path" => get(ev, "env_path", nothing))
+    println(client, JSON.json(open_ev)); flush(client)
+
     ctx = SERVER_CONTEXT[]
     runner() = BonitoMCP.julia_eval_handler(args)
     result = try
@@ -484,11 +495,12 @@ function invoke_bt_eval(client, ev::AbstractDict)
 
     out = Dict{String,Any}(
         "type"     => "bt_eval_result",
-        "tool_id"  => String(get(ev, "id", "te_$(rand(UInt32))")),
+        "tool_id"  => tool_id,
         "code"     => String(get(ev, "code", "")),
         "env_path" => get(ev, "env_path", nothing),
         "content"  => get(result, "content", Any[]),
         "is_error" => Bool(get(result, "isError", false)),
+        "opened"   => true,   # bt_eval_open already emitted pending/in_progress
     )
     println(client, JSON.json(out)); flush(client)
 end

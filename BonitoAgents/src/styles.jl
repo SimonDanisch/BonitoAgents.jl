@@ -1023,52 +1023,24 @@ const ChatStyles = Bonito.Styles(
     # The Monaco wrapper chain must pass full height down to the editor div.
     CSS(".bt-file-editor-body > div, .bt-file-editor-body .monaco-editor-div",
         "height" => "100%", "min-height" => "0"),
-    # Live code preview: the code a running bt_julia_eval is executing,
-    # painted under the header BEFORE any result exists. Compact by default
-    # (capped height + bottom fade), the ⌄ toggle grows it — same
-    # small-preview → enlarge interaction as the diff view. Removed when the
-    # eval completes (the body's Monaco "Code" section takes over).
-    CSS(".bt-eval-preview",
-        "position" => "relative",
+    # Live stdout tail of a RUNNING bt_julia_eval: a small terminal-style
+    # pane under the header (~4 lines, auto-scrolled to the newest output by
+    # the client). Removed when the eval completes — the body's "Output"
+    # section carries the full (ANSI-colored) output afterwards. The code
+    # "preview" is no longer a separate element: the eval body eager-mounts
+    # compactly (Collapsable compact-body mode), so the real Monaco Code
+    # editor is what shows at ~4 lines.
+    CSS(".bt-eval-stream",
+        "margin" => "0",
         "border-top" => "1px solid var(--bt-border)",
         "background" => "#0f172a",
-        "max-height" => "132px",
-        "overflow" => "hidden"),
-    CSS(".bt-eval-preview pre",
-        "margin" => "0",
-        "padding" => "8px 12px",
+        "color" => "#e2e8f0",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
         "font-size" => "12px", "line-height" => "1.5",
-        "color" => "#e2e8f0",
+        "padding" => "6px 12px",
+        "max-height" => "78px",           # ≈ 4 lines at 12px/1.5
+        "overflow-y" => "auto",
         "white-space" => "pre-wrap", "word-break" => "break-word"),
-    # Bottom fade hints that the preview is clipped; gone when enlarged.
-    CSS(".bt-eval-preview::after",
-        "content" => "\"\"",
-        "position" => "absolute",
-        "left" => "0", "right" => "0", "bottom" => "0",
-        "height" => "28px",
-        "pointer-events" => "none",
-        "background" => "linear-gradient(to bottom, rgba(15,23,42,0), rgba(15,23,42,0.92))"),
-    CSS(".bt-eval-preview.bt-eval-preview-full",
-        "max-height" => "600px",
-        "overflow-y" => "auto"),
-    CSS(".bt-eval-preview.bt-eval-preview-full::after",
-        "display" => "none"),
-    CSS(".bt-eval-preview-toggle",
-        "position" => "absolute",
-        "right" => "6px", "bottom" => "4px",
-        "z-index" => "2",
-        "background" => "rgba(255,255,255,0.08)",
-        "border" => "1px solid rgba(255,255,255,0.15)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "color" => "#e2e8f0",
-        "font-size" => "12px", "line-height" => "1",
-        "padding" => "2px 8px",
-        "cursor" => "pointer",
-        "user-select" => "none",
-        "transition" => "background 80ms"),
-    CSS(".bt-eval-preview-toggle:hover",
-        "background" => "rgba(255,255,255,0.18)"),
 
     # The command a Bash tool ran — ALWAYS visible (unlike the eval preview there
     # is no Monaco "Code" section afterwards to fall back on), same dark code look,

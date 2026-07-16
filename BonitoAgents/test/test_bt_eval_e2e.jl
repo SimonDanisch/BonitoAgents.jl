@@ -106,6 +106,71 @@ end
     end
 end
 
+# The live-display triple for a RUNNING eval: (1) the body eager-mounts in
+# COMPACT mode while the code runs — the real Monaco "Code" editor capped at
+# ~4 lines is the preview; (2) stdout streams into a small auto-scrolled tail
+# pane under the header; (3) a completed eval that RETURNED a value (non-
+# nothing) auto-expands the body so the result is visible without a click
+# (and the stream pane is gone — the Output section owns the text now).
+@testset "bt_eval e2e — live display: compact Monaco, stdout stream tail, auto-expand on result" begin
+    project = fresh_project("stream")
+    code = """
+    for i in 1:12
+        println("STREAMLINE ", i)
+        sleep(0.4)
+    end
+    1234321
+    """
+    s = TK.dev_server(; agent = msg -> [
+        text("streaming eval"),
+        bt_eval(code; env_path = project, id = "ts-1"),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 900)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        sleep(1)
+        TK.send_message(s, "stream please")
+        card = ".bt-tool-msg[data-msg-id*=\"ts-1\"]"
+
+        # (1) While running: the body is MOUNTED without any click (compact
+        # eager-mount) and the tool is still in_progress.
+        @test TK.wait_for(s, "compact body mounted while running",
+            """(() => { const c = document.querySelector('$card');
+                return !!(c && c.querySelector('.bt-eval-body') &&
+                    c.querySelector('.bt-tool-status')?.textContent === 'in_progress'); })()""";
+            timeout = 120) == true
+
+        # (2) The stdout tail pane appears and follows the newest output
+        # (later STREAMLINE lines show up; the pane stays pinned to the end).
+        @test TK.wait_for(s, "stream tail shows output",
+            """(() => { const p = document.querySelector('$card .bt-eval-stream');
+                return !!(p && p.textContent.includes('STREAMLINE')); })()""";
+            timeout = 60) == true
+        @test TK.wait_for(s, "stream tail advances to late lines",
+            """(() => { const p = document.querySelector('$card .bt-eval-stream');
+                return !!(p && /STREAMLINE (8|9|10|11|12)/.test(p.textContent) &&
+                          p.scrollTop + p.clientHeight >= p.scrollHeight - 4); })()""";
+            timeout = 60) == true
+
+        # (3) Completion with a non-nothing result: auto-expanded body, the
+        # result visible, the stream pane gone.
+        @test TK.wait_for(s, "completed + auto-expanded + result visible",
+            """(() => { const c = document.querySelector('$card');
+                if (!c) return false;
+                const done = c.querySelector('.bt-tool-status')?.textContent === 'completed';
+                const open = c.querySelector('.bt-tool-header')?.dataset.expanded === 'true';
+                const res  = c.querySelector('.bt-embed')?.innerText.includes('1234321');
+                return !!(done && open && res); })()"""; timeout = 60) == true
+        @test TK.eval_js(s, "!document.querySelector('$card .bt-eval-stream')") == true
+
+        TK.screenshot(s, shot("bt_eval-stream.png"))
+    finally
+        close(s)
+    end
+end
+
 @testset "bt_eval e2e — env_path isolation: two projects, separate sessions" begin
     # Two independent tmp projects. Run `Base.active_project()` in each
     # via bt_eval. The output for each must point at its OWN tmp project,

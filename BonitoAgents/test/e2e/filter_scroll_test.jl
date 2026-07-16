@@ -68,22 +68,46 @@
     before = TK.eval_js(s, MARKER)
     @test before !== nothing && before["mk"] > 0
 
+    # Toggle + pre-probe ATOMICALLY (one synchronous JS execution): the
+    # invariant is "the toggle preserves the view AS OF THE TOGGLE INSTANT".
+    # Under full-suite load a late ResizeObserver re-measure can still shift
+    # the transcript by one row BETWEEN a Julia-side probe and the toggle —
+    # that drift is settle noise, not a toggle jump, and comparing against a
+    # stale probe was exactly the recurring one-row (~53px) soak flake.
+    TOGGLE(hidden) = """(() => {
+        const probe = $MARKER;
+        const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
+        c.__bt_chat.setKeyHidden('tool:read', $hidden);
+        return probe;
+    })()"""
+    # On failure, the anchor's own capture decision tells WHICH row it pinned.
+    ANCHOR_DEBUG = "JSON.stringify(($CH)._anchorDebug ?? null)"
+
     @testset "hiding a type holds the top marker" begin
-        TK.eval_js(s, "(() => { ($CH).setKeyHidden('tool:read', true); })()")
+        pre = TK.eval_js(s, TOGGLE(true))
+        # Settle drift between the reference probe and the toggle is worth
+        # SEEING when diagnosing (it was the historical flake), but it is not
+        # a failure of the toggle itself.
+        pre["mk"] == before["mk"] && pre["off"] == before["off"] ||
+            @info "filter_scroll: geometry drifted between probe and toggle (settle noise)" before pre
         sleep(0.6)
         hid = TK.eval_js(s, MARKER)
         @test hid !== nothing
-        @test hid["mk"] == before["mk"]                       # same marker → view held
-        @test abs(Int(hid["off"]) - Int(before["off"])) <= 4  # same screen position
+        ok = hid["mk"] == pre["mk"] && abs(Int(hid["off"]) - Int(pre["off"])) <= 4
+        ok || @info "filter_scroll hide FAILED" pre hid anchor = TK.eval_js(s, ANCHOR_DEBUG)
+        @test hid["mk"] == pre["mk"]                       # same marker → view held
+        @test abs(Int(hid["off"]) - Int(pre["off"])) <= 4  # same screen position
     end
 
     @testset "showing it again holds the top marker" begin
-        TK.eval_js(s, "(() => { ($CH).setKeyHidden('tool:read', false); })()")
+        pre = TK.eval_js(s, TOGGLE(false))
         sleep(0.6)
         shown = TK.eval_js(s, MARKER)
         @test shown !== nothing
-        @test shown["mk"] == before["mk"]
-        @test abs(Int(shown["off"]) - Int(before["off"])) <= 6
+        ok = shown["mk"] == pre["mk"] && abs(Int(shown["off"]) - Int(pre["off"])) <= 6
+        ok || @info "filter_scroll show FAILED" pre shown anchor = TK.eval_js(s, ANCHOR_DEBUG)
+        @test shown["mk"] == pre["mk"]
+        @test abs(Int(shown["off"]) - Int(pre["off"])) <= 6
     end
 
     @test isempty(TK.js_errors(s))

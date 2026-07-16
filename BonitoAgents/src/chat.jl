@@ -677,9 +677,15 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     code::String                  # the code being executed (live preview + Code section)
     env_path::String              # project env; "" ⇒ ephemeral temp session
     timeout::Union{Float64,Nothing}   # soft checkpoint cadence; nothing ⇒ default
+    # Live stdout tail while the eval runs (`eval_stream_loop!` tails the
+    # session's on-disk log on the worker): read cursor, rolling text window,
+    # and the poller task (nothing until the eval turns in_progress).
+    stream_offset::Int
+    stream_text::String
+    stream_task::Union{Task,Nothing}
 end
 JuliaEvalToolMsg(message::Message, server) =
-    JuliaEvalToolMsg(message, server, "", "", nothing)
+    JuliaEvalToolMsg(message, server, "", "", nothing, 0, "", nothing)
 
 mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     message::Message
@@ -687,9 +693,12 @@ mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     code::String                  # continue carries none — stays "" (shared render path)
     env_path::String
     timeout::Union{Float64,Nothing}
+    stream_offset::Int
+    stream_text::String
+    stream_task::Union{Task,Nothing}
 end
 JuliaContinueToolMsg(message::Message, server) =
-    JuliaContinueToolMsg(message, server, "", "", nothing)
+    JuliaContinueToolMsg(message, server, "", "", nothing, 0, "", nothing)
 
 mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
     message::Message
@@ -1359,6 +1368,10 @@ function eval_extras!(d::Dict, m::JuliaEvalCall)
     isempty(m.code) || (d["code"] = m.code)       # `continue` has none — that's fine
     d["timeout_s"] = eval_timeout_label(m)
     d["stoppable"] = true                         # a JuliaEvalCall holds an eval in flight
+    # The client builds the eval card's Collapsable in compact-body mode (the
+    # edit-tool mechanism): the body stays mounted, collapse is a HEIGHT cap
+    # (~4 code lines) — so the "preview" is the real Monaco Code editor.
+    d["compact_body"] = true
     return d
 end
 
@@ -1790,13 +1803,14 @@ Bonito.jsrender(session::Bonito.Session, m::ToolMsg) =
         Bonito.jsrender(session, render_tool_body(tool_chat(m).state, m, tool_chat(m).cwd,
             tool_chat(m).chat_dir; project_id = tool_chat(m).project_id))
 
-# The typed eval body: Code / Output / live Result. The worker rendered the
-# result VALUE to ONE self-contained HTML fragment (`RemoteProxy.render_eval_html`)
-# shipped as the FINAL content block — `EvalResultPlaceholder` mounts it live
-# over the eval bridge (assets/observables proxy to the worker; interaction
-# round-trips). Everything between the code echo and the result block is
-# console output. No content sniffing: position + the TYPE carry it all. The
-# pill summary carries the env; the code lives in the Code section.
+# The typed eval body: Code / Output / live Result. The worker PARKS the
+# result value in a holder session (`RemoteProxy.remote_ref`); the FINAL
+# content block is its descriptor, and `RemoteRef`'s jsrender mounts it
+# serialize-on-mount over the eval bridge (assets/observables proxy to the
+# worker; interaction round-trips). Everything between the code echo and the
+# result block is console output. No content sniffing: position + the TYPE
+# carry it all. The pill summary carries the env; the code lives in the Code
+# section.
 function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     chat = tool_chat(m)
     chat === nothing && return Bonito.jsrender(session,
@@ -1811,13 +1825,13 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     isempty(console) || push!(sections,
         tool_subsection("Output", DOM.div((render_text_block(c.text) for c in console)...)))
     if completed
-        result = content[end]
-        html   = result isa AgentClientProtocol.TextContent ? result.text : ""
+        result  = content[end]
+        payload = result isa AgentClientProtocol.TextContent ? result.text : ""
         # Empty result (a `nothing`-returning eval — e.g. `Pkg.status(); nothing`):
         # the result block is intentionally empty so the invariant holds (stdout
         # stays in Output above); don't mount an empty "(no result)" box.
-        isempty(html) || push!(sections,
-            wrap_for_detach(tool_id(m), eval_result_placeholder(chat.state, html, chat.project_id)))
+        isempty(payload) || push!(sections,
+            wrap_for_detach(tool_id(m), remote_result(chat.state, payload, chat.project_id)))
     end
     return Bonito.jsrender(session, DOM.div(sections...; class = "bt-eval-body"))
 end
@@ -3055,6 +3069,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
                 "status" => tool_status(b), "title" => pt0, "summary" => tool_summary(b))
             (auto_expand_body(b, m.content) || has_show_reference(m.content)) &&
                 (d0["expand"] = true)
+            auto_expand_full(b, m.content) && (d0["expand_full"] = true)
             mime0 = tool_media_mime(m.content)
             mime0 === nothing || (d0["show_mime"] = mime0)
             hd0 = Dict{String,Any}("kind" => tool_kind(b), "title" => pt0)
@@ -3114,6 +3129,9 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             # presence — no content sniffing inline here.
             (auto_expand_body(b, snap.content) || has_show_reference(snap.content)) &&
                 (d["expand"] = true)
+            auto_expand_full(b, snap.content) && (d["expand_full"] = true)
+            # A running eval starts its live stdout tail (idempotent).
+            b isa JuliaEvalCall && h.status == "in_progress" && start_eval_stream!(b)
             # Displayable media (bt_show mime, or inline image content from
             # e.g. Read on a PNG) — the client's Native Images mode keys on
             # this; ship it with the update that carries the result.
@@ -3154,6 +3172,24 @@ end
 #   • Everything else stays click-to-expand.
 auto_expand_body(::ToolMsg, snap_content) = false
 auto_expand_body(::EditToolMsg, snap_content) = any(c -> c isa DiffContent, snap_content)
+# Eval: eager-mount the compact body while the code RUNS (the body's first
+# section is the full Monaco Code editor, height-capped by the client's
+# compact mode — "the preview IS the editor, collapsed to ~4 lines"), and
+# again once completed with a result (paired with `auto_expand_full`).
+auto_expand_body(m::JuliaEvalCall, snap_content) =
+    tool_status(m) in ("pending", "in_progress") ? !isempty(m.code) :
+    auto_expand_full(m, snap_content)
+
+# FULL uncollapse (not just the compact eager-mount) — typed, default off.
+# Eval: a completed call whose final payload is non-empty returned != nothing;
+# the result should be visible without a click.
+auto_expand_full(::ToolMsg, snap_content) = false
+function auto_expand_full(m::JuliaEvalCall, snap_content)
+    tool_status(m) == "completed" || return false
+    isempty(snap_content) && return false
+    c = snap_content[end]
+    return c isa AgentClientProtocol.TextContent && !isempty(c.text)
+end
 # Two-arg fallback for tests / call sites that don't have the snap yet.
 auto_expand_body(b::ToolMsg) = auto_expand_body(b, Any[])
 
@@ -3346,6 +3382,68 @@ function write_bg_content!(chat_dir::AbstractString, m::BashToolMsg)
 end
 
 bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
+
+# ── Live stdout tail for a RUNNING bt_julia_eval ─────────────────────────────
+# The eval session tees its full stdout/stderr to a DETERMINISTIC on-disk log
+# on the worker machine (`BonitoMCP.eval_log_path(env_path)`); while the tool
+# is in_progress we tail it over the worker file protocol (same machinery as
+# bash background output) and ship the last lines to the client as
+# `stream_tail` updates — a ~4-line auto-scrolled pane under the header. The
+# first read seeks to the log's CURRENT end so only output of THIS eval shows.
+const EVAL_STREAM_POLL_S = 0.5
+const EVAL_STREAM_KEEP_CHARS = 8_000
+const EVAL_STREAM_TAIL_LINES = 12
+
+strip_ansi_codes(s::AbstractString) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
+
+function last_lines(s::AbstractString, n::Int)
+    ls = split(s, '\n'; keepempty = true)
+    return join(ls[max(1, end - n + 1):end], '\n')
+end
+
+function start_eval_stream!(m::JuliaEvalCall)
+    chat = tool_chat(m)
+    chat === nothing && return nothing
+    m.stream_task === nothing || return nothing
+    isempty(m.env_path) && return nothing
+    m.stream_task = Base.errormonitor(Threads.@spawn eval_stream_loop!(chat, m))
+    return nothing
+end
+
+function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
+    state = chat.state
+    wid = bg_worker_id(state, chat)
+    wid === nothing && return nothing
+    path = BonitoMCP.eval_log_path(m.env_path)
+    first_read = true
+    deadline = time() + 4 * 3600      # hard stop for a wedged status
+    while tool_status(m) in ("pending", "in_progress") && time() < deadline
+        r = try
+            tail_worker_file(state, wid, path;
+                offset = m.stream_offset, max_bytes = 4_000_000, timeout = 10.0)
+        catch e
+            @debug "eval stream tail failed (will retry)" id = tool_id(m) exception = e
+            sleep(EVAL_STREAM_POLL_S)
+            continue
+        end
+        if r.exists && r.offset > m.stream_offset
+            if first_read
+                # Seek past whatever earlier evals wrote — stream only THIS one.
+                m.stream_offset = r.offset
+            else
+                m.stream_offset = r.offset
+                m.stream_text = last(m.stream_text * strip_ansi_codes(r.chunk),
+                                     EVAL_STREAM_KEEP_CHARS)
+                chat_emit(chat, Dict{String,Any}(
+                    "type" => "tool_update", "id" => tool_id(m),
+                    "stream_tail" => last_lines(m.stream_text, EVAL_STREAM_TAIL_LINES)))
+            end
+        end
+        first_read = false
+        sleep(EVAL_STREAM_POLL_S)
+    end
+    return nothing
+end
 
 function stream_bg_update!(model::ChatModel, m::BashToolMsg)
     write_bg_content!(model.chat_dir, m)
@@ -5961,7 +6059,7 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     end
     msg === nothing && return nothing
     # Run the render OFF the comm task. `render_tool_body` for a live eval result
-    # mounts an `EvalResultPlaceholder` whose `jsrender` attaches the worker bridge
+    # mounts a `RemoteRef` whose `jsrender` attaches the worker bridge
     # host wiring (`attach_bridge_host!`) + may pull proxied assets over the dial-back
     # ws. If we ran it inline, that work would stop EVERY other chat event for this
     # tab (scroll fetches, sends, tab switches) until it returned — multiple stuck
