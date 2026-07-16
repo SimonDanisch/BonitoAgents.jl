@@ -359,6 +359,12 @@ bound_for_render(@nospecialize x) = x
 display_value(@nospecialize x) = x
 display_value(s::AbstractString) =
     Bonito.has_ansi_codes(String(s)) ? Bonito.RichText(String(s)) : s
+# Callables would be swallowed by `App`'s handler constructor (`App(sqrt)`
+# reads as "sqrt IS the app" and rejects its signature) — show them as the
+# REPL would instead. Matches `App`'s handler dispatch surface exactly
+# (functions AND types are callable).
+display_value(f::Union{Function, Type}) =
+    Bonito.RichText(sprint(show, MIME"text/plain"(), f; context = :color => true))
 
 function render_eval_html(value)
     parent = get_parent_session()

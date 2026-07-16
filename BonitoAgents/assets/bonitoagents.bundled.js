@@ -9,6 +9,7 @@ class Collapsable {
         this.toggle = opts.toggleEl || null;
         this.native = opts.native || false;
         this.editMode = opts.editMode || false;
+        this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
         this.compactHeight = opts.compactHeight || 240;
         this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand = this.editMode ? false : opts.fetchEachExpand || false;
@@ -41,7 +42,7 @@ class Collapsable {
         if (!this.native) {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            if (this.editMode) {
+            if (this.editMode && !this.hideBodyOnCollapse) {
                 this.body.style.display = '';
                 this._applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
@@ -418,6 +419,10 @@ class BonitoChat {
     }
     destroy() {
         this.destroyed = true;
+        if (this._elapsedTimer) {
+            clearInterval(this._elapsedTimer);
+            this._elapsedTimer = null;
+        }
         if (this._onScroll) {
             this.container.removeEventListener('scroll', this._onScroll);
         }
@@ -1375,8 +1380,8 @@ class BonitoChat {
             }
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
+            if (live) this._ensureElapsedTicker();
             if (!live) {
-                node.querySelector('.bt-eval-stream')?.remove();
                 if (node.dataset.compactBody === '1' && node.collapsable && node.collapsable.loaded && node.isConnected) {
                     this.comm.notify({
                         type: 'tool.render',
@@ -1416,7 +1421,7 @@ class BonitoChat {
         if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
             const c = node.collapsable;
             c.editMode = true;
-            c.compactHeight = 110;
+            c.hideBodyOnCollapse = true;
             c.fetchEachExpand = false;
             c.discardOnCollapse = false;
             node.dataset.compactBody = '1';
@@ -1434,8 +1439,10 @@ class BonitoChat {
                             id: msg.id
                         });
                     }
+                    if (node.collapsable.hideBodyOnCollapse) node.collapsable.setExpanded(true);
                 } else {
                     node.dataset.btAutoMount = '1';
+                    if (node.collapsable.hideBodyOnCollapse) node.dataset.btAutoExpand = '1';
                 }
             } else if (node.isConnected) {
                 node.collapsable.setExpanded(true);
@@ -1485,7 +1492,12 @@ class BonitoChat {
             headerEl.insertBefore(sb, headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
         if (msg.stream_tail != null && stillLive && headerEl) {
-            let sp = node.querySelector('.bt-eval-stream');
+            let sp = node.querySelector('.bt-tool-body .bt-eval-stream');
+            if (sp) {
+                for (const stray of node.querySelectorAll('.bt-eval-stream'))if (stray !== sp) stray.remove();
+            } else {
+                sp = node.querySelector('.bt-eval-stream');
+            }
             if (!sp) {
                 sp = document.createElement('pre');
                 sp.className = 'bt-eval-stream';
@@ -1677,14 +1689,17 @@ class BonitoChat {
                     if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
                     _writeToolElapsed(div);
                     const liveTool = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
-                    if (liveTool) div.classList.add('bt-tool-live');
+                    if (liveTool) {
+                        div.classList.add('bt-tool-live');
+                        this._ensureElapsedTicker();
+                    }
                     const id = msg.id;
                     const compactBody = msg.kind === 'edit' || msg.compact_body === true;
                     if (msg.compact_body === true) div.dataset.compactBody = '1';
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
                         editMode: compactBody,
-                        compactHeight: msg.compact_body === true ? 110 : undefined,
+                        hideBodyOnCollapse: msg.compact_body === true,
                         fetchEachExpand: !compactBody,
                         discardOnCollapse: !compactBody,
                         onExpand: ()=>this.comm.notify({
@@ -1850,6 +1865,21 @@ class BonitoChat {
             };
             this.taskbarEl.addEventListener('click', this._onTaskbarClick);
         }
+    }
+    _ensureElapsedTicker() {
+        if (this._elapsedTimer) return;
+        this._elapsedTimer = setInterval(()=>{
+            let any = false;
+            for (const node of this.nodeById.values()){
+                if (!node.classList || !node.classList.contains('bt-tool-live')) continue;
+                any = true;
+                if (node.isConnected) _writeToolElapsed(node);
+            }
+            if (!any) {
+                clearInterval(this._elapsedTimer);
+                this._elapsedTimer = null;
+            }
+        }, 1000);
     }
     _setupLens() {
         const host = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-lens-bar');
@@ -2752,8 +2782,8 @@ function _writeToolElapsed(node) {
     if (!timer) return;
     const started = parseFloat(node.dataset.toolStarted ?? '0');
     const finished = parseFloat(node.dataset.toolFinished ?? '0');
-    if (!started || !finished) return;
-    const dt = finished - started;
+    if (!started) return;
+    const dt = Math.max(0, (finished || Date.now() / 1000) - started);
     timer.textContent = dt > 1 ? _formatElapsed(dt) : '';
 }
 function arrayBufferToBase64(buf) {

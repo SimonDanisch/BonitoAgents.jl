@@ -61,8 +61,10 @@
             TK.delay(12000),
             TK.tool_update("rd1"; status = "completed",
                            content = [TK.text_block("greet() = println(\"hi\")\n")]),
+            # Wire contract v3: the eval's content is plain output text (the
+            # result repr echoed REPL-style) — no code echo, no labels.
             TK.tool_update("ev1"; status = "completed",
-                           content = [TK.text_block("```julia\nsleep(2); 40 + 2\n```\n42")]),
+                           content = [TK.text_block("42")]),
         ]
     end
 
@@ -79,14 +81,15 @@
             "[...document.querySelectorAll('.bt-tool-title')].some(t => (t.innerText||'').indexOf('bt_julia_eval') !== -1)";
             timeout = 30) == true
 
-        # The args update eager-mounts the COMPACT body WHILE running — the
-        # "preview" is the real Monaco Code editor (height-capped by the
-        # Collapsable's compact-body mode), not a separate element.
-        @test TK.wait_for(s, "compact Monaco body mounts on the args update",
+        # The args update eager-mounts the body WHILE running — the "preview"
+        # is the real Monaco Code editor (a LONG Code section clamps itself;
+        # see the section-clamp contract in test_bt_eval_e2e.jl) — and flips
+        # the header to expanded so the arrow matches the visible body.
+        @test TK.wait_for(s, "Monaco body mounts + shows on the args update",
             "(() => { const n = $(card("ev1")); " *
             "const b = n && n.querySelector('.bt-eval-body'); " *
             "return !!b && (b.innerText || '').indexOf('sleep(2)') !== -1 && " *
-            "n.querySelector('.bt-tool-header')?.dataset.expanded === 'false'; })()";
+            "n.querySelector('.bt-tool-header')?.dataset.expanded === 'true'; })()";
             timeout = 15) == true
 
         # The ⏱ timeout badge inserted late (60s from rawInput.timeout).
@@ -128,10 +131,11 @@
             timeout = 10) == true
     end
 
-    @testset "streamed rawInput resolves: eval completes, auto-expands with the result" begin
-        # On completion: the stream pane (if any) is gone, and a non-nothing
-        # result AUTO-EXPANDS the body (`expand_full`) — the result must be
-        # visible WITHOUT any click.
+    @testset "streamed rawInput resolves: eval completes with the result visible" begin
+        # On completion: the stream pane is gone and the output is visible
+        # WITHOUT any click — the body stays shown from the eager mount
+        # (scripted content carries no result descriptor, so there's no
+        # `expand_full`; real evals get that from the descriptor block).
         @test TK.wait_for(s, "completed + auto-expanded, no stream pane",
             "(() => { const n = $(card("ev1")); " *
             "const st = n && n.querySelector('.bt-tool-status'); " *

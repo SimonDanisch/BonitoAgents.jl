@@ -1688,32 +1688,17 @@ console_block(body::AbstractString) = DOM.div(Bonito.RichText(body); class="bt-c
 #     "stdout" / "result" / "error".
 #  3. ANSI-bearing prose                 → RichText (terminal block).
 #  4. Mixed prose                        → Markdown.parse fallback.
-const EVAL_SECTION_LABELS = ("stdout", "stderr", "result", "error")
-
+# Render a single GENERIC tool-content text block (third-party tools whose
+# text has no typed contract). This is text PRESENTATION, not protocol
+# decoding: fenced code is standard markdown → Monaco; ANSI-bearing text →
+# terminal pane; everything else → markdown. Our own eval wire carries no
+# in-band shapes to recognize (contract v3: output text + descriptor).
 function render_text_block(text::AbstractString)
     m = match(r"^\s*```(\w*)\r?\n(.*?)\r?\n```\s*$"s, text)
     if m !== nothing
         lang = isempty(m.captures[1]) ? "plaintext" : String(m.captures[1])
         return monaco_readonly(String(m.captures[2]), lang)
     end
-    m = match(Regex("^(" * join(EVAL_SECTION_LABELS, "|") * "):\n(.*)\$", "s"), text)
-    if m !== nothing
-        label = String(m.captures[1])
-        body = String(m.captures[2])
-        # `result` is a Julia value's repr → julia syntax highlighting.
-        # stdout / stderr / error are unstructured console output (captured
-        # prints, stack traces) → RichText so ANSI colors survive and the
-        # block stays a lightweight monospace pane, not a full editor.
-        rendered = label == "result" ?
-                   monaco_readonly(body, "julia") : console_block(body)
-        return DOM.div(
-            DOM.div(uppercase(label); class="bt-section-label"),
-            rendered;
-            class="bt-eval-section")
-    end
-    # Raw console dump that didn't match a section label but still carries
-    # ANSI — render as a terminal block rather than letting Markdown.parse
-    # mangle the escape codes.
     Bonito.has_ansi_codes(text) && return console_block(text)
     return DOM.div(Markdown.parse(text), class="bt-tool-md")
 end
@@ -1723,22 +1708,50 @@ end
 # present from the start (no lazy fetch), used for eval Code/Output sub-sections
 # inside an already-expanded tool card. `label` is the always-visible heading;
 # `preview` (optional) is dim text next to it; `open` shows it expanded.
+#
+# `lines` is the section's content line count: a long section (> CLAMP_LINES)
+# is height-clamped to ~4-5 visible lines with a "show all (N lines)" bar that
+# toggles the full height. The clamp lives on the SECTION, never on the tool
+# card — every section (and the result embed below them) stays reachable in
+# the card's default state.
 struct Collapsable
     label::String
     body::Any
     preview::String
     open::Bool
+    lines::Int
 end
-Collapsable(label::AbstractString, body; preview::AbstractString="", open::Bool=true) =
-    Collapsable(String(label), body, String(preview), open)
+Collapsable(label::AbstractString, body; preview::AbstractString="", open::Bool=true,
+            lines::Integer=0) =
+    Collapsable(String(label), body, String(preview), open, Int(lines))
+
+# Sections longer than this many lines get the clamp + "show all" bar.
+const CLAMP_LINES = 6
 
 function Bonito.jsrender(session::Session, c::Collapsable)
     summary_kids = Any[DOM.span(c.label; class="bt-subsection-label")]
     isempty(c.preview) || push!(summary_kids,
         DOM.span(c.preview; class="bt-subsection-preview"))
+    clamped = c.lines > CLAMP_LINES
+    if clamped
+        # The show-all toggle lives IN the summary row, so its position never
+        # changes when the body height does — expanding and collapsing are two
+        # clicks on the same spot (a bar below the body would jump to the end
+        # of a long output on expand). preventDefault keeps the click from
+        # also toggling the <details> open state.
+        more_label = "show all ($(c.lines) lines) ⌄"
+        push!(summary_kids, DOM.span(more_label; class="bt-subsection-more",
+            onclick=js"""e => {
+                e.preventDefault();
+                e.stopPropagation();
+                const d = e.target.closest('.bt-subsection');
+                const full = d.toggleAttribute('data-full');
+                e.target.textContent = full ? 'show less ⌃' : $(more_label);
+            }"""))
+    end
     Bonito.jsrender(session, DOM.details(
         DOM.summary(summary_kids...; class="bt-subsection-summary"),
-        DOM.div(c.body; class="bt-subsection-body");
+        DOM.div(c.body; class=clamped ? "bt-subsection-body bt-clamped" : "bt-subsection-body");
         class="bt-subsection",
         open=c.open ? true : nothing))
 end
@@ -1746,8 +1759,12 @@ end
 # Open by default — an already-expanded tool card should show everything without
 # extra clicks; the collapsible just lets the user fold away a long code block
 # or a noisy output to focus on the other.
-tool_subsection(label::AbstractString, body; preview::AbstractString="", open::Bool=true) =
-    Collapsable(label, body; preview, open)
+tool_subsection(label::AbstractString, body; preview::AbstractString="", open::Bool=true,
+                lines::Integer=0) =
+    Collapsable(label, body; preview, open, lines)
+
+# Content line count for the clamp decision.
+section_lines(s::AbstractString) = count(==('\n'), s) + 1
 
 # bt_julia_eval tool bodies: a ```julia code echo followed by stdout / result
 # / error sections. Render as two collapsibles — "Code" (Monaco julia, same
@@ -1757,7 +1774,8 @@ tool_subsection(label::AbstractString, body; preview::AbstractString="", open::B
 function render_eval_body(content)
     isempty(content) && return nothing
     code = nothing
-    rest = []
+    texts = String[]
+    media = []
     for c in content
         if c isa TextContent && code === nothing
             m = match(r"^\s*```julia\r?\n(.*?)\r?\n```\s*$"s, c.text)
@@ -1767,14 +1785,14 @@ function render_eval_body(content)
             end
         end
         if c isa TextContent
-            push!(rest, render_text_block(c.text))
+            push!(texts, c.text)
         elseif c isa DiffContent
-            push!(rest, render_diff_block(c))
+            push!(media, render_diff_block(c))
         elseif c isa ImageContent
             # Eval output images (the MCP renders 2-D arrays as PNG) get the same
             # click-to-enlarge lightbox as Read / bt_show images — previously this
             # was a bare <img> with no enlarge affordance.
-            push!(rest, media_element("data:$(c.mime_type);base64,$(c.data)",
+            push!(media, media_element("data:$(c.mime_type);base64,$(c.data)",
                 c.mime_type, false))
         end
     end
@@ -1784,10 +1802,15 @@ function render_eval_body(content)
     code_preview = length(first_line) > 60 ?
                    SubString(first_line, 1, prevind(first_line, 60)) * "…" : first_line
     code_section = tool_subsection("Code", monaco_readonly(code, "julia");
-        preview=code_preview)
-    output_section = isempty(rest) ?
+        preview=code_preview, lines=section_lines(code))
+    # One terminal pane for all the text + any media blocks.
+    merged = join(texts, "\n")
+    kids = Any[]
+    isempty(strip(merged)) || push!(kids, console_block(merged))
+    append!(kids, media)
+    output_section = isempty(kids) ?
                      tool_subsection("Output", DOM.div("(no output)"; class="bt-tool-empty")) :
-                     tool_subsection("Output", DOM.div(rest...))
+                     tool_subsection("Output", DOM.div(kids...); lines=section_lines(merged))
     return DOM.div(code_section, output_section; class="bt-eval-body")
 end
 
@@ -1817,22 +1840,49 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
         DOM.div(DOM.div("(no live session)"; class = "bt-tool-empty"); class = "bt-eval-body"))
 
     content   = tool_content_for_render(m, chat.chat_dir)
-    sections  = Any[tool_subsection("Code", monaco_readonly(m.code, "julia"))]
-    completed = tool_status(m) == "completed" && !isempty(content)
-    stop      = completed ? lastindex(content) - 1 : lastindex(content)   # drop trailing result
-    console   = AgentClientProtocol.TextContent[
-        c for c in (length(content) >= 2 ? content[2:stop] : ()) if c isa AgentClientProtocol.TextContent]
-    isempty(console) || push!(sections,
-        tool_subsection("Output", DOM.div((render_text_block(c.text) for c in console)...)))
-    if completed
-        result  = content[end]
-        payload = result isa AgentClientProtocol.TextContent ? result.text : ""
-        # Empty result (a `nothing`-returning eval — e.g. `Pkg.status(); nothing`):
-        # the result block is intentionally empty so the invariant holds (stdout
-        # stays in Output above); don't mount an empty "(no result)" box.
-        isempty(payload) || push!(sections,
-            wrap_for_detach(tool_id(m), remote_result(chat.state, payload, chat.project_id)))
+    # bt_julia_continue carries NO code (it reattaches to the original eval,
+    # whose card sits above with the source) — an empty Monaco box under a
+    # "Code" heading helps nobody, so the section only renders when there is
+    # code. The content-position invariant is unchanged either way: the
+    # worker echoes the ORIGINAL code as content[1] even for continue.
+    sections  = Any[]
+    isempty(m.code) || push!(sections,
+        tool_subsection("Code", monaco_readonly(m.code, "julia");
+            lines=section_lines(m.code)))
+    # Wire contract v3: content is `[output_text?, descriptor?]` — the
+    # descriptor (exact decode of our own json, see `result_descriptor`) is
+    # the LAST block of a completed call whenever a result ref exists (values
+    # AND errors — the worker parks a thrown `CapturedException` like any
+    # value, `errored: true` marks it). Every other text block IS the
+    # terminal output, verbatim. Zero content sniffing. A checkpoint /
+    # `nothing` result simply has no descriptor.
+    desc = nothing
+    if tool_status(m) == "completed" && !isempty(content)
+        last = content[end]
+        desc = last isa AgentClientProtocol.TextContent ?
+            result_descriptor(last.text) : nothing
     end
+    if tool_status(m) in ("pending", "in_progress")
+        # The stream IS the output while running: the worker's captured
+        # stdout lands here via `stream_tail` updates (the JS writes into
+        # `.bt-eval-stream`, pinned to the newest line). The terminal
+        # re-render swaps in the complete text from the content block — the
+        # same bytes, atomic with the result and persisted for history.
+        # No section clamp (`lines = 0`): the live pane bounds ITSELF via the
+        # `.bt-eval-stream` max-height and auto-scrolls to the newest line —
+        # a "show all" toggle makes no sense for a moving stream.
+        push!(sections, tool_subsection("Output",
+            DOM.pre(m.stream_text; class = "bt-eval-stream")))
+    else
+        stop   = desc === nothing ? lastindex(content) : lastindex(content) - 1
+        output = join(String[c.text for c in content[begin:stop]
+                             if c isa AgentClientProtocol.TextContent], "\n")
+        isempty(strip(output)) || push!(sections,
+            tool_subsection("Output", console_block(output);
+                lines = section_lines(output)))
+    end
+    desc === nothing || push!(sections,
+        wrap_for_detach(tool_id(m), remote_result(chat.state, content[end].text, chat.project_id)))
     return Bonito.jsrender(session, DOM.div(sections...; class = "bt-eval-body"))
 end
 
@@ -3130,8 +3180,13 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             (auto_expand_body(b, snap.content) || has_show_reference(snap.content)) &&
                 (d["expand"] = true)
             auto_expand_full(b, snap.content) && (d["expand_full"] = true)
-            # A running eval starts its live stdout tail (idempotent).
-            b isa JuliaEvalCall && h.status == "in_progress" && start_eval_stream!(b)
+            # A running eval starts its live stdout tail (idempotent). The real
+            # claude wire keeps the status at "pending" for the whole MCP call
+            # (no in_progress transition while the tool runs — observed live;
+            # the old in_progress gate meant the tail never appeared outside
+            # the mock), so any non-terminal status with code counts as running.
+            b isa JuliaEvalCall && h.status in ("pending", "in_progress") &&
+                !isempty(b.code) && start_eval_stream!(b)
             # Displayable media (bt_show mime, or inline image content from
             # e.g. Read on a PNG) — the client's Native Images mode keys on
             # this; ship it with the update that carries the result.
@@ -3181,14 +3236,16 @@ auto_expand_body(m::JuliaEvalCall, snap_content) =
     auto_expand_full(m, snap_content)
 
 # FULL uncollapse (not just the compact eager-mount) — typed, default off.
-# Eval: a completed call whose final payload is non-empty returned != nothing;
-# the result should be visible without a click.
+# Eval: a completed call whose final block is a result descriptor (exact
+# decode — the eval returned != nothing, value or error); the result should
+# be visible without a click.
 auto_expand_full(::ToolMsg, snap_content) = false
 function auto_expand_full(m::JuliaEvalCall, snap_content)
     tool_status(m) == "completed" || return false
     isempty(snap_content) && return false
     c = snap_content[end]
-    return c isa AgentClientProtocol.TextContent && !isempty(c.text)
+    return c isa AgentClientProtocol.TextContent &&
+        result_descriptor(c.text) !== nothing
 end
 # Two-arg fallback for tests / call sites that don't have the snap yet.
 auto_expand_body(b::ToolMsg) = auto_expand_body(b, Any[])
@@ -3393,6 +3450,9 @@ bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
 const EVAL_STREAM_POLL_S = 0.5
 const EVAL_STREAM_KEEP_CHARS = 8_000
 const EVAL_STREAM_TAIL_LINES = 12
+# Per-poll read cap — also the skip window: output older than this never
+# ships over the worker-control WS (the tail display can't show it anyway).
+const EVAL_STREAM_READ_BYTES = 65_536
 
 strip_ansi_codes(s::AbstractString) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
 
@@ -3418,19 +3478,50 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
     first_read = true
     deadline = time() + 4 * 3600      # hard stop for a wedged status
     while tool_status(m) in ("pending", "in_progress") && time() < deadline
-        r = try
+        # One cheap EOF probe per poll: the worker clamps the requested offset
+        # to the file size, so a `max_bytes = 0` read "from infinity" returns
+        # EOF without shipping a byte. The display only keeps the last lines,
+        # so anything older than the trailing window is SKIPPED, never read —
+        # a huge burst (a 300k-line eval) or a fat backlog from earlier evals
+        # must not flood the worker-control WS in multi-MB JSON frames and
+        # starve its heartbeat (observed: pong loss → worker bounce → eval
+        # bridge torn down → every later result mount degraded).
+        eof = try
             tail_worker_file(state, wid, path;
-                offset = m.stream_offset, max_bytes = 4_000_000, timeout = 10.0)
+                offset = typemax(Int) ÷ 2, max_bytes = 0, timeout = 10.0)
         catch e
-            @debug "eval stream tail failed (will retry)" id = tool_id(m) exception = e
+            @debug "eval stream probe failed (will retry)" id = tool_id(m) exception = e
             sleep(EVAL_STREAM_POLL_S)
             continue
         end
-        if r.exists && r.offset > m.stream_offset
-            if first_read
-                # Seek past whatever earlier evals wrote — stream only THIS one.
-                m.stream_offset = r.offset
-            else
+        if !eof.exists
+            sleep(EVAL_STREAM_POLL_S)
+            continue
+        end
+        if first_read
+            # Stream only THIS eval: start at the current end of file.
+            m.stream_offset = eof.offset
+            first_read = false
+        elseif eof.offset < m.stream_offset
+            # The log SHRANK under us: a fresh session opens it "w"
+            # (truncate), racing a stream that already sought to the old
+            # end. Everything in the file now belongs to the new session —
+            # rewind to the top.
+            m.stream_offset = 0
+        end
+        if eof.offset > m.stream_offset
+            # Trailing window only — skip (don't ship) any excess backlog.
+            m.stream_offset = max(m.stream_offset, eof.offset - EVAL_STREAM_READ_BYTES)
+            r = try
+                tail_worker_file(state, wid, path;
+                    offset = m.stream_offset, max_bytes = EVAL_STREAM_READ_BYTES,
+                    timeout = 10.0)
+            catch e
+                @debug "eval stream tail failed (will retry)" id = tool_id(m) exception = e
+                sleep(EVAL_STREAM_POLL_S)
+                continue
+            end
+            if r.exists && r.offset > m.stream_offset
                 m.stream_offset = r.offset
                 m.stream_text = last(m.stream_text * strip_ansi_codes(r.chunk),
                                      EVAL_STREAM_KEEP_CHARS)
@@ -3439,7 +3530,6 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
                     "stream_tail" => last_lines(m.stream_text, EVAL_STREAM_TAIL_LINES)))
             end
         end
-        first_read = false
         sleep(EVAL_STREAM_POLL_S)
     end
     return nothing

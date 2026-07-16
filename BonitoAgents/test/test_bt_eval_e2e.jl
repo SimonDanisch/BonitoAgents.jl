@@ -19,11 +19,17 @@ using Bonito           # test dep — used to locate the RESOLVED v5 Bonito sour
 include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
 import .TestKit
 const TK = TestKit
-using .TestKit: text, bt_eval, end_turn
+using .TestKit: text, bt_eval, bt_continue, end_turn
 
 const SHOT_DIR = joinpath(tempdir(), "bt-eval-e2e")
 mkpath(SHOT_DIR)
 shot(name) = joinpath(SHOT_DIR, name)
+
+# The committed eval test env (dev Bonito via [sources]) — REQUIRED for any
+# testset asserting the LIVE result embed: a fresh empty project resolves a
+# pre-v5 Bonito, the bridge gate skips setup, and contract v3 then has no
+# descriptor — the result is the REPL-style echo in Output instead.
+const EVALENV = abspath(joinpath(@__DIR__, "evalenv"))
 
 # Create a tmp project directory with a fresh, empty Project.toml. No
 # package deps → no Pkg.instantiate needed → fast. The `Base.active_project()`
@@ -106,18 +112,28 @@ end
     end
 end
 
-# The live-display triple for a RUNNING eval: (1) the body eager-mounts in
-# COMPACT mode while the code runs — the real Monaco "Code" editor capped at
-# ~4 lines is the preview; (2) stdout streams into a small auto-scrolled tail
-# pane under the header; (3) a completed eval that RETURNED a value (non-
-# nothing) auto-expands the body so the result is visible without a click
-# (and the stream pane is gone — the Output section owns the text now).
-@testset "bt_eval e2e — live display: compact Monaco, stdout stream tail, auto-expand on result" begin
-    project = fresh_project("stream")
+# The live-display contract for a RUNNING eval: (1) the body eager-mounts
+# without any click while the code runs (real wire: the status stays PENDING
+# for the whole MCP call — no in_progress ever arrives) and a LONG Code
+# section is clamped to ~4 visible lines with a "show all" bar — the clamp
+# lives on the SECTION, never on the tool card, so Output and the result
+# embed below it are always reachable; (2) stdout streams into a small
+# auto-scrolled tail pane under the header; (3) a completed eval that
+# RETURNED a value shows the result without a click (stream pane gone — the
+# Output section owns the text now, itself clamped with its own "show all").
+@testset "bt_eval e2e — live display: section clamps, stdout stream tail, result visible" begin
+    project = EVALENV   # live embed asserted → needs the bridge (see EVALENV)
+    # 9 code lines (> CLAMP_LINES) so the Code section clamps while running;
+    # 12 output lines so the Output section clamps after completion.
     code = """
+    # streaming demo: prints twelve lines, slowly,
+    # with enough code lines that the Code section
+    # itself exceeds the section clamp threshold.
+    acc = 0
     for i in 1:12
         println("STREAMLINE ", i)
-        sleep(0.4)
+        global acc += i
+        sleep(1.0)
     end
     1234321
     """
@@ -131,32 +147,72 @@ end
         pid = TK.new_chat(s)
         TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
         sleep(1)
+        # Fresh evalenv session: the pool is process-global, so a session left by
+        # an earlier testset still dials ITS (closed) dev_server — the mount
+        # would degrade to the static fallback. Each dev_server = a fresh boot.
+        TK.refresh_eval_session!(EVALENV)
         TK.send_message(s, "stream please")
         card = ".bt-tool-msg[data-msg-id*=\"ts-1\"]"
 
-        # (1) While running: the body is MOUNTED without any click (compact
-        # eager-mount) and the tool is still in_progress.
-        @test TK.wait_for(s, "compact body mounted while running",
+        # (1) While running (status stays "pending" on the real wire): the
+        # body is MOUNTED and VISIBLE without any click, and the header reads
+        # expanded so the arrow matches the shown body.
+        @test TK.wait_for(s, "body mounted + visible while running",
             """(() => { const c = document.querySelector('$card');
                 return !!(c && c.querySelector('.bt-eval-body') &&
-                    c.querySelector('.bt-tool-status')?.textContent === 'in_progress'); })()""";
+                    c.querySelector('.bt-tool-status')?.textContent === 'pending' &&
+                    c.querySelector('.bt-tool-header')?.dataset.expanded === 'true'); })()""";
             timeout = 120) == true
+        # The header clock TICKS while it runs — with the status parked at
+        # "pending" for the whole MCP call, elapsed time is the user's only
+        # hang-vs-slow signal. Two distinct values observed while still live
+        # prove it advances (recomputed from started_at, 1Hz shared ticker).
+        @test TK.wait_for(s, "elapsed clock ticks while running",
+            """(() => { const c = document.querySelector('$card');
+                const t = c && c.querySelector('.bt-tool-timer');
+                if (!t || !t.textContent) return false;
+                if (c.querySelector('.bt-tool-status')?.textContent !== 'pending') return false;
+                window.__clk1 ??= t.textContent;
+                return t.textContent !== window.__clk1; })()""";
+            timeout = 30, interval = 0.5) == true
+        # The long Code SECTION is clamped to ~4-5 lines (110px + padding
+        # slack) with real Monaco lines rendered — the whole-card cap this
+        # replaces once hid Output/result entirely, and an earlier cap
+        # regressed silently because only presence was asserted, never
+        # height. The card body itself must NOT be capped.
+        @test TK.wait_for(s, "Code section clamped with rendered lines",
+            """(() => { const b = document.querySelector('$card .bt-subsection-body.bt-clamped');
+                return !!b && b.querySelectorAll('.view-line').length >= 3 &&
+                       b.offsetHeight > 0 && b.offsetHeight <= 140; })()""";
+            timeout = 30) == true
+        @test TK.eval_js(s,
+            "!!document.querySelector('$card .bt-subsection-more')") == true
 
-        # (2) The stdout tail pane appears and follows the newest output
-        # (later STREAMLINE lines show up; the pane stays pinned to the end).
-        @test TK.wait_for(s, "stream tail shows output",
-            """(() => { const p = document.querySelector('$card .bt-eval-stream');
-                return !!(p && p.textContent.includes('STREAMLINE')); })()""";
-            timeout = 60) == true
-        @test TK.wait_for(s, "stream tail advances to late lines",
-            """(() => { const p = document.querySelector('$card .bt-eval-stream');
-                return !!(p && /STREAMLINE (8|9|10|11|12)/.test(p.textContent) &&
-                          p.scrollTop + p.clientHeight >= p.scrollHeight - 4); })()""";
-            timeout = 60) == true
+        # (2) The stdout streams into the body's Output pane, pinned to the
+        # newest line. ONE combined wait with a boot-tolerant timeout: the
+        # fresh evalenv session pays worker spawn + `using` before the first
+        # print, and the pane only exists while the eval RUNS (the terminal
+        # re-render replaces it) — two separate short waits raced completion.
+        stream_ok = try
+            TK.wait_for(s, "stream tail streams late lines, pinned to end",
+                """(() => { const p = document.querySelector('$card .bt-eval-stream');
+                    return !!(p && /STREAMLINE (8|9|10|11|12)/.test(p.textContent) &&
+                              p.scrollTop + p.clientHeight >= p.scrollHeight - 4); })()""";
+                timeout = 180) == true
+        catch
+            false
+        end
+        stream_ok || @info "stream dump" pane = TK.eval_js(s,
+                """(() => { const p = document.querySelector('$card .bt-eval-stream');
+                    return p ? JSON.stringify({txt: p.textContent.slice(-200),
+                        st: p.scrollTop, ch: p.clientHeight, sh: p.scrollHeight}) : "(no pane)"; })()""") body = TK.eval_js(s,
+                "document.querySelector('$card .bt-tool-body')?.innerText?.slice(0, 300)")
+        @test stream_ok
 
-        # (3) Completion with a non-nothing result: auto-expanded body, the
-        # result visible, the stream pane gone.
-        @test TK.wait_for(s, "completed + auto-expanded + result visible",
+        # (3) Completion with a non-nothing result: the result embed is
+        # visible (below the clamped sections — no click needed), the stream
+        # pane is gone.
+        @test TK.wait_for(s, "completed + result visible",
             """(() => { const c = document.querySelector('$card');
                 if (!c) return false;
                 const done = c.querySelector('.bt-tool-status')?.textContent === 'completed';
@@ -164,8 +220,152 @@ end
                 const res  = c.querySelector('.bt-embed')?.innerText.includes('1234321');
                 return !!(done && open && res); })()"""; timeout = 60) == true
         @test TK.eval_js(s, "!document.querySelector('$card .bt-eval-stream')") == true
+        # The clock FREEZES at the final duration on completion.
+        clk1 = TK.eval_js(s, "document.querySelector('$card .bt-tool-timer').textContent")
+        sleep(1.6)
+        clk2 = TK.eval_js(s, "document.querySelector('$card .bt-tool-timer').textContent")
+        @test occursin(r"^\d+(s|m(\d+s)?)$", clk1)
+        @test clk1 == clk2
+
+        # (4) The Output section (12 console lines) is clamped with its own
+        # "show all (N lines)" toggle in the SUMMARY row; clicking it reveals
+        # the full output.
+        out_sec = """[...document.querySelectorAll('$card .bt-subsection')].find(d =>
+            d.querySelector('.bt-subsection-label')?.textContent === 'Output')"""
+        @test TK.wait_for(s, "Output section clamped + show-all toggle",
+            """(() => { const d = $out_sec;
+                const b = d && d.querySelector('.bt-subsection-body.bt-clamped');
+                const m = d && d.querySelector('.bt-subsection-summary .bt-subsection-more');
+                return !!(b && m && b.offsetHeight <= 140 &&
+                          m.textContent.includes('show all')); })()""";
+            timeout = 30) == true
+        # The toggle lives in the summary row so its SCREEN POSITION must not
+        # move across the click (the double-click-to-flip contract), and the
+        # <details> stays open (preventDefault stops the native toggle).
+        # Probe + click + re-probe in ONE synchronous JS execution.
+        flip = TK.eval_js(s, """(() => {
+            const d = $out_sec;
+            const m = d.querySelector('.bt-subsection-more');
+            const y1 = Math.round(m.getBoundingClientRect().top);
+            m.click();
+            const y2 = Math.round(m.getBoundingClientRect().top);
+            return {y1: y1, y2: y2, full: d.hasAttribute('data-full'),
+                    open: d.hasAttribute('open')};
+        })()""")
+        @test flip["y1"] == flip["y2"]
+        @test flip["full"] == true
+        @test flip["open"] == true
+        @test TK.wait_for(s, "show-all reveals the full output",
+            """(() => { const d = $out_sec;
+                return !!(d && d.querySelector('.bt-subsection-body').offsetHeight > 140 &&
+                    d.querySelector('.bt-subsection-more').textContent.includes('show less')); })()""";
+            timeout = 10) == true
 
         TK.screenshot(s, shot("bt_eval-stream.png"))
+    finally
+        close(s)
+    end
+end
+
+# An ERRORING eval must SHOW its error. Contract v3: a user error is a
+# VALUE — the worker parks the `CapturedException` like any result (the
+# descriptor carries `errored: true`) and prints the red `ERROR: …` text
+# into the output, REPL-style. MCP `isError` stays FALSE (it's reserved for
+# infra failures — claude fuses isError content into one rawOutput blob), so
+# the tool status is `completed` and nothing ever fuses. The chat shows the
+# error twice over: terminal text in Output, live-rendered exception
+# (Bonito's `jsrender(::CapturedException)`) as the result embed.
+@testset "bt_eval e2e — erroring eval renders ERROR output + live exception result" begin
+    project = EVALENV   # live exception embed asserted → needs the bridge
+    s = TK.dev_server(; agent = msg -> [
+        text("this will fail"),
+        bt_eval("values = [4.0, 9.0, -16.0, 25.0]\nmap(sqrt, values)";
+                env_path = project, id = "terr-1"),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        sleep(1)
+        TK.refresh_eval_session!(EVALENV)   # fresh bridge for THIS dev_server
+        TK.send_message(s, "fail please")
+        card = ".bt-tool-msg[data-msg-id*=\"terr-1\"]"
+
+        # User error ≠ failed tool: the MCP call completed (isError is infra-only).
+        @test TK.wait_for(s, "eval completed",
+            "document.querySelector('$card .bt-tool-status')?.textContent === 'completed'";
+            timeout = 120) == true
+        # The red ERROR text + stacktrace in the Output console, no click.
+        @test TK.wait_for(s, "ERROR output visible",
+            """(() => { const b = document.querySelector('$card .bt-tool-body');
+                const t = (b && b.innerText) || '';
+                return t.includes('ERROR:') && t.includes('DomainError'); })()""";
+            timeout = 30) == true
+        # The result embed is the LIVE-rendered CapturedException (descriptor
+        # with errored: true → RemoteRef mount → Bonito's exception render).
+        @test TK.wait_for(s, "live exception result mounted",
+            """(() => { const e = document.querySelector('$card .bt-embed');
+                return !!e && (e.innerText || '').includes('DomainError'); })()""";
+            timeout = 30) == true
+
+        TK.screenshot(s, shot("bt_eval-failed.png"))
+    finally
+        close(s)
+    end
+end
+
+# bt_julia_continue: the checkpoint/reattach pair. The eval checkpoints on
+# its soft timeout (partial output + "still running"); the continue call
+# reattaches through the REAL julia_continue_handler and delivers the rest.
+# The continue card carries NO code argument — its body must NOT render an
+# empty "Code" Monaco box (the source lives in the eval card above): Output
+# and the result only.
+@testset "bt_eval e2e — continue: checkpoint reattach, no empty Code box" begin
+    project = EVALENV   # result embed asserted → needs the bridge
+    code = """
+    println("before checkpoint")
+    sleep(3)
+    println("after checkpoint")
+    424242
+    """
+    s = TK.dev_server(; agent = msg -> [
+        text("slow job"),
+        bt_eval(code; env_path = project, id = "tc-1", timeout = 1),
+        bt_continue(; env_path = project, id = "tc-2", timeout = 60),
+        end_turn(),
+    ])
+    try
+        TK.open_browser(s; width = 1280, height = 900)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        sleep(1)
+        TK.refresh_eval_session!(EVALENV)   # fresh bridge for THIS dev_server
+        TK.send_message(s, "continue please")
+        card1 = ".bt-tool-msg[data-msg-id*=\"tc-1\"]"
+        card2 = ".bt-tool-msg[data-msg-id*=\"tc-2\"]"
+
+        # The eval checkpoints: completed with the "still running" footer.
+        @test TK.wait_for(s, "eval checkpointed",
+            """(() => { const c = document.querySelector('$card1');
+                return !!(c && c.querySelector('.bt-tool-status')?.textContent === 'completed' &&
+                    (c.querySelector('.bt-tool-body')?.innerText || '').includes('still running')); })()""";
+            timeout = 120) == true
+        # The continue card completes with the tail of the output + result.
+        @test TK.wait_for(s, "continue delivered output + result",
+            """(() => { const c = document.querySelector('$card2');
+                if (!c) return false;
+                const t = (c.querySelector('.bt-tool-body')?.innerText || '');
+                return c.querySelector('.bt-tool-status')?.textContent === 'completed' &&
+                       t.includes('after checkpoint') &&
+                       (c.querySelector('.bt-embed')?.innerText || '').includes('424242'); })()""";
+            timeout = 120) == true
+        # ... and it has NO Code section (continue carries no code).
+        @test TK.eval_js(s,
+            """[...document.querySelectorAll('$card2 .bt-subsection-label')]
+               .every(l => l.textContent !== 'Code')""") == true
+
+        TK.screenshot(s, shot("bt_eval-continue.png"))
     finally
         close(s)
     end

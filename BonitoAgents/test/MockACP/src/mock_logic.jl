@@ -488,15 +488,21 @@ function run_dispatcher_prompt(prompt_id)
                 "toolCallId" => tid, "status" => "completed", "_meta" => meta))
         elseif et == "bt_eval_open"
             # The dispatcher announces the eval BEFORE running it (mirrors real
-            # claude: the tool opens, args stream in, and in_progress lasts as
-            # long as the MCP call). `bt_eval_result` below arrives when the
-            # eval finishes and carries `opened => true` so the open frames
-            # aren't repeated.
+            # claude: the tool opens, the args stream in on an update, and the
+            # status stays PENDING for the whole MCP call — the real wire never
+            # flips to in_progress while the tool runs; observed live. The old
+            # in_progress frame here was mock-only fiction and masked a chat
+            # bug that gated the live stdout tail on in_progress.
+            # `bt_eval_result` below arrives when the eval finishes and
+            # carries `opened => true` so the open frames aren't repeated.
             tid = String(ev["tool_id"])
             code = String(get(ev, "code", ""))
-            raw_input = Dict{String,Any}("code" => code)
-            ev["env_path"] === nothing || (raw_input["env_path"] = String(ev["env_path"]))
-            toolname = "mcp__btworker__bt_julia_eval"
+            raw_input = Dict{String,Any}()
+            isempty(code) || (raw_input["code"] = code)
+            get(ev, "env_path", nothing) === nothing ||
+                (raw_input["env_path"] = String(ev["env_path"]))
+            haskey(ev, "timeout") && (raw_input["timeout"] = ev["timeout"])
+            toolname = String(get(ev, "tool", "mcp__btworker__bt_julia_eval"))
             meta = Dict("claudeCode" => Dict("toolName" => toolname))
             upd("tool_call", Dict{String,Any}(
                 "toolCallId" => tid, "kind" => "other",
@@ -504,7 +510,7 @@ function run_dispatcher_prompt(prompt_id)
                 "rawInput" => Dict{String,Any}(), "content" => Any[],
                 "_meta" => meta))
             upd("tool_call_update", Dict{String,Any}(
-                "toolCallId" => tid, "status" => "in_progress",
+                "toolCallId" => tid, "status" => "pending",
                 "rawInput" => raw_input, "title" => toolname, "kind" => "other",
                 "_meta" => meta))
         elseif et == "bt_eval_result"
@@ -526,7 +532,7 @@ function run_dispatcher_prompt(prompt_id)
             #   3. tool_call_update: status "completed" (or "failed") + content.
             # A title/kind/upfront-rawInput mock would mask the prettify + merge +
             # finalize paths a real user exercises.
-            toolname = "mcp__btworker__bt_julia_eval"
+            toolname = String(get(ev, "tool", "mcp__btworker__bt_julia_eval"))
             meta = Dict("claudeCode" => Dict("toolName" => toolname))
             if !Bool(get(ev, "opened", false))
                 upd("tool_call", Dict{String,Any}(
@@ -535,18 +541,30 @@ function run_dispatcher_prompt(prompt_id)
                     "rawInput" => Dict{String,Any}(), "content" => Any[],
                     "_meta" => meta))
                 upd("tool_call_update", Dict{String,Any}(
-                    "toolCallId" => tid, "status" => "in_progress",
+                    "toolCallId" => tid, "status" => "pending",
                     "rawInput" => raw_input, "title" => toolname, "kind" => "other",
                     "_meta" => meta))
             end
-            packed = Any[]
-            for c in get(ev, "content", Any[])
-                push!(packed, Dict{String,Any}("type" => "content", "content" => c))
+            if Bool(get(ev, "is_error", false))
+                # Real claude-agent-acp ships a FAILED MCP tool's result as ONE
+                # fused `rawOutput` STRING with NO content blocks (verified on
+                # acp.jsonl) — mirror that shape so the suite exercises the
+                # chat's rawOutput→content normalization, not a tidier fiction.
+                fused = join(String[String(get(c, "text", ""))
+                                    for c in get(ev, "content", Any[])
+                                    if get(c, "type", "") == "text"], "\n")
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => "failed",
+                    "rawOutput" => fused, "_meta" => meta))
+            else
+                packed = Any[]
+                for c in get(ev, "content", Any[])
+                    push!(packed, Dict{String,Any}("type" => "content", "content" => c))
+                end
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => "completed",
+                    "content" => packed, "_meta" => meta))
             end
-            upd("tool_call_update", Dict{String,Any}(
-                "toolCallId" => tid,
-                "status" => Bool(get(ev, "is_error", false)) ? "failed" : "completed",
-                "content" => packed, "_meta" => meta))
         elseif et == "tool"
             # Generic tool call of any kind (edit/search/execute/other). Opens
             # the bubble, then (unless complete=false) ships content + a final

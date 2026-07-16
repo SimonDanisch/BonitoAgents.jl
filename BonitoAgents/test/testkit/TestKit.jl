@@ -58,7 +58,8 @@ export TestServer, dev_server, add_worker!,
        text, user, thought, edit, bash, todo, delay, tool, tool_update, REPLAY_FN,
        post_turn,
        sub_text, sub_tool,
-       diff_block, text_block, error_reply, crash, end_turn, bt_eval,
+       diff_block, text_block, error_reply, crash, end_turn,
+       mcp_call, bt_eval, bt_continue,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
        exit_success,
@@ -106,21 +107,32 @@ bash(command, output; id = nothing) = begin
     d
 end
 """
-    bt_eval(code; env_path = nothing, id = nothing) -> Dict
+    mcp_call(tool; id = nothing, args...) -> Dict
 
-Agent event that runs `code` through `BonitoMCP.julia_eval_handler` exactly
-the way the real chat does it: Malt worker per `env_path`, real `--project`
-activation, real captured stdout/value/errors. The dispatcher executes it in
-the test process and pipes the resulting MCP content blocks back to the mock
-as ACP tool_call frames. `env_path = nothing` opts into BonitoMCP's
-ephemeral-temp session (same as the default in production).
+Agent event that runs the REAL BonitoMCP handler for the bare tool name
+`tool` exactly the way the real chat does it: Malt worker per `env_path`,
+real `--project` activation, real captured stdout/value/errors. The
+dispatcher executes it in the test process and pipes the resulting MCP
+content blocks back to the mock as ACP tool_call frames announced under
+`mcp__btworker__<tool>`. `args` are the tool arguments (`nothing`-valued
+ones are dropped; `env_path = nothing` opts into BonitoMCP's ephemeral-temp
+session, same as the default in production). `bt_eval` / `bt_continue` are
+sugar over this.
 """
-bt_eval(code; env_path = nothing, id = nothing) = begin
-    d = Dict{String,Any}("type" => "bt_eval", "code" => String(code))
-    env_path === nothing  || (d["env_path"] = String(env_path))
-    id       === nothing  || (d["id"]       = String(id))
+mcp_call(tool::AbstractString; id = nothing, args...) = begin
+    d = Dict{String,Any}("type" => "mcp_call", "tool" => String(tool))
+    id === nothing || (d["id"] = String(id))
+    for (k, v) in pairs(args)
+        v === nothing || (d[String(k)] = v)
+    end
     d
 end
+bt_eval(code; env_path = nothing, id = nothing, timeout = nothing) =
+    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout)
+# bt_julia_continue reattaches to the in-flight eval after a soft-timeout
+# checkpoint — its call carries NO code argument, exactly like real claude.
+bt_continue(; env_path = nothing, timeout = nothing, id = nothing) =
+    mcp_call("bt_julia_continue"; id, env_path, timeout)
 
 # Content-block specs for the generic `tool` event. `diff_block` renders as a
 # Monaco DiffEditor; `text_block` as a tool text block (grep-style lines render
@@ -423,8 +435,8 @@ end
 # else is forwarded verbatim.
 function forward_event(client, ev::AbstractDict)
     t = String(get(ev, "type", ""))
-    if t == "bt_eval"
-        invoke_bt_eval(client, ev)
+    if t == "mcp_call"
+        invoke_mcp(client, ev)
     else
         println(client, JSON.json(ev)); flush(client)
     end
@@ -460,26 +472,29 @@ function with_bridge_env(ctx, f)
     end
 end
 
-function invoke_bt_eval(client, ev::AbstractDict)
-    args = Dict{String,Any}("code" => String(get(ev, "code", "")))
-    haskey(ev, "env_path") && (args["env_path"] = String(ev["env_path"]))
-    haskey(ev, "timeout")  && (args["timeout"]  = ev["timeout"])
-    haskey(ev, "max_response_bytes") && (args["max_response_bytes"] = ev["max_response_bytes"])
-    haskey(ev, "full_output") && (args["full_output"] = ev["full_output"])
+function invoke_mcp(client, ev::AbstractDict)
+    tool = String(get(ev, "tool", "bt_julia_eval"))
+    # Everything besides the event bookkeeping IS the tool's argument dict —
+    # `mcp_call` sugar (bt_eval / bt_continue) puts args at the top level.
+    args = Dict{String,Any}(String(k) => v for (k, v) in ev
+                            if String(k) ∉ ("type", "tool", "id"))
 
     tool_id = String(get(ev, "id", "te_$(rand(UInt32))"))
-    # Real claude opens the tool bubble BEFORE the MCP call runs (pending ->
-    # in_progress with streamed rawInput), so the in_progress phase lasts as
-    # long as the eval - that's what the chat's live affordances (compact code
-    # preview, stdout stream tail, stop button) key on. Announce first, run after.
+    # Real claude opens the tool bubble BEFORE the MCP call runs, streams the
+    # args on an update, and the status stays PENDING for the whole call —
+    # that's what the chat's live affordances (compact code preview, stdout
+    # stream tail, stop button, elapsed clock) key on. Announce first, run after.
     open_ev = Dict{String,Any}(
         "type" => "bt_eval_open", "tool_id" => tool_id,
+        "tool" => "mcp__btworker__" * tool,
         "code" => String(get(ev, "code", "")),
         "env_path" => get(ev, "env_path", nothing))
+    haskey(ev, "timeout") && (open_ev["timeout"] = ev["timeout"])
     println(client, JSON.json(open_ev)); flush(client)
 
     ctx = SERVER_CONTEXT[]
-    runner() = BonitoMCP.julia_eval_handler(args)
+    runner() = tool == "bt_julia_continue" ?
+        BonitoMCP.julia_continue_handler(args) : BonitoMCP.julia_eval_handler(args)
     result = try
         # `ctx === nothing` is the standalone case (no live bridge → text fallback,
         # still a valid result). With a server context, wire the dial-back so the
@@ -488,7 +503,7 @@ function invoke_bt_eval(client, ev::AbstractDict)
     catch e
         Dict{String,Any}(
             "content" => Any[Dict("type" => "text",
-                                   "text" => "TestKit bt_eval crash: $(sprint(showerror, e))")],
+                                   "text" => "TestKit mcp_call crash: $(sprint(showerror, e))")],
             "isError" => true,
         )
     end
@@ -496,11 +511,12 @@ function invoke_bt_eval(client, ev::AbstractDict)
     out = Dict{String,Any}(
         "type"     => "bt_eval_result",
         "tool_id"  => tool_id,
+        "tool"     => "mcp__btworker__" * tool,
         "code"     => String(get(ev, "code", "")),
         "env_path" => get(ev, "env_path", nothing),
         "content"  => get(result, "content", Any[]),
         "is_error" => Bool(get(result, "isError", false)),
-        "opened"   => true,   # bt_eval_open already emitted pending/in_progress
+        "opened"   => true,   # bt_eval_open already emitted the pending frames
     )
     println(client, JSON.json(out)); flush(client)
 end

@@ -691,17 +691,31 @@ function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
     return Bonito.jsrender(session, node)
 end
 
+# Exact decode of the worker's result descriptor json — the ONE place the
+# eval wire format is recognized (`{"remote_ref": "prefix/uuid", "errored":
+# bool}`; the `errored` field marks a parked CapturedException). Returns
+# nothing for anything else: the block is then plain output text. This is
+# boundary decoding of our own versioned format, not content sniffing.
+function result_descriptor(payload::AbstractString)
+    s = String(payload)
+    startswith(s, "{") || return nothing
+    d = try
+        JSON.parse(s)
+    catch
+        return nothing
+    end
+    d isa AbstractDict || return nothing
+    ref = get(d, "remote_ref", nothing)
+    ref isa AbstractString || return nothing
+    return (ref = String(ref), errored = get(d, "errored", false) === true)
+end
+
 # Build the RemoteRef from the persisted result payload (the final content
-# block). Current payloads are the JSON descriptor `{"remote_ref": id}`;
+# block). Current payloads are the JSON descriptor (see `result_descriptor`);
 # pre-RemoteRef history persisted the rendered html itself — which is exactly
 # a static snapshot, so it maps onto the same value with no live bridge.
 function remote_result(state::ServerState, payload::AbstractString, project_id::AbstractString)
-    s = String(payload)
-    if startswith(s, "{")
-        d = JSON.parse(s)
-        ref = d isa AbstractDict ? get(d, "remote_ref", nothing) : nothing
-        ref isa AbstractString &&
-            return RemoteRef(eval_bridge_for(state, project_id), ref, "")
-    end
-    return RemoteRef(nothing, "", s)
+    desc = result_descriptor(payload)
+    desc === nothing && return RemoteRef(nothing, "", String(payload))
+    return RemoteRef(eval_bridge_for(state, project_id), desc.ref, "")
 end

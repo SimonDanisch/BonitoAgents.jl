@@ -35,6 +35,11 @@ export class Collapsable {
         this.toggle  = opts.toggleEl || null;
         this.native  = opts.native || false;          // hosted in <details>/<summary>
         this.editMode = opts.editMode || false;
+        // Eval cards: the body stays MOUNTED across collapse (live embeds /
+        // Monaco survive) but collapse hides it via display — the height
+        // clamping happens per SUB-SECTION inside the body (see styles.jl
+        // .bt-clamped), never on the card body as a whole.
+        this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
         this.compactHeight  = opts.compactHeight  || 240;
         this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand   = this.editMode ? false : (opts.fetchEachExpand || false);
@@ -47,7 +52,8 @@ export class Collapsable {
         // in COMPACT visual state (Monaco capped to 240px) but their body
         // element is rendered/visible from the start; the initial
         // `setMaxHeight` lookup is deferred to the first toggle (Monaco may
-        // not have finished its async init when createNode runs).
+        // not have finished its async init when createNode runs). Compact
+        // EVAL bodies are capped by the CSS clamp instead (styles.jl).
         this.expanded = false;
 
         if (this.native) {
@@ -79,12 +85,17 @@ export class Collapsable {
         if (!this.native) {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            if (this.editMode) {
-                // Body stays visible; size via Monaco's own API so the
-                // resize is animated by Monaco itself instead of CSS clip.
+            if (this.editMode && !this.hideBodyOnCollapse) {
+                // Edit tools: body stays visible; size via Monaco's own API
+                // so the resize is animated by Monaco itself instead of CSS
+                // clip.
                 this.body.style.display = '';
                 this._applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
+                // Plain lazy bodies AND eval compact bodies hide on collapse;
+                // for the latter the node stays mounted (editMode skips the
+                // discard below), so re-expanding is instant and live embeds
+                // keep their sessions.
                 this.body.style.display = expanded ? '' : 'none';
             }
         }
@@ -104,7 +115,12 @@ export class Collapsable {
     // construction" (the body has the .monaco-diff-editor-div but no
     // __btMonacoDiff yet) and multi-diff bodies (just resize the first; the
     // sibling diffs are sized by the same body wrapper). No-op if the
-    // editor finished tearing down or never mounted.
+    // editor finished tearing down or never mounted — and for compact-body
+    // EVAL tools, whose plain Code editor has no such API: their ~4-line cap
+    // is a pure CSS clamp on the body wrapper keyed off
+    // `[data-compact-body] .bt-tool-header[data-expanded] ~ .bt-tool-body`
+    // (see styles.jl), so it holds for EVERY mount path (eager mount,
+    // terminal re-render, history reload) with no lifecycle hook.
     _applyEditHeight(h) {
         const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
         divs.forEach(div => {
@@ -738,6 +754,10 @@ class BonitoChat {
 
     destroy() {
         this.destroyed = true;
+        if (this._elapsedTimer) {
+            clearInterval(this._elapsedTimer);
+            this._elapsedTimer = null;
+        }
         if (this._onScroll) {
             this.container.removeEventListener('scroll', this._onScroll);
         }
@@ -2082,17 +2102,18 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
             // Pulsing glow + taskbar slot are gated on the `bt-tool-live`
-            // class. Terminal status sheds it; mid-flight gets it.
+            // class. Terminal status sheds it; mid-flight gets it (and the
+            // shared elapsed ticker with it).
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
-            // The live stdout tail's job ends with the eval — the completed
-            // body renders the full output in its "Output" section.
+            if (live) this._ensureElapsedTicker();
+            // Compact-body evals mount their body DURING the run (the live
+            // stream pane inside the Output section) and editMode never
+            // re-fetches on expand, so the completed content would stay
+            // stale forever. Re-render once at terminal status — the fresh
+            // body carries the COMPLETE output text (same bytes the stream
+            // showed, atomic with the result) and the result embed.
             if (!live) {
-                node.querySelector('.bt-eval-stream')?.remove();
-                // Compact-body evals mount their body DURING the run (Code
-                // only — no output/result exists yet) and editMode never
-                // re-fetches on expand, so the completed content would stay
-                // stale forever. Re-render once at terminal status.
                 if (node.dataset.compactBody === '1' && node.collapsable &&
                     node.collapsable.loaded && node.isConnected) {
                     this.comm.notify({ type: 'tool.render', id: msg.id });
@@ -2140,7 +2161,7 @@ class BonitoChat {
         if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
             const c = node.collapsable;
             c.editMode = true;
-            c.compactHeight = 110;
+            c.hideBodyOnCollapse = true;
             c.fetchEachExpand = false;
             c.discardOnCollapse = false;
             node.dataset.compactBody = '1';
@@ -2161,13 +2182,20 @@ class BonitoChat {
                 // compact size). A click on the header is what expands
                 // Monaco; this auto-mount just makes the diff visible
                 // without requiring a click.
+                // Eval compact bodies (hideBodyOnCollapse) DO flip expanded:
+                // their visible-body state IS the expanded state (sections
+                // self-clamp), so the arrow must read ▼ while the body shows.
                 if (node.isConnected) {
                     if (!node.collapsable.loaded) {
                         node.collapsable.loaded = true;
                         this.comm.notify({type: 'tool.render', id: msg.id});
                     }
+                    if (node.collapsable.hideBodyOnCollapse)
+                        node.collapsable.setExpanded(true);
                 } else {
                     node.dataset.btAutoMount = '1';
+                    if (node.collapsable.hideBodyOnCollapse)
+                        node.dataset.btAutoExpand = '1';
                 }
             } else if (node.isConnected) {
                 node.collapsable.setExpanded(true);
@@ -2218,12 +2246,22 @@ class BonitoChat {
             headerEl.insertBefore(sb,
                 headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
-        // Live stdout tail of a RUNNING eval: a small auto-scrolled pane
-        // under the header, fed by `stream_tail` updates (the server tails
-        // the eval session's log). Removed at terminal status — the full
-        // output then lives in the body's "Output" section.
+        // Live stdout of a RUNNING eval, fed by `stream_tail` updates (the
+        // server tails the eval session's log). The pane IS the body's
+        // Output section (server-rendered `.bt-eval-stream` inside it) —
+        // the stream is the output while running; the terminal re-render
+        // swaps in the complete text. Fallback: if the update raced the
+        // body mount, park a pane under the header (the mount replaces it).
         if (msg.stream_tail != null && stillLive && headerEl) {
-            let sp = node.querySelector('.bt-eval-stream');
+            let sp = node.querySelector('.bt-tool-body .bt-eval-stream');
+            if (sp) {
+                // The body's Output pane owns the stream now — drop a
+                // fallback pane parked under the header before the mount.
+                for (const stray of node.querySelectorAll('.bt-eval-stream'))
+                    if (stray !== sp) stray.remove();
+            } else {
+                sp = node.querySelector('.bt-eval-stream');
+            }
             if (!sp) {
                 sp = document.createElement('pre');
                 sp.className = 'bt-eval-stream';
@@ -2513,7 +2551,10 @@ class BonitoChat {
                 // / Task land here; regular tools don't.
                 const liveTool = !(msg.status === 'completed' || msg.status === 'failed') &&
                                   msg.finished_at == null;
-                if (liveTool) div.classList.add('bt-tool-live');
+                if (liveTool) {
+                    div.classList.add('bt-tool-live');
+                    this._ensureElapsedTicker();
+                }
                 const id = msg.id;
                 // Click-header host; the body is re-rendered (Monaco etc.) on
                 // every expand via tool.render → dom_in_js, and discarded on
@@ -2522,10 +2563,11 @@ class BonitoChat {
                 // header eagerly (no click required). The Collapsable's
                 // editMode keeps the body mounted across collapse — toggle
                 // just calls Monaco.setMaxHeight to swap compact↔full.
-                // Eval tools opt into the same compact-body mode via
-                // `compact_body` (server-typed): the body — whose first
-                // section is the full Monaco Code editor — stays mounted and
-                // collapse is a HEIGHT cap of ~4 code lines.
+                // Eval tools reuse editMode's KEEP-MOUNTED semantics via
+                // `compact_body` (server-typed) but not its height games:
+                // their body shows all sections (Code / Output each clamped
+                // to ~4 lines SECTION-side, result embed unclamped) and the
+                // header toggle plainly hides/shows the mounted body.
                 const compactBody = msg.kind === 'edit' || msg.compact_body === true;
                 if (msg.compact_body === true) div.dataset.compactBody = '1';
                 div.collapsable = new Collapsable(
@@ -2533,7 +2575,7 @@ class BonitoChat {
                     div.querySelector('.bt-tool-body'),
                     { toggleEl: div.querySelector('.bt-tool-toggle'),
                       editMode: compactBody,
-                      compactHeight: msg.compact_body === true ? 110 : undefined,
+                      hideBodyOnCollapse: msg.compact_body === true,
                       fetchEachExpand: !compactBody, discardOnCollapse: !compactBody,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
                 // Subagent Task: rebuild the live activity feed from the
@@ -2711,10 +2753,11 @@ class BonitoChat {
         // A tool ships either `code` (eval preview above) or `command` (this).
         const cmdPreview = msg.command ? `
             <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
-        // Elapsed timer — empty until the pill finishes, then filled ONCE
-        // with the final duration by `_writeToolElapsed` (on creation of an
-        // already-finished pill, and on the completion update). Live elapsed
-        // time is the taskbar's job (Julia clock); no JS timer touches this.
+        // Elapsed timer — ticks at 1Hz while the pill is LIVE (see
+        // _ensureElapsedTicker; running evals sit at "pending" for the whole
+        // MCP call, so this is how a user tells a hang from slow work) and
+        // freezes at the final duration on the terminal update
+        // (`_writeToolElapsed`).
         // The full-width toggle lives IN the header (right edge, after the
         // status pill) — an overlay button floating over the body covered
         // the actual app/diff content. CSS reveals it only while the body
@@ -2743,12 +2786,11 @@ class BonitoChat {
     }
 
     // ── Live tools / todos: pulse + timer + taskbar ──────────────────────
-    // A single 1s interval drives all live-state UX:
-    //   1) Update the inline `.bt-tool-timer` on each live pill (> 1s only).
-    //   2) Rebuild the floating taskbar from current live DOM (one slot per
-    //      live pill; click → scrollIntoView on the source).
-    // No per-pill timers, no server-pushed taskbar state — DOM is the source
-    // of truth. Cheap: scans at most a few dozen nodes once a second.
+    // Live-pill UX: the shared 1Hz `_ensureElapsedTicker` writes each live
+    // pill's `.bt-tool-timer` (> 1s only); the taskbar is a Julia-rendered
+    // component wired in `_setupLiveTicker` (click-to-scroll only here).
+    // No per-pill timers — DOM is the source of truth, scanned once a second
+    // while anything is live.
     onPlanUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -2796,11 +2838,35 @@ class BonitoChat {
             };
             this.taskbarEl.addEventListener('click', this._onTaskbarClick);
         }
-        // NO ticker here. Live elapsed time is shown in the TASKBAR, driven
-        // by a Julia clock (taskbar.jl / ensure_taskbar_clock!). In-chat tool
-        // pills show their FINAL duration, written ONCE on completion
-        // (`_writeToolElapsed`) — event-driven, never polled, so the scroll
-        // container is never queried on a timer.
+        // The in-chat elapsed ticker lives in `_ensureElapsedTicker` below —
+        // started on demand when a live pill appears, self-stopping when the
+        // last one finishes. (The taskbar keeps its own Julia clock.)
+    }
+
+    // One shared 1Hz interval ticks the inline `.bt-tool-timer` of every
+    // LIVE pill. Self-managing: call whenever a pill becomes live; the
+    // interval clears itself once no live pill exists anywhere (checked
+    // against `nodeById`, not the container — a live pill the virtual
+    // scroll has DETACHED must keep the ticker alive so it shows the right
+    // time the moment it scrolls back in). Ticks only write a span's
+    // textContent (no height change → no scroll perturbation), and the
+    // value is recomputed from `toolStarted` each tick, so the 1s cadence
+    // is purely cosmetic (background throttling clamps intervals to 1Hz —
+    // exactly this rate).
+    _ensureElapsedTicker() {
+        if (this._elapsedTimer) return;
+        this._elapsedTimer = setInterval(() => {
+            let any = false;
+            for (const node of this.nodeById.values()) {
+                if (!node.classList || !node.classList.contains('bt-tool-live')) continue;
+                any = true;
+                if (node.isConnected) _writeToolElapsed(node);
+            }
+            if (!any) {
+                clearInterval(this._elapsedTimer);
+                this._elapsedTimer = null;
+            }
+        }, 1000);
     }
 
     // ── Lens search bar (header) ─────────────────────────────────────────
@@ -3948,19 +4014,25 @@ function _formatElapsed(sec) {
     return s === 0 ? `${m}m` : `${m}m${s}s`;
 }
 
-// Write a tool pill's FINAL duration into its `.bt-tool-timer`, once, from
-// its started/finished data attrs. Event-driven (called on creation of an
-// already-finished pill and on the completion update) — there is no timer.
-// A still-running pill (no finished attr) shows nothing; its live elapsed
-// is the taskbar's job (Julia clock).
+// Write a tool pill's duration into its `.bt-tool-timer` from its data
+// attrs. A finished pill freezes at finished−started (event-driven writes on
+// creation of an already-finished pill and on the terminal update); a LIVE
+// pill (no finished attr) shows elapsed against the browser clock, driven by
+// the shared 1Hz ticker (`_ensureElapsedTicker`) — a running eval sits at
+// "pending" for its whole MCP call on the real wire, and without a clock
+// there's no telling a hang from slow work. The value is always RECOMPUTED
+// from the server's `started_at` timestamp (never accumulated tick counts),
+// so background-throttled or missed ticks and machine sleep can't drift it,
+// and a page reloaded mid-run still shows the true elapsed. Clamped ≥ 0
+// against minor server/browser clock skew.
 function _writeToolElapsed(node) {
     if (!node) return;
     const timer = node.querySelector('.bt-tool-timer');
     if (!timer) return;
     const started  = parseFloat(node.dataset.toolStarted  ?? '0');
     const finished = parseFloat(node.dataset.toolFinished ?? '0');
-    if (!started || !finished) return;
-    const dt = finished - started;
+    if (!started) return;
+    const dt = Math.max(0, (finished || Date.now() / 1000) - started);
     timer.textContent = dt > 1 ? _formatElapsed(dt) : '';
 }
 

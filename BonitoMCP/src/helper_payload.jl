@@ -1,8 +1,8 @@
 # Loaded into every Malt-managed Julia subprocess on startup. Provides two
 # pure formatting functions called from the wrapper expression in
-# session.jl::execute. Returns Vector{Dict{String,Any}} of MCP content
-# blocks — base types only, so Malt's serialiser never sees user-defined
-# types it can't reconstruct on the parent side.
+# session.jl::execute. Returns a `(; blocks, html, errored, echo)` payload of
+# base types only, so Malt's serialiser never sees user-defined types it
+# can't reconstruct on the parent side.
 
 module BonitoMCPHelper
 
@@ -30,28 +30,32 @@ const BACKTRACE_NOISE_FRAMES = (
 )
 
 # ── Public entries ──────────────────────────────────────────────────────────
+# Both formatters return the same typed payload NamedTuple:
+#   blocks  — extra agent-facing content blocks (rich-file refs; usually empty)
+#   html    — the result DESCRIPTOR json (`{"remote_ref": "...", "errored": ...}`)
+#             when a ref was parked, else nothing. NEVER rendered markup.
+#   errored — the eval threw (a USER error — typed, never sniffed from text)
+#   echo    — text appended to the OUTPUT stream, terminal-faithful: the
+#             result's repr (a REPL echoes the value) or the red ERROR text.
 """
-    format_value(val, max_bytes, full_output) → Vector{Dict{String,Any}}
+    format_value(val, out_dir, max_bytes, full_output)
 
-Turn a Julia value into MCP content blocks. `nothing` returns are suppressed.
-2-D color arrays render to PNG when PNGFiles is loaded in the env. Large
-containers are summarised. Always-text blocks use the `result:\\n<body>` shape
-so the chat-side renderer picks them up as labeled Monaco sections.
+Turn a Julia value into the eval result payload. In a chat context the value
+is PARKED in a page-invisible holder session (`RemoteProxy.remote_ref`) — no
+render at eval time; the descriptor identifies it and the chat's `RemoteRef`
+mounts it serialize-on-mount over the bridge. The agent reads the value from
+the output echo. 2-D color arrays additionally render to an on-disk PNG when
+PNGFiles is loaded in the env; large container reprs are summarised.
 """
 function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output::Bool)
-    # A `nothing` result still gets an (empty) html result block so the chat's
-    # invariant holds — content ALWAYS ends with the result, and everything
-    # between the code echo and it is stdout/console. Without this, a
-    # `Pkg.status(); nothing` (output, no value) leaves no result block and the
-    # chat would mount the stdout block AS the result, hiding the Output section.
-    val === nothing && return (; blocks = Dict{String,Any}[], html = "")
+    val === nothing &&
+        return (; blocks = Dict{String,Any}[], html = nothing, errored = false,
+                  echo = nothing)
 
-    # Chat context (proxy bridge loaded): the result is PARKED in a
-    # page-invisible holder session (`RemoteProxy.remote_ref`) — NO render at
-    # eval time. The final content block becomes a tiny JSON descriptor; the
-    # chat's typed render builds a `RemoteRef` from it and rendering happens
-    # per-mount over the bridge (serialize-on-mount). Ids are uuid/uuid
-    # strings, so the hand-built JSON needs no escaping.
+    repr = !full_output && is_large_container(val) ?
+        summarize_container(val) : sprint(show, "text/plain", val)
+    echo = truncate_text(repr, max_bytes, full_output, "result")
+
     ref = nothing
     if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
         ref = try
@@ -62,20 +66,16 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
         end
     end
     ref === nothing ||
-        return (; blocks = Dict{String,Any}[], html = "{\"remote_ref\":\"$(ref)\"}")
+        return (; blocks = Dict{String,Any}[],
+                  html = "{\"remote_ref\":\"$(ref)\",\"errored\":false}",
+                  errored = false, echo = echo)
 
-    # No bridge (standalone MCP): fall back to a text repr + on-disk rich preview
-    # so the agent still has a readable result without a live render.
+    # No bridge (standalone MCP): the repr echo is all the result there is;
+    # add an on-disk rich preview when the value is genuinely visual.
     blocks = Dict{String,Any}[]
-    repr = !full_output && is_large_container(val) ?
-        summarize_container(val) : sprint(show, "text/plain", val)
-    push!(blocks, Dict{String,Any}(
-        "type" => "text",
-        "text" => "result:\n$(truncate_text(repr, max_bytes, full_output, "result"))",
-    ))
     show_block = try_save_rich(val, out_dir, max_bytes)
     show_block === nothing || push!(blocks, show_block)
-    return (; blocks = blocks, html = nothing)
+    return (; blocks = blocks, html = nothing, errored = false, echo = echo)
 end
 
 # Walk the IMAGE MIME chain (PNG → SVG, plus PNGFiles for Colorant matrices)
@@ -182,34 +182,31 @@ function format_bytes_short(n::Integer)
 end
 
 """
-    format_error(err, bt, max_bytes, full_output) → Vector{Dict{String,Any}}
+    format_error(err, bt, max_bytes, full_output)
 
-Render an exception + trimmed backtrace as a single error block.
+An error is a VALUE: the `CapturedException` is parked via `remote_ref`
+exactly like any result (the chat mounts it live and Bonito renders it via
+`jsrender(::Session, ::CapturedException)`), the descriptor carries
+`errored: true`, and the terminal-faithful red `ERROR: …` text (with the
+trimmed backtrace) goes to the output echo — what a REPL would print.
 """
 function format_error(err, bt, max_bytes::Int, full_output::Bool)
-    text = sprint() do io
-        showerror(io, err)
-        println(io)
-        Base.show_backtrace(io, bt)
-    end
-    text = trim_backtrace(text)
-    # Same `(; blocks, html)` shape as format_value. bt_julia_eval ALWAYS renders
-    # an HTML fragment (when the bridge is up) — errors included — so the chat's
-    # EvalMsg can uniformly mount "the result render" without ever testing block
-    # content. The error renders as the exception itself (App(err) → its repr);
-    # the full backtrace stays in the text block for the agent.
-    html = nothing
-    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_eval_html)
-        html = try
-            Main.RemoteProxy.render_eval_html(err)
-        catch
+    ce = CapturedException(err, bt)
+    text = trim_backtrace(sprint(showerror, ce))
+    echo = "\e[91mERROR: " * truncate_text(text, max_bytes, full_output, "error") * "\e[39m"
+
+    ref = nothing
+    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
+        ref = try
+            Main.RemoteProxy.remote_ref(ce)
+        catch e
+            @warn "format_error: remote_ref failed; error stays text-only" exception = (e, catch_backtrace())
             nothing
         end
     end
-    return (; blocks = [Dict{String,Any}(
-        "type" => "text",
-        "text" => "error:\n$(truncate_text(text, max_bytes, full_output, "error"))",
-    )], html = html)
+    html = ref === nothing ? nothing :
+        "{\"remote_ref\":\"$(ref)\",\"errored\":true}"
+    return (; blocks = Dict{String,Any}[], html = html, errored = true, echo = echo)
 end
 
 # ── Output discipline ──────────────────────────────────────────────────────

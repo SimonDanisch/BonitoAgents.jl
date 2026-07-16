@@ -14,38 +14,40 @@
 # of more round-trips; higher = less polling overhead.
 
 # ── Status helpers ──────────────────────────────────────────────────────────
-# Emit the same block shape as `completed_response` (```julia code echo +
-# `stdout:` block) so the chat renderer treats running/completed identically:
-# code under "Code", live stdout under "Output", `Bonito.RichText` keeps ANSI
-# colors, no Markdown.parse italicizing `bt_julia_continue` into bt_*julia*_*.
-# Trailing decision line goes inside the stdout block so it stays in the
-# console-block render (one section, no second block falling to markdown).
+# Wire contract v3 — content blocks are:
+#   [output_text?, descriptor?]
+# where output_text is ONE terminal-faithful text (stdout/stderr as captured,
+# then the result repr or red ERROR text, REPL-style; agent-facing — the chat
+# shows the LIVE stream while running and only falls back to this block for
+# history) and descriptor is `{"remote_ref": "...", "errored": bool}` whenever
+# a ref was parked (values AND errors — a CapturedException is a value). No
+# code echo (agent has its tool input, chat has the typed `code` field), no
+# in-band labels, nothing to sniff. A checkpoint (still running) has no
+# descriptor; its footer rides inside the output text.
 function running_response(env_path::Union{String,Nothing},
-                          partial::AbstractString, elapsed::Real,
-                          code::AbstractString)
-    code_str = rstrip(String(code), '\n')
+                          partial::AbstractString, elapsed::Real)
     footer = string(
         "\n--- still running (", round(elapsed; digits = 2), "s",
         env_path === nothing ? "" : ", env=$env_path", ")",
         " — next: bt_julia_continue / bt_julia_interrupt / bt_julia_restart")
-    stdout_body = (isempty(partial) ? "(no output captured yet)" : partial) * footer
+    output = (isempty(partial) ? "(no output captured yet)" : partial) * footer
     return Dict{String,Any}(
-        "content" => [
-            Dict("type" => "text", "text" => "```julia\n$code_str\n```"),
-            Dict("type" => "text", "text" => "stdout:\n$stdout_body"),
-        ],
+        "content" => [Dict("type" => "text", "text" => output)],
         "isError" => false,
         "_meta"   => Dict("status" => "running", "elapsed_s" => elapsed),
     )
 end
 
-# `html` is the rendered result fragment (nothing outside a chat bridge). When
-# present it's appended as the FINAL content block: bt_julia_eval always renders,
-# so the chat's typed EvalMsg can mount "the last block" as the live result with
-# zero content sniffing (the tool name IS the type), and the agent sees it too.
+# `html` is the result DESCRIPTOR json (nothing outside a chat bridge, or for
+# a `nothing` result / checkpoint). Appended as the FINAL content block; the
+# chat identifies it by exact decode of its own format. `is_error` is the MCP
+# isError = INFRASTRUCTURE failures only — user errors ship a descriptor with
+# `errored: true` instead (claude fuses isError content into one rawOutput
+# string, which must never happen to a plain user error).
 function completed_response(blocks, html, is_error::Bool, elapsed::Real)
     content = copy(blocks)
-    html === nothing || push!(content, Dict{String,Any}("type" => "text", "text" => html))
+    html === nothing ||
+        push!(content, Dict{String,Any}("type" => "text", "text" => html))
     return Dict{String,Any}(
         "content" => content,
         "isError" => is_error,
@@ -101,7 +103,7 @@ function julia_eval_handler(args::AbstractDict)
 
     return res.status === :completed ?
         completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s, res.code)
+        running_response(env_path, res.partial, res.elapsed_s)
 end
 
 function julia_continue_handler(args::AbstractDict)
@@ -133,7 +135,7 @@ function julia_continue_handler(args::AbstractDict)
     end
     return res.status === :completed ?
         completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s, res.code)
+        running_response(env_path, res.partial, res.elapsed_s)
 end
 
 function julia_interrupt_handler(args::AbstractDict)
@@ -160,7 +162,7 @@ function julia_interrupt_handler(args::AbstractDict)
     end
     return res.status === :completed ?
         completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s, res.code)
+        running_response(env_path, res.partial, res.elapsed_s)
 end
 
 function julia_restart_handler(args::AbstractDict)

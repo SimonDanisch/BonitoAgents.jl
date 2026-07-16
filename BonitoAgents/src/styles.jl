@@ -1157,20 +1157,6 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "13px", "line-height" => "1.5",
         "padding-top" => "8px"),
 
-    # Eval-section blocks (BonitoMCP bt_julia_eval output): a tiny uppercase
-    # label (STDOUT / RESULT / ERROR) above the Monaco-rendered body of each
-    # section, so the input code, captured output, and return value are
-    # visually distinct in the tool body.
-    CSS(".bt-section-label",
-        "font-size" => "10.5px", "font-weight" => "600",
-        "letter-spacing" => "0.08em", "text-transform" => "uppercase",
-        "color" => "var(--bt-text-faint)",
-        "margin" => "12px 0 4px"),
-    CSS(".bt-eval-section + .bt-eval-section",
-        "margin-top" => "4px"),
-    CSS(".bt-eval-section:first-child .bt-section-label",
-        "margin-top" => "8px"),
-
     # Tool-body sub-section collapsibles (`<details>`). Used by bt_julia_eval
     # bodies to split Code / Output into two independently foldable blocks.
     # The disclosure marker is a `::before` glyph swapped on `[open]` — a
@@ -1210,6 +1196,34 @@ const ChatStyles = Bonito.Styles(
         "white-space" => "nowrap", "min-width" => "0"),
     CSS(".bt-subsection-body",
         "padding" => "8px 10px"),
+    # Per-SECTION height clamp (never on the whole tool card — the card's
+    # default state must keep every section and the result embed reachable).
+    # A long Code / Output section shows ~4-5 lines; the `.bt-subsection-more`
+    # toggle sits IN the summary row (right-aligned) so its position never
+    # moves when the body height changes — double-click flips expand/collapse.
+    # It toggles `data-full` on the <details>; the label swap lives in its
+    # onclick. Hidden while the section itself is folded (nothing to reveal).
+    CSS(".bt-subsection:not([data-full]) > .bt-subsection-body.bt-clamped",
+        "max-height" => "110px",
+        "overflow" => "hidden"),
+    CSS(".bt-subsection-more",
+        "margin-left" => "auto",
+        "font-size" => "11px",
+        "font-weight" => "400",
+        "text-transform" => "none",
+        "letter-spacing" => "normal",
+        "color" => "var(--bt-text-faint)",
+        "cursor" => "pointer",
+        "flex-shrink" => "0",
+        "user-select" => "none"),
+    CSS(".bt-subsection-more:hover",
+        "color" => "var(--bt-text)"),
+    CSS("details.bt-subsection:not([open]) .bt-subsection-more",
+        "display" => "none"),
+    # "show all" means ALL: the inner console pane drops its own scroll cap
+    # while the section is expanded to full.
+    CSS(".bt-subsection[data-full] .bt-console",
+        "max-height" => "none"),
 
     # Console block — wraps a `Bonito.RichText` terminal pane (ANSI → styled
     # HTML). Captured stdout / stderr / error backtraces render here instead

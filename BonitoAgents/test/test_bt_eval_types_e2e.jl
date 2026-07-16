@@ -172,8 +172,16 @@ const BY_ID = Dict(id => code for (id, code, _) in CASES)
                 "['completed','failed'].includes(document.querySelector('$(jsel(id)) .bt-tool-status')?.textContent)";
                 timeout = tmo) == true
             TK.click(s, "$(jsel(id)) .bt-tool-header")
-            ok = TK.wait_for(s, "$id rendered", predicate; timeout = 40) == true
-            ok || @info "case body dump" id body = TK.eval_js(s, "document.querySelector('$(jsel(id))')?.innerText?.slice(0,400) ?? '(none)'")
+            # wait_for THROWS on timeout — catch it so the failure dump below
+            # actually runs (an exception would skip straight past it).
+            ok = try
+                TK.wait_for(s, "$id rendered", predicate; timeout = 40) == true
+            catch
+                false
+            end
+            ok || @info "case body dump" id body = TK.eval_js(s,
+                "document.querySelector('$(jsel(id))')?.innerText?.slice(0,400) ?? '(none)'") embed = TK.eval_js(s,
+                "document.querySelector('$(jsel(id)) .bt-embed')?.innerText?.slice(0,200) ?? '(no embed)'")
             @test ok
         end
 

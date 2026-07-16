@@ -336,6 +336,10 @@ function start!(s::JuliaSession)
     # Background pumps drain worker stdout/stderr into our buffer (and tee
     # into the log file if one is configured). Both streams merge into the
     # same buffer — same UX as a normal REPL.
+    # A fresh session OWNS its deterministic log file (the chat derives the
+    # path from env_path alone to tail the live stream): truncate ONCE here,
+    # before the pumps spawn — they append from then on.
+    s.log_path === nothing || try write(s.log_path, "") catch end
     s.stdout_pump = Threads.@spawn pump_pipe!(s, s.worker.stdout)
     s.stderr_pump = Threads.@spawn pump_pipe!(s, s.worker.stderr)
 
@@ -351,6 +355,21 @@ function start!(s::JuliaSession)
     # Malt can't serialise a `Module` reference back to the parent.
     Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch; end; nothing))
     Malt.remote_eval_fetch(s.worker, :(include($(helper_payload_path())); nothing))
+    # The worker's PIPED stdout/stderr are write-buffered: plain `println`s in
+    # user code would reach the host (and the chat's live stream tail) in
+    # multi-second bursts — a terminal flushes far more eagerly. A 4Hz
+    # flusher task makes the captured stream terminal-faithful; it dies with
+    # the streams (flush on a closing stream throws → loop ends) and with
+    # the worker.
+    Malt.remote_eval_fetch(s.worker, :(@async try
+        while true
+            flush(stdout)
+            flush(stderr)
+            sleep(0.25)
+        end
+    catch
+        # stream closed — worker shutting down
+    end; nothing))
 
     # Interactive-app dial-back is lazy (ensure_eval_dialed! from bt_show_app),
     # so non-Bonito eval sessions don't pay for it.
@@ -363,6 +382,10 @@ function start!(s::JuliaSession)
 end
 
 function pump_pipe!(s::JuliaSession, pipe)
+    # APPEND, never "w": TWO pumps (stdout + stderr) write this same file —
+    # O_APPEND keeps their interleaved writes atomic, while two "w" handles
+    # would each write from position 0 and clobber each other. The fresh-
+    # session truncation happens ONCE in start!, before the pumps spawn.
     log_io = s.log_path === nothing ? nothing : open(s.log_path, "a")
     try
         while !eof(pipe)
@@ -448,10 +471,14 @@ function execute(s::JuliaSession, code::AbstractString;
         expr = try
             Meta.parseall(String(code))
         catch e
+            # A parse error is a USER error, delivered as terminal-faithful
+            # output text (never MCP isError — that's reserved for infra
+            # failures; claude fuses isError results into one rawOutput blob).
             return (status   = :completed,
                     blocks   = [Dict{String,Any}("type"=>"text",
-                                                  "text"=>"error:\nparse error: $(sprint(showerror, e))")],
-                    is_error = true,
+                                                  "text"=>"\e[91mERROR: parse error: $(sprint(showerror, e))\e[39m")],
+                    html     = nothing,
+                    is_error = false,
                     elapsed_s = 0.0)
         end
 
@@ -523,12 +550,14 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
     partial = cap_response_text(drain_output!(s))
 
     if istaskdone(f)
-        # `format_value`/`format_error` return `(; blocks, html)` — the agent
-        # text blocks plus (in a chat context) the rendered result HTML fragment.
+        # `format_value`/`format_error` return `(; blocks, html, errored, echo)`
+        # — extra agent blocks, the result descriptor json, the TYPED user-error
+        # flag, and the terminal-faithful output echo (result repr / ERROR text).
         result, fetch_failed = try
             (fetch(f), false)
         catch e
-            ((; blocks = interrupt_blocks(e), html = nothing), true)
+            ((; blocks = Dict{String,Any}[], html = nothing, errored = true,
+               echo = interrupt_echo(e)), true)
         end
         value_blocks = result.blocks
         html         = result.html
@@ -549,19 +578,23 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
         # Clear only if it's still OUR task — a concurrent kill may have already
         # nulled/replaced it.
         @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
-        # Worker's try/catch wraps user errors as `error:` blocks (returned
-        # normally), so a successful fetch can still represent a user error.
-        # Inspect the blocks to set is_error correctly.
-        is_error = fetch_failed || any(b -> startswith(get(b, "text", ""), "error:"),
-                                         value_blocks)
-        # Stitch: code echo + stdout (if any) + value/error blocks
-        blocks = Dict{String,Any}[]
-        push!(blocks, Dict("type" => "text",
-                            "text" => "```julia\n$(rstrip(s.in_flight_code, '\n'))\n```"))
-        if !isempty(partial)
-            push!(blocks, Dict("type" => "text",
-                                "text" => "stdout:\n$partial"))
+        # MCP-level isError is INFRASTRUCTURE failures only (worker task
+        # died / interrupt): claude-agent-acp fuses isError content into one
+        # rawOutput string, so a plain user error must never ride it — the
+        # descriptor's typed `errored` flag carries that instead. No block
+        # sniffing anywhere: the flag comes from the worker payload.
+        is_error = fetch_failed
+        # Stitch ONE terminal-faithful output text: captured stdout/stderr,
+        # then the echo (result repr / red ERROR text) — exactly what a REPL
+        # session would show. No code echo (the agent has its own tool input,
+        # the chat has the typed `code` field), no in-band labels.
+        output = partial
+        if result.echo !== nothing
+            output = isempty(output) ? result.echo : output * "\n" * result.echo
         end
+        blocks = Dict{String,Any}[]
+        isempty(output) ||
+            push!(blocks, Dict{String,Any}("type" => "text", "text" => output))
         append!(blocks, value_blocks)
         return (status = :completed, blocks = blocks, html = html,
                 is_error = is_error, elapsed_s = elapsed)
@@ -570,13 +603,10 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
             code = s.in_flight_code)
 end
 
-# Build a one-block error array from a Malt task failure. Drills through the
-# wrapper layers (TaskFailedException → RemoteException → InterruptException
-# or whatever the user's code actually threw).
-function interrupt_blocks(e)
-    msg = sprint(showerror, e)
-    return [Dict{String,Any}("type" => "text", "text" => "error:\n$msg")]
-end
+# Terminal-faithful text for a Malt task failure (interrupt / worker death).
+# Drills through the wrapper layers via showerror (TaskFailedException →
+# RemoteException → InterruptException or whatever the user's code threw).
+interrupt_echo(e) = "\e[91mERROR: $(sprint(showerror, e))\e[39m"
 
 # ── Lifecycle ───────────────────────────────────────────────────────────────
 function kill_session!(s::JuliaSession)

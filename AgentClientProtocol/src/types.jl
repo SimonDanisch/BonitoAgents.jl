@@ -325,6 +325,18 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
         )
     elseif kind == "tool_call_update"
         content = [parse_tool_content_item(c) for c in get(params, "content", [])]
+        # claude-agent-acp ships a FAILED MCP tool's result as a bare
+        # `rawOutput` STRING with NO content blocks (verified on acp.jsonl:
+        # the fused "```julia\n…\n```\nerror:\n…" text of a bt_julia_eval
+        # DomainError) — success frames carry real content blocks instead.
+        # Normalize the asymmetry HERE so every downstream consumer (snaps,
+        # persistence, renderers) only ever sees content. Terminal frames
+        # only: a mid-flight rawOutput would race the real content blocks.
+        if isempty(content) && get(params, "status", nothing) in ("completed", "failed")
+            rout = get(params, "rawOutput", nothing)
+            rout isa AbstractString && !isempty(rout) &&
+                (content = [TextContent(String(rout))])
+        end
         locs = [parse_location(l) for l in get(params, "locations", [])]
         name, rinput = parse_claude_meta(params)
         # Updates often omit meta + rawInput — preserve `nothing` so the
