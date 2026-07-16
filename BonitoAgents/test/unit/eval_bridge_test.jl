@@ -24,11 +24,23 @@ Bonito.setup_connection(::Bonito.Session{SlowConn}) = nothing
 
 @testset "EvalBridge server-side (headless)" begin
 
-    @testset "call_ctrl fails fast when the socket is down" begin
+    @testset "call_ctrl fails fast when the socket is down (redial_grace = 0)" begin
         eb = mkbridge()
         t0 = time()
-        @test_throws Exception BT.call_ctrl(eb, "delegate"; timeout = 30.0)
+        @test_throws Exception BT.call_ctrl(eb, "delegate"; timeout = 30.0, redial_grace = 0.0)
         @test time() - t0 < 1.0          # fast-fail, NOT a 30s timedwait
+    end
+
+    @testset "call_ctrl waits out the redial grace, then errors" begin
+        # A dropped dial-back gets a bounded reconnect window before failing —
+        # an instant error here used to leave fragments without their JS module
+        # (asset fetch during a redial). No redial happens in this test, so the
+        # call must error AFTER the grace, not before and not much later.
+        eb = mkbridge()
+        t0 = time()
+        @test_throws Exception BT.call_ctrl(eb, "delegate"; timeout = 30.0, redial_grace = 0.3)
+        elapsed = time() - t0
+        @test 0.3 <= elapsed < 2.0
     end
 
     @testset "fail_pending! resolves every in-flight request, then empties" begin

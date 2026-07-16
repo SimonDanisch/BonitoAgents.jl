@@ -76,7 +76,7 @@ file_tab_id(path::AbstractString) = "file:" * String(path)
 app_panel_id(tool_id::AbstractString) = "app:" * String(tool_id)
 
 # ── Tool-body wrapper helper ─────────────────────────────────────────────────
-# Wrap an `EvalResultPlaceholder` (or any rendered app body) in the slot/embed
+# Wrap a `RemoteRef` (or any rendered app body) in the slot/embed
 # pair the workspace controller needs, plus a placeholder string that takes over
 # the inline spot while the embed is detached.
 #

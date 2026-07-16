@@ -46,23 +46,23 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
     # chat would mount the stdout block AS the result, hiding the Output section.
     val === nothing && return (; blocks = Dict{String,Any}[], html = "")
 
-    # Rich render → ONE self-contained HTML fragment, when the proxy bridge is
-    # loaded (a chat context). `App(val)` + Bonito's MIME dispatch covers
-    # everything `try_save_rich` did: a plot/image becomes a `DOM.img` backed by
-    # a `BinaryAsset` URL served over the proxy (NOT base64 inline), text becomes
-    # text. When we get a fragment it IS the whole result — the chat mounts it
-    # and the agent reads it — so we emit NO text repr / file block: the content
-    # is a clean `[…, html]` the chat keys off by tool NAME, never by parsing.
-    html = nothing
-    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_eval_html)
-        html = try
-            Main.RemoteProxy.render_eval_html(val)
+    # Chat context (proxy bridge loaded): the result is PARKED in a
+    # page-invisible holder session (`RemoteProxy.remote_ref`) — NO render at
+    # eval time. The final content block becomes a tiny JSON descriptor; the
+    # chat's typed render builds a `RemoteRef` from it and rendering happens
+    # per-mount over the bridge (serialize-on-mount). Ids are uuid/uuid
+    # strings, so the hand-built JSON needs no escaping.
+    ref = nothing
+    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
+        ref = try
+            Main.RemoteProxy.remote_ref(val)
         catch e
-            @warn "format_value: result HTML render failed; falling back to text/file preview" exception = (e, catch_backtrace())
+            @warn "format_value: remote_ref failed; falling back to text/file preview" exception = (e, catch_backtrace())
             nothing
         end
     end
-    html === nothing || return (; blocks = Dict{String,Any}[], html = html)
+    ref === nothing ||
+        return (; blocks = Dict{String,Any}[], html = "{\"remote_ref\":\"$(ref)\"}")
 
     # No bridge (standalone MCP): fall back to a text repr + on-disk rich preview
     # so the agent still has a readable result without a live render.

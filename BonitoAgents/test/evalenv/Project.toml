@@ -20,6 +20,14 @@ DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 ImageShow = "4e3cecfd-b093-5904-9786-8bbb286a6a31"
 PNGFiles = "f57f5aa1-a3ce-4bc8-8ab9-96f992907883"
+WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
+
+[extras]
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+ComputePipeline = "95dc2771-c249-4cd0-9c9f-1f3b4330693c"
 
 [sources]
 Bonito = {path = "../../../../Bonito"}
+WGLMakie = {path = "../../../../Makie/WGLMakie"}
+Makie = {path = "../../../../Makie/Makie"}
+ComputePipeline = {path = "../../../../Makie/ComputePipeline"}

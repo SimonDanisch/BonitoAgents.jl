@@ -609,8 +609,17 @@ mutable struct SessionManager
     log_dir::String
 end
 
+# DETERMINISTIC log location: the chat host derives the same path from the
+# env_path alone (`eval_log_path`) and live-tails it over the worker file
+# protocol while an eval runs — a random mktempdir would make the path
+# unknowable outside this process. Two MCP instances on one machine sharing an
+# env append to the same file; for a live tail this interleaving is harmless
+# (offset-based tailing only surfaces what arrives while THIS eval runs).
+eval_log_dir() = joinpath(tempdir(), "bonitoagents-mcp-logs")
+
 function SessionManager()
-    log_dir = mktempdir(; prefix = "bonitoagents-mcp-logs-")
+    log_dir = eval_log_dir()
+    mkpath(log_dir)
     SessionManager(Dict{String,JuliaSession}(),
                    Dict{String,Task}(),
                    ReentrantLock(), log_dir)
@@ -620,12 +629,25 @@ const TEMP_KEY = "__temp__"
 
 _key(env_path::Union{String,Nothing}) = env_path === nothing ? TEMP_KEY : abspath(env_path)
 
-function _log_path(m::SessionManager, key::String)
+function log_file_name(key::AbstractString)
     safe = replace(key, '/' => '_', '\\' => '_')
     safe = strip(safe, '_')
     isempty(safe) && (safe = "temp")
-    return joinpath(m.log_dir, "$safe.log")
+    return "$safe.log"
 end
+
+"""
+    eval_log_path(env_path) -> String
+
+The on-disk stdout/stderr log of the eval session for `env_path`, derivable
+WITHOUT a manager instance — the chat host uses this to live-tail a running
+eval's output on the worker machine.
+"""
+eval_log_path(env_path::Union{AbstractString,Nothing}) =
+    joinpath(eval_log_dir(),
+             log_file_name(_key(env_path === nothing ? nothing : String(env_path))))
+
+_log_path(m::SessionManager, key::String) = joinpath(m.log_dir, log_file_name(key))
 
 # Return the live Julia session for `env_path`, creating one if needed. Creation
 # is SINGLE-FLIGHT per key: concurrent callers for the same env_path share ONE

@@ -33,13 +33,25 @@ mutable struct EvalBridge
     pending_lock::ReentrantLock
     reqid::Threads.Atomic{Int}
     root_conn::Base.RefValue{Any}        # current browser root connection (worker→browser target)
-    # Per-bridge host-side wiring. FIELDS, not module-global `BRIDGE_ATTACHED` /
-    # `MOUNTS` Dicts keyed by this bridge's prefix: this state belongs to ONE
-    # bridge and dies with it (`clear_bridge_wiring!` just empties these).
+    # Worker→browser frames that arrived while NO browser connection was
+    # attached (the dial-back → first-mount window, or a tab-switch gap).
+    # Dropping them silently was the root cause of the "plot spinner never
+    # finishes" hang: glyph batches at eval time, session init bundles — all
+    # gone with no retry. Parked frames flush IN ORDER on the next attach /
+    # reconnect (`flush_parked!`); the byte-cap keeps a never-mounted chat from
+    # holding unbounded memory (overflow drops OLDEST first, with a warn —
+    # the subsession pull/re-mount paths recover from that).
+    parked::Vector{Vector{UInt8}}
+    parked_bytes::Int
+    parked_lock::ReentrantLock
+    # Per-bridge host-side wiring. FIELDS, not module-global state keyed by
+    # this bridge's prefix: it belongs to ONE bridge and dies with it
+    # (`clear_bridge_wiring!` empties it).
     attached_roots::Set{String}          # root.id of every tab this bridge is wired to (attach-once guard)
-    mounts::Dict{String,String}          # "root.id|app_id" => current worker sub_id (supersede bookkeeping)
-    wire_lock::ReentrantLock             # guards attached_roots + mounts
+    wire_lock::ReentrantLock             # guards attached_roots
 end
+
+const PARKED_BYTE_CAP = 64 * 1024 * 1024  # 64 MB per bridge
 
 # Reconnects compare prefix (== BRIDGE[].parent.id on the worker): same prefix
 # means same BRIDGE[] / same routes, swap WS; different prefix means worker
@@ -48,7 +60,50 @@ make_eval_bridge(prefix::AbstractString, ws, host) = EvalBridge(
     String(prefix), ws, ReentrantLock(), host,
     Dict{Int,Channel{Any}}(), ReentrantLock(),
     Threads.Atomic{Int}(0), Base.RefValue{Any}(nothing),
-    Set{String}(), Dict{String,String}(), ReentrantLock())
+    Vector{Vector{UInt8}}(), 0, ReentrantLock(),
+    Set{String}(), ReentrantLock())
+
+# Park a worker→browser frame until a browser connection attaches. Overflow
+# drops the OLDEST frames: the newest ones are the likeliest to matter (the
+# most recent snapshot/bundle), and the pull/re-mount paths heal older losses.
+function park_frame!(eb::EvalBridge, payload::Vector{UInt8})
+    lock(eb.parked_lock) do
+        push!(eb.parked, payload)
+        eb.parked_bytes += length(payload)
+        dropped = 0
+        while eb.parked_bytes > PARKED_BYTE_CAP && length(eb.parked) > 1
+            old = popfirst!(eb.parked)
+            eb.parked_bytes -= length(old)
+            dropped += 1
+        end
+        dropped == 0 ||
+            @warn "eval relay: parked-frame cap hit; dropped oldest frames" dropped prefix = eb.prefix maxlog = 5
+    end
+    return
+end
+
+# Flush parked frames IN ORDER to `rc`. Failures re-park the remainder (the
+# connection died mid-flush; the next attach retries).
+function flush_parked!(eb::EvalBridge, rc)
+    rc === nothing && return
+    lock(eb.parked_lock) do
+        isempty(eb.parked) && return
+        n = length(eb.parked)
+        while !isempty(eb.parked)
+            payload = eb.parked[1]
+            try
+                write(rc, payload)
+            catch e
+                @warn "eval relay: parked-frame flush failed; keeping remainder for next attach" exception = (e,) remaining = length(eb.parked) prefix = eb.prefix
+                return
+            end
+            popfirst!(eb.parked)
+            eb.parked_bytes -= length(payload)
+        end
+        @info "eval relay: flushed parked frames to browser" frames = n prefix = eb.prefix
+    end
+    return
+end
 
 # Read an eval bridge for `project_id` under `state.lock` (T11). Writers
 # (`handle_eval_ws`, `teardown_eval_bridge!`) mutate `state.eval_workers` under the
@@ -108,11 +163,21 @@ worker_asset_url(eb::EvalBridge, path::AbstractString) =
 # A control request that expects a reply (asset_read / asset_url). The dial-back
 # relay loop resolves it via `pending`; this runs on a DIFFERENT task (a chat
 # command or an HTTP asset handler), so the wait can't deadlock the relay.
-function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, kw...)
-    # Disconnected window (WS dropped, worker redialing): fail fast instead of
-    # sending into the void and waiting out the full timeout. The worker's
-    # dial_loop reconnects within its backoff; the caller can retry/re-render.
-    eb.ws === nothing && error("eval bridge disconnected (worker redialing); '$op' not sent")
+function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, redial_grace = 10.0, kw...)
+    # Disconnected window (WS dropped, worker redialing): the worker's
+    # dial_loop reconnects within a couple of seconds, so WAIT that window out
+    # instead of failing instantly — an instant failure here was what left
+    # fragments without their JS module (asset fetch during a redial → module
+    # never loads → permanent spinner). Only error once the grace runs out.
+    # `redial_grace = 0` restores fail-fast (tests, callers with own retry).
+    if eb.ws === nothing
+        deadline = time() + redial_grace
+        while eb.ws === nothing && time() < deadline
+            sleep(0.1)
+        end
+        eb.ws === nothing &&
+            error("eval bridge disconnected (worker did not redial within $(redial_grace)s); '$op' not sent")
+    end
     id = Threads.atomic_add!(eb.reqid, 1)
     ch = Channel{Any}(1)
     lock(eb.pending_lock) do; eb.pending[id] = ch; end
@@ -227,12 +292,22 @@ function relay_writer(eb::EvalBridge, outbound::Channel{Vector{UInt8}})
     for payload in outbound
         rc = eb.root_conn[]
         if rc === nothing
-            # One-shot log on the FIRST drop of a run (T12): the old condition
-            # `just_failed && (…; just_failed = true)` was inverted — it only
-            # logged once `just_failed` was ALREADY true, so the promised
-            # "frame dropped" line never fired on the first drop. Log when NOT
-            # already in a failed run, then latch.
-            just_failed || (@info "eval relay: no browser connection — frame dropped" prefix = eb.prefix)
+            # No browser connection attached (dial-back → first-mount window,
+            # tab switch, reload). PARK the frame — dropping here was the root
+            # cause of the permanent plot spinner (lost init bundles / glyph
+            # batches with no retry). `flush_parked!` delivers them in order on
+            # the next attach/reconnect.
+            just_failed || (@info "eval relay: no browser connection — frame parked" prefix = eb.prefix)
+            just_failed = true
+            park_frame!(eb, payload)
+            continue
+        end
+        # Ordering: anything parked must go out before this frame. If the flush
+        # couldn't complete (connection died mid-flush), park this frame behind
+        # the remainder instead of overtaking it.
+        flush_parked!(eb, rc)
+        if lock(() -> !isempty(eb.parked), eb.parked_lock)
+            park_frame!(eb, payload)
             just_failed = true
             continue
         end
@@ -243,7 +318,10 @@ function relay_writer(eb::EvalBridge, outbound::Channel{Vector{UInt8}})
                 just_failed = false
             end
         catch e
-            @warn "eval relay: browser write failed (frame dropped)" exception = (e, catch_backtrace()) bytes = length(payload) prefix = eb.prefix
+            # The connection died under us: park this frame too — the next
+            # attach (re-mount, reconnect) delivers it instead of losing it.
+            @warn "eval relay: browser write failed (frame parked for next attach)" exception = (e, catch_backtrace()) bytes = length(payload) prefix = eb.prefix
+            park_frame!(eb, payload)
             just_failed = true
         end
     end
@@ -362,14 +440,16 @@ function handle_eval_ws(state::ServerState, ws)
 end
 
 # Clear a bridge's host-side wiring: its `attach_bridge_host!` attach-once guard
-# and per-mount subsession bookkeeping — so a later bridge (same tab) re-attaches
-# cleanly instead of short-circuiting on a stale attach tag. The wiring lives on
-# the bridge now, so this just empties it. (The mounted subs are already dead once
-# the worker session is gone, so we just drop the entries.)
+# — so a later bridge (same tab) re-attaches cleanly instead of
+# short-circuiting on a stale attach tag.
 function clear_bridge_wiring!(eb::EvalBridge)
     lock(eb.wire_lock) do
         empty!(eb.attached_roots)
-        empty!(eb.mounts)
+    end
+    # A retired bridge's parked frames belong to a dead worker session — drop them.
+    lock(eb.parked_lock) do
+        empty!(eb.parked)
+        eb.parked_bytes = 0
     end
     return nothing
 end
@@ -512,14 +592,25 @@ end
 # attach-once guard is a per-bridge `eb.attached_roots` set of root ids (the bridge
 # IS the prefix), not a module-global keyed by "prefix|root".
 function attach_bridge_host!(root::Bonito.Session, eb::EvalBridge)
+    # ALWAYS rebind the browser connection + flush parked frames, even for an
+    # already-attached root: the attach-once guard below only covers the
+    # route/listener wiring. Keeping `root_conn` from the FIRST attach was a
+    # pinned hang cause — after a page ws reconnect the relay kept writing to
+    # the stale connection while every later mount's attach returned early.
+    eb.root_conn[] = Bonito.connection(root)
+    flush_parked!(eb, eb.root_conn[])
+
     lock(eb.wire_lock) do
         root.id in eb.attached_roots && return false
         push!(eb.attached_roots, root.id); return true
     end || return
 
-    # worker → browser frames are written to this connection by the dial-back
-    # relay loop (`handle_eval_ws`); point it at this tab's socket.
-    eb.root_conn[] = Bonito.connection(root)
+    # Rebind + flush on every (re)connect of this tab's websocket, so a
+    # reconnect can't leave the relay pointed at the dead connection.
+    Bonito.on(root.on_open) do _
+        eb.root_conn[] = Bonito.connection(root)
+        flush_parked!(eb, eb.root_conn[])
+    end
 
     # browser → worker: the host decodes each inbound frame to route it
     # (route_to_remote needs the msg_type/session), then `proxy_forward(eb, data)`
@@ -532,44 +623,9 @@ function attach_bridge_host!(root::Bonito.Session, eb::EvalBridge)
     Bonito.on(root.on_close) do _
         Bonito.unregister_remote!(root, eb.prefix)
         eb.root_conn[] === Bonito.connection(root) && (eb.root_conn[] = nothing)
-        # Close any worker subsessions still mounted for this tab so they don't
-        # outlive the page.
-        for sid in take_mounts!(root, eb); close_remote_sub!(eb, sid); end
         lock(eb.wire_lock) do; delete!(eb.attached_roots, root.id); end
     end
     return
-end
-
-# ── Per-mount subsession bookkeeping ────────────────────────────────────────
-#
-# `Collapsable` discards a tool body with `innerHTML=''` and re-renders via a
-# FRESH `dom_in_js` on the next expand — and that DOM removal does NOT close the
-# proxied worker subsession (Bonito's delete-observer doesn't reliably collect
-# proxied subs; the reference `embed_app` likewise tears down explicitly on
-# `host.on_close`). So we track the current worker sub per (tab, app) and close
-# the previous one when a new mount supersedes it, mirroring `embed_app`. Closing
-# the worker sub releases its asset (1→0) AND — because the bridge parent is
-# marked ready — emits `Bonito.free_session(sub_id)` to the browser, dropping the
-# stale listeners a removed mount left on shared observables.
-# Mount bookkeeping lives on the bridge (`eb.mounts`), so the key drops the prefix
-# (the bridge IS the prefix): "root.id|app_id" => current sub_id.
-mount_key(root, app_id) = string(root.id, '|', app_id)
-
-# Record `sub_id` as the live mount for (root, app); return the superseded one (or nothing).
-function swap_mount!(root, eb, app_id, sub_id)
-    lock(eb.wire_lock) do
-        k = mount_key(root, app_id)
-        old = get(eb.mounts, k, nothing); eb.mounts[k] = sub_id; old
-    end
-end
-
-# Drop + return every mounted sub_id for this (root, bridge) — used on tab close.
-function take_mounts!(root, eb)
-    lock(eb.wire_lock) do
-        pre = string(root.id, '|')
-        ks = filter(k -> startswith(k, pre), collect(keys(eb.mounts)))
-        sids = String[eb.mounts[k] for k in ks]; foreach(k -> delete!(eb.mounts, k), ks); sids
-    end
 end
 
 # Close a proxied worker subsession (best-effort): a `close` control frame. The
@@ -579,33 +635,73 @@ end
 close_remote_sub!(eb::EvalBridge, sub_id::AbstractString) =
     (send_ctrl(eb, Dict("op" => "close", "sub" => String(sub_id))); nothing)
 
-# ── Pre-rendered eval RESULT (bt_julia_eval) ─────────────────────────────────
-# Unlike a live `bonito_app`, the worker ALREADY rendered the result VALUE to a
-# self-contained HTML fragment (`RemoteProxy.render_eval_html`), shipped as the
-# final ACP content block. Its inline `init_session(...)` runs on mount thanks
-# to Bonito's RAW_HTML script-rerun, so there's NO `delegate` round-trip: we
-# just attach the bridge host wiring — so the fragment's proxied assets +
-# observables route to the worker — and drop the HTML in. The html string IS the
-# persisted result; with no live bridge (history reloaded, worker gone) it still
-# mounts as a STATIC snapshot, only the proxied asset/obs traffic won't resolve.
-struct EvalResultPlaceholder
-    bridge::Union{Nothing, EvalBridge}
-    html::String
+# ── RemoteRef: a worker-held eval RESULT as a composable value ───────────────
+# (spec: docs/superpowers/specs/2026-07-15-remote-ref-design.md)
+#
+# The worker PARKS the result value in a page-invisible holder session
+# (`RemoteProxy.remote_ref`) and the chat receives only its id. Rendering is
+# serialize-on-mount: `jsrender` asks the worker (the "mount" control op) to
+# render the held App into a FRESH, disposable render-subsession targeted at
+# our placeholder node — delivered as one atomic `UpdateSession` through the
+# relay (the page polls for the node, so the reply racing the DOM mount is
+# fine). Static-first: the placeholder shows `snapshot` (or a not-live note)
+# immediately and the UpdateSession REPLACES it — a dead bridge, an evicted
+# holder, a slow worker, or a lost reply all degrade to the same visible
+# static state. Nothing can hang.
+#
+# Ownership: each mount's LOCAL session owns its OWN render-sub — collapse
+# discards the local `dom_in_js` sub, its `on_close` closes the render-sub on
+# the worker (Julia-first deletion, so the page frees via `free_session`).
+# The holder is never touched by mount lifecycles, so collapse → re-expand
+# (fresh local session → fresh mount → fresh render-sub) can never be killed
+# by a stale close, and the page GC collecting an unmounted render-sub is
+# correct behavior.
+struct RemoteRef
+    bridge::Union{Nothing, EvalBridge}   # THIS worker incarnation; the id's prefix pins validity
+    session_id::String                   # worker-side holder session id ("prefix/uuid")
+    snapshot::String                     # static html fallback; "" = none yet
 end
 
-function Bonito.jsrender(session::Bonito.Session, p::EvalResultPlaceholder)
-    isempty(p.html) &&
-        return Bonito.jsrender(session, Bonito.DOM.div("(no result render)"; class = "bt-tool-empty"))
-    # Attach the bridge routing to the ROOT session that owns the tab's websocket
-    # — NOT `session`, which is the transient `dom_in_js` subsession the
-    # ToolRenderCommand renders the body in. `register_remote!` must live on the
-    # root so the host's `route_to_remote` forwards the eval subsession's OUTGOING
-    # frames (observable notifies from clicks) back to the worker; on the subsession
-    # they'd be ignored and interaction would be dead even though the bundle loaded.
-    # Uses root_session(host) + attach_bridge_host! to wire the bridge to the tab.
-    p.bridge === nothing || attach_bridge_host!(Bonito.root_session(session), p.bridge)
-    return Bonito.jsrender(session, HTML(p.html))
+function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
+    body = isempty(r.snapshot) ?
+        Bonito.DOM.div("(result not live — worker gone and no snapshot)"; class = "bt-tool-empty") :
+        HTML(r.snapshot)
+    node = Bonito.DOM.div(body; class = "bt-remote-ref")
+    eb = r.bridge
+    if eb === nothing || eb.ws === nothing
+        return Bonito.jsrender(session, node)
+    end
+    node_id = Bonito.uuid(session, node)
+    # Routing must live on the ROOT (owns the tab's websocket); `session` is the
+    # transient `dom_in_js` sub the tool body renders in.
+    attach_bridge_host!(Bonito.root_session(session), eb)
+    Base.errormonitor(@async try
+        render_sub = String(call_ctrl(eb, "mount"; sub = r.session_id, node = node_id))
+        Bonito.on(session, session.on_close) do _
+            close_remote_sub!(eb, render_sub)
+        end
+        # The local session may have closed while the round trip was in flight
+        # (fast collapse): the listener above will never fire, close directly.
+        Bonito.isclosed(session) && close_remote_sub!(eb, render_sub)
+    catch e
+        # The placeholder keeps showing the static state; a re-expand retries
+        # with a fresh mount.
+        @warn "RemoteRef mount failed (static fallback stays)" exception = (e,) session_id = r.session_id
+    end)
+    return Bonito.jsrender(session, node)
 end
 
-eval_result_placeholder(state::ServerState, html::AbstractString, project_id::AbstractString) =
-    EvalResultPlaceholder(eval_bridge_for(state, project_id), String(html))
+# Build the RemoteRef from the persisted result payload (the final content
+# block). Current payloads are the JSON descriptor `{"remote_ref": id}`;
+# pre-RemoteRef history persisted the rendered html itself — which is exactly
+# a static snapshot, so it maps onto the same value with no live bridge.
+function remote_result(state::ServerState, payload::AbstractString, project_id::AbstractString)
+    s = String(payload)
+    if startswith(s, "{")
+        d = JSON.parse(s)
+        ref = d isa AbstractDict ? get(d, "remote_ref", nothing) : nothing
+        ref isa AbstractString &&
+            return RemoteRef(eval_bridge_for(state, project_id), ref, "")
+    end
+    return RemoteRef(nothing, "", s)
+end

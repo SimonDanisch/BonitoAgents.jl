@@ -250,6 +250,24 @@ end
 # on. Any exception below MUST come back as a reply with an `err` field — otherwise
 # the host's `call_ctrl` only learns about the failure after a 30s timeout,
 # freezing the chat tool-render path. Notifications (`close`) carry no id.
+# ── RemoteRef: page-invisible value holder + serialize-on-mount ─────────────
+# (spec: BonitoAgents/docs/superpowers/specs/2026-07-15-remote-ref-design.md)
+#
+# An eval result is PARKED, not rendered: a subsession of the bridge parent
+# holds `App(value)` in `current_app` and is never shipped to any page (so the
+# page-side session GC can't touch it; it dies with the worker). The session
+# tree is the registry — `get_session` finds it by id. Rendering happens per
+# MOUNT via the "mount" control op below: `update_session_dom!` creates a
+# fresh, disposable render-subsession and delivers html + init messages as one
+# atomic UpdateSession through the relay. Each mount is independent, so
+# collapse/re-expand loops and page reloads can never race each other.
+function remote_ref(@nospecialize(value))
+    parent = get_parent_session()
+    holder = Bonito.Session(parent)
+    holder.current_app[] = Bonito.App(display_value(bound_for_render(value)))
+    return holder.id
+end
+
 function handle_control(b::RemoteBridge, msg::AbstractDict)
     op = msg["op"]
     d = b.driver
@@ -271,6 +289,15 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
         elseif op == "close"
             s = Bonito.get_session(b.parent, String(msg["sub"]))
             s === nothing || close(s)
+        elseif op == "mount"
+            holder = Bonito.get_session(b.parent, String(msg["sub"]))
+            holder === nothing &&
+                error("result session $(msg["sub"]) not found (worker restarted or result evicted)")
+            app = holder.current_app[]
+            app === nothing && error("result session $(msg["sub"]) holds no app")
+            Bonito.force_subsession!(true)
+            sub = Bonito.update_session_dom!(holder, String(msg["node"]), app)
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => sub.id))
         end
     catch e
         # Surface the failure to the host so its 30s timedwait turns into a fast,
