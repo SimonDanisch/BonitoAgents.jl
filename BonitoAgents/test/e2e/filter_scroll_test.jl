@@ -5,6 +5,15 @@
 # and re-pins it after refresh; pre-fix the reflow jumped the reader several
 # messages down (marker 9 -> 15 in the repro) because refresh's own anchor ran
 # only AFTER the jump and faithfully preserved the wrong spot (#48).
+#
+# The invariant asserted is "the READING ROW keeps its screen offset": the
+# marker that was top-visible at the toggle instant must sit at the same
+# viewport offset afterwards. It is NOT "the top-visible marker number is
+# unchanged" — when a to-be-hidden tool row straddles the viewport top edge,
+# collapsing it necessarily slides the PREVIOUS marker's bottom down into the
+# viewport, so the first-visible-marker identity can legitimately change while
+# the view holds pixel-perfectly (observed: anchor held marker 9 at +30 exactly,
+# yet marker 8's bottom landed at +30 and became the new "top" marker).
 @testitem "e2e:filter_scroll" setup = [SharedServer] tags = [:e2e] begin
     S = SharedServer; s = S.server(); TK = S.TK
 
@@ -82,32 +91,41 @@
     })()"""
     # On failure, the anchor's own capture decision tells WHICH row it pinned.
     ANCHOR_DEBUG = "JSON.stringify(($CH)._anchorDebug ?? null)"
+    # Viewport offset of marker #mk (the reading row), or null if not rendered.
+    # The row is pinned at the viewport top by the toggle anchor, so it cannot
+    # be virtualized away between the toggle and this probe.
+    OFFSET_OF(mk) = """(() => {
+        const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
+        const n = [...c.querySelectorAll('.bt-agent-msg')].filter(n=>n.offsetParent)
+            .find(n => (((n.innerText||'').match(/number (\\d+)/)||[])[1]|0) === $mk);
+        return n ? Math.round(n.offsetTop - c.scrollTop) : null;
+    })()"""
 
-    @testset "hiding a type holds the top marker" begin
+    @testset "hiding a type holds the reading row" begin
         pre = TK.eval_js(s, TOGGLE(true))
+        @test pre !== nothing && pre["mk"] > 0
         # Settle drift between the reference probe and the toggle is worth
         # SEEING when diagnosing (it was the historical flake), but it is not
         # a failure of the toggle itself.
         pre["mk"] == before["mk"] && pre["off"] == before["off"] ||
             @info "filter_scroll: geometry drifted between probe and toggle (settle noise)" before pre
         sleep(0.6)
-        hid = TK.eval_js(s, MARKER)
-        @test hid !== nothing
-        ok = hid["mk"] == pre["mk"] && abs(Int(hid["off"]) - Int(pre["off"])) <= 4
-        ok || @info "filter_scroll hide FAILED" pre hid anchor = TK.eval_js(s, ANCHOR_DEBUG)
-        @test hid["mk"] == pre["mk"]                       # same marker → view held
-        @test abs(Int(hid["off"]) - Int(pre["off"])) <= 4  # same screen position
+        off = TK.eval_js(s, OFFSET_OF(pre["mk"]))
+        ok = off !== nothing && abs(Int(off) - Int(pre["off"])) <= 4
+        ok || @info "filter_scroll hide FAILED" pre off top = TK.eval_js(s, MARKER) anchor = TK.eval_js(s, ANCHOR_DEBUG)
+        @test off !== nothing
+        @test abs(Int(off) - Int(pre["off"])) <= 4   # reading row kept its screen position
     end
 
-    @testset "showing it again holds the top marker" begin
+    @testset "showing it again holds the reading row" begin
         pre = TK.eval_js(s, TOGGLE(false))
+        @test pre !== nothing && pre["mk"] > 0
         sleep(0.6)
-        shown = TK.eval_js(s, MARKER)
-        @test shown !== nothing
-        ok = shown["mk"] == pre["mk"] && abs(Int(shown["off"]) - Int(pre["off"])) <= 6
-        ok || @info "filter_scroll show FAILED" pre shown anchor = TK.eval_js(s, ANCHOR_DEBUG)
-        @test shown["mk"] == pre["mk"]
-        @test abs(Int(shown["off"]) - Int(pre["off"])) <= 6
+        off = TK.eval_js(s, OFFSET_OF(pre["mk"]))
+        ok = off !== nothing && abs(Int(off) - Int(pre["off"])) <= 6
+        ok || @info "filter_scroll show FAILED" pre off top = TK.eval_js(s, MARKER) anchor = TK.eval_js(s, ANCHOR_DEBUG)
+        @test off !== nothing
+        @test abs(Int(off) - Int(pre["off"])) <= 6
     end
 
     @test isempty(TK.js_errors(s))

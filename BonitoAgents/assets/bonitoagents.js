@@ -1318,14 +1318,20 @@ class BonitoChat {
     // the toggle, so anchoring on one would lose the read position (setKeyHidden).
     _captureAnchor(excludeKey = null) {
         const st = this.container.scrollTop;
+        // Same 4px bottom-overhang tolerance as the key anchor and the
+        // top-marker probes: a row with a couple of pixels hanging into the
+        // viewport is not the reading position, and pinning such a sliver is
+        // how one-row drifts are born (see _captureKeyAnchor).
         for (const i of [...this.rendered].sort((a, b) => a - b)) {
             const n = this.cache.get(i);
             if (!n || !n.isConnected || n.style.display === 'none') continue;
             if (excludeKey && n.dataset.filterKey === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st) {
+            if (n.offsetTop + n.offsetHeight > st + 4) {
+                this._anchorDebugG = { st, idx: i, off: n.offsetTop - st };
                 return { idx: i, off: n.offsetTop - st };
             }
         }
+        this._anchorDebugG = { st, idx: -1, off: 0 };
         return null;
     }
 
