@@ -2,6 +2,10 @@
 // deno-lint-ignore-file
 // This code was bundled using `deno bundle` and it's not recommended to edit it manually
 
+if (typeof document !== 'undefined') {
+    const vp = document.querySelector('meta[name="viewport"]');
+    if (vp && !vp.content.includes('interactive-widget')) vp.content += ', interactive-widget=resizes-content';
+}
 class Collapsable {
     constructor(headerEl, bodyEl, opts = {}){
         this.header = headerEl;
@@ -1745,7 +1749,15 @@ class BonitoChat {
     _setupLiveTicker() {
         this.taskbarEl = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-taskbar');
         if (this.taskbarEl) {
+            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const paneW = this.container.closest('.bt-chatpane')?.clientWidth ?? window.innerWidth;
+            this.taskbarEl.classList.toggle('bt-todo-collapsed', storedTodo != null ? storedTodo === '1' : paneW < 660);
             this._onTaskbarClick = (ev)=>{
+                if (ev.target.closest('.bt-taskbar-todo-toggle')) {
+                    const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
+                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    return;
+                }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;

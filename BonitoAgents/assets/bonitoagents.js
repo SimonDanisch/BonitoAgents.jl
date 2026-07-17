@@ -12,6 +12,20 @@
 // `[data-tool-id]` slot directly. Everything else (counts, ranges, message
 // pushes, status pings) is on `comm`.
 
+// Android keyboard fix (runs once per page, on module import): Chrome 108+
+// defaults to `interactive-widget=resizes-visual` — the on-screen keyboard
+// shrinks only the VISUAL viewport, so the 100dvh app layout keeps the
+// composer behind the keyboard and the browser pans to the focused caret
+// instead (the input ends up floating mid-screen over dead space).
+// `resizes-content` makes the LAYOUT viewport track the keyboard, pinning
+// the composer right above it. Set dynamically because Bonito owns the
+// served <meta name=viewport>; Chromium honours runtime viewport changes.
+if (typeof document !== 'undefined') {
+    const vp = document.querySelector('meta[name="viewport"]');
+    if (vp && !vp.content.includes('interactive-widget'))
+        vp.content += ', interactive-widget=resizes-content';
+}
+
 // One reusable collapsible-section behaviour, shared by tool rows and thought
 // bubbles (and any future lazy section). It owns the expand/collapse plus the
 // lazy-body lifecycle that used to be duplicated across wireToolToggle /
@@ -2639,7 +2653,23 @@ class BonitoChat {
         this.taskbarEl = (this.app || this.container.closest('.bt-app') ||
                           this.container.parentElement).querySelector('.bt-taskbar');
         if (this.taskbarEl) {
+            // Live-todo collapse state lives HERE, on the persistent
+            // .bt-taskbar element: the slots inside are 1 Hz KeyedList
+            // re-renders (static snapshots), so state on them would be wiped
+            // every tick. Default: collapsed on narrow panes (a long plan
+            // card buried the whole chat on phones), expanded elsewhere; the
+            // ▾ toggle persists the user's choice browser-wide.
+            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const paneW = this.container.closest('.bt-chatpane')?.clientWidth
+                       ?? window.innerWidth;
+            this.taskbarEl.classList.toggle('bt-todo-collapsed',
+                storedTodo != null ? storedTodo === '1' : paneW < 660);
             this._onTaskbarClick = (ev) => {
+                if (ev.target.closest('.bt-taskbar-todo-toggle')) {
+                    const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
+                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    return;
+                }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;
