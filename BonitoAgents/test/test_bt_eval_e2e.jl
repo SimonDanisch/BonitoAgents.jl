@@ -112,6 +112,65 @@ end
     end
 end
 
+# REPL semantics: the worker evals the code STRING per-top-level-statement
+# (`repl_eval` → `include_string` with soft scope), NOT as one spliced
+# expression. Two things that broke under the old splice-as-argument path:
+#   (1) soft scope — a top-level `for` may assign to a global (`acc += i`);
+#       under hard scope it errored "acc not defined in local scope".
+#   (2) world age — a `function` def then a call to it in the SAME eval no
+#       longer warns "access to binding … in a world prior to its definition"
+#       (Julia ≥ 1.12); the def advances the world before the call runs.
+@testset "bt_eval e2e — REPL semantics: soft-scope loops + world-age-clean defs" begin
+    project = EVALENV   # result embed asserted → needs the bridge (see EVALENV)
+    softscope_code = "acc = 0\nfor i in 1:5\n    acc += i\nend\nacc"
+    worldage_code  = "double(x) = 2x\ndouble(21)"
+    s = TK.dev_server(; agent = msg ->
+        occursin("loop", msg) ?
+            [text("summing"), bt_eval(softscope_code; env_path = project, id = "ss-1"), end_turn()] :
+            [text("defining"), bt_eval(worldage_code; env_path = project, id = "wa-1"), end_turn()])
+    try
+        TK.open_browser(s; width = 1280, height = 820)
+        pid = TK.new_chat(s)
+        TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
+        sleep(1)
+        TK.refresh_eval_session!(EVALENV)
+
+        # (1) Soft-scope accumulator: completes without error and the result
+        # embed shows 15 (a hard-scope failure would set errored + show the
+        # "not defined in local scope" text instead).
+        TK.send_message(s, "run the loop")
+        card1 = ".bt-tool-msg[data-msg-id*=\"ss-1\"]"
+        @test TK.wait_for(s, "soft-scope loop completed with result 15",
+            """(() => { const c = document.querySelector('$card1');
+                if (!c || c.querySelector('.bt-tool-status')?.textContent !== 'completed') return false;
+                return (c.querySelector('.bt-embed')?.innerText || '').includes('15'); })()""";
+            timeout = 90) == true
+        # No error, no soft-scope diagnostic anywhere in the card.
+        @test TK.eval_js(s, """(() => { const c = document.querySelector('$card1');
+            const t = c.innerText || '';
+            return !/local scope|UndefVarError/.test(t); })()""") == true
+
+        # (2) Define-then-call in one eval: result 42, and NO world-age warning
+        # leaked into the Output (there should be no Output section at all —
+        # nothing was printed).
+        TK.send_message(s, "define and call")
+        card2 = ".bt-tool-msg[data-msg-id*=\"wa-1\"]"
+        @test TK.wait_for(s, "world-age-clean def completed with result 42",
+            """(() => { const c = document.querySelector('$card2');
+                if (!c || c.querySelector('.bt-tool-status')?.textContent !== 'completed') return false;
+                return (c.querySelector('.bt-embed')?.innerText || '').includes('42'); })()""";
+            timeout = 60) == true
+        @test TK.eval_js(s, """(() => { const c = document.querySelector('$card2');
+            const t = c.innerText || '';
+            return !/world|prior to its definition/i.test(t); })()""") == true
+        # Nothing printed → no Output section.
+        @test TK.eval_js(s, """[...document.querySelector('$card2').querySelectorAll('.bt-subsection-label')]
+            .every(l => (l.textContent||'').trim() !== 'Output')""") == true
+    finally
+        close(s)
+    end
+end
+
 # The live-display contract for a RUNNING eval: (1) the body eager-mounts
 # without any click while the code runs (real wire: the status stays PENDING
 # for the whole MCP call — no in_progress ever arrives) and a LONG Code
@@ -237,17 +296,23 @@ end
 
         # (4) The completed Output section is the SAME pin_end console in
         # SUMMARY state — scrollbar, capped to ~4 lines. Clicking its HEADER
-        # cycles the three states: summary → collapsed → full → summary.
+        # cycles the three states: summary → collapsed → full → summary. Each
+        # state has its OWN distinct disclosure marker (▸ collapsed, ▿ summary,
+        # ▾ full) so all three are visually distinguishable.
+        marker = () -> TK.eval_js(s,
+            "getComputedStyle(($out_sec).querySelector('.bt-subsection-summary'), '::before').content")
         @test TK.wait_for(s, "Output section done: summary state, pinned console",
             """(() => { const d = $out_sec;
                 const b = d && d.querySelector('.bt-subsection-body');
                 return !!(d && b && d.dataset.state === 'summary' && d.dataset.pinEnd === '1' &&
                           d.hasAttribute('open') && b.offsetHeight <= 110); })()""";
             timeout = 30) == true
+        @test occursin("▿", marker())          # summary marker
         # Cycle 1: summary → collapsed (header click; body hidden).
         TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
         @test TK.wait_for(s, "cycled to collapsed",
             "!(($out_sec).hasAttribute('open'))"; timeout = 5) == true
+        @test occursin("▸", marker())          # collapsed marker (distinct)
         # Cycle 2: collapsed → full (body back, taller than the summary cap).
         TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
         @test TK.wait_for(s, "cycled to full (uncapped)",
@@ -255,6 +320,7 @@ end
                 return !!(d.hasAttribute('open') && d.dataset.state === 'full' &&
                     d.querySelector('.bt-subsection-body').offsetHeight > 110); })()""";
             timeout = 5) == true
+        @test occursin("▾", marker())          # full marker (distinct from the other two)
         # Cycle 3: full → summary (back to the ~4-line window).
         TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
         @test TK.wait_for(s, "cycled back to summary",

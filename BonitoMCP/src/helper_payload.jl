@@ -8,8 +8,46 @@ module BonitoMCPHelper
 
 using Base64
 
+# Soft-scope transform for REPL-style top-level eval (see `repl_eval`). REPL is
+# a stdlib (always in the sysimage), so this import is essentially free; fall
+# back to hard scope (identity) only if it somehow can't resolve.
+const SOFTSCOPE = try
+    @eval import REPL
+    REPL.softscope
+catch
+    identity
+end
+
 const DEFAULT_MAX_RESPONSE_BYTES = 10_000
 const LARGE_CONTAINER_THRESHOLD  = 100      # array / dict elements
+
+"""
+    repl_eval(code) -> value
+
+Evaluate `code` exactly as a Julia REPL would, and return the value of the LAST
+top-level statement. Each top-level statement is evaluated SEPARATELY in `Main`
+(via `include_string`), which is what makes bt_julia_eval behave like a REPL
+and not like a single spliced expression:
+
+  * A `function` / `struct` / `const` definition advances the world age before
+    later statements use it — so `f(x) = ...; f(1)` in ONE call no longer warns
+    "access to binding `f` in a world prior to its definition" (Julia ≥ 1.12).
+  * Soft scope: a top-level `for` / `while` may assign to a global
+    (`acc = 0; for i in 1:n; acc += i; end`) — the REPL's behavior, which hard
+    (file/`include`) scope rejects.
+
+The previous path spliced the parsed block as a function ARGUMENT
+(`format_value(<whole block>, …)`), flattening it into one expression that got
+neither property. Backtrace noise from `include_string` is already trimmed
+(see `BACKTRACE_NOISE_FRAMES`).
+"""
+repl_eval(code::AbstractString) =
+    Base.include_string(SOFTSCOPE, Main, String(code), "bt_julia_eval")
+
+# One worker call: REPL-eval the code, then format the result value. A user
+# error thrown by the eval propagates to the caller's try/catch (→ format_error).
+eval_and_format(code::AbstractString, out_dir::AbstractString, max_bytes::Int, full_output::Bool) =
+    format_value(repl_eval(code), out_dir, max_bytes, full_output)
 
 # On-disk cap for rich-output files (PNG/SVG written by try_save_rich).
 # This is SEPARATE from `max_bytes` (the per-block RESPONSE cap, 10KB default):

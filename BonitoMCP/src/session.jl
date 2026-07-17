@@ -507,12 +507,15 @@ function execute(s::JuliaSession, code::AbstractString;
         is_alive(s) || start!(s)
         drain_output!(s)
 
-        expr = try
+        # Early parse-error detection (fast-fail with a clean message before the
+        # remote round-trip). A parse error is a USER error, delivered as
+        # terminal-faithful output text (never MCP isError — that's reserved for
+        # infra failures; claude fuses isError results into one rawOutput blob).
+        # The worker does the REAL evaluation REPL-style from the code STRING
+        # (see `repl_eval`); we don't reuse this parsed AST.
+        try
             Meta.parseall(String(code))
         catch e
-            # A parse error is a USER error, delivered as terminal-faithful
-            # output text (never MCP isError — that's reserved for infra
-            # failures; claude fuses isError results into one rawOutput blob).
             return (status   = :completed,
                     blocks   = [Dict{String,Any}("type"=>"text",
                                                   "text"=>"\e[91mERROR: parse error: $(sprint(showerror, e))\e[39m")],
@@ -531,12 +534,15 @@ function execute(s::JuliaSession, code::AbstractString;
 
         s.in_flight_code    = String(code)
         s.in_flight_started = time()
-        # Wrap in the helper so the worker returns pre-formatted block dicts
-        # (base types only, never user-defined types Malt's serialiser
-        # wouldn't recognise on the parent side).
+        # The worker REPL-evals the code STRING (`eval_and_format` →
+        # `repl_eval`: per-top-level-statement, soft scope, correct world age)
+        # and returns pre-formatted block dicts (base types only, never
+        # user-defined types Malt's serialiser wouldn't recognise on the parent
+        # side). A user error propagates here to `format_error`.
+        code_str = String(code)
         wrapped = quote
             try
-                Main.BonitoMCPHelper.format_value($(expr), $out_dir, $max_bytes, $full_output)
+                Main.BonitoMCPHelper.eval_and_format($code_str, $out_dir, $max_bytes, $full_output)
             catch __mcp_err__
                 Main.BonitoMCPHelper.format_error(__mcp_err__, catch_backtrace(),
                                                    $max_bytes, $full_output)

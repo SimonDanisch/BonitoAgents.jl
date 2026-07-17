@@ -1311,11 +1311,18 @@ const ChatStyles = Bonito.Styles(
         "list-style" => "none",
         "background" => "var(--bt-surface-2)"),
     CSS(".bt-subsection-summary::-webkit-details-marker", "display" => "none"),
+    # THREE distinct disclosure markers, one per state of the cycle
+    # (collapsed → full → summary): the amount of "ink" tracks how much
+    # content is shown. ▸ closed (nothing), ▿ hollow = summary preview (some),
+    # ▾ filled = full (all). Base rule is the collapsed marker; the two
+    # `[open]` rules (more specific) override it while open.
     CSS(".bt-subsection-summary::before",
         "content" => "\"▸\"",
         "color" => "var(--bt-text-faint)", "font-size" => "10px",
         "flex-shrink" => "0"),
-    CSS("details.bt-subsection[open] > .bt-subsection-summary::before",
+    CSS("details.bt-subsection[open][data-state=\"summary\"] > .bt-subsection-summary::before",
+        "content" => "\"▿\""),
+    CSS("details.bt-subsection[open][data-state=\"full\"] > .bt-subsection-summary::before",
         "content" => "\"▾\""),
     CSS(".bt-subsection-summary:hover",
         "background" => "var(--bt-surface)"),

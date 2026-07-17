@@ -59,6 +59,40 @@ end
     end
 end
 
+# ── REPL semantics: soft scope + world-age-clean defs (execute path) ──────────
+# The worker evals the code STRING per-top-level-statement (`repl_eval` →
+# `include_string`, soft scope), NOT as one spliced expression. Regression for
+# two things the old splice-as-argument path broke.
+@testset "REPL semantics: soft-scope loops + world-age-clean defs" begin
+    m   = M.manager()
+    s   = M.JuliaSession(nothing; is_temp = true)
+    key = "test-repl-" * string(rand(UInt32))
+    lock(m.lock) do; m.sessions[key] = s; end
+    outtext(r) = join(String[get(b, "text", "") for b in get(r, :blocks, Dict{String,Any}[])
+                             if get(b, "type", "") == "text"], "\n")
+    try
+        # (1) Soft scope: a top-level for-loop assigns to a global. Under hard
+        # scope this errored "acc not defined in local scope". No bridge in a
+        # temp session → the result repr rides in the output text.
+        r1 = M.execute(s, "acc = 0\nfor i in 1:5\n    acc += i\nend\nacc"; timeout = 30.0)
+        @test r1.status == :completed
+        @test r1.is_error == false
+        @test occursin("15", outtext(r1))
+        @test !occursin("local scope", outtext(r1))
+
+        # (2) World age: define a function and call it in the SAME eval — no
+        # "access to binding … in a world prior to its definition" warning.
+        r2 = M.execute(s, "dbl(x) = 2x\ndbl(21)"; timeout = 30.0)
+        @test r2.status == :completed
+        @test r2.is_error == false
+        @test occursin("42", outtext(r2))
+        @test !occursin("prior to its definition", outtext(r2))
+    finally
+        lock(m.lock) do; delete!(m.sessions, key); end
+        M.kill_session!(s)
+    end
+end
+
 # ── M5: continue/interrupt are pure lookups (never get_or_create!) ─────────────
 @testset "M5: continue/interrupt error on absent session (no resurrection)" begin
     m = M.manager()
