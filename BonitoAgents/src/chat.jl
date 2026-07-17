@@ -677,15 +677,14 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     code::String                  # the code being executed (live preview + Code section)
     env_path::String              # project env; "" ⇒ ephemeral temp session
     timeout::Union{Float64,Nothing}   # soft checkpoint cadence; nothing ⇒ default
-    # Live stdout tail while the eval runs (`eval_stream_loop!` tails the
-    # session's on-disk log on the worker): read cursor, rolling text window,
-    # and the poller task (nothing until the eval turns in_progress).
-    stream_offset::Int
+    # Live stdout tail while the eval runs (`eval_stream_loop!` drains the MCP's
+    # forwarded stream): rolling text window + the drain task (nothing until the
+    # eval turns pending/in_progress).
     stream_text::String
     stream_task::Union{Task,Nothing}
 end
 JuliaEvalToolMsg(message::Message, server) =
-    JuliaEvalToolMsg(message, server, "", "", nothing, 0, "", nothing)
+    JuliaEvalToolMsg(message, server, "", "", nothing, "", nothing)
 
 mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     message::Message
@@ -693,12 +692,11 @@ mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     code::String                  # continue carries none — stays "" (shared render path)
     env_path::String
     timeout::Union{Float64,Nothing}
-    stream_offset::Int
     stream_text::String
     stream_task::Union{Task,Nothing}
 end
 JuliaContinueToolMsg(message::Message, server) =
-    JuliaContinueToolMsg(message, server, "", "", nothing, 0, "", nothing)
+    JuliaContinueToolMsg(message, server, "", "", nothing, "", nothing)
 
 mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
     message::Message
@@ -3441,18 +3439,15 @@ end
 bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
 
 # ── Live stdout tail for a RUNNING bt_julia_eval ─────────────────────────────
-# The eval session tees its full stdout/stderr to a DETERMINISTIC on-disk log
-# on the worker machine (`BonitoMCP.eval_log_path(env_path)`); while the tool
-# is in_progress we tail it over the worker file protocol (same machinery as
-# bash background output) and ship the last lines to the client as
-# `stream_tail` updates — a ~4-line auto-scrolled pane under the header. The
-# first read seeks to the log's CURRENT end so only output of THIS eval shows.
-const EVAL_STREAM_POLL_S = 0.5
+# The MCP forwards the eval worker's stdout/stderr live over /mcp-ws (no on-disk
+# log, no polling — see BonitoMCP.stream_forward_loop!). Each chunk lands in a
+# per-eval sink channel (registered here, drained below) and we ship the last
+# lines to the client as `stream_tail` updates — a ~4-line auto-scrolled pane
+# under the header. A fresh JuliaEvalCall starts with empty `stream_text`, so it
+# only ever shows output that arrives while THIS eval runs.
 const EVAL_STREAM_KEEP_CHARS = 8_000
 const EVAL_STREAM_TAIL_LINES = 12
-# Per-poll read cap — also the skip window: output older than this never
-# ships over the worker-control WS (the tail display can't show it anyway).
-const EVAL_STREAM_READ_BYTES = 65_536
+const EVAL_STREAM_IDLE_S     = 0.1   # sink-drain cadence when no chunk is waiting
 
 strip_ansi_codes(s::AbstractString) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
 
@@ -3461,76 +3456,58 @@ function last_lines(s::AbstractString, n::Int)
     return join(ls[max(1, end - n + 1):end], '\n')
 end
 
+# Route key for a running eval's stream sink — matched against BonitoMCP.stream_route
+# on the MCP side. Temp sessions (no env_path) collapse onto TEMP_KEY; project
+# sessions use the abspath (the MCP abspaths its env_dir the same way). The
+# documented workflow always passes an absolute env_path, so abspath is a stable,
+# cwd-independent match across the two processes.
+eval_route_key(m::JuliaEvalCall) =
+    isempty(m.env_path) ? BonitoMCP.TEMP_KEY : abspath(m.env_path)
+
 function start_eval_stream!(m::JuliaEvalCall)
     chat = tool_chat(m)
     chat === nothing && return nothing
     m.stream_task === nothing || return nothing
-    isempty(m.env_path) && return nothing
     m.stream_task = Base.errormonitor(Threads.@spawn eval_stream_loop!(chat, m))
     return nothing
 end
 
 function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
     state = chat.state
-    wid = bg_worker_id(state, chat)
-    wid === nothing && return nothing
-    path = BonitoMCP.eval_log_path(m.env_path)
-    first_read = true
+    key = eval_sink_key(chat.project_id, eval_route_key(m))
+    ch = Channel{String}(Inf)
+    lock(state.lock) do
+        # A stale sink from a prior eval on the same route can only linger if its
+        # loop died without cleanup; overwrite it (the MCP routes to the newest).
+        state.eval_stream_sinks[key] = ch
+    end
     deadline = time() + 4 * 3600      # hard stop for a wedged status
-    while tool_status(m) in ("pending", "in_progress") && time() < deadline
-        # One cheap EOF probe per poll: the worker clamps the requested offset
-        # to the file size, so a `max_bytes = 0` read "from infinity" returns
-        # EOF without shipping a byte. The display only keeps the last lines,
-        # so anything older than the trailing window is SKIPPED, never read —
-        # a huge burst (a 300k-line eval) or a fat backlog from earlier evals
-        # must not flood the worker-control WS in multi-MB JSON frames and
-        # starve its heartbeat (observed: pong loss → worker bounce → eval
-        # bridge torn down → every later result mount degraded).
-        eof = try
-            tail_worker_file(state, wid, path;
-                offset = typemax(Int) ÷ 2, max_bytes = 0, timeout = 10.0)
-        catch e
-            @debug "eval stream probe failed (will retry)" id = tool_id(m) exception = e
-            sleep(EVAL_STREAM_POLL_S)
-            continue
-        end
-        if !eof.exists
-            sleep(EVAL_STREAM_POLL_S)
-            continue
-        end
-        if first_read
-            # Stream only THIS eval: start at the current end of file.
-            m.stream_offset = eof.offset
-            first_read = false
-        elseif eof.offset < m.stream_offset
-            # The log SHRANK under us: a fresh session opens it "w"
-            # (truncate), racing a stream that already sought to the old
-            # end. Everything in the file now belongs to the new session —
-            # rewind to the top.
-            m.stream_offset = 0
-        end
-        if eof.offset > m.stream_offset
-            # Trailing window only — skip (don't ship) any excess backlog.
-            m.stream_offset = max(m.stream_offset, eof.offset - EVAL_STREAM_READ_BYTES)
-            r = try
-                tail_worker_file(state, wid, path;
-                    offset = m.stream_offset, max_bytes = EVAL_STREAM_READ_BYTES,
-                    timeout = 10.0)
-            catch e
-                @debug "eval stream tail failed (will retry)" id = tool_id(m) exception = e
-                sleep(EVAL_STREAM_POLL_S)
-                continue
-            end
-            if r.exists && r.offset > m.stream_offset
-                m.stream_offset = r.offset
-                m.stream_text = last(m.stream_text * strip_ansi_codes(r.chunk),
+    try
+        while tool_status(m) in ("pending", "in_progress") && time() < deadline
+            if isready(ch)
+                # Drain everything queued this tick, then emit ONCE — the MCP
+                # already coalesced + capped each chunk, so this just merges a
+                # burst into a single tail update.
+                buf = IOBuffer()
+                while isready(ch)
+                    write(buf, take!(ch))
+                end
+                m.stream_text = last(m.stream_text * strip_ansi_codes(String(take!(buf))),
                                      EVAL_STREAM_KEEP_CHARS)
                 chat_emit(chat, Dict{String,Any}(
                     "type" => "tool_update", "id" => tool_id(m),
                     "stream_tail" => last_lines(m.stream_text, EVAL_STREAM_TAIL_LINES)))
+            else
+                sleep(EVAL_STREAM_IDLE_S)
             end
         end
-        sleep(EVAL_STREAM_POLL_S)
+    finally
+        # Identity-guarded: a re-run on the same route may have replaced us.
+        lock(state.lock) do
+            get(state.eval_stream_sinks, key, nothing) === ch &&
+                delete!(state.eval_stream_sinks, key)
+        end
+        close(ch)
     end
     return nothing
 end

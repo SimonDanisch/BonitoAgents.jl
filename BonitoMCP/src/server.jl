@@ -4,40 +4,36 @@
 # Structured logger (stderr) — never write non-MCP content to stdout
 log_info(msg) = println(stderr, "[$SERVER_NAME] ", msg)
 
-# `tools/call`s are dispatched on their own tasks (so a long eval can't block
-# the read loop from processing a `notifications/cancelled`), so multiple tasks
-# may write a response concurrently. One line per frame must stay atomic.
-const OUT_LOCK = ReentrantLock()
-
 # How long to give `Malt.interrupt` to land before the nuclear fallback (kill the
 # worker). Generous because user code in a `try/catch` may swallow the first
 # InterruptException for a bit; the existing `interrupt!` tool uses the same 30s.
 const CANCEL_KILL_GRACE = 30.0
 
-# Maps an in-flight `tools/call` requestId → the env_path it's evaluating in, so
-# `notifications/cancelled` can target ONLY the session the cancelled request
-# owns, instead of interrupting every in-flight eval across all sessions (M9 —
-# a stop in chat A previously SIGINT'd chat B's computation). Populated/cleared
-# in `dispatch!` around the eval-family handlers. `nothing` env_path = temp.
-const INFLIGHT_REQUESTS = Dict{Any,Union{String,Nothing}}()
-const INFLIGHT_LOCK = ReentrantLock()
-
 const EVAL_TOOL_NAMES = ("bt_julia_eval", "bt_julia_continue", "bt_julia_interrupt")
 
+# `SERVER.inflight` maps an in-flight `tools/call` requestId → the env_path it's
+# evaluating in, so `notifications/cancelled` can target ONLY the session the
+# cancelled request owns, instead of interrupting every in-flight eval across all
+# sessions (M9 — a stop in chat A previously SIGINT'd chat B's computation).
+# Populated/cleared in `dispatch!` around the eval-family handlers. `nothing`
+# env_path = temp. (Lives on the SERVER context — see context.jl.)
 function note_inflight_request!(id, env_path::Union{String,Nothing})
     id === nothing && return nothing
-    @lock INFLIGHT_LOCK (INFLIGHT_REQUESTS[id] = env_path)
+    @lock SERVER.inflight_lock (SERVER.inflight[id] = env_path)
     return nothing
 end
 
 function clear_inflight_request!(id)
     id === nothing && return nothing
-    @lock INFLIGHT_LOCK (haskey(INFLIGHT_REQUESTS, id) && delete!(INFLIGHT_REQUESTS, id))
+    @lock SERVER.inflight_lock (haskey(SERVER.inflight, id) && delete!(SERVER.inflight, id))
     return nothing
 end
 
+# `tools/call`s are dispatched on their own tasks (so a long eval can't block the
+# read loop from a `notifications/cancelled`), so multiple tasks may write a
+# response concurrently — `SERVER.out_lock` keeps one line per frame atomic.
 function send!(out::IO, payload::AbstractDict)
-    lock(OUT_LOCK) do
+    lock(SERVER.out_lock) do
         println(out, JSON.json(payload))
         flush(out)
     end
@@ -136,7 +132,7 @@ function handle_cancelled!(req::AbstractDict)
     # after the handler cleared it), fall back to interrupting all in-flight
     # evals — never silently fail to stop a runaway computation.
     target_env = rid === nothing ? :unknown :
-        @lock INFLIGHT_LOCK get(INFLIGHT_REQUESTS, rid, :unknown)
+        @lock SERVER.inflight_lock get(SERVER.inflight, rid, :unknown)
     n = target_env === :unknown ?
         interrupt_in_flight!(nothing) :
         interrupt_in_flight!(target_env; scope_temp = target_env === nothing)

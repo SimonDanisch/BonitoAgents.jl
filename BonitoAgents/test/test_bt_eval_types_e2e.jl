@@ -22,9 +22,9 @@
 # DataFrames/Colors/ImageShow/Tables), warmed in runtests.jl.
 
 using Test, JSON
-include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
-import .TestKit
-const TK = TestKit
+# TestKit / TK come from the enclosing @testitem (setup=[SharedServer]) so the
+# dispatcher + SERVER_CONTEXT are the shared, live ones. Only the DSL names are
+# pulled in here.
 using .TestKit: text, bt_eval, end_turn
 
 const EVALENV  = abspath(joinpath(@__DIR__, "evalenv"))
@@ -149,16 +149,25 @@ const CASES = [
 const BY_ID = Dict(id => code for (id, code, _) in CASES)
 
 @testset "bt_julia_eval renders $(length(CASES)) output types / stdout / safety / errors (live chat)" begin
-    s = TK.dev_server(; agent = msg -> begin
+    # The one per-worker shared server + browser (see SharedServer). We only swap
+    # in this suite's scenario agent and open a fresh chat on it — never close it.
+    s = SharedServer.server()
+    s.agent_fn[] = msg -> begin
         code = get(BY_ID, String(msg), nothing)
         code === nothing ? Any[text("unknown case"), end_turn()] :
             Any[bt_eval(code; env_path = EVALENV, id = String(msg)), end_turn()]
-    end)
-    try
-        TK.open_browser(s; width = 1280, height = 900)
+    end
+    begin
         pid = TK.new_chat(s)
         TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
         sleep(1)
+        # Fresh evalenv session: the eval-session pool is PROCESS-GLOBAL and the
+        # eval bridge is keyed by project_id, so a worker left by an earlier chat
+        # (this item's OR a prior e2e item's) is registered under a DIFFERENT
+        # project_id — its live-render bridge would miss and every embed degrades
+        # to "worker gone". Drop it so THIS chat's first eval dials a fresh bridge
+        # under THIS project_id (`ensure_eval_dialed!` won't re-dial a live worker).
+        TK.refresh_eval_session!(EVALENV)
 
         # Per case: send the prompt, wait for ITS tool to reach a terminal status
         # (the first eval pays worker-spawn + first `using DataFrames`/dev-Bonito
@@ -186,7 +195,5 @@ const BY_ID = Dict(id => code for (id, code, _) in CASES)
         end
 
         TK.screenshot(s, joinpath(SHOT_DIR, "bt_eval-types.png"))
-    finally
-        close(s)
     end
 end

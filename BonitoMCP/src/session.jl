@@ -102,11 +102,15 @@ mutable struct JuliaSession
     output_lock::ReentrantLock          # protects output_buffer
     stdout_pump::Union{Task,Nothing}
     stderr_pump::Union{Task,Nothing}
+    # Drains `stream_channel` and forwards the worker's live stdout/stderr over
+    # /mcp-ws to the chat (coalesced + trailing-window capped). Dies when the
+    # channel closes (kill_session!). No on-disk log, no polling.
+    stream_forward::Union{Task,Nothing}
     in_flight::Union{Task,Nothing}      # Malt.remote_eval task
     in_flight_code::String
     in_flight_started::Float64
     lock::ReentrantLock                 # serialises eval/continue/interrupt
-    log_path::Union{String,Nothing}
+    stream_channel::Channel{String}     # real-time stdout/stderr chunks for /mcp-ws streaming
     dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
     dial_error::String                  # last eval-bridge setup/connect failure (live-render bridge)
     closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
@@ -115,14 +119,18 @@ end
 function JuliaSession(env_path;
                        is_temp::Bool   = false,
                        is_test::Bool   = false,
-                       julia_cmd::Union{String,Nothing} = nothing,
-                       log_path::Union{String,Nothing}  = nothing)
+                       julia_cmd::Union{String,Nothing} = nothing)
     return JuliaSession(env_path, is_temp, is_test, julia_cmd,
                         nothing, IOBuffer(), ReentrantLock(),
-                        nothing, nothing,
+                        nothing, nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), log_path, false, "", false)
+                        ReentrantLock(), Channel{String}(Inf), false, "", false)
 end
+
+# The chat routes live stream chunks by this key (matched against the eval
+# tool's env_path, normalized the same way on the chat side). Temp sessions
+# collapse onto TEMP_KEY; project sessions use their abspath env_dir.
+stream_route(s::JuliaSession) = s.is_temp ? TEMP_KEY : String(s.env_path)
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
 
@@ -333,15 +341,15 @@ function start!(s::JuliaSession)
         env            = worker_env(),
         exeflags       = build_exeflags(s.env_path, s.julia_cmd),
     )
-    # Background pumps drain worker stdout/stderr into our buffer (and tee
-    # into the log file if one is configured). Both streams merge into the
-    # same buffer — same UX as a normal REPL.
-    # A fresh session OWNS its deterministic log file (the chat derives the
-    # path from env_path alone to tail the live stream): truncate ONCE here,
-    # before the pumps spawn — they append from then on.
-    s.log_path === nothing || try write(s.log_path, "") catch end
+    # Background pumps drain worker stdout/stderr into our buffer (the agent's
+    # copy, drained into the MCP response) AND push each chunk to stream_channel.
+    # Both streams merge into the same buffer — same UX as a normal REPL.
     s.stdout_pump = Threads.@spawn pump_pipe!(s, s.worker.stdout)
     s.stderr_pump = Threads.@spawn pump_pipe!(s, s.worker.stderr)
+    # The forwarder relays stream_channel over /mcp-ws to the chat's live tail
+    # (see stream_forward_loop!). Spawned once per session; dies when the channel
+    # closes in kill_session!.
+    s.stream_forward = Threads.@spawn stream_forward_loop!(s)
 
     # The worker is a plain `julia --project=env_path`: `--project` sets the env,
     # and `worker_env()` resets JULIA_LOAD_PATH to Julia's default so the inherited
@@ -382,11 +390,6 @@ function start!(s::JuliaSession)
 end
 
 function pump_pipe!(s::JuliaSession, pipe)
-    # APPEND, never "w": TWO pumps (stdout + stderr) write this same file —
-    # O_APPEND keeps their interleaved writes atomic, while two "w" handles
-    # would each write from position 0 and clobber each other. The fresh-
-    # session truncation happens ONCE in start!, before the pumps spawn.
-    log_io = s.log_path === nothing ? nothing : open(s.log_path, "a")
     try
         while !eof(pipe)
             data = readavailable(pipe)
@@ -395,17 +398,53 @@ function pump_pipe!(s::JuliaSession, pipe)
                 write(s.output_buffer, data)
                 cap_output_buffer!(s.output_buffer)
             end
-            # The on-disk log is uncapped on purpose — it's the full record and
-            # not part of the in-memory/MCP-context budget.
-            log_io === nothing || (write(log_io, data); flush(log_io))
+            # Feed the live-tail forwarder. Best-effort: an unbounded channel
+            # never blocks the pump, and if no chat is listening the forwarder
+            # drains + drops (see stream_forward_loop!). Raw bytes (ANSI intact) —
+            # the chat strips codes for the tail; keeping them keeps colored
+            # rendering possible later without a wire change.
+            try isopen(s.stream_channel) && put!(s.stream_channel, String(data)) catch end
         end
     catch e
         e isa EOFError && return
         e isa Base.IOError && return
         @warn "pipe pump error" exception=e
-    finally
-        log_io === nothing || try close(log_io) catch end
     end
+end
+
+# How long the forwarder batches a burst before shipping, and the max bytes per
+# frame. Bounds /mcp-ws load so a firehose eval (300k lines) can't flood the
+# control channel and starve its heartbeat — the tail only shows the last lines,
+# so older bytes of an over-cap burst are dropped, never shipped.
+const STREAM_COALESCE_S = 0.15
+const STREAM_MAX_CHUNK  = 8_192
+
+# Drain stream_channel, coalesce a short burst, and forward the trailing window
+# over /mcp-ws (tagged with stream_route so the chat routes it to the right eval
+# card). Always DRAINS even when no control channel is up (send is a no-op then),
+# so the channel stays bounded. Ends when kill_session! closes the channel.
+function stream_forward_loop!(s::JuliaSession)
+    for first_chunk in s.stream_channel        # blocks until a chunk or channel close
+        io = IOBuffer()
+        write(io, first_chunk)
+        sleep(STREAM_COALESCE_S)               # let a burst accumulate
+        # Drain into an IOBuffer (O(1) amortized — NOT `buf *= take!`, which is
+        # quadratic and melts the CPU under a 300k-line firehose). Bound the drain
+        # to what's ALREADY queued (`n_avail` snapshot): a pump pushing as fast as
+        # we take must not livelock this loop or grow `io` without bound — the rest
+        # waits for the next window.
+        for _ in 1:Base.n_avail(s.stream_channel)
+            isready(s.stream_channel) || break
+            write(io, take!(s.stream_channel))
+        end
+        # Ship only the trailing window — a firehose must never put a multi-MB
+        # frame on the control channel. `last` is char-based, so the cut can't
+        # split a UTF-8 codepoint.
+        str = String(take!(io))
+        length(str) > STREAM_MAX_CHUNK && (str = String(last(str, STREAM_MAX_CHUNK)))
+        send_eval_stream_chunk(stream_route(s), str)
+    end
+    return nothing
 end
 
 # Keep `buf` bounded to `STDOUT_CAP_BYTES` by dropping the OLDEST bytes when it
@@ -623,6 +662,8 @@ function kill_session!(s::JuliaSession)
     s.closed = true
     s.worker = nothing
     s.in_flight = nothing
+    # Closing the channel ends stream_forward_loop! (the `for` over it returns).
+    try close(s.stream_channel) catch end
     s.is_temp && s.env_path !== nothing && isdir(s.env_path) &&
         try rm(s.env_path; recursive = true, force = true) catch end
     return nothing
@@ -636,48 +677,15 @@ mutable struct SessionManager
     # so it only ever holds the few in flight — no per-key lock registry to leak.
     creating::Dict{String,Task}
     lock::ReentrantLock                 # guards BOTH `sessions` and `creating`
-    log_dir::String
 end
 
-# DETERMINISTIC log location: the chat host derives the same path from the
-# env_path alone (`eval_log_path`) and live-tails it over the worker file
-# protocol while an eval runs — a random mktempdir would make the path
-# unknowable outside this process. Two MCP instances on one machine sharing an
-# env append to the same file; for a live tail this interleaving is harmless
-# (offset-based tailing only surfaces what arrives while THIS eval runs).
-eval_log_dir() = joinpath(tempdir(), "bonitoagents-mcp-logs")
-
-function SessionManager()
-    log_dir = eval_log_dir()
-    mkpath(log_dir)
-    SessionManager(Dict{String,JuliaSession}(),
-                   Dict{String,Task}(),
-                   ReentrantLock(), log_dir)
-end
+SessionManager() = SessionManager(Dict{String,JuliaSession}(),
+                                  Dict{String,Task}(),
+                                  ReentrantLock())
 
 const TEMP_KEY = "__temp__"
 
 _key(env_path::Union{String,Nothing}) = env_path === nothing ? TEMP_KEY : abspath(env_path)
-
-function log_file_name(key::AbstractString)
-    safe = replace(key, '/' => '_', '\\' => '_')
-    safe = strip(safe, '_')
-    isempty(safe) && (safe = "temp")
-    return "$safe.log"
-end
-
-"""
-    eval_log_path(env_path) -> String
-
-The on-disk stdout/stderr log of the eval session for `env_path`, derivable
-WITHOUT a manager instance — the chat host uses this to live-tail a running
-eval's output on the worker machine.
-"""
-eval_log_path(env_path::Union{AbstractString,Nothing}) =
-    joinpath(eval_log_dir(),
-             log_file_name(_key(env_path === nothing ? nothing : String(env_path))))
-
-_log_path(m::SessionManager, key::String) = joinpath(m.log_dir, log_file_name(key))
 
 # Return the live Julia session for `env_path`, creating one if needed. Creation
 # is SINGLE-FLIGHT per key: concurrent callers for the same env_path share ONE
@@ -738,8 +746,7 @@ function build_session!(m::SessionManager, key::String, env_path::Union{String,N
         # bt_show_app fails loudly but bt_julia_eval still works in the bare env.
         is_temp && seed_temp_env_with_bonito!(env_dir)
         is_test = !is_temp && basename(rstrip(env_dir, '/')) == "test"
-        s = JuliaSession(env_dir; is_temp, is_test, julia_cmd,
-                         log_path = _log_path(m, key))
+        s = JuliaSession(env_dir; is_temp, is_test, julia_cmd)
         start!(s)
     catch
         @lock m.lock delete!(m.creating, key)
@@ -783,7 +790,6 @@ list_sessions(m::SessionManager) = @lock m.lock begin
       alive    = is_alive(s),
       temp     = s.is_temp,
       julia_cmd = s.julia_cmd,
-      log_path  = s.log_path,
       in_flight = s.in_flight !== nothing)
      for s in values(m.sessions)]
 end
@@ -795,7 +801,6 @@ function shutdown!(m::SessionManager)
         end
         empty!(m.sessions)
     end
-    try rm(m.log_dir; recursive = true, force = true) catch end
     return nothing
 end
 
@@ -811,8 +816,5 @@ function effective_timeout(code::AbstractString,
     return requested > 0 ? requested : nothing
 end
 
-const MANAGER = Ref{Union{SessionManager,Nothing}}(nothing)
-function manager()
-    MANAGER[] === nothing && (MANAGER[] = SessionManager())
-    return MANAGER[]
-end
+# The process-wide session manager + accessor `manager()` live on the one
+# `SERVER` context (see context.jl).

@@ -246,6 +246,11 @@ mutable struct ServerState
     # same mutex their old globals were already taken under.
     eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (eval-result dial-back)
     mcp_ctrl           :: Dict{String,Any}              # project_id => live MCP control WS
+    # Live stdout/stderr stream sinks for RUNNING evals: "project_id\0route" =>
+    # Channel the MCP pushes chunks into (drained by `eval_stream_loop!`). The MCP
+    # forwards worker IO over /mcp-ws (no on-disk log, no polling); the sink exists
+    # only while an eval's tail loop runs. Guarded by `lock`.
+    eval_stream_sinks  :: Dict{String,Channel{String}}
     session_inflight   :: Dict{String,Task}             # project_id => in-flight ensure_project_session! task
     # Per-path serialization lock for fetched `bt_show` files (server_dst => lock);
     # a process-level coordination pool, server-scoped here so it dies with the server.
@@ -303,6 +308,7 @@ function ServerState(; state_dir::String,
         Ref(""),                                  # base_url (set by serve())
         Dict{String,Any}(),                       # eval_workers
         Dict{String,Any}(),                       # mcp_ctrl
+        Dict{String,Channel{String}}(),           # eval_stream_sinks
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
         String[],                                 # bound_lru
@@ -343,6 +349,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.base_url,
             s.eval_workers,            # shared registries — one per server, all
             s.mcp_ctrl,                # sessions cooperate on the same tables
+            s.eval_stream_sinks,
             s.session_inflight,
             s.show_fetch_inflight,
             s.bound_lru,               # shared registry — one per server

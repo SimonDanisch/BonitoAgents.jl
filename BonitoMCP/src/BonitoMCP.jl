@@ -35,6 +35,7 @@ end
 include("server.jl")
 include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)
 include("ctrl_ws.jl")          # control dial-back to BonitoAgents (per-tool interrupt)
+include("context.jl")          # the one MCPServer value (SERVER) owning all process state
 include("tools/eval.jl")
 include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
 

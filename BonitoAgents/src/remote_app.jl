@@ -518,9 +518,16 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
             # Per-frame guard — one malformed reply must not drop the channel.
             try
                 d = JSON.parse(String(msg))
-                rid = get(d, "request_id", nothing)
-                rid isa AbstractString && !isempty(rid) &&
-                    deliver_rpc_response!(state, String(rid), Dict{String,Any}(d))
+                if get(d, "type", "") == "eval_stream_chunk"
+                    # Unsolicited live-stdout push (no request_id): route it to the
+                    # matching running eval's tail. High-volume, so handled first.
+                    route_eval_chunk!(state, project_id,
+                        String(get(d, "route", "")), String(get(d, "chunk", "")))
+                else
+                    rid = get(d, "request_id", nothing)
+                    rid isa AbstractString && !isempty(rid) &&
+                        deliver_rpc_response!(state, String(rid), Dict{String,Any}(d))
+                end
             catch e
                 @warn "mcp ctrl frame error" exception = e
             end
@@ -537,6 +544,34 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
         @info "MCP control channel closed" project_id
     end
     return
+end
+
+# Sink registry key: one live eval tail per (chat, eval session). `route` is the
+# eval session's env_path as the MCP tags it (see BonitoMCP.stream_route),
+# matched against the tool's normalized env_path in `eval_stream_loop!`.
+eval_sink_key(project_id::AbstractString, route::AbstractString) = "$project_id\0$route"
+
+"""
+    route_eval_chunk!(state, project_id, route, chunk)
+
+Deliver a live stdout/stderr chunk (pushed by the MCP over /mcp-ws) to the
+matching running eval's tail loop. Drops silently if no tail is listening — the
+live stream is a best-effort display side-channel; the agent's copy of the
+output rides the MCP tool response separately.
+"""
+function route_eval_chunk!(state::ServerState, project_id::AbstractString,
+                           route::AbstractString, chunk::AbstractString)
+    isempty(chunk) && return nothing
+    ch = lock(state.lock) do
+        get(state.eval_stream_sinks, eval_sink_key(project_id, route), nothing)
+    end
+    ch === nothing && return nothing
+    try
+        isopen(ch) && put!(ch, chunk)
+    catch
+        # channel closed between the read and the put — the tail loop is gone
+    end
+    return nothing
 end
 
 """

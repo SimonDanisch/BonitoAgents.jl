@@ -364,6 +364,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # `bt_eval` invocations can route the eval worker's dial-back to the
     # right BonitoAgents instance.
     SERVER_CONTEXT[] = (url = h.url, secret = h.secret, project_id = Ref(""))
+    # Clean slate for the MCP control dial-back (armed lazily on the first eval,
+    # see invoke_mcp) in case a prior test tore down without close().
+    try BonitoMCP.reset_ctrl_dialback!() catch end
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
                        Ref{Any}(nothing), Ref(false))
@@ -495,11 +498,17 @@ function invoke_mcp(client, ev::AbstractDict)
     ctx = SERVER_CONTEXT[]
     runner() = tool == "bt_julia_continue" ?
         BonitoMCP.julia_continue_handler(args) : BonitoMCP.julia_eval_handler(args)
+    # Faithful MCP-process behaviour: arm the /mcp-ws control dial-back (idempotent)
+    # so the eval's live stdout streams over the REAL wire to the chat's tail, same
+    # as production. Env vars (incl. project_id) are set by with_bridge_env, which
+    # start_ctrl_dialback! reads synchronously; the async dial connects well before
+    # the worker's first print. reset_ctrl_dialback! (dev_server/close) re-points it.
+    armed() = (BonitoMCP.start_ctrl_dialback!(); runner())
     result = try
         # `ctx === nothing` is the standalone case (no live bridge → text fallback,
         # still a valid result). With a server context, wire the dial-back so the
         # result renders to a LIVE Bonito fragment over the eval bridge.
-        ctx === nothing ? runner() : with_bridge_env(ctx, runner)
+        ctx === nothing ? runner() : with_bridge_env(ctx, armed)
     catch e
         Dict{String,Any}(
             "content" => Any[Dict("type" => "text",
@@ -546,6 +555,10 @@ end
 function Base.close(s::TestServer)
     s.closed[] && return s
     s.closed[] = true
+    # Tear down the MCP control dial-back this process armed for `s` (see
+    # invoke_mcp): the test process stands in for one MCP server per dev_server,
+    # so its /mcp-ws dial must be re-pointed, not left dangling on a dead server.
+    try BonitoMCP.reset_ctrl_dialback!() catch end
     ctx = s.browser[]
     ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)

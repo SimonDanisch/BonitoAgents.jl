@@ -191,7 +191,6 @@ function julia_list_sessions_handler(::AbstractDict)
             tail = isempty(extras) ? "" : "  [" * join(extras, ", ") * "]"
             label = s.env_path === nothing ? "<temp>" : s.env_path
             push!(lines, "  - $label$tail")
-            s.log_path === nothing  || push!(lines, "      log: $(s.log_path)")
         end
         join(lines, "\n")
     end

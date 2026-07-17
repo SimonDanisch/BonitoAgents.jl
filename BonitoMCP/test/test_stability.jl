@@ -164,13 +164,13 @@ end
 @testset "M9: requestId maps cancel to one session" begin
     # Pure mapping check — no workers needed.
     M.note_inflight_request!(42, "/some/env")
-    got = lock(M.INFLIGHT_LOCK) do
-        get(M.INFLIGHT_REQUESTS, 42, :missing)
+    got = lock(M.SERVER.inflight_lock) do
+        get(M.SERVER.inflight, 42, :missing)
     end
     @test got == "/some/env"
     M.clear_inflight_request!(42)
-    gone = lock(M.INFLIGHT_LOCK) do
-        get(M.INFLIGHT_REQUESTS, 42, :missing)
+    gone = lock(M.SERVER.inflight_lock) do
+        get(M.SERVER.inflight, 42, :missing)
     end
     @test gone === :missing
 end
