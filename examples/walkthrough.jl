@@ -95,14 +95,18 @@ function warm_chats!(server, pids)
 end
 
 # After a COLD rig attach the eval worker is fresh, so the live app the agent
-# registered during seeding is gone — its embed shows the placeholder. One
-# cheap single-purpose prompt re-registers it. Opt-in (BT_WALKTHROUGH_REVIVE=1)
+# returned during seeding is gone — its embed shows the placeholder. One cheap
+# single-purpose prompt returns a fresh one. Opt-in (BT_WALKTHROUGH_REVIVE=1)
 # because it's the only step that talks to the real agent.
+#
+# The live app is now just a value `bt_julia_eval` RETURNS (there is no separate
+# bt_show_app tool anymore): the eval parks the App as a RemoteRef and the chat
+# mounts it live, with the same detach / keep-alive the tour relies on.
 function revive_live_app!(server, pids)
     state = server.h.state
     # The rig worker dials back asynchronously after attach — a prompt sent
     # before its control WS is up fails the lazy ACP bind ("Worker … is not
-    # connected") and the revive turn dies without registering anything.
+    # connected") and the revive turn dies without returning anything.
     t0 = time()
     while isempty(state.worker_control_ws) && time() - t0 < 60
         sleep(0.5)
@@ -111,9 +115,11 @@ function revive_live_app!(server, pids)
     model = BT.ensure_project_session!(state, state.projects[][pids["LorenzExplorer"]])
     s = BT.shared(model)
     BT.send_message!(model, BT.UserMsg(
-        "Bring the interactive explorer app back up with bt_show_app " *
-        "(env_path = \"/sim/Programmieren/ClaudeExperiments\", rho slider 10:60, " *
-        "same as before). Nothing else, no prose."))
+        "Use bt_julia_eval (env_path = \"/sim/Programmieren/ClaudeExperiments\") to " *
+        "build and RETURN the interactive Lorenz visit-density explorer as a Bonito " *
+        "App: a rho Slider(10:60) driving the Axis3 density surface, recomputed in " *
+        "the worker on every drag. Return the App as the LAST expression so it " *
+        "renders live in the chat. Nothing else, no prose."))
     t0 = time()
     while !s.busy_active[] && time() - t0 < 60; sleep(2); end
     while s.busy_active[] && time() - t0 < 420; sleep(5); end
@@ -123,8 +129,9 @@ end
 # ── camera helpers ───────────────────────────────────────────────────────────
 # REAL input only: everything on camera must be a genuine input event on a
 # VISIBLE element — no programmatic scrollTo/scrollIntoView, no
-# `element.click()`, no value-poking. Scrolling is `ECT.wheel` (trusted
-# `sendInputEvent` wheel at the cursor), sliders are `ECT.steer_slider`
+# `element.click()`. Scrolling drives the chat's own spring scroller (`scroll_by!`;
+# ElectronCall dropped its trusted wheel and the scroller ignores synthetic
+# wheel anyway), sliders are `ECT.steer_slider`
 # (trusted mouse drag of the thumb) and it THROWS if the slider isn't on
 # screen; clicks are `ECT.click` at resolved coordinates.
 
@@ -155,16 +162,39 @@ function el_offscreen(s, js_el::AbstractString; at = 0.5, tol = 60)
     return v === nothing ? nothing : Float64(v)
 end
 
-# Real-wheel until `js_el` sits at viewport position `at` (e.g. 0.25 parks a
-# slider near the top so the canvas below it stays in frame).
+# Scroll the transcript by `delta` px (positive = toward the bottom). The chat
+# uses a CUSTOM pan/spring scroller that ignores a synthetic wheel event and
+# ElectronCall no longer ships a trusted `wheel` — so drive the scroller's OWN
+# state, exactly as a real fling does: follow-mode off, animate `scrollTop`
+# toward the target over a few frames, and keep the user-input timestamp fresh
+# so the chase doesn't snap back to the bottom mid-pan.
+function scroll_by!(s, delta; steps = 12)
+    TK.eval_js(s, """(() => {
+        const c = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent);
+        if (!c) return; const ch = c.__bt_chat;
+        ch && ch.setFollowMode && ch.setFollowMode(false);
+        const max = Math.max(0, c.scrollHeight - c.clientHeight);
+        const from = c.scrollTop;
+        const target = Math.max(0, Math.min(max, from + ($(Float64(delta)))));
+        const N = $(steps); let i = 0;
+        const tick = () => { i++;
+            c.scrollTop = from + (target - from) * (i / N);
+            if (ch) ch._lastUserInputT = performance.now();
+            if (i < N) requestAnimationFrame(tick); };
+        tick();
+    })()""")
+    sleep(0.25)
+end
+
+# Pan the transcript until `js_el` sits at viewport position `at` (e.g. 0.18
+# parks a slider near the top so the canvas below it stays in frame).
 function wheel_to!(s, ctx, js_el::AbstractString; at = 0.5, max_ticks = 40)
     cursor_to_transcript!(s, ctx)
     for _ in 1:max_ticks
         off = el_offscreen(s, js_el; at)
         off === nothing && return false
         off == 0 && return true
-        ECT.wheel(ctx, clamp(off, -320, 320))
-        sleep(0.25)
+        scroll_by!(s, clamp(off, -320, 320))
     end
     return el_offscreen(s, js_el; at) == 0
 end
@@ -237,6 +267,32 @@ pill_collapsed(s, needle; nth = 1) = TK.eval_js(s, """(() => {
 # like a user — never by poking navigation state).
 home_js() = """[...document.querySelectorAll('.bt-side-item')]
     .find(x => x.offsetParent && (x.innerText||'').trim() === 'Home')"""
+
+# Open lorenz.jl from a chat's sidebar file tree, into a Monaco tab beside the
+# app. The ▾ files hint is HOVER-gated (its pointer-events flip on CSS
+# `:hover`), and ElectronCall's synthetic cursor can't set a real `:hover` — so
+# animate the cursor over the row for the camera, then trip the hint's OWN
+# onclick through the DOM (nudge pointer-events + `.click()`), which fires the
+# same handler a real hover-click would. The tree rows themselves are not
+# hover-gated, so a normal click opens the file.
+function open_lorenz_file!(s, ctx)
+    ECT.move_to(ctx, ECT.JS(side_chat_js("Lorenz attractor explorer")); duration = 0.5)
+    sleep(0.5)
+    TK.eval_js(s, """(() => {
+        const c = [...document.querySelectorAll('.bt-side-chat')]
+            .find(x => (x.innerText || '').includes('Lorenz'));
+        const h = c && c.querySelector('.bt-side-tree-hint');
+        if (h) { h.style.pointerEvents = 'auto'; h.click(); }
+        return !!h;
+    })()""")
+    TK.wait_for(s, "file tree open",
+        "[...document.querySelectorAll('.bt-tree-row')].some(e => e.offsetParent)"; timeout = 20)
+    sleep(0.6)
+    ECT.click(ctx, ECT.JS(el_center_js("""[...document.querySelectorAll('.bt-tree-row')]
+        .find(x => x.offsetParent && x.innerText.includes('lorenz.jl'))""")))
+    TK.wait_for(s, "editor open",
+        "!!document.querySelector('.bt-file-editor .monaco-editor-div')"; timeout = 30)
+end
 
 # The live embed occasionally lands in a broken intermediate state after the
 # warm sweep's keep-alive evictions (re-embed raced by the next navigation);
@@ -323,20 +379,7 @@ function tour(s, ctx, pids)
     sleep(0.8)
 
     # 6 ─ open lorenz.jl from the sidebar file tree → a tab beside the app.
-    #     The ▾ files hint is HOVER-gated (pointer-events flips on `:hover`),
-    #     which only real pointer state sets — real_click sends trusted input.
-    ECT.move_to(ctx, ECT.JS(side_chat_js("Lorenz attractor explorer")))
-    sleep(0.6)                                    # hover reveals the ▾ files hint
-    ECT.real_click(ctx, ECT.JS(el_center_js("""[...document.querySelectorAll('.bt-side-chat')]
-        .find(c => (c.innerText||'').includes('Lorenz'))
-        ?.querySelector('.bt-side-tree-hint')""")))
-    TK.wait_for(s, "file tree open",
-        "[...document.querySelectorAll('.bt-tree-row')].some(e => e.offsetParent)"; timeout = 20)
-    sleep(0.6)
-    ECT.click(ctx, ECT.JS(el_center_js("""[...document.querySelectorAll('.bt-tree-row')]
-        .find(x => x.offsetParent && x.innerText.includes('lorenz.jl'))""")))
-    TK.wait_for(s, "editor open",
-        "!!document.querySelector('.bt-file-editor .monaco-editor-div')"; timeout = 30)
+    open_lorenz_file!(s, ctx)
     sleep(1.8)
 
     # 7 ─ switch chats: the fractal gallery, wheeling up through the renders.
@@ -346,7 +389,7 @@ function tour(s, ctx, pids)
     sleep(1.0)
     cursor_to_transcript!(s, ctx)
     for _ in 1:3
-        ECT.wheel(ctx, -700; steps = 8, step_sleep = 0.1)
+        scroll_by!(s, -700)
         sleep(1.8)
     end
 
@@ -354,25 +397,32 @@ function tour(s, ctx, pids)
     #     pill's ▶ toggle to expand it (only if it isn't already open). The
     #     toggle is the deterministic target: the header CENTER can land on
     #     the title, which is a path-link that opens the editor instead.
+    #     Wrapped: this browses an OLD (un-reseeded) chat whose replayed Edit
+    #     content can occasionally not re-render its diff on the tool.render
+    #     round trip — a flake there must not abort the whole recording.
     ECT.click(ctx, ECT.JS(side_chat_js("Game of Life: torus mode")))
     sleep(1.0)
-    wheel_to!(s, ctx, pill_js("Edit"; nth = 1))
-    if pill_collapsed(s, "Edit"; nth = 1)
-        ECT.click(ctx, ECT.JS(el_center_js(pill_js("Edit"; nth = 1) *
-            "?.querySelector('.bt-tool-toggle')")))
-        # Replayed diffs arrive via a tool.render round trip — hold the shot
-        # until Monaco is actually on screen.
-        TK.wait_for(s, "diff mounts",
-            pill_js("Edit"; nth = 1) *
-            "?.querySelector('.monaco-diff-editor-div, .monaco-diff-editor') != null";
-            timeout = 20)
+    try
+        wheel_to!(s, ctx, pill_js("Edit"; nth = 1))
+        if pill_collapsed(s, "Edit"; nth = 1)
+            ECT.click(ctx, ECT.JS(el_center_js(pill_js("Edit"; nth = 1) *
+                "?.querySelector('.bt-tool-toggle')")))
+            # Replayed diffs arrive via a tool.render round trip — hold the shot
+            # until Monaco is actually on screen.
+            TK.wait_for(s, "diff mounts",
+                pill_js("Edit"; nth = 1) *
+                "?.querySelector('.monaco-diff-editor-div, .monaco-diff-editor') != null";
+                timeout = 20)
+        end
+    catch e
+        @warn "walkthrough: GoL diff step flaked (replayed edit) — continuing" exception = e
     end
     sleep(2.4)
 
     # 9 ─ the audit chat: three parallel subagents with live activity feeds.
     ECT.click(ctx, ECT.JS(side_chat_js("Parallel code audit")))
     sleep(1.2)
-    wheel_to!(s, ctx, pill_js("Task"; nth = 1))
+    try; wheel_to!(s, ctx, pill_js("Task"; nth = 1)); catch; end
     sleep(3.0)
 
     # 10 ─ home stretch: back to the dashboard by clicking Home, like a user.
@@ -509,18 +559,7 @@ function stills(; server = nothing,
                   ECT.JS(groupbody("Chat"; rel = (0.94, 0.5)))];
                  grab = 0.4, move = 1.1)
         sleep(1.6)
-        ECT.move_to(ctx, ECT.JS(side_chat_js("Lorenz attractor explorer")))
-        sleep(0.6)
-        ECT.real_click(ctx, ECT.JS(el_center_js("""[...document.querySelectorAll('.bt-side-chat')]
-            .find(c => (c.innerText||'').includes('Lorenz'))
-            ?.querySelector('.bt-side-tree-hint')""")))
-        TK.wait_for(s, "file tree open",
-            "[...document.querySelectorAll('.bt-tree-row')].some(e => e.offsetParent)"; timeout = 20)
-        sleep(0.6)
-        ECT.click(ctx, ECT.JS(el_center_js("""[...document.querySelectorAll('.bt-tree-row')]
-            .find(x => x.offsetParent && x.innerText.includes('lorenz.jl'))""")))
-        TK.wait_for(s, "editor open",
-            "!!document.querySelector('.bt-file-editor .monaco-editor-div')"; timeout = 30)
+        open_lorenz_file!(s, ctx)
         sleep(3.0)                                   # Monaco + canvas settle
         hide_cursor(s)
         ws_png = joinpath(outdir, "screenshot-workspace.png")

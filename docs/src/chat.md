@@ -16,6 +16,11 @@ growing above the viewport.
 - **Tool calls** appear as one-line pills (icon, title, status) that expand
   in place: file edits into a Monaco diff viewer, shell commands into
   scrollable terminal output, searches into match lists.
+- **Julia evals** (`bt_julia_eval`) stream their stdout into a live terminal
+  pane while they run, then settle into Code and Output sections that each
+  collapse three ways (full → a scrollable ~4-line summary → hidden). The
+  return value renders below as a live result — an interactive app included
+  (see [Julia Tools & Live Apps](@ref)).
 - **Questions** (ACP elicitations) render as forms you answer inline.
 - **Plans and todo lists** the agent maintains are pinned to the taskbar while
   the turn runs.
@@ -48,12 +53,15 @@ split horizontally or vertically, float as windows, and dock back.
 
 ## Media and live apps
 
-Agents push results into the chat via the built-in `bt_show` tools
-([Julia Tools & Live Apps](@ref)). Images and videos render inline with a
-lightbox, and `bt_show_app` embeds a running Bonito app whose logic executes
-in the worker's Julia session, so interactions round trip to real code. Live
-embeds detach from their bubble into a workspace tab or floating window and
-stay alive there.
+Agents push results into the chat through the built-in Julia tools
+([Julia Tools & Live Apps](@ref)). `bt_show` renders a worker-side file — images
+and videos inline with a lightbox, text as syntax-highlighted code. And
+whatever `bt_julia_eval` **returns** renders as a live value: a plot, a table,
+or a running Bonito app whose logic executes in the worker's Julia session, so a
+slider drag or button click round trips to real code. Live embeds detach from
+their bubble into a workspace tab or floating window and stay alive there — the
+same DOM node is moved, so their WebGL context and session are kept rather than
+rebuilt.
 
 ## Staying in control
 
