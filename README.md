@@ -16,7 +16,7 @@
 > through BonitoAgents from wiping your entire PC or leaking all your secrets.
 
 <p align="center">
-  <img src="BonitoAgents/assets/screenshot-chat.png" alt="BonitoAgents dashboard" width="850">
+  <img src="BonitoAgents/assets/screenshot-chat.png" alt="Chat with a streamed Monaco diff from a real refactor" width="850">
 </p>
 
 A small worker process runs on every machine that has code on it. All workers

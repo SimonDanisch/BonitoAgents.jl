@@ -11,7 +11,15 @@ checkouts with your own Claude subscription.
     driven through BonitoAgents from wiping your entire PC or leaking all your
     secrets.
 
-![The chat: streaming plan, Monaco diff, terminal output and a live app](assets/screenshot-chat.png)
+The tour below is real: four claude-agent-acp sessions, a live WGLMakie app
+detached into the workspace, files opened from the project tree, and the
+dashboard keeping a rich preview of every chat.
+
+```@raw html
+<video src="assets/walkthrough.mp4" controls autoplay muted loop playsinline
+       style="width: 100%; border-radius: 10px; border: 1px solid rgba(128,128,128,0.25);">
+</video>
+```
 
 ## What you get
 
@@ -31,8 +39,6 @@ checkouts with your own Claude subscription.
   you left off. Existing Claude Code sessions on a worker can be imported and
   resumed. Half-open network links (suspend, a Wi-Fi to LAN switch) are caught
   by heartbeats on both ends and heal automatically.
-
-![Split workspace: chat beside the built-in editor](assets/screenshot-workspace.png)
 
 ## Where next
 

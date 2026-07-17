@@ -217,4 +217,61 @@ end
         @test startswith(sub.id, b.parent.id * "/")
         close(cap2); wait(t2)
     end
+
+    @testset "every render is self-contained (no cross-mount dedup on the proxied root)" begin
+        # The bridge parent is a long-lived ROOT session that outlives browser
+        # pages (reloads, later tabs). Stock Bonito dedups serialization
+        # against the root's `session_objects` and ships bare TrackingOnly
+        # references for anything already sent — an assumption that holds per
+        # PAGE, not per bridge: after a reload the page's object cache is
+        # empty, so a re-mounted embed would reference objects the fresh page
+        # never received (DOM up, observables alive, every cached payload
+        # silently missing — the eternal-spinner WGLMakie embed).
+        #
+        # Ours resolves this at the SERIALIZATION layer instead of tracking
+        # pages: proxied roots opt out of dedup entirely (dev Bonito's
+        # `dedup_cached_objects(::Session{<:ProxyConnection}) = false`), so
+        # EVERY mount — first, re-expand, post-reload — ships full values.
+        # (Root METADATA hazards went with `get_order!`: GlyphSync ships glyph
+        # batches as root evaljs and the page PULLS whatever it lacks.)
+        b, cap = fresh_bridge!()
+        marker = "PAGE_CACHE_MARKER_" * "x"^64
+        payload = Observable(marker)
+        mkapp() = App(s -> (onjs(s, payload, js"(x)=>{}");
+                            DOM.div(DOM.span("app"))))
+
+        # Self-contained ≡ the marker VALUE rides in the fragment itself or in
+        # the init bundle its render registered on the proxy asset server.
+        shipped_marker(html) = begin
+            occursin(marker, html) && return true
+            adds = filter(d -> get(d, "op", "") == "asset_add", ctrl_frames(cap))
+            any(adds) do d
+                bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
+                                                String(d["key"]))
+                occursin(marker, String(copy(bytes)))
+            end
+        end
+
+        # First mount ships the observable's value...
+        @test shipped_marker(RP.render_eval_html(mkapp()))
+        empty!(cap.sent)
+        # ...and so does every LATER mount of the same shared observable — the
+        # assertion that failed on stock dedup after a page reload.
+        @test shipped_marker(RP.render_eval_html(mkapp()))
+
+        # JS module emission: every fragment must carry its <script type=module>
+        # tag wherever it mounts. Pre-Bonito#406 sub emissions were deduped
+        # against `root.imports` "for the page's lifetime" — on a bridge root
+        # outliving pages, a post-reload fragment omitted e.g. the WGLMakie
+        # module script (module never loads, `$(WGL).then(...)` pends forever,
+        # black canvas, zero errors). #406 made subs re-emit their own imports;
+        # duplicate module tags are idempotent in the browser's registry.
+        js_file = joinpath(mktempdir(), "probemod.js")
+        write(js_file, "export function probe() { return 42; }\n")
+        probemod = Bonito.ES6Module(js_file)
+        impapp() = App(s -> DOM.div(Bonito.jsrender(s,
+            js"$(probemod).then(m => m.probe())")))
+        @test occursin("probemod", RP.render_eval_html(impapp()))
+        @test occursin("probemod", RP.render_eval_html(impapp()))   # re-emitted, never deduped away
+    end
 end

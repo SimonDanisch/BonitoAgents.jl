@@ -169,6 +169,18 @@ function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::Taskba
     if item.kind === :todo
         ents = taskbar_todo_rows(item.source)
         ents === nothing && (ents = item.entries)
+        # Done/total counter + collapse chevron. Both are STATIC snapshots
+        # like everything else in a slot: the counter re-renders through the
+        # KeyedList key when entries change, and the chevron's behaviour is
+        # delegated JS on the persistent `.bt-taskbar` parent (the collapsed
+        # state is a class THERE — any state on the slot itself would be
+        # wiped by the 1 Hz re-render; see `_setupLiveTicker`).
+        ndone = count(e -> e[2] == "completed", ents)
+        push!(head, DOM.span(string(ndone, "/", length(ents));
+                             class = "bt-taskbar-todo-count"))
+        push!(head, DOM.button("▾"; type = "button",
+                               class = "bt-taskbar-todo-toggle",
+                               title = "Collapse / expand the task list"))
         rows = DOM.div((begin
                 cls = status == "completed"   ? "bt-taskbar-todo-item bt-todo-done" :
                       status == "in_progress" ? "bt-taskbar-todo-item bt-todo-active" :

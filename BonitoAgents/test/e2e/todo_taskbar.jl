@@ -23,10 +23,12 @@ const PLAN_V2 = [(content = "step one",   status = "completed"),
                  (content = "step two",   status = "in_progress"),
                  (content = "step three", status = "pending")]
 
-# Emit the first plan, hold the turn open, grow it to three items, hold again,
-# then a closing word so the turn ends (zombie-finalizing the still-open list).
+# Emit the first plan, hold the turn open, grow it to three items, hold again
+# (long enough for the collapse testset: two toggle round-trips plus a full
+# 1 Hz re-render tick the collapsed state must survive), then a closing word
+# so the turn ends (zombie-finalizing the still-open list).
 agent_script(_prompt) = [TK.todo(PLAN_V1), TK.delay(3500),
-                         TK.todo(PLAN_V2), TK.delay(3500),
+                         TK.todo(PLAN_V2), TK.delay(8000),
                          TK.text("All wrapped up.")]
 
 function run_suite(server)
@@ -57,6 +59,36 @@ function run_suite(server)
                 "(() => { const d = document.querySelector('.bt-taskbar-todo-item.bt-todo-done'); return d && d.textContent; })()") == "step one"
             @test TK.eval_js(server,
                 "(() => { const a = document.querySelector('.bt-taskbar-todo-item.bt-todo-active'); return a && a.textContent; })()") == "step two"
+        end
+
+        @testset "todo card is collapsible, capped, and survives re-renders" begin
+            # Done/total counter in the head (1 of 3 after PLAN_V2).
+            @test TK.eval_js(server,
+                "(() => { const c = document.querySelector('.bt-taskbar-todo-count'); return c && c.textContent; })()") == "1/3"
+            # Rows are height-capped with internal scroll — a huge plan must
+            # never bury the chat under the floating card.
+            @test TK.eval_js(server,
+                "getComputedStyle(document.querySelector('.bt-taskbar-todo-rows')).overflowY") == "auto"
+            # Collapse via the chevron: rows hidden. The state lives on the
+            # persistent .bt-taskbar (class), so it must SURVIVE the 1 Hz
+            # KeyedList re-render that replaces the slot node.
+            TK.click(server, ".bt-taskbar-todo-toggle")
+            @test TK.wait_for(server, "rows hidden after collapse",
+                "(() => { const r = document.querySelector('.bt-taskbar-todo-rows'); return r && r.offsetParent === null; })()"; timeout = 4) == true
+            sleep(1.5)   # at least one re-render tick swaps the slot node
+            @test TK.eval_js(server,
+                "(() => { const r = document.querySelector('.bt-taskbar-todo-rows'); return r && r.offsetParent === null; })()") == true
+            # Expand again for the finalize testset, and clear the persisted
+            # choice so later suites on a shared server see the default.
+            TK.click(server, ".bt-taskbar-todo-toggle")
+            @test TK.wait_for(server, "rows visible after expand",
+                "(() => { const r = document.querySelector('.bt-taskbar-todo-rows'); return r && r.offsetParent !== null; })()"; timeout = 4) == true
+            TK.eval_js(server, "localStorage.removeItem('bt-todo-collapsed'); true")
+            # The viewport meta carries the Android keyboard fix
+            # (interactive-widget=resizes-content, set at module import in
+            # bonitoagents.js) — asserted here since both live in that asset.
+            @test TK.eval_js(server,
+                "document.querySelector('meta[name=viewport]').content.includes('interactive-widget=resizes-content')") == true
         end
 
         @testset "turn end finalizes the list into one bubble and drops the pin" begin

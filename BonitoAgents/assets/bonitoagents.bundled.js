@@ -2,6 +2,10 @@
 // deno-lint-ignore-file
 // This code was bundled using `deno bundle` and it's not recommended to edit it manually
 
+if (typeof document !== 'undefined') {
+    const vp = document.querySelector('meta[name="viewport"]');
+    if (vp && !vp.content.includes('interactive-widget')) vp.content += ', interactive-widget=resizes-content';
+}
 class Collapsable {
     constructor(headerEl, bodyEl, opts = {}){
         this.header = headerEl;
@@ -49,7 +53,8 @@ class Collapsable {
                 this.body.style.display = expanded ? '' : 'none';
             }
         }
-        if (expanded && !this.editMode) {
+        const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
+        if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
                 this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
                 this.onExpand && this.onExpand();
@@ -1738,8 +1743,13 @@ class BonitoChat {
                     if (this._wantsNative(div)) {
                         div.classList.add('bt-tool-native');
                         div.dataset.btAutoExpand = '1';
-                    } else if (msg.expand) {
-                        div.dataset.btAutoExpand = '1';
+                    } else if (msg.expand || msg.expand_full) {
+                        if (div.collapsable.editMode) {
+                            div.dataset.btAutoMount = '1';
+                            if (msg.expand_full || div.collapsable.hideBodyOnCollapse) div.dataset.btAutoExpand = '1';
+                        } else {
+                            div.dataset.btAutoExpand = '1';
+                        }
                     }
                     break;
                 }
@@ -1850,7 +1860,15 @@ class BonitoChat {
     _setupLiveTicker() {
         this.taskbarEl = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-taskbar');
         if (this.taskbarEl) {
+            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const paneW = this.container.closest('.bt-chatpane')?.clientWidth ?? window.innerWidth;
+            this.taskbarEl.classList.toggle('bt-todo-collapsed', storedTodo != null ? storedTodo === '1' : paneW < 660);
             this._onTaskbarClick = (ev)=>{
+                if (ev.target.closest('.bt-taskbar-todo-toggle')) {
+                    const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
+                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    return;
+                }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;

@@ -199,6 +199,16 @@ mutable struct ChatModel
     # live (see taskbar.jl). Shared across session views; owns its own poll
     # loop. Replaces the old `taskbar_items`/`taskbar_clock` + background poller.
     taskbar::TaskBar
+
+    # Per-tool render serialization: tool_id → (render lock, latest generation).
+    # ToolRenderCommand handlers run async, and for a `bonito_app` body two
+    # CONCURRENT renders each delegate a worker subsession — the interleaved
+    # supersede bookkeeping could close the NEWER sub while the stale render's
+    # html won the slot (a dead embed stuck on its spinner). Renders for one
+    # tool hold the lock across render + ship; a render that is no longer the
+    # latest generation at its turn skips entirely. Guarded by `model.lock`
+    # for the get!/increment; entries are few (one per rendered tool).
+    tool_renders::Dict{String, Tuple{ReentrantLock, Ref{Int}}}
 end
 
 # The provider tracked by the `provider` observable: the singleton descriptor the
@@ -261,6 +271,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Dict{String, Tuple{Channel, Any}}(),   # pending_asks
         String[],                              # tool_cache_order (LRU for the cache)
         TaskBar(),                             # live-task board (owns its poll loop)
+        Dict{String, Tuple{ReentrantLock, Ref{Int}}}(),  # tool_renders (serialize + latest-wins)
     )
     # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
     # with `chat = nothing` (the model doesn't exist yet while parsing), but
@@ -331,6 +342,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.pending_asks,            # shared → asks resolve against the parent
             m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
             m.taskbar,                 # shared → one live-task board per chat
+            m.tool_renders,            # shared → renders serialize across every tab
         )
     end
 end
@@ -803,7 +815,16 @@ mutable struct TodoListMsg <: ChatMsg
     # The chat's TaskBar while this list is live; `nothing` once finalized.
     # MEMBERSHIP IS LIVENESS (`push!`/`finished!` the only mutators). Init nothing.
     task_bar::Union{TaskBar,Nothing}
+    # Contents stripped from this list's display: finished carry-over from the
+    # previously finalized list. Claude keeps ONE cumulative todo list per
+    # session and re-sends every crossed-off item with each new task's plan
+    # updates — without this a fresh list opens pre-filled with the whole
+    # session's history. Established once at creation (`process_todo!`); an
+    # item resurfacing as OPEN work un-hides (and its later completion shows).
+    hidden::Set{String}
 end
+TodoListMsg(id, entries, started_at, finished_at, chat, task_bar) =
+    TodoListMsg(id, entries, started_at, finished_at, chat, task_bar, Set{String}())
 TodoListMsg(id, entries, started_at, finished_at, chat) =
     TodoListMsg(id, entries, started_at, finished_at, chat, nothing)
 TodoListMsg(entries::Vector{PlanEntry}) =
@@ -1398,6 +1419,18 @@ function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
     isempty(m.server) || (d["server"] = m.server)
     d["title"] = tool_key(m)
     mcp_input_extras!(d, m)
+    # Same typed auto-expand contract as the live tool_update path: a header
+    # rebuilt for a FRESH page (reload, late scroll-in) must render the way
+    # the live update did — an eval eager-mounts its body while running and
+    # fully uncollapses once completed with a result descriptor. Without
+    # this, a completed eval's live result embed only re-mounted after a
+    # manual click post-reload (dead transcript where the live run showed
+    # the result). Content via the render cache (disk fallback) — the
+    # composed ToolMsg holds it on the inner Message, not as a field here.
+    let content = tool_content_for_render(m, chat_dir)
+        auto_expand_body(m, content) && (d["expand"] = true)
+        auto_expand_full(m, content) && (d["expand_full"] = true)
+    end
     # A path argument on the call (bt_show's `path`, …) feeds the ✎
     # editable derivation in augment_generic_header! below.
     hint = tool_path_hint(m)
@@ -3575,25 +3608,55 @@ function process_todo!(chat::ChatModel, entries)
     s = shared(chat)
     t = s.live_todo[]
     if t isa TodoListMsg && is_live(t)
-        t.entries = collect(PlanEntry, entries)
-    else
-        # Claude habitually RE-SENDS the final all-done list ("todos
-        # cleared"). Starting a fresh list from that would immediately
-        # finalize a duplicate history bubble — drop it when it matches
-        # the most recent finalized list.
-        new = collect(PlanEntry, entries)
-        if !any(e -> e.status in ("pending", "in_progress"), new)
-            last_todo = lock(s.lock) do
-                idx = findlast(m -> m isa TodoListMsg, s.msgs_store)
-                idx === nothing ? nothing : s.msgs_store[idx]
-            end
-            if last_todo !== nothing &&
-               [(e.content, e.status) for e in last_todo.entries] ==
-               [(e.content, e.status) for e in new]
-                return nothing
-            end
+        incoming = collect(PlanEntry, entries)
+        # Keep stripping the carry-over this list was created without (claude
+        # re-sends its full cumulative session list on EVERY update) — but an
+        # item resurfacing as OPEN work un-hides, so if it is genuinely
+        # reopened (and later completed again) it shows.
+        for e in incoming
+            e.status == "completed" || delete!(t.hidden, e.content)
         end
-        t = TodoListMsg(chat, new)
+        t.entries = [e for e in incoming
+                     if !(e.status == "completed" && e.content in t.hidden)]
+    else
+        # A FRESH list. Claude keeps ONE cumulative todo list per session, so
+        # this update re-sends every item of every previously finalized list
+        # too — crossed-off work from finished tasks would pre-fill the new
+        # card forever. Strip entries that are completed NOW and were already
+        # completed in an earlier finalized bubble: they are history, not
+        # this task's progress. (An item that was PENDING at finalize and
+        # arrives completed is this task's progress — kept.) This also
+        # subsumes the old "claude re-sends the final all-done list" dedup:
+        # such a resend strips to nothing and is skipped entirely, even when
+        # the LLM dropped a leftover item so exact equality wouldn't fire.
+        #
+        # The scope is ALL finalized bubbles, not just the most recent one:
+        # bubbles are themselves stripped, so bubble N only tells task N's
+        # story — a one-bubble-back lookup would let items from task N-1 leak
+        # back into task N+1's card. Each bubble's own `hidden` set is folded
+        # in as belt-and-suspenders for the in-memory case; after a chat.md
+        # reload (hidden not persisted) the union over entries alone already
+        # covers everything, since a stripped item is by construction
+        # completed in some earlier bubble.
+        new = collect(PlanEntry, entries)
+        prev_done = lock(s.lock) do
+            done = Set{String}()
+            for m in s.msgs_store
+                m isa TodoListMsg || continue
+                for e in m.entries
+                    e.status == "completed" && push!(done, e.content)
+                end
+                union!(done, m.hidden)
+            end
+            done
+        end
+        hidden = Set(e.content for e in new
+                     if e.status == "completed" && e.content in prev_done)
+        keep = [e for e in new
+                if !(e.status == "completed" && e.content in hidden)]
+        isempty(keep) && return nothing
+        t = TodoListMsg(chat, keep)
+        t.hidden = hidden
         s.live_todo[] = t
     end
     # Always enter the bar — membership IS liveness. The bar's own loop finalizes
@@ -4888,12 +4951,27 @@ msg_matches(a::UserMsg,  b::AgentClientProtocol.UserMessage)  =
 msg_matches(a::SummaryMsg, b::AgentClientProtocol.UserMessage) =
     is_summary_text(b.text) && strip(a.text) == strip(b.text)
 msg_matches(a::AgentMsg, b::AgentClientProtocol.AgentMessage) = strip(a.text) == strip(b.text)
-msg_matches(a::TodoListMsg, b::AgentClientProtocol.Plan)         = plan_entries_equal(a.entries, b.entries)
-msg_matches(a::TodoListMsg, b::AgentClientProtocol.TodoWriteCall) = plan_entries_equal(a.entries, b.entries)
+msg_matches(a::TodoListMsg, b::AgentClientProtocol.Plan)         = plan_entries_compatible(a.entries, b.entries)
+msg_matches(a::TodoListMsg, b::AgentClientProtocol.TodoWriteCall) = plan_entries_compatible(a.entries, b.entries)
 msg_matches(::ChatMsg,   ::AgentClientProtocol.Message)       = false
 
-plan_entries_equal(a, b) = length(a) == length(b) &&
-    all(ea.content == eb.content && ea.status == eb.status for (ea, eb) in zip(a, b))
+# Ordered content SUBSEQUENCE, statuses ignored. Exact (content, status)
+# equality is unattainable for plans on two counts: the chat.md round-trip
+# maps `in_progress` to `pending` (history_block writes only [x]/[ ]), and a
+# stored bubble may be display-stripped of finished carry-over
+# (`process_todo!`) while the replay re-sends claude's full cumulative list.
+# A stored list "matches" a replayed one when its contents appear in the
+# replayed contents in order — tight enough to anchor the reconciler, loose
+# enough that neither transform breaks resume.
+function plan_entries_compatible(stored, replayed)
+    isempty(stored) && return isempty(replayed)
+    i = 1
+    for e in replayed
+        i <= length(stored) || break
+        stored[i].content == e.content && (i += 1)
+    end
+    return i > length(stored)
+end
 
 # Length of the leading run where our store and the replay candidates line up
 # index-for-index (the shared prefix). Everything after is claude-only → adopt.
@@ -5414,8 +5492,12 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # comparison modal (see `render_sync_modal`). Computed at header build
     # time — re-navigating refreshes it if siblings appear/disappear.
     sibs = isempty(project_id) ? ProjectInfo[] : same_name_siblings(state, project_id)
+    # `nothing` (not an empty placeholder span): a rendered empty span still
+    # occupies a flex-gap slot in `.bt-header-actions`, doubling the visible
+    # gap between the provider select and Sync in both the wide strip and the
+    # collapsed-header panel.
     xsync_control = if isempty(sibs)
-        DOM.span()
+        nothing
     else
         other = first(sibs)
         other_label = haskey(state.workers[], other.worker_id) ?
@@ -5596,6 +5678,22 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
 
+    # ── Narrow-pane collapse toggle ──────────────────────────────────────────
+    # Pure-CSS checkbox pattern (label wraps its own input — no id/for pair, so
+    # several chat panes never collide). Invisible on wide panes; a container
+    # query in styles.jl reveals it when the PANE (not the viewport — panes
+    # can be narrow on a wide desktop) drops under the collapse breakpoint and
+    # hides the action cluster, lens bar and env line. ONE toggle brings them
+    # all back as a full-width panel right below itself. The glyph swaps to ✕
+    # on :checked so the open toggle reads as the close button of the panel it
+    # sits on top of.
+    more_toggle = DOM.label(
+        DOM.input(; type = "checkbox", class = "bt-header-more-check"),
+        DOM.span("⋯"; class = "bt-toggle-closed"),
+        DOM.span("✕"; class = "bt-toggle-open");
+        class = "bt-header-collapse-toggle bt-header-more-toggle",
+        title = "Search & session controls")
+
     # No back arrow — the unified app's sidebar Home icon is the way home.
     # One compact control row (title + the session-config "model" picks + the
     # provider/sync/restart buttons), then the always-on lens search bar.
@@ -5612,6 +5710,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
             # mid-switch) only its own left edge moves into the gap — the
             # provider/sync/restart buttons never reflow.
             DOM.span(provider_status; class="bt-header-status"),
+            more_toggle,
             DOM.div(
                 meta_line,
                 provider_select,
@@ -6132,30 +6231,51 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     # tab (scroll fetches, sends, tab switches) until it returned — multiple stuck
     # tools compound to seconds of frozen UI.
     #
-    # Each render is fire-and-forget — no return value the comm handler needs.
-    # Concurrent renders are safe: `call_ctrl` uses per-request channels +
-    # serial WS writes under `eb.wlock`, and `dom_in_js` opens its own
-    # subsession per call. The catch keeps a stale tool id / dead bridge from
-    # leaking out as an uncaught task error.
+    # Renders for the SAME tool serialize (latest wins): auto-expand can fire
+    # more than once, and for a live eval result two CONCURRENT renders each
+    # mount their own worker render-subsession (RemoteRef "mount") — the
+    # STALE render's DOM could win the slot while the newer mount's
+    # subsession is the one still wired, leaving a dead embed on its spinner
+    # (hit reproducibly on remounts after a page reload, pre-RemoteRef).
+    # Each request bumps the tool's render generation; the async task takes
+    # the tool's render lock and SKIPS if it's no longer the newest — so at
+    # most one render is in flight per tool and the last request's html ships
+    # last. The catch keeps a stale tool id / dead bridge from leaking out as
+    # an uncaught task error.
+    # Keyed per (page, tool): each browser page ships into its own slot, so
+    # only renders for the SAME page supersede each other — another tab's
+    # request must not cancel ours. (Entries are tiny and per rendered tool;
+    # dead pages leave a few behind until the chat closes — acceptable.)
+    render_key = string(Bonito.root_session(session).id, '|', cmd.tool_id)
+    render_lock, gen_ref = lock(model.lock) do
+        get!(() -> (ReentrantLock(), Ref(0)), shared(model).tool_renders, render_key)
+    end
+    my_gen = lock(model.lock) do
+        gen_ref[] += 1
+    end
     Base.errormonitor(@async try
-        # Render the MESSAGE via jsrender: `JuliaEvalCall` hits its typed render,
-        # every other tool type the generic `jsrender(::ToolMsg)` bridge →
-        # `render_tool_body`. `dom_in_js` wraps a non-Node through
-        # `render_subsession`, so handing it the message is fine.
-        # `toolSlot` (a ChatLib module export — no window.* global) also
-        # finds slots on nodes the virtual scroll holds DETACHED (cache
-        # window / prefetch) — a plain document.querySelector misses those
-        # and the body would be stuck on "loading…".
-        Bonito.dom_in_js(
-            session,
-            msg,
-            js"""(elem) => {
+        lock(render_lock) do
+            # A newer request superseded us while we waited — it will ship.
+            lock(() -> gen_ref[], model.lock) == my_gen || return
+            # Render the MESSAGE via jsrender: `JuliaEvalCall` hits its typed
+            # render, every other tool type the generic `jsrender(::ToolMsg)`
+            # bridge → `render_tool_body`. `dom_in_js` wraps a non-Node through
+            # `render_subsession`, so handing it the message is fine.
+            # `toolSlot` (a ChatLib module export — no window.* global) also
+            # finds slots on nodes the virtual scroll holds DETACHED (cache
+            # window / prefetch) — a plain document.querySelector misses those
+            # and the body would be stuck on "loading…".
+            Bonito.dom_in_js(
+                session,
+                msg,
+                js"""(elem) => {
     $(ChatLib).then(lib => {
         const slot = lib.toolSlot($(cmd.tool_id));
         if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
     });
 }"""
-        )
+            )
+        end
     catch e
         @warn "tool render failed" tool_id = cmd.tool_id exception = e
         # Replace the stale "loading…" with a visible failure so the user knows

@@ -78,7 +78,104 @@ const ChatStyles = Bonito.Styles(
         "box-sizing" => "border-box"),
     CSS(".bt-header-row",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
+        # Wrap instead of clip when the pane gets tight: the right-anchored
+        # action cluster drops to its own line as a unit (and the expanded
+        # collapse panel lands on its own full-width row).
+        "flex-wrap" => "wrap", "row-gap" => "6px",
         "width" => "100%"),
+
+    # ── Responsive header ────────────────────────────────────────────────────
+    # The CHAT header is a size container so all breakpoints below query the
+    # CHAT PANE's width — a docked plot pane can squeeze the chat on a huge
+    # desktop, and a phone is just the same thing smaller. Scoped under
+    # `.bt-chatpane`: the dashboard's landing header shares the `.bt-header`
+    # class but has none of the collapsible elements.
+    CSS(".bt-chatpane .bt-header", "container-type" => "inline-size"),
+    # Collapse toggle (⋯). Checkbox-in-label pattern: no ids, state is
+    # pure CSS via :has(input:checked). Hidden on wide panes.
+    CSS(".bt-header-collapse-toggle",
+        "display" => "none", "align-items" => "center",
+        "justify-content" => "center",
+        # Positioning context for the hidden checkbox below: keyboard-focusing
+        # an absolutely-positioned input scrolls to where it RESOLVES, so it
+        # must resolve inside its own label.
+        "position" => "relative",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "border-radius" => "6px",
+        "font-size" => "13px", "line-height" => "1.4",
+        "padding" => "3px 9px",
+        "cursor" => "pointer", "user-select" => "none",
+        "flex" => "0 0 auto"),
+    CSS(".bt-header-collapse-toggle input",
+        "position" => "absolute", "opacity" => "0",
+        "width" => "0", "height" => "0", "pointer-events" => "none"),
+    CSS(".bt-header-collapse-toggle:hover",
+        "background" => "var(--bt-surface-2)"),
+    # The real checkbox is visually hidden but still keyboard-focusable —
+    # surface its focus on the label so tab + space works with a visible ring.
+    CSS(".bt-header-collapse-toggle:has(input:focus-visible)",
+        "outline" => "2px solid var(--bt-accent)", "outline-offset" => "1px"),
+    CSS(".bt-header-collapse-toggle:has(input:checked)",
+        "background" => "var(--bt-surface-2)",
+        "border-color" => "var(--bt-accent)"),
+    # Glyph swap: ⋯ while closed, ✕ while open — the open toggle IS the
+    # close button for the panel it revealed.
+    CSS(".bt-header-collapse-toggle .bt-toggle-open", "display" => "none"),
+    CSS(".bt-header-collapse-toggle:has(input:checked) .bt-toggle-open",
+        "display" => "inline"),
+    CSS(".bt-header-collapse-toggle:has(input:checked) .bt-toggle-closed",
+        "display" => "none"),
+    # Medium panes: the category prefixes ("model:" / "permissions:" /
+    # "effort:") go — the values carry the meaning and each pill keeps its
+    # long-form tooltip.
+    CSS("@container (max-width: 900px)",
+        CSS(".bt-header-meta-cat", "display" => "none")),
+    # Narrow panes: EVERYTHING (action cluster, env path line, lens search
+    # bar) collapses behind the single ⋯ toggle. Checking it expands the
+    # header in flow — the action cluster wraps onto its own full-width row
+    # directly under the toggle (the row is flex-wrap), then the env line and
+    # the lens bar follow — so the ✕ sits right on top of the panel it closes
+    # and the rest of the pane is simply pushed down (hamburger-menu style,
+    # no floating dropdown).
+    # The hide rules carry a `.bt-header` prefix: the base
+    # `.bt-header-actions` / `.bt-lens-bar` / `.bt-header-env` rules are
+    # defined LATER in this stylesheet at equal specificity and would win the
+    # cascade otherwise.
+    CSS("@container (max-width: 660px)",
+        CSS(".bt-header-collapse-toggle",
+            "display" => "inline-flex", "margin-left" => "auto"),
+        CSS(".bt-header .bt-header-actions", "display" => "none"),
+        CSS(".bt-header .bt-header-env", "display" => "none"),
+        CSS(".bt-header .bt-lens-bar", "display" => "none"),
+        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-actions",
+            "display" => "flex", "flex-direction" => "column",
+            "align-items" => "stretch", "gap" => "8px",
+            "flex-basis" => "100%", "margin" => "6px 0 0 0"),
+        # Stacked controls all span the panel with centered labels — the Sync
+        # button's compact `max-width` cap and the provider select's start
+        # alignment only make sense in the wide control strip. Descendant
+        # selector on purpose: the provider select / meta pills sit inside
+        # `display:contents` sub-session fragments, so `> *` can't reach them.
+        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-actions :is(select, button)",
+            "max-width" => "none", "text-align" => "center"),
+        # Inside the expanded panel the config pills stack like the buttons.
+        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta",
+            "flex-direction" => "column", "align-items" => "stretch",
+            "white-space" => "normal"),
+        # Stacked pills center their content (the pick pills are inline-flex,
+        # the static ones plain text — cover both) and bring the category
+        # prefixes BACK: the medium-width rule drops "model:"/"permissions:"/
+        # "effort:" to save strip space, but in a stacked menu a bare
+        # "default" row is ambiguous and there is plenty of width.
+        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta-item",
+            "justify-content" => "center", "text-align" => "center"),
+        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta-cat",
+            "display" => "inline"),
+        CSS(".bt-header:has(.bt-header-more-check:checked) .bt-header-env",
+            "display" => "block"),
+        CSS(".bt-header:has(.bt-header-more-check:checked) .bt-lens-bar",
+            "display" => "flex")),
 
     # ── Lens search bar (header) ─────────────────────────────────────────────
     # Always visible, directly under the control row.
@@ -362,6 +459,12 @@ const ChatStyles = Bonito.Styles(
     # Sits inline in the control row (the session-config "model" picks). Shrinks
     # and ellipsizes before the fixed buttons do; pushed to the right by the
     # title's flex-grow.
+    # A pill-less session (`session_meta` empty) renders the meta div with no
+    # children — drop it from the flex flow entirely, or its zero-width box
+    # still costs a gap slot (a phantom extra gap before the provider select
+    # in the strip AND in the collapsed-header panel). The rule un-applies by
+    # itself the moment pills arrive.
+    CSS(".bt-header-meta:empty", "display" => "none"),
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
@@ -680,6 +783,11 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-msg.bt-tool-wide-active",
         "align-self" => "stretch",
         "max-width" => "100%"),
+    # Live app embeds get a wider default cap than text pills: the visuals ARE
+    # the content, and a responsive (resize_to = :parent) canvas will actually
+    # use the room.
+    CSS(".bt-tool-msg:has(.bt-embed)",
+        "max-width" => "min(98%, 1100px)"),
     # Detach button in the tool header (rendered only for bonito_app tools).
     # ⤢ is the conventional "open in a window" glyph; clicking pops the embed
     # into the floating window. Small, neutral, sits at the right of the header.
@@ -842,7 +950,9 @@ const ChatStyles = Bonito.Styles(
         "top" => "8px", "left" => "8px",
         "z-index" => "6",
         "pointer-events" => "none",   # slots re-enable so we don't catch the messages scroll
-        "max-width" => "280px"),
+        # Never wider than the pane leaves room for — on a phone the fixed
+        # 280px was most of the message column.
+        "max-width" => "min(280px, calc(100% - 16px))"),
     CSS(".bt-taskbar-slots",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "6px"),
@@ -899,7 +1009,35 @@ const ChatStyles = Bonito.Styles(
     # message each clock tick), so the 4px inter-item spacing the outer slot's
     # `gap` used to give the items when they were direct children now lives here.
     CSS(".bt-taskbar-todo-rows",
-        "display" => "flex", "flex-direction" => "column", "gap" => "4px"),
+        "display" => "flex", "flex-direction" => "column", "gap" => "4px",
+        # A long plan must never bury the chat under the floating card —
+        # cap the rows and scroll them internally.
+        "max-height" => "min(40vh, 320px)", "overflow-y" => "auto"),
+    # Done/total counter in the todo head.
+    CSS(".bt-taskbar-todo-count",
+        "flex-shrink" => "0",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "10.5px",
+        "font-weight" => "400",
+        "color" => "var(--bt-text-muted)"),
+    # Collapse chevron. The collapsed state is the `bt-todo-collapsed` class
+    # on the PERSISTENT `.bt-taskbar` element (not the slot — slots are 1 Hz
+    # KeyedList re-renders that would wipe any state; see _setupLiveTicker in
+    # bonitoagents.js, which also persists the choice in localStorage and
+    # defaults phones to collapsed).
+    CSS(".bt-taskbar-todo-toggle",
+        "flex-shrink" => "0",
+        "appearance" => "none", "border" => "none", "background" => "none",
+        "cursor" => "pointer",
+        "padding" => "0 2px",
+        "font-size" => "11px", "line-height" => "1",
+        "color" => "var(--bt-text-muted)",
+        "transition" => "transform 120ms"),
+    CSS(".bt-taskbar-todo-toggle:hover", "color" => "var(--bt-text)"),
+    CSS(".bt-taskbar.bt-todo-collapsed .bt-taskbar-todo-rows",
+        "display" => "none"),
+    CSS(".bt-taskbar.bt-todo-collapsed .bt-taskbar-todo-toggle",
+        "transform" => "rotate(-90deg)"),
     CSS(".bt-taskbar-todo-item",
         "font-size" => "11.5px",
         "color" => "var(--bt-text-muted)",

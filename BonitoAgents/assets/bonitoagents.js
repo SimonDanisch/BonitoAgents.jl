@@ -12,6 +12,20 @@
 // `[data-tool-id]` slot directly. Everything else (counts, ranges, message
 // pushes, status pings) is on `comm`.
 
+// Android keyboard fix (runs once per page, on module import): Chrome 108+
+// defaults to `interactive-widget=resizes-visual` — the on-screen keyboard
+// shrinks only the VISUAL viewport, so the 100dvh app layout keeps the
+// composer behind the keyboard and the browser pans to the focused caret
+// instead (the input ends up floating mid-screen over dead space).
+// `resizes-content` makes the LAYOUT viewport track the keyboard, pinning
+// the composer right above it. Set dynamically because Bonito owns the
+// served <meta name=viewport>; Chromium honours runtime viewport changes.
+if (typeof document !== 'undefined') {
+    const vp = document.querySelector('meta[name="viewport"]');
+    if (vp && !vp.content.includes('interactive-widget'))
+        vp.content += ', interactive-widget=resizes-content';
+}
+
 // One reusable collapsible-section behaviour, shared by tool rows and thought
 // bubbles (and any future lazy section). It owns the expand/collapse plus the
 // lazy-body lifecycle that used to be duplicated across wireToolToggle /
@@ -99,7 +113,16 @@ export class Collapsable {
                 this.body.style.display = expanded ? '' : 'none';
             }
         }
-        if (expanded && !this.editMode) {
+        // Lazy body fetch. editMode pills normally keep their streamed-in
+        // body across toggles and only resize Monaco — but a HISTORY-REPLAYED
+        // edit pill starts with an EMPTY body (its diff lives server-side
+        // until a tool.render round trip), so gating the fetch on
+        // `!editMode` alone made replayed Edit pills permanently
+        // unexpandable: the arrow flipped, `_applyEditHeight` sized zero
+        // Monaco divs, and nothing ever appeared. Fetch whenever the body
+        // has nothing to show.
+        const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
+        if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
                 this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
                 this.onExpand && this.onExpand();
@@ -2624,15 +2647,26 @@ class BonitoChat {
                     // first insertion.
                     div.classList.add('bt-tool-native');
                     div.dataset.btAutoExpand = '1';
-                } else if (msg.expand) {
-                    // Auto-expand (e.g. bt_show) — DEFERRED until the node
-                    // first enters the document (insertSorted). The history
-                    // prefetcher creates nodes detached; expanding those
-                    // immediately fired tool.render whose dom_in_js reply
-                    // found no slot in the document — the body stayed on
-                    // "loading…" forever (and every off-screen bt_show in
-                    // history cost a render round-trip up front).
-                    div.dataset.btAutoExpand = '1';
+                } else if (msg.expand || msg.expand_full) {
+                    // Auto-expand (bt_show refs, eval eager-mount /
+                    // expand_full) — DEFERRED until the node first enters the
+                    // document (insertSorted). The history prefetcher creates
+                    // nodes detached; expanding those immediately fired
+                    // tool.render whose dom_in_js reply found no slot in the
+                    // document — the body stayed on "loading…" forever (and
+                    // every off-screen auto-expand in history cost a render
+                    // round-trip up front). Same split as onToolUpdate's
+                    // detached fallback: editMode bodies need the explicit
+                    // MOUNT flag (their applyExpanded never lazy-fetches),
+                    // plus the expanded flip for expand_full / evals whose
+                    // visible-body state IS the expanded state.
+                    if (div.collapsable.editMode) {
+                        div.dataset.btAutoMount = '1';
+                        if (msg.expand_full || div.collapsable.hideBodyOnCollapse)
+                            div.dataset.btAutoExpand = '1';
+                    } else {
+                        div.dataset.btAutoExpand = '1';
+                    }
                 }
                 break;
             }
@@ -2817,7 +2851,23 @@ class BonitoChat {
         this.taskbarEl = (this.app || this.container.closest('.bt-app') ||
                           this.container.parentElement).querySelector('.bt-taskbar');
         if (this.taskbarEl) {
+            // Live-todo collapse state lives HERE, on the persistent
+            // .bt-taskbar element: the slots inside are 1 Hz KeyedList
+            // re-renders (static snapshots), so state on them would be wiped
+            // every tick. Default: collapsed on narrow panes (a long plan
+            // card buried the whole chat on phones), expanded elsewhere; the
+            // ▾ toggle persists the user's choice browser-wide.
+            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const paneW = this.container.closest('.bt-chatpane')?.clientWidth
+                       ?? window.innerWidth;
+            this.taskbarEl.classList.toggle('bt-todo-collapsed',
+                storedTodo != null ? storedTodo === '1' : paneW < 660);
             this._onTaskbarClick = (ev) => {
+                if (ev.target.closest('.bt-taskbar-todo-toggle')) {
+                    const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
+                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    return;
+                }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;

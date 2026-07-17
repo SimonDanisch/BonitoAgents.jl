@@ -74,10 +74,11 @@ const BT = BonitoAgents
             withenv("BONITOAGENTS_SERVER_URL" => url,
                     "BONITOAGENTS_SECRET"     => "ctrl-secret",
                     "BONITOAGENTS_PROJECT_ID" => "ctrl-proj") do
-                # CTRL_TASK is once-per-process; reset for test isolation
-                # (other test files don't arm it — env is unset there).
-                BonitoMCP.CTRL_STOP[] = false
-                BonitoMCP.CTRL_TASK[] = nothing
+                # The control channel is once-per-process; reset for test
+                # isolation (other test files don't arm it — env is unset
+                # there). `reset_ctrl_dialback!` stops any prior loop, waits
+                # it out, and clears task/ws/stop so this arm starts fresh.
+                BonitoMCP.reset_ctrl_dialback!()
                 BonitoMCP.start_ctrl_dialback!()
             end
             @test timedwait(5.0) do
@@ -101,7 +102,7 @@ const BT = BonitoAgents
             # ctrl WS — `close(srv)` BLOCKS until its websocket handlers
             # drain, and the handler sits in `for msg in ws` until the
             # socket actually closes. Bounded close as a backstop.
-            BonitoMCP.CTRL_STOP[] = true
+            BonitoMCP.reset_ctrl_dialback!()
             ws = BT.mcp_ctrl_for(state, "ctrl-proj")
             if ws !== nothing
                 try
