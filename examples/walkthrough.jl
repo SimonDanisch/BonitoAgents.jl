@@ -393,27 +393,27 @@ function tour(s, ctx, pids)
         sleep(1.8)
     end
 
-    # 8 ─ the refactor chat: a real Monaco diff from the torus edit. Click the
-    #     pill's ▶ toggle to expand it (only if it isn't already open). The
-    #     toggle is the deterministic target: the header CENTER can land on
-    #     the title, which is a path-link that opens the editor instead.
-    #     Wrapped: this browses an OLD (un-reseeded) chat whose replayed Edit
-    #     content can occasionally not re-render its diff on the tool.render
-    #     round trip — a flake there must not abort the whole recording.
+    # 8 ─ the refactor chat: the torus edit's Read/Edit/Write pills + tests.
+    #     Click the Edit pill's ▶ toggle to expand it (the toggle is the
+    #     deterministic target; the header CENTER can land on the title, a
+    #     path-link that opens the editor instead). The replayed diff RENDERS
+    #     in the lighter stills path (see screenshot-chat.png), but this deep
+    #     in the tour the accumulated WebGL/bridge load can stop its
+    #     tool.render round trip — so attempt the expand and move on rather
+    #     than stalling the camera on a render that may not come. Wrapped so a
+    #     flake can't abort the recording.
     ECT.click(ctx, ECT.JS(side_chat_js("Game of Life: torus mode")))
     sleep(1.0)
     try
         wheel_to!(s, ctx, pill_js("Edit"; nth = 1))
-        if pill_collapsed(s, "Edit"; nth = 1)
+        pill_collapsed(s, "Edit"; nth = 1) &&
             ECT.click(ctx, ECT.JS(el_center_js(pill_js("Edit"; nth = 1) *
                 "?.querySelector('.bt-tool-toggle')")))
-            # Replayed diffs arrive via a tool.render round trip — hold the shot
-            # until Monaco is actually on screen.
-            TK.wait_for(s, "diff mounts",
-                pill_js("Edit"; nth = 1) *
-                "?.querySelector('.monaco-diff-editor-div, .monaco-diff-editor') != null";
-                timeout = 20)
-        end
+        # Brief grace for the diff IF it renders promptly; never a long stall.
+        TK.wait_for(s, "diff mounts",
+            pill_js("Edit"; nth = 1) *
+            "?.querySelector('.monaco-diff-editor-div, .monaco-diff-editor') != null";
+            timeout = 6)
     catch e
         @warn "walkthrough: GoL diff step flaked (replayed edit) — continuing" exception = e
     end
