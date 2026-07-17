@@ -234,13 +234,16 @@ Base.show(io::IO, ::MIME"text/html", ::HtmlOnly) = print(io, "<ul><li>hi</li></u
         @test Helper.try_save_rich(methods(push!), dir, 10_000) === nothing
         @test isempty(filter(f -> endswith(f, ".html"), readdir(dir)))
     end
-    # format_value still ships the readable text repr for such values — one
-    # text block, no `shown:` reference, no markup.
+    # format_value still ships the readable text repr for such values. With no
+    # RemoteProxy bridge loaded here, there's no parked ref → the repr rides in
+    # `echo` (the terminal output), NOT the descriptor. No rich file block, no
+    # markup, no `html` descriptor.
     mktempdir() do dir
-        blocks = Helper.format_value(methods(push!), dir, 10_000, false)
-        @test length(blocks) == 1
-        @test startswith(blocks[1]["text"], "result:")
-        @test occursin("push!", blocks[1]["text"])
-        @test !occursin("<li>", blocks[1]["text"])
+        r = Helper.format_value(methods(push!), dir, 10_000, false)
+        @test isempty(r.blocks)          # html-only value → no rich file block
+        @test r.html === nothing         # no bridge → no descriptor
+        @test r.echo !== nothing
+        @test occursin("push!", r.echo)
+        @test !occursin("<li>", r.echo)
     end
 end

@@ -52,9 +52,9 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
         return (; blocks = Dict{String,Any}[], html = nothing, errored = false,
                   echo = nothing)
 
-    repr = !full_output && is_large_container(val) ?
-        summarize_container(val) : result_repr(val)
-    echo = truncate_text(repr, max_bytes, full_output, "result")
+    repr = truncate_text(
+        !full_output && is_large_container(val) ? summarize_container(val) : result_repr(val),
+        max_bytes, full_output, "result")
 
     ref = nothing
     if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
@@ -65,17 +65,45 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
             nothing
         end
     end
+    # A parked ref IS displayed live as the result embed — the pane shows the
+    # value, so there must be ZERO Output for it (`echo = nothing`): the Output
+    # section is captured STDOUT only, never the result repr. The agent still
+    # reads the result from the descriptor's `repr` field.
     ref === nothing ||
         return (; blocks = Dict{String,Any}[],
-                  html = "{\"remote_ref\":\"$(ref)\",\"errored\":false}",
-                  errored = false, echo = echo)
+                  html = result_descriptor(ref, false, repr),
+                  errored = false, echo = nothing)
 
-    # No bridge (standalone MCP): the repr echo is all the result there is;
-    # add an on-disk rich preview when the value is genuinely visual.
+    # No bridge (standalone MCP): no embed, so the repr echo IS the result —
+    # append it to the output; add an on-disk rich preview when genuinely visual.
     blocks = Dict{String,Any}[]
     show_block = try_save_rich(val, out_dir, max_bytes)
     show_block === nothing || push!(blocks, show_block)
-    return (; blocks = blocks, html = nothing, errored = false, echo = echo)
+    return (; blocks = blocks, html = nothing, errored = false, echo = repr)
+end
+
+# The result descriptor json the chat decodes (BonitoAgents remote_app.jl):
+# `{"remote_ref": "...", "errored": bool, "repr": "..."}`. `repr` is the result
+# echo for the AGENT (the chat renders the live embed instead, and never shows
+# `repr` — the value is already displayed). No JSON dep in the worker env, so
+# escape the string by hand.
+result_descriptor(ref::AbstractString, errored::Bool, repr::AbstractString) =
+    string("{\"remote_ref\":\"", ref, "\",\"errored\":", errored ? "true" : "false",
+           ",\"repr\":\"", json_escape_string(repr), "\"}")
+
+function json_escape_string(s::AbstractString)
+    io = IOBuffer()
+    for c in s
+        if     c == '"';  print(io, "\\\"")
+        elseif c == '\\'; print(io, "\\\\")
+        elseif c == '\n'; print(io, "\\n")
+        elseif c == '\r'; print(io, "\\r")
+        elseif c == '\t'; print(io, "\\t")
+        elseif c < ' ';   print(io, "\\u", lpad(string(UInt16(c), base = 16), 4, '0'))
+        else              print(io, c)
+        end
+    end
+    return String(take!(io))
 end
 
 # Walk the IMAGE MIME chain (PNG → SVG, plus PNGFiles for Colorant matrices)
@@ -204,8 +232,11 @@ function format_error(err, bt, max_bytes::Int, full_output::Bool)
             nothing
         end
     end
-    html = ref === nothing ? nothing :
-        "{\"remote_ref\":\"$(ref)\",\"errored\":true}"
+    # Unlike a value, an ERROR keeps its echo in the output stream: the agent
+    # must SEE the failure prominently (not buried in a descriptor) to fix the
+    # code, and the red console error is the terminal-faithful view. The embed
+    # renders the exception too — redundancy is warranted for errors.
+    html = ref === nothing ? nothing : result_descriptor(ref, true, "")
     return (; blocks = Dict{String,Any}[], html = html, errored = true, echo = echo)
 end
 
@@ -232,16 +263,16 @@ function trim_backtrace(text::AbstractString)
     return strip(join(kept, "\n"))
 end
 
-# The result echo appended to the output stream. Terminal-faithful: normally
-# the value's `show(text/plain)` repr — a REPL echoes the value. BUT a value
+# The result repr — the AGENT-facing text of the value (it rides in the
+# descriptor's `repr`, or the output stream in the no-bridge fallback).
+# Terminal-faithful: normally the value's `show(text/plain)` repr. BUT a value
 # with a rich display (a Bonito App, a Makie figure) has NO meaningful text
 # form: `show(text/plain)` falls back to the default struct dump (opaque
 # closures / Refs / `nothing`s), which a real REPL would never print — it
 # would DISPLAY the object instead. In the chat that display IS the live
-# result embed, so echoing the struct dump into Output is both ugly and
-# redundant. For those, echo a concise `summary` (e.g. "Bonito.App"); the
-# embed carries the actual result. Plain data structs (no rich display) keep
-# their struct dump — that IS their REPL repr and it's informative.
+# result embed, so a struct dump would be useless to the agent. For those,
+# use a concise `summary` (e.g. "Bonito.App"). Plain data structs (no rich
+# display) keep their struct dump — that IS their REPL repr and it's useful.
 const GENERIC_SHOW2 = which(Base.show, (IO, Any))
 const GENERIC_SHOW3 = which(Base.show, (IO, MIME"text/plain", Any))
 has_readable_repr(v) =
