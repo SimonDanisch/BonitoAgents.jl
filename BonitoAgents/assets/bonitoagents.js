@@ -820,6 +820,11 @@ class BonitoChat {
         if (this._onTextInputKeyCapture && this.textInput) {
             this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
         }
+        if (this.textInput) {
+            this._onCmdInput && this.textInput.removeEventListener('input', this._onCmdInput);
+            this._onCmdBlur  && this.textInput.removeEventListener('blur',  this._onCmdBlur);
+        }
+        if (this.cmdAc) { this.cmdAc.remove(); this.cmdAc = null; }
         if (this._onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this._onAppClickCapture, true);
         }
@@ -875,6 +880,7 @@ class BonitoChat {
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'msgs.reload':  return this.onMsgsReload(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
+            case 'commands':     this.slashCommands = msg.items || []; return;
             case 'lens.vocab':   this.lensVocab = msg.keys || []; return;
             case 'lens.saved':   return this.onLensSaved(msg);
             case 'lens.result':  return this.onLensResult(msg);
@@ -3651,12 +3657,102 @@ class BonitoChat {
 
         // Enter-to-send on the textarea (Shift+Enter newline as usual).
         this._onTextInputKeyCapture = (e) => {
+            if (this._cmdAcHandleKey(e)) return;   // autocomplete owns the key
             if (e.key !== 'Enter' || e.shiftKey) return;
             e.preventDefault();
             e.stopImmediatePropagation();
             this._submit();
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+
+        // ── Slash-command autocomplete ────────────────────────────────────
+        // `this.slashCommands` ({name, description, hint}) = the agent's
+        // command set — seeded via connect(init) for late-mounted tabs,
+        // refreshed by the 'commands' comm event (available_commands_update
+        // re-pushes the complete set whenever it changes). The popup opens
+        // while the composer holds ONLY a "/partial" first token; ↑/↓ move,
+        // Enter/Tab accept, Escape closes (swallowed before the global
+        // ESC-cancels-turn handler — see _onEscapeKey).
+        this.cmdAc = document.createElement('div');
+        this.cmdAc.className = 'bt-cmd-ac';
+        this.inputArea.appendChild(this.cmdAc);
+        this._cmdAcItems = [];
+        this._cmdAcSel = 0;
+        const acClose = () => {
+            this._cmdAcItems = [];
+            this.cmdAc.classList.remove('bt-cmd-ac-open');
+        };
+        this._cmdAcClose = acClose;
+        const acAccept = (cmd) => {
+            this.textInput.value = '/' + cmd.name + ' ';
+            this.textInput.focus();
+            acClose();
+        };
+        const acRender = () => {
+            this.cmdAc.innerHTML = '';
+            this._cmdAcItems.forEach((cmd, i) => {
+                const row = document.createElement('div');
+                row.className = 'bt-cmd-ac-item' +
+                    (i === this._cmdAcSel ? ' bt-cmd-ac-sel' : '');
+                const name = document.createElement('span');
+                name.className = 'bt-cmd-ac-name';
+                name.textContent = '/' + cmd.name;
+                row.appendChild(name);
+                if (cmd.hint) {
+                    const hint = document.createElement('span');
+                    hint.className = 'bt-cmd-ac-hint';
+                    hint.textContent = cmd.hint;
+                    row.appendChild(hint);
+                }
+                if (cmd.description) {
+                    const desc = document.createElement('span');
+                    desc.className = 'bt-cmd-ac-desc';
+                    desc.textContent = cmd.description;
+                    row.appendChild(desc);
+                }
+                // mousedown, not click: fires before the textarea blurs, so
+                // the blur-close below can't beat the accept.
+                row.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    acAccept(cmd);
+                });
+                this.cmdAc.appendChild(row);
+            });
+            this.cmdAc.classList.toggle('bt-cmd-ac-open', this._cmdAcItems.length > 0);
+        };
+        this._cmdAcHandleKey = (e) => {
+            if (!this._cmdAcItems.length) return false;
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                const d = e.key === 'ArrowDown' ? 1 : -1;
+                this._cmdAcSel = (this._cmdAcSel + d + this._cmdAcItems.length)
+                               % this._cmdAcItems.length;
+                acRender();
+            } else if (e.key === 'Enter' || e.key === 'Tab') {
+                acAccept(this._cmdAcItems[this._cmdAcSel]);
+            } else if (e.key === 'Escape') {
+                acClose();
+            } else {
+                return false;
+            }
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return true;
+        };
+        this._onCmdInput = () => {
+            const m = (this.textInput.value || '').match(/^\/([\w:-]*)$/);
+            const cmds = this.slashCommands || [];
+            if (!m || !cmds.length) { acClose(); return; }
+            const q = m[1].toLowerCase();
+            const starts = cmds.filter(c => c.name.toLowerCase().startsWith(q));
+            const incl   = cmds.filter(c => !c.name.toLowerCase().startsWith(q) &&
+                                            c.name.toLowerCase().includes(q));
+            this._cmdAcItems = starts.concat(incl).slice(0, 8);
+            this._cmdAcSel = 0;
+            acRender();
+        };
+        this._onCmdBlur = () => acClose();
+        this.textInput.addEventListener('input', this._onCmdInput);
+        this.textInput.addEventListener('blur', this._onCmdBlur);
 
         // ESC anywhere → cancel. Listener on `document` so the user's
         // current focus (textarea, scroll position, anywhere) can't
@@ -3673,6 +3769,14 @@ class BonitoChat {
             // ancestor-level unmount: self-destroy.
             if (!this.container.isConnected) { this._lazyDestroy(); return; }
             if (this.container.offsetParent === null) return;
+            // The slash-command popup owns ESC while open (this document-level
+            // capture fires BEFORE the textarea's own capture handler, so the
+            // popup must be dismissed here or ESC would cancel the turn).
+            if (this._cmdAcItems && this._cmdAcItems.length) {
+                e.preventDefault();
+                this._cmdAcClose();
+                return;
+            }
             const t = e.target;
             if (t && t.closest && t.closest('.monaco-editor')) return;
             e.preventDefault();
@@ -4167,8 +4271,12 @@ export function toolSlot(id) {
     return null;
 }
 
-export function connect(node, comm) {
+export function connect(node, comm, init = {}) {
     const chat = new BonitoChat(node, comm);
+    // Late-mount snapshot: comm events fired before this tab connected are
+    // gone, so the server bakes the current slash-command set into the init
+    // call; live changes keep flowing via the 'commands' comm event.
+    if (Array.isArray(init.commands)) chat.slashCommands = init.commands;
     node.__bt_chat = chat;     // devtools/test inspection hook
     CHAT_INSTANCES.add(chat);
 

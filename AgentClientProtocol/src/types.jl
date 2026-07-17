@@ -142,6 +142,32 @@ struct CurrentModeUpdateNotif <: SessionUpdate
     mode_id::String
 end
 
+# Context/cost telemetry (`usage_update`): claude-agent-acp sends it after
+# each assistant message — total tokens in context (`used`), the model's
+# context window (`size`), and (≥ v0.44) the cumulative session cost. The
+# `_meta["_claude/origin"].kind` tag distinguishes autonomous work (e.g.
+# "task-notification" follow-ups) from user turns.
+struct UsageUpdateNotif <: SessionUpdate
+    used::Int
+    size::Int
+    cost_amount::Union{Float64,Nothing}
+    cost_currency::Union{String,Nothing}
+    origin_kind::Union{String,Nothing}
+end
+
+# One slash command (`available_commands_update`): pushed at session start
+# and re-pushed whenever claude's command set changes. `hint` is the
+# flattened `input.hint` argument hint, when the command takes arguments.
+struct CommandInfo
+    name::String
+    description::String
+    hint::Union{String,Nothing}
+end
+
+struct AvailableCommandsUpdateNotif <: SessionUpdate
+    commands::Vector{CommandInfo}
+end
+
 _opt_desc(x) = x isa AbstractString && !isempty(x) ? String(x) : nothing
 
 function parse_config_option(d::AbstractDict)::ConfigOption
@@ -362,6 +388,32 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
         # claude form first, fall back to the spec form, so both agents work.
         return CurrentModeUpdateNotif(
             String(get(params, "currentModeId", get(params, "modeId", ""))))
+    elseif kind == "usage_update"
+        # Wire shape (verified, claude-agent-acp v0.44.0 source + logs):
+        # {used:: tokens in context, size:: context window, cost::
+        # {amount, currency} (≥ 0.44), _meta::{"_claude/origin"::{kind,…}}}.
+        cost = get(params, "cost", nothing)
+        meta = get(params, "_meta", nothing)
+        origin = meta isa AbstractDict ? get(meta, "_claude/origin", nothing) : nothing
+        okind = origin isa AbstractDict ? get(origin, "kind", nothing) : nothing
+        return UsageUpdateNotif(
+            round(Int, get(params, "used", 0)),
+            round(Int, get(params, "size", 0)),
+            cost isa AbstractDict ? Float64(get(cost, "amount", 0.0)) : nothing,
+            cost isa AbstractDict ? String(get(cost, "currency", "USD")) : nothing,
+            okind isa AbstractString ? String(okind) : nothing)
+    elseif kind == "available_commands_update"
+        cmds = CommandInfo[]
+        for c in get(params, "availableCommands", [])
+            c isa AbstractDict || continue
+            input = get(c, "input", nothing)
+            hint = input isa AbstractDict ? get(input, "hint", nothing) : nothing
+            push!(cmds, CommandInfo(
+                String(get(c, "name", "")),
+                String(get(c, "description", "")),
+                hint isa AbstractString ? String(hint) : nothing))
+        end
+        return AvailableCommandsUpdateNotif(cmds)
     else
         return UnknownUpdate(kind, params)
     end

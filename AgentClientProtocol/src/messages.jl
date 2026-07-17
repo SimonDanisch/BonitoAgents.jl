@@ -121,6 +121,19 @@ end
 struct ModeUpdate <: Message
     mode_id::String
 end
+# Context/cost telemetry after each assistant message. Metadata, not content —
+# same rules as ConfigUpdate (no bubble, doesn't close the streaming message).
+struct UsageUpdate <: Message
+    used::Int
+    size::Int
+    cost_amount::Union{Float64,Nothing}
+    cost_currency::Union{String,Nothing}
+    origin_kind::Union{String,Nothing}
+end
+# The agent's slash-command set (complete state, re-pushed on change).
+struct CommandsUpdate <: Message
+    commands::Vector{CommandInfo}
+end
 
 # A fresh streaming message, seeded with its first chunk.
 AgentMessage(t::AbstractString) = AgentMessage(String(t), Channel{String}(BUF))
@@ -445,6 +458,10 @@ end
 # which are content boundaries).
 parse_update!(out, st, u::ConfigOptionUpdateNotif) = (put!(out, ConfigUpdate(u.options)); nothing)
 parse_update!(out, st, u::CurrentModeUpdateNotif)  = (put!(out, ModeUpdate(u.mode_id)); nothing)
+parse_update!(out, st, u::UsageUpdateNotif) =
+    (put!(out, UsageUpdate(u.used, u.size, u.cost_amount, u.cost_currency, u.origin_kind)); nothing)
+parse_update!(out, st, u::AvailableCommandsUpdateNotif) =
+    (put!(out, CommandsUpdate(u.commands)); nothing)
 
 # Subagent-tagged updates: NEVER coalesced into the main stream (no
 # current_message touch, no st.tools entry, nothing put! on `out`) — that

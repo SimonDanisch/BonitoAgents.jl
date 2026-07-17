@@ -465,6 +465,21 @@ const ChatStyles = Bonito.Styles(
     # in the strip AND in the collapsed-header panel). The rule un-applies by
     # itself the moment pills arrive.
     CSS(".bt-header-meta:empty", "display" => "none"),
+    # Context meter ("21.8k/200k · 11% · $0.42", usage_update telemetry).
+    # Muted mono text, no pill chrome — telemetry, not a control. Empty until
+    # the first turn reports; same :empty treatment as the meta div so it
+    # never costs a gap slot while blank.
+    CSS(".bt-header-usage",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        "flex" => "0 0 auto",
+        "align-self" => "center",
+        "text-align" => "center"),
+    # The label is a Bonito string-Observable: it renders as an INNER span
+    # (the fast-path swap node), so the outer node is never `:empty` itself.
+    CSS(".bt-header-usage:has(> span:empty)", "display" => "none"),
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
@@ -1754,7 +1769,44 @@ const ChatStyles = Bonito.Styles(
         "padding-bottom" => "max(12px, env(safe-area-inset-bottom))",
         "display" => "flex", "flex-direction" => "column", "align-items" => "center",
         "gap" => "8px",
+        # Anchor for the slash-command autocomplete popup (.bt-cmd-ac).
+        "position" => "relative",
         "background" => "var(--bt-surface)"),
+    # Slash-command autocomplete: floats ABOVE the composer while the input
+    # holds a lone "/partial" token (built/driven in bonitoagents.js
+    # _setupInputs; fed by available_commands_update via the 'commands' comm
+    # event + the connect-time init snapshot).
+    CSS(".bt-cmd-ac",
+        "position" => "absolute", "bottom" => "100%",
+        "left" => "14px", "right" => "14px",
+        "display" => "none", "flex-direction" => "column",
+        "margin-bottom" => "6px", "padding" => "4px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "10px",
+        "box-shadow" => "var(--bt-shadow-md)",
+        "z-index" => "40",
+        "max-height" => "40vh", "overflow-y" => "auto"),
+    CSS(".bt-cmd-ac.bt-cmd-ac-open", "display" => "flex"),
+    CSS(".bt-cmd-ac-item",
+        "display" => "flex", "align-items" => "baseline", "gap" => "8px",
+        "padding" => "5px 9px", "border-radius" => "6px",
+        "cursor" => "pointer",
+        "white-space" => "nowrap", "overflow" => "hidden"),
+    CSS(".bt-cmd-ac-item:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-cmd-ac-item.bt-cmd-ac-sel", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-cmd-ac-name",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "12.5px", "font-weight" => "600",
+        "flex" => "0 0 auto"),
+    CSS(".bt-cmd-ac-hint",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "flex" => "0 0 auto"),
+    CSS(".bt-cmd-ac-desc",
+        "font-size" => "11.5px", "color" => "var(--bt-text-muted)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "flex" => "1 1 auto"),
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%"),
