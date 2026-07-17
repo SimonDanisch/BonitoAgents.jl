@@ -599,6 +599,18 @@ function run_dispatcher_prompt(prompt_id)
             # with the same set mutates the one live list in place; the chat
             # pins it to the taskbar until the turn ends or all items finish.
             upd("plan", Dict("entries" => get(ev, "entries", Any[])))
+        elseif et == "usage"
+            # Context/cost telemetry — the shape claude-agent-acp ≥ 0.44 emits
+            # after every assistant message.
+            fields = Dict{String,Any}("used" => get(ev, "used", 0),
+                                      "size" => get(ev, "size", 0))
+            haskey(ev, "cost") && (fields["cost"] =
+                Dict("amount" => ev["cost"], "currency" => "USD"))
+            upd("usage_update", fields)
+        elseif et == "commands"
+            # The agent's slash-command set (complete state).
+            upd("available_commands_update",
+                Dict("availableCommands" => get(ev, "commands", Any[])))
         elseif et == "delay"
             # Pace the stream WITHOUT ending the turn — the frames already
             # emitted stay live (e.g. the pinned todo panel) while the test

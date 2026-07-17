@@ -128,6 +128,16 @@ mutable struct ChatModel
     # bring-up (`start_chat_client!`); ephemeral, never persisted.
     session_meta::Observable{Vector{Any}}
 
+    # Live context/cost telemetry off `usage_update` (sent after every
+    # assistant message): `nothing` until the first turn, then a NamedTuple
+    # (used, size, cost, origin). Drives the header context meter. Ephemeral
+    # like session_meta.
+    usage::Observable{Any}
+
+    # Claude's slash-command set (`available_commands_update`; complete state,
+    # re-pushed on change). Shipped to JS for composer `/` autocomplete.
+    available_commands::Observable{Vector{AgentClientProtocol.CommandInfo}}
+
     # The single `run_chat!` consumer task. Started once (guarded) by
     # `start_chat_client!`; survives `restart_chat_session!` (which only swaps
     # the ACP client, not the consumer). Shared across per-session views.
@@ -244,6 +254,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(false),          # yolo (auto-continue mode; off by default)
         Observable(""),             # yolo_reminders (appended to each continue-prompt)
         Observable(Any[]),          # session_meta
+        Observable{Any}(nothing),   # usage (context/cost telemetry)
+        Observable(AgentClientProtocol.CommandInfo[]),  # available_commands
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
         Ref{Union{Task,Nothing}}(nothing),   # poller_task
         Ref(false),                 # restart_inflight
@@ -316,6 +328,8 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.yolo),
             map(identity, session, m.yolo_reminders),
             map(identity, session, m.session_meta),
+            any_bridge(session, m.usage),   # Any-typed: nothing → NamedTuple
+            map(identity, session, m.available_commands),
             m.consumer_task,           # shared → only the parent runs the loop
             m.poller_task,             # shared → one poller per chat
             m.restart_inflight,        # shared → one restart coordinator per chat
@@ -1606,6 +1620,24 @@ function todolist_summary(entries)
     return "$done/$(length(entries)) done"
 end
 
+# ── Header context meter ─────────────────────────────────────────────────────
+# "21.8k/200k · 11% · \$0.42" off the shared `usage` observable (usage_update
+# telemetry). Empty string until the first turn reports — the pill hides via
+# CSS `:empty`.
+fmt_tokens(n::Integer) =
+    n >= 1_000_000 ? short_num(n / 1_000_000) * "M" :
+    n >= 1_000     ? short_num(n / 1_000) * "k"     : string(n)
+# "21.8" but "200", never "200.0".
+short_num(x) = (r = round(x; digits = 1); isinteger(r) ? string(Int(r)) : string(r))
+
+function usage_label(u)
+    u === nothing && return ""
+    parts = [string(fmt_tokens(u.used), "/", fmt_tokens(u.size))]
+    u.size > 0 && push!(parts, string(round(Int, 100 * u.used / u.size), "%"))
+    u.cost === nothing || push!(parts, string("\$", round(u.cost; digits = 2)))
+    return join(parts, " · ")
+end
+
 # ── Edit-tool body sizing ────────────────────────────────────────────────────
 # Edit-tool bodies render as a Monaco `DiffEditor` (see `render_diff_block`).
 # To keep multi-edit tool calls from flooding the chat with full-height
@@ -2891,6 +2923,28 @@ function process!(chat::ChatModel, m::AgentClientProtocol.ModeUpdate)
     end...]
     return nothing
 end
+
+# Context/cost telemetry (after every assistant message): pure header
+# metadata, no bubble, no persistence — the next turn refreshes it.
+function process!(chat::ChatModel, m::AgentClientProtocol.UsageUpdate)
+    shared(chat).usage[] = (used = m.used, size = m.size,
+                            cost = m.cost_amount, origin = m.origin_kind)
+    return nothing
+end
+
+# The agent's slash-command set (complete state): store + ship to JS for the
+# composer's `/` autocomplete (see `commands` in bonitoagents.js dispatch).
+function process!(chat::ChatModel, m::AgentClientProtocol.CommandsUpdate)
+    s = shared(chat)
+    s.available_commands[] = m.commands
+    chat_emit(chat, commands_event(m.commands))
+    return nothing
+end
+
+commands_event(cmds) = Dict{String,Any}("type" => "commands",
+    "items" => [Dict{String,Any}("name" => c.name, "description" => c.description,
+                                 "hint" => something(c.hint, ""))
+                for c in cmds])
 
 # Adopt the AUTHORITATIVE config state the agent returns in a session/new,
 # session/load, or session/set_config_option result. The `set_config_option`
@@ -4878,6 +4932,14 @@ keep_in_history(m::AgentClientProtocol.UserMessage)  = !isempty(strip(m.text))
 keep_in_history(m::AgentClientProtocol.Thought)      = false
 keep_in_history(m::AgentClientProtocol.ToolCall)     = true
 keep_in_history(m::AgentClientProtocol.Plan)         = true
+# Metadata messages (config/mode/usage/commands) are session state, not
+# history. Explicit methods, not a `::Message` fallback: a NEW message kind
+# reaching the reconciler should fail loudly so its history policy is a
+# decision, not an accident.
+keep_in_history(::AgentClientProtocol.ConfigUpdate)   = false
+keep_in_history(::AgentClientProtocol.ModeUpdate)     = false
+keep_in_history(::AgentClientProtocol.UsageUpdate)    = false
+keep_in_history(::AgentClientProtocol.CommandsUpdate) = false
 
 # Does an existing (chat.md) message correspond to a replayed one? Tools key on
 # claude's tool_use id (the one id that survives the replay, stored as ToolMsg.id);
@@ -5381,6 +5443,13 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # lower-case reads fine for any provider's mode option.
     meta_line = map(items -> header_meta_line(items, config_pick; lowercase_modes = true),
                     model.session_meta)
+    # Context meter + running cost, straight off the wire's `usage_update`
+    # (tokens in context / window size after every assistant message; the
+    # cumulative session cost rides along since claude-agent-acp 0.44).
+    # Empty until the first turn — CSS hides the empty pill.
+    usage_node = DOM.span(map(usage_label, model.usage);
+        class = "bt-header-usage",
+        title = "Context window usage · cumulative session cost")
     on(session, config_pick) do pick
         (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
         cfg_id, value = String(pick[1]), String(pick[2])
@@ -5613,6 +5682,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
             # provider/sync/restart buttons never reflow.
             DOM.span(provider_status; class="bt-header-status"),
             DOM.div(
+                usage_node,
                 meta_line,
                 provider_select,
                 xsync_control,
@@ -6674,8 +6744,15 @@ function Bonito.jsrender(session::Session, m::ChatModel)
         DOM.div(class="bt-messages-tail");
         class="bt-messages")
 
+    # Init snapshot: comm events fired before this tab connected are gone, so
+    # bake the CURRENT slash-command set into the connect call (a tab opened
+    # after the session's first turn would otherwise have no autocomplete
+    # until the next available_commands_update).
+    init_snapshot = Dict{String,Any}(
+        "commands" => commands_event(shared(model).available_commands[])["items"])
     init_script = js"""
-        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
+        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm),
+                                           $(init_snapshot)))
     """
 
     # Cross-worker sync modal state + apply. `nothing` ⇒ hidden; otherwise

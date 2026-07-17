@@ -55,7 +55,7 @@ import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
 
 export TestServer, dev_server, add_worker!,
-       text, user, thought, edit, bash, todo, delay, tool, tool_update, REPLAY_FN,
+       text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update, REPLAY_FN,
        post_turn,
        sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn,
@@ -233,6 +233,36 @@ todo(entries::AbstractVector) = Dict("type" => "todo",
     "entries" => [Dict("content"  => String(e.content),
                        "status"    => String(e.status),
                        "priority"  => String(get(e, :priority, "medium"))) for e in entries])
+
+"""
+    usage(used, size; cost = nothing) -> Dict
+
+Agent event that emits a `usage_update` SessionUpdate (context/cost
+telemetry, the shape claude-agent-acp ≥ 0.44 sends after every assistant
+message). Drives the header context meter.
+"""
+function usage(used::Integer, size::Integer; cost = nothing)
+    ev = Dict{String,Any}("type" => "usage", "used" => used, "size" => size)
+    cost === nothing || (ev["cost"] = Float64(cost))
+    return ev
+end
+
+"""
+    commands(cmds) -> Dict
+
+Agent event that emits an `available_commands_update` SessionUpdate (the
+complete slash-command set). `cmds` is a vector of NamedTuples with `name`,
+`description` and an optional `hint` (argument hint) — the shape the composer
+autocomplete consumes.
+"""
+commands(cmds::AbstractVector) = Dict("type" => "commands",
+    "commands" => [begin
+            hint = get(c, :hint, nothing)
+            d = Dict{String,Any}("name" => String(c.name),
+                                 "description" => String(c.description))
+            d["input"] = hint === nothing ? nothing : Dict("hint" => String(hint))
+            d
+        end for c in cmds])
 
 """
     delay(ms) -> Dict
