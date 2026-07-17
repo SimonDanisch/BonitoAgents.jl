@@ -771,18 +771,10 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "13px",
         "box-shadow" => "var(--bt-shadow-sm)",
         "overflow" => "hidden",
-        # Positioning context for the absolute `.bt-tool-fullwidth` button that
-        # floats at the bubble's right-edge center.
         "position" => "relative",
-        # Transition so flipping the wide toggle animates smoothly rather than
-        # snapping in at a different width and tearing the layout.
+        # Transition so a content-driven width change (e.g. a wide embed
+        # mounting) animates smoothly rather than snapping and tearing layout.
         "transition" => "max-width 160ms ease, align-self 160ms ease"),
-    # Full-chat-width toggle. Spans the entire message column so wide content
-    # (diffs / tables / `bt_show_app` embeds) has the room it needs. Flipped by
-    # the .bt-tool-wide button in the tool header.
-    CSS(".bt-tool-msg.bt-tool-wide-active",
-        "align-self" => "stretch",
-        "max-width" => "100%"),
     # Live app embeds get a wider default cap than text pills: the visuals ARE
     # the content, and a responsive (resize_to = :parent) canvas will actually
     # use the room.
@@ -805,30 +797,6 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-detach:hover",
         "background" => "var(--bt-surface-2)",
         "color" => "var(--bt-accent)"),
-    # Full-chat-width toggle — a slim, quiet header button (same chrome as the
-    # ⤢ detach button), NOT an overlay floating over the body: an absolutely
-    # positioned button covered the actual app/diff content and looked bulky.
-    # Hidden by default; revealed only while the tool body is expanded —
-    # there's nothing to widen on a collapsed header.
-    CSS(".bt-tool-fullwidth",
-        "display" => "none",
-        "background" => "transparent",
-        "border" => "none",
-        "padding" => "2px 6px",
-        "cursor" => "pointer",
-        "color" => "var(--bt-text-faint)",
-        "font-size" => "13px", "line-height" => "1",
-        "border-radius" => "var(--bt-radius-sm)",
-        "flex-shrink" => "0",
-        "user-select" => "none",
-        "transition" => "background 80ms, color 80ms"),
-    CSS(".bt-tool-fullwidth:hover",
-        "background" => "var(--bt-surface-2)",
-        "color" => "var(--bt-accent)"),
-    # Reveal the full-width toggle only while the body is expanded
-    # (Collapsable flips `data-expanded` on the header it lives in).
-    CSS(".bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
-        "display" => "inline-flex"),
     # NOTE: deliberately NO `user-select: none` here — every piece of text in
     # the app should be selectable + copyable (file paths especially). The
     # browser treats a drag-select as a drag (not a click), so the
@@ -1836,12 +1804,6 @@ const ChatStyles = Bonito.Styles(
         "box-shadow" => "none",
         "overflow" => "visible"),
     CSS(".bt-tool-native .bt-tool-header", "display" => "none"),
-    # The full-width toggle lives inside the (hidden) header now, but keep an
-    # explicit hide that out-ranks the expanded-state reveal rule in case a
-    # future layout moves it back out of the header.
-    CSS(".bt-tool-native .bt-tool-fullwidth, " *
-        ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
-        "display" => "none"),
     CSS(".bt-tool-native .bt-tool-body",
         "border-top" => "none",
         "padding" => "0"),

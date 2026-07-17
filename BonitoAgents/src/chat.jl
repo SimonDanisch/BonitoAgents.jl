@@ -1778,6 +1778,7 @@ function Bonito.jsrender(session::Session, c::Collapsable)
     # open). Entering summary/full re-pins a `pin_end` body to its end.
     cycle = js"""e => {
         e.preventDefault();
+        e.stopPropagation();
         const d = e.target.closest('.bt-subsection');
         if (!d.open) { d.open = true; d.dataset.state = 'full'; }
         else if (d.dataset.state === 'full') { d.dataset.state = 'summary'; }

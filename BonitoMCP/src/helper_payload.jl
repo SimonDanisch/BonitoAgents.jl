@@ -53,7 +53,7 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
                   echo = nothing)
 
     repr = !full_output && is_large_container(val) ?
-        summarize_container(val) : sprint(show, "text/plain", val)
+        summarize_container(val) : result_repr(val)
     echo = truncate_text(repr, max_bytes, full_output, "result")
 
     ref = nothing
@@ -230,6 +230,29 @@ function trim_backtrace(text::AbstractString)
     suppressed = length(lines) - length(kept)
     suppressed > 1 && push!(kept, "  [+ $suppressed internal frames]")
     return strip(join(kept, "\n"))
+end
+
+# The result echo appended to the output stream. Terminal-faithful: normally
+# the value's `show(text/plain)` repr — a REPL echoes the value. BUT a value
+# with a rich display (a Bonito App, a Makie figure) has NO meaningful text
+# form: `show(text/plain)` falls back to the default struct dump (opaque
+# closures / Refs / `nothing`s), which a real REPL would never print — it
+# would DISPLAY the object instead. In the chat that display IS the live
+# result embed, so echoing the struct dump into Output is both ugly and
+# redundant. For those, echo a concise `summary` (e.g. "Bonito.App"); the
+# embed carries the actual result. Plain data structs (no rich display) keep
+# their struct dump — that IS their REPL repr and it's informative.
+const GENERIC_SHOW2 = which(Base.show, (IO, Any))
+const GENERIC_SHOW3 = which(Base.show, (IO, MIME"text/plain", Any))
+has_readable_repr(v) =
+    which(Base.show, (IO, typeof(v))) !== GENERIC_SHOW2 ||
+    which(Base.show, (IO, MIME"text/plain", typeof(v))) !== GENERIC_SHOW3
+is_richly_displayable(v) =
+    showable(MIME"text/html"(), v) || showable(MIME"image/png"(), v) ||
+    showable(MIME"image/svg+xml"(), v)
+function result_repr(v)
+    (!has_readable_repr(v) && is_richly_displayable(v)) && return summary(v)
+    return sprint(show, "text/plain", v)
 end
 
 function is_large_container(value)

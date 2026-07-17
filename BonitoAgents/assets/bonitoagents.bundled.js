@@ -1502,7 +1502,7 @@ class BonitoChat {
                     id: msg.id
                 });
             });
-            headerEl.insertBefore(sb, headerEl.querySelector('.bt-tool-fullwidth') || null);
+            headerEl.appendChild(sb);
         }
         if (msg.live_embed) {
             node.dataset.btApp = '1';
@@ -1519,7 +1519,7 @@ class BonitoChat {
                         id: msg.id
                     });
                 });
-                headerEl.insertBefore(db, headerEl.querySelector('.bt-tool-fullwidth') || null);
+                headerEl.appendChild(db);
             }
         }
         if (msg.stream_tail != null && stillLive && headerEl) {
@@ -1753,13 +1753,6 @@ class BonitoChat {
                             id
                         });
                     });
-                    const wideBtn = div.querySelector('.bt-tool-fullwidth');
-                    if (wideBtn) wideBtn.addEventListener('click', (e)=>{
-                        e.stopPropagation();
-                        const active = div.classList.toggle('bt-tool-wide-active');
-                        wideBtn.textContent = active ? '«' : '»';
-                        wideBtn.title = active ? 'Collapse to default width' : 'Expand to full chat width';
-                    });
                     const stopBtn2 = div.querySelector('.bt-tool-stop');
                     if (stopBtn2) stopBtn2.addEventListener('click', (e)=>{
                         e.stopPropagation();
@@ -1865,8 +1858,6 @@ class BonitoChat {
                 ${stopBtn}
                 ${msg.kind === 'bonito_app' || msg.live_embed ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>` : ''}
-                <button class="bt-tool-fullwidth" type="button"
-                        title="Expand to full chat width">»</button>
             </div>
             ${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;

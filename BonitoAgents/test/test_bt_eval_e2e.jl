@@ -555,6 +555,24 @@ end
         TK.click(s, ".my-counter .counter-btn")
         @test TK.wait_for(s, "counter incremented over the bridge",
             "document.querySelector('.counter-out')?.textContent === 'C=7'"; timeout = 30) == true
+
+        # The result echo in the Output console is a CONCISE `summary` ("App"),
+        # NOT the App's default struct dump. An App has a rich display (the live
+        # embed below) but no meaningful text repr — `show(text/plain)` falls
+        # back to `App(<opaque closures / Refs / nothings>)`, which a REPL would
+        # never print (it would DISPLAY the app). `result_repr` (helper_payload)
+        # echoes `summary` for rich-but-unreadable values; this pins that the
+        # struct dump never leaks back into Output.
+        out_txt = TK.eval_js(s, """(() => {
+            const c = document.querySelector('.bt-tool-msg[data-msg-id*="tc-1"]')
+                   || document.querySelector('.bt-tool-msg');
+            const o = [...c.querySelectorAll('.bt-subsection')].find(d =>
+                d.querySelector('.bt-subsection-label')?.textContent === 'Output');
+            return o ? (o.querySelector('.bt-console')?.innerText || '') : '';
+        })()""")
+        @test occursin("App", out_txt)
+        @test !occursin("normalize_handler", out_txt)   # no struct-field dump
+        @test !occursin("RefValue", out_txt)
         TK.screenshot(s, shot("bt_eval-counter.png"))
     finally
         close(s)

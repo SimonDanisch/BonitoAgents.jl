@@ -2280,8 +2280,7 @@ class BonitoChat {
                 e.stopPropagation();
                 this.comm.notify({ type: 'stop_tool', id: msg.id });
             });
-            headerEl.insertBefore(sb,
-                headerEl.querySelector('.bt-tool-fullwidth') || null);
+            headerEl.appendChild(sb);
         }
         // The completed update announced a LIVE result embed (worker-parked
         // value mounted via RemoteRef): give the card bt_show_app's output
@@ -2301,8 +2300,7 @@ class BonitoChat {
                     e.stopPropagation();
                     this.comm.notify({ type: 'detach_app', id: msg.id });
                 });
-                headerEl.insertBefore(db,
-                    headerEl.querySelector('.bt-tool-fullwidth') || null);
+                headerEl.appendChild(db);
             }
         }
         // Live stdout of a RUNNING eval, fed by `stream_tail` updates (the
@@ -2655,20 +2653,6 @@ class BonitoChat {
                     e.stopPropagation();
                     this.comm.notify({ type: 'detach_app', id });
                 });
-                // Full-chat-width toggle, vertically centered on the bubble's
-                // right edge (CSS reveals it only while the body is expanded —
-                // there's no point widening an empty header). Extends the pill to
-                // span the whole message column so wide content (diffs / tables /
-                // remote-app embeds) gets room. Must NOT toggle expand/collapse,
-                // so stopPropagation.
-                const wideBtn = div.querySelector('.bt-tool-fullwidth');
-                if (wideBtn) wideBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const active = div.classList.toggle('bt-tool-wide-active');
-                    wideBtn.textContent = active ? '«' : '»';
-                    wideBtn.title = active ?
-                        'Collapse to default width' : 'Expand to full chat width';
-                });
                 // Per-pill interrupt (eval family). Routes through the same
                 // stop_tool command the taskbar uses; the server dispatches
                 // per tool kind (eval → SIGINT the worker's eval process).
@@ -2850,8 +2834,6 @@ class BonitoChat {
                     ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>`
                     : ''}
-                <button class="bt-tool-fullwidth" type="button"
-                        title="Expand to full chat width">»</button>
             </div>
             ${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
