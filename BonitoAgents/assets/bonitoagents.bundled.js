@@ -1374,6 +1374,14 @@ class BonitoChat {
             node.classList?.remove('bt-stream-active');
         }
     }
+    _evalOutputConsole(node) {
+        const secs = node.querySelectorAll('.bt-tool-body .bt-subsection');
+        for (const d of secs){
+            const label = d.querySelector('.bt-subsection-label');
+            if (label && (label.textContent || '').trim() === 'Output') return d.querySelector('.bt-console');
+        }
+        return null;
+    }
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -1496,20 +1504,41 @@ class BonitoChat {
             });
             headerEl.insertBefore(sb, headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
+        if (msg.live_embed) {
+            node.dataset.btApp = '1';
+            if (headerEl && !headerEl.querySelector('.bt-tool-detach')) {
+                const db = document.createElement('button');
+                db.type = 'button';
+                db.className = 'bt-tool-detach';
+                db.title = 'Detach to floating window';
+                db.textContent = '⤢';
+                db.addEventListener('click', (e)=>{
+                    e.stopPropagation();
+                    this.comm.notify({
+                        type: 'detach_app',
+                        id: msg.id
+                    });
+                });
+                headerEl.insertBefore(db, headerEl.querySelector('.bt-tool-fullwidth') || null);
+            }
+        }
         if (msg.stream_tail != null && stillLive && headerEl) {
-            let sp = node.querySelector('.bt-tool-body .bt-eval-stream');
-            if (sp) {
-                for (const stray of node.querySelectorAll('.bt-eval-stream'))if (stray !== sp) stray.remove();
+            const con = this._evalOutputConsole(node);
+            if (con) {
+                for (const stray of node.querySelectorAll('.bt-eval-stream'))stray.remove();
+                con.textContent = msg.stream_tail;
+                const scroller = con.closest('.bt-subsection-body');
+                if (scroller) scroller.scrollTop = scroller.scrollHeight;
             } else {
-                sp = node.querySelector('.bt-eval-stream');
+                let sp = node.querySelector('.bt-eval-stream');
+                if (!sp) {
+                    sp = document.createElement('pre');
+                    sp.className = 'bt-eval-stream';
+                    headerEl.insertAdjacentElement('afterend', sp);
+                }
+                sp.textContent = msg.stream_tail;
+                sp.scrollTop = sp.scrollHeight;
             }
-            if (!sp) {
-                sp = document.createElement('pre');
-                sp.className = 'bt-eval-stream';
-                headerEl.insertAdjacentElement('afterend', sp);
-            }
-            sp.textContent = msg.stream_tail;
-            sp.scrollTop = sp.scrollHeight;
         }
         if (msg.editable && msg.edit_path && headerEl) {
             const t = headerEl.querySelector('.bt-tool-title');
@@ -1688,7 +1717,7 @@ class BonitoChat {
                 {
                     div.className = 'bt-tool-msg';
                     div.innerHTML = this.toolHTML(msg);
-                    if (msg.kind === 'bonito_app') div.dataset.btApp = '1';
+                    if (msg.kind === 'bonito_app' || msg.live_embed) div.dataset.btApp = '1';
                     if (msg.id) div.dataset.msgId = msg.id;
                     if (msg.started_at != null) div.dataset.toolStarted = String(msg.started_at);
                     if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
@@ -1834,7 +1863,7 @@ class BonitoChat {
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
                 ${stopBtn}
-                ${msg.kind === 'bonito_app' ? `<button class="bt-tool-detach" type="button"
+                ${msg.kind === 'bonito_app' || msg.live_embed ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>` : ''}
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>

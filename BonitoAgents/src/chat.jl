@@ -1430,6 +1430,7 @@ function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
     let content = tool_content_for_render(m, chat_dir)
         auto_expand_body(m, content) && (d["expand"] = true)
         auto_expand_full(m, content) && (d["expand_full"] = true)
+        live_result_embed(m, content) && (d["live_embed"] = true)
     end
     # A path argument on the call (bt_show's `path`, …) feeds the ✎
     # editable derivation in augment_generic_header! below.
@@ -1738,64 +1739,70 @@ end
 # JS `Collapsable` in bonitoagents.js. Renders a native <details>: the `body` is
 # present from the start (no lazy fetch), used for eval Code/Output sub-sections
 # inside an already-expanded tool card. `label` is the always-visible heading;
-# `preview` (optional) is dim text next to it; `open` shows it expanded.
+# `preview` (optional) is dim text next to it.
 #
-# `lines` is the section's content line count: a long section (> CLAMP_LINES)
-# is height-clamped to ~4-5 visible lines with a "show all (N lines)" bar that
-# toggles the full height. The clamp lives on the SECTION, never on the tool
-# card — every section (and the result embed below them) stays reachable in
-# the card's default state.
+# THE default three-state collapsible: clicking the header cycles
+# [full → summary → collapsed → full]. `summary_lines` is the height of the
+# SUMMARY state (the restricted preview) in text lines — the body is capped
+# to that height and SCROLLS (the scrollbar belongs to the Collapsable, not
+# to its content), so nothing is ever clipped away: the summary is a window
+# onto the full content, not a truncation. `pin_end` keeps that window
+# pinned to the END (console panes — the newest output is what matters,
+# streaming or done). The cap lives on the SECTION, never on the tool card —
+# every section (and the result embed below them) stays reachable.
 struct Collapsable
     label::String
     body::Any
     preview::String
-    open::Bool
-    lines::Int
+    summary_lines::Int
+    state::Symbol           # initial state: :full | :summary | :collapsed
+    pin_end::Bool
 end
-Collapsable(label::AbstractString, body; preview::AbstractString="", open::Bool=true,
-            lines::Integer=0) =
-    Collapsable(String(label), body, String(preview), open, Int(lines))
-
-# Sections longer than this many lines get the clamp + "show all" bar.
-const CLAMP_LINES = 6
+function Collapsable(label::AbstractString, body; preview::AbstractString = "",
+                     summary_lines::Integer = 4, state::Symbol = :summary,
+                     pin_end::Bool = false)
+    state in (:full, :summary, :collapsed) ||
+        throw(ArgumentError("Collapsable state must be :full, :summary or :collapsed, got $(state)"))
+    return Collapsable(String(label), body, String(preview), Int(summary_lines),
+                       state, pin_end)
+end
 
 function Bonito.jsrender(session::Session, c::Collapsable)
     summary_kids = Any[DOM.span(c.label; class="bt-subsection-label")]
     isempty(c.preview) || push!(summary_kids,
         DOM.span(c.preview; class="bt-subsection-preview"))
-    clamped = c.lines > CLAMP_LINES
-    if clamped
-        # The show-all toggle lives IN the summary row, so its position never
-        # changes when the body height does — expanding and collapsing are two
-        # clicks on the same spot (a bar below the body would jump to the end
-        # of a long output on expand). preventDefault keeps the click from
-        # also toggling the <details> open state.
-        more_label = "show all ($(c.lines) lines) ⌄"
-        push!(summary_kids, DOM.span(more_label; class="bt-subsection-more",
-            onclick=js"""e => {
-                e.preventDefault();
-                e.stopPropagation();
-                const d = e.target.closest('.bt-subsection');
-                const full = d.toggleAttribute('data-full');
-                e.target.textContent = full ? 'show less ⌃' : $(more_label);
-            }"""))
-    end
-    Bonito.jsrender(session, DOM.details(
-        DOM.summary(summary_kids...; class="bt-subsection-summary"),
-        DOM.div(c.body; class=clamped ? "bt-subsection-body bt-clamped" : "bt-subsection-body");
+    body = DOM.div(c.body; class="bt-subsection-body")
+    # Header click cycles the three states. preventDefault keeps the click
+    # from ALSO firing the native <details> toggle — `open` is driven here
+    # (open ⇔ not collapsed; `data-state` carries full vs summary while
+    # open). Entering summary/full re-pins a `pin_end` body to its end.
+    cycle = js"""e => {
+        e.preventDefault();
+        const d = e.target.closest('.bt-subsection');
+        if (!d.open) { d.open = true; d.dataset.state = 'full'; }
+        else if (d.dataset.state === 'full') { d.dataset.state = 'summary'; }
+        else { d.open = false; return; }
+        if (d.dataset.pinEnd === '1') {
+            const b = d.querySelector('.bt-subsection-body');
+            if (b) b.scrollTop = b.scrollHeight;
+        }
+    }"""
+    kids = Any[DOM.summary(summary_kids...; class="bt-subsection-summary", onclick=cycle), body]
+    # Initial end-pin, once the subtree is parsed (inline JSCode children run
+    # right after their surrounding DOM — the Bonito idiom for init steps).
+    c.pin_end && push!(kids, js"""(() => {
+        const b = $(body);
+        if (b) b.scrollTop = b.scrollHeight;
+    })()""")
+    Bonito.jsrender(session, DOM.details(kids...;
         class="bt-subsection",
-        open=c.open ? true : nothing))
+        dataState=c.state === :collapsed ? "summary" : String(c.state),
+        dataPinEnd=c.pin_end ? "1" : nothing,
+        style=Styles("--bt-summary-lines" => string(c.summary_lines)),
+        open=c.state === :collapsed ? nothing : true))
 end
 
-# Open by default — an already-expanded tool card should show everything without
-# extra clicks; the collapsible just lets the user fold away a long code block
-# or a noisy output to focus on the other.
-tool_subsection(label::AbstractString, body; preview::AbstractString="", open::Bool=true,
-                lines::Integer=0) =
-    Collapsable(label, body; preview, open, lines)
-
-# Content line count for the clamp decision.
-section_lines(s::AbstractString) = count(==('\n'), s) + 1
+tool_subsection(label::AbstractString, body; kwargs...) = Collapsable(label, body; kwargs...)
 
 # bt_julia_eval tool bodies: a ```julia code echo followed by stdout / result
 # / error sections. Render as two collapsibles — "Code" (Monaco julia, same
@@ -1833,7 +1840,7 @@ function render_eval_body(content)
     code_preview = length(first_line) > 60 ?
                    SubString(first_line, 1, prevind(first_line, 60)) * "…" : first_line
     code_section = tool_subsection("Code", monaco_readonly(code, "julia");
-        preview=code_preview, lines=section_lines(code))
+        preview=code_preview)
     # One terminal pane for all the text + any media blocks.
     merged = join(texts, "\n")
     kids = Any[]
@@ -1841,7 +1848,7 @@ function render_eval_body(content)
     append!(kids, media)
     output_section = isempty(kids) ?
                      tool_subsection("Output", DOM.div("(no output)"; class="bt-tool-empty")) :
-                     tool_subsection("Output", DOM.div(kids...); lines=section_lines(merged))
+                     tool_subsection("Output", DOM.div(kids...); pin_end=true)
     return DOM.div(code_section, output_section; class="bt-eval-body")
 end
 
@@ -1877,9 +1884,11 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     # code. The content-position invariant is unchanged either way: the
     # worker echoes the ORIGINAL code as content[1] even for continue.
     sections  = Any[]
+    # Code preview: the summary state shows ~4 lines (the Monaco editor sizes
+    # itself to the content; the Collapsable body caps + scrolls). Header
+    # click cycles full → summary → collapsed.
     isempty(m.code) || push!(sections,
-        tool_subsection("Code", monaco_readonly(m.code, "julia");
-            lines=section_lines(m.code)))
+        tool_subsection("Code", monaco_readonly(m.code, "julia")))
     # Wire contract v3: content is `[output_text?, descriptor?]` — the
     # descriptor (exact decode of our own json, see `result_descriptor`) is
     # the LAST block of a completed call whenever a result ref exists (values
@@ -1893,24 +1902,21 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
         desc = last isa AgentClientProtocol.TextContent ?
             result_descriptor(last.text) : nothing
     end
+    # The Output section is the SAME widget streaming or done: a `pin_end`
+    # Collapsable in summary state — its body owns the scrollbar and stays
+    # pinned to the newest line. While running, the worker's captured stdout
+    # lands in `m.stream_text` (grown by `stream_tail` updates, which also
+    # re-pin the body); the terminal re-render swaps in the complete text
+    # from the content block — same bytes, same chrome, no styling jump.
     if tool_status(m) in ("pending", "in_progress")
-        # The stream IS the output while running: the worker's captured
-        # stdout lands here via `stream_tail` updates (the JS writes into
-        # `.bt-eval-stream`, pinned to the newest line). The terminal
-        # re-render swaps in the complete text from the content block — the
-        # same bytes, atomic with the result and persisted for history.
-        # No section clamp (`lines = 0`): the live pane bounds ITSELF via the
-        # `.bt-eval-stream` max-height and auto-scrolls to the newest line —
-        # a "show all" toggle makes no sense for a moving stream.
         push!(sections, tool_subsection("Output",
-            DOM.pre(m.stream_text; class = "bt-eval-stream")))
+            console_block(m.stream_text); pin_end = true))
     else
         stop   = desc === nothing ? lastindex(content) : lastindex(content) - 1
         output = join(String[c.text for c in content[begin:stop]
                              if c isa AgentClientProtocol.TextContent], "\n")
         isempty(strip(output)) || push!(sections,
-            tool_subsection("Output", console_block(output);
-                lines = section_lines(output)))
+            tool_subsection("Output", console_block(output); pin_end = true))
     end
     desc === nothing || push!(sections,
         wrap_for_detach(tool_id(m), remote_result(chat.state, content[end].text, chat.project_id)))
@@ -3151,6 +3157,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             (auto_expand_body(b, m.content) || has_show_reference(m.content)) &&
                 (d0["expand"] = true)
             auto_expand_full(b, m.content) && (d0["expand_full"] = true)
+            live_result_embed(b, m.content) && (d0["live_embed"] = true)
             mime0 = tool_media_mime(m.content)
             mime0 === nothing || (d0["show_mime"] = mime0)
             hd0 = Dict{String,Any}("kind" => tool_kind(b), "title" => pt0)
@@ -3161,7 +3168,8 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
                 d0["editable"]  = true
                 d0["edit_path"] = ep0
             end
-            (haskey(d0, "expand") || haskey(d0, "show_mime") || haskey(d0, "editable")) &&
+            (haskey(d0, "expand") || haskey(d0, "show_mime") ||
+             haskey(d0, "editable") || haskey(d0, "live_embed")) &&
                 chat_emit(h.chat, d0)
         end
         for snap in m.updates
@@ -3211,6 +3219,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             (auto_expand_body(b, snap.content) || has_show_reference(snap.content)) &&
                 (d["expand"] = true)
             auto_expand_full(b, snap.content) && (d["expand_full"] = true)
+            live_result_embed(b, snap.content) && (d["live_embed"] = true)
             # A running eval starts its live stdout tail (idempotent). The real
             # claude wire keeps the status at "pending" for the whole MCP call
             # (no in_progress transition while the tool runs — observed live;
@@ -3266,18 +3275,29 @@ auto_expand_body(m::JuliaEvalCall, snap_content) =
     tool_status(m) in ("pending", "in_progress") ? !isempty(m.code) :
     auto_expand_full(m, snap_content)
 
-# FULL uncollapse (not just the compact eager-mount) — typed, default off.
-# Eval: a completed call whose final block is a result descriptor (exact
-# decode — the eval returned != nothing, value or error); the result should
-# be visible without a click.
-auto_expand_full(::ToolMsg, snap_content) = false
-function auto_expand_full(m::JuliaEvalCall, snap_content)
+# The tool holds a LIVE result embed: a worker-parked value the body mounts
+# via `RemoteRef` (values AND errors — both are parked refs rendered live).
+# The client gives such cards `bt_show_app`'s output handling: the ⤢ detach
+# button (embed adopted into its own workspace panel, same live DOM node)
+# and keep-alive parking on scroll-off (the btApp LRU — plain virtualization
+# would drop the DOM, closing the sub-session and killing e.g. a WGLMakie
+# canvas). Typed, default off; eval: completed + a result descriptor as the
+# final content block (exact decode of our own json — no sniffing).
+live_result_embed(::ToolMsg, snap_content) = false
+function live_result_embed(m::JuliaEvalCall, snap_content)
     tool_status(m) == "completed" || return false
     isempty(snap_content) && return false
     c = snap_content[end]
     return c isa AgentClientProtocol.TextContent &&
         result_descriptor(c.text) !== nothing
 end
+
+# FULL uncollapse (not just the compact eager-mount) — typed, default off.
+# Eval: exactly when a live result embed exists (the eval returned
+# != nothing, value or error); the result should be visible without a click.
+auto_expand_full(::ToolMsg, snap_content) = false
+auto_expand_full(m::JuliaEvalCall, snap_content) =
+    live_result_embed(m, snap_content)
 # Two-arg fallback for tests / call sites that don't have the snap yet.
 auto_expand_body(b::ToolMsg) = auto_expand_body(b, Any[])
 

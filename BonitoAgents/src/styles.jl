@@ -1332,47 +1332,37 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-faint)",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap", "min-width" => "0"),
+    # THE scrollbar lives HERE, on the Collapsable body — not on the content
+    # inside it. So a section behaves identically whether it holds a live
+    # stdout stream or the same text after completion: capped height, its own
+    # scrollbar, pinned to the newest line (`data-pin-end`, driven from JS).
+    # A single line-height unit (console 12px/1.5 = 18px; Monaco ~ same) makes
+    # `summary_lines` mean exactly what it says.
     CSS(".bt-subsection-body",
-        "padding" => "8px 10px"),
-    # Per-SECTION height clamp (never on the whole tool card — the card's
-    # default state must keep every section and the result embed reachable).
-    # A long Code / Output section shows ~4-5 lines; the `.bt-subsection-more`
-    # toggle sits IN the summary row (right-aligned) so its position never
-    # moves when the body height changes — double-click flips expand/collapse.
-    # It toggles `data-full` on the <details>; the label swap lives in its
-    # onclick. Hidden while the section itself is folded (nothing to reveal).
-    CSS(".bt-subsection:not([data-full]) > .bt-subsection-body.bt-clamped",
-        "max-height" => "110px",
-        "overflow" => "hidden"),
-    CSS(".bt-subsection-more",
-        "margin-left" => "auto",
-        "font-size" => "11px",
-        "font-weight" => "400",
-        "text-transform" => "none",
-        "letter-spacing" => "normal",
-        "color" => "var(--bt-text-faint)",
-        "cursor" => "pointer",
-        "flex-shrink" => "0",
-        "user-select" => "none"),
-    CSS(".bt-subsection-more:hover",
-        "color" => "var(--bt-text)"),
-    CSS("details.bt-subsection:not([open]) .bt-subsection-more",
-        "display" => "none"),
-    # "show all" means ALL: the inner console pane drops its own scroll cap
-    # while the section is expanded to full.
-    CSS(".bt-subsection[data-full] .bt-console",
-        "max-height" => "none"),
+        "padding" => "8px 10px",
+        "overflow-y" => "auto"),
+    # SUMMARY state: the restricted preview — `summary_lines` tall, scrolls.
+    # +16px for the body's own vertical padding so N lines are actually
+    # visible above the scrollbar. The cap lives on the SECTION, never on the
+    # tool card — every section (and the result embed below them) stays
+    # reachable in the card's default state.
+    CSS("""details.bt-subsection[data-state="summary"] > .bt-subsection-body""",
+        "max-height" => "calc(var(--bt-summary-lines, 4) * 18px + 16px)"),
+    # FULL state: the whole content, still capped generously so one huge
+    # output can't blow up the card — the body scrolls past that.
+    CSS("""details.bt-subsection[data-state="full"] > .bt-subsection-body""",
+        "max-height" => "480px"),
 
     # Console block — wraps a `Bonito.RichText` terminal pane (ANSI → styled
     # HTML). Captured stdout / stderr / error backtraces render here instead
-    # of in a Monaco editor: lighter, ANSI-aware, scrolls on overflow.
+    # of in a Monaco editor: lighter, ANSI-aware. NO own scroll cap — the
+    # Collapsable body owns height + scrollbar (see `.bt-subsection-body`), so
+    # the console looks and scrolls the same streaming or done.
     CSS(".bt-console",
         "background" => "var(--bt-surface-2)",
         "border" => "1px solid var(--bt-border)",
         "border-radius" => "var(--bt-radius-sm)",
-        "padding" => "8px 10px",
-        "max-height" => "360px",
-        "overflow" => "auto"),
+        "padding" => "8px 10px"),
     CSS(".bt-console .terminal-output",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
         "font-size" => "12px", "line-height" => "1.5",

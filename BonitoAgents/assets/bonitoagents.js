@@ -2118,6 +2118,20 @@ class BonitoChat {
         }
     }
 
+    // The `.bt-console` of an eval body's Output section (the pin_end
+    // Collapsable the live stdout stream writes into), or null before the
+    // body has mounted. Matched by the section's "Output" label so a Code /
+    // error console can't be picked by mistake.
+    _evalOutputConsole(node) {
+        const secs = node.querySelectorAll('.bt-tool-body .bt-subsection');
+        for (const d of secs) {
+            const label = d.querySelector('.bt-subsection-label');
+            if (label && (label.textContent || '').trim() === 'Output')
+                return d.querySelector('.bt-console');
+        }
+        return null;
+    }
+
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -2269,29 +2283,53 @@ class BonitoChat {
             headerEl.insertBefore(sb,
                 headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
+        // The completed update announced a LIVE result embed (worker-parked
+        // value mounted via RemoteRef): give the card bt_show_app's output
+        // handling — keep-alive parking on scroll-off (btApp LRU; plain
+        // virtualization would close the sub-session and kill e.g. a
+        // WGLMakie canvas) and the ⤢ detach button (embed adopted into its
+        // own workspace panel; same wiring as createNode's).
+        if (msg.live_embed) {
+            node.dataset.btApp = '1';
+            if (headerEl && !headerEl.querySelector('.bt-tool-detach')) {
+                const db = document.createElement('button');
+                db.type = 'button';
+                db.className = 'bt-tool-detach';
+                db.title = 'Detach to floating window';
+                db.textContent = '⤢';
+                db.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.comm.notify({ type: 'detach_app', id: msg.id });
+                });
+                headerEl.insertBefore(db,
+                    headerEl.querySelector('.bt-tool-fullwidth') || null);
+            }
+        }
         // Live stdout of a RUNNING eval, fed by `stream_tail` updates (the
-        // server tails the eval session's log). The pane IS the body's
-        // Output section (server-rendered `.bt-eval-stream` inside it) —
-        // the stream is the output while running; the terminal re-render
-        // swaps in the complete text. Fallback: if the update raced the
-        // body mount, park a pane under the header (the mount replaces it).
+        // server tails the eval session's log). The stream IS the body's
+        // Output section — a `pin_end` Collapsable whose `.bt-console` shows
+        // the text; write into it and pin its scroller (the .bt-subsection-
+        // body) to the newest line. Same widget the terminal re-render swaps
+        // the complete text into, so there's no styling jump on completion.
+        // Fallback: if the update raced the body mount, park a plain pane
+        // under the header (the mount, which carries the same text, drops it).
         if (msg.stream_tail != null && stillLive && headerEl) {
-            let sp = node.querySelector('.bt-tool-body .bt-eval-stream');
-            if (sp) {
-                // The body's Output pane owns the stream now — drop a
-                // fallback pane parked under the header before the mount.
-                for (const stray of node.querySelectorAll('.bt-eval-stream'))
-                    if (stray !== sp) stray.remove();
+            const con = this._evalOutputConsole(node);
+            if (con) {
+                for (const stray of node.querySelectorAll('.bt-eval-stream')) stray.remove();
+                con.textContent = msg.stream_tail;
+                const scroller = con.closest('.bt-subsection-body');
+                if (scroller) scroller.scrollTop = scroller.scrollHeight;
             } else {
-                sp = node.querySelector('.bt-eval-stream');
+                let sp = node.querySelector('.bt-eval-stream');
+                if (!sp) {
+                    sp = document.createElement('pre');
+                    sp.className = 'bt-eval-stream';
+                    headerEl.insertAdjacentElement('afterend', sp);
+                }
+                sp.textContent = msg.stream_tail;
+                sp.scrollTop = sp.scrollHeight;
             }
-            if (!sp) {
-                sp = document.createElement('pre');
-                sp.className = 'bt-eval-stream';
-                headerEl.insertAdjacentElement('afterend', sp);
-            }
-            sp.textContent = msg.stream_tail;
-            sp.scrollTop = sp.scrollHeight;   // always show the newest lines
         }
         // The file path usually arrives with a later update (the initial
         // header has no arguments/content yet) — turn the title into a
@@ -2557,7 +2595,7 @@ class BonitoChat {
                 div.innerHTML = this.toolHTML(msg);
                 // Live Bonito/WGLMakie embeds get kept alive (display:none) on
                 // scroll-off instead of removed — see the keep-alive LRU.
-                if (msg.kind === 'bonito_app') div.dataset.btApp = '1';
+                if (msg.kind === 'bonito_app' || msg.live_embed) div.dataset.btApp = '1';
                 // Live state + start/finish time live on the message node.
                 // Status `pending` / `in_progress` count as live until a
                 // terminal update flips the class via `onToolUpdate`; the
@@ -2808,7 +2846,7 @@ class BonitoChat {
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
                 ${stopBtn}
-                ${msg.kind === 'bonito_app'
+                ${(msg.kind === 'bonito_app' || msg.live_embed)
                     ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>`
                     : ''}

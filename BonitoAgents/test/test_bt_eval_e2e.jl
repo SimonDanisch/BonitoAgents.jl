@@ -115,13 +115,15 @@ end
 # The live-display contract for a RUNNING eval: (1) the body eager-mounts
 # without any click while the code runs (real wire: the status stays PENDING
 # for the whole MCP call — no in_progress ever arrives) and a LONG Code
-# section is clamped to ~4 visible lines with a "show all" bar — the clamp
-# lives on the SECTION, never on the tool card, so Output and the result
-# embed below it are always reachable; (2) stdout streams into a small
-# auto-scrolled tail pane under the header; (3) a completed eval that
-# RETURNED a value shows the result without a click (stream pane gone — the
-# Output section owns the text now, itself clamped with its own "show all").
-@testset "bt_eval e2e — live display: section clamps, stdout stream tail, result visible" begin
+# section starts in SUMMARY state — a ~4-line window onto the editor, capped
+# by the Collapsable body (which owns the scrollbar). The cap lives on the
+# SECTION, never on the tool card, so Output and the result embed below it are
+# always reachable; (2) stdout streams into the Output section's `pin_end`
+# console, pinned to the newest line — the SAME widget the completed output
+# uses (no styling jump); (3) a completed eval that RETURNED a value shows the
+# result without a click, and the Output header cycles the three states
+# summary → collapsed → full → summary.
+@testset "bt_eval e2e — live display: three-state sections, stdout stream tail, result visible" begin
     project = EVALENV   # live embed asserted → needs the bridge (see EVALENV)
     # 9 code lines (> CLAMP_LINES) so the Code section clamps while running;
     # 12 output lines so the Output section clamps after completion.
@@ -175,43 +177,49 @@ end
                 window.__clk1 ??= t.textContent;
                 return t.textContent !== window.__clk1; })()""";
             timeout = 30, interval = 0.5) == true
-        # The long Code SECTION is clamped to ~4-5 lines (110px + padding
-        # slack) with real Monaco lines rendered — the whole-card cap this
-        # replaces once hid Output/result entirely, and an earlier cap
-        # regressed silently because only presence was asserted, never
-        # height. The card body itself must NOT be capped.
-        @test TK.wait_for(s, "Code section clamped with rendered lines",
-            """(() => { const b = document.querySelector('$card .bt-subsection-body.bt-clamped');
-                return !!b && b.querySelectorAll('.view-line').length >= 3 &&
-                       b.offsetHeight > 0 && b.offsetHeight <= 140; })()""";
+        # The Code SECTION starts in SUMMARY state — a ~4-line window onto the
+        # editor, capped by the Collapsable body (which owns the scrollbar),
+        # with real Monaco lines rendered. The card body itself is NOT capped.
+        code_sec = """[...document.querySelectorAll('$card .bt-subsection')].find(d =>
+            d.querySelector('.bt-subsection-label')?.textContent === 'Code')"""
+        @test TK.wait_for(s, "Code section in summary state, ~4 lines",
+            """(() => { const d = $code_sec;
+                const b = d && d.querySelector('.bt-subsection-body');
+                return !!(d && b && d.dataset.state === 'summary' &&
+                       b.querySelectorAll('.view-line').length >= 3 &&
+                       b.offsetHeight > 0 && b.offsetHeight <= 110); })()""";
             timeout = 30) == true
-        @test TK.eval_js(s,
-            "!!document.querySelector('$card .bt-subsection-more')") == true
 
-        # (2) The stdout streams into the body's Output pane, pinned to the
-        # newest line. ONE combined wait with a boot-tolerant timeout: the
-        # fresh evalenv session pays worker spawn + `using` before the first
-        # print, and the pane only exists while the eval RUNS (the terminal
-        # re-render replaces it) — two separate short waits raced completion.
+        # (2) The stdout streams into the Output section's console, pinned to
+        # the newest line — the SAME `pin_end` Collapsable body the completed
+        # output uses (no styling jump). ONE combined wait with a boot-tolerant
+        # timeout: the fresh evalenv session pays worker spawn + `using` before
+        # the first print.
+        out_sec = """[...document.querySelectorAll('$card .bt-subsection')].find(d =>
+            d.querySelector('.bt-subsection-label')?.textContent === 'Output')"""
         stream_ok = try
             TK.wait_for(s, "stream tail streams late lines, pinned to end",
-                """(() => { const p = document.querySelector('$card .bt-eval-stream');
-                    return !!(p && /STREAMLINE (8|9|10|11|12)/.test(p.textContent) &&
-                              p.scrollTop + p.clientHeight >= p.scrollHeight - 4); })()""";
+                """(() => { const d = $out_sec;
+                    const con = d && d.querySelector('.bt-console');
+                    const sc  = d && d.querySelector('.bt-subsection-body');
+                    return !!(con && sc && /STREAMLINE (8|9|10|11|12)/.test(con.textContent) &&
+                              d.dataset.pinEnd === '1' &&
+                              sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4); })()""";
                 timeout = 180) == true
         catch
             false
         end
         stream_ok || @info "stream dump" pane = TK.eval_js(s,
-                """(() => { const p = document.querySelector('$card .bt-eval-stream');
-                    return p ? JSON.stringify({txt: p.textContent.slice(-200),
-                        st: p.scrollTop, ch: p.clientHeight, sh: p.scrollHeight}) : "(no pane)"; })()""") body = TK.eval_js(s,
+                """(() => { const d = $out_sec; const con = d && d.querySelector('.bt-console');
+                    const sc = d && d.querySelector('.bt-subsection-body');
+                    return con ? JSON.stringify({txt: con.textContent.slice(-200),
+                        st: sc?.scrollTop, ch: sc?.clientHeight, sh: sc?.scrollHeight}) : "(no console)"; })()""") body = TK.eval_js(s,
                 "document.querySelector('$card .bt-tool-body')?.innerText?.slice(0, 300)")
         @test stream_ok
 
         # (3) Completion with a non-nothing result: the result embed is
-        # visible (below the clamped sections — no click needed), the stream
-        # pane is gone.
+        # visible (below the summary-state sections — no click needed), and no
+        # fallback stream pane lingers.
         @test TK.wait_for(s, "completed + result visible",
             """(() => { const c = document.querySelector('$card');
                 if (!c) return false;
@@ -227,39 +235,33 @@ end
         @test occursin(r"^\d+(s|m(\d+s)?)$", clk1)
         @test clk1 == clk2
 
-        # (4) The Output section (12 console lines) is clamped with its own
-        # "show all (N lines)" toggle in the SUMMARY row; clicking it reveals
-        # the full output.
-        out_sec = """[...document.querySelectorAll('$card .bt-subsection')].find(d =>
-            d.querySelector('.bt-subsection-label')?.textContent === 'Output')"""
-        @test TK.wait_for(s, "Output section clamped + show-all toggle",
+        # (4) The completed Output section is the SAME pin_end console in
+        # SUMMARY state — scrollbar, capped to ~4 lines. Clicking its HEADER
+        # cycles the three states: summary → collapsed → full → summary.
+        @test TK.wait_for(s, "Output section done: summary state, pinned console",
             """(() => { const d = $out_sec;
-                const b = d && d.querySelector('.bt-subsection-body.bt-clamped');
-                const m = d && d.querySelector('.bt-subsection-summary .bt-subsection-more');
-                return !!(b && m && b.offsetHeight <= 140 &&
-                          m.textContent.includes('show all')); })()""";
+                const b = d && d.querySelector('.bt-subsection-body');
+                return !!(d && b && d.dataset.state === 'summary' && d.dataset.pinEnd === '1' &&
+                          d.hasAttribute('open') && b.offsetHeight <= 110); })()""";
             timeout = 30) == true
-        # The toggle lives in the summary row so its SCREEN POSITION must not
-        # move across the click (the double-click-to-flip contract), and the
-        # <details> stays open (preventDefault stops the native toggle).
-        # Probe + click + re-probe in ONE synchronous JS execution.
-        flip = TK.eval_js(s, """(() => {
-            const d = $out_sec;
-            const m = d.querySelector('.bt-subsection-more');
-            const y1 = Math.round(m.getBoundingClientRect().top);
-            m.click();
-            const y2 = Math.round(m.getBoundingClientRect().top);
-            return {y1: y1, y2: y2, full: d.hasAttribute('data-full'),
-                    open: d.hasAttribute('open')};
-        })()""")
-        @test flip["y1"] == flip["y2"]
-        @test flip["full"] == true
-        @test flip["open"] == true
-        @test TK.wait_for(s, "show-all reveals the full output",
+        # Cycle 1: summary → collapsed (header click; body hidden).
+        TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
+        @test TK.wait_for(s, "cycled to collapsed",
+            "!(($out_sec).hasAttribute('open'))"; timeout = 5) == true
+        # Cycle 2: collapsed → full (body back, taller than the summary cap).
+        TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
+        @test TK.wait_for(s, "cycled to full (uncapped)",
             """(() => { const d = $out_sec;
-                return !!(d && d.querySelector('.bt-subsection-body').offsetHeight > 140 &&
-                    d.querySelector('.bt-subsection-more').textContent.includes('show less')); })()""";
-            timeout = 10) == true
+                return !!(d.hasAttribute('open') && d.dataset.state === 'full' &&
+                    d.querySelector('.bt-subsection-body').offsetHeight > 110); })()""";
+            timeout = 5) == true
+        # Cycle 3: full → summary (back to the ~4-line window).
+        TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
+        @test TK.wait_for(s, "cycled back to summary",
+            """(() => { const d = $out_sec;
+                return !!(d.hasAttribute('open') && d.dataset.state === 'summary' &&
+                    d.querySelector('.bt-subsection-body').offsetHeight <= 110); })()""";
+            timeout = 5) == true
 
         TK.screenshot(s, shot("bt_eval-stream.png"))
     finally

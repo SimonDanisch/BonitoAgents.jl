@@ -201,11 +201,27 @@
             }, 100);
         }))()""")
         @test quiesced == true
-        n_requests = TK.eval_js(s, """(() => new Promise(resolve => {
+        # Stash the chat object + poke holes in its cache (so a running
+        # prefetcher WOULD have rows to fetch), then REALLY hide the pane by
+        # navigating to the dashboard — the product drives onHidden itself.
+        # Manually faking ch.onHidden() on a still-visible pane was a
+        # synthetic state: any product-side visibility resync — e.g. the
+        # chat-LRU eviction (cap 8) updating the sidebar, which only happens
+        # once the full soak has accumulated enough chats — flipped it back
+        # to shown MID-COUNT, the backfill legitimately resumed (the
+        # intermittent `188 == 0`), and by the explicit onShown phase it had
+        # already finished (its `0 > 0` twin).
+        TK.eval_js(s, """(() => {
             const ch = $CH;
+            window.__saBf = ch;
             for (const k of [...ch.cache.keys()]) if (k % 2 === 0) { ch.cache.get(k)?.remove(); ch.cache.delete(k); ch.rendered.delete(k); }
             ch._prefetchStarted = false; ch._prefetchCursor = null;
-            ch.onHidden();
+            return true;
+        })()""")
+        TK.to_dashboard(s)
+        sleep(0.5)
+        n_requests = TK.eval_js(s, """(() => new Promise(resolve => {
+            const ch = window.__saBf;
             let n = 0;
             const orig = ch.comm.notify.bind(ch.comm);
             ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') n++; return orig(m); };
@@ -213,15 +229,19 @@
             setTimeout(() => { ch.comm.notify = orig; resolve(n); }, 1500);
         }))()""")
         @test Int(n_requests) == 0
-        n_after = TK.eval_js(s, """(() => new Promise(resolve => {
-            const ch = $CH;
-            let n = 0;
+        # Navigate back: the pane shows for real and the backfill resumes.
+        TK.eval_js(s, """(() => {
+            const ch = window.__saBf;
+            window.__saBfN = 0;
             const orig = ch.comm.notify.bind(ch.comm);
-            ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') n++; return orig(m); };
-            ch.onShown();
-            setTimeout(() => { ch.comm.notify = orig; resolve(n); }, 1500);
-        }))()""")
-        @test Int(n_after) > 0
+            window.__saBfRestore = () => { ch.comm.notify = orig; };
+            ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') window.__saBfN++; return orig(m); };
+            return true;
+        })()""")
+        TK.open_chat(s, pid)
+        @test TK.wait_for(s, "backfill resumes once shown",
+            "window.__saBfN > 0"; timeout = 15) == true
+        TK.eval_js(s, "window.__saBfRestore(); delete window.__saBf; true")
         sleep(1.5)   # let the resumed backfill settle
     end
 
