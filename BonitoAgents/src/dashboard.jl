@@ -1847,6 +1847,7 @@ end
 const PickerEntry = NamedTuple{(:name, :dir), Tuple{String, Bool}}
 
 mutable struct RemoteFolderPicker
+    state::ServerState
     worker_name::String
     cur::Observable{String}
     selected::Observable{String}
@@ -1859,11 +1860,24 @@ mutable struct RemoteFolderPicker
     listeners_set_up::Ref{Bool}        # idempotency for setup_listeners!
 end
 
-RemoteFolderPicker(worker_name::String, start::String = "") = RemoteFolderPicker(
-    worker_name, Observable(start), Observable(""), Observable(false),
-    Observable(false),
-    Observable(PickerEntry[]), Observable(false), Observable(""),
-    Ref(0), Ref(false))
+RemoteFolderPicker(state::ServerState, worker_name::String, start::String = "") =
+    RemoteFolderPicker(
+        state, worker_name, Observable(start), Observable(""), Observable(false),
+        Observable(false),
+        Observable(PickerEntry[]), Observable(false), Observable(""),
+        Ref(0), Ref(false))
+
+# Reset the picker to a new worker (called when the user switches the worker
+# select in the New Project form). Updates worker_name and navigates to
+# `new_root`; the existing cur-listener fires the fresh fetch automatically.
+function reset_to_worker!(p::RemoteFolderPicker, worker_name::String, new_root::String)
+    p.worker_name  = worker_name
+    p.selected[]   = ""
+    p.entries[]    = PickerEntry[]
+    p.loading[]    = false
+    p.err[]        = ""
+    p.cur[]        = new_root   # triggers on(p.cur) → fetch_remote_entries! (if expanded)
+end
 
 # Kick off a WS list_worker_dir for `p.cur[]` and update entries/loading/err.
 # Older in-flight responses are discarded via fetch_id.
@@ -1875,7 +1889,7 @@ function fetch_remote_entries!(p::RemoteFolderPicker)
     p.err[]     = ""
     @async begin
         try
-            resp = list_worker_dir(p.worker_name, target)
+            resp = list_worker_dir(p.state, p.worker_name, target)
             my_id == p.fetch_id[] || return        # stale response, abandon
             if resp.path != target
                 # Worker resolved cur="" → its $HOME. Cascading on(cur) will
@@ -2052,14 +2066,24 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     busy = Observable(BUSY_IDLE)
 
     # Form fields
-    np_name   = Observable("")
-    np_picker = FolderPicker(state.working_dir)
-    on(session, np_picker.selected) do sel
+    np_name        = Observable("")
+    np_worker      = Observable("")
+    # Initialized empty; seeded with the selected worker's projects_root when
+    # the New Project button is clicked (or the worker select changes).
+    np_remote_picker = RemoteFolderPicker(state, "", "")
+    on(session, np_remote_picker.selected) do sel
         isempty(strip(np_name[])) || return
         isempty(sel) && return
         np_name[] = basename(rstrip(sel, '/'))
     end
-    np_worker = Observable("")
+    # When the user switches workers in the form, navigate the picker to the
+    # new worker's projects_root so it starts at a sensible location.
+    on(session, np_worker) do wid
+        isempty(wid) && return
+        w = get(state.workers[], wid, nothing)
+        w === nothing && return
+        reset_to_worker!(np_remote_picker, wid, w.projects_root)
+    end
     gh_url    = Observable("")
     gh_worker = Observable("")
 
@@ -2150,12 +2174,12 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         @async begin
             try
                 p = create_project!(state, nm,
-                                 String(strip(np_picker.selected[])),
+                                 String(strip(np_remote_picker.selected[])),
                                  String(strip(np_worker[]));
                                  progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 which_form[] = :none
-                np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
+                np_name[] = ""; np_remote_picker.selected[] = ""; np_worker[] = ""
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to create project: $e"
@@ -2178,7 +2202,15 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             error_obs[] = "Register a worker before creating a project."
             return
         end
-        np_worker[]  = first(keys(state.workers[]))
+        # Pick the first worker and seed the remote picker to its projects_root.
+        # The on(np_worker) listener above does the actual reset; setting np_worker
+        # here triggers it (even if already set to the same value, since the form
+        # was just opened/reset).
+        first_wid = first(keys(state.workers[]))
+        w0 = state.workers[][first_wid]
+        np_worker[]  = ""               # force the listener to fire even if already set
+        np_worker[]  = first_wid
+        np_name[]    = ""
         which_form[] = :new_project
         error_obs[]  = ""
     end
@@ -2329,16 +2361,8 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         oninput = js"event => $(obs).notify(event.target.value)")
 
     new_proj_form() = DOM.div(
-        DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
-        DOM.label("Source"), DOM.div(
-            folder_picker_render(session, np_picker),
-            map(np_picker.selected) do sel
-                isempty(sel) ? DOM.div() :
-                    DOM.div("✓ selected: $sel",
-                            style = Styles("color" => "#065f46",
-                                           "font-size" => "12px",
-                                           "margin-top" => "4px"))
-            end),
+        # Worker first — the folder picker navigates to that worker's filesystem,
+        # so selecting a worker must come before browsing for a folder.
         DOM.label("Worker"),
         DOM.select(
             # Show w.name (mutable display label) but submit w.worker_id
@@ -2346,9 +2370,21 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             # The class is a stable hook: tests / tooling target THIS select —
             # "first visible <select>" broke once the dashboard grew the
             # session-config pills (also native selects).
-            (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
+            (DOM.option(w.name; value=w.worker_id,
+                        selected = w.worker_id == np_worker[]) for w in values(state.workers[]))...;
             class = "bt-np-worker-select",
+            value = np_worker,
             onchange = js"event => $(np_worker).notify(event.target.value)"),
+        DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
+        DOM.label("Folder on worker"), DOM.div(
+            remote_folder_picker_render(session, np_remote_picker),
+            map(np_remote_picker.selected) do sel
+                isempty(sel) ? DOM.div() :
+                    DOM.div("✓ selected: $sel",
+                            style = Styles("color" => "#065f46",
+                                           "font-size" => "12px",
+                                           "margin-top" => "4px"))
+            end),
         # Form action row — the global progress card is the visual feedback
         # for the in-flight submit; click handlers guard against double-fire.
         DOM.div(np_cancel, np_submit, class = "bt-form-actions"),

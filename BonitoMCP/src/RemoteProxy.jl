@@ -284,8 +284,13 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             # `RemoteAsset` and serves `/assets/<key>` with on-demand range reads.
             # Returns that host-relative url to drop into a plain <img>/<video>
             # src — no App/subsession needed for media.
-            url = Bonito.url(b.parent.asset_server, Bonito.Asset(abspath(String(msg["path"]))))
-            send_control(d, Dict("op" => "reply", "id" => id, "val" => url))
+            # Append ?v=<mtime> so the browser treats each file version as a
+            # distinct URL (cache-bust). The HTTP handler strips the query string
+            # before the asset lookup, so the server always finds the asset.
+            path_str = abspath(String(msg["path"]))
+            url = Bonito.url(b.parent.asset_server, Bonito.Asset(path_str))
+            mt  = isfile(path_str) ? round(Int, mtime(path_str)) : 0
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => url * "?v=" * string(mt)))
         elseif op == "close"
             s = Bonito.get_session(b.parent, String(msg["sub"]))
             s === nothing || close(s)

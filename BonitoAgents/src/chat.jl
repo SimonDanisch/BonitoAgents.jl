@@ -2170,7 +2170,7 @@ end
 # carry the `.bt-tool-error` the UI/tests key on).
 function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
     body = try
-        render_show_file(st)
+        render_show_file(st, session)
     catch e
         @warn "bt_show: could not render file" path = st.path exception = (e, catch_backtrace())
         DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
@@ -2338,19 +2338,27 @@ end
 # Source for a worker media file: a streamed proxied-asset url when the worker
 # bridge is live (range reads on demand, no whole-file copy), else the
 # copy-then-serve local Asset fallback (e.g. a reloaded chat with no live worker).
-function show_media_src(st::ShowTool)
+# The URL always includes a ?v=<mtime> cache-buster so the browser fetches the
+# latest bytes after a file is regenerated (video re-recorded, image re-rendered).
+# The bridge path bakes the mtime into the URL in RemoteProxy.jl's asset_url handler;
+# for the fallback path we append it here using the server-side mirror's mtime.
+function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     eb = eval_bridge_for(st.state, st.project_id)
     if eb !== nothing
         proj = get(st.state.projects[], st.project_id, nothing)
         worker_src = (isabspath(st.path) || proj === nothing) ? st.path :
             joinpath(proj.worker_path, st.path)
         try
-            return worker_asset_url(eb, worker_src)
+            return worker_asset_url(eb, worker_src)  # mtime baked in by RemoteProxy
         catch e
             @warn "bt_show: stream via bridge failed; copying instead" exception = (e, catch_backtrace()) path = st.path
         end
     end
-    return Bonito.Asset(fetch_show_file(st))
+    local_path = fetch_show_file(st)
+    asset = Bonito.Asset(local_path)
+    session === nothing && return asset
+    mt = round(Int, mtime(local_path))
+    return Bonito.url(session, asset) * "?v=$(mt)"
 end
 
 # Inline image from a tool result (e.g. Read on a PNG ships an ACP ImageContent).
@@ -2373,12 +2381,12 @@ function read_image_element(state::ServerState, project_id::AbstractString,
     return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, false; filename = fname)
 end
 
-function render_show_file(st::ShowTool)
+function render_show_file(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     ext = lowercase(splitext(st.path)[2])
     if ext in SHOW_IMAGE_EXTS
-        return media_element(show_media_src(st), "", false; filename = basename(st.path))
+        return media_element(show_media_src(st, session), "", false; filename = basename(st.path))
     elseif haskey(SHOW_VIDEO_MIME, ext)
-        return media_element(show_media_src(st), SHOW_VIDEO_MIME[ext], true; filename = basename(st.path))
+        return media_element(show_media_src(st, session), SHOW_VIDEO_MIME[ext], true; filename = basename(st.path))
     end
     # Non-media: the bytes have to be on the server (Monaco / caption read them).
     path = fetch_show_file(st)
