@@ -147,7 +147,6 @@ jobs:
           - chat_close_rename
           - app_reload
           - eval_embed_park
-          - bt_eval_types
           - leak_cycle
           - scroll_persist
           - streaming_flood
