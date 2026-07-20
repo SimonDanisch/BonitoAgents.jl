@@ -3963,9 +3963,7 @@ class BonitoChat {
             this._cancelPendingScroll();
         }
         if (this.followMode) return;
-        if (atBot || (scrollTop > prevTop &&
-                      scrollHeight - scrollTop - clientHeight < clientHeight &&
-                      !this.lastMessageFullyOutOfView())) {
+        if (atBot) {
             this.setFollowMode(true);
             // Pin the viewport. The chase rAF defers while the gesture is
             // still in flight and re-arms itself (see _queueScrollToBottom),
@@ -3974,7 +3972,11 @@ class BonitoChat {
             this._queueScrollToBottom();
         } else {
             // Off-bottom without re-engaging: any pending chase yields to
-            // the user's position (same cancel the old handler did).
+            // the user's position. Re-engagement requires actually reaching
+            // the bottom (AT_BOTTOM_PX) or clicking the jump-to-bottom pill
+            // — the old "within one viewport of bottom" shortcut was too
+            // aggressive on mobile, snapping the view while the user was
+            // still reading the previous sentence.
             this._cancelPendingScroll();
         }
     }

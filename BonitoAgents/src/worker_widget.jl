@@ -36,7 +36,7 @@ function WorkerCard(state::ServerState, worker_id::AbstractString;
                 error_obs, picker_state, discover_state,
                 busy, discover_busy, discover_results,
                 do_import, trigger_scan,
-                RemoteFolderPicker(worker_id),
+                RemoteFolderPicker(state, worker_id),
                 Observable(initial_name),
                 Observable(initial_initials))
 end
