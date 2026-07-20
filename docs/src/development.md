@@ -57,7 +57,7 @@ page:
 - [`walkthrough_mock.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl)
   → `walkthrough.mp4`: the focused `bt_julia_eval` demo (curve-fitting dashboard,
   degree-slider sweep, streaming cross-validation, three-state collapse,
-  detach/dock/steer). Self-contained — a `MockACP` agent scripts the
+  detach/dock/steer). Self-contained: a `MockACP` agent scripts the
   conversation while the REAL `bt_julia_eval` runs the code.
 
 ```bash

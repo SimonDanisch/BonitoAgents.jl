@@ -25,7 +25,7 @@ And every chat is real: claude-agent-acp sessions driving `bt_julia_eval`. Here
 the agent returns a live curve-fitting dashboard, its degree slider is steered
 from underfit to overfit with the RMSE updating live, a streaming
 cross-validation sweep finds the best degree, and the app is detached into the
-workspace and docked beside the chat — still interactive.
+workspace and docked beside the chat, still interactive.
 
 ```@raw html
 <video src="assets/walkthrough.mp4" controls autoplay muted loop playsinline
@@ -45,8 +45,8 @@ workspace and docked beside the chat — still interactive.
   saves back to the worker, and a VSCode-style layout where files, chats and
   live apps drag into tabs, splits and floating windows.
 - **Live results.** The built-in `bt_julia_eval` tool is a warm Julia REPL the
-  agent shares with you: its output streams live, and whatever it *returns* —
-  a plot, a table, a running Bonito app — embeds into the chat as the real
+  agent shares with you: its output streams live, and whatever it *returns*
+  (a plot, a table, a running Bonito app) embeds into the chat as the real
   value, still wired to the worker's session, so sliders and buttons round trip
   to real code.
 - **Sessions that survive.** Chats persist on disk and reconnects resume where
@@ -60,5 +60,5 @@ workspace and docked beside the chat — still interactive.
   with a copy-paste one-liner.
 - [Concepts](@ref): how server, workers, projects and agents fit together.
 - [The Chat](@ref): what the transcript and workspace can do.
-- [Julia Tools & Live Apps](@ref): `bt_julia_eval` — a shared live REPL whose
-  results embed as interactive apps — plus `bt_show`.
+- [Julia Tools & Live Apps](@ref): `bt_julia_eval`, a shared live REPL whose
+  results embed as interactive apps, plus `bt_show`.

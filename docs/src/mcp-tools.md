@@ -3,7 +3,7 @@
 Every chat exposes MCP tools backed by
 [`BonitoMCP`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/BonitoMCP):
 the agent's window into a persistent Julia session per project, running on the
-worker next to the code. `bt_julia_eval` is the heart of it — a warm REPL the
+worker next to the code. `bt_julia_eval` is the heart of it: a warm REPL the
 agent shares with you, where the result of an eval isn't a screenshot or a text
 dump but the **live value**, rendered into the chat and still wired to the code
 that produced it.
@@ -31,8 +31,8 @@ call without a world-age warning.
 ### Streaming, not a black box
 
 `timeout` is a **soft checkpoint**, not a hard kill. A call returns within
-`timeout` seconds either `completed` (with the result) or still `running` — and
-in the running case it hands back the stdout captured so far. In the chat that
+`timeout` seconds either `completed` (with the result) or still `running`; in
+the running case it hands back the stdout captured so far. In the chat that
 stdout streams into a small terminal pane under the header, always pinned to the
 newest line, so a long build or training loop shows its progress live rather
 than freezing the pill. When a call is still running the agent (or you) can:
@@ -40,8 +40,8 @@ than freezing the pill. When a call is still running the agent (or you) can:
 | next | effect |
 |---|---|
 | `bt_julia_continue` | wait another `timeout` seconds |
-| `bt_julia_interrupt` | `SIGINT` — captures the partial output + the `InterruptException`, session state preserved |
-| `bt_julia_restart` | `SIGKILL` — a fresh process, loses all session state |
+| `bt_julia_interrupt` | `SIGINT`; captures the partial output plus the `InterruptException`, session state preserved |
+| `bt_julia_restart` | `SIGKILL`; a fresh process, loses all session state |
 
 `bt_julia_list_sessions` lists the live sessions. `timeout` auto-disables for
 `Pkg.*` (installs are routinely multi-minute); pass `timeout=0` to disable the
@@ -50,7 +50,7 @@ checkpoint entirely.
 ### The result is the live value
 
 Whatever the eval returns is rendered into the chat as a **live embed**, not a
-text repr. A number, an array, a `DataFrame`, an image — and, crucially, a
+text repr. A number, an array, a `DataFrame`, an image, and, crucially, a
 Bonito `App` or a WGLMakie figure, which stay *interactive*: a slider drag or a
 button click round trips to the Julia object still living in the worker's
 session. The value is held in the worker and rendered on demand
@@ -60,12 +60,12 @@ and re-expanding the card, and even a browser reload.
 Because the value is displayed, it never also gets dumped as text: the **Output
 section shows captured stdout only** (and is absent entirely when the code
 printed nothing). A returned `App` shows the running app, not
-`App(#= opaque closures =#)`. The agent still learns what the result was — a
-concise repr rides along for it — but your view is the thing itself.
+`App(#= opaque closures =#)`. The agent still learns what the result was (a
+concise repr rides along for it), but your view is the thing itself.
 
 Live embeds are workspace panels like any other. Detach one from its chat
 bubble (the ⤢ button) into a floating window or a tab beside the chat and it
-stays alive — the same live DOM node is moved, so the WebGL context and
+stays alive: the same live DOM node is moved, so the WebGL context and
 sub-session are kept, not re-created. Scrolling a live embed out of view parks
 it (`display:none`) rather than removing it, so its plot doesn't come back dead;
 a bounded LRU caps how many stay live at once.
@@ -74,7 +74,7 @@ a bounded LRU caps how many stay live at once.
 
 A `bt_julia_eval` pill expands into a body with **Code** and **Output**
 sections and the live result below them. Each section is a three-state
-collapsible — clicking its header cycles **full → summary → collapsed**. The
+collapsible; clicking its header cycles **full → summary → collapsed**. The
 summary state is a scrollable ~4-line window onto the content (the scrollbar
 belongs to the section, so the summary is a window, never a truncation), which
 for streaming output stays pinned to the newest line. The card can also be
@@ -90,7 +90,7 @@ enforces hygiene instead:
 | Situation | Behavior |
 |---|---|
 | Response over `max_response_bytes` (10 KB default) | truncated with a `[truncated: …]` marker |
-| `nothing` return | suppressed — no wasted tokens |
+| `nothing` return | suppressed, no wasted tokens |
 | Container with hundreds of elements | summarized (`Vector{Int} with 500 elements; first 10: …`) |
 | A user error | red `ERROR: …` in Output plus the exception rendered as a live result; the tool stays `completed` (an infra failure is a different, `isError` case) |
 | `full_output = true` | bypasses truncation and summarisation |
@@ -130,5 +130,7 @@ end
 Returned from an eval, this renders running in the chat; dragging the slider
 recomputes the attractor in the worker and morphs the surface in your browser.
 Detach it beside the chat and keep steering it while you read the code that
-built it — that is the [walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl)'s
-centerpiece.
+built it. That whole loop, from building the app to steering it to docking it
+beside the chat, is what the recorded
+[`bt_julia_eval` walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl)
+puts on screen.
