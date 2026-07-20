@@ -95,6 +95,12 @@ end
 
 const BRIDGE = Ref{Union{Nothing, RemoteBridge}}(nothing)
 
+# The running `dial_loop` task, tracked so `stop_dial!` can WAIT for it to exit
+# before anything re-dials — a second loop starting while the first is still
+# alive would fight over `driver.ws[]` forever (see the warning in session.jl's
+# ensure_eval_dialed_locked!). Set by `start_dial!`, cleared by `stop_dial!`.
+const DIAL_TASK = Ref{Union{Nothing, Task}}(nothing)
+
 """
     RemoteBridge(; compression=false)
 
@@ -183,6 +189,54 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
     end
     @info "RemoteProxy: dial loop exiting (BRIDGE cleared)"
     return
+end
+
+"""
+    start_dial!(wsurl, handshake)
+
+Build the bridge (if needed) and spawn the self-reconnecting `dial_loop`,
+remembering its task in `DIAL_TASK` so `stop_dial!` can join it. Called once per
+(re)dial from the host's `ensure_eval_dialed!` bootstrap.
+"""
+function start_dial!(wsurl::AbstractString, handshake::AbstractString)
+    ensure_bridge!()
+    DIAL_TASK[] = @async try
+        dial_loop(wsurl, handshake)
+    catch e
+        @warn "BonitoMCP eval-ws dial loop crashed" exception = (e, catch_backtrace())
+    end
+    return nothing
+end
+
+"""
+    stop_dial!(; timeout = 10.0) -> Bool
+
+Tear the dial-back down WITHOUT killing the worker: clear `BRIDGE[]` so the loop's
+`while BRIDGE[] !== nothing` exits, close the live socket to unblock a connected
+`serve_bridge`, then WAIT (bounded) for the task to finish. The warm Malt session
+and its compiled state are untouched; the next eval rebuilds the bridge and dials
+whatever server is current. `timeout` exceeds `dial_loop`'s `max_backoff` (8s) so
+a loop caught mid-backoff still exits before we return. Returns whether the loop
+actually stopped (so a caller can avoid re-dialing on top of a lingering loop).
+"""
+function stop_dial!(; timeout::Float64 = 10.0)
+    b = BRIDGE[]
+    BRIDGE[] = nothing                        # loop exits at its next `while` check
+    if b !== nothing
+        try
+            ws = b.driver.ws[]
+            ws === nothing || close(ws)        # unblock serve_bridge if connected
+        catch
+        end
+    end
+    t = DIAL_TASK[]
+    DIAL_TASK[] = nothing
+    t === nothing && return true
+    t0 = time()
+    while !istaskdone(t) && time() - t0 < timeout
+        sleep(0.05)
+    end
+    return istaskdone(t)
 end
 
 """

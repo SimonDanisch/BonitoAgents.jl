@@ -167,7 +167,6 @@ const BY_ID = Dict(id => code for (id, code, _) in CASES)
         # project_id — its live-render bridge would miss and every embed degrades
         # to "worker gone". Drop it so THIS chat's first eval dials a fresh bridge
         # under THIS project_id (`ensure_eval_dialed!` won't re-dial a live worker).
-        TK.refresh_eval_session!(EVALENV)
 
         # Per case: send the prompt, wait for ITS tool to reach a terminal status
         # (the first eval pays worker-spawn + first `using DataFrames`/dev-Bonito

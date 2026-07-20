@@ -100,7 +100,6 @@ end
 
 function run_suite(server)
     server.agent_fn[] = agent_script
-    TK.refresh_eval_session!(APP_ENV)
 
     @testset "live embed survives page reload (UI-only)" begin
         pid = TK.new_chat(server; title = "ReloadApp")

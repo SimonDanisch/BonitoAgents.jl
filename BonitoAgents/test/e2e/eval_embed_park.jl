@@ -69,7 +69,6 @@ end
 
 function run_suite(server)
     server.agent_fn[] = park_agent
-    TK.refresh_eval_session!(PARK_ENV)
 
     pid = TK.new_chat(server; title = "ParkApp")
     TK.send_message(server, "show the app")

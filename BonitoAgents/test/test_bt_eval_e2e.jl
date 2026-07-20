@@ -133,7 +133,6 @@ end
         pid = TK.new_chat(s)
         TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
         sleep(1)
-        TK.refresh_eval_session!(EVALENV)
 
         # (1) Soft-scope accumulator: completes without error and the result
         # embed shows 15 (a hard-scope failure would set errored + show the
@@ -211,7 +210,6 @@ end
         # Fresh evalenv session: the pool is process-global, so a session left by
         # an earlier testset still dials ITS (closed) dev_server — the mount
         # would degrade to the static fallback. Each dev_server = a fresh boot.
-        TK.refresh_eval_session!(EVALENV)
         TK.send_message(s, "stream please")
         card = ".bt-tool-msg[data-msg-id*=\"ts-1\"]"
 
@@ -356,7 +354,6 @@ end
         pid = TK.new_chat(s)
         TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
         sleep(1)
-        TK.refresh_eval_session!(EVALENV)   # fresh bridge for THIS dev_server
         TK.send_message(s, "fail please")
         card = ".bt-tool-msg[data-msg-id*=\"terr-1\"]"
 
@@ -408,7 +405,6 @@ end
         pid = TK.new_chat(s)
         TK.click(s, ".bt-side-item[data-project-id=\"$pid\"]")
         sleep(1)
-        TK.refresh_eval_session!(EVALENV)   # fresh bridge for THIS dev_server
         TK.send_message(s, "continue please")
         card1 = ".bt-tool-msg[data-msg-id*=\"tc-1\"]"
         card2 = ".bt-tool-msg[data-msg-id*=\"tc-2\"]"
@@ -600,7 +596,6 @@ end
         # Bind a fresh per-project dial-back for THIS chat's eval worker (the worker
         # dials back once, bound to the first project that used it — app_interactive
         # does the same so the embed renders for the right chat).
-        TK.refresh_eval_session!(project)
         TK.send_message(s, "give me a counter")
         TK.wait_for(s, "eval tool completed",
             "document.querySelector('.bt-tool-msg .bt-tool-status')?.textContent === 'completed'";
