@@ -19,10 +19,6 @@
 
 isdefined(@__MODULE__, :tour) || include(joinpath(@__DIR__, "walkthrough.jl"))
 
-# The rig's project NAMES (rig_pids maps name → id). Order here is only for the
-# opening glide across the grid.
-const DASH_NAMES = ["FractalGallery", "GameOfLife", "TinyServer", "LorenzExplorer"]
-
 # ── view-state gates (READ ONLY) ───────────────────────────────────────────────
 dash_visible_js() = "(document.querySelector('.bt-ov-grid')?.offsetParent ?? null) !== null"
 pane_visible_js(pid) = "(document.querySelector('.bt-chatpane[data-pane-pid=$(repr(pid))]')?.offsetParent ?? null) !== null"
@@ -68,13 +64,9 @@ function tour_dashboard(s, ctx, pids)
     T0 = time(); mark(n) = @info "dash" step = n at = round(time() - T0; digits = 1)
 
     # 1 ─ THE DASHBOARD. Every project on every machine as a live card, each
-    #     thumbnail rendered from that chat's own plot. Glide across the grid.
-    wait_dash!(s); sleep(1.7)
-    for name in DASH_NAMES
-        haskey(pids, name) || continue
-        ECT.move_to(ctx, ECT.JS(card_js(pids[name])); duration = 0.55); sleep(0.35)
-    end
-    sleep(0.7); mark("1 dashboard")
+    #     thumbnail rendered from that chat's own plot. Let it hold in frame — no
+    #     aimless cursor wandering; the first move is the one that opens a project.
+    wait_dash!(s); sleep(2.6); mark("1 dashboard")
 
     # 2 ─ open a project straight from its card → its full chat.
     open_card!(s, ctx, pids["FractalGallery"]; peek = 430)
