@@ -1381,10 +1381,21 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-surface-2)",
         "border" => "1px solid var(--bt-border)",
         "border-radius" => "var(--bt-radius-sm)",
-        "padding" => "8px 10px"),
+        "padding" => "8px 10px",
+        # Streaming writes the live stdout tail as a raw text node straight into
+        # `.bt-console` (see bonitoagents.js `_evalOutputConsole`), so it needs
+        # its own `pre-wrap` — otherwise newlines collapse and the tail renders
+        # as one wrapped line, unlike the completed `.terminal-output` <pre>.
+        "white-space" => "pre-wrap", "word-break" => "break-word",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "1.5"),
     CSS(".bt-console .terminal-output",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
         "font-size" => "12px", "line-height" => "1.5",
+        # Match the streaming tail exactly (the completed pane is a <pre>, which
+        # defaults to `white-space: pre` — force `pre-wrap` so long lines wrap
+        # the same streaming or done).
+        "white-space" => "pre-wrap", "word-break" => "break-word",
         "margin" => "0"),
 
     # ── Edit-tool body container ─────────────────────────────────────────────
