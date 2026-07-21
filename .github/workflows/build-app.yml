@@ -41,10 +41,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every platform ships the SAME format: a relocatable, UNSIGNED .tar.gz
-        # (no macOS notarization / Windows MSIX signing). The bundle carries the
-        # right launcher per OS (.sh on unix, .bat on Windows) + an install
-        # script; users extract and run.
+        # Every platform ships the SAME format: a relocatable .tar.gz (no
+        # notarization / MSIX signing). The bundle carries the right launcher
+        # per OS (.sh on unix, .bat on Windows) + an install script; users
+        # extract and run. macOS bundles get an extra post-build pass that
+        # ad-hoc re-signs the Mach-O binaries (see the "Fix macOS bundle" step)
+        # — without it macOS SIGKILLs the bundled Julia at launch.
         include:
           - runner: macos-latest
             os: macos
@@ -94,6 +96,22 @@ jobs:
           --build-dir=build --target-arch=${{ matrix.arch }}
           --target-os=${{ matrix.os }}
           --target-bundle=${{ matrix.bundle }}
+
+      # AppBundler ships the macOS `tarball` target UNSIGNED, and the bundled
+      # Mach-O binaries carry signatures that pass `codesign --verify` yet fail
+      # macOS's runtime page validation → the bundled Julia is SIGKILLed at
+      # launch ("Code Signature Invalid / Invalid Page") on every stock Mac.
+      # Re-sign every Mach-O ad-hoc so the bundle actually runs (and restore the
+      # REPL precompile test helpers if a stripped build removed them). Runs
+      # natively on each mac runner, so it signs the matching arch. See the
+      # script header for the full story.
+      - name: Fix macOS bundle (ad-hoc sign + REPL test helpers)
+        if: matrix.os == 'macos'
+        run: |
+          set -euo pipefail
+          for t in build/*.tar.gz; do
+            bash .github/scripts/macos-fix-bundle.sh "$t"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
