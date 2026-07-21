@@ -76,9 +76,13 @@ function run_suite(server)
     @testset "live eval embed gets the bt_show_app affordances" begin
         @test TK.wait_for(server, "app mounts live",
             "document.body.innerText.includes('PARK-APP')"; timeout = 180) == true
+        # Cold-start budget: "app mounts live" only sees the static PARK-APP
+        # string; the first live value (PARKAPP=0) waits on the embed's
+        # WGLMakie/Bonito live-init, so give it room like the render/interaction
+        # waits, not the old 10s (shortest budget for the slowest step).
         @test TK.wait_for(server, "initial out",
             "(() => { const e=document.querySelector('.park-out'); return !!(e && e.innerText==='PARKAPP=0'); })()";
-            timeout = 10) == true
+            timeout = 30) == true
         # The completed card is flagged for keep-alive + carries the ⤢ button.
         @test TK.eval_js(server, "document.querySelector('$CARD')?.dataset.btApp === '1'") == true
         @test TK.eval_js(server, "!!document.querySelector('$CARD .bt-tool-detach')") == true
