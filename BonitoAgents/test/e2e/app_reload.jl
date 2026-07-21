@@ -100,7 +100,6 @@ end
 
 function run_suite(server)
     server.agent_fn[] = agent_script
-    TK.refresh_eval_session!(APP_ENV)
 
     @testset "live embed survives page reload (UI-only)" begin
         pid = TK.new_chat(server; title = "ReloadApp")
@@ -109,9 +108,15 @@ function run_suite(server)
         # Baseline: first mount on the first page, live round trip.
         @test TK.wait_for(server, "app renders",
             "document.body.innerText.includes('RELOAD-APP')"; timeout = 180) == true
+        # The FIRST live value is the coldest wait in the whole test: "app renders"
+        # only checks the static RELOAD-APP string, which is in the DOM before the
+        # embed's WGLMakie/Bonito live-init (shader compile + observable subscribe +
+        # first frame) finishes, and that init is what puts RAPP=0 on screen. Give
+        # it a cold-start budget in line with the 180s render / 15s reload waits,
+        # not the old 10s (the shortest budget for the slowest step — an oversight).
         @test TK.wait_for(server, "initial out",
             "(() => { const e=document.querySelector('.rapp-out'); return !!(e && e.innerText==='RAPP=0'); })()";
-            timeout = 10) == true
+            timeout = 30) == true
         @test reload_click_until(server, "RAPP=11")
 
         # Reload #1: first page→page transition on the bridge. The re-mounted

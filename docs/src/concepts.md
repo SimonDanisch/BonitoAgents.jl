@@ -72,8 +72,9 @@ Agents speak the [Agent Client Protocol](https://agentclientprotocol.com)
 (ACP). The worker spawns the agent binary per project; the server bridges the
 protocol stream into the chat model that drives the UI. Providers are
 pluggable descriptors (see [Agent Providers](@ref)). The same mechanism powers
-the deterministic mock agent used by the test suite and the scripted
-[walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl).
+the deterministic mock agent used by the test suite; the
+[dashboard walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_dashboard.jl)
+replays real recorded agent sessions from disk.
 
 ## Security
 

@@ -11,6 +11,15 @@ Everything speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) (ACP): one agent
 process per project, spawned on the first message and reaped when idle.
 
+## Session config
+
+Each chat's header carries the agent's own settings as pills: the **permission
+mode** (how much it may do before asking), the **effort** or thinking level, and
+whatever else the provider reports, such as the model. The options come over ACP
+from the running agent, so the list always matches the provider. Change them for
+one chat in its header, or set fleet-wide starting points in the dashboard's
+*Session defaults* bar, which every new chat inherits.
+
 ## Claude Code
 
 The default provider. Prerequisites on each worker machine:
@@ -42,7 +51,7 @@ agent.
 
 `MockAgent` is a deterministic, scriptable ACP agent used by the test suite
 and the recorded
-[walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl).
+[`bt_julia_eval` walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl).
 A Julia function maps each prompt to a list of protocol events (text chunks,
 tool calls with diffs, live-app pushes, delays for pacing). It only appears in
 the dropdown when `BT_ENABLE_MOCK_AGENT` is set, which is handy for demos and

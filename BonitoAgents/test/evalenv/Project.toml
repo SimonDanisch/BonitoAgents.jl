@@ -1,10 +1,13 @@
 # Committed eval-worker project for the bt_julia_eval render-type e2e tests
-# (`e2e:bt_eval_types`). It is what an eval RUNS IN — a normal user-style project
+# (`e2e:bt_eval_types`). It is what an eval RUNS IN: a normal user-style project
 # with the packages those tests render (color images via ImageShow, tables via
 # DataFrames/Tables; Markdown + Pkg are stdlibs, reachable from @stdlib). Bonito
-# is path-pinned to the DEV checkout so the tests exercise our local Bonito (the
-# render fixes live there); the relative path resolves from this file's real
-# location (Pkg.test runs from the original tree, not a sandbox copy — verified).
+# and the Makie stack are git-pinned to the render branches the tests exercise
+# (Bonito sd/media-proxy ships full objects to proxied roots; Makie
+# sd/electroncall carries the GlyphSync fix), the SAME revs the server-side test
+# env uses, so both sides of the eval proxy agree. Keep these in sync with
+# BonitoAgents/test/Project.toml. Local Bonito/Makie dev repoints these to paths
+# uncommitted.
 #
 # Instantiated once as a warmup in runtests.jl (the packages are precompiled in
 # the depot, so it's a cache hit). NEVER generate this env at runtime in a test.
@@ -27,7 +30,7 @@ Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 ComputePipeline = "95dc2771-c249-4cd0-9c9f-1f3b4330693c"
 
 [sources]
-Bonito = {path = "../../../../Bonito"}
-WGLMakie = {path = "../../../../Makie/WGLMakie"}
-Makie = {path = "../../../../Makie/Makie"}
-ComputePipeline = {path = "../../../../Makie/ComputePipeline"}
+Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
+WGLMakie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "WGLMakie"}
+Makie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "Makie"}
+ComputePipeline = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "ComputePipeline"}

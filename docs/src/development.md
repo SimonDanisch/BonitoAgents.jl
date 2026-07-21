@@ -41,14 +41,29 @@ tool calls with diff and terminal content, forms, plans, subagent feeds,
 live-app pushes, pacing delays and mid-turn cancellation, so most UI behavior
 can be scripted in a few lines.
 
-## The walkthrough
+## The walkthrough videos
 
-[`examples/walkthrough.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl)
-records the tour video with ElectronCall's animated cursor and frame-pump
-recorder against a mock-agent dev server:
+Two recorders under [`examples/`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/examples)
+drive a real Electron window with ElectronCall's animated cursor and frame-pump
+recorder, using only trusted input (`ECT.real_click`, `ECT.wheel`) so the clip
+shows exactly what a user does. They write the two videos embedded on the home
+page:
+
+- [`walkthrough_dashboard.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_dashboard.jl)
+  → `walkthrough_dashboard.mp4`: the multi-project dashboard tour (open a project
+  from its card, switch projects from the sidebar, back to Home). Replays the
+  persistent rig (`BT_WALKTHROUGH_RIG`), so it uses no tokens and never prompts
+  the agent.
+- [`walkthrough_mock.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl)
+  → `walkthrough.mp4`: the focused `bt_julia_eval` demo (curve-fitting dashboard,
+  degree-slider sweep, streaming cross-validation, three-state collapse,
+  detach/dock/steer). Self-contained: a `MockACP` agent scripts the
+  conversation while the REAL `bt_julia_eval` runs the code.
 
 ```bash
-julia --project=BonitoAgents/test examples/walkthrough.jl   # writes examples/walkthrough.mp4
+# run in an env that dev's ElectronCall with the trusted-input helpers:
+julia --project examples/walkthrough_mock.jl        # → examples/walkthrough.mp4
+julia --project examples/walkthrough_dashboard.jl   # → examples/walkthrough_dashboard.mp4
 ```
 
 ## Building these docs

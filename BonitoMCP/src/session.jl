@@ -281,13 +281,9 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
         # `BRIDGE[].routes` is preserved across drops, so already-registered
         # apps keep working without re-running their code.
         Malt.remote_eval_fetch(s.worker, quote
-            @async try
-                Main.RemoteProxy.dial_loop(
-                    $wsurl,
-                    $(secret * " " * project_id * " " * prefix))
-            catch e
-                @warn "BonitoMCP eval-ws dial loop crashed" exception = (e, catch_backtrace())
-            end
+            Main.RemoteProxy.start_dial!(
+                $wsurl,
+                $(secret * " " * project_id * " " * prefix))
             nothing
         end)
         # Wait until the dial actually connects (serve_bridge sets the socket) so
@@ -787,6 +783,49 @@ function restart!(m::SessionManager, env_path::Union{String,Nothing})
         haskey(m.sessions, key) || return nothing
         kill_session!(m.sessions[key])
         delete!(m.sessions, key)
+    end
+    return nothing
+end
+
+"""
+    reset_eval_dialback!(m::SessionManager = manager(), env_path = nothing)
+
+Drop the live-render dial-back WITHOUT killing the session: the warm Malt worker
+and its compiled state survive, but its `RemoteProxy` bridge is torn down
+(`stop_dial!`) and `s.dialed_back` flips false, so the NEXT eval re-dials to
+whatever server is current. This is the eval-side parallel of
+`reset_ctrl_dialback!`: an MCP host / dev_server that goes away re-points the dial
+rather than leaving the worker bridged to a dead server. `env_path === nothing`
+resets every session. Keeping the worker warm is the point — re-`start!`ing it
+(as `restart!` does) would re-pay the eval env's compile cost.
+"""
+function reset_eval_dialback!(m::SessionManager = manager(),
+                              env_path::Union{AbstractString,Nothing} = nothing)
+    targets = @lock m.lock begin
+        env_path === nothing ? collect(values(m.sessions)) :
+            (haskey(m.sessions, _key(env_path)) ? JuliaSession[m.sessions[_key(env_path)]] : JuliaSession[])
+    end
+    for s in targets
+        reset_eval_dialback!(s)
+    end
+    return nothing
+end
+
+function reset_eval_dialback!(s::JuliaSession)
+    @lock s.lock begin
+        s.dialed_back || return nothing
+        if is_alive(s)
+            try
+                Malt.remote_eval_fetch(s.worker, quote
+                    isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :stop_dial!) &&
+                        Main.RemoteProxy.stop_dial!()
+                    nothing
+                end)
+            catch e
+                @warn "reset_eval_dialback!: worker bridge teardown failed (continuing)" exception = e
+            end
+        end
+        s.dialed_back = false
     end
     return nothing
 end

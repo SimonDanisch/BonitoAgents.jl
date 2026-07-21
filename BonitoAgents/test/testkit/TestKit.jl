@@ -619,10 +619,16 @@ end
 function Base.close(s::TestServer)
     s.closed[] && return s
     s.closed[] = true
-    # Tear down the MCP control dial-back this process armed for `s` (see
-    # invoke_mcp): the test process stands in for one MCP server per dev_server,
-    # so its /mcp-ws dial must be re-pointed, not left dangling on a dead server.
+    # Tear down the MCP dial-backs this process armed for `s` (see invoke_mcp):
+    # the test process stands in for one MCP server per dev_server, so both its
+    # /mcp-ws control dial AND every eval worker's /eval-ws render dial must be
+    # re-pointed, not left dangling on this dead server. `reset_eval_dialback!`
+    # keeps the warm eval workers alive (just drops their bridge) so the NEXT
+    # dev_server re-dials fresh — this replaces the old `refresh_eval_session!`
+    # test hack, tying eval-session lifecycle to the dev_server like production
+    # ties it to the agent's MCP child.
     try BonitoMCP.reset_ctrl_dialback!() catch end
+    try BonitoMCP.reset_eval_dialback!() catch end
     ctx = s.browser[]
     ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
@@ -826,26 +832,11 @@ function clear_js_errors(s::TestServer)
     return nothing
 end
 
-"""
-    refresh_eval_session!(env_path)
-
-Drop the per-`env_path` eval session so the NEXT `bt_eval` re-dials the bridge
-for ITS OWN project. The eval worker is shared per env and dials back ONCE (bound
-to the first project that used it); a `bt_eval` from a SECOND chat sharing the
-env reuses that stale dial-back and the live result never renders. An e2e suite
-that mounts a live result calls this at its start so it gets a fresh per-project
-dial-back — order-independent under the shared-server soak. (The robust product
-fix is to re-dial per project in BonitoMCP's `ensure_eval_dialed!`; this is the
-test-side stand-in until then.)
-"""
-function refresh_eval_session!(env_path::AbstractString)
-    try
-        BonitoMCP.restart!(BonitoMCP.manager(), String(env_path))
-    catch e
-        @warn "refresh_eval_session! failed (continuing)" exception = e
-    end
-    return nothing
-end
+# (Removed `refresh_eval_session!`.) It `restart!`-ed the whole eval worker at
+# each test's START to dodge a stale per-env dial-back — a racy stand-in that
+# also threw away warm compile state. The dial-back is now re-pointed at
+# dev_server CLOSE (`BonitoMCP.reset_eval_dialback!` in `Base.close(::TestServer)`),
+# deterministically and without killing the worker, so tests never need it.
 
 """
     wait_for(s, label, js_predicate; timeout = 8) -> Bool

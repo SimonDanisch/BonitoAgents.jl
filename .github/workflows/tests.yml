@@ -145,9 +145,8 @@ jobs:
           - workflows
           - chat_features
           - chat_close_rename
-          - embedded_app
-          - app_detach
-          - app_scroll
+          - app_reload
+          - eval_embed_park
           - leak_cycle
           - scroll_persist
           - streaming_flood
