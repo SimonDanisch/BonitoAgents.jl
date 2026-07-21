@@ -1074,6 +1074,16 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     pid = current_chat_id(s)
     ctx = SERVER_CONTEXT[]
     ctx === nothing || (ctx.project_id[] = pid)
+    # Faithful per-chat eval isolation. In production each chat is its own agent →
+    # its own MCP child → its own eval worker/bridge, so two chats NEVER share a
+    # dial-back. The e2e harness runs ONE in-process MCP manager, so without this a
+    # second chat's `bt_eval` reuses the first chat's dial-back and its live embed
+    # renders against the wrong page — the "second live result never mounts"
+    # artifact `refresh_eval_session!` used to hide by restarting the worker (cold
+    # every time). Drop the dial-back so THIS chat's first eval re-dials for itself
+    # (with the pid set just above); the warm Malt worker — including its compiled
+    # render path — is KEPT, so the mount stays fast.
+    try BonitoMCP.reset_eval_dialback!() catch end
     return pid
 end
 

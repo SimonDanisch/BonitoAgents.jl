@@ -65,7 +65,23 @@
             TK.wait_for(s, "new-project form",
                 "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
                 timeout = 30)
-            # Type the source folder into the breadcrumb address field.
+            # Select the target worker FIRST. Switching the worker RESETS the
+            # folder picker to that worker's projects_root (the picked folder is
+            # worker-specific — dashboard.jl `on(np_worker)` → reset_to_worker!),
+            # so it MUST come before picking the folder, or the selection is wiped
+            # and Create fails with "Source path is required". The form's select
+            # carries one <option value=worker_id>name</option> per worker.
+            picked = TK.eval_js(s, """(() => {
+                const sel = document.querySelector('.bt-np-worker-select');
+                if (!sel) return false;
+                const opt = [...sel.options].find(o => o.value === $(TK.json(worker_id)));
+                if (!opt) return false;
+                sel.value = opt.value;
+                sel.dispatchEvent(new Event('input', {bubbles: true}));
+                sel.dispatchEvent(new Event('change', {bubbles: true}));
+                return true; })()""")
+            picked === true || error("create_on_worker: no Worker <option> for $worker_id")
+            # Now type the source folder into the (worker-scoped) breadcrumb field.
             TK.click_until(s, ".bt-addr-icon-btn",
                 "[...document.querySelectorAll('.bt-addr-input')].some(el => el && el.offsetParent !== null)";
                 timeout = 30)
@@ -85,19 +101,6 @@
             TK.click_text(s, "Choose")
             # Name the project (same name on both ⇒ siblings).
             TK.set_input(s, "input", PROJNAME; placeholder = "e.g. my-project")
-            # Drive the Worker <select> to the desired worker_id. The form's
-            # select carries one <option value=worker_id>name</option> per worker;
-            # set its value + fire change so `np_worker` updates before Create.
-            picked = TK.eval_js(s, """(() => {
-                const sel = document.querySelector('.bt-np-worker-select');
-                if (!sel) return false;
-                const opt = [...sel.options].find(o => o.value === $(TK.json(worker_id)));
-                if (!opt) return false;
-                sel.value = opt.value;
-                sel.dispatchEvent(new Event('input', {bubbles: true}));
-                sel.dispatchEvent(new Event('change', {bubbles: true}));
-                return true; })()""")
-            picked === true || error("create_on_worker: no Worker <option> for $worker_id")
             TK.click_text(s, "Create")
             # Chat view renders after the ACP session binds (mock-agent cold
             # start can take a while) and the new chat becomes the active row.
