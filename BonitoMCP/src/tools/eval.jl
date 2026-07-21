@@ -231,8 +231,9 @@ Streaming model — IMPORTANT:
     to disable the checkpoint entirely.
 
 Output:
-  - Echoed code, captured stdout, return value, and errors are returned
-    as separate blocks.
+  - Captured stdout/stderr followed by the return value's repr (or the error),
+    exactly as a REPL would show it — one terminal-faithful text block. The
+    code is NOT echoed back (you already have it as the tool input).
   - `nothing` returns are suppressed (don't waste tokens on it; if you
     need a value, return it explicitly as the last expression).
   - Output is auto-truncated at `max_response_bytes` (default 10000).

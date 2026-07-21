@@ -1744,14 +1744,6 @@ end
 # monospace `pre-wrap`. Wrapped in `.bt-console` so the chat can size it.
 console_block(body::AbstractString) = DOM.div(Bonito.RichText(body); class="bt-console")
 
-# Render a single tool-content text block. Recognised shapes:
-#  1. Fenced code (```lang\n...\n```)   → Monaco read-only with that language
-#  2. Eval section (label:\n<body>)      → labeled card; `result` is a Julia
-#     value repr → Monaco julia, the rest is console output → RichText.
-#     Emitted by BonitoMCP's bt_julia_eval, which prefixes blocks with
-#     "stdout" / "result" / "error".
-#  3. ANSI-bearing prose                 → RichText (terminal block).
-#  4. Mixed prose                        → Markdown.parse fallback.
 # Render a single GENERIC tool-content text block (third-party tools whose
 # text has no typed contract). This is text PRESENTATION, not protocol
 # decoding: fenced code is standard markdown → Monaco; ANSI-bearing text →
@@ -1837,54 +1829,6 @@ end
 
 tool_subsection(label::AbstractString, body; kwargs...) = Collapsable(label, body; kwargs...)
 
-# bt_julia_eval tool bodies: a ```julia code echo followed by stdout / result
-# / error sections. Render as two collapsibles — "Code" (Monaco julia, same
-# read-only editor the `read` file tool uses) and "Output" (the eval-section
-# stack). Returns `nothing` if `content` isn't eval-shaped so the caller
-# falls through to the generic renderer.
-function render_eval_body(content)
-    isempty(content) && return nothing
-    code = nothing
-    texts = String[]
-    media = []
-    for c in content
-        if c isa TextContent && code === nothing
-            m = match(r"^\s*```julia\r?\n(.*?)\r?\n```\s*$"s, c.text)
-            if m !== nothing
-                code = String(m.captures[1])
-                continue
-            end
-        end
-        if c isa TextContent
-            push!(texts, c.text)
-        elseif c isa DiffContent
-            push!(media, render_diff_block(c))
-        elseif c isa ImageContent
-            # Eval output images (the MCP renders 2-D arrays as PNG) get the same
-            # click-to-enlarge lightbox as Read / bt_show images — previously this
-            # was a bare <img> with no enlarge affordance.
-            push!(media, media_element("data:$(c.mime_type);base64,$(c.data)",
-                c.mime_type, false))
-        end
-    end
-    code === nothing && return nothing   # not eval-shaped — let caller handle it
-    # `split` always yields ≥1 element (even for ""), so `first` is safe.
-    first_line = strip(first(split(code, '\n')))
-    code_preview = length(first_line) > 60 ?
-                   SubString(first_line, 1, prevind(first_line, 60)) * "…" : first_line
-    code_section = tool_subsection("Code", monaco_readonly(code, "julia");
-        preview=code_preview)
-    # One terminal pane for all the text + any media blocks.
-    merged = join(texts, "\n")
-    kids = Any[]
-    isempty(strip(merged)) || push!(kids, console_block(merged))
-    append!(kids, media)
-    output_section = isempty(kids) ?
-                     tool_subsection("Output", DOM.div("(no output)"; class="bt-tool-empty")) :
-                     tool_subsection("Output", DOM.div(kids...); pin_end=true)
-    return DOM.div(code_section, output_section; class="bt-eval-body")
-end
-
 # Generic tool-body bridge: every tool type renders through `jsrender` so the
 # `ToolRenderCommand` handler can hand the MESSAGE (not a pre-rendered Node) to
 # `dom_in_js`. Most variants keep their existing `render_tool_body`; the eval
@@ -1897,14 +1841,49 @@ Bonito.jsrender(session::Bonito.Session, m::ToolMsg) =
         Bonito.jsrender(session, render_tool_body(tool_chat(m).state, m, tool_chat(m).cwd,
             tool_chat(m).chat_dir; project_id = tool_chat(m).project_id))
 
-# The typed eval body: Code / Output / live Result. The worker PARKS the
-# result value in a holder session (`RemoteProxy.remote_ref`); the FINAL
-# content block is its descriptor, and `RemoteRef`'s jsrender mounts it
+# A pre-v3 BonitoMCP worker echoed the code back in a ```julia fence and labelled
+# blocks ("result:" / "stdout:"); the current worker does neither (code is the
+# typed field, output is one clean terminal block + a descriptor). Detect that
+# deprecated shape — a code-fenced output with no v3 descriptor — so the card can
+# tell the user to update the worker instead of rendering the mangled echo. This
+# is a deliberate, narrow deprecation guard, NOT the general content sniffing the
+# typed path avoids.
+const OUTDATED_WORKER_ECHO = r"^\s*```julia\r?\n"
+
+# True when `content` is an outdated (pre-v3) worker's eval output: some text
+# block is a ```julia code echo AND there's no v3 descriptor as the final block.
+# Shared by the banner (jsrender) and the auto-expand decision, so a stale card
+# opens itself and the warning is seen without a click.
+function outdated_worker_content(content)
+    isempty(content) && return false
+    last = content[end]
+    last isa AgentClientProtocol.TextContent && result_descriptor(last.text) !== nothing &&
+        return false
+    for c in content
+        c isa AgentClientProtocol.TextContent && occursin(OUTDATED_WORKER_ECHO, c.text) &&
+            return true
+    end
+    return false
+end
+
+outdated_worker_banner() = DOM.div(
+    DOM.div("This worker is running an outdated BonitoMCP";
+            class = "bt-worker-stale-title"),
+    DOM.div("Its eval results still use the pre-v3 format (echoed code + " *
+            "\"result:\" labels), so the card below is mangled. Update the worker " *
+            "by re-running its installer — the one-liner is on the dashboard under " *
+            "\"Add another worker\".";
+            class = "bt-worker-stale-body");
+    class = "bt-worker-stale")
+
+# The typed eval body: Code / Output / live Result. The code comes from the
+# typed `m.code` field (the tool input), never from the content. The worker
+# PARKS the result value in a holder session (`RemoteProxy.remote_ref`); the
+# FINAL content block is its descriptor, and `RemoteRef`'s jsrender mounts it
 # serialize-on-mount over the eval bridge (assets/observables proxy to the
-# worker; interaction round-trips). Everything between the code echo and the
-# result block is console output. No content sniffing: position + the TYPE
-# carry it all. The pill summary carries the env; the code lives in the Code
-# section.
+# worker; interaction round-trips). Every content block before the descriptor
+# is console output. No content sniffing: position + the TYPE carry it all.
+# The pill summary carries the env; the code lives in the Code section.
 function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     chat = tool_chat(m)
     chat === nothing && return Bonito.jsrender(session,
@@ -1913,9 +1892,8 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     content   = tool_content_for_render(m, chat.chat_dir)
     # bt_julia_continue carries NO code (it reattaches to the original eval,
     # whose card sits above with the source) — an empty Monaco box under a
-    # "Code" heading helps nobody, so the section only renders when there is
-    # code. The content-position invariant is unchanged either way: the
-    # worker echoes the ORIGINAL code as content[1] even for continue.
+    # "Code" heading helps nobody, so the section only renders when `m.code`
+    # is non-empty.
     sections  = Any[]
     # Code preview: the summary state shows ~4 lines (the Monaco editor sizes
     # itself to the content; the Collapsable body caps + scrolls). Header
@@ -1948,6 +1926,11 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
         stop   = desc === nothing ? lastindex(content) : lastindex(content) - 1
         output = join(String[c.text for c in content[begin:stop]
                              if c isa AgentClientProtocol.TextContent], "\n")
+        # Deprecation guard: an outdated worker's output is a ```julia code echo
+        # with no v3 descriptor. Surface an upgrade hint above the raw output
+        # (kept, so nothing is hidden) instead of a silently-mangled card.
+        outdated_worker_content(content) &&
+            pushfirst!(sections, outdated_worker_banner())
         isempty(strip(output)) || push!(sections,
             tool_subsection("Output", console_block(output); pin_end = true))
     end
@@ -2555,23 +2538,15 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     isempty(content) &&
         return DOM.div("(loading…)"; class = "bt-tool-empty bt-tool-loading")
 
-    # bt_show output: ANY text block starts with "shown: " (the bt_julia_eval
-    # wrapper prepends a `\`\`\`julia` code-echo block before the formatter's
-    # output, so we have to scan, not just look at the first block). The
-    # rendered file lives on the worker; the chat fetches it lazily and
-    # renders a collapsible preview without putting the bytes through claude.
+    # bt_show output: a "shown: <path>" reference block (scanned across all text
+    # blocks, since captured stdout can precede it). The rendered file lives on
+    # the worker; the chat fetches it lazily and renders a collapsible preview
+    # without putting the bytes through claude.
     show_text = find_show_reference(content)
     if show_text !== nothing
         path = parse_show_path(show_text)
         path === nothing || return ShowTool(state, project_id, String(cwd), path)
     end
-
-    # bt_julia_eval: `\`\`\`julia` code echo + stdout/result/error sections →
-    # two collapsibles (Code / Output). Checked before the kind dispatch so
-    # it works regardless of what `kind` claude-agent-acp tagged the MCP
-    # tool with — the content shape is the reliable signal.
-    eval_body = render_eval_body(content)
-    eval_body === nothing || return eval_body
 
     # Per-type body. Dispatched on the message TYPE (EditToolMsg / SearchToolMsg
     # / ReadToolMsg / BashToolMsg / …), never a `kind ==` string test.
@@ -3336,7 +3311,8 @@ auto_expand_body(::EditToolMsg, snap_content) = any(c -> c isa DiffContent, snap
 # again once completed with a result (paired with `auto_expand_full`).
 auto_expand_body(m::JuliaEvalCall, snap_content) =
     tool_status(m) in ("pending", "in_progress") ? !isempty(m.code) :
-    auto_expand_full(m, snap_content)
+    auto_expand_full(m, snap_content) ||
+    (tool_status(m) == "completed" && outdated_worker_content(snap_content))
 
 # The tool holds a LIVE result embed: a worker-parked value the body mounts
 # via `RemoteRef` (values AND errors — both are parked refs rendered live).
@@ -3359,6 +3335,9 @@ end
 # Eval: exactly when a live result embed exists (the eval returned
 # != nothing, value or error); the result should be visible without a click.
 auto_expand_full(::ToolMsg, snap_content) = false
+# FULL uncollapse is tied to a LIVE result embed (which mounts extra JS): keep it
+# embed-only. An outdated-worker card instead opens just its BODY (below) so the
+# banner shows without triggering embed-mount logic against a non-existent embed.
 auto_expand_full(m::JuliaEvalCall, snap_content) =
     live_result_embed(m, snap_content)
 # Two-arg fallback for tests / call sites that don't have the snap yet.

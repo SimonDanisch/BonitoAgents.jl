@@ -159,6 +159,7 @@ jobs:
           - todo_taskbar
           - worker_lifecycle
           - cross_worker
+          - outdated_worker
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2

@@ -486,8 +486,9 @@ Returns one of:
   (status = :running,   partial::String, elapsed_s::Float64, code::String)
 
 The `code` field on the running variant carries the in-flight code so the chat
-renderer can show the ```julia code echo + partial stdout as eval-shaped
-content (same render as the completed case), instead of a raw status blob.
+renderer can keep showing the same eval card (Code from the typed field, the
+live stdout tail as Output) while the eval is still in flight, instead of a
+raw status blob.
 
 Soft timeout — `:running` means the eval is still in flight; the caller can
 `continue_eval!` to wait more, `interrupt!` to SIGINT, or restart the session.

@@ -442,17 +442,50 @@ end
 install_rev_for(v::Union{VersionNumber,Nothing}) =
     v !== nothing && isempty(v.prerelease) && isempty(v.build) ? "v$(v)" : "main"
 
-# Helper: best-effort `(branch | sha)` for a working-tree path. Returns
-# `default` when the path isn't a git checkout or git refuses to answer.
+# Helper: best-effort `(branch | sha)` for a working-tree path that a worker's
+# `Pkg.add(rev = …)` can ACTUALLY resolve against the remote. Returns `default`
+# when the path isn't a git checkout, git refuses to answer, or nothing usable
+# is reachable on origin.
+#
+# The subtlety: `git rev-parse --abbrev-ref HEAD` happily returns a branch name
+# that only exists locally — e.g. a feature branch that was merged and DELETED on
+# the remote. Templating that into the installer makes every worker install fail
+# with "Did not find rev <branch>". So we only hand back the branch when origin
+# still has it; otherwise the exact sha if THAT is reachable on origin; otherwise
+# the caller's default (a `v<version>` tag or "main").
 function _git_head_ref_of(path::AbstractString, default::AbstractString)
     ispath(joinpath(path, ".git")) || return default
     try
         branch = strip(read(`git -C $path rev-parse --abbrev-ref HEAD`, String))
-        branch == "HEAD" && return strip(read(`git -C $path rev-parse HEAD`, String))
-        return String(branch)
+        sha    = strip(read(`git -C $path rev-parse HEAD`, String))
+        branch != "HEAD" && _branch_on_origin(path, branch) && return String(branch)
+        _sha_on_origin(path, sha) && return String(sha)
+        return default
     catch e
         @debug "_git_head_ref_of: git resolve failed" path exception=e
         return default
+    end
+end
+
+# Does origin still publish this branch? Authoritative (a network `ls-remote`);
+# on ANY failure (offline, git error) assume NO so we fall back to a safe ref
+# rather than template a branch the worker can't fetch.
+function _branch_on_origin(path::AbstractString, branch::AbstractString)
+    try
+        return !isempty(strip(read(`git -C $path ls-remote --heads origin $branch`, String)))
+    catch
+        return false
+    end
+end
+
+# Is this sha reachable from a remote-tracking branch (so `Pkg.add(rev=sha)` can
+# fetch it)? `git branch -r` lists ONLY remote-tracking refs, so a non-empty
+# result means some origin branch contains the commit. Fast (local refs).
+function _sha_on_origin(path::AbstractString, sha::AbstractString)
+    try
+        return !isempty(strip(read(`git -C $path branch -r --contains $sha`, String)))
+    catch
+        return false
     end
 end
 
