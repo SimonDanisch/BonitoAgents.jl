@@ -13,7 +13,7 @@
     %LOCALAPPDATA%\BonitoAgents and is never touched by install/update/uninstall.
 
     Run it with:
-        irm https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.ps1 | iex
+        irm https://agents.bonito.sh/install.ps1 | iex
 
     When piped through `iex`, options are taken from environment variables
     (the -Parameters only bind when you run the saved .ps1 directly):

@@ -1,7 +1,7 @@
 #!/bin/sh
 # BonitoAgents desktop installer (Linux and macOS).
 #
-#   curl -fsSL https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.sh | sh
+#   curl -fsSL https://agents.bonito.sh/install.sh | sh
 #
 # Downloads the prebuilt release bundle for this machine, installs it under the
 # user's data dir (no sudo), exposes a `bonito-agents` command, and starts the
@@ -48,7 +48,7 @@ usage() {
     cat <<'EOF'
 BonitoAgents desktop installer (Linux and macOS).
 
-  curl -fsSL https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.sh | sh
+  curl -fsSL https://agents.bonito.sh/install.sh | sh
 
 Downloads the prebuilt release bundle for this machine, installs it under the
 user's data dir (no sudo), exposes a `bonito-agents` command, and starts the
