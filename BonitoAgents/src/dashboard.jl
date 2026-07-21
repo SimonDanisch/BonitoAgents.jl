@@ -2087,6 +2087,29 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     gh_url    = Observable("")
     gh_worker = Observable("")
 
+    # ── Copy-project form state ────────────────────────────────────────────────
+    cp_src_worker  = Observable("")
+    cp_src_project = Observable("")
+    cp_tgt_worker  = Observable("")
+    cp_new_name    = Observable("")
+
+    # When source worker changes, auto-select the first project on that worker.
+    on(session, cp_src_worker) do wid
+        isempty(wid) && return
+        wid_projs = sort([p for p in values(state.projects[]) if p.worker_id == wid];
+                         by = p -> p.name)
+        cp_src_project[] = isempty(wid_projs) ? "" : first(wid_projs).id
+    end
+    # When source project changes, seed the copy name (sanitized for copy_to!
+    # which requires ^[a-zA-Z0-9_\-]+$).
+    on(session, cp_src_project) do pid
+        isempty(pid) && return
+        p = get(state.projects[], pid, nothing)
+        p === nothing && return
+        safe = replace(p.name, r"[^a-zA-Z0-9_\-]" => "-")
+        cp_new_name[] = safe * "-copy"
+    end
+
     # ── Sync-to-server click handler ─────────────────────────────────────────
     # Fired by the project card's "Sync to server" / "Re-sync" button. The
     # actual transfer runs in the background; we update `busy` + notify(state.projects)
@@ -2261,6 +2284,73 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         error_obs[]  = ""
     end
 
+    cp_submit = Bonito.Button("Copy"; style=nothing, class = "bt-btn")
+    cp_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
+
+    on(session, cp_submit.value) do clicked
+        clicked || return
+        is_busy_idle(busy[]) || return
+        pid = String(cp_src_project[])
+        tgt = String(cp_tgt_worker[])
+        nm  = String(strip(cp_new_name[]))
+        isempty(pid) && (error_obs[] = "Select a source project."; return)
+        isempty(tgt) && (error_obs[] = "Select a target worker."; return)
+        isempty(nm)  && (error_obs[] = "Enter a name for the copy."; return)
+        haskey(state.projects[], pid) ||
+            (error_obs[] = "Source project not found."; return)
+        haskey(state.workers[], tgt) ||
+            (error_obs[] = "Target worker not found."; return)
+        p    = state.projects[][pid]
+        tgt_w = state.workers[][tgt]
+        busy_start!(busy, "Copying $(p.name) → $(tgt_w.name)")
+        @async begin
+            try
+                new_p = copy_to!(state, p, tgt; name = nm,
+                    progress = (stage, info) -> busy_event!(busy, stage, info))
+                safe_set!(error_obs, "")
+                which_form[] = :none
+                current_view !== nothing && (current_view[] = new_p.id)
+            catch e
+                bt = catch_backtrace()
+                @warn "copy_to! failed" project=p.name target=tgt exception=(e, bt)
+                safe_set!(error_obs,
+                    "Copy failed: $(sprint(showerror, e))")
+            finally
+                busy_clear!(busy)
+            end
+        end
+    end
+
+    on(session, cp_cancel.value) do clicked
+        clicked || return
+        is_busy_idle(busy[]) || return
+        which_form[] = :none
+        error_obs[]  = ""
+    end
+
+    cp_btn = Bonito.Button("→ Copy project"; style=nothing, class = "bt-btn bt-btn-secondary")
+    on(session, cp_btn.value) do clicked
+        clicked || return
+        if isempty(state.workers[]) || isempty(state.projects[])
+            error_obs[] = isempty(state.workers[]) ?
+                "Register a worker before copying projects." :
+                "No projects to copy yet."
+            return
+        end
+        # Prefer a source worker that actually has projects; fall back to first.
+        workers_with_projs = unique(p.worker_id for p in values(state.projects[]))
+        src_wid = isempty(workers_with_projs) ?
+            first(keys(state.workers[])) : first(workers_with_projs)
+        # Default target to a DIFFERENT worker than source when one exists.
+        other_wids = [w for w in keys(state.workers[]) if w != src_wid]
+        tgt_wid = isempty(other_wids) ? src_wid : first(other_wids)
+        cp_src_worker[] = ""          # force on(cp_src_worker) to fire even if same value
+        cp_src_worker[] = src_wid
+        cp_tgt_worker[] = tgt_wid
+        which_form[] = :copy_project
+        error_obs[]  = ""
+    end
+
     # `picker_state` holds the worker_id whose picker form is currently
     # visible (""  → none). The folder-picker instances themselves live on
     # each WorkerCard (stable across re-renders because the card is stable).
@@ -2404,6 +2494,41 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             class = "bt-gh-worker-select",
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
         DOM.div(gh_cancel, gh_submit, class = "bt-form-actions"),
+        class = "bt-form")
+
+    worker_select(id_obs::Observable, cls::String) = DOM.select(
+        (DOM.option(w.name; value=w.worker_id,
+                    selected=w.worker_id==id_obs[]) for w in values(state.workers[]))...;
+        class = cls,
+        value = id_obs,
+        onchange = js"event => $(id_obs).notify(event.target.value)")
+
+    cp_form() = DOM.div(
+        DOM.label("Source worker"),
+        worker_select(cp_src_worker, "bt-cp-src-worker"),
+        DOM.label("Source project"),
+        map(session, state.projects, cp_src_worker) do projects, wid
+            wid_projs = sort([p for p in values(projects) if p.worker_id == wid];
+                             by = p -> p.name)
+            isempty(wid_projs) ?
+                DOM.div("No projects on this worker";
+                        style = Styles("color"=>"var(--bt-text-muted)", "font-size"=>"12px")) :
+                DOM.select(
+                    (DOM.option(p.name; value=p.id,
+                                selected=p.id==cp_src_project[]) for p in wid_projs)...;
+                    class = "bt-cp-src-project",
+                    value = cp_src_project,
+                    onchange = js"event => $(cp_src_project).notify(event.target.value)")
+        end,
+        DOM.label("Target worker"),
+        worker_select(cp_tgt_worker, "bt-cp-tgt-worker"),
+        DOM.label("Name on target"),
+        text_input(cp_new_name, "e.g. my-project-copy"),
+        DOM.div("Letters, digits, _ and - only.";
+                style = Styles("font-size" => "11px",
+                               "color"     => "var(--bt-text-muted)",
+                               "margin-top" => "-4px")),
+        DOM.div(cp_cancel, cp_submit; class = "bt-form-actions"),
         class = "bt-form")
 
     # The per-worker picker form and discover panel are now rendered inside
@@ -2600,6 +2725,8 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             DOM.div(new_proj_form(); class = "bt-slide-in")
         elseif which === :github
             DOM.div(gh_form(); class = "bt-slide-in")
+        elseif which === :copy_project
+            DOM.div(cp_form(); class = "bt-slide-in")
         else
             DOM.div()
         end
@@ -2656,7 +2783,8 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.div(
             DOM.h2("New project"),
             new_proj_btn,
-            gh_btn;
+            gh_btn,
+            cp_btn;
             class = "bt-section"),
         form_block,
 

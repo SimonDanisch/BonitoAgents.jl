@@ -550,6 +550,40 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)",
         "user-select" => "none"),
 
+    # ── Searchable config dropdown (model search) ────────────────────────────
+    # Appears when a ConfigOption has more choices than MODEL_SEARCH_THRESHOLD.
+    CSS(".bt-msearch",
+        "position" => "relative", "display" => "inline-block"),
+    CSS(".bt-msearch-trigger",
+        "cursor" => "pointer", "user-select" => "none"),
+    CSS(".bt-msearch-list",
+        "display" => "none",
+        "position" => "absolute", "top" => "calc(100% + 4px)", "left" => "0",
+        "z-index" => "200",
+        "min-width" => "240px", "max-height" => "320px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "6px",
+        "box-shadow" => "0 4px 16px rgba(0,0,0,0.15)",
+        "flex-direction" => "column", "overflow" => "hidden"),
+    CSS(".bt-msearch-open > .bt-msearch-list", "display" => "flex"),
+    CSS(".bt-msearch-input",
+        "flex" => "0 0 auto",
+        "border" => "none", "border-bottom" => "1px solid var(--bt-border)",
+        "background" => "transparent", "color" => "var(--bt-text)",
+        "font" => "inherit", "font-size" => "12px",
+        "padding" => "6px 10px", "outline" => "none"),
+    CSS(".bt-msearch-items",
+        "overflow-y" => "auto", "flex" => "1"),
+    CSS(".bt-msearch-item",
+        "padding" => "5px 10px",
+        "cursor" => "pointer", "font-size" => "12px",
+        "white-space" => "nowrap", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "color" => "var(--bt-text)"),
+    CSS(".bt-msearch-item:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-msearch-item-cur",
+        "font-weight" => "600", "color" => "var(--bt-accent)"),
+
     # ── Home "Defaults" control ───────────────────────────────────────────────
     # A labelled row of the same config pills, wired to the server-wide defaults.
     # Lives in the home "Defaults" section; the pills reuse `.bt-header-meta*`.

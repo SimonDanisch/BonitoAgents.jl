@@ -5317,12 +5317,54 @@ pill_category_label(o::AgentClientProtocol.ConfigOption) =
 # `lowercase_modes` lower-cases the PERMISSION-MODE labels (claude reports them
 # title-cased — "Default", "Bypass Permissions"); set for the Claude provider so
 # the mode pill reads in the same lower-case style as the underlying values.
+const MODEL_SEARCH_THRESHOLD = 8  # use searchable dropdown when choices exceed this
+
+# Custom dropdown with a search/filter input — used when a ConfigOption has many
+# choices (e.g. OpenCode reports ~100 models). Pure DOM manipulation via the
+# btMSearch* JS helpers; no Julia round-trips for keystroke filtering.
+function searchable_config_pill(o::AgentClientProtocol.ConfigOption, pick::Observable;
+                                lc::Bool = false)
+    cfg_id = o.id
+    cur    = o.current_value
+    lab(c) = let s = AgentClientProtocol.choice_label(o, c); lc ? lowercase(s) : s end
+    cur_label = let idx = findfirst(c -> c.value == cur, o.choices)
+        idx !== nothing ? lab(o.choices[idx]) : cur
+    end
+    items = [
+        DOM.div(lab(c);
+            class = "bt-msearch-item" * (c.value == cur ? " bt-msearch-item-cur" : ""),
+            dataLabel = lowercase(lab(c)) * " " * lowercase(c.value),
+            title = isnothing(c.description) ? c.name : c.description,
+            onclick = js"event => window.btMSearchSelect(event.currentTarget, $(pick), $(cfg_id), $(c.value))")
+        for c in o.choices
+    ]
+    search_input = DOM.input(;
+        type = "text", placeholder = "Search…", class = "bt-msearch-input",
+        oninput = js"event => window.btMSearchFilter(event.target)")
+    trigger = DOM.div(
+        DOM.span(pill_category_label(o) * ": "; class = "bt-header-meta-cat"),
+        DOM.span(cur_label),
+        " ▾";
+        class = "bt-header-meta-item bt-header-meta-pick bt-msearch-trigger",
+        onclick = js"event => { event.stopPropagation(); window.btMSearchOpen(event.currentTarget); }",
+        title = pill_tooltip(o))
+    DOM.div(
+        trigger,
+        DOM.div(
+            search_input,
+            DOM.div(items...; class = "bt-msearch-items");
+            class = "bt-msearch-list");
+        class = "bt-msearch")
+end
+
 function header_pill(o::AgentClientProtocol.ConfigOption,
                      pick::Union{Observable,Nothing} = nothing;
                      lowercase_modes::Bool = false)
     lc = lowercase_modes && o.category == "mode"
     if pick !== nothing && o.category in SELECTABLE_CONFIG && length(o.choices) > 1
-        return config_select_pill(o, pick; lc = lc)
+        return length(o.choices) > MODEL_SEARCH_THRESHOLD ?
+            searchable_config_pill(o, pick; lc = lc) :
+            config_select_pill(o, pick; lc = lc)
     end
     label = AgentClientProtocol.pill_label(o)
     lc && (label = lowercase(label))

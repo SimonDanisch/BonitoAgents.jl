@@ -4241,6 +4241,48 @@ function arrayBufferToBase64(buf) {
     return btoa(binary);
 }
 
+// ── Searchable config select (model search) ────────────────────────────────
+// Replaces the native <select> when there are many choices (e.g. OpenCode's
+// ~100 models). All filtering is pure DOM — no Julia round-trips per keystroke.
+
+// Exposed on window so inline onclick= handlers (outside ES6 module scope) can call them.
+window.btMSearchFilter = function btMSearchFilter(inputEl) {
+    const q = inputEl.value.toLowerCase();
+    const wrap = inputEl.closest('.bt-msearch');
+    wrap.querySelectorAll('.bt-msearch-item').forEach(item => {
+        item.hidden = q.length > 0 && !item.dataset.label.includes(q);
+    });
+};
+
+window.btMSearchOpen = function btMSearchOpen(triggerEl) {
+    // Close any other open dropdown first.
+    document.querySelectorAll('.bt-msearch-open').forEach(el =>
+        el.classList.remove('bt-msearch-open'));
+    const wrap = triggerEl.closest('.bt-msearch');
+    wrap.classList.add('bt-msearch-open');
+    const input = wrap.querySelector('.bt-msearch-input');
+    if (input) { input.value = ''; window.btMSearchFilter(input); }
+    // Register close-on-outside-click after one frame so the triggering click
+    // doesn't immediately close the dropdown we just opened.
+    requestAnimationFrame(() => {
+        function onOutside(e) {
+            if (!e.target.closest('.bt-msearch-open')) {
+                document.querySelectorAll('.bt-msearch-open').forEach(el =>
+                    el.classList.remove('bt-msearch-open'));
+                document.removeEventListener('click', onOutside, true);
+            }
+        }
+        document.addEventListener('click', onOutside, true);
+        if (input) input.focus();
+    });
+};
+
+window.btMSearchSelect = function btMSearchSelect(itemEl, pickObs, cfgId, value) {
+    pickObs.notify([cfgId, value]);
+    const wrap = itemEl.closest('.bt-msearch');
+    if (wrap) wrap.classList.remove('bt-msearch-open');
+};
+
 // ── ES6 module exports ─────────────────────────────────────────────────────
 // `connect(node, comm)` is the public entry point — Julia calls it inline
 // via `js"$(ChatLib).then(lib => lib.connect($(node), $(comm)))"`. The

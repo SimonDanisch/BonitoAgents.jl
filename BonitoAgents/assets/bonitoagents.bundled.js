@@ -2732,7 +2732,7 @@ class BonitoChat {
             this._cancelPendingScroll();
         }
         if (this.followMode) return;
-        if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
+        if (atBot) {
             this.setFollowMode(true);
             this._queueScrollToBottom();
         } else {
@@ -2937,6 +2937,41 @@ function arrayBufferToBase64(buf) {
     }
     return btoa(binary);
 }
+window.btMSearchFilter = function btMSearchFilter(inputEl) {
+    const q = inputEl.value.toLowerCase();
+    const wrap = inputEl.closest('.bt-msearch');
+    wrap.querySelectorAll('.bt-msearch-item').forEach((item)=>{
+        item.hidden = q.length > 0 && !item.dataset.label.includes(q);
+    });
+};
+window.btMSearchOpen = function btMSearchOpen(triggerEl) {
+    document.querySelectorAll('.bt-msearch-open').forEach((el)=>el.classList.remove('bt-msearch-open'));
+    const wrap = triggerEl.closest('.bt-msearch');
+    wrap.classList.add('bt-msearch-open');
+    const input = wrap.querySelector('.bt-msearch-input');
+    if (input) {
+        input.value = '';
+        window.btMSearchFilter(input);
+    }
+    requestAnimationFrame(()=>{
+        function onOutside(e) {
+            if (!e.target.closest('.bt-msearch-open')) {
+                document.querySelectorAll('.bt-msearch-open').forEach((el)=>el.classList.remove('bt-msearch-open'));
+                document.removeEventListener('click', onOutside, true);
+            }
+        }
+        document.addEventListener('click', onOutside, true);
+        if (input) input.focus();
+    });
+};
+window.btMSearchSelect = function btMSearchSelect(itemEl, pickObs, cfgId, value) {
+    pickObs.notify([
+        cfgId,
+        value
+    ]);
+    const wrap = itemEl.closest('.bt-msearch');
+    if (wrap) wrap.classList.remove('bt-msearch-open');
+};
 const CHAT_INSTANCES = new Set();
 if (typeof window !== 'undefined') window.__btChats = CHAT_INSTANCES;
 function toolSlot(id) {
