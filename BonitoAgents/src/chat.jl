@@ -1757,6 +1757,12 @@ function monaco_readonly(text::AbstractString, lang::AbstractString)
         scrollBeyondLastLine=false,
         lineNumbers="off",
         minimap=Dict(:enabled => false),
+        # The editor is sized to its full content height (MONACO_RESIZE_INIT), so
+        # it never scrolls internally — the height-capped `.bt-subsection-body`
+        # around it does. Monaco still swallows the wheel by default, so scrolling
+        # over the code moved nothing. `alwaysConsumeMouseWheel:false` lets the
+        # wheel through to the outer scroll container.
+        scrollbar=Dict(:alwaysConsumeMouseWheel => false),
         # Force light Monaco. BonitoBook's "default" theme follows the host OS
         # `prefers-color-scheme` (dark here), which clashed with the light app.
         theme=Observable("vs"),
