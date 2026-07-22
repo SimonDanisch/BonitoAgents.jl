@@ -529,8 +529,14 @@ GenericToolMsg(message::Message) = GenericToolMsg(message, Dict{String,Any}())
 mutable struct EditToolMsg <: BuiltinToolMsg      # kind "edit" (Edit / Write / MultiEdit)
     message::Message
     file_path::String             # the REAL path (titles are display strings) — ✎ affordance
+    # The edit's before/after from rawInput. claude-agent-acp ships the diff in a
+    # mid-flight tool_call_update that the ACP layer coalesces into the terminal
+    # (text) result, so the content usually has no DiffContent — we rebuild the
+    # diff from these instead of rendering the "… updated successfully …" text.
+    old_string::String
+    new_string::String
 end
-EditToolMsg(message::Message) = EditToolMsg(message, "")
+EditToolMsg(message::Message) = EditToolMsg(message, "", "", "")
 
 mutable struct ReadToolMsg <: BuiltinToolMsg      # kind "read" (Read)
     message::Message
@@ -570,9 +576,29 @@ builtin_msg_type(kind::AbstractString) = get(BUILTIN_MSG_TYPES, kind, GenericToo
 # method must tolerate partial/empty dicts and only overwrite on real values.
 apply_input!(::ToolMsg, ::AbstractDict) = nothing
 apply_input!(m::GenericToolMsg, raw::AbstractDict) = (merge!(m.raw_input, raw); nothing)
-function apply_input!(m::Union{EditToolMsg,ReadToolMsg}, raw::AbstractDict)
+function apply_input!(m::ReadToolMsg, raw::AbstractDict)
     fp = get(raw, "file_path", nothing)
     fp isa AbstractString && !isempty(fp) && (m.file_path = String(fp))
+    return nothing
+end
+function apply_input!(m::EditToolMsg, raw::AbstractDict)
+    fp = get(raw, "file_path", nothing)
+    fp isa AbstractString && !isempty(fp) && (m.file_path = String(fp))
+    # Rebuild the diff from the edit's own input. Edit → old_string/new_string;
+    # Write → `content` is the whole new file (empty old side); MultiEdit → the
+    # first edit as a coarse but useful preview.
+    os = get(raw, "old_string", nothing)
+    os isa AbstractString && (m.old_string = String(os))
+    ns = get(raw, "new_string", nothing)
+    ns isa AbstractString && (m.new_string = String(ns))
+    c = get(raw, "content", nothing)
+    c isa AbstractString && (m.old_string = ""; m.new_string = String(c))
+    edits = get(raw, "edits", nothing)
+    if edits isa AbstractVector && !isempty(edits) && first(edits) isa AbstractDict
+        e1 = first(edits)
+        get(e1, "old_string", nothing) isa AbstractString && (m.old_string = String(e1["old_string"]))
+        get(e1, "new_string", nothing) isa AbstractString && (m.new_string = String(e1["new_string"]))
+    end
     return nothing
 end
 function apply_input!(m::SearchToolMsg, raw::AbstractDict)
@@ -2643,11 +2669,43 @@ render_tool_content(state::ServerState, m::ToolMsg, content, project_id::Abstrac
 # so the compact diff shows under the header without a click.
 function render_tool_content(state::ServerState, m::EditToolMsg, content, project_id::AbstractString)
     diffs = [c for c in content if c isa DiffContent]
-    isempty(diffs) && return render_tool_parts(state, m, content, project_id)
+    if isempty(diffs)
+        # claude-agent-acp ships the diff in a mid-flight tool_call_update the ACP
+        # layer coalesces into the terminal (text) result, so the content usually
+        # has no DiffContent. Rebuild the diff from the edit's own input instead of
+        # rendering the "The file … updated successfully …" rawOutput.
+        d = edit_diff_from_input(m)
+        d === nothing && return render_tool_parts(state, m, content, project_id)
+        diffs = [d]
+    end
     return DOM.div(
         (render_diff_block(d; max_height = EDIT_BODY_COMPACT_PX) for d in diffs)...;
         class = length(diffs) > 1 ? "bt-multi-diff bt-edit-tool-body" : "bt-edit-tool-body",
         dataEditTool = "1")
+end
+
+# A DiffContent from an edit's own input — live from the message fields, or on a
+# history reload from the persisted rawInput. `nothing` when there's nothing to
+# diff (no captured old/new).
+function edit_diff_from_input(m::EditToolMsg)
+    fp, old, new = m.file_path, m.old_string, m.new_string
+    if isempty(old) && isempty(new)
+        chat = tool_chat(m)
+        ri = chat === nothing ? nothing : stored_raw_input(chat.chat_dir, tool_id(m))
+        ri === nothing && return nothing
+        isempty(fp) && (fp = String(get(ri, "file_path", "")))
+        old = String(get(ri, "old_string", ""))
+        new = String(get(ri, "new_string", ""))
+        c = get(ri, "content", nothing)
+        c isa AbstractString && (old = ""; new = String(c))
+        edits = get(ri, "edits", nothing)
+        if edits isa AbstractVector && !isempty(edits) && first(edits) isa AbstractDict
+            e1 = first(edits)
+            old = String(get(e1, "old_string", old)); new = String(get(e1, "new_string", new))
+        end
+    end
+    (isempty(old) && isempty(new)) && return nothing
+    return DiffContent(fp, old, new)
 end
 
 function render_tool_content(state::ServerState, m::SearchToolMsg, content, project_id::AbstractString)
@@ -3364,7 +3422,9 @@ end
 #     about to ship, so we don't re-load from cache/disk.
 #   • Everything else stays click-to-expand.
 auto_expand_body(::ToolMsg, snap_content) = false
-auto_expand_body(::EditToolMsg, snap_content) = any(c -> c isa DiffContent, snap_content)
+auto_expand_body(m::EditToolMsg, snap_content) =
+    any(c -> c isa DiffContent, snap_content) ||
+    !isempty(m.new_string) || !isempty(m.old_string)
 # Eval: eager-mount the compact body while the code RUNS (the body's first
 # section is the full Monaco Code editor, height-capped by the client's
 # compact mode — "the preview IS the editor, collapsed to ~4 lines"), and

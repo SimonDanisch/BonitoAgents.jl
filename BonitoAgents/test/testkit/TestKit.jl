@@ -181,11 +181,16 @@ way real claude-agent-acp delivers tool input: ACP merges it into the live
 editable-path hint materialise on this in-flight update rather than the empty
 opening header.
 """
-tool_update(id; status = nothing, content = nothing, raw_input = nothing) = begin
+tool_update(id; status = nothing, content = nothing, raw_input = nothing,
+            raw_output = nothing) = begin
     d = Dict{String,Any}("type" => "tool_update", "id" => String(id))
-    status    === nothing || (d["status"]    = String(status))
-    content   === nothing || (d["content"]   = content)
-    raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
+    status     === nothing || (d["status"]     = String(status))
+    content    === nothing || (d["content"]    = content)
+    raw_input  === nothing || (d["raw_input"]  = Dict{String,Any}(raw_input))
+    # A terminal update with `raw_output` (and no content) = real claude-agent-acp
+    # for a completed Edit: the diff rode earlier updates; this frame is just the
+    # "… updated successfully …" rawOutput.
+    raw_output === nothing || (d["raw_output"] = String(raw_output))
     d
 end
 

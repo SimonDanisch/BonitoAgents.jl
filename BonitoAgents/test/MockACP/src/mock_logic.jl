@@ -591,6 +591,11 @@ function run_dispatcher_prompt(prompt_id)
             # tool_call_update; ACP merges this `rawInput` into the live
             # MCPCall/GenericTool so the eval extras + ✎ path hint materialise.
             haskey(ev, "raw_input") && (fields["rawInput"] = ev["raw_input"])
+            # A terminal tool_call_update can carry a `rawOutput` STRING with NO
+            # content (real claude-agent-acp for a completed Edit: the diff rode
+            # earlier updates, the completed frame just has the "… updated
+            # successfully …" rawOutput). The chat's ACP layer normalizes that.
+            haskey(ev, "raw_output") && (fields["rawOutput"] = String(ev["raw_output"]))
             upd("tool_call_update", fields)
         elseif et == "todo"
             # Live plan/todo list. Real claude-agent-acp reports todos as
