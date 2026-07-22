@@ -318,8 +318,37 @@ end
 function remote_ref(@nospecialize(value))
     parent = get_parent_session()
     holder = Bonito.Session(parent)
-    holder.current_app[] = Bonito.App(display_value(bound_for_render(value)))
-    return holder.id
+    app = Bonito.App(display_value(bound_for_render(value)))
+    holder.current_app[] = app
+    return (id = holder.id, error = probe_render_error(app))
+end
+
+# Run the App's handler once now — the `App() do … end` body, where render-time
+# errors actually fire (an invalid Makie attribute, a bad observable, …). The
+# heavy browser render still happens later at mount; this is just the Julia-side
+# body, so the eval RESULT can tell the agent the display FAILED instead of
+# claiming it worked, and Bonito's `handle_render_error`/showerror lands in the
+# captured eval output. Best-effort: run on a throwaway session (never the holder
+# the browser will mount) and swallow any hiccup in the probe itself.
+function probe_render_error(app::Bonito.App)
+    probe = Bonito.Session(get_parent_session())
+    err = try
+        Base.invokelatest(app.handler, probe, Bonito.HTTP.Request())
+        nothing
+    catch e
+        # Print it here too (captured in the eval's output, the same way Bonito's
+        # handle_render_error surfaces it in a REPL) so the failure is visible in
+        # the console, not only in the result descriptor.
+        try
+            printstyled(stderr, "\nError rendering the returned app:\n"; color = :red, bold = true)
+            showerror(stderr, e)
+            println(stderr)
+        catch
+        end
+        e
+    end
+    try close(probe) catch end
+    return err
 end
 
 function handle_control(b::RemoteBridge, msg::AbstractDict)

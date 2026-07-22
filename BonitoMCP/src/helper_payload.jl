@@ -106,11 +106,21 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
     # A parked ref IS displayed live as the result embed — the pane shows the
     # value, so there must be ZERO Output for it (`echo = nothing`): the Output
     # section is captured STDOUT only, never the result repr. The agent still
-    # reads the result from the descriptor's `repr` field.
-    ref === nothing ||
+    # reads the result from the descriptor's `repr` field. `remote_ref` also probe-
+    # renders the App: if that surfaced a render-time error (bad Makie attribute,
+    # etc.), mark the descriptor `errored` and tell the agent the display FAILED —
+    # instead of a repr that claims it rendered fine. The MCP-level `errored` stays
+    # false (the eval itself succeeded; only the display failed).
+    if ref !== nothing
+        rerr = ref.error
+        r = rerr === nothing ? display_repr(val, repr) :
+            truncate_text("⟨the returned $(string(nameof(typeof(val)))) FAILED to render — " *
+                          sprint(showerror, rerr) * "; fix the code and return it again⟩",
+                          max_bytes, full_output, "result")
         return (; blocks = Dict{String,Any}[],
-                  html = result_descriptor(ref, false, display_repr(val, repr)),
+                  html = result_descriptor(ref.id, rerr !== nothing, r),
                   errored = false, echo = nothing)
+    end
 
     # No bridge (standalone MCP OR the env's Bonito is too old): no embed, so the
     # repr echo IS the result — append it to the output; add an on-disk rich
@@ -300,8 +310,9 @@ function format_error(err, bt, max_bytes::Int, full_output::Bool)
     # Unlike a value, an ERROR keeps its echo in the output stream: the agent
     # must SEE the failure prominently (not buried in a descriptor) to fix the
     # code, and the red console error is the terminal-faithful view. The embed
-    # renders the exception too — redundancy is warranted for errors.
-    html = ref === nothing ? nothing : result_descriptor(ref, true, "")
+    # renders the exception too — redundancy is warranted for errors. `remote_ref`
+    # returns `(id, error)`; the error side is irrelevant here (this IS the error).
+    html = ref === nothing ? nothing : result_descriptor(ref.id, true, "")
     return (; blocks = Dict{String,Any}[], html = html, errored = true, echo = echo)
 end
 
