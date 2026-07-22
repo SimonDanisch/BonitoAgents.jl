@@ -1603,7 +1603,16 @@ function split_attachment_suffix(text::AbstractString)
     rels = String[]
     for line in split(text[last(r)+1:end], '\n')
         l = strip(line)
-        startswith(l, "- ") && push!(rels, String(strip(l[3:end])))
+        startswith(l, "- ") || continue
+        rel = strip(l[3:end])
+        # Claude Code appends "[Request interrupted by user]" (and other trailing
+        # notes) onto the LAST attachment line with no newline. Attachment rels
+        # never contain a space or '[', so keep only up to the first one — without
+        # this the junked rel's extension is unrecognised and the all-or-nothing
+        # gallery render (`msg_to_dict(::UserMsg)`) drops EVERY image in the
+        # message to raw text on reload.
+        rel = first(split(rel, r"[\s\[]"; limit = 2))
+        isempty(rel) || push!(rels, String(rel))
     end
     isempty(rels) && return (String(text), String[])
     # prevind, not first(r)-1: the byte before '[' may be the tail of a

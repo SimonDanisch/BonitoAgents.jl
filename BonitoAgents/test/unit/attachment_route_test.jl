@@ -24,6 +24,13 @@
               ("x [attached files in this message] y", String[])
         # Empty text.
         @test BT.split_attachment_suffix("") == ("", String[])
+        # Claude Code appends "[Request interrupted by user]" onto the LAST
+        # attachment line with NO newline; the rel must be stripped so its image
+        # mime still resolves — otherwise the all-or-nothing gallery drops EVERY
+        # image in the message to raw text after a reload.
+        ti = "hi\n\n[attached files in this message]\n  - .bt-attachments/a.png\n  - .bt-attachments/b.png[Request interrupted by user]"
+        @test BT.split_attachment_suffix(ti) ==
+              ("hi", [".bt-attachments/a.png", ".bt-attachments/b.png"])
     end
 
     @testset "attachment_response route guards + happy path" begin
@@ -87,6 +94,12 @@
         d3 = BT.msg_to_dict(BT.UserMsg(model, t3))
         @test d3["text"] == t3
         @test !haskey(d3, "attachments")
+        # An interrupted send appends "[Request interrupted by user]" onto the
+        # last attachment line: the gallery must still render (not fall to text).
+        t4 = "look\n\n[attached files in this message]\n  - .bt-attachments/2026-01-01_000000_beef00.png[Request interrupted by user]"
+        d4 = BT.msg_to_dict(BT.UserMsg(model, t4))
+        @test length(get(d4, "attachments", Any[])) == 1
+        @test d4["attachments"][1]["mime"] == "image/png"
         close(model)
     end
 
