@@ -213,6 +213,24 @@ calls. Revise.jl is auto-loaded so source edits to packages are picked up
 without restart. If the env path ends in `/test`, TestEnv is auto-activated
 so the parent project's test deps are visible.
 
+Displaying apps & plots:
+  - The return value (the last expression) is rendered in the chat. A Bonito
+    `App`, a WGLMakie `Figure`/plot, an image, a DataFrame or HTML renders as a
+    live result; widgets and plots stay connected to this session, so the user
+    can drive them. To show a plot or a UI, return it.
+      using WGLMakie
+      App() do
+          s = Bonito.Slider(1:10)
+          xs = 0:0.05:2π
+          fig = Figure(); lines!(Axis(fig[1,1]), xs, map(v -> sin.(v .* xs), s.value))
+          DOM.div(s, fig)
+      end
+  - Use WGLMakie (renders in the browser over the bridge), not GLMakie/CairoMakie.
+  - A rendered app/plot reports "⟨interactive plot displayed live in the chat⟩"
+    in place of the value repr; that is the confirmation, no screenshot needed.
+  - Don't call `display`, `Page`, or `Bonito.Server` — the session is already
+    wired to the chat; return the value instead.
+
 Streaming model — IMPORTANT:
   - `timeout` is a **soft** checkpoint, not a hard kill. The call returns
     within `timeout` seconds with either:

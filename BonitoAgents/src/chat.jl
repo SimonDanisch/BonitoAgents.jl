@@ -1766,7 +1766,7 @@ end
 # `preview` (optional) is dim text next to it.
 #
 # THE default three-state collapsible: clicking the header cycles
-# [full → summary → collapsed → full]. `summary_lines` is the height of the
+# [summary → full → collapsed → summary]. `summary_lines` is the height of the
 # SUMMARY state (the restricted preview) in text lines — the body is capped
 # to that height and SCROLLS (the scrollbar belongs to the Collapsable, not
 # to its content), so nothing is ever clipped away: the summary is a window
@@ -1796,16 +1796,17 @@ function Bonito.jsrender(session::Session, c::Collapsable)
     isempty(c.preview) || push!(summary_kids,
         DOM.span(c.preview; class="bt-subsection-preview"))
     body = DOM.div(c.body; class="bt-subsection-body")
-    # Header click cycles the three states. preventDefault keeps the click
-    # from ALSO firing the native <details> toggle — `open` is driven here
-    # (open ⇔ not collapsed; `data-state` carries full vs summary while
-    # open). Entering summary/full re-pins a `pin_end` body to its end.
+    # Header click cycles the three states summary → full → collapsed → summary.
+    # preventDefault keeps the click from ALSO firing the native <details> toggle
+    # — `open` is driven here (open ⇔ not collapsed; `data-state` carries full vs
+    # summary while open). Entering summary/full re-pins a `pin_end` body to its
+    # end.
     cycle = js"""e => {
         e.preventDefault();
         e.stopPropagation();
         const d = e.target.closest('.bt-subsection');
-        if (!d.open) { d.open = true; d.dataset.state = 'full'; }
-        else if (d.dataset.state === 'full') { d.dataset.state = 'summary'; }
+        if (!d.open) { d.open = true; d.dataset.state = 'summary'; }
+        else if (d.dataset.state === 'summary') { d.dataset.state = 'full'; }
         else { d.open = false; return; }
         if (d.dataset.pinEnd === '1') {
             const b = d.querySelector('.bt-subsection-body');

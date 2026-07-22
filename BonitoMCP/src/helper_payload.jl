@@ -109,7 +109,7 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
     # reads the result from the descriptor's `repr` field.
     ref === nothing ||
         return (; blocks = Dict{String,Any}[],
-                  html = result_descriptor(ref, false, repr),
+                  html = result_descriptor(ref, false, display_repr(val, repr)),
                   errored = false, echo = nothing)
 
     # No bridge (standalone MCP): no embed, so the repr echo IS the result —
@@ -118,6 +118,21 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
     show_block = try_save_rich(val, out_dir, max_bytes)
     show_block === nothing || push!(blocks, show_block)
     return (; blocks = blocks, html = nothing, errored = false, echo = repr)
+end
+
+# The agent-facing `repr` for a value parked as a LIVE embed. For a plain value
+# the repr IS the value, so keep it. For an INTERACTIVE display (a Bonito `App`
+# or a Makie plot/figure) the bare type repr — a lone "App" — reads like nothing
+# happened and leaves the agent unsure the display worked; replace it with an
+# explicit note that the value is now shown live & interactive in the chat. Type
+# match is by name so no Bonito/Makie dependency is needed in the worker env.
+function display_repr(val, repr::AbstractString)
+    n = string(nameof(typeof(val)))
+    kind = n == "App" ? "interactive app" :
+           (startswith(n, "Figure") || n == "Scene" || endswith(n, "Plot")) ? "interactive plot" :
+           nothing
+    kind === nothing && return repr
+    return "⟨$(kind) displayed live in the chat — the user can see and interact with it now⟩"
 end
 
 # The result descriptor json the chat decodes (BonitoAgents remote_app.jl):
