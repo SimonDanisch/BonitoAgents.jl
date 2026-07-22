@@ -113,6 +113,7 @@ mutable struct JuliaSession
     stream_channel::Channel{String}     # real-time stdout/stderr chunks for /mcp-ws streaming
     dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
     dial_error::String                  # last eval-bridge setup/connect failure (live-render bridge)
+    bonito_mismatch::String             # project env's Bonito version when it's too old for the bridge ("" = ok); drives the chat's one-click upgrade card
     closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
 end
 
@@ -124,7 +125,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), Channel{String}(Inf), false, "", false)
+                        ReentrantLock(), Channel{String}(Inf), false, "", "", false)
 end
 
 # The chat routes live stream chunks by this key (matched against the eval
@@ -245,6 +246,7 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
              v === nothing ? "unknown" : string(v))
         end)
         if !ok
+            s.bonito_mismatch = vstr    # drives the chat's one-click upgrade card
             s.dial_error = "the live-render bridge needs Bonito ≥ $(MIN_BRIDGE_BONITO) " *
                 "(the remote-app proxy API), but this chat's project env resolved " *
                 "Bonito v$(vstr). Add a Bonito ≥ $(MIN_BRIDGE_BONITO) to the project " *
@@ -299,6 +301,7 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
         end
         if ready
             s.dial_error = ""
+            s.bonito_mismatch = ""   # bridge connected ⇒ this env's Bonito is fine
         else
             s.dial_error = "the RemoteProxy bridge was built on the worker but never connected to $wsurl within 30s — the eval worker couldn't reach the BonitoAgents server (wrong/unreachable BONITOAGENTS_SERVER_URL, server gone, or the dial_loop crashed). Check the worker log for a 'dial loop crashed' / 'dial failed' warning."
             @warn "BonitoMCP: bridge dial not connected 30s after setup" wsurl
@@ -603,6 +606,10 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
         end
         value_blocks = result.blocks
         html         = result.html
+        # `wants_display` (from format_value): the value would have rendered live
+        # but there was no bridge — the handler pairs it with a Bonito-version
+        # mismatch to offer the upgrade card. Absent on the error/nothing payloads.
+        wants_display = hasproperty(result, :wants_display) && result.wants_display
         # M11: the task is done, but the worker's final `println`s may still be
         # in the OS pipe — the pump task hasn't necessarily flushed them into our
         # buffer by the time `fetch` returns. Without a settle, that trailing
@@ -639,7 +646,7 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
             push!(blocks, Dict{String,Any}("type" => "text", "text" => output))
         append!(blocks, value_blocks)
         return (status = :completed, blocks = blocks, html = html,
-                is_error = is_error, elapsed_s = elapsed)
+                is_error = is_error, elapsed_s = elapsed, wants_display = wants_display)
     end
     return (status = :running, partial = partial, elapsed_s = elapsed,
             code = s.in_flight_code)

@@ -1877,6 +1877,58 @@ outdated_worker_banner() = DOM.div(
             class = "bt-worker-stale-body");
     class = "bt-worker-stale")
 
+# The project env's Bonito is too old for the live-render bridge. BonitoMCP emits
+# a `{"bonito_upgrade": …}` marker block instead of degrading a plot/app to text;
+# the card below turns it into a one-click fix. `chat` is captured so the button
+# can submit the Pkg.add as a real user message (the agent applies it in the SAME
+# env bt_julia_eval uses — no side channel).
+struct BonitoUpgradeCard
+    chat::ChatModel
+    current::String
+    need::String
+    env::String
+    add::String        # the `Pkg.add(…)` call that installs a compatible Bonito
+end
+
+# Decoded `{"bonito_upgrade": …}` marker if `content` carries one, else nothing.
+function bonito_upgrade_content(content)
+    for c in content
+        c isa AgentClientProtocol.TextContent || continue
+        u = bonito_upgrade_descriptor(c.text)
+        u === nothing || return u
+    end
+    return nothing
+end
+
+function Bonito.jsrender(session::Bonito.Session, c::BonitoUpgradeCard)
+    # Clicking [Update env] submits the fix as a user message; the agent runs it
+    # via bt_julia_eval against this project's env, then can re-run the display.
+    do_fix = Observable(false)
+    on(session, do_fix) do go
+        go || return
+        prompt = "The live-display bridge needs a newer Bonito in this project's env" *
+                 (isempty(c.env) ? "" : " ($(c.env))") * ". Run this via bt_julia_eval " *
+                 "(env_path = this project) and then re-run the previous display:\n\n" *
+                 "```julia\nimport Pkg; $(c.add)\n```"
+        try
+            send_message!(c.chat, UserMsg(c.chat, prompt))
+        catch e
+            @warn "BonitoUpgradeCard: failed to submit fix prompt" exception = (e,)
+        end
+    end
+    btn = DOM.button("Update env";
+        class = "bt-btn bt-worker-upgrade-btn",
+        onclick = js"e => { e.preventDefault(); e.stopPropagation(); $(do_fix).notify(true); }")
+    Bonito.jsrender(session, DOM.div(
+        DOM.div("Live display needs a newer Bonito"; class = "bt-worker-stale-title"),
+        DOM.div("This project's env resolved Bonito v$(c.current); the live-render " *
+                "bridge needs v$(c.need). Interactive apps and plots can't display " *
+                "until it's updated. Click to add a compatible Bonito to this env.";
+                class = "bt-worker-stale-body"),
+        DOM.div(btn; style = Styles("margin-top" => "8px"));
+        class = "bt-worker-stale"))
+end
+
 # The typed eval body: Code / Output / live Result. The code comes from the
 # typed `m.code` field (the tool input), never from the content. The worker
 # PARKS the result value in a holder session (`RemoteProxy.remote_ref`); the
@@ -1925,8 +1977,13 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
             console_block(m.stream_text); pin_end = true))
     else
         stop   = desc === nothing ? lastindex(content) : lastindex(content) - 1
+        # Bonito-version-mismatch marker (if any): the env is too old to display
+        # the value live. Render the one-click upgrade card and DON'T print the
+        # marker's raw json as output.
+        upgrade = bonito_upgrade_content(content)
         output = join(String[c.text for c in content[begin:stop]
-                             if c isa AgentClientProtocol.TextContent], "\n")
+                             if c isa AgentClientProtocol.TextContent &&
+                                bonito_upgrade_descriptor(c.text) === nothing], "\n")
         # Deprecation guard: an outdated worker's output is a ```julia code echo
         # with no v3 descriptor. Surface an upgrade hint above the raw output
         # (kept, so nothing is hidden) instead of a silently-mangled card.
@@ -1934,6 +1991,8 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
             pushfirst!(sections, outdated_worker_banner())
         isempty(strip(output)) || push!(sections,
             tool_subsection("Output", console_block(output); pin_end = true))
+        upgrade === nothing || pushfirst!(sections,
+            BonitoUpgradeCard(chat, upgrade.current, upgrade.need, upgrade.env, upgrade.add))
     end
     desc === nothing || push!(sections,
         wrap_for_detach(tool_id(m), remote_result(chat.state, content[end].text, chat.project_id)))
@@ -3313,7 +3372,9 @@ auto_expand_body(::EditToolMsg, snap_content) = any(c -> c isa DiffContent, snap
 auto_expand_body(m::JuliaEvalCall, snap_content) =
     tool_status(m) in ("pending", "in_progress") ? !isempty(m.code) :
     auto_expand_full(m, snap_content) ||
-    (tool_status(m) == "completed" && outdated_worker_content(snap_content))
+    (tool_status(m) == "completed" &&
+     (outdated_worker_content(snap_content) ||
+      bonito_upgrade_content(snap_content) !== nothing))
 
 # The tool holds a LIVE result embed: a worker-parked value the body mounts
 # via `RemoteRef` (values AND errors — both are parked refs rendered live).

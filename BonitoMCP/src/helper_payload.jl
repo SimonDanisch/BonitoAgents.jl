@@ -112,12 +112,16 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
                   html = result_descriptor(ref, false, display_repr(val, repr)),
                   errored = false, echo = nothing)
 
-    # No bridge (standalone MCP): no embed, so the repr echo IS the result —
-    # append it to the output; add an on-disk rich preview when genuinely visual.
+    # No bridge (standalone MCP OR the env's Bonito is too old): no embed, so the
+    # repr echo IS the result — append it to the output; add an on-disk rich
+    # preview when genuinely visual. `wants_display` flags a value that WOULD have
+    # rendered live (a Bonito App / Makie plot / rich image) so the host can offer
+    # the version-upgrade card instead of just degrading to text.
     blocks = Dict{String,Any}[]
     show_block = try_save_rich(val, out_dir, max_bytes)
     show_block === nothing || push!(blocks, show_block)
-    return (; blocks = blocks, html = nothing, errored = false, echo = repr)
+    return (; blocks = blocks, html = nothing, errored = false, echo = repr,
+              wants_display = is_display_type(val) || show_block !== nothing)
 end
 
 # The agent-facing `repr` for a value parked as a LIVE embed. For a plain value
@@ -133,6 +137,14 @@ function display_repr(val, repr::AbstractString)
            nothing
     kind === nothing && return repr
     return "⟨$(kind) displayed live in the chat — the user can see and interact with it now⟩"
+end
+
+# A rich, INTERACTIVE display value (Bonito `App` or a Makie plot) by type name —
+# no Bonito/Makie dependency needed in the worker env. Used to decide whether a
+# value that couldn't reach the live bridge would have WANTED to display (so the
+# host can offer the version-upgrade card instead of silently degrading to text).
+is_display_type(val) = let n = string(nameof(typeof(val)))
+    n == "App" || startswith(n, "Figure") || n == "Scene" || endswith(n, "Plot")
 end
 
 # The result descriptor json the chat decodes (BonitoAgents remote_app.jl):

@@ -745,6 +745,27 @@ function result_descriptor(payload::AbstractString)
     return (ref = String(ref), errored = get(d, "errored", false) === true)
 end
 
+# Boundary decode of the eval wire's Bonito-version-mismatch marker, emitted by
+# BonitoMCP when the project env's Bonito is too old for the live-render bridge:
+# `{"bonito_upgrade":{"current","need","env","add"}}`. Returns nothing otherwise
+# (so a normal output block is untouched). Same boundary-decode discipline as
+# `result_descriptor` — our own versioned format, not content sniffing.
+function bonito_upgrade_descriptor(payload::AbstractString)
+    s = String(payload)
+    startswith(s, "{\"bonito_upgrade\"") || return nothing
+    d = try
+        JSON.parse(s)
+    catch
+        return nothing
+    end
+    (d isa AbstractDict && get(d, "bonito_upgrade", nothing) isa AbstractDict) || return nothing
+    u = d["bonito_upgrade"]
+    return (current = String(get(u, "current", "?")),
+            need    = String(get(u, "need", "?")),
+            env     = String(get(u, "env", "")),
+            add     = String(get(u, "add", "")))
+end
+
 # Build the RemoteRef from the persisted result payload (the final content
 # block). Current payloads are the JSON descriptor (see `result_descriptor`);
 # pre-RemoteRef history persisted the rendered html itself — which is exactly

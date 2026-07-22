@@ -101,9 +101,37 @@ function julia_eval_handler(args::AbstractDict)
         )
     end
 
-    return res.status === :completed ?
-        completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s)
+    res.status === :completed || return running_response(env_path, res.partial, res.elapsed_s)
+
+    # A DISPLAY value (App / plot / image) came back as text because this env's
+    # Bonito is too old for the live bridge (`s.bonito_mismatch` set by the gate).
+    # Prepend the upgrade marker so the chat shows the one-click [Update env] card
+    # instead of a bare "App". Plain-text evals never carry `wants_display`, so a
+    # `println` on a mismatched env won't nag.
+    blocks = res.blocks
+    if res.wants_display && !isempty(s.bonito_mismatch)
+        blocks = copy(blocks)
+        pushfirst!(blocks, bonito_upgrade_block(s.bonito_mismatch, s.env_path))
+    end
+    return completed_response(blocks, res.html, res.is_error, res.elapsed_s)
+end
+
+# The upgrade-card marker the chat decodes (`bonito_upgrade_descriptor` in
+# BonitoAgents remote_app.jl): a value wanted a live display but the project env's
+# Bonito is too old. Carries current/needed versions + the `Pkg.add` the [Update
+# env] button runs. Bonito's live-render fixes aren't released, so the add pins
+# the git branch (works without a release).
+const BONITO_UPGRADE_URL = "https://github.com/SimonDanisch/Bonito.jl"
+const BONITO_UPGRADE_REV = "sd/media-proxy"
+function bonito_upgrade_block(current::AbstractString, env_path)
+    add = "Pkg.add(url=\"$(BONITO_UPGRADE_URL)\", rev=\"$(BONITO_UPGRADE_REV)\")"
+    e(x) = json_escape_string(string(x))
+    j = string("{\"bonito_upgrade\":{",
+               "\"current\":\"", e(current), "\",",
+               "\"need\":\"",    e(MIN_BRIDGE_BONITO), "\",",
+               "\"env\":\"",     e(env_path === nothing ? "" : env_path), "\",",
+               "\"add\":\"",     e(add), "\"}}")
+    return Dict{String,Any}("type" => "text", "text" => j)
 end
 
 function julia_continue_handler(args::AbstractDict)
