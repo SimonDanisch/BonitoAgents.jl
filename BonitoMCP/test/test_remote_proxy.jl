@@ -59,13 +59,18 @@ function decode_sm(x)
     de = inner[4]
     return (de isa MsgPack.Extension && de.type == EXT_BIN_TAG) ? MsgPack.unpack(de.data) : de
 end
+# A DATA frame's payload is enveloped `[UInt8 len][prefix][frame]` (per-page
+# `PageDriver`) so the host can demux it to the owning tab — strip the prefix to
+# get the raw serialized frame the browser applies.
+strip_env(p) = (pv = collect(p); pv[2 + Int(pv[1]):end])
+
 # Every UpdateObservable (id => payload) in the captured data frames, flattening
 # FusedMessage bundles.
 function updates(ws::CapWS)
     out = Pair{String,Any}[]
     for (t, p) in untag.(ws.sent)
         t == RP.TAG_DATA || continue
-        d = decode_sm(collect(p))
+        d = decode_sm(strip_env(p))
         d isa AbstractDict || continue
         if d["msg_type"] == "9"
             for s in get(d, "payload", [])
@@ -218,20 +223,16 @@ end
         close(cap2); wait(t2)
     end
 
-    @testset "every render is self-contained (no cross-mount dedup on the proxied root)" begin
-        # The bridge parent is a long-lived ROOT session that outlives browser
-        # pages (reloads, later tabs). Stock Bonito dedups serialization
-        # against the root's `session_objects` and ships bare TrackingOnly
-        # references for anything already sent — an assumption that holds per
-        # PAGE, not per bridge: after a reload the page's object cache is
-        # empty, so a re-mounted embed would reference objects the fresh page
-        # never received (DOM up, observables alive, every cached payload
-        # silently missing — the eternal-spinner WGLMakie embed).
-        #
-        # Ours resolves this at the SERIALIZATION layer instead of tracking
-        # pages: proxied roots opt out of dedup entirely (dev Bonito's
-        # `dedup_cached_objects(::Session{<:ProxyConnection}) = false`), so
-        # EVERY mount — first, re-expand, post-reload — ships full values.
+    @testset "every render_eval_html fragment is self-contained" begin
+        # Reload-safety is now STRUCTURAL: one proxied root PER browser page
+        # (per-page roots), so §0's invariant holds again — a page's object cache
+        # matches its own root's, and a reload gets a FRESH page-root (empty cache
+        # → full re-ship), so stock `dedup_cached_objects=true` is sound. That
+        # retired the old `dedup_cached_objects(::Session{<:ProxyConnection})=false`
+        # override this test used to lean on. This test now pins the remaining
+        # property of the LEGACY standalone `render_eval_html` path: each fragment
+        # it emits carries its own values (in the fragment or the init bundle its
+        # render registered), so a text-only/offline result is never half-shipped.
         # (Root METADATA hazards went with `get_order!`: GlyphSync ships glyph
         # batches as root evaljs and the page PULLS whatever it lacks.)
         b, cap = fresh_bridge!()

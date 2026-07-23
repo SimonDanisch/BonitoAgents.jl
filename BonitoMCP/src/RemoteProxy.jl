@@ -87,10 +87,44 @@ Bonito.proxy_asset_add(d::BridgeDriver, key, mime, total, cached) =
 Bonito.proxy_asset_remove(d::BridgeDriver, key) =
     send_control(d, Dict("op" => "asset_remove", "key" => key))
 
-# ── The bridge: one long-lived proxied root session over the dial-back driver ─
+# A DATA frame for a per-page proxied root carries that root's prefix so the host
+# can demux it to the right browser tab: `[TAG_DATA][UInt8 len][prefix][payload]`.
+# CTRL/asset frames stay bare (shared across pages). A prefix is a uuid (≤255), so
+# one length byte suffices. Rides the same pending/flush path as `send_frame`.
+function send_frame_prefixed(d::BridgeDriver, prefix::AbstractString, payload::AbstractVector{UInt8})
+    pfx = codeunits(String(prefix))
+    env = Vector{UInt8}(undef, length(pfx) + 1 + length(payload))
+    @inbounds env[1] = UInt8(length(pfx))
+    copyto!(env, 2, pfx, firstindex(pfx), length(pfx))
+    copyto!(env, 2 + length(pfx), payload, firstindex(payload), length(payload))
+    send_frame(d, TAG_DATA, env)
+    return nothing
+end
+
+# Per-page proxied root driver: tags DATA with its page prefix so the host routes
+# it to the owning tab; asset verbs DELEGATE to the shared `BridgeDriver` (assets
+# are content-addressed and served once for all pages → cross-page asset dedup,
+# while object caches stay per page-root). The registry root uses one too (its
+# frames envelope with the registry prefix and the host simply has no tab bound
+# to it), so EVERY DATA frame is enveloped — no ambiguous bare-vs-tagged parse.
+struct PageDriver
+    bridge::BridgeDriver
+    prefix::String
+end
+Bonito.proxy_send(pd::PageDriver, bytes) = send_frame_prefixed(pd.bridge, pd.prefix, bytes)
+Bonito.proxy_asset_add(pd::PageDriver, key, mime, total, cached) =
+    Bonito.proxy_asset_add(pd.bridge, key, mime, total, cached)
+Bonito.proxy_asset_remove(pd::PageDriver, key) = Bonito.proxy_asset_remove(pd.bridge, key)
+
+# ── The bridge: a worker-global value registry + one proxied root per browser ─
+# page, all multiplexed over the one dial-back driver. `parent` holds the parked
+# value holders (page-invisible, never rendered); `page_roots` are the real
+# per-tab render roots (own object cache = §0 per-page scope), keyed by prefix.
 mutable struct RemoteBridge
     parent::Bonito.Session
     driver::BridgeDriver
+    page_roots::Dict{String, Bonito.Session}
+    plock::ReentrantLock
 end
 
 const BRIDGE = Ref{Union{Nothing, RemoteBridge}}(nothing)
@@ -113,7 +147,7 @@ event down the dial-back socket.
 function RemoteBridge(; compression::Bool = false)
     prefix = string(Bonito.uuid4())
     driver = BridgeDriver()
-    conn   = Bonito.ProxyConnection(prefix, driver)
+    conn   = Bonito.ProxyConnection(prefix, PageDriver(driver, prefix))
     parent = Bonito.Session(conn; id = prefix,
                             asset_server = Bonito.ProxyAssetServer(driver),
                             compression_enabled = compression)
@@ -121,7 +155,42 @@ function RemoteBridge(; compression::Bool = false)
     # writes reach the browser through the host relay — mark it ready so
     # `close`ing a subsession can emit `free_session` through the bridge.
     isready(parent.connection_ready) || put!(parent.connection_ready, true)
-    return RemoteBridge(parent, driver)
+    return RemoteBridge(parent, driver, Dict{String, Bonito.Session}(), ReentrantLock())
+end
+
+# One proxied root per browser page. A real ROOT (no parent) so Bonito auto-spawns
+# its inbox reader — browser→worker dispatch is free. Its `asset_server` is the
+# bridge's SHARED one (cross-page asset dedup); its object cache is its own
+# (per-page dedup). Frames envelope with `prefix` via `PageDriver`.
+function open_page_root!(b::RemoteBridge; compression::Bool = false)
+    prefix = string(Bonito.uuid4())
+    conn = Bonito.ProxyConnection(prefix, PageDriver(b.driver, prefix))
+    pr = Bonito.Session(conn; id = prefix,
+                        asset_server = b.parent.asset_server,
+                        compression_enabled = compression)
+    isready(pr.connection_ready) || put!(pr.connection_ready, true)
+    lock(b.plock) do
+        b.page_roots[prefix] = pr
+    end
+    return prefix
+end
+
+function close_page_root!(b::RemoteBridge, prefix::AbstractString)
+    pr = lock(b.plock) do
+        pop!(b.page_roots, String(prefix), nothing)
+    end
+    pr === nothing || close(pr)
+    return nothing
+end
+
+# The page-root for `prefix`, or the registry `parent` if the frame targets it
+# (its holders are never mounted, so this is only a defensive fallback).
+function page_root_for(b::RemoteBridge, prefix::AbstractString)
+    p = String(prefix)
+    p == b.parent.id && return b.parent
+    lock(b.plock) do
+        get(b.page_roots, p, nothing)
+    end
 end
 
 """
@@ -274,11 +343,20 @@ function serve_bridge(ws)
                    Vector{UInt8}(codeunits(String(msg)))
             isempty(data) && continue
             tag = @inbounds data[1]
-            payload = Vector{UInt8}(@view data[2:end])
             if tag == TAG_DATA
-                # Inbound Bonito frame → stock inbox dispatch (kept in order).
-                isopen(b.parent.inbox) && put!(b.parent.inbox, payload)
+                # Enveloped `[len][prefix][frame]` → the owning page-root's inbox,
+                # whose auto-spawned reader runs `process_message` in order.
+                plen = Int(@inbounds data[2])
+                prefix = String(@view data[3:2+plen])
+                frame  = Vector{UInt8}(@view data[3+plen:end])
+                pr = page_root_for(b, prefix)
+                if pr === nothing
+                    @warn "RemoteProxy: inbound frame for unknown page-root (tab closed?)" prefix
+                elseif isopen(pr.inbox)
+                    put!(pr.inbox, frame)
+                end
             elseif tag == TAG_CTRL
+                payload = Vector{UInt8}(@view data[2:end])
                 # Control can render (slow) or read assets — run it OFF the receive
                 # loop so it never starves inbound frames; guard so one bad control
                 # frame can't kill the bridge.
@@ -347,17 +425,32 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             url = Bonito.url(b.parent.asset_server, Bonito.Asset(path_str))
             mt  = isfile(path_str) ? round(Int, mtime(path_str)) : 0
             send_control(d, Dict("op" => "reply", "id" => id, "val" => url * "?v=" * string(mt)))
+        elseif op == "open_root"
+            # A browser tab's first embed → mint its per-page proxied root; the
+            # host binds this prefix to that tab's connection and routes by it.
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => open_page_root!(b)))
+        elseif op == "close_root"
+            close_page_root!(b, String(msg["root"]))
         elseif op == "close"
-            s = Bonito.get_session(b.parent, String(msg["sub"]))
+            # A render-sub lives under its page-root (id is "pageprefix/uuid").
+            sid = String(msg["sub"])
+            pr = page_root_for(b, first(split(sid, '/')))
+            s = pr === nothing ? nothing : Bonito.get_session(pr, sid)
             s === nothing || close(s)
         elseif op == "mount"
+            # The VALUE holder lives in the registry (`parent`); it is RENDERED as
+            # a fresh sub of the requesting tab's PAGE-ROOT (per-page cache), never
+            # of the holder — so each tab gets its own §0-compliant copy.
             holder = Bonito.get_session(b.parent, String(msg["sub"]))
             holder === nothing &&
                 error("result session $(msg["sub"]) not found (worker restarted or result evicted)")
             app = holder.current_app[]
             app === nothing && error("result session $(msg["sub"]) holds no app")
+            pr = page_root_for(b, String(msg["root"]))
+            pr === nothing &&
+                error("page root $(msg["root"]) not found (tab closed or worker reconnected)")
             Bonito.force_subsession!(true)
-            sub = Bonito.update_session_dom!(holder, String(msg["node"]), app)
+            sub = Bonito.update_session_dom!(pr, String(msg["node"]), app)
             send_control(d, Dict("op" => "reply", "id" => id, "val" => sub.id))
         end
     catch e

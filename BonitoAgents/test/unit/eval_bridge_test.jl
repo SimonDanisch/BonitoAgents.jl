@@ -22,6 +22,16 @@ Base.isopen(::SlowConn) = true
 Base.close(::SlowConn) = nothing
 Bonito.setup_connection(::Bonito.Session{SlowConn}) = nothing
 
+# A browser connection that records exactly what it receives (in order).
+mutable struct CapConn <: Bonito.FrontendConnection
+    got::Vector{Vector{UInt8}}
+end
+CapConn() = CapConn(Vector{UInt8}[])
+Base.write(c::CapConn, b::AbstractVector{UInt8}) = (push!(c.got, collect(b)); nothing)
+Base.isopen(::CapConn) = true
+Base.close(::CapConn) = nothing
+Bonito.setup_connection(::Bonito.Session{CapConn}) = nothing
+
 @testset "EvalBridge server-side (headless)" begin
 
     @testset "call_ctrl fails fast when the socket is down (redial_grace = 0)" begin
@@ -80,13 +90,17 @@ Bonito.setup_connection(::Bonito.Session{SlowConn}) = nothing
         # replies → 30s timeouts. Now data frames are queued for a writer task and
         # control frames are handled inline — a slow write must not delay a reply.
         eb = mkbridge()
-        eb.root_conn[] = SlowConn()                       # every browser write takes 2s
+        # A DATA frame is enveloped `[len][prefix][payload]` and routes to the tab
+        # bound to `prefix` (see relay_writer); bind this page-root to the slow tab.
+        pfx = "tab1"
+        lock(eb.pc_lock) do; eb.page_conns[pfx] = SlowConn(); end   # writes take 2s
+        env(payload) = vcat(UInt8(ncodeunits(pfx)), codeunits(pfx), payload)
         outbound = Channel{Vector{UInt8}}(2048)
         writer = Base.errormonitor(@async BT.relay_writer(eb, outbound))
 
         ch = Channel{Any}(1); lock(eb.pending_lock) do; eb.pending[7] = ch; end
         # A DATA frame the writer will spend 2s shipping to the slow browser…
-        BT.relay_frame!(eb, outbound, vcat(UInt8('D'), rand(UInt8, 8_000)))
+        BT.relay_frame!(eb, outbound, vcat(UInt8('D'), env(rand(UInt8, 8_000))))
         # …immediately followed by the control REPLY for the in-flight request.
         reply = Bonito.MsgPack.pack(Dict{String,Any}("op" => "reply", "id" => 7, "val" => "ok"))
         t0 = time()
@@ -94,6 +108,34 @@ Bonito.setup_connection(::Bonito.Session{SlowConn}) = nothing
         @test timedwait(() -> isready(ch), 1.0) === :ok   # reply NOT stuck behind the 2s write
         @test time() - t0 < 1.0
         @test take!(ch) == "ok"
+        close(outbound)
+    end
+
+    @testset "two tabs on one bridge: each frame routes to its own page-root (no clobber)" begin
+        # The regression the old single `root_conn` could NOT pass: two browser
+        # tabs of the same project, each its own page-root prefix. relay_writer
+        # demuxes by the DATA-frame prefix envelope → the bound tab's connection,
+        # stripping the envelope so the browser gets the raw frame. Frames for one
+        # tab never reach the other.
+        eb = mkbridge()
+        a, b = CapConn(), CapConn()
+        lock(eb.pc_lock) do; eb.page_conns["A"] = a; eb.page_conns["B"] = b; end
+        env(pfx, payload) = vcat(UInt8(ncodeunits(pfx)), codeunits(pfx), payload)
+        outbound = Channel{Vector{UInt8}}(64)
+        writer = Base.errormonitor(@async BT.relay_writer(eb, outbound))
+
+        BT.relay_frame!(eb, outbound, vcat(UInt8('D'), env("A", UInt8[1, 2, 3])))
+        BT.relay_frame!(eb, outbound, vcat(UInt8('D'), env("B", UInt8[9, 9])))
+        BT.relay_frame!(eb, outbound, vcat(UInt8('D'), env("A", UInt8[4, 5])))
+
+        @test timedwait(() -> length(a.got) == 2 && length(b.got) == 1, 2.0) === :ok
+        @test a.got == [UInt8[1, 2, 3], UInt8[4, 5]]   # A's frames, in order, envelope stripped
+        @test b.got == [UInt8[9, 9]]                   # B untouched by A's frames
+
+        # A frame for a tab with no bound connection parks (does not error / cross).
+        BT.relay_frame!(eb, outbound, vcat(UInt8('D'), env("GONE", UInt8[7])))
+        @test timedwait(() -> lock(() -> haskey(eb.parked, "GONE"), eb.parked_lock), 2.0) === :ok
+        @test lock(() -> length(a.got) == 2 && length(b.got) == 1, eb.pc_lock)  # no stray delivery
         close(outbound)
     end
 end
