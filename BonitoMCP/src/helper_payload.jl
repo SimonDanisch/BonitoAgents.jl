@@ -94,32 +94,20 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
         !full_output && is_large_container(val) ? summarize_container(val) : result_repr(val),
         max_bytes, full_output, "result")
 
-    ref = nothing
+    # Bridge path: park the value for the live embed, and — for a DISPLAY value
+    # (App/plot/rich) — pre-render its DOM to compact, assetless HTML for the
+    # agent. The pre-render runs the App body HERE (inside the eval's captured
+    # stdout), so a render-time error surfaces to the agent as a normal error
+    # instead of failing silently at mount. Throwing inside is caught here and
+    # degrades to the no-bridge text path below.
     if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
-        ref = try
-            Main.RemoteProxy.remote_ref(val)
+        result = try
+            bridge_result(val, repr, max_bytes, full_output)
         catch e
-            @warn "format_value: remote_ref failed; falling back to text/file preview" exception = (e, catch_backtrace())
+            @warn "format_value: bridge path failed; falling back to text/file preview" exception = (e, catch_backtrace())
             nothing
         end
-    end
-    # A parked ref IS displayed live as the result embed — the pane shows the
-    # value, so there must be ZERO Output for it (`echo = nothing`): the Output
-    # section is captured STDOUT only, never the result repr. The agent still
-    # reads the result from the descriptor's `repr` field. `remote_ref` also probe-
-    # renders the App: if that surfaced a render-time error (bad Makie attribute,
-    # etc.), mark the descriptor `errored` and tell the agent the display FAILED —
-    # instead of a repr that claims it rendered fine. The MCP-level `errored` stays
-    # false (the eval itself succeeded; only the display failed).
-    if ref !== nothing
-        rerr = ref.error
-        r = rerr === nothing ? display_repr(val, repr) :
-            truncate_text("⟨the returned $(string(nameof(typeof(val)))) FAILED to render — " *
-                          sprint(showerror, rerr) * "; fix the code and return it again⟩",
-                          max_bytes, full_output, "result")
-        return (; blocks = Dict{String,Any}[],
-                  html = result_descriptor(ref.id, rerr !== nothing, r),
-                  errored = false, echo = nothing)
+        result === nothing || return result
     end
 
     # No bridge (standalone MCP OR the env's Bonito is too old): no embed, so the
@@ -132,6 +120,42 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
     show_block === nothing || push!(blocks, show_block)
     return (; blocks = blocks, html = nothing, errored = false, echo = repr,
               wants_display = is_display_type(val) || show_block !== nothing)
+end
+
+# The bridge result: parks `val` for the live embed and builds the agent-facing
+# descriptor. A DISPLAY value (App/plot/rich) is pre-rendered to compact,
+# assetless HTML (`RemoteProxy.summary_html`) so the agent sees the REAL DOM,
+# not a bare note — and because that render runs the App body, a render-time
+# failure comes back as a `CapturedException`: surface it like an error value
+# (park the exception so the embed shows it via `jsrender(::CapturedException)`,
+# echo the terminal-faithful red error so it lands in the agent's captured
+# stdout) while the MCP-level `errored` stays FALSE — the eval succeeded, only
+# the display failed. A plain value keeps its short text repr. Any throw here
+# propagates to `format_value`, which degrades to the no-bridge text path.
+function bridge_result(val, repr::AbstractString, max_bytes::Int, full_output::Bool)
+    RP = Main.RemoteProxy
+    if is_display_type(val)
+        sm = RP.summary_html(val)
+        if sm isa CapturedException
+            ref = RP.remote_ref(sm)
+            echo = "\e[91mERROR: " *
+                   truncate_text(sprint(showerror, sm), max_bytes, full_output, "result") *
+                   "\e[39m"
+            return (; blocks = Dict{String,Any}[],
+                      html = result_descriptor(ref, true, ""), errored = false, echo = echo)
+        end
+        ref = RP.remote_ref(val)
+        return (; blocks = Dict{String,Any}[],
+                  html = result_descriptor(ref, false,
+                           truncate_text(sm, max_bytes, full_output, "result")),
+                  errored = false, echo = nothing)
+    end
+    # Plain value: park for the embed, keep the short text repr (rendering
+    # `App(42)` to `<div>42</div>` is more tokens and less clear than "42").
+    ref = RP.remote_ref(val)
+    return (; blocks = Dict{String,Any}[],
+              html = result_descriptor(ref, false, display_repr(val, repr)),
+              errored = false, echo = nothing)
 end
 
 # The agent-facing `repr` for a value parked as a LIVE embed. For a plain value
@@ -311,8 +335,8 @@ function format_error(err, bt, max_bytes::Int, full_output::Bool)
     # must SEE the failure prominently (not buried in a descriptor) to fix the
     # code, and the red console error is the terminal-faithful view. The embed
     # renders the exception too — redundancy is warranted for errors. `remote_ref`
-    # returns `(id, error)`; the error side is irrelevant here (this IS the error).
-    html = ref === nothing ? nothing : result_descriptor(ref.id, true, "")
+    # returns the holder id; this IS the error, so the descriptor is always errored.
+    html = ref === nothing ? nothing : result_descriptor(ref, true, "")
     return (; blocks = Dict{String,Any}[], html = html, errored = true, echo = echo)
 end
 

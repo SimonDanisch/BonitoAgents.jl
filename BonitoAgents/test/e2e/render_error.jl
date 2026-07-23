@@ -1,8 +1,11 @@
 # A returned App that throws at RENDER time (an invalid Makie attribute, etc.)
-# must not silently claim it displayed. `remote_ref` probe-renders the App's body
-# at eval time (Julia-side; the heavy browser render still happens at mount): the
-# error is printed into the captured output AND the result descriptor is marked
-# `errored`, so both the user and the agent see WHY the display failed.
+# must not silently claim it displayed. At EVAL time `format_value` pre-renders
+# the App to compact HTML (`RemoteProxy.summary_html`, a throwaway NoConnection
+# render). Because that runs the App body inside the eval's captured stdout, the
+# throw comes back as a `CapturedException`: the terminal-faithful red error is
+# echoed into the card's Output stream (so the AGENT sees WHY), and the exception
+# is parked as the embed (so the USER sees it rendered too). No probe, no second
+# throwaway render.
 #
 # UI-only: real dev_server + real eval worker (evalenv), real bt_julia_eval, DOM
 # assertions.
@@ -40,8 +43,9 @@ function run_suite(server)
 
         @test TK.wait_for(server, "eval card",
             "!!document.querySelector('$CARD')"; timeout = 180) == true
-        # The render error surfaces in the card — the probe printed it into the
-        # captured output, and the descriptor is `errored` so the embed shows it.
+        # The render error surfaces in the card — `summary_html` returned the
+        # CapturedException, so the red error is echoed into the Output stream and
+        # the exception is parked as the embed. Either way the marker is visible.
         @test TK.wait_for(server, "render error shown",
             "(() => { const e = document.querySelector('$CARD'); return !!(e && (e.innerText||'').includes('notanattr_zqx')); })()";
             timeout = 30) == true

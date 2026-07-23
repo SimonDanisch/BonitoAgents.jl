@@ -318,37 +318,8 @@ end
 function remote_ref(@nospecialize(value))
     parent = get_parent_session()
     holder = Bonito.Session(parent)
-    app = Bonito.App(display_value(bound_for_render(value)))
-    holder.current_app[] = app
-    return (id = holder.id, error = probe_render_error(app))
-end
-
-# Run the App's handler once now — the `App() do … end` body, where render-time
-# errors actually fire (an invalid Makie attribute, a bad observable, …). The
-# heavy browser render still happens later at mount; this is just the Julia-side
-# body, so the eval RESULT can tell the agent the display FAILED instead of
-# claiming it worked, and Bonito's `handle_render_error`/showerror lands in the
-# captured eval output. Best-effort: run on a throwaway session (never the holder
-# the browser will mount) and swallow any hiccup in the probe itself.
-function probe_render_error(app::Bonito.App)
-    probe = Bonito.Session(get_parent_session())
-    err = try
-        Base.invokelatest(app.handler, probe, Bonito.HTTP.Request())
-        nothing
-    catch e
-        # Print it here too (captured in the eval's output, the same way Bonito's
-        # handle_render_error surfaces it in a REPL) so the failure is visible in
-        # the console, not only in the result descriptor.
-        try
-            printstyled(stderr, "\nError rendering the returned app:\n"; color = :red, bold = true)
-            showerror(stderr, e)
-            println(stderr)
-        catch
-        end
-        e
-    end
-    try close(probe) catch end
-    return err
+    holder.current_app[] = display_app(value)
+    return holder.id
 end
 
 function handle_control(b::RemoteBridge, msg::AbstractDict)
@@ -453,6 +424,64 @@ display_value(s::AbstractString) =
 # (functions AND types are callable).
 display_value(f::Union{Function, Type}) =
     Bonito.RichText(sprint(show, MIME"text/plain"(), f; context = :color => true))
+
+# The display App for an eval RESULT value — shared by the live embed
+# (`remote_ref` parks it) and the agent-facing summary (`summary_html` renders
+# it). `App(value)` IS the whole renderer (per-type `jsrender`); callables/ANSI
+# strings are normalized by `display_value`, huge strings bounded up front.
+# A value that IS ALREADY an `App` is used directly — never re-wrapped as
+# `App(App(...))`. The double wrap routes the inner App's render error through
+# Bonito's `handle_render_error` (swallowed into error-HTML) BEFORE
+# `summary_html`'s catch could turn it into a `CapturedException`, so the render
+# error would never reach the agent as an error.
+display_app(app::Bonito.App) = app
+display_app(@nospecialize value) = Bonito.App(display_value(bound_for_render(value)))
+
+# ── Agent-facing summary: the returned App's DOM as compact, assetless HTML ───
+# The agent gets the REAL rendered DOM — not a live embed (that's the browser
+# mount) and not a bare note. We render the App body on a throwaway NoConnection
+# session, which does two things at once:
+#   * the `App() do … end` body RUNS here, inside the eval's captured stdout — a
+#     render-time error (bad Makie attribute, …) is caught and RETURNED as a
+#     `CapturedException`, so the caller surfaces it like any eval error instead
+#     of it failing silently at mount.
+#   * `print` of the jsrendered node is just the DOM tree; it skips the init
+#     bundle (that lives in `session_dom(...; init=true)`, which we never call).
+# `StubAssetServer` is the one lever that keeps the HTML small: `url` returns a
+# short marker instead of `NoServer`'s base64 `data:` URL, so images/assets never
+# inline their bytes into the agent's context.
+struct StubAssetServer <: Bonito.AbstractAssetServer end
+Base.similar(s::StubAssetServer) = s
+Bonito.url(::StubAssetServer, a::Bonito.BinaryAsset) = "[binary:$(a.mime):$(length(a.data))B]"
+Bonito.url(::StubAssetServer, a::Bonito.Asset) =
+    isempty(a.online_path) ? "[asset:$(Bonito.mediatype(a))]" : a.online_path
+# es6 modules interpolated in inline `js""` scripts reference the import key and
+# never inline (mirrors `NoServer`; `render_asset`/`session_dom` aren't hit on
+# this path, so the other asset-server verbs aren't needed).
+function Bonito.import_in_js(io::IO, session::Bonito.Session, ::StubAssetServer, asset::Bonito.Asset)
+    push!(session.imports, asset)
+    print(io, "BONITO_IMPORTS['$(Bonito.unique_key(asset))']")
+end
+
+# Returns the compact HTML `String` on success, or the `CapturedException` a
+# render-time failure threw (a VALUE — the caller decides how to surface it). The
+# inner try/catch RETURNS the error, it never swallows it; the try/finally is
+# session cleanup only.
+function summary_html(@nospecialize value)
+    s = Bonito.Session(Bonito.NoConnection(); asset_server = StubAssetServer())
+    try
+        dom = try
+            app = display_app(value)
+            d = Base.invokelatest(app.handler, s, Bonito.HTTP.Request())
+            Base.invokelatest(Bonito.jsrender, s, d)
+        catch e
+            return CapturedException(e, Base.catch_backtrace())
+        end
+        return sprint(print, dom)
+    finally
+        close(s)
+    end
+end
 
 function render_eval_html(value)
     parent = get_parent_session()
