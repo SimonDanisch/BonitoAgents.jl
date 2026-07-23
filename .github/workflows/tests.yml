@@ -163,6 +163,7 @@ jobs:
           - bonito_upgrade
           - edit_diff
           - render_error
+          - two_tab
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
