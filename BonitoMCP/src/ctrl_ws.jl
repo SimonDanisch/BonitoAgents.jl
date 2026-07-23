@@ -51,7 +51,8 @@ function send_ctrl_frame(payload::AbstractDict)
     try
         WebSockets.send(ws, JSON.json(payload))
         return true
-    catch
+    catch e
+        (e isa WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError) || rethrow()
         return false
     end
 end
@@ -83,9 +84,23 @@ end
 function reset_ctrl_dialback!()
     SERVER.control.stop = true
     w = SERVER.control.ws
-    w === nothing || try close(w) catch end   # unblock the receive loop
+    if w !== nothing
+        try
+            close(w)                            # unblock the receive loop
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "reset_ctrl_dialback!: closing control ws failed (already gone?)" exception = e
+        end
+    end
     t = SERVER.control.task
-    t === nothing || try wait(t) catch end     # loop exits at its next stop check
+    if t !== nothing
+        try
+            wait(t)                             # loop exits at its next stop check
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "reset_ctrl_dialback!: waiting for dial loop failed" exception = e
+        end
+    end
     SERVER.control.task = nothing
     SERVER.control.ws   = nothing
     SERVER.control.stop = false

@@ -14,7 +14,8 @@ using Base64
 const SOFTSCOPE = try
     @eval import REPL
     REPL.softscope
-catch
+catch e
+    e isa InterruptException && rethrow()
     identity
 end
 
@@ -238,7 +239,9 @@ function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
             if length(png) <= cap
                 return write_show_file(out_dir, base, ".png", "image/png", png, val)
             end
-        catch
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "try_save_rich: PNG encode failed (falling through to next MIME)" exception = e
         end
     end
 
@@ -283,7 +286,8 @@ typeof_short(val) = string(typeof(val).name.name)
 function showable_safe(mime::MIME, val)
     try
         return showable(mime, val)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return false
     end
 end
@@ -296,7 +300,8 @@ function sprint_mime(val, mime::MIME)
         io = IOBuffer()
         show(io, mime, val)
         return take!(io)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return UInt8[]
     end
 end

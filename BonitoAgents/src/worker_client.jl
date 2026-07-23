@@ -327,7 +327,8 @@ function handle_worker_control(state::ServerState, ws)
             try
                 WebSockets.send(ws, JSON.json(Dict("type" => "ping")))
                 last_ping_ok[] = time()
-            catch
+            catch e
+                (e isa WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError) || rethrow()
                 break   # socket is gone — the frame loop is already tearing down
             end
         end)

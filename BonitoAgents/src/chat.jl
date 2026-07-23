@@ -5317,7 +5317,8 @@ function session_advanced_since_sync(state::ServerState, p::ProjectInfo)
     p.resume_session_id === nothing && return false
     stamp = try
         parse(Float64, strip(read(sync_stamp_path(chat_storage_dir(state, p.id, p.server_path)), String)))
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         0.0   # never synced (or unreadable stamp) → sync if the scan knows the session
     end
     for r in get(state.discovered[], p.worker_id, Dict{String,Any}[])
@@ -5912,7 +5913,8 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         # Resolve the wire name back to the provider singleton (default Claude).
         new_provider = try
             find_provider(val)
-        catch
+        catch e
+            e isa InterruptException && rethrow()
             find_provider("ClaudeCode")
         end
         current = model.provider[]

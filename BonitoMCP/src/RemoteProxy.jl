@@ -226,7 +226,9 @@ function stop_dial!(; timeout::Float64 = 10.0)
         try
             ws = b.driver.ws[]
             ws === nothing || close(ws)        # unblock serve_bridge if connected
-        catch
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "stop_dial!: closing dial-back ws failed (already gone?)" exception = e
         end
     end
     t = DIAL_TASK[]
@@ -366,7 +368,9 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             try
                 send_control(d, Dict("op" => "reply", "id" => id,
                                      "err" => sprint(showerror, e)))
-            catch
+            catch reply_e
+                reply_e isa InterruptException && rethrow()
+                @debug "handle_control: sending error reply to host failed" exception = reply_e
             end
         end
         rethrow()

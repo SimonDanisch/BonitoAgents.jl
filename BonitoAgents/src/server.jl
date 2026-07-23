@@ -473,7 +473,8 @@ end
 function _branch_on_origin(path::AbstractString, branch::AbstractString)
     try
         return !isempty(strip(read(`git -C $path ls-remote --heads origin $branch`, String)))
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return false
     end
 end
@@ -484,7 +485,8 @@ end
 function _sha_on_origin(path::AbstractString, sha::AbstractString)
     try
         return !isempty(strip(read(`git -C $path branch -r --contains $sha`, String)))
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return false
     end
 end

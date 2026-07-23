@@ -219,7 +219,8 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
                 :(isdefined(Main, :RemoteProxy) &&
                   Main.RemoteProxy.BRIDGE[] !== nothing &&
                   Main.RemoteProxy.BRIDGE[].driver.ws[] !== nothing))
-        catch
+        catch e
+            e isa InterruptException && rethrow()
             false
         end
         if worker_ws_live(); s.dial_error = ""; return s; end
@@ -360,7 +361,7 @@ function start!(s::JuliaSession)
     # Auto-Revise (best-effort) + load our format helper. The trailing
     # `; nothing` is load-bearing: include() returns the module object and
     # Malt can't serialise a `Module` reference back to the parent.
-    Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch; end; nothing))
+    Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch e; e isa InterruptException && rethrow(); end; nothing))
     Malt.remote_eval_fetch(s.worker, :(include($(helper_payload_path())); nothing))
     # The worker's PIPED stdout/stderr are write-buffered: plain `println`s in
     # user code would reach the host (and the chat's live stream tail) in
@@ -374,8 +375,9 @@ function start!(s::JuliaSession)
             flush(stderr)
             sleep(0.25)
         end
-    catch
+    catch e
         # stream closed — worker shutting down
+        (e isa Base.IOError || e isa EOFError) || rethrow()
     end; nothing))
 
     # Interactive-app dial-back is lazy (ensure_eval_dialed! from bt_show_app),
@@ -383,7 +385,7 @@ function start!(s::JuliaSession)
 
     if s.is_test
         Malt.remote_eval_fetch(s.worker,
-            :(try; using TestEnv; TestEnv.activate(); catch; end; nothing))
+            :(try; using TestEnv; TestEnv.activate(); catch e; e isa InterruptException && rethrow(); end; nothing))
     end
     return s
 end
@@ -402,7 +404,11 @@ function pump_pipe!(s::JuliaSession, pipe)
             # drains + drops (see stream_forward_loop!). Raw bytes (ANSI intact) —
             # the chat strips codes for the tail; keeping them keeps colored
             # rendering possible later without a wire change.
-            try isopen(s.stream_channel) && put!(s.stream_channel, String(data)) catch end
+            try
+                isopen(s.stream_channel) && put!(s.stream_channel, String(data))
+            catch e
+                e isa InvalidStateException || rethrow()   # channel raced closed
+            end
         end
     catch e
         e isa EOFError && return
@@ -660,7 +666,12 @@ interrupt_echo(e) = "\e[91mERROR: $(sprint(showerror, e))\e[39m"
 # ── Lifecycle ───────────────────────────────────────────────────────────────
 function kill_session!(s::JuliaSession)
     if is_alive(s)
-        try Malt.stop(s.worker) catch end
+        try
+            Malt.stop(s.worker)
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "kill_session!: Malt.stop failed (worker already gone?)" exception = e
+        end
     end
     # Deliberately NOT taken under s.lock: kill_session! must be able to reap a
     # worker whose eval ignored the interrupt, and that eval's await_or_yield
@@ -673,9 +684,19 @@ function kill_session!(s::JuliaSession)
     s.worker = nothing
     s.in_flight = nothing
     # Closing the channel ends stream_forward_loop! (the `for` over it returns).
-    try close(s.stream_channel) catch end
-    s.is_temp && s.env_path !== nothing && isdir(s.env_path) &&
-        try rm(s.env_path; recursive = true, force = true) catch end
+    try
+        close(s.stream_channel)
+    catch e
+        e isa InvalidStateException || rethrow()   # already closed
+    end
+    if s.is_temp && s.env_path !== nothing && isdir(s.env_path)
+        try
+            rm(s.env_path; recursive = true, force = true)
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "kill_session!: removing temp env failed (already gone?)" env_path = s.env_path exception = e
+        end
+    end
     return nothing
 end
 
@@ -760,7 +781,14 @@ function build_session!(m::SessionManager, key::String, env_path::Union{String,N
         start!(s)
     catch
         @lock m.lock delete!(m.creating, key)
-        s === nothing || (try kill_session!(s) catch end)
+        if s !== nothing
+            try
+                kill_session!(s)
+            catch kill_e
+                kill_e isa InterruptException && rethrow()
+                @debug "build_session!: reaping half-started session failed" exception = kill_e
+            end
+        end
         rethrow()
     end
     @lock m.lock begin
@@ -850,7 +878,12 @@ end
 function shutdown!(m::SessionManager)
     @lock m.lock begin
         for s in values(m.sessions)
-            try kill_session!(s) catch end
+            try
+                kill_session!(s)
+            catch e
+                e isa InterruptException && rethrow()
+                @debug "shutdown!: kill_session! failed" exception = e
+            end
         end
         empty!(m.sessions)
     end

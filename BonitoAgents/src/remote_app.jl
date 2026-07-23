@@ -498,7 +498,9 @@ mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
     end
 
 function handle_mcp_ctrl_ws(state::ServerState, ws)
-    line = try; String(HTTP.WebSockets.receive(ws)); catch; return; end
+    line = try; String(HTTP.WebSockets.receive(ws)); catch e
+        @warn "mcp ctrl dial-back rejected: handshake never arrived" exception=e; return
+    end
     parts = split(strip(line), ' '; limit = 2)
     if length(parts) != 2
         @warn "mcp ctrl dial-back rejected: malformed handshake (expected 2 fields 'secret project_id')" got_fields=length(parts)
@@ -568,8 +570,9 @@ function route_eval_chunk!(state::ServerState, project_id::AbstractString,
     ch === nothing && return nothing
     try
         isopen(ch) && put!(ch, chunk)
-    catch
+    catch e
         # channel closed between the read and the put — the tail loop is gone
+        e isa InvalidStateException || rethrow()
     end
     return nothing
 end
@@ -736,7 +739,8 @@ function result_descriptor(payload::AbstractString)
     startswith(s, "{") || return nothing
     d = try
         JSON.parse(s)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return nothing
     end
     d isa AbstractDict || return nothing
@@ -755,7 +759,8 @@ function bonito_upgrade_descriptor(payload::AbstractString)
     startswith(s, "{\"bonito_upgrade\"") || return nothing
     d = try
         JSON.parse(s)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return nothing
     end
     (d isa AbstractDict && get(d, "bonito_upgrade", nothing) isa AbstractDict) || return nothing
