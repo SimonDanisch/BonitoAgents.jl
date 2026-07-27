@@ -4433,14 +4433,18 @@ end
 # ── Yolo mode (autonomous auto-continue) ────────────────────────────────────
 # The nudge sent after each turn while Yolo is on. The agent bails by replying
 # just `no`; anything else is treated as "still working" and re-continues.
-const YOLO_CONTINUE_PROMPT = "Is the work really done — or can you keep going? Reply `no` only if you're certain there's nothing more you can do on your own."
+# Phrased so `no` can ONLY mean stop. The old lead-in ("Is the work really
+# done?") made `no` read as "not done, keep going" — the opposite of how we
+# interpret it — so a correct answer could halt the loop, or fail to.
+const YOLO_CONTINUE_PROMPT = "Is there anything more you can do on your own? Start your reply with `no` only if you're certain there isn't — otherwise just keep going."
 
 # Composer placeholder while Yolo is armed — the message input doubles as the
 # reminders editor then (see `chat_input_area`).
 const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Enter to lock in"
 
-# The turn's final agent reply normalized to the bail signal.
-yolo_bail(text::AbstractString) = strip(replace(lowercase(strip(text)), r"[.!]+$" => "")) == "no"
+# Bail on the reply's LEADING word — "No, everything is done." must stop too.
+# `\b` keeps "Not quite…" going; `\W*` tolerates markdown (`**No**`).
+yolo_bail(text::AbstractString) = occursin(r"^\W*no\b"i, strip(text))
 
 # The visible (dim/system-styled) auto-continue bubble the Yolo loop enqueues.
 # Appends the chat's user-editable reminders (if any) so the agent doesn't drift
@@ -4493,7 +4497,10 @@ function drain_turn!(chat::ChatModel, turn)
         # todo list would zombie a list the successor is still working.
         last_turn = lock(() -> (s.turns_active[] -= 1) == 0, s.lock)
         if last_turn
-            chat.busy_active[] = false
+            # SHARED, not `chat.busy_active`: the per-tab one is a session-scoped
+            # child (parent→child only), so writing it left the parent stuck true
+            # and every other tab/reload rendering "working" forever.
+            s.busy_active[] = false
             # The turn added messages (agent reply, tools, …) → refresh the
             # lens autocomplete vocabulary so new tool/type keys are
             # suggestable. (Emitted on mount too, but that's before any
@@ -4551,10 +4558,16 @@ function drain_turn!(chat::ChatModel, turn)
                     idx = findlast(m -> m isa AgentMsg, @view s.msgs_store[(nstore0+1):end])
                     idx === nothing ? "" : s.msgs_store[nstore0+idx].text
                 end
-                if !isempty(strip(reply)) && !yolo_bail(reply)
-                    # Real work / non-bail reply → auto-continue. (A bare `no`
-                    # bails: toggle stays on but we don't re-prompt; it re-arms
-                    # on the user's next message.)
+                # A missing reply is NOT a bail: a turn ending on a tool call has
+                # no closing text, which used to stop Yolo silently.
+                produced = lock(() -> length(s.msgs_store), s.lock) > nstore0
+                if yolo_bail(reply)
+                    # Declined → stop; re-arms on the user's next message.
+                elseif !produced
+                    # Nothing happened — stop visibly, don't spin on a dead provider.
+                    close(send!(chat, AgentMsg(chat,
+                        "_Yolo stopped: the turn ended without any output._")))
+                else
                     Base.errormonitor(@async try
                         send_message!(chat, yolo_user_msg(chat))
                     catch e
