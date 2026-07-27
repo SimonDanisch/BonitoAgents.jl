@@ -204,8 +204,11 @@ function ensure_bridge!(; compression::Bool = false)
     if BRIDGE[] === nothing
         BRIDGE[] = RemoteBridge(; compression)
         # Log every (re)build with the prefix — a rebuild starts a fresh proxied
-        # parent session, which is otherwise invisible.
-        @info "RemoteProxy: BRIDGE built" prefix = BRIDGE[].parent.id
+        # parent session, which is otherwise invisible. `@debug`, NOT `@info`:
+        # this runs inside the EVAL WORKER, whose stdout/stderr IS the
+        # `bt_julia_eval` tool result, so anything above debug level surfaces in
+        # the agent's output as noise attached to unrelated user code.
+        @debug "RemoteProxy: BRIDGE built" prefix = BRIDGE[].parent.id
     end
     return BRIDGE[].parent.id
 end
@@ -256,7 +259,7 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
         backoff = connected ? min_backoff : min(backoff * 2, max_backoff)
         sleep(backoff)
     end
-    @info "RemoteProxy: dial loop exiting (BRIDGE cleared)"
+    @debug "RemoteProxy: dial loop exiting (BRIDGE cleared)"   # eval-worker stdout ⇒ agent output
     return
 end
 
@@ -334,7 +337,7 @@ function serve_bridge(ws)
                 write_frame(ws, buf)
             end
             empty!(d.pending)
-            @info "RemoteProxy: flushed buffered frames on dial-back connect" frames = n
+            @debug "RemoteProxy: flushed buffered frames on dial-back connect" frames = n
         end
     end
     try
@@ -437,6 +440,13 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             pr = page_root_for(b, first(split(sid, '/')))
             s = pr === nothing ? nothing : Bonito.get_session(pr, sid)
             s === nothing || close(s)
+        elseif op == "evict"
+            # Free a parked eval RESULT: close its holder (a sub of the registry),
+            # dropping `current_app` — the value, its observables, and a plot's
+            # scene/GPU data — so a heavy page of apps can reclaim worker memory on
+            # demand. A later re-mount of this id fails fast → the embed shows freed.
+            h = Bonito.get_session(b.parent, String(msg["sub"]))
+            h === nothing || close(h)
         elseif op == "mount"
             # The VALUE holder lives in the registry (`parent`); it is RENDERED as
             # a fresh sub of the requesting tab's PAGE-ROOT (per-page cache), never

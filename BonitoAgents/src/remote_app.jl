@@ -730,24 +730,47 @@ function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
     body = isempty(r.snapshot) ?
         Bonito.DOM.div("(result not live — worker gone and no snapshot)"; class = "bt-tool-empty") :
         HTML(r.snapshot)
-    node = Bonito.DOM.div(body; class = "bt-remote-ref")
     eb = r.bridge
     if eb === nothing || eb.ws === nothing
-        return Bonito.jsrender(session, node)
+        return Bonito.jsrender(session, Bonito.DOM.div(body; class = "bt-remote-ref"))
     end
+    # A ✕ that CLOSES the app completely: unmount the live render AND evict the
+    # worker-side holder (frees the parked value — its observables, and for a plot
+    # the scene/GPU data). Reclaims memory on a heavy page of apps/plots; a later
+    # re-expand degrades to the static/"freed" state (the value is gone). `freed`
+    # is wired here (not in the async) so an early click is never lost; the async
+    # backfills the render-sub id it must also close.
+    freed = Bonito.Observable(false)
+    node = Bonito.DOM.div(
+        Bonito.DOM.button("✕"; class = "bt-embed-close",
+            title = "Close this app and free its memory",
+            onclick = Bonito.js"(e) => { e.stopPropagation(); $(freed).notify(true); }"),
+        body; class = "bt-remote-ref")
     node_id = Bonito.uuid(session, node)
+    render_sub = Ref{Union{Nothing,String}}(nothing)
+    Bonito.on(session, freed) do yes
+        yes || return
+        rs = render_sub[]
+        rs === nothing || close_remote_sub!(eb, rs)          # unmount the live render
+        send_ctrl(eb, Dict("op" => "evict", "sub" => r.session_id))   # free the holder value
+        isopen(session) && Bonito.evaljs(session, Bonito.js"""(() => {
+            const n = document.querySelector('[data-jscall-id="' + $(node_id) + '"]');
+            if (n) n.innerHTML = '<div class="bt-tool-empty">app closed &amp; freed</div>';
+        })()""")
+    end
     # Routing must live on the ROOT (owns the tab's websocket); `session` is the
     # transient `dom_in_js` sub the tool body renders in. `ensure_page_root!`
     # round-trips (open_root) so it runs inside the async mount, not in jsrender.
     Base.errormonitor(@async try
         prefix = ensure_page_root!(Bonito.root_session(session), eb)
-        render_sub = String(call_ctrl(eb, "mount"; sub = r.session_id, root = prefix, node = node_id))
+        sub = String(call_ctrl(eb, "mount"; sub = r.session_id, root = prefix, node = node_id))
+        render_sub[] = sub
         Bonito.on(session, session.on_close) do _
-            close_remote_sub!(eb, render_sub)
+            close_remote_sub!(eb, sub)
         end
-        # The local session may have closed while the round trip was in flight
-        # (fast collapse): the listener above will never fire, close directly.
-        Bonito.isclosed(session) && close_remote_sub!(eb, render_sub)
+        # The local session closed, or the user hit ✕, while the round trip was in
+        # flight: the listeners above never fire, so close directly.
+        (Bonito.isclosed(session) || freed[]) && close_remote_sub!(eb, sub)
     catch e
         # The placeholder keeps showing the static state; a re-expand retries
         # with a fresh mount.

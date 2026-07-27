@@ -425,8 +425,8 @@ const ChatStyles = Bonito.Styles(
         CSS("0%, 100%", "opacity" => "0.5"),
         CSS("50%",      "opacity" => "0.9")),
     # ── Provider switcher ──────────────────────────────────────────────────
-    # Dropdown to switch between Claude Code and MiMo Code. Styled as a
-    # compact pill similar to the restart button.
+    # Dropdown to switch between the providers in `current_providers()`. Styled
+    # as a compact pill similar to the restart button.
     CSS(".bt-header-provider-select",
         "appearance" => "none",
         "border" => "1px solid var(--bt-border)",
@@ -1297,6 +1297,23 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-faint)",
         "font-style" => "italic", "font-size" => "12px"),
 
+    # Live eval embed (RemoteRef). `position:relative` anchors the ✕ close/free
+    # button, which appears on hover (top-right) so it never covers the plot.
+    # Clicking it unmounts the render AND evicts the worker-side value (frees
+    # memory) — see `jsrender(::RemoteRef)`.
+    CSS(".bt-remote-ref", "position" => "relative"),
+    CSS(".bt-embed-close",
+        "position" => "absolute", "top" => "4px", "right" => "4px", "z-index" => "5",
+        "width" => "20px", "height" => "20px", "padding" => "0",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text-muted)",
+        "font-size" => "12px", "line-height" => "1", "cursor" => "pointer",
+        "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-remote-ref:hover .bt-embed-close", "opacity" => "0.85"),
+    CSS(".bt-embed-close:hover",
+        "opacity" => "1", "color" => "var(--bt-text)", "background" => "var(--bt-surface-2)"),
+
     # Media (bt_show / Read image & video) + click-to-enlarge lightbox. The wrap
     # is the hover target for the ⤢ button; the fullscreen overlay holds a clone
     # of the media and closes on backdrop click or Esc.
@@ -1413,17 +1430,29 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-subsection-body",
         "padding" => "8px 10px",
         "overflow-y" => "auto"),
+    # A console body paints the terminal surface on the BODY, not on the
+    # `.bt-console` inside it (see the chrome reset below) — so the padding
+    # gutter the scrollbar lives in is the same colour as the text area, and
+    # the bar reads as the section's own rather than as a strip floating
+    # between two nested boxes.
+    CSS(".bt-subsection-body:has(> .bt-console)",
+        "background" => "var(--bt-surface-2)"),
     # SUMMARY state: the restricted preview — `summary_lines` tall, scrolls.
-    # +16px for the body's own vertical padding so N lines are actually
-    # visible above the scrollbar. The cap lives on the SECTION, never on the
-    # tool card — every section (and the result embed below them) stays
-    # reachable in the card's default state.
+    # Sizing is content-box, so `max-height` bounds the CONTENT box and the
+    # body's own 8px padding is added on top by the layout: the cap is exactly
+    # N line-heights, no padding term. (It used to carry a `+ 16px` "for the
+    # body's padding", which double-counted it and — together with the nested
+    # console's padding+border — left 3.92 lines visible instead of 4, slicing
+    # the last row mid-glyph.) The cap lives on the SECTION, never on the tool
+    # card — every section (and the result embed below them) stays reachable in
+    # the card's default state.
     CSS("""details.bt-subsection[data-state="summary"] > .bt-subsection-body""",
-        "max-height" => "calc(var(--bt-summary-lines, 4) * 18px + 16px)"),
+        "max-height" => "calc(var(--bt-summary-lines, 4) * 18px)"),
     # FULL state: the whole content, still capped generously so one huge
-    # output can't blow up the card — the body scrolls past that.
+    # output can't blow up the card — the body scrolls past that. Whole lines
+    # here too (26 × 18px = 468px), so no state ever ends on a half row.
     CSS("""details.bt-subsection[data-state="full"] > .bt-subsection-body""",
-        "max-height" => "480px"),
+        "max-height" => "calc(26 * 18px)"),
 
     # Console block — wraps a `Bonito.RichText` terminal pane (ANSI → styled
     # HTML). Captured stdout / stderr / error backtraces render here instead
@@ -1442,6 +1471,20 @@ const ChatStyles = Bonito.Styles(
         "white-space" => "pre-wrap", "word-break" => "break-word",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
         "font-size" => "12px", "line-height" => "1.5"),
+    # …but inside a Collapsable the section ALREADY draws that box (border,
+    # radius, surface) and owns the scrollbar, so the console's own chrome is a
+    # second, smaller rounded box nested in the first. That nesting is what made
+    # the scrollbar look detached: the bar belongs to `.bt-subsection-body`, so
+    # it rendered in the 25.8px channel BETWEEN the console's border and the
+    # section's — reading as a scrollbar sitting outside the bubble. Drop the
+    # chrome (the body carries the surface) and the bar sits against the text,
+    # clipped by the section's radius. Standalone `.bt-console` (a generic tool
+    # text block, no section around it) keeps the box above.
+    CSS(".bt-subsection-body > .bt-console",
+        "background" => "transparent",
+        "border" => "none",
+        "border-radius" => "0",
+        "padding" => "0"),
     CSS(".bt-console .terminal-output",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
         "font-size" => "12px", "line-height" => "1.5",
@@ -2066,16 +2109,22 @@ const ChatStyles = Bonito.Styles(
         "border-color" => "var(--bt-error)",
         "box-shadow" => "0 0 0 3px rgba(239,68,68,0.18)"),
     # Thin, modern scrollbar instead of the Linux/Electron default with up/down
-    # arrow buttons. Only visible when textarea grows past max-height.
-    CSS(".bt-text-input",
+    # arrow buttons. EVERY element we let scroll needs to opt in — the default
+    # is the 15px native bar with arrow buttons, which is what a Collapsable
+    # body (tool Output/Code sections) used to get. Chromium honours
+    # `scrollbar-width`/`scrollbar-color` and then IGNORES the `::-webkit-`
+    # pseudo-elements, so the webkit rules are the fallback for older engines,
+    # not dead weight. On the text input it's only visible when the textarea
+    # grows past max-height.
+    CSS(".bt-text-input, .bt-subsection-body",
         "scrollbar-width" => "thin",
         "scrollbar-color" => "var(--bt-border-strong) transparent"),
-    CSS(".bt-text-input::-webkit-scrollbar",
+    CSS(".bt-text-input::-webkit-scrollbar, .bt-subsection-body::-webkit-scrollbar",
         "width" => "6px"),
-    CSS(".bt-text-input::-webkit-scrollbar-thumb",
+    CSS(".bt-text-input::-webkit-scrollbar-thumb, .bt-subsection-body::-webkit-scrollbar-thumb",
         "background" => "var(--bt-border-strong)",
         "border-radius" => "3px"),
-    CSS(".bt-text-input::-webkit-scrollbar-button",
+    CSS(".bt-text-input::-webkit-scrollbar-button, .bt-subsection-body::-webkit-scrollbar-button",
         "display" => "none"),
 
     # Send / stop buttons — circles, big enough for thumb. `box-sizing:
