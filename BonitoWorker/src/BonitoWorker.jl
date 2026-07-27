@@ -898,7 +898,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
                 env_overrides)
 
     # `provider.args` carries any required subcommand (e.g. `["acp"]` for
-    # mimo/opencode, whose ACP server lives under that subcommand).
+    # mimo/opencode/kimi, whose ACP server lives under that subcommand).
     agent_args = provider.args
     proc = try
         open(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd), "r+")

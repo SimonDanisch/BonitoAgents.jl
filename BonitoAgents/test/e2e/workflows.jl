@@ -125,6 +125,12 @@ function run_suite(server)
             opts = TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return s ? [...s.options].map(o => o.textContent.trim()) : []; })()")
             @test "Mock Agent" in opts
             @test "Mock Agent 2" in opts
+            # Every registered provider reaches the dropdown, not just the mocks
+            # — the menu is built from `current_providers()`, so a provider that
+            # is registered but missing here means the UI and the registry drifted.
+            for p in ("Claude Code", "MiMo Code", "OpenCode", "Kimi Code")
+                @test p in opts
+            end
             # Must really start on the default — otherwise the switch below would be
             # a no-op early-return and prove nothing.
             @test TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent'; })()") == true

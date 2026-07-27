@@ -1,6 +1,6 @@
 # Agents — the SERVER-side live agent.
 #
-# Provider DESCRIPTORS (ClaudeCodeAgent/MiMoAgent/OpenCodeAgent/MockAgent), their
+# Provider DESCRIPTORS (ClaudeCodeAgent/MiMoAgent/OpenCodeAgent/KimiAgent/MockAgent), their
 # `provider_name`/`label`/`icon` dispatch, and `current_providers()` /
 # `find_provider` live in the AgentProviders package — the single source of truth,
 # shared with the worker. This file defines the live agent the SERVER drives:
@@ -18,7 +18,7 @@
 #     agent_cwd(a)         the path the agent sees as its working directory
 
 import AgentProviders: AgentProvider, BinAgent,
-                       ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent,
+                       ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent,
                        provider_name, label, icon, resumable_session,
                        current_providers, find_provider
 

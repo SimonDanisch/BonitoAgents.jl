@@ -39,13 +39,31 @@ including the conversation history, which the dashboard reconciles into its
 transcript. Resuming a session continues it with the same context, now with
 the dashboard's rendering, file tree and live-app tooling on top.
 
-## MiMo and OpenCode
+## MiMo, OpenCode and Kimi Code
 
-Descriptors for [MiMo](https://github.com/XiaomiMiMo) and
-[OpenCode](https://github.com/sst/opencode) ship in the registry (both expose
-ACP under an `acp` subcommand). Select them per chat from the provider
+Descriptors for [MiMo](https://github.com/XiaomiMiMo),
+[OpenCode](https://github.com/sst/opencode) and
+[Kimi Code](https://github.com/MoonshotAI) ship in the registry (all three
+expose ACP under an `acp` subcommand). Select them per chat from the provider
 dropdown; switching providers mid-project starts the next turn under the new
 agent.
+
+Kimi Code additionally advertises ACP `session/load`, but its sessions are not
+resumed across a server restart yet: a project stores its session id without
+the provider that created it, so restoring one under a different provider would
+fail. Only Claude Code resumes today.
+
+### Tool cards across providers
+
+`bt_julia_eval` and the other `btworker` tools render as the same typed cards
+whichever agent calls them, even though ACP leaves it up to the agent how to
+identify an MCP tool. Claude Code states the name in a `_meta` extension, Kimi
+puts it in the ACP title as `mcp__btworker__bt_julia_eval`, OpenCode as
+`btworker_bt_julia_eval`, and Kimi streams the arguments as content text rather
+than `rawInput`. All of these are normalised back to `(server, tool)` plus the
+real arguments, so the code preview, output pane and live embeds behave the
+same everywhere. A tool we don't recognise is left untouched and shows the
+generic card.
 
 ## The mock agent
 

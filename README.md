@@ -38,7 +38,7 @@ subscription.
 ```
 
 Agents are pluggable [ACP](https://agentclientprotocol.com) providers:
-Claude Code by default, with MiMo and OpenCode adapters included
+Claude Code by default, with MiMo, OpenCode and Kimi Code adapters included
 ([`AgentProviders/`](AgentProviders/)).
 
 ## Features

@@ -130,13 +130,13 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # Build the provider singleton list ONCE here, on the uncontended startup path
     # (ENV is now fully configured; no browser is attached yet). Without this the
     # list is built lazily on the FIRST chat bind — and that first build compiles
-    # four descriptor constructors, reached concurrently from the bind path
+    # every descriptor constructor, reached concurrently from the bind path
     # (`default_provider`) AND the provider-dropdown render (`current_providers`).
     # Under nworkers=4 load that concurrent first-build stalled the bind for >90 s
     # ("chat view opened" timeout); worse, since the memo only caches AFTER a full
     # build, a stalled build was never cached, so every later bind on that worker
     # re-entered the build and re-hung. `refresh_providers!` builds + first-compiles
-    # the four descriptor constructors once here, uncontended, so no bind ever
+    # every descriptor constructor once here, uncontended, so no bind ever
     # first-builds it; it also rebuilds from the now-complete ENV, so a list
     # memoised earlier (before `BT_ENABLE_MOCK_AGENT` was set) can't hide the mock.
     refresh_providers!()

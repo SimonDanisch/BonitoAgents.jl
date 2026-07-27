@@ -13,7 +13,7 @@ module AgentProviders
 # memoised. `find_provider(name)` maps the wire name back to its singleton.
 
 export AgentProvider, BinAgent
-export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent, MockAgent2
+export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent, MockAgent2
 export provider_name, label, icon, resumable_session
 export current_providers, find_provider, refresh_providers!
 
@@ -39,6 +39,11 @@ function opencode_bin()
     e = get(ENV, "OPENCODE_AGENT_ACP", ""); isempty(e) || return e
     b = Sys.which("opencode"); b !== nothing && return b
     p = joinpath(homedir(), ".opencode", "bin", "opencode"); isfile(p) ? p : "opencode"
+end
+function kimi_bin()
+    e = get(ENV, "KIMI_AGENT_ACP", ""); isempty(e) || return e
+    b = Sys.which("kimi"); b !== nothing && return b
+    p = joinpath(homedir(), ".kimi-code", "bin", "kimi"); isfile(p) ? p : "kimi"
 end
 # The mock runs as a Julia application: `julia --project=<env> -m MockACP`. The
 # test harness sets `BT_MOCK_PROJECT` to the env where MockACP is resolvable (the
@@ -71,8 +76,8 @@ ClaudeCodeAgent() = ClaudeCodeAgent(claude_bin(), String[],
 struct MiMoAgent <: BinAgent
     bin::String; args::Vector{String}; env::Dict{String,String}; elicitation::Dict{String,Any}
 end
-# `mimo`/`opencode` are multi-command CLIs whose ACP server lives under the `acp`
-# subcommand; the bare binary launches their TUI and never speaks ACP.
+# `mimo`/`opencode`/`kimi` are multi-command CLIs whose ACP server lives under the
+# `acp` subcommand; the bare binary launches their TUI and never speaks ACP.
 MiMoAgent() = MiMoAgent(mimo_bin(), ["acp"], Dict{String,String}(),
     Dict{String,Any}("form" => Dict{String,Any}()))
 
@@ -81,6 +86,23 @@ struct OpenCodeAgent <: BinAgent
 end
 OpenCodeAgent() = OpenCodeAgent(opencode_bin(), ["acp"], Dict{String,String}(),
     Dict{String,Any}("form" => Dict{String,Any}()))
+
+struct KimiAgent <: BinAgent
+    bin::String; args::Vector{String}; env::Dict{String,String}; elicitation::Dict{String,Any}
+end
+KimiAgent() = KimiAgent(kimi_bin(), ["acp"], Dict{String,String}(),
+    Dict{String,Any}("form" => Dict{String,Any}()))
+
+# NOTE — `elicitation["form"]` is an OBJECT for every provider above, never
+# `true`, and that is not cosmetic. The ACP schema declares
+# `zElicitationFormCapabilities = z.object({…})` and reads it through
+# `defaultOnError(…, () => undefined)`, so a BOOLEAN does not error: it is
+# silently replaced by `undefined` and the form capability is DROPPED —
+# AskUserQuestion just stops working, with nothing in any log. (Verified against
+# the installed schema, acp 0.62.0; the same held on 0.44.0.) Kimi validates
+# strictly instead and rejects the boolean outright with `-32602 Invalid params`
+# ("expected object, received boolean"), which is how the silent version was
+# finally noticed. `unit:providers` pins the shape so it can't drift back.
 
 struct MockAgent <: BinAgent
     bin::String; args::Vector{String}; env::Dict{String,String}; elicitation::Dict{String,Any}
@@ -116,18 +138,21 @@ end
 provider_name(::ClaudeCodeAgent) = "ClaudeCode"
 provider_name(::MiMoAgent)       = "MiMoCode"
 provider_name(::OpenCodeAgent)   = "OpenCode"
+provider_name(::KimiAgent)       = "KimiCode"
 provider_name(::MockAgent)       = "MockCode"
 provider_name(::MockAgent2)      = "MockCode2"
 
 label(::ClaudeCodeAgent) = "Claude Code"
 label(::MiMoAgent)       = "MiMo Code"
 label(::OpenCodeAgent)   = "OpenCode"
+label(::KimiAgent)       = "Kimi Code"
 label(::MockAgent)       = "Mock Agent"
 label(::MockAgent2)      = "Mock Agent 2"
 
 icon(::ClaudeCodeAgent) = "bt-provider-claude"
 icon(::MiMoAgent)       = "bt-provider-mimo"
 icon(::OpenCodeAgent)   = "bt-provider-opencode"
+icon(::KimiAgent)       = "bt-provider-kimi"
 icon(::MockAgent)       = "bt-provider-mock"
 icon(::MockAgent2)      = "bt-provider-mock"
 
@@ -136,6 +161,16 @@ icon(::MockAgent2)      = "bt-provider-mock"
 # `session/load` re-attach: ClaudeCode does, and the mock mimics it (it answers
 # `session/load`). MiMo/OpenCode don't, so persisting their id would make the
 # next bring-up `session/load` a session that provider never created.
+#
+# Kimi is the interesting case: it DOES advertise `loadSession` and answers
+# `session/load` for an id it created, but it still belongs in the `false` camp,
+# because the persistence layer stores the session id WITHOUT the provider that
+# minted it (`ProjectInfo.resume_session_id`, no provider field) and every
+# bring-up constructs its `WorkerAgent` with `default_provider()`. A persisted
+# kimi id would therefore come back up under ClaudeCode and `session/load` an id
+# claude never created — the dead-chat failure `switch_provider!` clears the id
+# to avoid. Flipping this to `true` REQUIRES persisting the provider per project
+# first.
 resumable_session(::AgentProvider)  = false
 resumable_session(::ClaudeCodeAgent) = true
 resumable_session(::MockAgent)       = true
@@ -150,7 +185,7 @@ const _PROVIDERS = Ref{Vector{AgentProvider}}()
 # reached from at least two independent tasks — the chat-bind path
 # (`default_provider` → `find_provider`) and the provider-dropdown render
 # (`current_providers` in the chat header) — and the FIRST call also triggers
-# first-time compilation of the four descriptor constructors. With no lock, two
+# first-time compilation of every descriptor constructor. With no lock, two
 # tasks could enter the build concurrently and deadlock against each other on
 # Julia's codegen lock while first-compiling the same methods, stranding the
 # chat-bind for >90 s. Because the memo only writes `_PROVIDERS[]` AFTER a full
@@ -163,7 +198,7 @@ const _PROVIDERS_LOCK = ReentrantLock()
 # is offered only when `BT_ENABLE_MOCK_AGENT` is set — so the result depends on
 # ENV at the moment of the call, which is exactly why the memo below must not be
 # populated before the spawner has finished configuring that ENV.
-_build_providers() = (ps = AgentProvider[ClaudeCodeAgent(), MiMoAgent(), OpenCodeAgent()];
+_build_providers() = (ps = AgentProvider[ClaudeCodeAgent(), MiMoAgent(), OpenCodeAgent(), KimiAgent()];
                       haskey(ENV, "BT_ENABLE_MOCK_AGENT") && append!(ps, (MockAgent(), MockAgent2())); ps)
 
 function current_providers()
@@ -180,8 +215,8 @@ end
 
 Force-rebuild the memoised provider list from the CURRENT ENV and return it.
 `dev_server` calls this once, right after it finishes writing the agent ENV, for
-two reasons: (1) it WARMS the list — building + first-compiling the four
-descriptor constructors on the uncontended startup path, so the first chat bind
+two reasons: (1) it WARMS the list — building + first-compiling every
+descriptor constructor on the uncontended startup path, so the first chat bind
 never triggers that build concurrently with the provider-dropdown render (which
 under load stalled the bind >90 s and, never being cached, wedged every later
 bind on the worker); and (2) it OVERRIDES any list memoised earlier — e.g. before

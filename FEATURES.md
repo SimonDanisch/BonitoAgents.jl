@@ -40,8 +40,8 @@ enumerates.
 
 ## Agents & providers
 
-- Pluggable **ACP providers**: Claude Code (default), MiMo, OpenCode, plus a
-  deterministic scriptable **mock agent** for demos and tests (no API key).
+- Pluggable **ACP providers**: Claude Code (default), MiMo, OpenCode, Kimi Code,
+  plus a deterministic scriptable **mock agent** for demos and tests (no API key).
 - Per-chat provider dropdown, resolved on the worker (binaries checked where
   they run); switching providers takes effect on the next turn.
 - Session **resume**: continue an existing Claude Code session from the
