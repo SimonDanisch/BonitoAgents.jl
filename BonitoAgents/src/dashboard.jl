@@ -59,6 +59,33 @@ Create a new project on the named worker. Steps:
    `state.chat_models[id]` so `unified_main` can render it when the user
    selects this project in the sidebar.
 """
+# ── Foreign (worker) path hygiene ───────────────────────────────────────────
+# A worker can run a different OS than the server, so `ProjectInfo.worker_path`
+# is a path string the server only ever STORES and echoes back — it must never
+# be interpreted with the server's own separator.
+#
+# Windows paths are the hazard. A backslash is an escape character in JS string
+# literals, so a `C:\Users\sdani\Programmieren\VulkanDev` that reaches JS
+# unescaped comes back as `C:UserssdaniProgrammierenVulkanDev` — `\U`, `\s` and
+# `\P` are invalid escapes and JS just drops the backslash. Reported from a real
+# Windows worker: every `session/load` then ran with a cwd that doesn't exist.
+#
+# Windows accepts forward slashes everywhere, and forward slashes survive JS,
+# JSON and HTML untouched, so we normalize ONCE on the way in and store only
+# forward-slash paths. Linux paths are left alone — a backslash is a legal
+# character in a Linux filename, so rewriting one would corrupt it.
+windows_path(p::AbstractString) =
+    occursin(r"^[A-Za-z]:[\\/]", p) || startswith(p, "\\\\")
+
+normalize_worker_path(p::AbstractString) =
+    windows_path(p) ? replace(String(p), '\\' => '/') : String(p)
+
+# A drive letter followed by something that is NOT a separator (`C:Users…`) is a
+# path whose backslashes were already eaten. It cannot be repaired — the
+# separator positions are gone — so callers refuse it loudly rather than store a
+# project whose every session bring-up fails with an inexplicable cwd.
+mangled_windows_path(p::AbstractString) = occursin(r"^[A-Za-z]:[^\\/]", p)
+
 function create_project!(state::ServerState, name::String, src_path::String,
                           worker_name::String;
                           progress = nothing)
@@ -71,7 +98,11 @@ function create_project!(state::ServerState, name::String, src_path::String,
 
     w = state.workers[][worker_name]
     server_path = compute_server_path(state, worker_name, name)
-    worker_path = joinpath(w.projects_root, name)
+    # NOT `joinpath`: that uses the SERVER's separator, so a Windows worker's
+    # `C:\Users\x\projects` would come out as `C:\Users\x\projects/Name`.
+    # `normalize_worker_path` has already made it forward-slash, so a plain
+    # join is both correct and consistent with what we store everywhere else.
+    worker_path = rstrip(normalize_worker_path(w.projects_root), '/') * "/" * name
 
     # Idempotent re-import: if the same folder on the same worker is already
     # registered, return the existing entry instead of creating a duplicate.
@@ -129,11 +160,21 @@ restarts.
 """
 function create_project_from_worker!(state::ServerState, worker_name::String,
                                       worker_path::String;
-                                      name::String = basename(rstrip(worker_path, '/')),
+                                      name::String = basename(rstrip(normalize_worker_path(worker_path), '/')),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
                                       start_session::Bool = true,
                                       progress = nothing)
+    # A worker may run a different OS than the server, so `worker_path` is a
+    # FOREIGN path the server only stores and echoes back — normalize it once,
+    # HERE, before it is stored or used to derive anything. See
+    # `normalize_worker_path`. (`name`'s default above uses the normalized form
+    # too: `basename` of a backslash path on a Linux server returns the WHOLE
+    # string, which made the project name the entire path.)
+    mangled_windows_path(worker_path) && error(
+        "Worker path '$worker_path' lost its separators (a Windows path whose " *
+        "backslashes were eaten). It can't be repaired — re-pick the folder.")
+    worker_path = normalize_worker_path(worker_path)
     # `start_session=false` skips the post-registration ACP session
     # bring-up. Used by tests that exercise the import logic without
     # needing a real worker subprocess; production callers always want
