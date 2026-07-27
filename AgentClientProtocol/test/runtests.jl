@@ -2,6 +2,7 @@ using AgentClientProtocol
 using Test
 import HTTP
 import Sockets
+import JSON
 
 const ACP = AgentClientProtocol
 
@@ -490,4 +491,159 @@ end
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
         relay_close!(m)
     end
+end
+
+# ── Non-claude agents: MCP tool identity + arguments ─────────────────────────
+# Replays the REAL frames `kimi acp` 0.29.2 emitted while driving the real
+# btworker MCP server (captured verbatim into test/fixtures). A non-claude agent
+# ships no `_meta.claudeCode` envelope and no `rawInput` at all: it names the
+# tool in the ACP `title` and streams the ARGUMENTS as growing content text.
+# Parsed naively that yields a nameless `GenericTool` whose "output" is
+# half-typed argument JSON — the same tool rendering completely differently
+# depending on which agent ran it, with an empty code preview.
+@testset "MCP tool call from a non-claude agent (real kimi wire)" begin
+    frames = [JSON.parse(l) for l in
+              readlines(joinpath(@__DIR__, "fixtures", "kimi_mcp_tool_call.jsonl"))]
+    @test !isempty(frames)
+    # The fixture must stay a genuine non-claude capture, or it stops guarding
+    # anything: NO `_meta` envelope anywhere, so the tool is identifiable only
+    # through its title. `rawInput` shows up on exactly one late frame (the one
+    # that completes the argument stream), so it cannot name the tool either —
+    # every earlier frame has to be routed on the title alone.
+    @test !any(f -> haskey(f, "_meta"), frames)
+    @test count(f -> haskey(f, "rawInput"), frames) == 1
+    @test !haskey(frames[1], "rawInput")
+
+    out = Channel{Any}(256)
+    st  = ACP.TurnState()
+    for f in frames
+        ACP.parse_update!(out, st, ACP.parse_session_update(f))
+    end
+    close(st); close(out)
+    tools = [x for x in collect(out) if x isa ACP.ToolCall]
+    @test length(tools) == 1
+    tc = tools[1]
+
+    # Identity recovered from the title → the typed MCP path, not GenericTool.
+    @test tc isa ACP.MCPCall
+    @test tc.server == "btworker"
+    @test tc.tool_name == "bt_julia_eval"
+    # Arguments recovered from the streamed content → a filled code preview.
+    @test tc.raw_input["code"] == "1+1"
+    @test tc.raw_input["env_path"] == "/tmp/kimiprobe"
+    # …and the streamed argument JSON never leaks into the content the UI shows
+    # as output: only the tool's real result survives.
+    @test tc.status == "completed"
+    @test [c.text for c in tc.content if c isa ACP.TextContent] == ["2"]
+end
+
+# Native (non-MCP) tools from the same agent. Kimi labels them with Claude's own
+# names — `Read`, `Bash`, `Agent` — but only on the OPENING frame: a later frame
+# replaces the title with a sentence ("Running: echo …"). Without reading that
+# opening title a shell call has no command to show and a delegation has no Task
+# card, which is what "it used something else instead of subagents" looks like.
+@testset "native tool calls from a non-claude agent (real kimi wire)" begin
+    frames = [JSON.parse(l) for l in
+              readlines(joinpath(@__DIR__, "fixtures", "kimi_native_tools.jsonl"))]
+    @test !any(f -> haskey(f, "_meta"), frames)      # still a genuine non-claude capture
+
+    out = Channel{Any}(1024)
+    st  = ACP.TurnState()
+    for f in frames
+        ACP.parse_update!(out, st, ACP.parse_session_update(f))
+    end
+    close(st); close(out)
+    tools = [x for x in collect(out) if x isa ACP.ToolCall]
+    @test length(tools) == 3
+    rd, sh, ag = tools
+
+    @test rd isa ACP.GenericTool && rd.name == "Read" && rd.kind == "read"
+    @test rd.raw_input["path"] == "hello.txt"
+
+    # The shell call is the one that was landing as a nameless generic pill.
+    @test sh isa ACP.BashCall
+    @test sh.command == "echo NATIVEPROBE"
+    @test !sh.run_in_background
+
+    # Delegation: a real Task call, with the sub-prompt it dispatched.
+    @test ag isa ACP.TaskCall
+    @test ag.description == "Count lines in hello.txt"
+    @test occursin("hello.txt", ag.prompt)
+
+    # None of the half-typed argument JSON that streams through `content` may
+    # survive as the tool's output.
+    for t in tools
+        for c in t.content
+            c isa ACP.TextContent || continue
+            @test !startswith(lstrip(c.text), "{\"")
+        end
+    end
+    @test occursin("NATIVEPROBE", sh.content[end].text)
+end
+
+# The claude path must be entirely unaffected by the two fallbacks above: it
+# names tools through `_meta` and sends `rawInput`, so a content frame stays
+# content even when it happens to look like a JSON object.
+@testset "claude-shaped MCP frames keep _meta/rawInput semantics" begin
+    id = "toolu_1"
+    call = Dict("sessionUpdate" => "tool_call", "toolCallId" => id,
+                "title" => "Run julia code",
+                "kind" => "other", "status" => "pending", "content" => [],
+                "_meta" => Dict("claudeCode" => Dict("toolName" => "mcp__btworker__bt_julia_eval")),
+                "rawInput" => Dict("code" => "2+2", "env_path" => "/tmp/x"))
+    # A JSON-object-shaped OUTPUT chunk mid-flight must still be treated as
+    # content — the arguments are already known, so the recovery stays dormant.
+    mid  = Dict("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+                "status" => "in_progress",
+                "content" => [Dict("type" => "content",
+                                   "content" => Dict("type" => "text",
+                                                     "text" => "{\"partial\":true}"))])
+    fin  = Dict("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+                "status" => "completed",
+                "content" => [Dict("type" => "content",
+                                   "content" => Dict("type" => "text", "text" => "4"))])
+    out = Channel{Any}(64)
+    st  = ACP.TurnState()
+    for f in (call, mid, fin)
+        ACP.parse_update!(out, st, ACP.parse_session_update(f))
+    end
+    close(st); close(out)
+    tc = only([x for x in collect(out) if x isa ACP.ToolCall])
+    @test tc isa ACP.MCPCall
+    @test tc.tool_name == "bt_julia_eval"
+    @test tc.raw_input["code"] == "2+2"        # from rawInput, not from content
+    @test tc.content[end].text == "4"
+end
+
+# The title fallback is narrow on purpose: only the canonical MCP form counts,
+# so a human-readable title can never be mistaken for a tool name.
+@testset "title fallback accepts only mcp__server__tool" begin
+    @test ACP.is_mcp_tool_name("mcp__btworker__bt_julia_eval")
+    @test !ACP.is_mcp_tool_name("Run julia code")
+    @test !ACP.is_mcp_tool_name("mcp__btworker__")      # empty tool
+    @test !ACP.is_mcp_tool_name("mcp____bt_julia_eval") # empty server
+    @test !ACP.is_mcp_tool_name("mcp__btworker")        # no separator
+    @test !ACP.is_mcp_tool_name("")
+end
+
+# A tool NAME is one token; every human title kimi emitted has a space in it.
+@testset "bare-name titles are told apart from human titles" begin
+    for name in ("Read", "Bash", "Agent", "TodoWrite", "mcp__btworker__bt_julia_eval")
+        @test ACP.looks_like_tool_name(name)
+    end
+    for title in ("Reading hello.txt", "Running: echo NATIVEPROBE",
+                  "Launching explore agent: Count lines", "", " ")
+        @test !ACP.looks_like_tool_name(title)
+    end
+
+    # …and a mutated title on a LATER frame must not overwrite the name the
+    # opening frame established, or a completed Bash would lose its identity.
+    open_frame = Dict("sessionUpdate" => "tool_call", "toolCallId" => "t1",
+                      "title" => "Bash", "kind" => "execute", "status" => "pending",
+                      "content" => [])
+    later      = Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "t1",
+                      "title" => "Running: echo hi", "status" => "in_progress",
+                      "content" => [])
+    @test ACP.parse_session_update(open_frame).tool_name == "Bash"
+    @test ACP.parse_session_update(later).tool_name === nothing
 end

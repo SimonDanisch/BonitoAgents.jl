@@ -565,6 +565,52 @@ function run_dispatcher_prompt(prompt_id)
                     "toolCallId" => tid, "status" => "completed",
                     "content" => packed, "_meta" => meta))
             end
+        elseif et == "kimi_tool"
+            # A tool call in KIMI's wire dialect rather than claude's. Captured
+            # verbatim from kimi 0.29.2 (see AgentClientProtocol/test/fixtures/
+            # kimi_*.jsonl); the differences that matter to the chat are:
+            #
+            #   • NO `_meta.claudeCode` envelope anywhere — the tool's identity
+            #     is the ACP `title` on the OPENING frame only.
+            #   • That title is then REPLACED by a human sentence ("Running:
+            #     echo hi") on a later frame, so a consumer that re-reads it
+            #     loses the name.
+            #   • The arguments STREAM as growing `content` text (partial JSON),
+            #     and `rawInput` appears only once, near the end.
+            #
+            # Claude's shape is emitted by every other event here, so both live
+            # side by side and the chat has to handle each.
+            tid  = String(get(ev, "id", "ktool-$(next_tool_id)")); next_tool_id += 1
+            name = String(ev["name"])
+            kind = String(get(ev, "kind", "other"))
+            args = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
+            args_json = JSON.json(args)
+            text_block(s) = Any[Dict{String,Any}(
+                "type" => "content", "content" => Dict("type" => "text", "text" => s))]
+
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => kind,
+                "title" => name, "status" => "pending",
+                "content" => text_block("")))
+            # Partial-JSON prefixes, the way kimi types the arguments out. A few
+            # cut points are enough to prove none of them leak into the output.
+            n = lastindex(args_json)
+            for frac in (0.25, 0.5, 0.75)
+                cut = thisind(args_json, max(1, floor(Int, n * frac)))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => "in_progress",
+                    "content" => text_block(args_json[1:cut])))
+                pause()
+            end
+            # The one frame that carries `rawInput` — and swaps in a human title.
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid, "status" => "in_progress", "kind" => kind,
+                "title" => String(get(ev, "human_title", "Running $name")),
+                "rawInput" => args, "content" => text_block(args_json)))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid,
+                "status" => String(get(ev, "status", "completed")),
+                "content" => pack_tool_content(get(ev, "content", Any[]))))
         elseif et == "tool"
             # Generic tool call of any kind (edit/search/execute/other). Opens
             # the bubble, then (unless complete=false) ships content + a final

@@ -425,6 +425,55 @@ function merge_late_input!(tc::TaskCall, ri::AbstractDict)
     return nothing
 end
 
+# Do we already know this call's arguments? Each variant answers for the field
+# it would actually show, so the streamed-input recovery below stays dormant the
+# moment real arguments exist — which for claude-agent-acp is immediately, since
+# it always sends them in `rawInput`.
+input_known(::ToolCall)         = true
+input_known(tc::GenericTool)    = !isempty(tc.raw_input)
+input_known(tc::MCPCall)        = !isempty(tc.raw_input)
+input_known(tc::BashCall)       = !isempty(tc.command)
+input_known(tc::TaskCall)       = !isempty(tc.prompt)
+input_known(tc::TodoWriteCall)  = !isempty(tc.entries)
+
+"""
+    streamed_input_text(tc, u) -> String or nothing
+
+The text of a `tool_call_update` that is the agent STREAMING this call's
+arguments rather than reporting output, or `nothing` when the frame is ordinary
+content.
+
+Deliberately narrow, so an agent that reports output normally is never
+misread: it fires only when the frame carries no `rawInput` of its own, the
+call still has NO arguments at all, the frame is non-terminal, and its content
+is exactly one text block that opens a JSON object. claude-agent-acp always
+puts arguments in `rawInput`, so `input_known` is already true by the time any
+content arrives and this path stays dormant for it.
+"""
+function streamed_input_text(tc::ToolCall, u::ToolCallUpdateNotif)
+    u.raw_input === nothing || return nothing
+    input_known(tc) && return nothing
+    is_terminal(something(u.status, tc.status)) && return nothing
+    length(u.content) == 1 || return nothing
+    c = u.content[1]
+    c isa TextContent || return nothing
+    t = lstrip(c.text)
+    return startswith(t, "{") ? String(t) : nothing
+end
+
+# The streamed argument text is a complete JSON object only on the LAST
+# non-terminal frame; every earlier prefix is a parse error, which is the
+# expected steady state here and not something to report.
+function parse_json_object(s::AbstractString)
+    v = try
+        JSON.parse(s)
+    catch e
+        e isa InterruptException && rethrow()
+        return nothing
+    end
+    return v isa AbstractDict ? Dict{String,Any}(String(k) => x for (k, x) in v) : nothing
+end
+
 function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never touches the text bubble
     tc = get(st.tools, u.tool_call_id, nothing)
     tc === nothing && return nothing
@@ -432,7 +481,21 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
     u.title  !== nothing && (tc.title  = u.title)
     u.raw_input === nothing || merge_late_input!(tc, u.raw_input)
     u.tool_name === nothing || !(tc isa GenericTool) || (tc.name = u.tool_name)
-    isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+    # Agents that never send `rawInput` stream the tool's ARGUMENTS as content
+    # text instead (verified against kimi 0.29.2: 14 non-terminal frames going
+    # `{"code":"` → `{"code":"1` → … → the complete argument object, then one
+    # terminal frame whose content is the real result). Taking those at face
+    # value renders half-typed argument JSON as the tool's OUTPUT and leaves the
+    # arguments unknown — an eval card with a flickering Output pane and an
+    # empty Code box. Route them to the input instead, and don't let them
+    # overwrite content. See `streamed_input_text`.
+    args_text = streamed_input_text(tc, u)
+    if args_text === nothing
+        isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+    else
+        parsed = parse_json_object(args_text)
+        parsed === nothing || merge_late_input!(tc, parsed)
+    end
     # Async subagent: the `async_launched` update carries the transcript
     # `outputFile` in `_meta.claudeCode.toolResponse` — the only deterministic
     # completion signal (the tool_call itself is `completed` at launch). Capture

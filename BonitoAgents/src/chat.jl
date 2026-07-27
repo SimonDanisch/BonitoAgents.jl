@@ -547,8 +547,13 @@ ReadToolMsg(message::Message) = ReadToolMsg(message, "")
 mutable struct SearchToolMsg <: BuiltinToolMsg    # kind "search" (Grep / Glob)
     message::Message
     path::String                  # the searched root, when the call carries one
+    # WHAT was searched for. Kept separate from `path` on purpose: `path` feeds
+    # `tool_path_hint`, which drives the open-this-file affordance, so a glob or
+    # regex must never end up there. Kimi sends ONLY this (no path at all), so
+    # without it a search card has nothing to show but a hit count.
+    pattern::String
 end
-SearchToolMsg(message::Message) = SearchToolMsg(message, "")
+SearchToolMsg(message::Message) = SearchToolMsg(message, "", "")
 
 mutable struct MoveToolMsg <: BuiltinToolMsg      # kind "move"
     message::Message
@@ -570,6 +575,29 @@ const BUILTIN_MSG_TYPES = Dict{String,DataType}(
 )
 builtin_msg_type(kind::AbstractString) = get(BUILTIN_MSG_TYPES, kind, GenericToolMsg)
 
+# …but the ACP `kind` is a coarse category and agents disagree about it: kimi
+# tags BOTH `Grep` and `Glob` as kind "read" (verified on the wire), so keying
+# on kind alone turns every search into a `ReadToolMsg` that then finds no file
+# path and renders blank. The tool NAME is strictly more specific, so it wins
+# when the agent gave one. Claude agrees on every entry here (its `Grep` already
+# arrives as kind "search"), so this only ever REFINES a coarser kind.
+const BUILTIN_NAME_TYPES = Dict{String,DataType}(
+    "Read"         => ReadToolMsg,
+    "Edit"         => EditToolMsg,
+    "Write"        => EditToolMsg,
+    "MultiEdit"    => EditToolMsg,
+    "NotebookEdit" => EditToolMsg,
+    "Grep"         => SearchToolMsg,
+    "Glob"         => SearchToolMsg,
+    "WebFetch"     => FetchToolMsg,
+)
+builtin_msg_type(kind::AbstractString, name::AbstractString) =
+    get(BUILTIN_NAME_TYPES, name, builtin_msg_type(kind))
+
+# The tool name an ACP call carries, or "" — only the untyped fallback keeps one.
+tool_call_name(::AgentClientProtocol.ToolCall) = ""
+tool_call_name(tc::AgentClientProtocol.GenericTool) = tc.name
+
 # ── Streamed-input parsing ──────────────────────────────────────────────────
 # Parse the wire rawInput into the variant's TYPED fields. Called at build time
 # AND per `tool_call_update` snap (the arguments stream in late), so every
@@ -577,12 +605,17 @@ builtin_msg_type(kind::AbstractString) = get(BUILTIN_MSG_TYPES, kind, GenericToo
 apply_input!(::ToolMsg, ::AbstractDict) = nothing
 apply_input!(m::GenericToolMsg, raw::AbstractDict) = (merge!(m.raw_input, raw); nothing)
 function apply_input!(m::ReadToolMsg, raw::AbstractDict)
-    fp = get(raw, "file_path", nothing)
+    # Agents name this argument differently — claude-agent-acp `file_path`, kimi
+    # `path` (both verified on the wire) — and with the wrong key the card just
+    # shows no file at all. `file_path` wins when an agent sends both.
+    fp = get(raw, "file_path", get(raw, "path", nothing))
     fp isa AbstractString && !isempty(fp) && (m.file_path = String(fp))
     return nothing
 end
 function apply_input!(m::EditToolMsg, raw::AbstractDict)
-    fp = get(raw, "file_path", nothing)
+    # `file_path` (claude) vs `path` (kimi) — see `apply_input!(::ReadToolMsg, …)`.
+    # kimi's `Edit`/`Write` otherwise diff correctly but against a nameless file.
+    fp = get(raw, "file_path", get(raw, "path", nothing))
     fp isa AbstractString && !isempty(fp) && (m.file_path = String(fp))
     # Rebuild the diff from the edit's own input. Edit → old_string/new_string;
     # Write → `content` is the whole new file (empty old side); MultiEdit → the
@@ -604,6 +637,8 @@ end
 function apply_input!(m::SearchToolMsg, raw::AbstractDict)
     p = get(raw, "path", nothing)
     p isa AbstractString && !isempty(p) && (m.path = String(p))
+    pat = get(raw, "pattern", nothing)
+    pat isa AbstractString && !isempty(pat) && (m.pattern = String(pat))
     return nothing
 end
 
@@ -807,6 +842,48 @@ const MCP_MSG_TYPES = Dict{String,DataType}(
     "bt_show"                => ShowToolMsg,
 )
 mcp_msg_type(tool_name::AbstractString) = get(MCP_MSG_TYPES, tool_name, GenericMCPToolMsg)
+
+"""
+    resolve_mcp_tool(name) -> (server, tool) or nothing
+
+Recover `(server, tool)` from whatever an agent calls one of OUR MCP tools, or
+`nothing` when the string names no tool we know.
+
+Every ACP agent labels MCP tools differently, and only claude-agent-acp states
+the name outright (`_meta.claudeCode.toolName`), so a tool that renders as a
+typed card under Claude Code fell back to a bare generic card everywhere else.
+Verified against the real binaries driving the real `btworker` server:
+
+  claude-agent-acp  `_meta.claudeCode.toolName` = "mcp__btworker__bt_julia_eval"
+  kimi 0.29.2       no `_meta`; title           = "mcp__btworker__bt_julia_eval"
+  opencode          no `_meta`; title           = "btworker_bt_julia_eval"
+
+The `mcp__<server>__<tool>` form is unambiguous and already split in the ACP
+layer. OpenCode's `<server>_<tool>` is NOT: with a single underscore joining two
+names that both contain underscores, nothing in the string says where the split
+is. It becomes decidable only HERE, against `MCP_MSG_TYPES` — the tools we can
+actually render — so we anchor on a known tool name as the suffix and treat
+whatever precedes the separator as the server. Anything else stays `nothing` and
+renders exactly as it does today.
+"""
+function resolve_mcp_tool(name::AbstractString)
+    s = startswith(name, "mcp__") ? chop(name; head = 5, tail = 0) : SubString(name, 1)
+    isempty(s) && return nothing
+    haskey(MCP_MSG_TYPES, s) && return ("", String(s))   # bare tool name, no prefix
+    for tool in keys(MCP_MSG_TYPES), sep in ("__", "_")
+        suffix = sep * tool
+        endswith(s, suffix) || continue
+        server = chop(s; tail = ncodeunits(suffix))
+        isempty(server) && continue          # no server segment ⇒ not this shape
+        return (String(server), tool)
+    end
+    return nothing
+end
+
+# What the agent called this tool: the explicit name when it gave one, else the
+# ACP title (which is where the non-claude agents put it).
+agent_tool_label(tc::AgentClientProtocol.GenericTool) =
+    isempty(tc.name) ? tc.title : tc.name
 
 # Uniform MCP construction: the known types don't store the tool name (the TYPE
 # is the identity); only the unknown-tool fallback keeps it as data.
@@ -1744,16 +1821,69 @@ function detect_language(path::AbstractString)
     return "plaintext"
 end
 
-# Read-only Monaco that sizes itself to content height exactly once.
-# automaticLayout=false stops the polling loop that fights ResizeObserver.
-# The js_init_func runs after the editor Promise resolves and sets an explicit
-# pixel height so Monaco never gets a 0-height container.
+# Read-only Monaco sized to CONTENT height and CONTAINER width. `automaticLayout`
+# is off (its rAF polling loop fought this init); instead we `layout()` on the
+# container's real size changes via a ResizeObserver. The one-shot version laid
+# out once at `offsetWidth || 600` — so an editor that mounted while its card was
+# narrow (or measured 0) locked to ~600px forever: the code was boxed into a
+# fraction of a wide card WITH a horizontal scrollbar, and that horizontal
+# overflow made Monaco eat the wheel (for h-scroll) so vertical wheel-scroll of
+# the clamped `.bt-subsection-body` never fired. Re-fitting to the parent width
+# fixes both: full-width editor → no h-overflow → the wheel bubbles to the clamp.
 const MONACO_RESIZE_INIT = js"""(monacoEditor) => {
     monacoEditor.editor.then(editor => {
         const div = monacoEditor.editor_div;
-        const h = editor.getContentHeight();
-        div.style.height = h + 'px';
-        editor.layout({ width: div.offsetWidth || 600, height: h });
+        div.style.width = '100%';
+        let lw = -1, lh = -1;
+        const fit = () => {
+            const p = div.parentElement;
+            const w = (p && p.clientWidth) || div.clientWidth || 600;
+            const h = editor.getContentHeight();
+            if (w === lw && h === lh) return;   // no-op guard (avoids RO feedback loops)
+            lw = w; lh = h;
+            div.style.height = h + 'px';
+            editor.layout({ width: w, height: h });
+        };
+        fit();
+        // Resizing from INSIDE a ResizeObserver callback is what makes the
+        // browser report "ResizeObserver loop completed with undelivered
+        // notifications" — `fit` changes the editor's box, which resizes the
+        // very element being observed, so delivery spills into the next frame.
+        // The size-unchanged guard above can't prevent it (the first real
+        // resize legitimately re-lays-out). Deferring to the next animation
+        // frame breaks the synchronous loop: the observer callback returns
+        // immediately and the layout happens outside the delivery cycle. The
+        // pending flag coalesces a burst of notifications into ONE layout.
+        let pending = false;
+        const ro = new ResizeObserver(() => {
+            if (pending) return;
+            pending = true;
+            requestAnimationFrame(() => { pending = false; fit(); });
+        });
+        ro.observe(div.parentElement || div);
+        // The clamped `.bt-subsection-body` around us owns the scroll (the editor
+        // is sized to full content height). Monaco swallows the wheel by default,
+        // and BonitoBook doesn't reliably forward `scrollbar.handleMouseWheel`, so
+        // drive the nearest scroll container ourselves — capture phase, i.e. BEFORE
+        // Monaco sees the event — since the editor never needs its own scroll.
+        let sc = div.parentElement;
+        while (sc && !/(auto|scroll)/.test(getComputedStyle(sc).overflowY)) sc = sc.parentElement;
+        if (sc) div.addEventListener('wheel', (e) => {
+            sc.scrollTop += e.deltaY; sc.scrollLeft += e.deltaX; e.preventDefault();
+        }, { capture: true, passive: false });
+        // Tear the observers down when the editor is removed from its parent.
+        // Scope the observer to the PARENT's direct children (NOT document.body /
+        // subtree — that fires on every DOM mutation, and one per editor turns a
+        // page full of code blocks into an O(editors × mutations) storm). An
+        // ancestor-level removal detaches the whole cycle (parent↔ro↔mo) with no
+        // live ref, so GC reclaims it.
+        const parent = div.parentElement;
+        if (parent) {
+            const mo = new MutationObserver(() => {
+                if (!div.isConnected) { ro.disconnect(); mo.disconnect(); }
+            });
+            mo.observe(parent, { childList: true });
+        }
     });
 }"""
 
@@ -1766,12 +1896,10 @@ function monaco_readonly(text::AbstractString, lang::AbstractString)
         scrollBeyondLastLine=false,
         lineNumbers="off",
         minimap=Dict(:enabled => false),
-        # The editor is sized to its full content height (MONACO_RESIZE_INIT), so
-        # it never scrolls internally — the height-capped `.bt-subsection-body`
-        # around it does. Monaco still swallows the wheel by default, so scrolling
-        # over the code moved nothing. `alwaysConsumeMouseWheel:false` lets the
-        # wheel through to the outer scroll container.
-        scrollbar=Dict(:alwaysConsumeMouseWheel => false),
+        # Width fit + wheel-to-scroll-container are handled in MONACO_RESIZE_INIT
+        # (BonitoBook doesn't reliably forward `scrollbar.*` to monaco.editor.create,
+        # so the option-based approaches — `alwaysConsumeMouseWheel`/`handleMouseWheel`
+        # — didn't take; the init drives the scroll container itself instead).
         # Force light Monaco. BonitoBook's "default" theme follows the host OS
         # `prefers-color-scheme` (dark here), which clashed with the light app.
         theme=Observable("vs"),
@@ -3247,13 +3375,22 @@ to_message(chat::ChatModel, m::AgentClientProtocol.Plan)           = TodoListMsg
 # summary), so it always routes through `builtin_msg_type(kind)` — see
 # `content_summary`. `finished` stamps replayed history (never ticks a timer).
 tool_message(tc, chat::Union{ChatModel,Nothing}; finished::Bool = false) =
-    Message(tc.id, tc.kind, tc isa AgentClientProtocol.GenericTool ? tc.name : "",
+    Message(tc.id, tc.kind, tool_call_name(tc),
             tc.title, tc.status,
-            content_summary(builtin_msg_type(tc.kind), tc.content),
+            content_summary(builtin_msg_type(tc.kind, tool_call_name(tc)), tc.content),
             time(), finished ? time() : nothing, chat)
 
 function build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool)
-    m = builtin_msg_type(tc.kind)(tool_message(tc, chat))
+    # An agent that named the tool in a form the ACP layer couldn't split still
+    # gets the typed card — see `resolve_mcp_tool`.
+    r = resolve_mcp_tool(agent_tool_label(tc))
+    if r !== nothing
+        server, tool = r
+        m = build_mcp_msg(mcp_msg_type(tool), tool_message(tc, chat), server, tool)
+        apply_input!(m, tc.raw_input)
+        return m
+    end
+    m = builtin_msg_type(tc.kind, tc.name)(tool_message(tc, chat))
     apply_input!(m, tc.raw_input)
     return m
 end
@@ -3283,7 +3420,14 @@ end
 eval_env_summary(m::JuliaEvalCall) =
     "env " * (isempty(m.env_path) ? "<temp>" : m.env_path)
 
-snap_summary(::ToolMsg, snap)         = content_summary(builtin_msg_type(snap.kind), snap.content)
+snap_summary(::ToolMsg, snap)         = content_summary(builtin_msg_type(snap.kind, tool_call_name(snap)), snap.content)
+# A search's most useful line is the query, not just how many hits it got — and
+# for agents that send no path (kimi) the hit count is otherwise all there is.
+function snap_summary(b::SearchToolMsg, snap)
+    hits = content_summary(SearchToolMsg, snap.content)
+    isempty(b.pattern) && return hits
+    return isempty(hits) ? "\"$(b.pattern)\"" : "\"$(b.pattern)\" · $hits"
+end
 snap_summary(b::JuliaEvalCall, snap)  = eval_env_summary(b)
 
 # Default: stream the message's text deltas into the bubble, then finalize.
@@ -5277,7 +5421,15 @@ replayed_to_msg(model::ChatModel, m::AgentClientProtocol.Plan) =
 # subtype-specific fields too (so e.g. a replayed background bash still
 # rendered the right way).
 function replayed_tool_msg(tc::AgentClientProtocol.GenericTool)
-    m = builtin_msg_type(tc.kind)(tool_message(tc, nothing; finished = true))
+    r = resolve_mcp_tool(agent_tool_label(tc))     # same recovery as the live path
+    if r !== nothing
+        server, tool = r
+        m = build_mcp_msg(mcp_msg_type(tool), tool_message(tc, nothing; finished = true),
+                          server, tool)
+        apply_input!(m, tc.raw_input)
+        return m
+    end
+    m = builtin_msg_type(tc.kind, tc.name)(tool_message(tc, nothing; finished = true))
     apply_input!(m, tc.raw_input)
     return m
 end
@@ -5879,7 +6031,8 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # the control sits next to what it changes.)
 
     # ── Provider switcher ──────────────────────────────────────────────────
-    # Dropdown to switch between Claude Code, MiMo Code, and OpenCode per chat.
+    # Dropdown to switch between Claude Code, MiMo Code, OpenCode and Kimi Code
+    # per chat.
     # Changing the provider restarts the session with the new backend.
     # Wiring follows the restart button above: the DOM event notifies a plain
     # Observable, Julia reacts via `on(session, …)` (a DOM node itself is not

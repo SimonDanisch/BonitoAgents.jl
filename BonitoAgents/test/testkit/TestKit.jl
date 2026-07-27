@@ -55,7 +55,7 @@ import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
 
 export TestServer, dev_server, add_worker!,
-       text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update, REPLAY_FN,
+       text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update, kimi_tool, REPLAY_FN,
        post_turn,
        sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn,
@@ -141,6 +141,33 @@ bt_continue(; env_path = nothing, timeout = nothing, id = nothing) =
 diff_block(path, old, new) = Dict("type" => "diff", "path" => String(path),
                                   "old" => String(old), "new" => String(new))
 text_block(s::AbstractString) = Dict("type" => "text", "text" => String(s))
+
+"""
+    kimi_tool(name; kind, args, content, status, id, human_title) -> Dict
+
+Agent event for a tool call in KIMI's wire dialect instead of claude's — the
+shape captured verbatim from the real `kimi acp` binary (fixtures live in
+`AgentClientProtocol/test/fixtures/kimi_*.jsonl`).
+
+Use it whenever a test needs to prove the chat copes with a NON-claude agent:
+there is no `_meta.claudeCode` envelope, so the tool is identified only by the
+ACP `title` on its opening frame, that title is then replaced by a human
+sentence, and the arguments arrive as streamed partial-JSON `content` before a
+single late `rawInput`. `name` is the real tool name (`"Bash"`, `"Grep"`,
+`"mcp__btworker__bt_julia_eval"`, …) and `args` its argument dict.
+
+Everything else in TestKit emits claude's shape, so a scenario can mix both.
+"""
+kimi_tool(name; kind = "other", args = Dict{String,Any}(), content = Any[],
+          status = "completed", id = nothing, human_title = nothing) = begin
+    d = Dict{String,Any}("type" => "kimi_tool", "name" => String(name),
+                         "kind" => String(kind),
+                         "args" => Dict{String,Any}(args),
+                         "content" => content, "status" => String(status))
+    id          === nothing || (d["id"]          = String(id))
+    human_title === nothing || (d["human_title"] = String(human_title))
+    d
+end
 
 """
     tool(; kind, title, status, content, tool_name, id, complete, open_status,
@@ -1104,7 +1131,7 @@ end
     switch_agent(s, label)
 
 Switch the chat's agent/provider via the header dropdown, e.g. "Mock Agent",
-"Claude Code", "MiMo Code", "OpenCode". The chat must be open.
+"Claude Code", "MiMo Code", "OpenCode", "Kimi Code". The chat must be open.
 """
 function switch_agent(s::TestServer, label::AbstractString)
     l = json(String(label))

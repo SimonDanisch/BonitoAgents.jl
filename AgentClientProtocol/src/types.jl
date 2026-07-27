@@ -289,7 +289,23 @@ end
 # tool name + the raw argument dict via the `_meta.claudeCode` envelope. The
 # envelope is optional on the spec, so absence is fine — `parse_tool_call`
 # falls back to `GenericTool` when `tool_name` is empty.
-function parse_claude_meta(params::AbstractDict)
+#
+# Other agents don't ship that envelope, but they still identify MCP tools:
+# they put the canonical `mcp__<server>__<tool>` name in the ACP `title`.
+# Verified against kimi 0.29.2 driving the real btworker server — its
+# `tool_call` frame is
+#     {"toolCallId":"0:tool_…","title":"mcp__btworker__bt_julia_eval",
+#      "kind":"other","status":"pending","content":[…]}
+# with NO `_meta` and NO `rawInput` anywhere in the turn. Without the fallback
+# below `tool_name` stays empty, every such call lands in `GenericTool`, and
+# BonitoAgents renders a bare generic card instead of the typed eval card —
+# the same tool looking completely different depending on which agent ran it.
+#
+# The fallback is deliberately narrow: only a title in the `mcp__a__b` form is
+# taken as a name, which is the exact shape `build_tool_call` already parses
+# and not something a human-readable title collides with. A title that isn't in
+# that form leaves `tool_name` empty and behaves exactly as before.
+function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
     meta = get(params, "_meta", nothing)
     name = ""
     if meta isa AbstractDict
@@ -299,11 +315,42 @@ function parse_claude_meta(params::AbstractDict)
             v isa AbstractString && (name = String(v))
         end
     end
+    if isempty(name)
+        t = get(params, "title", nothing)
+        if t isa AbstractString &&
+           (is_mcp_tool_name(t) || (title_names && looks_like_tool_name(t)))
+            name = String(t)
+        end
+    end
     rinput = get(params, "rawInput", nothing)
     rinput_d = rinput isa AbstractDict ?
                  Dict{String,Any}(String(k) => v for (k, v) in rinput) :
                  Dict{String,Any}()
     return (name, rinput_d)
+end
+
+# A bare tool NAME rather than a human-readable title. Kimi labels its native
+# tools with Claude's own names — `Read`, `Bash`, `Agent` — on the opening
+# `tool_call`, which is the only thing that identifies e.g. a shell call as a
+# shell call once `_meta` is absent. It then REPLACES the title on a later frame
+# with a sentence ("Reading hello.txt", "Running: echo …", "Launching explore
+# agent: …"), so the name is only trustworthy on that opening frame — hence the
+# `title_names` opt-in, set for `tool_call` and NOT for `tool_call_update`.
+#
+# Whitespace is the discriminator: every real tool name is a single token, and
+# every human title kimi produced contains a space. A non-matching title just
+# leaves the name empty, exactly as before.
+looks_like_tool_name(s::AbstractString) =
+    !isempty(s) && ncodeunits(s) <= 64 && !occursin(r"\s", s)
+
+# `mcp__<server>__<tool>` with both parts non-empty — the MCP naming convention
+# every ACP agent uses for tools it got from an MCP server.
+function is_mcp_tool_name(s::AbstractString)
+    startswith(s, "mcp__") || return false
+    rest = SubString(s, 6)
+    sep = findfirst("__", String(rest))
+    sep === nothing && return false
+    return first(sep) > 1 && last(sep) < lastindex(rest)
 end
 
 # Defensive extraction of the subagent tag: the `_meta` envelope is optional
@@ -341,7 +388,10 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
     elseif kind == "tool_call"
         content = [parse_tool_content_item(c) for c in get(params, "content", [])]
         locs = [parse_location(l) for l in get(params, "locations", [])]
-        name, rinput = parse_claude_meta(params)
+        # Opening frame: the title may still be the bare tool name (see
+        # `looks_like_tool_name`), which is the only handle a non-claude agent
+        # gives us on WHICH tool this is.
+        name, rinput = parse_claude_meta(params; title_names = true)
         return ToolCallNotif(
             get(params, "toolCallId", ""),
             get(params, "title", ""),
