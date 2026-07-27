@@ -66,7 +66,7 @@ struct ClaudeCodeAgent <: BinAgent
 end
 ClaudeCodeAgent() = ClaudeCodeAgent(claude_bin(), String[],
     Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions", "CLAUDE_MAX_TURNS" => "100"),
-    Dict{String,Any}("form" => true))
+    Dict{String,Any}("form" => Dict{String,Any}()))
 
 struct MiMoAgent <: BinAgent
     bin::String; args::Vector{String}; env::Dict{String,String}; elicitation::Dict{String,Any}
@@ -74,7 +74,7 @@ end
 # `mimo`/`opencode` are multi-command CLIs whose ACP server lives under the `acp`
 # subcommand; the bare binary launches their TUI and never speaks ACP.
 MiMoAgent() = MiMoAgent(mimo_bin(), ["acp"], Dict{String,String}(),
-    Dict{String,Any}("form" => true))
+    Dict{String,Any}("form" => Dict{String,Any}()))
 
 struct OpenCodeAgent <: BinAgent
     bin::String; args::Vector{String}; env::Dict{String,String}; elicitation::Dict{String,Any}
@@ -91,7 +91,7 @@ function MockAgent()
     # config the spawner provides via the inherited ENV. Baking it here would
     # override what the test harness set (the worker merges provider.env OVER the
     # inherited ENV). MockACP defaults to "normal" internally when unset.
-    MockAgent(bin, args, Dict{String,String}(), Dict{String,Any}("form" => true))
+    MockAgent(bin, args, Dict{String,String}(), Dict{String,Any}("form" => Dict{String,Any}()))
 end
 
 # A SECOND mock backend, identical to `MockAgent` but with its own provider
@@ -107,7 +107,7 @@ struct MockAgent2 <: BinAgent
 end
 function MockAgent2()
     bin, args = mock_bin_args()
-    MockAgent2(bin, args, Dict{String,String}(), Dict{String,Any}("form" => true))
+    MockAgent2(bin, args, Dict{String,String}(), Dict{String,Any}("form" => Dict{String,Any}()))
 end
 
 # ── Per-provider display + protocol identity (dispatch, NOT predicate chains) ─
