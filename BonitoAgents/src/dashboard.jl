@@ -468,12 +468,19 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     # then floods the adopted history in around the user's message. The
     # watermark is a per-chat stamp file updated after every reconcile; the
     # session's freshness comes from the worker scan (`state.discovered`).
-    if p.resume_session_id !== nothing &&
-       (isempty(shared(model).msgs_store) || session_advanced_since_sync(state, p))
+    # A fresh chat binds eagerly too: its config pills (model, permission mode)
+    # ride the `session/new` result, so lazy binding left "+ new thread" showing
+    # neither until the user had already sent something.
+    eager_bind = if p.resume_session_id !== nothing
+        isempty(shared(model).msgs_store) || session_advanced_since_sync(state, p)
+    else
+        isempty(shared(model).msgs_store)      # brand-new thread, nothing to show yet
+    end
+    if eager_bind
         Base.errormonitor(@async try
             restart_chat_session!(model)
         catch e
-            @warn "eager history replay on open failed" project_id = p.id exception = (e, catch_backtrace())
+            @warn "eager bind on open failed" project_id = p.id exception = (e, catch_backtrace())
         end)
     end
 
