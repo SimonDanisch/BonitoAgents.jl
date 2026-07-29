@@ -42,6 +42,14 @@ if (typeof document !== 'undefined') {
 //     grows it. No re-fetch, no display:none. The eager body mount itself is
 //     triggered from `createNode` so the user sees the compact diff under the
 //     header immediately. Implies !fetchEachExpand && !discardOnCollapse.
+// Badge text for a queued bubble: position when known, plain "queued" when not
+// (an older wire dict, or a bubble restored from history).
+function queueLabel(pos) {
+    if (!Number.isInteger(pos) || pos < 1) return 'queued';
+    if (pos === 1) return 'next up';
+    return `queued \u00b7 #${pos}`;
+}
+
 export class Collapsable {
     constructor(headerEl, bodyEl, opts = {}) {
         this.header  = headerEl;
@@ -912,6 +920,7 @@ class BonitoChat {
             case 'chunk':        return this.appendChunk(msg);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
             case 'user_unqueue': return this.unqueueUser(msg);
+            case 'user_requeue': return this.requeueUser(msg);
             case 'summary_final':return this.onSummaryFinal(msg);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
@@ -2534,7 +2543,12 @@ class BonitoChat {
         switch (msg.type) {
             case 'user':
                 div.className = 'bt-user-msg';
-                if (msg.queued) div.classList.add('bt-queued');
+                if (msg.queued) {
+                    div.classList.add('bt-queued');
+                    // The badge text lives in an attribute so the position can
+                    // be re-numbered in place as the queue drains.
+                    div.dataset.queueLabel = queueLabel(msg.queue_pos);
+                }
                 // Yolo auto-continue nudge: dim/system-styled, not a real submit.
                 if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
@@ -2766,6 +2780,17 @@ class BonitoChat {
         }
         const q = this.container.querySelector('.bt-user-msg.bt-queued');
         if (q) q.classList.remove('bt-queued');
+    }
+
+    // Re-number the bubbles still waiting after one was promoted, so "3rd in
+    // queue" counts down instead of going stale. Same store-index targeting as
+    // unqueueUser — a virtually-scrolled-out bubble must not keep a wrong
+    // position in its cached node.
+    requeueUser(msg) {
+        for (const it of (msg.items || [])) {
+            const node = this.cache.get(it.idx);
+            if (node) node.dataset.queueLabel = queueLabel(it.pos);
+        }
     }
 
     onSummaryFinal(msg) {

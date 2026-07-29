@@ -701,7 +701,9 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-user-msg.bt-queued",
         "opacity" => "0.65"),
     CSS(".bt-user-msg.bt-queued::after",
-        "content" => "\"queued\"",
+        # Position-aware ("next up", "queued · #3"), re-numbered in place as the
+        # queue drains. Falls back to "queued" when no position is known.
+        "content" => "attr(data-queue-label, \"queued\")",
         "position" => "absolute",
         "right" => "10px", "bottom" => "-16px",
         "font-size" => "10px",

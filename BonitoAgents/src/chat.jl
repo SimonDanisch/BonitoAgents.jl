@@ -379,14 +379,17 @@ mutable struct UserMsg <: ChatMsg
     # a "queued" badge. Cleared via the `user_unqueue` wire event when
     # `run_turn!` finally pops it off `user_messages`.
     queued::Bool
+    # Place in the queue when it was submitted (1 = next up). "queued" alone
+    # doesn't answer the only question the user has — WHEN does this run.
+    queue_pos::Int
     # `true` for an app-generated bubble (Yolo auto-continue nudge) rather than
     # a real user submission — rendered dimmer (`.bt-user-msg-auto`) so it reads
     # as a system message.
     auto::Bool
     chat::Union{ChatModel,Nothing}
 end
-UserMsg(text::AbstractString) = UserMsg(String(text), false, false, nothing)
-UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), false, false, chat)
+UserMsg(text::AbstractString) = UserMsg(String(text), false, 0, false, nothing)
+UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), false, 0, false, chat)
 
 # A `/compact` session summary, rendered as a centered separator block — NOT a
 # user message. Claude Code persists it in its jsonl as a synthetic user record
@@ -1703,7 +1706,8 @@ end
 # (to render the edit preview); other variants ignore it.
 function msg_to_dict(m::UserMsg, _chat_dir::AbstractString="")
     d = Dict{String,Any}("type" => "user", "text" => m.text,
-                         "queued" => m.queued, "auto" => m.auto)
+                         "queued" => m.queued, "queue_pos" => m.queue_pos,
+                         "auto" => m.auto)
     # Attached images render INLINE in the bubble: swap the raw suffix block
     # for an `attachments` list the JS gallery understands. The full text (with
     # the suffix) still goes to the agent prompt and chat.md untouched — only
@@ -4453,7 +4457,7 @@ function yolo_user_msg(chat::ChatModel)
     reminders = strip(shared(chat).yolo_reminders[])
     text = isempty(reminders) ? YOLO_CONTINUE_PROMPT :
         YOLO_CONTINUE_PROMPT * "\n\nKeep these in mind as you continue:\n" * reminders
-    return UserMsg(String(text), false, true, nothing)
+    return UserMsg(String(text), false, 0, true, nothing)
 end
 
 function drain_turn!(chat::ChatModel, turn)
@@ -5068,6 +5072,10 @@ function send_message!(model::ChatModel, msg::UserMsg;
     # If there's a turn in flight, the bubble joins the queue (visually dim).
     bubble = UserMsg(model, msg.text)
     bubble.queued = s.busy_active[]
+    # Position among the bubbles still waiting, so the badge can say how far
+    # off this one is rather than just "queued".
+    bubble.queue_pos = bubble.queued ?
+        lock(() -> count(m -> m isa UserMsg && m.queued, s.msgs_store), s.lock) + 1 : 0
     bubble.auto = msg.auto   # preserve the Yolo auto-continue marker for dim styling
     close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
     # Track the bubble as "not yet seen by the agent" until `begin_turn!`
@@ -5187,16 +5195,25 @@ end
 # `user_unqueue` event so the browser drops the "queued" class. No-op when
 # the chat was idle — the just-pushed bubble was never queued.
 function promote_queued_user_bubble!(chat::ChatModel)
-    idx = lock(chat.lock) do
+    idx, moved = lock(chat.lock) do
+        found = nothing
         for (i, m) in enumerate(chat.msgs_store)
-            if m isa UserMsg && m.queued
-                m.queued = false
-                return i
+            m isa UserMsg && m.queued || continue
+            if found === nothing
+                m.queued = false; m.queue_pos = 0
+                found = i
+            else
+                m.queue_pos = max(1, m.queue_pos - 1)   # everyone behind moves up
             end
         end
-        return nothing
+        # Store index (0-based for JS) + the new positions of those still waiting.
+        return (found, [(i - 1, m.queue_pos) for (i, m) in enumerate(chat.msgs_store)
+                        if m isa UserMsg && m.queued])
     end
     idx === nothing && return nothing
+    isempty(moved) || chat_emit(chat, Dict{String,Any}(
+        "type" => "user_requeue",
+        "items" => [Dict{String,Any}("idx" => i, "pos" => p) for (i, p) in moved]))
     # Ship the store index (0-based for JS): the client must clear the badge
     # on the CACHED node at that index — a DOM-only lookup misses bubbles
     # that are virtually scrolled out, leaving a stale QUEUED badge that
