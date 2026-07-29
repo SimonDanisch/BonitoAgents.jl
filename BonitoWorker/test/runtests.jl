@@ -203,6 +203,20 @@ end
     # Newer sorts after older, so the UI's descending sort works.
     @test BW.acp_epoch("2026-07-29T10:04:35Z") > BW.acp_epoch("2026-07-27T13:02:47Z")
 
+    # session/list returns the RAW first prompt, so a session started by a
+    # provider switch is titled with the whole replayed transcript. The user's
+    # real text follows the prelude's divider.
+    @test BW.acp_title("hi what model are you using?") == "hi what model are you using?"
+    @test BW.acp_title("Below is a transcript…\n\nMy new message:\n\nwhat model?") == "what model?"
+    @test BW.acp_title("") == ""
+    @test BW.acp_title(nothing) == ""
+    # Divider with nothing after it has no user prose to show.
+    @test BW.acp_title("Below is a transcript…\n\nMy new message:\n\n") == ""
+    # Agents truncate the title (kimi ~200 chars), so the divider is often cut
+    # off entirely — drop it rather than title the row with our own prelude.
+    @test BW.acp_title("Below is a transcript of our previous conversation on this " *
+                       "project. I'm continuing where we left off --- PREVIOUS CONVER") == ""
+
     # A provider whose binary isn't installed is skipped, not an error — a
     # machine with only Claude must still scan cleanly.
     withenv("KIMI_AGENT_ACP" => "/nonexistent/kimi",

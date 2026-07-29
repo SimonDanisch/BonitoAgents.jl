@@ -2068,6 +2068,32 @@ function scan_acp_providers()
     return rows
 end
 
+# A session/list `title` cleaned the same way the file scan cleans a first
+# prompt. Wholly-injected titles (a resumed session's transcript preamble) have
+# no user prose to show, so fall back to the truncated raw text rather than a
+# blank row.
+function acp_title(raw)
+    raw isa AbstractString && !isempty(strip(raw)) || return ""
+    s = String(raw)
+    # A provider switch replays the chat as a prelude, so the FIRST prompt of
+    # the new session is that whole transcript and the session lists as "Below
+    # is a transcript of our previous conversation…". The user's actual text
+    # follows the last divider.
+    m = findlast("My new message:", s)
+    if m !== nothing
+        s = String(strip(s[nextind(s, last(m)):end]))
+    elseif startswith(s, "Below is a transcript of our previous conversation")
+        # Agents truncate the title (kimi at ~200 chars), so the divider is
+        # often cut off — the real message is simply not in the string. Better
+        # an empty preview, which falls back to the folder name, than a row
+        # titled with our own prelude.
+        return ""
+    end
+    isempty(s) && return ""
+    t = meaningful_prompt(s)
+    return clean_preview(t === nothing ? s : t)
+end
+
 # ISO-8601 (`2026-07-29T11:58:30.751Z`) → epoch seconds, to match the mtime the
 # file scan reports. Unparseable stamps sort last rather than throwing.
 function acp_epoch(s)
@@ -2142,7 +2168,11 @@ function acp_list_sessions(prov; timeout::Real = 20.0)
                     "parent_session_id" => nothing,
                     "running"           => false,   # not reported by session/list
                     "pid"               => nothing,
-                    "first_prompt"      => String(get(s, "title", "")),
+                    # `title` is the raw first prompt, so it carries the same
+                    # injected-context noise the file scan already strips (a
+                    # resumed session shows up titled "Below is a transcript of
+                    # our previous conversation…").
+                    "first_prompt"      => acp_title(get(s, "title", "")),
                 ))
             end
             cursor = get(res, "nextCursor", nothing)
