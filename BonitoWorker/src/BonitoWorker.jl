@@ -8,6 +8,7 @@ module BonitoWorker
 # Single port to open is on the server (8038), already needed for browsers.
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
+using Dates: DateTime, datetime2unix, @dateformat_str
 using Scratch: @get_scratch!
 import AgentProviders   # provider descriptors (find_provider) — the SSOT shared with the server
 
@@ -2019,6 +2020,8 @@ function handle_scan_sessions(ws, cmd::AbstractDict)
         @warn "BonitoWorker: scan_claude_sessions failed" exception=e
         Dict{String,Any}[]
     end
+    # …plus every other provider that can list its own sessions over ACP.
+    append!(sessions, scan_acp_providers())
     try
         WebSockets.send(ws, JSON.json(Dict(
             "type"       => "scan_sessions_result",
@@ -2028,6 +2031,128 @@ function handle_scan_sessions(ws, cmd::AbstractDict)
     catch e
         @warn "BonitoWorker: scan_sessions response failed" exception=e
     end
+end
+
+"""
+    scan_acp_providers() -> Vector{Dict}
+
+Discovered sessions from every installed provider that can list its own over
+ACP, in the same row shape as `scan_claude_sessions`.
+
+Claude keeps its sessions as files we can walk (`~/.claude/projects`), which is
+why discovery started there — but that only ever finds Claude. ACP has a
+`session/list` method, advertised via `agentCapabilities.sessionCapabilities.list`,
+so any agent that supports it can be asked directly. Verified against kimi
+0.29.2, which returns `{sessionId, cwd, title, updatedAt}` per session plus a
+`nextCursor`.
+
+Costs one short-lived agent process per provider, so it runs only on an explicit
+scan (first connect / Rescan), never per chat. Providers whose binary isn't
+installed, or that don't advertise `list`, are skipped.
+"""
+function scan_acp_providers()
+    rows = Dict{String,Any}[]
+    for prov in AgentProviders.current_providers()
+        prov isa AgentProviders.BinAgent || continue
+        # ClaudeCode is covered by the file scan (which also yields subagents,
+        # liveness and pids that `session/list` doesn't carry).
+        prov isa AgentProviders.ClaudeCodeAgent && continue
+        isfile(prov.bin) || Sys.which(prov.bin) !== nothing || continue
+        try
+            append!(rows, acp_list_sessions(prov))
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "BonitoWorker: ACP session listing failed" provider=AgentProviders.provider_name(prov) exception=e
+        end
+    end
+    return rows
+end
+
+# ISO-8601 (`2026-07-29T11:58:30.751Z`) → epoch seconds, to match the mtime the
+# file scan reports. Unparseable stamps sort last rather than throwing.
+function acp_epoch(s)
+    s isa AbstractString && !isempty(s) || return 0.0
+    try
+        return datetime2unix(DateTime(first(s, 19), dateformat"yyyy-mm-ddTHH:MM:SS"))
+    catch e
+        e isa InterruptException && rethrow()
+        return 0.0
+    end
+end
+
+# Drive one provider's `session/list` over stdio and normalize the result.
+function acp_list_sessions(prov; timeout::Real = 20.0)
+    proc = open(Cmd(`$(prov.bin) $(prov.args)`), "r+")
+    rows = Dict{String,Any}[]
+    try
+        replies = Dict{Int,Any}()
+        reader = @async begin
+            for line in eachline(proc)
+                isempty(strip(line)) && continue
+                msg = nothing
+                try
+                    msg = JSON.parse(line)
+                catch e
+                    e isa InterruptException && rethrow()
+                    msg = nothing             # notifications we don't care about
+                end
+                msg isa AbstractDict && haskey(msg, "id") &&
+                    (replies[Int(msg["id"])] = msg)
+            end
+        end
+        Base.errormonitor(reader)
+        ask(id, method, params) = begin
+            write(proc, JSON.json(Dict("jsonrpc" => "2.0", "id" => id,
+                                       "method" => method, "params" => params)), "\n")
+            flush(proc)
+            t0 = time()
+            while !haskey(replies, id) && !istaskdone(reader) && time() - t0 < timeout
+                sleep(0.05)
+            end
+            get(replies, id, nothing)
+        end
+
+        init = ask(0, "initialize", Dict(
+            "protocolVersion" => 1,
+            "clientCapabilities" => Dict(
+                "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
+                "elicitation" => prov.elicitation)))
+        init isa AbstractDict && haskey(init, "result") || return rows
+        caps = get(get(init["result"], "agentCapabilities", Dict()), "sessionCapabilities", nothing)
+        caps isa AbstractDict && haskey(caps, "list") || return rows   # can't list
+
+        kind = AgentProviders.provider_name(prov)
+        id, cursor = 1, nothing
+        while true
+            params = cursor === nothing ? Dict{String,Any}() : Dict("cursor" => cursor)
+            resp = ask(id, "session/list", params)
+            resp isa AbstractDict && haskey(resp, "result") || break
+            res = resp["result"]
+            for s in get(res, "sessions", [])
+                s isa AbstractDict || continue
+                cwd = String(get(s, "cwd", ""))
+                isempty(cwd) && continue
+                push!(rows, Dict{String,Any}(
+                    "path"              => cwd,
+                    "name"              => basename(cwd),
+                    "session_id"        => String(get(s, "sessionId", "")),
+                    "last_used"         => acp_epoch(get(s, "updatedAt", "")),
+                    "kind"              => "session",
+                    "agent_type"        => kind,
+                    "parent_session_id" => nothing,
+                    "running"           => false,   # not reported by session/list
+                    "pid"               => nothing,
+                    "first_prompt"      => String(get(s, "title", "")),
+                ))
+            end
+            cursor = get(res, "nextCursor", nothing)
+            cursor === nothing && break
+            id += 1
+        end
+    finally
+        try kill(proc) catch e; e isa InterruptException && rethrow() end
+    end
+    return rows
 end
 
 # Locate an executable on PATH. On Windows, `Sys.which` finds `.exe` but does

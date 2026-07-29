@@ -5,6 +5,7 @@
 
 using Test
 using BonitoWorker
+import AgentProviders
 const BW = BonitoWorker
 
 # A WebSocket stand-in that drops sends — handle_* helpers write their JSON
@@ -187,6 +188,32 @@ end
 # spawn_worker refuse when a live worker already holds the slot. We test the
 # path-injectable predicates against a temp file so the real scratch pidfile is
 # never touched (which would block the user's actual worker).
+# ── ACP session discovery ────────────────────────────────────────────────────
+# Discovery used to be Claude-only (a walk of ~/.claude/projects). Agents that
+# implement ACP's `session/list` can be asked directly — kimi and opencode both
+# advertise it. These guard the parts that don't need an agent installed.
+@testset "acp session discovery" begin
+    # ISO-8601 → epoch, matching the mtime the file scan reports.
+    @test BW.acp_epoch("2026-07-29T10:04:35.131Z") ==
+          BW.datetime2unix(BW.DateTime(2026, 7, 29, 10, 4, 35))
+    # A session with no/garbage timestamp sorts last instead of throwing.
+    @test BW.acp_epoch("") == 0.0
+    @test BW.acp_epoch(nothing) == 0.0
+    @test BW.acp_epoch("not-a-date") == 0.0
+    # Newer sorts after older, so the UI's descending sort works.
+    @test BW.acp_epoch("2026-07-29T10:04:35Z") > BW.acp_epoch("2026-07-27T13:02:47Z")
+
+    # A provider whose binary isn't installed is skipped, not an error — a
+    # machine with only Claude must still scan cleanly.
+    withenv("KIMI_AGENT_ACP" => "/nonexistent/kimi",
+            "MIMO_AGENT_ACP" => "/nonexistent/mimo",
+            "OPENCODE_AGENT_ACP" => "/nonexistent/opencode") do
+        AgentProviders.refresh_providers!()
+        @test BW.scan_acp_providers() == Dict{String,Any}[]
+    end
+    AgentProviders.refresh_providers!()
+end
+
 @testset "pidfile singleton guard" begin
     mktempdir() do dir
         pf = joinpath(dir, "sub", "worker.pid")   # nested → also tests mkpath
@@ -306,3 +333,4 @@ include("test_stability.jl")
 # and stands up an HTTP+WS server. Skipped automatically when
 # claude-agent-acp isn't on PATH (so unit-only environments stay green).
 include("test_real_agent.jl")
+
