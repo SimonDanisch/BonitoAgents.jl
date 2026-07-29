@@ -370,6 +370,8 @@ function handle_worker_control(state::ServerState, ws)
                         pong_seen[] = true
                     elseif t == "list_dir_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "make_dir_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "stat_path_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "list_project_files_response"
@@ -827,6 +829,36 @@ function list_worker_dir(state::ServerState, worker_name::String, path::Abstract
             entries = [(name = String(e["name"]), dir = Bool(e["dir"]),
                         size = Int(get(e, "size", 0)))
                        for e in resp["entries"]])
+end
+
+"""
+    make_worker_dir(state, worker_name, parent, name; timeout = 5.0) -> String
+
+Create `parent/name` on the worker and return its absolute path. Backs the
+folder picker's "New folder", so a project can be started somewhere that doesn't
+exist yet. The worker rejects anything but a single path segment.
+"""
+function make_worker_dir(state::ServerState, worker_name::String,
+                          parent::AbstractString, name::AbstractString;
+                          timeout::Real = 5.0)
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "make_dir",
+            "request_id" => rid,
+            "parent"     => String(parent),
+            "name"       => String(name),
+        ))
+        take_pending!(state, ch, rid, timeout, "make_dir on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("make_dir on '$worker_name': unexpected response shape")
+    haskey(resp, "error") && error("make_dir on '$worker_name': $(resp["error"])")
+    return String(resp["path"])
 end
 
 """

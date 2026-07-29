@@ -1111,6 +1111,17 @@ const DashboardStyles = Bonito.Styles(
         "gap" => "8px", "margin-bottom" => "8px",
         "flex-wrap" => "wrap",
         "min-width" => "0"),
+    CSS(".bt-picker-new",
+        "display" => "flex", "align-items" => "center",
+        "gap" => "8px", "margin-bottom" => "8px",
+        "min-width" => "0"),
+    CSS(".bt-picker-newname",
+        "flex" => "1 1 0", "min-width" => "0",
+        "padding" => "6px 8px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "font-size" => "13px"),
     # ── Windows-style address bar ────────────────────────────────────────────
     CSS(".bt-addr-bar",
         "flex" => "1 1 0",   "min-width" => "0",
@@ -2039,11 +2050,40 @@ function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPic
         DOM.div(rows...; class = "bt-picker bt-slide-in")
     end
 
+    # New folder: created on the WORKER (the picker browses the worker's
+    # filesystem), then navigated into, so a project can start somewhere that
+    # doesn't exist yet.
+    new_name = Observable("")
+    new_btn  = Bonito.Button("+ New folder"; style = nothing,
+                             class = "bt-btn bt-btn-secondary",
+                             title = "Create a folder here on the worker")
+    on(session, new_btn.value) do clicked
+        clicked || return
+        nm = strip(new_name[])
+        parent = p.cur[]
+        isempty(nm) && (p.err[] = "Enter a folder name first."; return)
+        isempty(parent) && return
+        @async try
+            created = make_worker_dir(p.state, p.worker_name, parent, nm)
+            safe_set!(new_name, "")
+            safe_set!(p.err, "")
+            safe_set!(p.cur, js_path(created))   # navigate in; listener re-lists
+        catch e
+            safe_set!(p.err, sprint(showerror, e))
+        end
+    end
+
     DOM.div(
         DOM.div(
             address_bar(p.cur, p.editing),
             up_btn, choose_btn;
             class = "bt-picker-cur"),
+        DOM.div(
+            DOM.input(type = "text", placeholder = "new-folder-name",
+                      value = new_name, class = "bt-picker-newname",
+                      oninput = js"event => $(new_name).notify(event.target.value)"),
+            new_btn;
+            class = "bt-picker-new"),
         list)
 end
 

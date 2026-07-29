@@ -759,6 +759,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
                 @async handle_list_dir(ws, cmd)
+            elseif t == "make_dir"
+                @async handle_make_dir(ws, cmd)
             elseif t == "stat_path"
                 @async handle_stat_path(ws, cmd)
             elseif t == "list_project_files"
@@ -1051,6 +1053,42 @@ function handle_list_dir(ws, cmd::AbstractDict)
         WebSockets.send(ws, JSON.json(response))
     catch e
         @warn "list_dir response failed" exception=e
+    end
+end
+
+"""
+Respond to `{type:"make_dir", request_id, parent, name}` — the folder picker's
+"New folder", so a project can start in a folder that doesn't exist yet.
+
+    {type: "make_dir_response", request_id, path}
+    {type: "make_dir_response", request_id, error: "..."}
+
+`name` is a single path segment: separators and `..` are rejected so this can
+only ever create a child of `parent`.
+"""
+function handle_make_dir(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    parent     = String(get(cmd, "parent", ""))
+    name       = strip(String(get(cmd, "name", "")))
+
+    response = try
+        isempty(name) && error("folder name is required")
+        (occursin('/', name) || occursin('\\', name) || name == ".." || name == ".") &&
+            error("folder name must be a single path segment, got: $name")
+        isdir(parent) || error("not a directory: $parent")
+        full = joinpath(parent, name)
+        ispath(full) && error("already exists: $full")
+        mkdir(full)
+        Dict("type" => "make_dir_response", "request_id" => request_id,
+             "path" => abspath(full))
+    catch e
+        Dict("type" => "make_dir_response", "request_id" => request_id,
+             "error" => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "make_dir response failed" exception=e
     end
 end
 

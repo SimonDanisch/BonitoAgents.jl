@@ -56,6 +56,22 @@ end
             @test !haskey(byname, ".git")   # dotfiles skipped by list_dir
         end
 
+        # Backs the picker's "New folder" — a project can be started somewhere
+        # that doesn't exist yet.
+        @testset "make_dir creates on the worker, and refuses to escape" begin
+            created = BT.make_worker_dir(h.state, wid, root, "fresh-proj")
+            @test isdir(created)
+            @test basename(created) == "fresh-proj"
+            # Visible to the picker immediately.
+            @test "fresh-proj" in [e.name for e in BT.list_worker_dir(h.state, wid, root).entries]
+            # Not a way to write anywhere else on the worker.
+            @test_throws Exception BT.make_worker_dir(h.state, wid, root, "../escape")
+            @test_throws Exception BT.make_worker_dir(h.state, wid, root, "a/b")
+            @test_throws Exception BT.make_worker_dir(h.state, wid, root, "")
+            @test_throws Exception BT.make_worker_dir(h.state, wid, root, "fresh-proj")  # exists
+            @test !ispath(joinpath(dirname(root), "escape"))
+        end
+
         @testset "stat_path: file vs dir vs missing" begin
             f = BT.stat_worker_path(h.state, wid, joinpath(root, "src", "main.jl"))
             @test f.exists && f.isfile && !f.isdir && f.size == 11
