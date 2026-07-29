@@ -2502,17 +2502,25 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         # Worker first — the folder picker navigates to that worker's filesystem,
         # so selecting a worker must come before browsing for a folder.
         DOM.label("Worker"),
-        DOM.select(
-            # Show w.name (mutable display label) but submit w.worker_id
-            # (stable UUID, the dict key into state.workers).
-            # The class is a stable hook: tests / tooling target THIS select —
-            # "first visible <select>" broke once the dashboard grew the
-            # session-config pills (also native selects).
-            (DOM.option(w.name; value=w.worker_id,
-                        selected = w.worker_id == np_worker[]) for w in values(state.workers[]))...;
-            class = "bt-np-worker-select",
-            value = np_worker,
-            onchange = js"event => $(np_worker).notify(event.target.value)"),
+        # No reactive `value=` here: on a native <select> it doesn't stick, and
+        # while `np_worker` is "" (its initial value, and re-set on open to force
+        # the reset listener) it drives selectedIndex to -1 — a BLANK box. Rebuild
+        # on change and mark the current <option selected> instead, same as the
+        # provider dropdown. `selected` is splatted in only on the current option:
+        # Bonito renders `selected=nothing` as a bare, always-on attribute.
+        map(session, state.workers, np_worker) do workers, cur
+            # Show w.name (mutable display label) but submit w.worker_id (stable
+            # UUID, the dict key into state.workers). The class is a stable hook
+            # for tests — "first visible <select>" broke once the dashboard grew
+            # the session-config pills (also native selects).
+            worker_opt(w) = DOM.option(w.name;
+                (w.worker_id == cur ? (; value = w.worker_id, selected = true) :
+                                      (; value = w.worker_id))...)
+            DOM.select(
+                (worker_opt(w) for w in values(workers))...;
+                class = "bt-np-worker-select",
+                onchange = js"event => $(np_worker).notify(event.target.value)")
+        end,
         DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
         DOM.label("Folder on worker"), DOM.div(
             remote_folder_picker_render(session, np_remote_picker),

@@ -129,6 +129,12 @@
         TK.wait_for(server, "form for id lookup",
             "(() => { const s = document.querySelector('.bt-np-worker-select'); return !!s && s.offsetParent !== null && s.options.length >= 2; })()";
             timeout = 30)
+        # The select must actually SHOW a worker. It used to render blank
+        # (selectedIndex -1) because a reactive `value=` binding on a native
+        # <select> drove it to "" — options present, nothing displayed.
+        @test TK.eval_js(server, """(() => {
+            const s = document.querySelector('.bt-np-worker-select');
+            return !!s && s.selectedIndex >= 0 && !!s.value; })()""") == true
         ids = TK.eval_js(server, """(() => {
             const sel = document.querySelector('.bt-np-worker-select');
             if (!sel) return null;
