@@ -52,6 +52,27 @@ function run_suite(server)
     @testset "BonitoAgents usage meter + slash autocomplete (UI-only)" begin
         TK.new_chat(server; title = "Usage")
 
+        # Slash commands must work on a chat you haven't typed in yet: agents
+        # push them at session start, and the chat binds on open. This used to
+        # be impossible — the command set stayed empty until the first turn,
+        # so `/` did nothing on a fresh thread.
+        @testset "commands are available before the first message" begin
+            @test TK.wait_for(server, "session-start commands", """(() => {
+                const p = $(PANE); if (!p) return false;
+                const t = p.querySelector('.bt-text-input'); if (!t) return false;
+                t.value = '/'; t.dispatchEvent(new Event('input', { bubbles: true }));
+                const ac = p.querySelector('.bt-cmd-ac');
+                return !!ac && ac.classList.contains('bt-cmd-ac-open') &&
+                       ac.querySelectorAll('.bt-cmd-ac-item').length >= 2; })()""";
+                timeout = 30) == true
+            # Leave the composer clean for the tests below.
+            TK.eval_js(server, """(() => {
+                const p = $(PANE); const t = p.querySelector('.bt-text-input');
+                t.value = ''; t.dispatchEvent(new Event('input', { bubbles: true }));
+                t.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                return true; })()""")
+        end
+
         @testset "header context meter shows the wire numbers" begin
             # Hidden until the first usage_update lands.
             @test TK.eval_js(server, """(() => {

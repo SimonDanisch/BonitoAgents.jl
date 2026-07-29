@@ -748,6 +748,14 @@ function dispatch_loop()
             resp(id, Dict())
         elseif method == "session/new" && id !== nothing
             resp(id, Dict("sessionId" => SESSION))
+            # Real agents push their slash commands right after session/new
+            # (verified on claude-agent-acp and kimi), which is what makes `/`
+            # autocomplete work on a chat you haven't typed in yet. Emitting
+            # them only as turn events made that untestable.
+            upd("available_commands_update", Dict("availableCommands" => [
+                Dict("name" => "compact", "description" => "Compact the chat history"),
+                Dict("name" => "clear",   "description" => "Clear the conversation"),
+            ]))
         elseif method == "session/load" && id !== nothing
             # Dispatcher mode: re-stream the scripted history as session/update
             # frames BEFORE the load response — exactly how real claude-agent-acp
