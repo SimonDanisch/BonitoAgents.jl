@@ -2531,6 +2531,12 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # toggled by `discover_state`, and the rows reference `import_path`
     # directly from the card's captured fields.
 
+    # A submit failure has to be visible WHERE you submitted. Each call builds
+    # its own node — the same mapped node can't be mounted in two places.
+    form_error() = map(error_obs) do msg
+        isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
+    end
+
     text_input(obs::Observable, ph::String) = DOM.input(
         type = "text", placeholder = ph,
         value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
@@ -2571,6 +2577,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             end),
         # Form action row — the global progress card is the visual feedback
         # for the in-flight submit; click handlers guard against double-fire.
+        form_error(),
         DOM.div(np_cancel, np_submit, class = "bt-form-actions"),
         class = "bt-form")
 
@@ -2587,6 +2594,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
             class = "bt-gh-worker-select",
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
+        form_error(),
         DOM.div(gh_cancel, gh_submit, class = "bt-form-actions"),
         class = "bt-form")
 
@@ -2622,6 +2630,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 style = Styles("font-size" => "11px",
                                "color"     => "var(--bt-text-muted)",
                                "margin-top" => "-4px")),
+        form_error(),
         DOM.div(cp_cancel, cp_submit; class = "bt-form-actions"),
         class = "bt-form")
 
@@ -2825,8 +2834,12 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             DOM.div()
         end
     end
-    error_block = map(error_obs) do msg
-        isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
+    # Top-of-page errors, for failures with no form on screen ("Register a
+    # worker before creating a project"). While a form IS open its own copy
+    # shows the message next to the button — see `form_error` — so this one
+    # stands down rather than duplicating it far above the fold.
+    error_block = map(error_obs, which_form) do msg, wf
+        (isempty(msg) || wf !== :none) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
 
     # Global busy progress pill — fixed top-centered, single text line.
