@@ -230,13 +230,13 @@ end
 
         # Stale file pointing at a dead pid → slot free (overwritable).
         write(pf, "999999")
-        @test BW.process_running(999999) === false
+        @test BW.pid_running(999999) === false
         @test BW.running_worker_pid(pf) === nothing
 
         # A live OTHER pid → blocked. pid 1 (init/launchd) is always alive and
         # never us; on Unix kill(1,0) → EPERM which process_running maps to true.
         write(pf, "1")
-        @test BW.process_running(1) === true
+        @test BW.pid_running(1) === true
         @test BW.running_worker_pid(pf) == 1
 
         # Garbage content → nothing (never throws).

@@ -71,7 +71,7 @@ end
     acp_init  = Channel{Dict{String,Any}}(1)
     done      = Channel{Nothing}(1)         # closed by the driver to wind down handlers
 
-    function ws_handler(ws::HTTP.WebSocket)
+    function ws_handler(ws::HTTP.WebSockets.WebSocket)
         path = ws.request.target
         if path == "/worker-ws"
             try
