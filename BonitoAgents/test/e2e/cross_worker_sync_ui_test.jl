@@ -129,6 +129,43 @@
         TK.wait_for(server, "form for id lookup",
             "(() => { const s = document.querySelector('.bt-np-worker-select'); return !!s && s.offsetParent !== null && s.options.length >= 2; })()";
             timeout = 30)
+        # "+ New folder" creates on the WORKER and navigates in, so a project
+        # can start somewhere that doesn't exist yet. The make_dir RPC itself is
+        # covered in unit:file_tree; this drives the actual button.
+        @testset "picker creates a folder on the worker" begin
+            base = mktempdir()
+            fresh = "brand-new-folder"
+            TK.click_until(server, ".bt-addr-icon-btn",
+                "[...document.querySelectorAll('.bt-addr-input')].some(el => el && el.offsetParent !== null)";
+                timeout = 30)
+            @test TK.eval_js(server, """(() => {
+                const inp = [...document.querySelectorAll('.bt-addr-input')].filter(el => el && el.offsetParent !== null)[0];
+                if (!inp) return false;
+                inp.focus();
+                const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set;
+                set.call(inp, $(TK.json(base)));
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                inp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
+                return true; })()""") == true
+            @test TK.wait_for(server, "picker at the temp dir",
+                "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($(TK.json(basename(base)))))";
+                timeout = 30) == true
+            @test TK.eval_js(server, """(() => {
+                const inp = [...document.querySelectorAll('.bt-picker-newname')].filter(el => el && el.offsetParent !== null)[0];
+                if (!inp) return false;
+                inp.focus();
+                const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set;
+                set.call(inp, $(TK.json(fresh)));
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                return true; })()""") == true
+            TK.click_text(server, "+ New folder")
+            # It exists on disk, and the picker navigated into it.
+            @test TK.wait_for(server, "created + navigated into",
+                "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($(TK.json(fresh))))";
+                timeout = 30) == true
+            @test isdir(joinpath(base, fresh))
+        end
+
         # The select must actually SHOW a worker. It used to render blank
         # (selectedIndex -1) because a reactive `value=` binding on a native
         # <select> drove it to "" — options present, nothing displayed.
