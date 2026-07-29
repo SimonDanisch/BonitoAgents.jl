@@ -38,6 +38,13 @@ function project_color(id::AbstractString)
     return "hsl($(hue), 60%, 48%)"
 end
 
+# Several chats commonly live in ONE folder, and telling them apart by identicon
+# alone is hard past a handful. Keying the hue on the folder makes same-folder
+# chats read as a family (the pattern still differs per chat). Falls back to the
+# id when a project has no path yet, so the colour is never blank.
+folder_hue_key(p::ProjectInfo) =
+    isempty(p.worker_path) ? p.id : rstrip(normalize_worker_path(p.worker_path), '/')
+
 """
     identicon_svg(id) → String
 
@@ -50,9 +57,9 @@ initials remain legible on. Single-quoted attributes so the result embeds
 directly into a CSS `url("data:image/svg+xml;utf8,…")` (the same trick the
 model-picker arrow uses in styles.jl).
 """
-function identicon_svg(id::AbstractString)
-    h   = hash(id)
-    hue = abs(h % 360)
+function identicon_svg(id::AbstractString, hue_key::AbstractString = id)
+    h   = hash(id)                      # pattern: unique per chat
+    hue = abs(hash(hue_key) % 360)      # colour: shared by chats in one folder
     cells = IOBuffer()
     for row in 0:4, col in 0:2
         ((h >> (row * 3 + col)) & 1) == 1 || continue
@@ -79,7 +86,7 @@ function project_icon(p::ProjectInfo, worker_tag::AbstractString = "";
     DOM.div(label;
         class = "bt-proj-icon",
         style = string("background-image:url(\"data:image/svg+xml;utf8,",
-                       identicon_svg(p.id), "\");",
+                       identicon_svg(p.id, folder_hue_key(p)), "\");",
                        "background-size:cover;",
                        "width:$(size_px)px;height:$(size_px)px;",
                        "line-height:$(size_px)px;font-size:$(round(Int, size_px*0.42))px"),
@@ -505,6 +512,13 @@ const SidebarStyles = Bonito.Styles(
         # main-panel logo's line instead of sitting ~20px below it. The
         # collapse rail below adds the rest of the offset.
         "padding" => "4px 0 10px"),
+    # A fixed 200px rail truncates chat titles to a few words on a big monitor,
+    # where the space is free. Widen in two steps; the collapsed rail and the
+    # narrow-screen rules below still win (they come later in the sheet).
+    CSS("@media (min-width: 1600px)",
+        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "260px")),
+    CSS("@media (min-width: 2000px)",
+        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "320px")),
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
     # Header rail: holds the VSCode-style sidebar toggle. Right-aligned when
