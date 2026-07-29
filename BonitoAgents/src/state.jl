@@ -234,6 +234,11 @@ mutable struct ServerState
     # `discovered.json`; mutated in place + `notify`d like `projects`.
     discovered :: Observable{Dict{String,Vector{Dict{String,Any}}}}
 
+    # worker_id → `time()` of that worker's last session scan. Lets opening a
+    # chat refresh a stale scan without re-scanning on every click. In-memory
+    # only: after a restart the first open re-scans, which is what we want.
+    last_scan :: Dict{String,Float64}
+
     # The base URL workers (and the dashboard's install snippet) should use to
     # reach this server. Set by `serve()` once the Bonito.Server is up —
     # either the explicit `public_url` argument or `Bonito.online_url`. A Ref
@@ -305,6 +310,7 @@ function ServerState(; state_dir::String,
         Dict{String,Any}(),                       # worker_control_ws
         Dict{String,Channel{Any}}(),              # pending_rpcs
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
+        Dict{String,Float64}(),                   # last_scan
         Ref(""),                                  # base_url (set by serve())
         Dict{String,Any}(),                       # eval_workers
         Dict{String,Any}(),                       # mcp_ctrl
@@ -346,6 +352,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.worker_control_ws,
             s.pending_rpcs,
             map(identity, session, s.discovered),
+            s.last_scan,               # shared: scan freshness is per server
             s.base_url,
             s.eval_workers,            # shared registries — one per server, all
             s.mcp_ctrl,                # sessions cooperate on the same tables

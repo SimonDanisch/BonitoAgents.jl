@@ -482,10 +482,41 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
         catch e
             @warn "eager bind on open failed" project_id = p.id exception = (e, catch_backtrace())
         end)
+    else
+        maybe_resync_on_open!(state, p, model)
     end
 
     fire_auto_prompt!(model)
     return model
+end
+
+# How stale a worker's scan may be before opening a chat refreshes it: long
+# enough that clicking between chats doesn't scan on every click.
+const RESCAN_ON_OPEN_AFTER = 30.0
+
+"""
+    maybe_resync_on_open!(state, p, model)
+
+Refresh `p`'s worker scan when it's stale, then bind if the session moved on.
+
+`session_advanced_since_sync` reads `state.discovered`, which was only ever
+refreshed on a worker's FIRST connect or by the Rescan button — so continuing a
+session in the Claude CLI left the freshness signal itself stale, and re-opening
+the chat showed a frozen snapshot. Async: the view mounts immediately and the
+replayed history fills in.
+"""
+function maybe_resync_on_open!(state::ServerState, p::ProjectInfo, model)
+    p.resume_session_id === nothing && return nothing
+    last = lock(() -> get(state.last_scan, p.worker_id, 0.0), state.lock)
+    time() - last < RESCAN_ON_OPEN_AFTER && return nothing
+    Base.errormonitor(@async try
+        scan_and_store!(state, p.worker_id)
+        # Re-ask now that the scan is current; bind only if it actually moved.
+        session_advanced_since_sync(state, p) && restart_chat_session!(model)
+    catch e
+        @warn "resync on open failed" project_id = p.id exception = (e, catch_backtrace())
+    end)
+    return nothing
 end
 
 # Short alias used by the move/copy plumbing below + the "Sync to server"

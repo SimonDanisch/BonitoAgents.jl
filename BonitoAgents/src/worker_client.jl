@@ -1203,6 +1203,7 @@ function scan_and_store!(state::ServerState, worker_id::AbstractString)
     norm = Dict{String,Any}[Dict{String,Any}(r) for r in raw]
     lock(state.lock) do
         state.discovered[][wid] = norm
+        state.last_scan[wid] = time()
         save_discovered!(state)
     end
     safe_notify!(state.discovered)
