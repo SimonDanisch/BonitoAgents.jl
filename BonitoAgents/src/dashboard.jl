@@ -2244,9 +2244,16 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         busy_start!(busy, "Creating $(nm)")
         @async begin
             try
-                p = create_project!(state, nm,
-                                 String(strip(np_remote_picker.selected[])),
-                                 String(strip(np_worker[]));
+                # The picker browses the WORKER's filesystem, and a project lives
+                # on the worker — the server copy is only a sync target, never an
+                # active checkout. `create_project!` means the opposite (validate
+                # a server-local folder with `isdir`, then push it over), so it
+                # rejected a perfectly good worker path with "Source path is not
+                # a directory".
+                p = create_project_from_worker!(state,
+                                 String(strip(np_worker[])),
+                                 String(strip(np_remote_picker.selected[]));
+                                 name = nm,
                                  progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 which_form[] = :none
