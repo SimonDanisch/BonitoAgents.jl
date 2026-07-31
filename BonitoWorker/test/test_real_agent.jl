@@ -71,8 +71,12 @@ end
     acp_init  = Channel{Dict{String,Any}}(1)
     done      = Channel{Nothing}(1)         # closed by the driver to wind down handlers
 
+    # `handshake_request`, not `request`: HTTP v2 renamed the field. Reading
+    # `ws.request` here threw on the handler's FIRST line, so the server
+    # answered 1011 before anything ran and the worker just saw
+    # "control session crashed" with no clue why.
     function ws_handler(ws::HTTP.WebSockets.WebSocket)
-        path = ws.request.target
+        path = ws.handshake_request.target
         if path == "/worker-ws"
             try
                 hello = JSON.parse(String(WebSockets.receive(ws)))

@@ -248,7 +248,7 @@ end
         @test BW.running_worker_pid(pf) === nothing
 
         # A live OTHER pid → blocked. pid 1 (init/launchd) is always alive and
-        # never us; on Unix kill(1,0) → EPERM which process_running maps to true.
+        # never us; on Unix kill(1,0) → EPERM which pid_running maps to true.
         write(pf, "1")
         @test BW.pid_running(1) === true
         @test BW.running_worker_pid(pf) == 1
