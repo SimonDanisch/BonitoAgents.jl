@@ -38,6 +38,7 @@ include("ctrl_ws.jl")          # control dial-back to BonitoAgents (per-tool int
 include("context.jl")          # the one MCPServer value (SERVER) owning all process state
 include("tools/eval.jl")
 include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
+include("apps.jl")             # Apps — the App/Context interface apps implement
 
 # `RemoteProxy.jl` is NOT included here — it references `Bonito.*` types and
 # BonitoMCP intentionally has no Bonito dep (cf. `eval_ws.jl`). The worker

@@ -1,0 +1,18 @@
+name = "DemoBriefing"
+uuid = "b7d1e6c4-9f28-4a3e-8b51-2c7d0a4f9e13"
+authors = ["Simon Danisch <sdanisch@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+BonitoMCP = "4a1c91af-1c90-46a4-8594-a3846516869d"
+Observables = "510215fc-4207-5dde-b226-833fc4488ee2"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
