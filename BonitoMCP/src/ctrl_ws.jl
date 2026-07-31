@@ -7,9 +7,9 @@
 # EVAL worker, the same process that runs the user's code — a busy eval can
 # starve its event loop, so it can't be trusted to deliver an interrupt. THIS
 # process never runs user code (evals are remote_eval'd into the Malt
-# worker), so its tasks stay responsive, and it already owns the one reliable
-# stop lever: `Malt.interrupt(worker)` — the same SIGINT `bt_julia_interrupt`
-# and the MCP `notifications/cancelled` path use.
+# worker), so its tasks stay responsive, and it already owns the stop lever:
+# `request_interrupt!` — the same one `bt_julia_interrupt` and the MCP
+# `notifications/cancelled` path use.
 #
 # Wire: one JSON object per WS message.
 #   server → us:  {"op": "interrupt_eval", "request_id": id, "env_path"?: p}

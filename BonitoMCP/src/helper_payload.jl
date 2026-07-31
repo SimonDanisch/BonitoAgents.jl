@@ -45,6 +45,31 @@ neither property. Backtrace noise from `include_string` is already trimmed
 repl_eval(code::AbstractString) =
     Base.include_string(SOFTSCOPE, Main, String(code), "bt_julia_eval")
 
+# The task currently running an eval, set by the wrapper in session.jl::execute.
+const EVAL_TASK = Ref{Union{Task,Nothing}}(nothing)
+
+"""
+    interrupt_eval() -> Bool
+
+Throw an `InterruptException` into the in-flight eval task, returning whether it
+was delivered. False means the host must escalate to SIGINT.
+
+A bare SIGINT goes to whichever task the scheduler happens to be running, which
+is very often the 4Hz stdout flusher rather than the eval — hence targeting the
+task directly.
+
+Only a task PARKED in a wait queue (`sleep`, blocking IO) can be reached this
+way. `schedule` on an executing task silently fails to stop it and is documented
+as scheduler-corrupting, so a tight loop reports false and takes the signal.
+"""
+function interrupt_eval()
+    t = EVAL_TASK[]
+    (t === nothing || istaskdone(t)) && return false
+    t.queue === nothing && return false     # executing, not parked
+    schedule(t, InterruptException(); error = true)
+    return true
+end
+
 # One worker call: REPL-eval the code, then format the result value. A user
 # error thrown by the eval propagates to the caller's try/catch (→ format_error).
 eval_and_format(code::AbstractString, out_dir::AbstractString, max_bytes::Int, full_output::Bool) =

@@ -114,16 +114,15 @@ end
 # request — how an ACP `session/cancel` reaches a long-running tool.
 #
 # An arbitrary user eval (`sleep`, `while true`, a blocking fetch) has NO
-# cooperative stop — it checks no flag — so the only lever to actually STOP it is
-# `Malt.interrupt` (SIGINT). It's unreliable and can crash the worker, so we don't
-# use it for OUR OWN loops (those stop via messages); but for stopping user code
-# it's the only tool, used deliberately here. A worker-kill fallback
+# cooperative stop — it checks no flag — so an InterruptException is the only
+# lever. `request_interrupt!` throws it straight into the eval task and falls
+# back to SIGINT for code too wedged to answer; a worker-kill fallback
 # (`finalize_cancelled_eval!`) covers code that swallows InterruptException so a
 # cancelled eval can never orphan-run forever.
 #
-# We don't take a session's `lock` (the in-flight poll may hold it); `Malt.interrupt`
-# is a lock-free signal and the in-flight `await_or_yield` clears `in_flight` when
-# the task dies. `requestId` is logged to confirm the agent forwards cancellation.
+# We don't take a session's `lock` (the in-flight poll may hold it) — the
+# in-flight `await_or_yield` clears `in_flight` when the task dies. `requestId`
+# is logged to confirm the agent forwards cancellation.
 function handle_cancelled!(req::AbstractDict)
     params = get(req, "params", Dict{String,Any}())
     rid = get(params, "requestId", get(params, "id", nothing))
@@ -171,9 +170,9 @@ function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool 
         # that legitimately started during the grace window (M3).
         f = s.in_flight
         try
-            is_alive(s) && Malt.interrupt(s.worker)
+            is_alive(s) && request_interrupt!(s)
         catch e
-            log_info("interrupt: Malt.interrupt failed: $(sprint(showerror, e))")
+            log_info("interrupt: request_interrupt! failed: $(sprint(showerror, e))")
         end
         f === nothing || @async finalize_cancelled_eval!(s, f)
     end

@@ -549,12 +549,17 @@ function execute(s::JuliaSession, code::AbstractString;
         # user-defined types Malt's serialiser wouldn't recognise on the parent
         # side). A user error propagates here to `format_error`.
         code_str = String(code)
+        # Registering the task is what makes `interrupt_eval` able to target THIS
+        # eval instead of whatever task a SIGINT happens to land on.
         wrapped = quote
+            Main.BonitoMCPHelper.EVAL_TASK[] = current_task()
             try
                 Main.BonitoMCPHelper.eval_and_format($code_str, $out_dir, $max_bytes, $full_output)
             catch __mcp_err__
                 Main.BonitoMCPHelper.format_error(__mcp_err__, catch_backtrace(),
                                                    $max_bytes, $full_output)
+            finally
+                Main.BonitoMCPHelper.EVAL_TASK[] = nothing
             end
         end
         s.in_flight = Malt.remote_eval(s.worker, wrapped)
@@ -570,10 +575,38 @@ function continue_eval!(s::JuliaSession;
     end
 end
 
+"""
+    request_interrupt!(s; grace) -> Symbol
+
+Stop the in-flight eval, returning `:targeted` or `:signal` for how it was done.
+
+SIGINT alone is unreliable here: Julia delivers it to whichever task the worker
+happens to be running, and every session has a 4Hz stdout flusher waking up
+constantly — the flusher took the exception and died while the eval ran on. So
+ask the worker to throw directly into the eval task, and keep SIGINT for code
+too wedged to answer (a tight loop never yields to Malt's message loop, which is
+also why the ack is awaited with a timeout rather than fetched).
+"""
+function request_interrupt!(s::JuliaSession; grace::Real = 2.0)
+    ack = Malt.remote_eval(s.worker, :(Main.BonitoMCPHelper.interrupt_eval()))
+    if timedwait(() -> istaskdone(ack), grace) === :ok
+        delivered = try
+            fetch(ack) === true
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "request_interrupt!: worker refused the targeted throw" exception = e
+            false
+        end
+        delivered && return :targeted
+    end
+    Malt.interrupt(s.worker)
+    return :signal
+end
+
 function interrupt!(s::JuliaSession)
     @lock s.lock begin
         s.in_flight === nothing && error("No eval in flight on this session.")
-        Malt.interrupt(s.worker)
+        request_interrupt!(s)
         # Generous timeout: the user's code might be in a try/catch that swallows
         # InterruptException briefly, but should yield within 30s.
         return await_or_yield(s, 30.0)

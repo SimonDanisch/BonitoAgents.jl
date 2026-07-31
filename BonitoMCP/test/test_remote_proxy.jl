@@ -253,12 +253,17 @@ end
             end
         end
 
-        # First mount ships the observable's value...
+        # One fragment ships the observable's value.
         @test shipped_marker(RP.render_eval_html(mkapp()))
+
+        # A SECOND fragment against the same long-lived parent does NOT re-ship
+        # it — the parent's object cache already holds it. That's why the live
+        # path doesn't render against the parent: a value is PARKED in a holder
+        # and re-rendered per tab (the `mount` op below), so each page root
+        # ships its own copy. `render_eval_html` renders straight against the
+        # parent and survives only as the Bonito-version probe in session.jl.
         empty!(cap.sent)
-        # ...and so does every LATER mount of the same shared observable — the
-        # assertion that failed on stock dedup after a page reload.
-        @test shipped_marker(RP.render_eval_html(mkapp()))
+        @test !shipped_marker(RP.render_eval_html(mkapp()))
 
         # JS module emission: every fragment must carry its <script type=module>
         # tag wherever it mounts. Pre-Bonito#406 sub emissions were deduped
@@ -274,5 +279,33 @@ end
             js"$(probemod).then(m => m.probe())")))
         @test occursin("probemod", RP.render_eval_html(impapp()))
         @test occursin("probemod", RP.render_eval_html(impapp()))   # re-emitted, never deduped away
+    end
+
+    # The property users actually depend on, on the path that actually ships:
+    # a result is parked ONCE and re-rendered per browser tab. Two tabs (and a
+    # reload, which mints a fresh root) must EACH receive the value — that's what
+    # per-page roots buy, and the reason a shared parent cache is not used.
+    @testset "a parked result ships to every page root that mounts it" begin
+        b, cap = fresh_bridge!()
+        marker = "MOUNT_MARKER_" * "x"^64
+        payload = Observable(marker)
+        holder = RP.remote_ref(App(s -> (onjs(s, payload, js"(x)=>{}");
+                                         DOM.div(DOM.span("app")))))
+
+        # `open_root` is a tab's first embed; each call is a different tab.
+        function mount_into_fresh_root(node)
+            RP.handle_control(b, Dict{String,Any}("op" => "open_root", "id" => 100))
+            reply = last(filter(d -> get(d, "op", "") == "reply" && get(d, "id", 0) == 100,
+                                ctrl_frames(cap)))
+            root = String(reply["val"])
+            empty!(cap.sent)                     # only look at THIS mount's frames
+            RP.handle_control(b, Dict{String,Any}("op" => "mount", "id" => 101,
+                "sub" => holder, "root" => root, "node" => node))
+            return any(u -> occursin(marker, string(u.second)), updates(cap)) ||
+                   any(f -> occursin(marker, String(copy(f[2]))), map(untag, cap.sent))
+        end
+
+        @test mount_into_fresh_root("node-tab-1")
+        @test mount_into_fresh_root("node-tab-2")   # second tab / post-reload root
     end
 end
