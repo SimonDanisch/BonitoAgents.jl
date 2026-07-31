@@ -9,5 +9,6 @@ using Test
     include("test_session_singleflight.jl")
     include("test_running_response_shape.jl")
     include("test_eval_cancel.jl")
+    include("test_process_reaping.jl")
     include("test_remote_proxy.jl")
 end

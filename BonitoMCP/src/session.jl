@@ -115,6 +115,7 @@ mutable struct JuliaSession
     dial_error::String                  # last eval-bridge setup/connect failure (live-render bridge)
     bonito_mismatch::String             # project env's Bonito version when it's too old for the bridge ("" = ok); drives the chat's one-click upgrade card
     closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
+    pgid::Int                           # worker's own process group (0 = none); reaped in kill_session!
 end
 
 function JuliaSession(env_path;
@@ -125,7 +126,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), Channel{String}(Inf), false, "", "", false)
+                        ReentrantLock(), Channel{String}(Inf), false, "", "", false, 0)
 end
 
 # The chat routes live stream chunks by this key (matched against the eval
@@ -341,6 +342,8 @@ function start!(s::JuliaSession)
         env            = worker_env(),
         exeflags       = build_exeflags(s.env_path, s.julia_cmd),
     )
+    # Before anything can spawn: everything the eval starts inherits this group.
+    s.pgid = isolate_worker!(s)
     # Background pumps drain worker stdout/stderr into our buffer (the agent's
     # copy, drained into the MCP response) AND push each chunk to stream_channel.
     # Both streams merge into the same buffer — same UX as a normal REPL.
@@ -663,8 +666,86 @@ end
 # RemoteException → InterruptException or whatever the user's code threw).
 interrupt_echo(e) = "\e[91mERROR: $(sprint(showerror, e))\e[39m"
 
+# ── Reaping what the eval spawned ───────────────────────────────────────────
+# Julia neither tracks nor reaps processes started with `run`, so a test suite,
+# server or `sleep 300` launched by eval'd code outlives the worker that started
+# it — killing the worker leaves it running forever.
+#
+# unix: the worker gets its own process group at startup, which we kill as a
+# unit. The kernel keeps the group intact when the leader dies, so this holds
+# even when the worker is SIGKILLed (no atexit handler can run then).
+# Windows has no process groups, and an orphan can't be found by walking down
+# from a dead parent — so there we snapshot the tree *before* teardown instead.
+
+worker_pid(s::JuliaSession) = s.worker === nothing ? 0 : Int(getpid(s.worker.proc))
+
+"""
+    isolate_worker!(s) -> Int
+
+Return the worker's own process group id, creating one if it isn't a leader
+already (Malt spawns detached, so normally it is). 0 if unavailable.
+"""
+function isolate_worker!(s::JuliaSession)
+    Sys.isunix() || return 0
+    pgid = Malt.remote_eval_fetch(s.worker, quote
+        pgid() = Int(ccall(:getpgid, Cint, (Cint,), 0))
+        pgid() == getpid() || ccall(:setsid, Cint, ())   # already a leader → EPERM, fine
+        pgid()
+    end)::Int
+    # Only ever trust a group the worker LEADS. Any other value means it still
+    # shares OUR group, and killing that would take down the MCP server itself.
+    return pgid == worker_pid(s) ? pgid : 0
+end
+
+function child_pids(pid::Integer)
+    out = Int[]
+    cmd = Sys.iswindows() ?
+        `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ParentProcessId=$pid').ProcessId"` :
+        `pgrep -P $pid`
+    # Both exit non-zero when there simply are no children, so ignorestatus.
+    txt = try
+        read(pipeline(ignorestatus(cmd), stderr = devnull), String)
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || rethrow()      # pgrep/powershell not installed
+        @debug "child_pids: process enumeration unavailable" exception = e
+        return out
+    end
+    for line in eachline(IOBuffer(txt))
+        n = tryparse(Int, strip(line))
+        n === nothing || push!(out, n)
+    end
+    return out
+end
+
+function descendant_pids(pid::Integer)
+    out, stack = Int[], Int[pid]
+    while !isempty(stack)
+        for c in child_pids(pop!(stack))
+            c in out && continue
+            push!(out, c)
+            push!(stack, c)
+        end
+    end
+    return out
+end
+
+# `pgid` comes from isolate_worker!, `strays` from a pre-teardown snapshot.
+function reap_process_tree(pgid::Int, strays::Vector{Int} = Int[])
+    # Belt and braces: never signal our own group, that would kill the server.
+    if Sys.isunix() && pgid != 0 && pgid != Int(ccall(:getpgid, Cint, (Cint,), 0))
+        ccall(:kill, Cint, (Cint, Cint), -pgid, 9)
+    end
+    for p in strays
+        success(pipeline(`taskkill /F /PID $p`, stdout = devnull, stderr = devnull))
+    end
+    return nothing
+end
+
 # ── Lifecycle ───────────────────────────────────────────────────────────────
 function kill_session!(s::JuliaSession)
+    # Snapshot first: once the worker is gone, a Windows orphan is unreachable.
+    strays = (Sys.iswindows() && is_alive(s)) ? descendant_pids(worker_pid(s)) : Int[]
     if is_alive(s)
         try
             Malt.stop(s.worker)
@@ -673,6 +754,8 @@ function kill_session!(s::JuliaSession)
             @debug "kill_session!: Malt.stop failed (worker already gone?)" exception = e
         end
     end
+    reap_process_tree(s.pgid, strays)
+    s.pgid = 0
     # Deliberately NOT taken under s.lock: kill_session! must be able to reap a
     # worker whose eval ignored the interrupt, and that eval's await_or_yield
     # poll holds s.lock for its whole duration — locking here would deadlock the
@@ -710,9 +793,14 @@ mutable struct SessionManager
     lock::ReentrantLock                 # guards BOTH `sessions` and `creating`
 end
 
-SessionManager() = SessionManager(Dict{String,JuliaSession}(),
-                                  Dict{String,Task}(),
-                                  ReentrantLock())
+function SessionManager()
+    m = SessionManager(Dict{String,JuliaSession}(), Dict{String,Task}(), ReentrantLock())
+    # Malt's own atexit stops the workers but not what they spawned — reap the
+    # process groups too. A SIGKILLed server runs no handler at all and still
+    # leaks; nothing in-process can fix that (see reap_process_tree).
+    atexit(() -> shutdown!(m))
+    return m
+end
 
 const TEMP_KEY = "__temp__"
 
