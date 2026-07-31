@@ -28,18 +28,24 @@ end
 # One user prompt → card snippet: drop the attachment suffix and interruption
 # markers, then reuse `meaningful_title` (peels `<system-reminder>`-style tag
 # blocks, collapses whitespace, truncates). `nothing` for system-only text.
-function overview_user_snippet(text::AbstractString)
+function overview_user_snippet(provider::AgentProvider, text::AbstractString)
     base, _ = split_attachment_suffix(text)
     base = replace(base, r"\[Request interrupted[^\]]*\]" => " ")
-    return meaningful_title(base)
+    return meaningful_title(provider, base)
 end
 
-function overview_snippets(msgs::Vector{ChatMsg}; limit::Int = OVERVIEW_SNIPPETS)
+# These messages come off disk (chat.md), and `ProjectInfo` does not record
+# which provider wrote them, so we assume Claude — the only provider that
+# injects wrappers today. Passed explicitly rather than defaulted inside
+# `meaningful_title` so this assumption is greppable when that stops holding.
+function overview_snippets(msgs::Vector{ChatMsg};
+                           limit::Int = OVERVIEW_SNIPPETS,
+                           provider::AgentProvider = find_provider("ClaudeCode"))
     out = String[]
     for m in Iterators.reverse(msgs)
         m isa UserMsg || continue
         m.auto && continue                       # Yolo auto-continue nudges aren't prompts
-        s = overview_user_snippet(m.text)
+        s = overview_user_snippet(provider, m.text)
         s === nothing && continue
         pushfirst!(out, s)
         length(out) >= limit && break

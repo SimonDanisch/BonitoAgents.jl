@@ -153,6 +153,14 @@ end
     # and an unknown leading tag is stripped just like a known one.
     @test BW.meaningful_prompt("<local-command-caveat>x</local-command-caveat><ide_opened_file>y</ide_opened_file>do the thing") == "do the thing"
 
+    # Regression: this copy of the stripper used to bail at the first space in
+    # the opener, so an attributed or self-closing wrapper leaked into the
+    # preview whole. The server's copy had been fixed and this one had not —
+    # which is why both now share AgentProviders.meaningful_prompt.
+    @test BW.meaningful_prompt("<ide_selection file=\"a.jl\">lines 1-2</ide_selection>fix the parser bug") == "fix the parser bug"
+    @test BW.meaningful_prompt("<command-args foo=\"x\"/>\nthe rest") == "the rest"
+    @test BW.meaningful_prompt("<system-reminder kind=\"foo\">no closer here") === nothing
+
     # first_user_text: returns nothing for non-user / injected records, prose
     # (clean_preview-collapsed) for real ones.
     mkrec(content) = Dict("type"=>"user", "message"=>Dict("role"=>"user","content"=>content))

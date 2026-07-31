@@ -1253,10 +1253,10 @@ end
 # different cleaned string (wrapper + prose where the wrapper part leaked
 # through the older regex). Clean titles round-trip to themselves and the
 # sweep ignores them.
-title_is_broken(t::Nothing) = false
-function title_is_broken(t::AbstractString)
+title_is_broken(::AgentProvider, ::Nothing) = false
+function title_is_broken(provider::AgentProvider, t::AbstractString)
     s = String(t)
-    cleaned = meaningful_title(s)
+    cleaned = meaningful_title(provider, s)
     return cleaned === nothing || String(cleaned) != s
 end
 
@@ -1276,20 +1276,25 @@ same state is a no-op the second time.
 function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
     wid = String(worker_id)
     fixed = 0
+    # Titles were derived from prompts on disk and `ProjectInfo` does not record
+    # which provider wrote them, so we assume Claude — the only provider that
+    # injects wrappers today. Explicit rather than defaulted so the assumption
+    # is greppable when that stops holding.
+    provider = find_provider("ClaudeCode")
     lock(state.lock) do
         for (pid, p) in state.projects[]
             p.worker_id == wid || continue
-            title_is_broken(p.title) || continue
+            title_is_broken(provider, p.title) || continue
             # Prefer the original prompt — re-running the filter against the
             # raw first user message recovers any prose the old truncation
             # dropped on the floor.
             chat_dir = chat_storage_dir(state, pid, p.server_path)
             raw = first_user_prompt(chat_dir)
-            new_title = raw === nothing ? nothing : meaningful_title(raw)
+            new_title = raw === nothing ? nothing : meaningful_title(provider, raw)
             # Fall back to cleaning the saved title in place — strictly an
             # improvement over the leaked form even when chat.md isn't
             # available (cwd moved, project imported, …).
-            new_title === nothing && (new_title = meaningful_title(String(p.title)))
+            new_title === nothing && (new_title = meaningful_title(provider, String(p.title)))
             p.title = new_title === nothing ? nothing : String(new_title)
             fixed += 1
         end
