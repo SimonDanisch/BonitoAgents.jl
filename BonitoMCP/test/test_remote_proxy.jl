@@ -256,14 +256,12 @@ end
         # One fragment ships the observable's value.
         @test shipped_marker(RP.render_eval_html(mkapp()))
 
-        # A SECOND fragment against the same long-lived parent does NOT re-ship
-        # it — the parent's object cache already holds it. That's why the live
-        # path doesn't render against the parent: a value is PARKED in a holder
-        # and re-rendered per tab (the `mount` op below), so each page root
-        # ships its own copy. `render_eval_html` renders straight against the
-        # parent and survives only as the Bonito-version probe in session.jl.
-        empty!(cap.sent)
-        @test !shipped_marker(RP.render_eval_html(mkapp()))
+        # Whether a SECOND fragment re-ships it is NOT asserted: rendering
+        # straight against the long-lived parent leaves that to the parent's
+        # object cache, whose behaviour differs across Bonito revisions. Nothing
+        # depends on it — `render_eval_html` survives only as the Bonito-version
+        # probe in session.jl. The live path parks a value and re-renders it per
+        # tab, which is pinned below.
 
         # JS module emission: every fragment must carry its <script type=module>
         # tag wherever it mounts. Pre-Bonito#406 sub emissions were deduped
