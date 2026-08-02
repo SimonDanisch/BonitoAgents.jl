@@ -1048,7 +1048,13 @@ chat view is open. Returns the new chat's project id.
 """
 function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
                                    title::AbstractString = "")
-    name = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
+    # `title` is used as the PROJECT NAME, which the dashboard validates as
+    # alphanumeric/_/- (it is also a directory name). The kwarg reads like a
+    # display label, so a caller naturally passes "Real stop" and gets a Create
+    # the server rejects. Sanitise the same way `github_project_name` does
+    # rather than making every caller know the rule.
+    raw  = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
+    name = replace(raw, r"[^A-Za-z0-9_\-]" => "-")
     leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
     to_dashboard(s)
     # RE-CLICK "+ New project" until the name field shows. A lone click can be
@@ -1084,13 +1090,32 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
         timeout = 30)
     click_text(s, "Choose")
     set_input(s, "input", name; placeholder = "e.g. my-project")
+    # Gate on the form being SUBMITTABLE before clicking Create. Both fields are
+    # filled asynchronously — the name via an `input` event whose notify has to
+    # round-trip to Julia, the worker by the open handler setting `np_worker` to
+    # "" and then to the first worker id (the "" pass makes the <select> render
+    # blank for a beat). Clicking Create in either window submits a form the
+    # server rejects, and the failure then surfaced only as a blind 90 s timeout
+    # on "chat view opened" with nothing saying why.
+    wait_for(s, "new-project form ready (worker + name)",
+        "(() => { const w = document.querySelector('.bt-np-worker-select'); " *
+        "const n = [...document.querySelectorAll('input')].find(e => (e.placeholder||'') === 'e.g. my-project'); " *
+        "return !!w && !!w.value && !!n && n.value.length > 0; })()";
+        timeout = 30)
     click_text(s, "Create")
     # The chat view renders only after the ACP session binds, which spawns a
-    # fresh mock-agent subprocess — its cold start can take the better part of a
-    # minute, so wait generously here.
-    wait_for(s, "chat view opened",
-             "!!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane')";
-             timeout = 90)
+    # fresh agent subprocess — cold start can take the better part of a minute,
+    # so wait generously. But race it against the form's own error line
+    # (`.bt-error`): a rejected Create never opens a chat, and without this the
+    # run burns the full timeout and reports "chat view opened" instead of the
+    # reason the server gave.
+    ok = wait_for(s, "chat view opened (or form error)",
+        "(() => { if (document.querySelector('.bt-error')) return true; " *
+        "return !!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane'); })()";
+        timeout = 90)
+    err = eval_js(s, "(() => { const e = document.querySelector('.bt-error'); " *
+                     "return e ? (e.innerText||'').trim() : ''; })()")
+    isempty(String(err)) || error("new_chat: the dashboard rejected Create — $(err)")
     # The ACP session binds asynchronously; until it does, the sidebar hasn't
     # marked the new chat active and a re-render can briefly drop `.bt-text-input`.
     # Gate on the new chat actually being SELECTED (non-empty active pid) AND its
