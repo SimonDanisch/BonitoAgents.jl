@@ -119,3 +119,101 @@ orphan_recorder(ch) = u -> (isopen(ch) && put!(ch, u); nothing)
         timedwait(() -> istaskdone(agent), 5.0)
     end
 end
+
+# ── Same property, driven by a REAL recording ────────────────────────────────
+#
+# The testset above hand-writes the agent's frames. This one replays
+# fixtures/real_stop_orphan_wire.jsonl — captured by `acp_frame_logger` from a
+# live claude-agent-acp session (BonitoAgents dev server, one Task subagent) at
+# the moment stop was pressed. Its tail is the whole bug:
+#
+#   37  in   RESPONSE stopReason=end_turn        active_turns empties
+#   38  in   session/update session_info_update  agent still streaming, no turn
+#   39  out  session/cancel                      what the fix makes happen
+#
+# Frame 39 is absent from any recording made before `Connection.orphan_work`
+# existed, because `cancel!` returned early on `isempty(active_turns)`.
+#
+# The agent side replays the recorded INBOUND frames in order, answering each
+# request with the recorded response (re-stamped with the id our Connection
+# actually used, since ids are per-connection).
+@testset "cancel during un-prompted work (real captured wire)" begin
+    frames = [JSON.parse(l) for l in
+              eachline(joinpath(@__DIR__, "fixtures", "real_stop_orphan_wire.jsonl"))]
+    inbound = [f["msg"] for f in frames if f["dir"] == "in"]
+    # Recorded responses, in order, to be matched against our outbound requests.
+    responses = [m for m in inbound if !haskey(m, "method")]
+    notifs    = [m for m in inbound if haskey(m, "method")]
+    @test !isempty(responses)
+    # The recording must actually contain the orphan-window cancel, or this test
+    # is pinning the wrong capture.
+    @test any(f -> f["dir"] == "out" && get(f["msg"], "method", "") == "session/cancel", frames)
+
+    port  = freeport()
+    ws_ch = Channel{Any}(1)
+    hold  = Channel{Nothing}(0)
+    seen  = Channel{String}(64)
+    ready = Channel{Nothing}(1)
+
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        put!(ws_ch, ws); try take!(hold) catch end
+    end
+
+    agent = @async try
+        HTTP.WebSockets.open("ws://127.0.0.1:$port") do cws
+            ri = 1
+            # Answer initialize + session/new + prompt from the recording.
+            while ri <= 3
+                line = recv_frame(cws); line === nothing && return
+                isempty(line) && continue
+                id = req_id(line); id === nothing && continue
+                body = JSON.json(get(responses[ri], "result", Dict{String,Any}()))
+                emit(cws, result_frame(id, body))
+                ri += 1
+                # After the prompt's request is answered we are past setup; stream
+                # the recorded notifications, then the prompt response.
+            end
+            for n in notifs
+                emit(cws, JSON.json(n))
+            end
+            put!(ready, nothing)
+            while true
+                line = recv_frame(cws); line === nothing && break
+                isempty(line) && continue
+                m = req_method(line)
+                m === nothing || (isopen(seen) && put!(seen, m))
+            end
+        end
+    catch e
+        e isa HTTP.WebSockets.WebSocketError ||
+            @warn "real-wire agent failed" exception = (e, catch_backtrace())
+    end
+
+    server_ws = take!(ws_ch)
+    orphans = Channel{Any}(64)
+    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), ACP.DiscardHandler())
+    conn.on_orphan_update = orphan_recorder(orphans)
+
+    try
+        session_id = do_setup(conn)
+        client = ACP.Client(conn, session_id, pwd(), Dict{String,Any}())
+        # The recorded prompt response resolves this turn; drain to its end.
+        for _ in ACP.prompt!(client, "replayed"); end
+        take!(ready)
+        @test timedwait(() -> isready(orphans), 10.0) === :ok
+        @test isempty(conn.active_turns)
+
+        ACP.cancel!(client)
+        got = String[]
+        ok = timedwait(10.0; pollint = 0.05) do
+            while isready(seen); push!(got, take!(seen)); end
+            "session/cancel" in got
+        end
+        @test ok === :ok
+        @test "session/cancel" in got
+    finally
+        close(orphans); close(seen); close(conn)
+        close(hold); close(server)
+        timedwait(() -> istaskdone(agent), 5.0)
+    end
+end
