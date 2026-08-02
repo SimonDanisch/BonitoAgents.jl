@@ -86,14 +86,28 @@ mutable struct Connection
     # (see `notify_frame`).
     on_frame::Union{Function,Nothing}
 
-    # Sink for session/updates arriving with NO turn in flight. The agent DOES
-    # stream between turns: a background subagent's parent-tagged activity
-    # keeps flowing after end_turn, and when the subagent finishes the main
-    # agent auto-wakes and streams an untagged completion message (captured
-    # live in BonitoAgents/test/fixtures/bg_subagent_wire.jsonl). Called as
+    # Sink for MAIN-THREAD session/updates arriving with NO turn in flight —
+    # the auto-wake completion message the agent streams after backgrounded
+    # work finishes (captured live in
+    # BonitoAgents/test/fixtures/bg_subagent_wire.jsonl). Called as
     # `on_orphan_update(update::SessionUpdate)` on the dispatcher task — keep
-    # it fast + non-throwing. `nothing` (default) = the old drop behavior.
+    # it fast + non-throwing. `nothing` (default) = drop.
+    #
+    # Subagent-tagged updates do NOT come here; they are addressed by
+    # `parentToolUseId` and go to `on_owner_update` instead.
     on_orphan_update::Union{Function,Nothing}
+
+    # Sink for updates that NAME their owner. Called as
+    # `on_owner_update(owner_id::String, update::SessionUpdate)` for every
+    # update carrying a `parentToolUseId` — i.e. everything a subagent emits.
+    #
+    # Addressed, not routed: a subagent's stream is its own from the first
+    # frame, so it never depends on which turn happens to be open, never
+    # competes with the main thread's spans, and is not silenced when a
+    # main-thread turn is cancelled. The consumer keeps per-owner state and
+    # renders it itself, which is what lets a subagent own its whole history
+    # instead of folding into a shared bounded feed.
+    on_owner_update::Union{Function,Nothing}
 
     # The in-flight streaming turns, OLDEST FIRST. `prompt_updates` appends;
     # the dispatcher feeds every `session/update` into the FIRST entry's
@@ -103,13 +117,25 @@ mutable struct Connection
     # second `session/prompt` be sent while one is running — the agent
     # injects the new user message into the live turn (steering) and, when
     # the SDK replays it, resolves the FIRST prompt with end_turn and hands
-    # the stream to the second (`pendingMessages`/`handedOff` upstream). This
-    # is also the ONLY way to get a turn back from the SDK's
-    # background-shell state: with a live background task the SDK never goes
-    # idle, so the active prompt never resolves on its own — the next prompt
-    # is what releases it. Oldest-first update routing matches the handoff
-    # contract: everything streamed before prompt N's response belongs to
-    # turn N.
+    # the stream to the second (`pendingMessages`/`handedOff` upstream).
+    # Oldest-first update routing matches the handoff contract: everything
+    # streamed before prompt N's response belongs to turn N.
+    #
+    # These are MAIN-THREAD spans only. Subagent updates are addressed by
+    # `parentToolUseId` and never enter here (see `on_owner_update`), so a
+    # background subagent neither competes with a turn for ownership nor
+    # depends on one being open.
+    #
+    # NB an earlier version of this comment claimed a live background task
+    # means the prompt "never resolves on its own — the next prompt is what
+    # releases it". That generalises a pathology: claude-agent-acp treats
+    # `session_state_changed: idle` as its authoritative turn-over signal, and
+    # documents its force-cancel grace as "armed and cleared, never fired, on
+    # healthy cancels … only trips when the SDK is genuinely wedged (e.g. a
+    # `TaskOutput { block: true }` poll against a hung background task — issue
+    # #680)". Healthy background work DOES resolve the turn:
+    # test/fixtures/real_stop_orphan_wire.jsonl shows end_turn at frame 26 with
+    # a `sleep 20` still running, its output arriving afterwards.
     active_turns::Vector{Pair{Int,Channel{SessionUpdate}}}
 
     # Single inbox for EVERY inbound frame (notifications, requests,
@@ -183,6 +209,7 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
                       handler,
                       on_frame,
                       nothing,                              # on_orphan_update (set post-bind)
+                      nothing,                              # on_owner_update  (set post-bind)
                       Pair{Int,Channel{SessionUpdate}}[],   # active_turns
                       Channel{Any}(1024),
                       ReentrantLock(), nothing, nothing, false,
@@ -386,6 +413,30 @@ end
 # route to the oldest unresolved one, matching claude-agent-acp's handoff
 # contract. (`session/load` still never overlaps a prompt in practice —
 # bring-up completes before the prompt consumer starts.)
+"""
+    deliver_owner!(conn, owner_id, update)
+
+Hand an addressed update to `on_owner_update`. Never blocks the dispatcher and
+never lets a throwing sink take it down — the same discipline `deliver_update!`
+follows, for the same reason: this task must stay free to reach a pending
+response sitting behind the inbox.
+
+`invokelatest` because the sink is assigned after this task exists (the chat
+layer wires it post-bind, and Revise redefining its target makes a newer method
+still); a direct call would throw a world-age MethodError and every subagent
+update would vanish behind the warning below.
+"""
+function deliver_owner!(conn::Connection, owner_id::AbstractString, update::SessionUpdate)
+    sink = conn.on_owner_update
+    sink === nothing && return nothing
+    try
+        Base.invokelatest(sink, String(owner_id), update)
+    catch e
+        @warn "on_owner_update threw" owner = owner_id exception = (e, catch_backtrace())
+    end
+    return nothing
+end
+
 function request_updates(conn::Connection, method::String, params)
     @atomic conn.cancelling  = false   # fresh turn renders normally
     @atomic conn.cancel_at   = 0.0     # fresh turn: no cancel recorded yet
@@ -465,6 +516,18 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             # render any more of this turn anyway (the consumer fast-discards),
             # so dropping here keeps the dispatcher free to reach the response
             # immediately, regardless of downstream speed.
+            # A SUBAGENT's update is addressed: `parentToolUseId` names its
+            # owner, so it never enters the main thread's span logic at all. It
+            # is not part of any turn, it is not "orphaned" when no turn is
+            # open, and cancelling a main-thread turn must not silence it —
+            # that coupling is what made background work vanish after a stop.
+            # Delivered straight to the owner sink for that id.
+            owner = parent_tool_use_id(update)
+            if owner !== nothing
+                deliver_owner!(conn, owner, update)
+                return nothing        # dispatch_message handles ONE frame; not a loop
+            end
+
             ch = lock(conn.lock) do
                 isempty(conn.active_turns) ? nothing : last(first(conn.active_turns))
             end
