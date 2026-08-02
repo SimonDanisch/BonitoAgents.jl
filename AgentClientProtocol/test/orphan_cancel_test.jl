@@ -122,38 +122,60 @@ end
 
 # ── Same property, driven by a REAL recording ────────────────────────────────
 #
-# The testset above hand-writes the agent's frames. This one replays
-# fixtures/real_stop_orphan_wire.jsonl — captured by `acp_frame_logger` from a
-# live claude-agent-acp session (BonitoAgents dev server, one Task subagent) at
-# the moment stop was pressed. Its tail is the whole bug:
+# fixtures/real_stop_orphan_wire.jsonl was captured by `acp_frame_logger` from a
+# live claude-agent-acp session: a backgrounded shell task, the turn ended
+# immediately, then the agent auto-woke when it finished. Its tail is why
+# liveness is narrowed to `is_agent_work`:
 #
-#   37  in   RESPONSE stopReason=end_turn        active_turns empties
-#   38  in   session/update session_info_update  agent still streaming, no turn
-#   39  out  session/cancel                      what the fix makes happen
+#   26  in   RESPONSE stopReason=end_turn          active_turns empties
+#   27  in   session/update session_info_update    metadata — must NOT arm
+#   28  in   session/update usage_update           metadata — must NOT arm
+#   29  in   session/update tool_call              REAL WORK — arms orphan_work
+#   30  out  session/cancel                        fires, and only now
 #
-# Frame 39 is absent from any recording made before `Connection.orphan_work`
-# existed, because `cancel!` returned early on `isempty(active_turns)`.
-#
-# The agent side replays the recorded INBOUND frames in order, answering each
-# request with the recorded response (re-stamped with the id our Connection
-# actually used, since ids are per-connection).
+# Both halves matter. An earlier capture had the cancel firing on frame 27's
+# metadata alone, which is what 05c12b8 removed: a session that has merely
+# reported its own state is idle, and cancelling there would latch `cancelling`
+# over an idle gap and swallow the agent's next burst of background work.
 @testset "cancel during un-prompted work (real captured wire)" begin
     frames = [JSON.parse(l) for l in
               eachline(joinpath(@__DIR__, "fixtures", "real_stop_orphan_wire.jsonl"))]
-    inbound = [f["msg"] for f in frames if f["dir"] == "in"]
-    # Recorded responses, in order, to be matched against our outbound requests.
-    responses = [m for m in inbound if !haskey(m, "method")]
-    notifs    = [m for m in inbound if haskey(m, "method")]
-    @test !isempty(responses)
-    # The recording must actually contain the orphan-window cancel, or this test
-    # is pinning the wrong capture.
-    @test any(f -> f["dir"] == "out" && get(f["msg"], "method", "") == "session/cancel", frames)
+    inbound  = [f["msg"] for f in frames if f["dir"] == "in"]
+    outbound = [f["msg"] for f in frames if f["dir"] == "out"]
+
+    # Pair each recorded response with the METHOD it answered, so the replay can
+    # answer by method rather than by position. Answering positionally handed the
+    # prompt a `set_config_option` result, so the turn resolved early and every
+    # remaining frame became an orphan — the test passed, but not via the
+    # structure it claimed to reproduce.
+    method_of_id = Dict{Any,String}(m["id"] => m["method"]
+                                  for m in outbound if haskey(m, "method") && haskey(m, "id"))
+    replies = Dict{String,Vector{Any}}()
+    for m in inbound
+        haskey(m, "method") && continue
+        meth = get(method_of_id, get(m, "id", nothing), nothing)
+        meth === nothing && continue
+        push!(get!(replies, meth, Any[]), get(m, "result", Dict{String,Any}()))
+    end
+    @test haskey(replies, "session/prompt")
+
+    # Guard the FIXTURE itself: if a recapture loses this ordering the test would
+    # silently stop covering what it documents.
+    su(m) = get(get(get(m, "params", Dict()), "update", Dict()), "sessionUpdate", "")
+    endi  = findlast(m -> !haskey(m, "method") &&
+                          get(get(m, "result", Dict()), "stopReason", "") != "", inbound)
+    # Notifications AFTER the last end_turn, in recorded order. Sliced out of
+    # `inbound` (where `endi` is an index) and not out of the pre-filtered
+    # `notifs`, whose indices do not line up with it.
+    tail_notifs = [m for m in inbound[(endi+1):end] if haskey(m, "method")]
+    tail  = [su(m) for m in tail_notifs]
+    @test "tool_call" in tail                       # real work after end_turn
+    @test findfirst(==("session_info_update"), tail) <
+          findfirst(==("tool_call"), tail)          # metadata comes first, and does not arm
 
     port  = freeport()
-    ws_ch = Channel{Any}(1)
-    hold  = Channel{Nothing}(0)
-    seen  = Channel{String}(64)
-    ready = Channel{Nothing}(1)
+    ws_ch = Channel{Any}(1); hold = Channel{Nothing}(0)
+    seen  = Channel{String}(64); ready = Channel{Nothing}(1)
 
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
         put!(ws_ch, ws); try take!(hold) catch end
@@ -161,27 +183,32 @@ end
 
     agent = @async try
         HTTP.WebSockets.open("ws://127.0.0.1:$port") do cws
-            ri = 1
-            # Answer initialize + session/new + prompt from the recording.
-            while ri <= 3
+            pending = Dict(k => copy(v) for (k, v) in replies)
+            # Answer requests from the recording, by method, until the prompt is
+            # answered — that response is the recorded end_turn, so the turn
+            # resolves exactly where it did live.
+            while true
                 line = recv_frame(cws); line === nothing && return
                 isempty(line) && continue
-                id = req_id(line); id === nothing && continue
-                body = JSON.json(get(responses[ri], "result", Dict{String,Any}()))
-                emit(cws, result_frame(id, body))
-                ri += 1
-                # After the prompt's request is answered we are past setup; stream
-                # the recorded notifications, then the prompt response.
+                id = req_id(line); m = req_method(line)
+                (id === nothing || m === nothing) && continue
+                got = get(pending, m, Any[])
+                body = isempty(got) ? Dict{String,Any}() : popfirst!(got)
+                emit(cws, result_frame(id, JSON.json(body)))
+                m == "session/prompt" && break
             end
-            for n in notifs
+            # Everything the agent streamed AFTER end_turn, in recorded order:
+            # metadata first (must not arm), then the tool_call (must).
+            for n in tail_notifs
                 emit(cws, JSON.json(n))
+                sleep(0.05)
             end
             put!(ready, nothing)
             while true
                 line = recv_frame(cws); line === nothing && break
                 isempty(line) && continue
-                m = req_method(line)
-                m === nothing || (isopen(seen) && put!(seen, m))
+                mm = req_method(line)
+                mm === nothing || (isopen(seen) && put!(seen, mm))
             end
         end
     catch e
@@ -197,8 +224,7 @@ end
     try
         session_id = do_setup(conn)
         client = ACP.Client(conn, session_id, pwd(), Dict{String,Any}())
-        # The recorded prompt response resolves this turn; drain to its end.
-        for _ in ACP.prompt!(client, "replayed"); end
+        for _ in ACP.prompt!(client, "replayed"); end   # resolves on the RECORDED end_turn
         take!(ready)
         @test timedwait(() -> isready(orphans), 10.0) === :ok
         @test isempty(conn.active_turns)
@@ -214,6 +240,74 @@ end
     finally
         close(orphans); close(seen); close(conn)
         close(hold); close(server)
+        timedwait(() -> istaskdone(agent), 5.0)
+    end
+end
+
+# ── Cancelling a turn must not silence unrelated background work ─────────────
+#
+# `cancelling` gates the orphan branch so the dispatcher can skip a cancelled
+# turn's backlog and reach its `cancelled` response. But it was only cleared by
+# the NEXT `request_updates`, so between the cancel and the user's next message
+# every orphan update was dropped — a background subagent nobody cancelled kept
+# running with its output thrown away. Stopping one turn should stop that turn.
+@testset "cancel does not silence later background work" begin
+    port  = freeport()
+    ws_ch = Channel{Any}(1); hold = Channel{Nothing}(0)
+    settled = Channel{Nothing}(1)
+
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        put!(ws_ch, ws); try take!(hold) catch end
+    end
+
+    agent = @async try
+        HTTP.WebSockets.open("ws://127.0.0.1:$port") do cws
+            answer_setup(cws) || return
+            pid = nothing
+            while pid === nothing
+                line = recv_frame(cws); line === nothing && return
+                isempty(line) && continue
+                req_method(line) == "session/prompt" && (pid = req_id(line))
+            end
+            emit(cws, text_update("streaming"))
+            # Wait for the cancel, then settle the turn — the real sequence.
+            while true
+                line = recv_frame(cws); line === nothing && return
+                isempty(line) && continue
+                req_method(line) == "session/cancel" && break
+            end
+            emit(cws, prompt_done(pid, "cancelled"))
+            put!(settled, nothing)
+            # A background subagent the user never cancelled, still working.
+            sleep(0.3)
+            emit(cws, text_update("background subagent still going"))
+            drain_until_close(cws)
+        end
+    catch e
+        e isa HTTP.WebSockets.WebSocketError ||
+            @warn "bg-after-cancel agent failed" exception = (e, catch_backtrace())
+    end
+
+    server_ws = take!(ws_ch)
+    orphans = Channel{Any}(64)
+    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), ACP.DiscardHandler())
+    conn.on_orphan_update = orphan_recorder(orphans)
+    try
+        session_id = do_setup(conn)
+        client = ACP.Client(conn, session_id, pwd(), Dict{String,Any}())
+        turn = ACP.prompt!(client, "go")
+        streamer = @async (for _ in turn; end)
+        timedwait(() -> (@atomic conn.cancelling) || true, 1.0)
+        ACP.cancel!(client)
+        @test (@atomic conn.cancelling)            # latched for the cancelled turn
+        take!(settled)
+        timedwait(() -> istaskdone(streamer), 5.0)
+
+        # Settled: the latch must be gone, so later background work still lands.
+        @test timedwait(() -> !(@atomic conn.cancelling), 5.0) === :ok
+        @test timedwait(() -> isready(orphans), 5.0) === :ok
+    finally
+        close(orphans); close(conn); close(hold); close(server)
         timedwait(() -> istaskdone(agent), 5.0)
     end
 end

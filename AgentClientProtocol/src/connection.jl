@@ -515,6 +515,18 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             if i !== nothing
                 close(last(conn.active_turns[i]))
                 deleteat!(conn.active_turns, i)
+                # Drop the cancel latch as soon as the cancelled turn is gone,
+                # not at the next prompt. `cancelling` exists to stop the
+                # dispatcher head-of-line blocking on THIS turn's update backlog
+                # so it can reach the `cancelled` response — once the turn is
+                # settled there is no backlog left to skip.
+                #
+                # Leaving it latched until `request_updates` meant every ORPHAN
+                # update in between was discarded: a background subagent the user
+                # never cancelled kept working while its output was thrown away,
+                # so stopping one turn made unrelated background work go silent
+                # until they happened to send another message.
+                isempty(conn.active_turns) && (@atomic conn.cancelling = false)
             end
             c = get(conn.pending, id, nothing)
             c === nothing || delete!(conn.pending, id)
