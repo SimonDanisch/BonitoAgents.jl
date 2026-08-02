@@ -2789,7 +2789,10 @@ class BonitoChat {
     requeueUser(msg) {
         for (const it of (msg.items || [])) {
             const node = this.cache.get(it.idx);
-            if (node) node.dataset.queueLabel = queueLabel(it.pos);
+            // An explicit `label` overrides the position wording — stop uses it
+            // to mark a dropped bubble "not sent" while keeping it dimmed, so
+            // the text is still there to copy but clearly never went out.
+            if (node) node.dataset.queueLabel = it.label || queueLabel(it.pos);
         }
     }
 

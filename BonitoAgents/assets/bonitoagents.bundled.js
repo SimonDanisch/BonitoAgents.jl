@@ -1846,7 +1846,7 @@ class BonitoChat {
     requeueUser(msg) {
         for (const it of msg.items || []){
             const node = this.cache.get(it.idx);
-            if (node) node.dataset.queueLabel = queueLabel(it.pos);
+            if (node) node.dataset.queueLabel = it.label || queueLabel(it.pos);
         }
     }
     onSummaryFinal(msg) {

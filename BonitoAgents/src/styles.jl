@@ -699,7 +699,11 @@ const ChatStyles = Bonito.Styles(
     # Queued state: the user submitted while a prior turn was still running.
     # Dim the bubble and badge it "queued" until `user_unqueue` promotes it.
     CSS(".bt-user-msg.bt-queued",
-        "opacity" => "0.65"),
+        "opacity" => "0.65",
+        # Room for the ::after badge, which hangs below the bubble. Without it
+        # consecutive queued bubbles stack tight enough that one bubble's badge
+        # runs into the next one.
+        "margin-bottom" => "18px"),
     CSS(".bt-user-msg.bt-queued::after",
         # Position-aware ("next up", "queued · #3"), re-numbered in place as the
         # queue drains. Falls back to "queued" when no position is known.

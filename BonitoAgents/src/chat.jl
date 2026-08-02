@@ -4072,11 +4072,18 @@ function run_chat!(chat::ChatModel)
             nothing
         end
         turn === nothing && continue
-        Base.errormonitor(@async try
+        # AWAITED, not spawned. Spawning it let the loop come straight back
+        # around and `begin_turn!` the next message while this turn was still
+        # streaming — so every queued bubble was promoted (and its prompt put on
+        # the wire) within milliseconds of being typed. That is why the queued
+        # badge never appeared, why two quick sends both claimed "next up", and
+        # why stop could not drain a queue: there wasn't one on our side, only
+        # the agent's own promptQueueing. One turn at a time, as documented.
+        try
             drain_turn!(chat, turn)
         catch e
             @error "chat turn failed" exception = (e, catch_backtrace())
-        end)
+        end
     end
     return nothing
 end
@@ -5085,17 +5092,23 @@ function send_message!(model::ChatModel, msg::UserMsg;
     s = shared(model)
     # If there's a turn in flight, the bubble joins the queue (visually dim).
     bubble = UserMsg(model, msg.text)
-    bubble.queued = s.busy_active[]
-    # Position among the bubbles still waiting, so the badge can say how far
-    # off this one is rather than just "queued".
-    bubble.queue_pos = bubble.queued ?
-        lock(() -> count(m -> m isa UserMsg && m.queued, s.msgs_store), s.lock) + 1 : 0
     bubble.auto = msg.auto   # preserve the Yolo auto-continue marker for dim styling
+    # Queue state + position + enqueue in ONE critical section, and counted off
+    # `pending_sends` — the bubbles whose prompt hasn't reached the agent yet,
+    # i.e. the queue itself. Counting `msgs_store` in a separate lock let two
+    # near-simultaneous sends both observe zero waiting bubbles and both stamp
+    # position 1, so both rendered "next up".
+    #
+    # `pending_sends` also tracks the bubble as "not yet seen by the agent" until
+    # `begin_turn!` delivers its prompt — a reconcile landing in between (the
+    # lazy bind on this very send) must keep it at the store's END and never
+    # anchor on it.
+    lock(model.lock) do
+        bubble.queued = s.busy_active[]
+        bubble.queue_pos = bubble.queued ? length(s.pending_sends) + 1 : 0
+        push!(s.pending_sends, bubble)
+    end
     close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
-    # Track the bubble as "not yet seen by the agent" until `begin_turn!`
-    # delivers its prompt — a reconcile landing in between (the lazy bind on
-    # this very send) must keep it at the store's END and never anchor on it.
-    lock(() -> push!(s.pending_sends, bubble), model.lock)
     # Refresh the lens vocabulary NOW that a user message exists, rather than
     # waiting for end-of-turn (drain_turn!'s emit_lens_vocab). Otherwise the
     # `/user_message` key isn't suggestable until the agent's reply lands — the
@@ -5183,6 +5196,47 @@ end
 # (FIFO matches the channel order under `send_message!`) and emits a
 # `user_unqueue` event so the browser drops the "queued" class. No-op when
 # the chat was idle — the just-pushed bubble was never queued.
+"""
+    drop_queued_sends!(chat) -> Int
+
+Discard every user message still waiting to be prompted, and relabel its bubble
+"not sent". Called by stop.
+
+The text is KEPT — silently deleting what someone typed is worse than not
+sending it — so the bubble stays dimmed and badged, and re-sending is a copy
+away. Returns how many were dropped.
+
+Drains `user_messages` (what the consumer would pick up) and `pending_sends`
+(the bubbles mirroring it) together, under the shared lock, so the two can't
+disagree about what is still queued.
+"""
+function drop_queued_sends!(chat::ChatModel)
+    s = shared(chat)
+    dropped = lock(s.lock) do
+        # Non-blocking drain: `isready` is false the moment the queue is empty,
+        # so this never waits on a producer.
+        while isready(s.user_messages)
+            take!(s.user_messages)
+        end
+        stuck = [(i - 1, m) for (i, m) in enumerate(s.msgs_store)
+                 if m isa UserMsg && m.queued]
+        for (_, m) in stuck
+            m.queued = false      # no longer waiting on us
+            m.queue_pos = 0
+        end
+        empty!(s.pending_sends)
+        stuck
+    end
+    isempty(dropped) && return 0
+    # Keep `.bt-queued` (dimmed) and swap the position badge for a plain reason:
+    # `user_unqueue` would clear the class and leave the bubble looking sent.
+    chat_emit(chat, Dict{String,Any}(
+        "type"  => "user_requeue",
+        "items" => [Dict{String,Any}("idx" => i, "label" => "not sent")
+                    for (i, _) in dropped]))
+    return length(dropped)
+end
+
 function promote_queued_user_bubble!(chat::ChatModel)
     idx, moved = lock(chat.lock) do
         found = nothing
@@ -6802,6 +6856,13 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
         @debug "dropping stale cancel" clicked_turn = cmd.seq current = s.turn_seq[]
         return nothing
     end
+
+    # Stop means stop the CHAT, not just this turn. Anything still waiting would
+    # otherwise start a fresh turn the moment the cancelled one ends — the user
+    # presses stop and the agent keeps answering. Drop the waiting prompts (the
+    # bubbles stay, relabelled) BEFORE cancelling, so the consumer can't pick one
+    # up in the window between the cancel landing and the turn winding down.
+    drop_queued_sends!(model)
 
     # A graceful `session/cancel` makes ACP close the active turn's update
     # channel; the `prompt!` loop ends, `run_turn!`'s `finally` clears
