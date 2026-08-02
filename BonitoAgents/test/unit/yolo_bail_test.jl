@@ -1,35 +1,63 @@
-# The bail test used to require the whole reply to be exactly "no", so an agent
-# answering "No, everything is done." kept getting re-prompted.
+# The bail signal used to be inferred from the reply's leading word, which
+# cannot work: "No, everything is done." must stop the loop and "no, here's
+# more" must not, and both begin with `no`. Whichever way the rule went, one of
+# them was wrong — and the implementation and yolo_mode_test.jl disagreed about
+# which. The loop now asks for a SENTINEL the agent has to opt into emitting, so
+# "am I finished" is a fact instead of a reading.
 @testitem "unit:yolo_bail" tags = [:unit] begin
-    B = BonitoAgents.yolo_bail
+    B  = BonitoAgents.yolo_bail
+    R  = BonitoAgents.yolo_stop_reason
+    N  = BonitoAgents.yolo_norm
+    S  = BonitoAgents.YOLO_DONE_SENTINEL
+    MX = BonitoAgents.YOLO_MAX_STREAK
 
-    @testset "declines that must stop the loop" begin
-        for reply in ("no", "No", "NO", "No.", "no!", "  No.  ", "No...",
-                      "**No**", "> No.",
-                      "No, everything is done.",          # the reported miss
-                      "No.\n\nThe tests pass and the branch is pushed.",
-                      "No — there's nothing left I can do on my own.")
+    @testset "the sentinel, on its own line, stops the loop" begin
+        for reply in (S, "  $S  ", "$S.", "**$S**", "> $S", "`$S`",
+                      "Everything is green and pushed.\n\n$S",
+                      "done\n$S\n")
             @test B(reply)
         end
     end
 
-    @testset "replies that must NOT stop the loop" begin
-        for reply in ("Not quite — I'll keep going.",      # `\b` guards this
-                      "Nothing is broken, continuing.",
-                      "Now running the tests.",
-                      "yes",
-                      "I still need to update the docs.",
-                      "There is more to do: the sidebar work is unfinished.",
-                      "")
+    @testset "prose never stops the loop on its own" begin
+        # The two that made a leading-word rule impossible. Neither bails now,
+        # because neither says so — and that is the point: the agent decides
+        # explicitly rather than us guessing from phrasing.
+        @test !B("No, everything is done.")
+        @test !B("no, here's more")
+        for reply in ("no", "No.", "**No**", "NO!", "Not quite — I'll keep going.",
+                      "I still need to update the docs.", "yes", "")
             @test !B(reply)
         end
     end
 
-    @testset "the old exact-match rule was the bug" begin
-        old(t) = strip(replace(lowercase(strip(t)), r"[.!]+$" => "")) == "no"
-        for reply in ("No, everything is done.", "No.\n\nThe tests pass.", "**No**")
-            @test !old(reply)      # old said "keep going"
-            @test B(reply)         # new correctly bails
-        end
+    @testset "a mention is not a declaration" begin
+        # Mid-sentence, or talked ABOUT, must not end the loop — otherwise the
+        # agent explaining the protocol would silently stop it.
+        @test !B("I will print $S when I am finished.")
+        @test !B("The sentinel is $S, but I am still working.")
+    end
+
+    @testset "normalisation folds case and whitespace" begin
+        @test N("  I'll   Continue\n now ") == N("i'll continue now")
+        @test N("") == ""
+    end
+
+    # `yolo_stop_reason` is pure (reply, produced, streak, last) so the whole
+    # rule is checkable here without standing up a chat.
+    @testset "stop reasons" begin
+        @test R(S, true, 0, "")               == ""          # declared: stop, silently
+        @test R("working", false, 0, "")      != nothing      # produced nothing
+        @test R("working", true, 0, "")       === nothing     # ordinary progress
+        # Repeat = spinning.
+        @test R("I'll continue.", true, 3, N("I'll continue.")) !== nothing
+        @test occursin("repeated", R("I'll continue.", true, 3, N("i'll   continue.")))
+        # A turn ending on a tool call has no reply; two in a row is normal work,
+        # not a repeat, so an empty reply must never trip the repeat check.
+        @test R("", true, 3, "") === nothing
+        # Backstop: bounded even if every turn looks new.
+        @test R("fresh text $(MX)", true, MX - 1, "") !== nothing
+        @test occursin(string(MX), R("fresh", true, MX - 1, ""))
+        @test R("fresh", true, MX - 2, "") === nothing
     end
 end
