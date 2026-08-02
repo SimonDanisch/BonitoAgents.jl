@@ -4490,15 +4490,26 @@ end
 const YOLO_DONE_SENTINEL = "YOLO-COMPLETE"
 
 const YOLO_CONTINUE_PROMPT = """
-Keep going on your own if there is more you can usefully do.
+You are being continued automatically. Nobody is reading in between, so a \
+question you ask here will not be answered — the next message is another \
+automatic continue.
 
-When you are genuinely finished — nothing left that you can do without me — end \
-your reply with this line on its own:
+Keep going while there is more you can usefully do on your own.
+
+Stop the loop by ending your reply with this line, on its own, as soon as ANY \
+of these is true:
+
+  - you have finished
+  - you need something only I can give: a decision, an answer, access, credentials
+  - you are repeating yourself, going in circles, or no longer making progress
 
 $(YOLO_DONE_SENTINEL)
 
-Emit that line ONLY then. Do not emit it while asking me something, and do not \
-mention it otherwise. Anything else you write means you are still working."""
+Emit it for one of those reasons and no other, and never while you still intend \
+to carry on. Do not mention it otherwise. Anything else you write means you are \
+still working.
+
+Stopping to ask is not failure — it is faster than looping."""
 
 # Composer placeholder while Yolo is armed — the message input doubles as the
 # reminders editor then (see `chat_input_area`).
