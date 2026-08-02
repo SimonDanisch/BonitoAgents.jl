@@ -13,9 +13,51 @@ turn an update belongs to:
 ch = isempty(conn.active_turns) ? nothing : last(first(conn.active_turns))
 ```
 
-"the oldest in-flight streaming request" — the handoff contract. Everything the
-protocol does not say, this line guesses. And when it cannot guess, the update is
+"the oldest in-flight streaming request". And when it cannot infer, the update is
 either diverted (`on_orphan_update`) or dropped (`cancelling`).
+
+**Correction to an earlier draft of this document.** It called that line a guess
+at structure the protocol does not have. That is wrong, and the field's own
+docstring says so: oldest-first matches claude-agent-acp's *handoff contract* —
+a second `session/prompt` sent while one is running gets injected into the live
+turn, and the SDK then resolves the FIRST prompt with `end_turn` and hands the
+stream to the second. The rule models real upstream behaviour.
+
+What is still wrong is narrower, and worth stating precisely rather than
+sweeping: the routing table is used to answer questions it was never built to
+answer (is the agent working? should this be cancelled? whose history is this?),
+and its fallback is to discard. The handoff contract itself has to survive any
+replacement — two concurrent prompts, the first resolving into the second, is a
+supported state and not an edge case.
+
+A second claim in that docstring needs settling before anything is built on it:
+
+> with a live background task the SDK never goes idle, so the active prompt
+> never resolves on its own — the next prompt is what releases it.
+
+**Resolved: the docstring overstates.** It generalises a pathology into a rule.
+claude-agent-acp's own source (`acp-agent.js`) treats `session_state_changed:
+idle` as "its authoritative turn-over signal", and its 30 s force-cancel grace is
+documented as
+
+> armed and cleared, never fired, on healthy cancels. It only trips when the SDK
+> is genuinely wedged (e.g. a `TaskOutput { block: true }` poll against a hung
+> background task — issue #680) and never yields.
+
+So a hung background task is an upstream anomaly with its own backstop, not the
+normal shape of background work. Healthy background work resolves the turn —
+which is what `fixtures/real_stop_orphan_wire.jsonl` shows directly: frame 26
+resolves `end_turn` while `sleep 20` is still running, and the work arrives
+afterwards at frames 27-29.
+
+Consequences for this design:
+
+- "a turn is a span over the main thread" is well-defined; a span ends when the
+  prompt resolves, and outstanding background work does not hold it open
+- the `cancelling`-clears-on-settle fix does fire in the case it was written for
+- the wedge case is already handled above us, so this layer does not need to
+  model it — but it must not ASSUME a turn always settles promptly either, which
+  is why per-owner state cannot be keyed on span lifetime alone
 
 Four bugs found in one session, all the same cause:
 
@@ -137,17 +179,59 @@ There is a corpus to refactor against, which there was not before:
 Any test that has to be edited to make the new design work is a behaviour change
 that needs arguing for on its own, not folded into a refactor.
 
-## Suggested order
+## Done in one pass, not staged
 
-1. Introduce owners alongside the router; dispatch by identity where present,
-   fall back to the current path. Nothing is deleted yet, everything still green.
-2. Move subagents onto their own owner + renderer. This alone kills the shared
-   ring buffer and `route_subagent_activity!`.
-3. Move the auto-wake stream onto the main-thread owner. `between_turn` and the
-   orphan branch go.
-4. Re-express liveness and cancel per owner. `orphan_work`, the `cancelling`
-   gate, and `is_agent_work` retire.
-5. Delete the fallback path and the handoff heuristic.
+An earlier draft staged this over five steps, starting with owners running
+*alongside* the router behind a fallback. That intermediate is a state nobody
+wants to ship: both code paths live at once, so it carries more total complexity
+than either endpoint and every behaviour has two implementations to keep
+agreeing. The value is in deleting the router, and a stage that keeps it is
+mostly ceremony.
 
-Each step is independently shippable and independently revertible, which matters
-because this is the layer everything else sits on.
+So: one coherent change, then test the whole application hard.
+
+### Blast radius
+
+Four source files, and the weight is not evenly spread:
+
+| file | lines |
+| --- | --- |
+| `BonitoAgents/src/chat.jl` | 7455 |
+| `AgentClientProtocol/src/connection.jl` | 609 |
+| `AgentClientProtocol/src/messages.jl` | 582 |
+| `AgentClientProtocol/src/client.jl` | 326 |
+
+### Which tests may change, and which may not
+
+This is the part that keeps "tests as specification" meaningful without a staged
+rollout. Six files name the internals being removed, so they necessarily change:
+
+    AgentClientProtocol/test/orphan_cancel_test.jl
+    AgentClientProtocol/test/runtests.jl
+    BonitoAgents/test/e2e/subagent_feed.jl
+    BonitoAgents/test/unit/between_turn_test.jl
+    BonitoAgents/test/unit/subagent_feed_test.jl
+    BonitoAgents/test/unit/session_config_test.jl
+
+Everything else — roughly thirty behavioural e2e items including `chat_cancel`,
+`cancel_escalation`, `chat_streaming_sustained`, `chat_remount`, `leak_cycle`,
+`queued_messages`, `yolo_mode` — never mentions them and **must pass unchanged**.
+Those describe what the user experiences; the six above describe how it is
+currently built.
+
+If one of the thirty has to be edited, that is a behaviour change and needs
+arguing on its own terms, not absorbing into the refactor.
+
+### Test plan for the single pass
+
+1. `AgentClientProtocol` suite, including both real captured wires.
+2. `BonitoWorker` suite (`Pkg.test`, real-agent integration included).
+3. Full `BonitoAgents` suite — all test items, not a subset. The interlocks that
+   matter (taskbar, persistence, virtual scroll, remount) are not in the files
+   this refactor touches, which is exactly why they are worth running.
+4. Real-agent run: background subagent, stop mid auto-wake, confirm the
+   transcript freezes and the subagent's own history is intact.
+5. Browser check of a long subagent run — the shared 50-entry ring is being
+   replaced by per-subagent history, so the visible failure mode (steps
+   disappearing from the middle of a long run) needs eyes on it, not just a
+   passing assertion.
