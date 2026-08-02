@@ -151,13 +151,21 @@ end
     julia_bin   = joinpath(Sys.BINDIR::String, Base.julia_exename())
     pkg_root    = normpath(joinpath(@__DIR__, ".."))
     standalone  = joinpath(pkg_root, "src", "worker_standalone.jl")
+    # Spawn against the ACTIVE test env, not `pkg_root`. BonitoWorker's own
+    # Project.toml is a dependency DECLARATION with no Manifest, so a subprocess
+    # pointed at it can't resolve HTTP. That used to work only because Pkg's
+    # sandbox leaked JULIA_LOAD_PATH through `copy(ENV)`; once test/Project.toml
+    # existed the leak went away and the worker died with "Package HTTP ... does
+    # not seem to be installed" before it could send hello. The test env is a
+    # real instantiated env that contains BonitoWorker, so use that.
+    worker_env  = dirname(Base.active_project())
     env         = copy(ENV)
     env["BONITOAGENTS_WORKER_SECRET"] = secret
     env["BONITOAGENTS_SERVER_URL"]    = server_url
     env["BONITOAGENTS_PROJECTS_ROOT"] = projects_root
 
     worker_log  = tempname() * ".log"
-    worker_cmd  = Cmd(`$julia_bin --project=$pkg_root --startup-file=no $standalone`)
+    worker_cmd  = Cmd(`$julia_bin --project=$worker_env --startup-file=no $standalone`)
     println("[real-agent] spawning worker subprocess; log -> ", worker_log)
     worker_proc = run(pipeline(setenv(worker_cmd, env);
                                 stdout = worker_log, stderr = worker_log);
