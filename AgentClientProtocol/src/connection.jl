@@ -474,10 +474,14 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
                    !(@atomic conn.cancelling)
                 # No turn in flight — but the agent legitimately streams here:
                 # background-subagent activity and the auto-wake completion
-                # message (see the field doc). This is the agent WORKING, so
-                # record it: `cancel!` reads this to tell "idle" from "busy but
-                # unregistered", which `active_turns` alone cannot.
-                @atomic conn.orphan_work = true
+                # message (see the field doc). Record it ONLY when it is the
+                # agent working (`is_agent_work`): `cancel!` reads this to tell
+                # "idle" from "busy but unregistered", which `active_turns`
+                # alone cannot. Session METADATA also lands here — a fresh
+                # session emits `available_commands_update` right after
+                # `session/new` — and counting that as work made every chat look
+                # busy from the moment it bound.
+                is_agent_work(update) && (@atomic conn.orphan_work = true)
                 # Hand it to the orphan sink; a throwing sink must never take
                 # the dispatcher down. `invokelatest` because the sink is
                 # assigned AFTER this task exists (chat.jl wires it post-`start!`,

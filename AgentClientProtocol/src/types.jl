@@ -32,6 +32,8 @@ end
 
 abstract type SessionUpdate end
 
+
+
 struct AgentMessageChunk <: SessionUpdate
     content::ContentBlock
 end
@@ -85,6 +87,8 @@ struct ToolCallUpdateNotif <: SessionUpdate
     raw::AbstractDict
 end
 
+
+
 struct UnknownUpdate <: SessionUpdate
     session_update::String
     raw::AbstractDict
@@ -110,6 +114,27 @@ The parent Task tool_use id a subagent-originated update is tagged with
 """
 parent_tool_use_id(::SessionUpdate) = nothing
 parent_tool_use_id(u::SubagentUpdate) = u.parent_tool_use_id
+
+"""
+    is_agent_work(u::SessionUpdate) -> Bool
+
+Whether `u` is the agent DOING something, as opposed to telling us about the
+session. Content the user watches appear — prose, thoughts, tool calls, plans —
+is work; `available_commands` / `current_mode` / `session_info` / `usage` are
+metadata that arrives on bind and at turn boundaries.
+
+The distinction matters because these updates also arrive with NO turn open
+(see `Connection.on_orphan_update`), and treating every one of them as
+"the agent is busy" latches liveness true on a chat that has done nothing:
+a fresh session emits `available_commands_update` right after `session/new`.
+"""
+is_agent_work(::SessionUpdate) = false
+is_agent_work(::AgentMessageChunk) = true
+is_agent_work(::AgentThoughtChunk) = true
+is_agent_work(::PlanUpdate) = true
+is_agent_work(::ToolCallNotif) = true
+is_agent_work(::ToolCallUpdateNotif) = true
+is_agent_work(::SubagentUpdate) = true
 
 # ── Session config options ────────────────────────────────────────────────────
 # ACP "Session Config Options": the session-setup response MAY carry a list of

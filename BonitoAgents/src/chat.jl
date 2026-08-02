@@ -4204,8 +4204,17 @@ function handle_orphan_update!(chat::ChatModel, u)
     # shared lock — the `on(busy_active)` hook takes `state.lock`, and taking
     # that under the model lock would invert the order used everywhere else.
     # Set-if-changed, same as the live-turn loop in `drain_turn!`.
+    #
+    # ONLY for updates that are the agent working. Session metadata arrives here
+    # too — `available_commands_update` lands right after `session/new` — and
+    # marking busy for it latched EVERY freshly-bound chat as "working" with
+    # nothing running: the header span, a first message wrongly badged queued,
+    # and `note_bound!` unable to evict anything (it skips busy chats), so
+    # BIND_CAP silently stopped capping live agents.
     s = shared(chat)
-    s.busy_active[] || (s.busy_active[] = true)
+    if AgentClientProtocol.is_agent_work(u)
+        s.busy_active[] || (s.busy_active[] = true)
+    end
     try
         put!(ch, u)                               # bounded, in-order; coalescer drains
     catch e
@@ -4859,11 +4868,21 @@ function note_bound!(state::ServerState, pid::AbstractString)
         filter!(!=(pid), lru)
         push!(lru, pid)                       # most-recently-bound last
         length(lru) <= BIND_CAP && return ""
-        for i in eachindex(lru)
+        # Prefer a chat with NO conversation in it. Since 58a88d2 a brand-new
+        # chat binds on OPEN, so simply opening tabs fills the cap and plain
+        # oldest-first eviction closes whichever chat you opened earliest —
+        # typically the one you are actually working in. An unmessaged chat has
+        # nothing to lose: it rebinds on its next turn and the user sees nothing.
+        # Falls through to oldest-first when every candidate has history.
+        for pass in (:unmessaged, :any), i in eachindex(lru)
             cand = lru[i]
             cand == pid && continue           # never evict the one we just bound
             m = get(state.chat_models, cand, nothing)
             m === nothing && (deleteat!(lru, i); return "")   # stale entry
+            if pass === :unmessaged
+                sm = shared(m)
+                lock(() -> any(x -> x isa UserMsg, sm.msgs_store), sm.lock) && continue
+            end
             shared(m).busy_active[] && continue               # don't cut a chat off mid-turn
             return cand
         end
