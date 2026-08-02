@@ -6,6 +6,11 @@ if (typeof document !== 'undefined') {
     const vp = document.querySelector('meta[name="viewport"]');
     if (vp && !vp.content.includes('interactive-widget')) vp.content += ', interactive-widget=resizes-content';
 }
+function queueLabel(pos) {
+    if (!Number.isInteger(pos) || pos < 1) return 'queued';
+    if (pos === 1) return 'next up';
+    return `queued \u00b7 #${pos}`;
+}
 class Collapsable {
     constructor(headerEl, bodyEl, opts = {}){
         this.header = headerEl;
@@ -573,6 +578,8 @@ class BonitoChat {
                 return this.appendUserChunk(msg.text);
             case 'user_unqueue':
                 return this.unqueueUser(msg);
+            case 'user_requeue':
+                return this.requeueUser(msg);
             case 'summary_final':
                 return this.onSummaryFinal(msg);
             case 'attach_error':
@@ -1669,7 +1676,10 @@ class BonitoChat {
         switch(msg.type){
             case 'user':
                 div.className = 'bt-user-msg';
-                if (msg.queued) div.classList.add('bt-queued');
+                if (msg.queued) {
+                    div.classList.add('bt-queued');
+                    div.dataset.queueLabel = queueLabel(msg.queue_pos);
+                }
                 if (msg.auto) div.classList.add('bt-user-msg-auto');
                 div.textContent = msg.text;
                 if (Array.isArray(msg.attachments) && msg.attachments.length) {
@@ -1832,6 +1842,12 @@ class BonitoChat {
         }
         const q = this.container.querySelector('.bt-user-msg.bt-queued');
         if (q) q.classList.remove('bt-queued');
+    }
+    requeueUser(msg) {
+        for (const it of msg.items || []){
+            const node = this.cache.get(it.idx);
+            if (node) node.dataset.queueLabel = queueLabel(it.pos);
+        }
     }
     onSummaryFinal(msg) {
         const node = msg.id ? this.nodeById.get(msg.id) : null;
