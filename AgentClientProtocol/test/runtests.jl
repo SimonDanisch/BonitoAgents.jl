@@ -647,3 +647,8 @@ end
     @test ACP.parse_session_update(open_frame).tool_name == "Bash"
     @test ACP.parse_session_update(later).tool_name === nothing
 end
+
+# Cancelling work the agent streams outside any request (the counterpart to
+# "A8 cancel is a no-op when idle" above: idle must stay a no-op, but
+# unregistered-and-working must not).
+include(joinpath(@__DIR__, "orphan_cancel_test.jl"))

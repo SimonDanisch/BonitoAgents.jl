@@ -282,14 +282,26 @@ end
 # resolves the prompt with `stopReason: cancelled`.
 function cancel!(client::Client)
     conn = client.conn
-    # No-op when idle (A8): cancelling between turns would otherwise leave
-    # `cancelling` latched true and poison the NEXT turn (its consumer would
-    # fast-discard every update). Only flip the flag + send the notification
-    # when a turn is actually in flight. Checked under `conn.lock` so we read a
-    # consistent view of `active_turns`.
-    has_turn = lock(() -> !isempty(conn.active_turns), conn.lock)
-    has_turn || return nothing
+    # Cancel targets the SESSION, not one request.
+    #
+    # `active_turns` answers "which turn owns this update"; it is not a liveness
+    # signal, and using it as one is why stop used to be a no-op for the whole
+    # window in which the agent auto-wakes after backgrounded work and streams
+    # tools + prose with nothing registered. See `Connection.orphan_work`.
+    #
+    # Still a no-op when GENUINELY idle (A8) — no turn and no un-prompted work
+    # since the last turn or cancel. That matters: `cancelling` gates the orphan
+    # branch, so latching it true over an idle gap would silently drop the
+    # agent's next burst of background work until a new prompt cleared it.
+    live = lock(conn.lock) do
+        !isempty(conn.active_turns) || (@atomic conn.orphan_work)
+    end
+    live || return nothing
     @atomic conn.cancelling = true
+    # Consumed: a second cancel arriving while still idle must no-op again. If
+    # the agent ignores this one and keeps streaming, the dispatcher sets it
+    # afresh, so a deliberate re-cancel still gets through (and still escalates).
+    @atomic conn.orphan_work = false
     send_notification(conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
     return nothing

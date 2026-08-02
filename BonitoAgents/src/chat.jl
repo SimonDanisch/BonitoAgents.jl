@@ -4189,6 +4189,16 @@ end
 function handle_orphan_update!(chat::ChatModel, u)
     ch = ensure_between_turn_sink!(chat)
     ch === nothing && return nothing              # chat closing / sink torn down
+    # The agent IS working, even though no prompt is open — this is the auto-wake
+    # after backgrounded work, streaming tools and prose. Without this the chat
+    # reads idle for the whole window: the header shows nothing running, and
+    # `send_message!` marks a typed message unqueued (`bubble.queued =
+    # busy_active[]`) so it races the work already in flight. Set OUTSIDE the
+    # shared lock — the `on(busy_active)` hook takes `state.lock`, and taking
+    # that under the model lock would invert the order used everywhere else.
+    # Set-if-changed, same as the live-turn loop in `drain_turn!`.
+    s = shared(chat)
+    s.busy_active[] || (s.busy_active[] = true)
     try
         put!(ch, u)                               # bounded, in-order; coalescer drains
     catch e
@@ -4265,6 +4275,10 @@ function teardown_between_turn!(chat::ChatModel)
         b
     end
     bt === nothing || close(bt.updates)
+    # The un-prompted work is over, so stop reporting busy — unless a real turn
+    # is running (the next prompt tears the sink down before its own turn opens,
+    # and a turn that outlives it must keep the flag). Same idiom as `drain_turn!`.
+    bt === nothing || (s.busy_active[] = (s.turns_active[] > 0))
     return bt
 end
 

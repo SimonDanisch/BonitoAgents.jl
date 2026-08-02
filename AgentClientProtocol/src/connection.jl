@@ -160,6 +160,20 @@ mutable struct Connection
     # impatient double-click — only the former, after the agent's had a real
     # chance, escalates to a force-close. Reset to 0.0 at each turn start.
     @atomic cancel_at::Float64
+    # The agent has streamed work with NO request open — i.e. `on_orphan_update`
+    # fired — since the last turn started or the last cancel went out.
+    #
+    # This exists because `active_turns` answers "which turn owns this update",
+    # NOT "is the agent working", and those stopped being the same question once
+    # the agent started auto-waking after backgrounded work. In the captured
+    # trace (BonitoAgents/test/fixtures/bg_subagent_wire.jsonl) the agent runs a
+    # tool and writes three message chunks across 27 s with `active_turns`
+    # empty; asking `active_turns` there says "idle" while the user is watching
+    # it work, so a stop click was dropped for the whole window.
+    #
+    # Cleared at each turn start and by `cancel!`, so it means "work a cancel
+    # could still affect", not "work ever happened".
+    @atomic orphan_work::Bool
 end
 
 function Connection(transport::Transport, handler::Handler = DiscardHandler();
@@ -173,7 +187,8 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
                       Channel{Any}(1024),
                       ReentrantLock(), nothing, nothing, false,
                       false,                     # cancelling
-                      0.0)                       # cancel_at
+                      0.0,                       # cancel_at
+                      false)                     # orphan_work
     conn.dispatcher_task = @async dispatcher_loop(conn)
     conn.reader_task     = @async reader_loop(conn)
     return conn
@@ -372,8 +387,9 @@ end
 # contract. (`session/load` still never overlaps a prompt in practice —
 # bring-up completes before the prompt consumer starts.)
 function request_updates(conn::Connection, method::String, params)
-    @atomic conn.cancelling = false   # fresh turn renders normally
-    @atomic conn.cancel_at  = 0.0     # fresh turn: no cancel recorded yet
+    @atomic conn.cancelling  = false   # fresh turn renders normally
+    @atomic conn.cancel_at   = 0.0     # fresh turn: no cancel recorded yet
+    @atomic conn.orphan_work = false   # any pre-turn stray work is this turn's now
     id = lock(conn.lock) do
         i = conn.next_id; conn.next_id += 1; i
     end
@@ -458,10 +474,18 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
                    !(@atomic conn.cancelling)
                 # No turn in flight — but the agent legitimately streams here:
                 # background-subagent activity and the auto-wake completion
-                # message (see the field doc). Hand it to the orphan sink;
-                # a throwing sink must never take the dispatcher down.
+                # message (see the field doc). This is the agent WORKING, so
+                # record it: `cancel!` reads this to tell "idle" from "busy but
+                # unregistered", which `active_turns` alone cannot.
+                @atomic conn.orphan_work = true
+                # Hand it to the orphan sink; a throwing sink must never take
+                # the dispatcher down. `invokelatest` because the sink is
+                # assigned AFTER this task exists (chat.jl wires it post-`start!`,
+                # and Revise redefining its target makes a newer method still):
+                # a direct call then throws a world-age MethodError and every
+                # orphan update silently vanishes behind the @warn below.
                 try
-                    conn.on_orphan_update(update)
+                    Base.invokelatest(conn.on_orphan_update, update)
                 catch e
                     @warn "on_orphan_update threw" exception = (e, catch_backtrace())
                 end
