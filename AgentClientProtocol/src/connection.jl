@@ -50,9 +50,9 @@ transport_eof(::Transport) = false
 #                                                       return the JSON-serializable
 #                                                       result or throw)
 #
-# Session updates are NOT handled here — they belong to a prompt turn and are
-# delivered as a `Channel{SessionUpdate}` from `prompt_updates` (see below), so
-# the consumer gets them as a bounded, ordered stream rather than via callback.
+# Session updates are NOT handled here — they are addressed to their owner (the
+# session's main thread, or a subagent) and reach it through `on_main_update` /
+# `on_owner_update`, which `Client` turns into bounded, ordered streams.
 #
 # Why dispatch instead of a `::Function` field on `Connection`:
 #   - The handler's identity shows up in stack traces / `methods(...)` / `@which`;
@@ -72,6 +72,21 @@ end
 # message — e.g. one-shot scripts that drive `prompt!` and discard output.
 struct DiscardHandler <: Handler end
 
+# One `session/prompt` in flight: a SPAN over the session's main stream, not a
+# container for it.
+#
+# `flush` is the span's end marker. The dispatcher puts it on the main stream at
+# the exact frame the response arrives, so the boundary is stamped where the wire
+# says it is — not wherever the caller's task happens to get scheduled. That
+# matters during steering: prompt 1 resolves while prompt 2 is already streaming,
+# and a marker injected from the caller could land after prompt 2's opening text,
+# merging it into prompt 1's bubble.
+struct PromptSpan
+    id::Int
+    response::Channel{Any}
+    flush::StreamFlush
+end
+PromptSpan(id::Int) = PromptSpan(id, Channel{Any}(1), StreamFlush())
 
 mutable struct Connection
     transport::Transport
@@ -86,16 +101,24 @@ mutable struct Connection
     # (see `notify_frame`).
     on_frame::Union{Function,Nothing}
 
-    # Sink for MAIN-THREAD session/updates arriving with NO turn in flight —
-    # the auto-wake completion message the agent streams after backgrounded
-    # work finishes (captured live in
-    # BonitoAgents/test/fixtures/bg_subagent_wire.jsonl). Called as
-    # `on_orphan_update(update::SessionUpdate)` on the dispatcher task — keep
-    # it fast + non-throwing. `nothing` (default) = drop.
+    # Sink for the session's MAIN THREAD: EVERY untagged `session/update`,
+    # whether or not a prompt happens to be in flight. Called as
+    # `on_main_update(update::SessionUpdate)` on the dispatcher task — keep it
+    # fast + non-throwing. `Client` installs it (one persistent coalescer per
+    # session); `nothing` = drop.
+    #
+    # There is deliberately no per-prompt update stream. The main thread is ONE
+    # stream that the agent speaks on continuously: inside a prompt, and also
+    # between prompts (the auto-wake it does after backgrounded work finishes —
+    # captured live in BonitoAgents/test/fixtures/bg_subagent_wire.jsonl). Those
+    # used to be two code paths, which meant two renderers, two notions of
+    # liveness, and a whole class of "which turn does this belong to" questions
+    # that the wire cannot answer. A prompt is now a SPAN over this stream, not
+    # a container for it.
     #
     # Subagent-tagged updates do NOT come here; they are addressed by
     # `parentToolUseId` and go to `on_owner_update` instead.
-    on_orphan_update::Union{Function,Nothing}
+    on_main_update::Union{Function,Nothing}
 
     # Sink for updates that NAME their owner. Called as
     # `on_owner_update(owner_id::String, update::SessionUpdate)` for every
@@ -109,34 +132,58 @@ mutable struct Connection
     # instead of folding into a shared bounded feed.
     on_owner_update::Union{Function,Nothing}
 
-    # The in-flight streaming turns, OLDEST FIRST. `prompt_updates` appends;
-    # the dispatcher feeds every `session/update` into the FIRST entry's
-    # channel and closes + removes an entry when its response arrives.
+    # `toolCallId` → the subagent that owns it, learned from the frames that DO
+    # carry `parentToolUseId`.
+    #
+    # claude-agent-acp does not tag every frame of a subagent's tool. Captured
+    # live (BonitoAgents/test/fixtures/bg_subagent_wire.jsonl), one subagent bash
+    # arrives: `tool_call`(tagged) → `tool_call_update`(UNTAGGED, and it is the
+    # one carrying `toolResponse`) → `tool_call_update`(tagged). Addressing on
+    # the tag alone sends that middle frame to the main thread, where the
+    # coalescer has never heard of the tool id and drops it — so the subagent
+    # silently loses an update, and a tool whose TERMINAL frame is the untagged
+    # one never reaches `completed` in its feed.
+    #
+    # The id is recoverable, so we recover it rather than guess: an untagged
+    # frame for a tool we have seen a subagent announce belongs to that subagent.
+    # A tool id never seen tagged stays the main thread's — this only ever
+    # re-unites frames with an owner the wire already told us about.
+    #
+    # Forgotten when the tool reports terminal, so it cannot grow unbounded over
+    # a long session.
+    tool_owners::Dict{String,String}
+
+    # Requests that CAPTURE the update stream for themselves instead of letting
+    # it reach `on_main_update`. Exactly one method does this: `session/load`,
+    # where the agent re-streams the resumed session's whole history as
+    # `session/update` notifications. That replay is not the live conversation
+    # and must not render as it — it is the request's own result, arriving in
+    # pieces, so the request collects it (`collect_replayed_updates`).
+    #
+    # `session/prompt` deliberately does NOT capture. A prompt is a span over
+    # the main stream, marked by `active_prompts`; its content goes to the one
+    # main sink like everything else the main thread says.
+    #
+    # A load never overlaps another load or a prompt in practice (bring-up
+    # completes before the chat's consumer starts), so "the oldest capturing
+    # request" is unambiguous here in a way it never was for prompts.
+    capture::Vector{Pair{Int,Channel{SessionUpdate}}}
+
+    # The in-flight `session/prompt` spans. NOT a routing table — nothing is
+    # routed by it. It answers exactly one question, "is a prompt open", which
+    # `cancel!` needs and which is otherwise unknowable, and it carries each
+    # span's end-of-turn marker so the dispatcher can stamp the boundary at the
+    # exact frame the response arrives (see `PromptSpan`).
     #
     # More than one entry is a real, supported state: claude-agent-acp lets a
-    # second `session/prompt` be sent while one is running — the agent
-    # injects the new user message into the live turn (steering) and, when
-    # the SDK replays it, resolves the FIRST prompt with end_turn and hands
-    # the stream to the second (`pendingMessages`/`handedOff` upstream).
-    # Oldest-first update routing matches the handoff contract: everything
-    # streamed before prompt N's response belongs to turn N.
-    #
-    # These are MAIN-THREAD spans only. Subagent updates are addressed by
-    # `parentToolUseId` and never enter here (see `on_owner_update`), so a
-    # background subagent neither competes with a turn for ownership nor
-    # depends on one being open.
-    #
-    # NB an earlier version of this comment claimed a live background task
-    # means the prompt "never resolves on its own — the next prompt is what
-    # releases it". That generalises a pathology: claude-agent-acp treats
-    # `session_state_changed: idle` as its authoritative turn-over signal, and
-    # documents its force-cancel grace as "armed and cleared, never fired, on
-    # healthy cancels … only trips when the SDK is genuinely wedged (e.g. a
-    # `TaskOutput { block: true }` poll against a hung background task — issue
-    # #680)". Healthy background work DOES resolve the turn:
-    # test/fixtures/real_stop_orphan_wire.jsonl shows end_turn at frame 26 with
-    # a `sleep 20` still running, its output arriving afterwards.
-    active_turns::Vector{Pair{Int,Channel{SessionUpdate}}}
+    # second `session/prompt` be sent while one is running — the agent injects
+    # the new user message into the live turn (steering) and, when the SDK
+    # replays it, resolves the FIRST prompt with end_turn and hands the stream
+    # to the second (`pendingMessages`/`handedOff` upstream). With one main
+    # stream that handoff needs no modelling at all: the agent's words arrive in
+    # wire order and are rendered in wire order, whichever prompt is credited
+    # with them.
+    active_prompts::Vector{PromptSpan}
 
     # Single inbox for EVERY inbound frame (notifications, requests,
     # responses). `reader_loop` parses each WS line into a raw JSON-RPC
@@ -174,32 +221,40 @@ mutable struct Connection
     dispatcher_task::Union{Task,Nothing}
     closed::Bool
 
-    # Set true by `cancel!` for the active turn. The `prompt!` consumer then
-    # fast-discards remaining buffered `session/update`s instead of coalescing +
-    # rendering them, so a token backlog can't keep the dispatcher from reaching
+    # Set true by `cancel!`. The dispatcher then drops main-thread updates
+    # instead of delivering them, so a token backlog can't keep it from reaching
     # the `cancelled` response (strict-FIFO head-of-line). Reset to false when
-    # the next turn starts (`request_updates`). Atomic for cross-task visibility
-    # (set on the cancel task, read in the consumer loop).
+    # the cancelled prompt settles, or when the next request starts. Atomic for
+    # cross-task visibility (set on the cancel task, read on the dispatcher).
+    #
+    # It gates the MAIN THREAD only. Subagent updates are addressed and return
+    # before this is consulted: cancelling a prompt must not silence background
+    # work the user never cancelled.
     @atomic cancelling::Bool
     # `time()` of the FIRST cancel for the active turn (0.0 if none). Lets the
     # chat layer tell a deliberate re-cancel ("force it, it's wedged") from an
     # impatient double-click — only the former, after the agent's had a real
     # chance, escalates to a force-close. Reset to 0.0 at each turn start.
     @atomic cancel_at::Float64
-    # The agent has streamed work with NO request open — i.e. `on_orphan_update`
-    # fired — since the last turn started or the last cancel went out.
+    # The main thread has streamed WORK with no prompt open, since the last
+    # request started or the last cancel went out.
     #
-    # This exists because `active_turns` answers "which turn owns this update",
-    # NOT "is the agent working", and those stopped being the same question once
-    # the agent started auto-waking after backgrounded work. In the captured
-    # trace (BonitoAgents/test/fixtures/bg_subagent_wire.jsonl) the agent runs a
-    # tool and writes three message chunks across 27 s with `active_turns`
-    # empty; asking `active_turns` there says "idle" while the user is watching
-    # it work, so a stop click was dropped for the whole window.
+    # `active_prompts` says whether we asked for something; this says whether the
+    # agent is saying something. They stopped being the same question once the
+    # agent started auto-waking after backgrounded work. In the captured trace
+    # (BonitoAgents/test/fixtures/bg_subagent_wire.jsonl) it runs a tool and
+    # writes three message chunks across 27 s with no prompt open; asking
+    # `active_prompts` there says "idle" while the user is watching it work, so a
+    # stop click was dropped for the whole window.
     #
-    # Cleared at each turn start and by `cancel!`, so it means "work a cancel
+    # WORK, not traffic: session metadata (`available_commands_update` right
+    # after `session/new`, usage, mode) is the agent answering about itself, not
+    # doing something — see `is_agent_work`. Counting it made every chat look
+    # busy from the moment it bound.
+    #
+    # Cleared at each request start and by `cancel!`, so it means "work a cancel
     # could still affect", not "work ever happened".
-    @atomic orphan_work::Bool
+    @atomic unprompted_work::Bool
 end
 
 function Connection(transport::Transport, handler::Handler = DiscardHandler();
@@ -208,14 +263,16 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
                       Dict{Int,Channel{Any}}(), 0,
                       handler,
                       on_frame,
-                      nothing,                              # on_orphan_update (set post-bind)
-                      nothing,                              # on_owner_update  (set post-bind)
-                      Pair{Int,Channel{SessionUpdate}}[],   # active_turns
+                      nothing,                              # on_main_update  (Client installs)
+                      nothing,                              # on_owner_update (set post-bind)
+                      Dict{String,String}(),                # tool_owners
+                      Pair{Int,Channel{SessionUpdate}}[],   # capture
+                      PromptSpan[],                         # active_prompts
                       Channel{Any}(1024),
                       ReentrantLock(), nothing, nothing, false,
                       false,                     # cancelling
                       0.0,                       # cancel_at
-                      false)                     # orphan_work
+                      false)                     # unprompted_work
     conn.dispatcher_task = @async dispatcher_loop(conn)
     conn.reader_task     = @async reader_loop(conn)
     return conn
@@ -255,16 +312,26 @@ function dispatcher_loop(conn::Connection)
         # racing teardown either registers before us (and gets failed below) or
         # sees `closed` and throws — it can never park on a channel nobody will
         # ever feed (A1/A2).
-        lock(conn.lock) do
+        stranded = lock(conn.lock) do
             conn.closed = true
-            for (_, ch) in conn.active_turns
+            for (_, ch) in conn.capture
                 close(ch)
             end
-            empty!(conn.active_turns)
+            empty!(conn.capture)
+            spans = copy(conn.active_prompts)
+            empty!(conn.active_prompts)
             for (_, ch) in conn.pending
                 put!(ch, ConnectionClosed())
             end
             empty!(conn.pending)
+            spans
+        end
+        # A span ALWAYS ends, on exactly one of two events: its response, or
+        # this. Callers wait on `span.flush` for "the turn is rendered", so a
+        # span that just evaporated on teardown would leave them waiting on a
+        # marker nobody will ever send.
+        for sp in stranded
+            deliver_main!(conn, sp.flush)
         end
     end
 end
@@ -282,16 +349,27 @@ function register_pending!(conn::Connection, id::Int, ch::Channel)
     return nothing
 end
 
-# Same, but also enrolls the request in the streaming-turn queue (oldest
-# first). Concurrent turns are deliberate — see the `active_turns` field doc:
-# a prompt sent while one runs is the agent's steering/handoff mechanism, and
-# the only way to free a turn the SDK holds open for a background shell.
-function register_turn!(conn::Connection, id::Int,
-                        response::Channel, updates::Channel)
+# Same, but the request also CAPTURES the update stream while it runs — see the
+# `capture` field doc. `session/load` only.
+function register_capture!(conn::Connection, id::Int,
+                           response::Channel, updates::Channel)
     lock(conn.lock) do
         conn.closed && throw(ConnectionClosed("connection torn down"))
         conn.pending[id] = response
-        push!(conn.active_turns, id => updates)
+        push!(conn.capture, id => updates)
+    end
+    return nothing
+end
+
+# Same, but marks the request as an open prompt span. Concurrent prompts are
+# deliberate — see the `active_prompts` field doc: a prompt sent while one runs
+# is the agent's steering/handoff mechanism, and the only way to free a turn the
+# SDK holds open for a background shell.
+function register_prompt!(conn::Connection, span::PromptSpan)
+    lock(conn.lock) do
+        conn.closed && throw(ConnectionClosed("connection torn down"))
+        conn.pending[span.id] = span.response
+        push!(conn.active_prompts, span)
     end
     return nothing
 end
@@ -313,7 +391,7 @@ end
 # to reach a `cancelled` response behind a backlog) is handled by bailing the
 # moment `cancelling` flips: the call site already stops delivering once
 # cancelling and the consumer fast-discards, so a parked put! can't wedge cancel.
-function deliver_update!(conn::Connection, ch::Channel{SessionUpdate}, update::SessionUpdate)
+function deliver_update!(conn::Connection, ch::Channel, update)
     while true
         lock(ch)
         try
@@ -400,19 +478,53 @@ function send_request(conn::Connection, method::String, params, timeout::Real)::
     return result
 end
 
-# Begin a request that streams `session/update` notifications back while it runs.
-# Both `session/prompt` (live turn) and `session/load` (the agent re-streams the
-# resumed session's history) do this. Returns `(updates, response)`:
-#   * `updates`  - a Channel{SessionUpdate} carrying this request's session/update
-#                  notifications in wire order, CLOSED when the request's response
-#                  arrives or the connection tears down.
-#   * `response` - a one-shot channel that receives the result (or a
-#                  ConnectionClosed on teardown), so the caller can detect a
-#                  dead session after draining `updates`.
-# Concurrent streaming requests are supported (see `active_turns`): updates
-# route to the oldest unresolved one, matching claude-agent-acp's handoff
-# contract. (`session/load` still never overlaps a prompt in practice —
-# bring-up completes before the prompt consumer starts.)
+"""
+    owner_of(conn, update) -> Union{String,Nothing}
+
+Who this update belongs to: the subagent named by `parentToolUseId`, or — for an
+untagged frame about a tool a subagent has already claimed — that same subagent.
+`nothing` means the session's main thread.
+
+Learning the tool→owner association is what makes the second case possible; see
+`Connection.tool_owners` for the captured wire behaviour that requires it.
+"""
+function owner_of(conn::Connection, update::SessionUpdate)
+    tagged = parent_tool_use_id(update)
+    tid    = tool_call_id(update)
+    lock(conn.lock) do
+        if tagged !== nothing
+            # Remember, then forget on the tool's own terminal frame — AFTER this
+            # call returns it, so the terminal frame still reaches its owner.
+            tid === nothing && return tagged
+            tool_is_terminal(update) ? delete!(conn.tool_owners, tid) :
+                                       (conn.tool_owners[tid] = tagged)
+            return tagged
+        end
+        tid === nothing && return nothing
+        owner = get(conn.tool_owners, tid, nothing)
+        owner === nothing && return nothing        # the main thread's own tool
+        tool_is_terminal(update) && delete!(conn.tool_owners, tid)
+        return owner
+    end
+end
+
+"""
+    deliver_main!(conn, update)
+
+Hand a main-thread update to `on_main_update`. Same discipline as
+`deliver_owner!`; see there for why `invokelatest`.
+"""
+function deliver_main!(conn::Connection, update::Union{SessionUpdate,StreamFlush})
+    sink = conn.on_main_update
+    sink === nothing && return nothing
+    try
+        Base.invokelatest(sink, update)
+    catch e
+        @warn "on_main_update threw" exception = (e, catch_backtrace())
+    end
+    return nothing
+end
+
 """
     deliver_owner!(conn, owner_id, update)
 
@@ -437,23 +549,52 @@ function deliver_owner!(conn::Connection, owner_id::AbstractString, update::Sess
     return nothing
 end
 
-function request_updates(conn::Connection, method::String, params)
-    @atomic conn.cancelling  = false   # fresh turn renders normally
-    @atomic conn.cancel_at   = 0.0     # fresh turn: no cancel recorded yet
-    @atomic conn.orphan_work = false   # any pre-turn stray work is this turn's now
-    id = lock(conn.lock) do
+# Reset the per-request cancel/liveness state. Any stray work from before this
+# request belongs to it now, and a fresh request renders normally.
+function reset_turn_state!(conn::Connection)
+    @atomic conn.cancelling       = false
+    @atomic conn.cancel_at        = 0.0
+    @atomic conn.unprompted_work  = false
+    return nothing
+end
+
+function next_request_id(conn::Connection)
+    lock(conn.lock) do
         i = conn.next_id; conn.next_id += 1; i
     end
+end
+
+# Begin a request that CAPTURES the `session/update` stream while it runs, i.e.
+# `session/load` (see the `capture` field doc). Returns `(updates, response)`:
+#   * `updates`  - a Channel{SessionUpdate} carrying the notifications that
+#                  arrive while this request is open, in wire order, CLOSED when
+#                  its response lands or the connection tears down.
+#   * `response` - a one-shot channel receiving the result (or a
+#                  ConnectionClosed on teardown), so the caller can detect a
+#                  dead session after draining `updates`.
+function request_updates(conn::Connection, method::String, params)
+    reset_turn_state!(conn)
+    id = next_request_id(conn)
     response = Channel{Any}(1)
     updates  = Channel{SessionUpdate}(BUF)
-    register_turn!(conn, id, response, updates)
+    register_capture!(conn, id, response, updates)
     send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id,
                         "method" => method, "params" => params))
     return updates, response
 end
 
-# A `session/prompt` turn — the original entry point, unchanged for callers.
-prompt_updates(conn::Connection, params) = request_updates(conn, "session/prompt", params)
+# Send a `session/prompt` and open a span over the main stream. Returns the
+# `PromptSpan`. The prompt's CONTENT does not come back through here — it is the
+# main thread speaking, and it goes to `on_main_update` like everything else the
+# main thread says.
+function prompt_request(conn::Connection, params)
+    reset_turn_state!(conn)
+    span = PromptSpan(next_request_id(conn))
+    register_prompt!(conn, span)
+    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => span.id,
+                        "method" => "session/prompt", "params" => params))
+    return span
+end
 
 function send_response(conn::Connection, id, result)
     send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
@@ -501,62 +642,54 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             # ACP wraps the actual update object under "update" key
             update_obj = get(params, "update", params)
             update = parse_session_update(update_obj)
-            # Belongs to the OLDEST in-flight streaming request (session/prompt
-            # or session/load): everything the agent streams before prompt N's
-            # response is turn N's content (the handoff contract — see
-            # `active_turns`). If none is active (the agent shouldn't stream
-            # otherwise), drop it.
+            # Every update is ADDRESSED, in this order of specificity:
             #
-            # DROP the moment cancel is requested. This single dispatcher task
-            # processes the inbox strictly in order, so if it BLOCKS here on
-            # `put!` into a backed-up updates channel (slow browser / heavy token
-            # or tool-call stream), it can never reach the `cancelled` response
-            # sitting behind the backlog — the turn would look wedged for as long
-            # as the browser takes to drain. Once cancel is requested we don't
-            # render any more of this turn anyway (the consumer fast-discards),
-            # so dropping here keeps the dispatcher free to reach the response
-            # immediately, regardless of downstream speed.
-            # A SUBAGENT's update is addressed: `parentToolUseId` names its
-            # owner, so it never enters the main thread's span logic at all. It
-            # is not part of any turn, it is not "orphaned" when no turn is
-            # open, and cancelling a main-thread turn must not silence it —
-            # that coupling is what made background work vanish after a stop.
-            # Delivered straight to the owner sink for that id.
-            owner = parent_tool_use_id(update)
+            #   1. `parentToolUseId` names a subagent — it owns the update. It
+            #      is not part of any turn, it is not "orphaned" when no prompt
+            #      is open, and cancelling the main thread must not silence it
+            #      (that coupling is what made background work vanish after a
+            #      stop). Straight to the owner sink, before anything else.
+            #   2. A `session/load` is capturing — the update is part of that
+            #      request's replayed result, not the live conversation.
+            #   3. Otherwise it is the session's MAIN THREAD talking, prompt
+            #      open or not. One stream, one sink.
+            #
+            # Nothing is inferred and nothing falls through to a drop.
+            owner = owner_of(conn, update)
             if owner !== nothing
-                deliver_owner!(conn, owner, update)
+                # The INNER update when the wire tagged it: `owner` already names
+                # who it belongs to, so the wrapper has done its job and would
+                # only make every consumer unwrap it again. An update whose owner
+                # we RECOVERED is already unwrapped.
+                inner = update isa SubagentUpdate ? update.update : update
+                deliver_owner!(conn, owner, inner)
                 return nothing        # dispatch_message handles ONE frame; not a loop
             end
 
             ch = lock(conn.lock) do
-                isempty(conn.active_turns) ? nothing : last(first(conn.active_turns))
+                isempty(conn.capture) ? nothing : last(first(conn.capture))
             end
-            if ch !== nothing && !(@atomic conn.cancelling)
+            if ch !== nothing
                 deliver_update!(conn, ch, update)
-            elseif ch === nothing && conn.on_orphan_update !== nothing &&
-                   !(@atomic conn.cancelling)
-                # No turn in flight — but the agent legitimately streams here:
-                # background-subagent activity and the auto-wake completion
-                # message (see the field doc). Record it ONLY when it is the
-                # agent working (`is_agent_work`): `cancel!` reads this to tell
-                # "idle" from "busy but unregistered", which `active_turns`
-                # alone cannot. Session METADATA also lands here — a fresh
-                # session emits `available_commands_update` right after
-                # `session/new` — and counting that as work made every chat look
-                # busy from the moment it bound.
-                is_agent_work(update) && (@atomic conn.orphan_work = true)
-                # Hand it to the orphan sink; a throwing sink must never take
-                # the dispatcher down. `invokelatest` because the sink is
-                # assigned AFTER this task exists (chat.jl wires it post-`start!`,
-                # and Revise redefining its target makes a newer method still):
-                # a direct call then throws a world-age MethodError and every
-                # orphan update silently vanishes behind the @warn below.
-                try
-                    Base.invokelatest(conn.on_orphan_update, update)
-                catch e
-                    @warn "on_orphan_update threw" exception = (e, catch_backtrace())
-                end
+                return nothing
             end
+
+            # DROP the main thread the moment cancel is requested. This single
+            # dispatcher task processes the inbox strictly in order, so if it
+            # BLOCKS below on a backed-up sink (slow browser / heavy token or
+            # tool-call stream), it can never reach the `cancelled` response
+            # sitting behind the backlog — the turn would look wedged for as
+            # long as the browser takes to drain. Once cancel is requested we
+            # aren't rendering any more of this turn anyway.
+            (@atomic conn.cancelling) && return nothing
+            # Record that the agent is WORKING, not merely talking: `cancel!`
+            # reads this to tell "idle" from "busy with no prompt open", which
+            # `active_prompts` alone cannot. Session metadata lands here too — a
+            # fresh session emits `available_commands_update` right after
+            # `session/new` — and counting that as work made every chat look
+            # busy from the moment it bound.
+            is_agent_work(update) && (@atomic conn.unprompted_work = true)
+            deliver_main!(conn, update)
         end
         # Other notifications silently ignored.
 
@@ -573,28 +706,46 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
         # pending table are read/mutated under `conn.lock` (A1) — caller tasks
         # register concurrently, so an unlocked get/delete here could miss an
         # entry mid-insert and hang the caller forever.
+        ended = nothing
         ch = lock(conn.lock) do
-            i = findfirst(t -> first(t) == id, conn.active_turns)
+            i = findfirst(t -> first(t) == id, conn.capture)
             if i !== nothing
-                close(last(conn.active_turns[i]))
-                deleteat!(conn.active_turns, i)
-                # Drop the cancel latch as soon as the cancelled turn is gone,
+                close(last(conn.capture[i]))
+                deleteat!(conn.capture, i)
+            end
+            j = findfirst(sp -> sp.id == id, conn.active_prompts)
+            if j !== nothing
+                ended = conn.active_prompts[j]
+                deleteat!(conn.active_prompts, j)
+            end
+            if isempty(conn.active_prompts)
+                # Drop the cancel latch as soon as the cancelled prompt is gone,
                 # not at the next prompt. `cancelling` exists to stop the
-                # dispatcher head-of-line blocking on THIS turn's update backlog
-                # so it can reach the `cancelled` response — once the turn is
-                # settled there is no backlog left to skip.
+                # dispatcher head-of-line blocking on the update backlog so it
+                # can reach the `cancelled` response — once the prompt is settled
+                # there is no backlog left to skip.
                 #
-                # Leaving it latched until `request_updates` meant every ORPHAN
-                # update in between was discarded: a background subagent the user
-                # never cancelled kept working while its output was thrown away,
-                # so stopping one turn made unrelated background work go silent
-                # until they happened to send another message.
-                isempty(conn.active_turns) && (@atomic conn.cancelling = false)
+                # Leaving it latched meant every un-prompted update in between
+                # was discarded: a background subagent the user never cancelled
+                # kept working while its output was thrown away, so stopping one
+                # turn made unrelated background work go silent until they
+                # happened to send another message.
+                @atomic conn.cancelling = false
+                # Work that streamed INSIDE this prompt was prompted. The flag
+                # means "the agent worked with no prompt open", so it only
+                # counts frames from here on (strict FIFO: everything earlier is
+                # already dispatched).
+                @atomic conn.unprompted_work = false
             end
             c = get(conn.pending, id, nothing)
             c === nothing || delete!(conn.pending, id)
             c
         end
+        # The span's END, stamped HERE — in strict FIFO order with the updates,
+        # so the coalescer seals the turn's trailing bubble at exactly the frame
+        # the agent resolved it, and a concurrent prompt's opening text can't be
+        # swept into it. Outside the lock: the sink is a bounded channel put.
+        ended === nothing || deliver_main!(conn, ended.flush)
         if ch !== nothing
             if haskey(msg, "error")
                 put!(ch, ErrorException(get(msg["error"], "message", "rpc error")))

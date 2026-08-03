@@ -161,28 +161,44 @@ end
         relay_close!(m)
     end
 
-    # ── A8: concurrent turns route updates oldest-first + handoff on response ──
+    # ── Concurrent prompts share ONE main stream ─────────────────────────────
     # claude-agent-acp supports a second `session/prompt` while one runs
-    # (steering). Updates route to the OLDEST unresolved prompt; a prompt's
-    # response closes ITS stream and updates flow to the next. The mock streams
-    # one chunk for turn 1, resolves turn 1, streams one chunk for turn 2,
-    # resolves turn 2 — all over the real wire.
-    @testset "concurrent turns route updates oldest-first, handoff on response" begin
+    # (steering): it injects the new message into the live turn and, when the SDK
+    # replays it, resolves the FIRST prompt and hands the stream to the second.
+    #
+    # There is nothing to route. Both prompts are spans over the session's main
+    # thread, so everything the agent says arrives in wire order on one stream
+    # and each response settles its own span. The mock streams a chunk for turn
+    # 1, resolves turn 1, streams a chunk for turn 2, resolves turn 2 — over the
+    # real wire — and we assert BOTH chunks land, in order, on the one stream.
+    @testset "concurrent prompts share one main stream; each response settles" begin
         m = spawn_mock("concurrent_turns"); conn = m.conn
         try
-            do_setup(conn)
-            u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
-            u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+            s1 = ACP.prompt_request(conn, Dict())
+            s2 = ACP.prompt_request(conn, Dict())
 
-            # Drain both streams concurrently: each closes when ITS response lands.
-            t1 = @async drain_text(u1)
-            t2 = @async drain_text(u2)
-            @test timedwait(() -> istaskdone(t1) && istaskdone(t2), 10.0) === :ok
-            @test fetch(t1) == ["for-turn-1"]            # u1 closed by id1's response
-            @test fetch(t2) == ["for-turn-2"]            # turn 1 gone → routed to 2
-            @test take!(r1)["stopReason"] == "end_turn"
-            @test take!(r2)["stopReason"] == "end_turn"
-            @test isempty(conn.active_turns)
+            @test ACP.wait_turn!(s1)["stopReason"] == "end_turn"
+            @test ACP.wait_turn!(s2)["stopReason"] == "end_turn"
+            @test isempty(conn.active_prompts)
+
+            # Both turns' text is on the ONE stream, in wire order — and as TWO
+            # bubbles, because each span's end marker (stamped by the dispatcher
+            # at its response frame) sealed the one before it. A single merged
+            # bubble here would mean the boundary was drawn late.
+            stop = ACP.flush_main!(client)          # our own marker: drain up to here
+            texts = String[]
+            drainer = @async for msg in client.messages
+                if msg isa ACP.StreamFlush
+                    ACP.signal_rendered!(msg)
+                    msg === stop && break
+                elseif msg isa ACP.AgentMessage
+                    push!(texts, msg.text * join(collect(msg.updates)))
+                end
+            end
+            @test timedwait(() -> istaskdone(drainer), 10.0) === :ok
+            @test texts == ["for-turn-1", "for-turn-2"]
         finally
             close(conn)
         end
@@ -190,19 +206,20 @@ end
         relay_close!(m)
     end
 
-    @testset "teardown closes every in-flight turn" begin
+    @testset "teardown fails every in-flight prompt" begin
         # The mock opens (reads) both prompts but never resolves them; teardown
-        # must close both update streams and fail both responses.
+        # must fail both responses and drop both spans.
         m = spawn_mock("two_turns_hang"); conn = m.conn
         try
             do_setup(conn)
-            u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
-            u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
+            s1 = ACP.prompt_request(conn, Dict())
+            s2 = ACP.prompt_request(conn, Dict())
             sleep(0.1)
+            @test length(conn.active_prompts) == 2
             close(conn)
-            @test timedwait(() -> !isopen(u1) && !isopen(u2), 5.0) === :ok
-            @test take!(r1) isa ACP.ConnectionClosed
-            @test take!(r2) isa ACP.ConnectionClosed
+            @test take!(s1.response) isa ACP.ConnectionClosed
+            @test take!(s2.response) isa ACP.ConnectionClosed
+            @test isempty(conn.active_prompts)
         finally
             close(conn)
         end
@@ -252,21 +269,21 @@ end
     # ── A7: tool-call snapshots — drop-oldest / latest-wins / never wedge ─────
     # BEHAVIORAL rewrite (no white-box `Base.n_avail`): the mock opens ONE tool
     # then floods N `tool_call_update`s mutating that SAME tool, ending with a
-    # terminal `completed`. The real `prompt!` consumer coalesces these onto one
-    # ToolCall whose per-message `updates` is the drop-oldest snapshot channel.
-    # A deliberately SLOW consumer must (a) never wedge, and (b) still observe the
-    # LATEST snapshot (status == "completed") — latest-wins, no block, no deadlock.
+    # terminal `completed`. The session's main-stream coalescer folds these onto
+    # one ToolCall whose per-message `updates` is the drop-oldest snapshot
+    # channel. A deliberately SLOW consumer must (a) never wedge, and (b) still
+    # observe the LATEST snapshot (status == "completed") — latest-wins, no
+    # block, no deadlock.
     @testset "A7 tool snapshots: drop-oldest, latest-wins, never wedge" begin
         handler = ACP.FSRequestHandler(pwd())
         m = spawn_mock("flood_snapshots"; n = 2000, handler); conn = m.conn
         try
             sid = do_setup(conn)
             client = ACP.Client(conn, sid, pwd())
-            messages = ACP.prompt!(client, "go")
 
             final_status = Ref{String}("")
             tools_seen   = Ref(0)
-            cons = @async for msg in messages
+            cons = @async for msg in client.messages
                 if msg isa ACP.ToolCall
                     tools_seen[] += 1
                     last_status = msg.status
@@ -275,11 +292,17 @@ end
                         sleep(0.0005)        # slow consumer → producer must drop-oldest
                     end
                     final_status[] = last_status
+                elseif msg isa ACP.StreamFlush
+                    ACP.signal_rendered!(msg)
                 end
             end
-            @test timedwait(() -> istaskdone(cons), 30.0) === :ok   # never wedged
-            @test tools_seen[] == 1
-            @test final_status[] == "completed"                     # latest-wins
+            ACP.wait_turn!(ACP.prompt!(client, "go"))
+            # The span's own end marker seals the turn; the slow consumer then
+            # has to finish draining the tool before it reaches that marker.
+            @test timedwait(() -> final_status[] == "completed", 30.0) === :ok
+            @test tools_seen[] == 1                                 # never wedged
+            close(client.updates)
+            @test timedwait(() -> istaskdone(cons), 10.0) === :ok
         finally
             close(conn)
         end
@@ -422,52 +445,99 @@ end
         @test u.update.tool_name == "Grep"
     end
 
-    @testset "parse_update! diverts subagent updates to the sink" begin
-        sub(pid, u) = ACP.SubagentUpdate(pid, u)
-        txt(s)  = ACP.AgentMessageChunk(ACP.TextContent(s))
-        tcall(id, title, status) = ACP.parse_session_update(Dict{String,Any}(
-            "sessionUpdate" => "tool_call", "toolCallId" => id,
-            "kind" => "search", "title" => title, "status" => status))
+    # A subagent's updates never enter the main thread's stream: the dispatcher
+    # reads `parentToolUseId` FIRST and hands the update to its owner. Driven
+    # through `dispatch_message`, which is where that decision lives.
+    @testset "subagent updates are addressed to their owner, not the main stream" begin
+        # A real Connection over the real WS relay; the mock is quiet after
+        # setup, so every frame below is one we hand the dispatcher directly.
+        # `session/update` never touches the wire — this exercises the addressing
+        # decision itself, which is what the test is about.
+        m = spawn_mock("two_turns_hang"); conn = m.conn
+        do_setup(conn)
+        sleep(0.2)                                 # let setup's own updates settle
+        main  = ACP.SessionUpdate[]
+        owned = Tuple{String,ACP.SessionUpdate}[]
+        conn.on_main_update  = u -> push!(main, u)
+        conn.on_owner_update = (owner, u) -> push!(owned, (owner, u))
 
-        # With a sink: every tagged update becomes a SubagentActivity, the
-        # main stream (out + current_message + tools) stays untouched.
-        acts = ACP.SubagentActivity[]
-        st  = ACP.TurnState(act -> push!(acts, act))
-        out = Channel{ACP.Message}(32)
-        ACP.parse_update!(out, st, txt("main "))              # opens the main bubble
-        ACP.parse_update!(out, st, sub("task-1", txt("sub prose")))
-        ACP.parse_update!(out, st, sub("task-1", tcall("sub-t1", "Grep foo", "in_progress")))
-        ACP.parse_update!(out, st, sub("task-1", ACP.parse_session_update(Dict{String,Any}(
+        tagged(inner) = Dict{String,Any}("jsonrpc" => "2.0", "method" => "session/update",
+            "params" => Dict{String,Any}("update" => merge(inner, Dict{String,Any}(
+                "_meta" => Dict("claudeCode" => Dict("parentToolUseId" => "task-1"))))))
+        plain(inner) = Dict{String,Any}("jsonrpc" => "2.0", "method" => "session/update",
+            "params" => Dict{String,Any}("update" => inner))
+        chunk(t) = Dict{String,Any}("sessionUpdate" => "agent_message_chunk",
+            "content" => Dict("type" => "text", "text" => t))
+        tcall(id, title, status) = Dict{String,Any}("sessionUpdate" => "tool_call",
+            "toolCallId" => id, "kind" => "search", "title" => title, "status" => status)
+
+        ACP.dispatch_message(conn, plain(chunk("main ")))
+        ACP.dispatch_message(conn, tagged(chunk("sub prose")))
+        ACP.dispatch_message(conn, tagged(tcall("sub-t1", "Grep foo", "in_progress")))
+        ACP.dispatch_message(conn, tagged(Dict{String,Any}(
             "sessionUpdate" => "tool_call_update",
-            "toolCallId" => "sub-t1", "status" => "completed"))))
-        ACP.parse_update!(out, st, txt("still main"))
-        close(st); close(out)
+            "toolCallId" => "sub-t1", "status" => "completed")))
+        ACP.dispatch_message(conn, plain(chunk("still main")))
 
-        msgs = collect(out)
-        @test length(msgs) == 1                               # ONE main bubble, nothing else
-        @test msgs[1] isa ACP.AgentMessage
-        @test msgs[1].text * join(collect(msgs[1].updates)) == "main still main"
-        @test isempty(st.tools)                               # sub tool never tracked
+        # The main thread saw only its own two chunks — no subagent prose, no
+        # subagent tool. Interleaving those is the failure this addressing removes.
+        @test length(main) == 2
+        @test all(u -> u isa ACP.AgentMessageChunk, main)
+        @test [ACP.text_of(u) for u in main] == ["main ", "still main"]
 
-        @test length(acts) == 3
-        @test all(a -> a.parent_id == "task-1", acts)
+        # The subagent got its whole stream, tagged with its own id.
+        @test length(owned) == 3
+        @test all(((o, _),) -> o == "task-1", owned)
+
+        # ... and distils into feed activity, which is what its owner renders.
+        acts = [ACP.subagent_activity(o, u) for (o, u) in owned]
         @test acts[1].kind === :text && acts[1].label == "sub prose"
         @test acts[2].kind === :tool && acts[2].tool_id == "sub-t1" &&
               acts[2].label == "Grep foo" && acts[2].status == "in_progress"
         @test acts[3].kind === :tool && acts[3].status == "completed"
 
-        # Without a sink (default TurnState): tagged updates are DROPPED —
-        # never interleaved into the main transcript, never tracked as tools.
-        st2  = ACP.TurnState()
-        out2 = Channel{ACP.Message}(32)
-        ACP.parse_update!(out2, st2, txt("main"))
-        ACP.parse_update!(out2, st2, sub("task-1", txt(" INTRUDER")))
-        ACP.parse_update!(out2, st2, sub("task-1", tcall("sub-t2", "Read bar", "pending")))
-        close(st2); close(out2)
-        msgs2 = collect(out2)
-        @test length(msgs2) == 1
-        @test msgs2[1].text * join(collect(msgs2[1].updates)) == "main"
-        @test isempty(st2.tools)
+        # An UNTAGGED frame for a tool a subagent already claimed is still that
+        # subagent's. claude-agent-acp does not tag every frame — captured live,
+        # a subagent bash goes tagged → UNTAGGED (the toolResponse frame) →
+        # tagged — and addressing on the tag alone hands the middle one to the
+        # main thread, whose coalescer has never heard of the tool id and drops
+        # it. The id is recoverable, so it is recovered.
+        ACP.dispatch_message(conn, tagged(tcall("sub-t2", "Bash sleep", "pending")))
+        ACP.dispatch_message(conn, plain(Dict{String,Any}(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "sub-t2",
+            "_meta" => Dict("claudeCode" => Dict("toolName" => "Bash",
+                "toolResponse" => Dict("stdout" => "hi"))))))
+        @test length(main) == 2                        # NOT the main thread's
+        @test last(owned)[1] == "task-1"               # ... it went to the subagent
+        @test ACP.tool_call_id(last(owned)[2]) == "sub-t2"
+
+        # A tool id we have never seen tagged belongs to the main thread, and
+        # stays there — recovery only ever re-unites frames with an owner the
+        # wire already named.
+        ACP.dispatch_message(conn, plain(Dict{String,Any}(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "main-only",
+            "status" => "completed")))
+        @test length(main) == 3
+        @test length(owned) == 5
+
+        # The association is forgotten once the tool is terminal, so a long
+        # session cannot accumulate them.
+        ACP.dispatch_message(conn, plain(Dict{String,Any}(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "sub-t2",
+            "status" => "completed")))
+        @test last(owned)[1] == "task-1"               # the terminal frame still lands
+        @test !haskey(conn.tool_owners, "sub-t2")      # ... and then it is dropped
+
+        # Cancelling the MAIN thread must not silence a subagent: the owner path
+        # returns before `cancelling` is ever consulted.
+        @atomic conn.cancelling = true
+        ACP.dispatch_message(conn, plain(chunk("dropped")))
+        ACP.dispatch_message(conn, tagged(chunk("still mine")))
+        @test length(main)  == 3                       # main thread went quiet
+        @test length(owned) == 7                       # subagent did not
+        close(conn)
+        @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
     end
 
     # ── Regression: a long resumed history with an un-terminated tool must not

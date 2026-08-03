@@ -3,7 +3,13 @@
 # Usage:
 #   handler = MyCustomHandler(...)   # subtype of Handler with on_update overloads
 #   client  = AgentClientProtocol.Client(cwd, handler)
-#   AgentClientProtocol.prompt!(client, "hello")   # blocks until end_turn/cancelled
+#
+#   # The session's main thread is ONE stream, for as long as the session lives.
+#   @async for m in client.messages
+#       m isa AgentClientProtocol.StreamFlush ? AgentClientProtocol.signal_rendered!(m) : render(m)
+#   end
+#
+#   AgentClientProtocol.wait_turn!(AgentClientProtocol.prompt!(client, "hello"))
 #   AgentClientProtocol.cancel!(client)
 
 # Upper bound on how long the `initialize` / `session/new` setup RPCs may take
@@ -32,11 +38,79 @@ mutable struct Client
     # `parse_config_options`), so agents with different metadata need no
     # Client/transport changes.
     session_result::Dict{String,Any}
+
+    # ── The session's main thread ────────────────────────────────────────────
+    # ONE continuous stream, for the session's whole life. `updates` takes raw
+    # main-thread `SessionUpdate`s straight from the dispatcher (plus
+    # `StreamFlush` boundary markers); a single coalescer turns them into whole
+    # `Message`s on `messages`, which the consumer renders in wire order.
+    #
+    # Not per-prompt. The agent talks on this stream inside a prompt AND
+    # between prompts (the auto-wake after backgrounded work), and it is the
+    # same voice either way — giving those two cases separate pipelines meant
+    # two renderers that had to be kept in agreement, and they weren't (an
+    # auto-wake session used to collapse into one merged bubble with its tools
+    # erased). A prompt is a SPAN over this stream: `prompt!` opens it,
+    # `StreamFlush` marks where it ends.
+    updates::Channel{Any}
+    messages::Channel{Message}
+    coalescer::Task
 end
 
-# Back-compat: existing call sites (and tests) construct without a result.
-Client(conn::Connection, session_id::AbstractString, cwd::AbstractString) =
-    Client(conn, String(session_id), String(cwd), Dict{String,Any}())
+function Client(conn::Connection, session_id::AbstractString, cwd::AbstractString,
+                session_result::Dict{String,Any} = Dict{String,Any}())
+    updates   = Channel{Any}(BUF)
+    messages  = Channel{Message}(BUF)
+    coalescer = Base.errormonitor(@async coalesce_main!(conn, updates, messages))
+    client = Client(conn, String(session_id), String(cwd), session_result,
+                    updates, messages, coalescer)
+    # The main sink is the session's own, installed here rather than by the
+    # embedder: there is exactly one main thread per session and it always has
+    # somewhere to go. Nothing to forget to wire, nothing to drop.
+    conn.on_main_update = u -> deliver_update!(conn, updates, u)
+    return client
+end
+
+# Coalesce the main thread's raw updates into whole messages, for as long as the
+# session lives. `TurnState` is persistent here — see its docstring: `close` is a
+# boundary on this stream, not the end of it.
+function coalesce_main!(conn::Connection, updates::Channel{Any},
+                        messages::Channel{Message})
+    st = TurnState()
+    try
+        for u in updates
+            if u isa StreamFlush
+                close(st)              # seal the trailing bubble + any open tool
+                put!(messages, u)      # ... then let the consumer catch up to here
+                continue
+            end
+            # Backlog from a cancelled turn: the dispatcher stopped delivering
+            # the moment cancel went out, but whatever was already buffered is
+            # still ahead of us. Skip it rather than render a turn the user
+            # stopped — the flush that follows seals what did get rendered.
+            (@atomic conn.cancelling) && continue
+            parse_update!(messages, st, u)
+        end
+    finally
+        close(st)
+        close(messages)
+    end
+    return nothing
+end
+
+# Put a boundary on the main stream and hand back the marker to wait on, or
+# `nothing` if the stream is already gone. The CALLER waits (`take!(m.done)`),
+# because the caller owns the consumer that signals it.
+function flush_main!(client::Client)
+    marker = StreamFlush()
+    try
+        put!(client.updates, marker)
+    catch e
+        e isa InvalidStateException || rethrow()   # stream torn down
+        return nothing
+    end
+    return marker
+end
 
 # Normalize whatever JSON gave us (Dict{String,Any} in practice).
 _result_dict(r) = r isa AbstractDict ?
@@ -164,27 +238,20 @@ struct ImageAttachment
     mime::String
 end
 
-# Send a user message; returns a `Channel{Message}` of the whole, ordered
-# messages that make up this turn (agent text, thoughts, tool calls, plans).
-# Each streaming message carries its own `updates` channel; iterate the
-# returned channel and drain each message's `updates` to render it. The
-# channel closes when the turn ends (end_turn / cancelled); if the connection
-# dies mid-turn, draining the channel rethrows `ConnectionClosed`.
+# Send a user message. Returns the turn's `PromptSpan`; `wait_turn!` blocks on it
+# for the stopReason (`end_turn` / `cancelled`) and rethrows a `ConnectionClosed`
+# if the session died. `span.flush` is put on the main stream at the response
+# frame, so a renderer sees the turn's boundary exactly where the agent drew it.
 #
-# The whole turn is ONE bounded loop: a local `TurnState` coalesces the raw
-# update stream into messages and is `close`d when the stream ends. Nothing
-# outlives the turn.
+# The turn's CONTENT does not come back through here. It is the session's main
+# thread talking, and it arrives on `client.messages` like everything else the
+# main thread says — before this call, during it, and after it. Render that
+# stream continuously; use `flush_main!` to find out when everything up to a
+# point has landed.
 #
 # `images` are appended after the text as ACP image content blocks.
-#
-# `on_subagent` is the turn's out-of-band sink for subagent-tagged updates
-# (`_meta.claudeCode.parentToolUseId`): called with each `SubagentActivity`
-# straight from the coalescer task, so a live parent-Task feed keeps moving
-# even while the message consumer is parked inside another message's drain.
-# `nothing` drops subagent updates (they never reach the message channel).
 function prompt!(client::Client, text::String;
-                 images::Vector{ImageAttachment} = ImageAttachment[],
-                 on_subagent::Union{Function,Nothing} = nothing)
+                 images::Vector{ImageAttachment} = ImageAttachment[])
     blocks = Any[Dict("type" => "text", "text" => text)]
     for img in images
         push!(blocks, Dict(
@@ -194,25 +261,15 @@ function prompt!(client::Client, text::String;
         ))
     end
     params = Dict("sessionId" => client.session_id, "prompt" => blocks)
-    updates, response = prompt_updates(client.conn, params)
-    conn = client.conn
-    return Channel{Message}(BUF) do messages
-        st = TurnState(on_subagent)
-        try
-            for u in updates
-                # Once cancel is issued, stop coalescing/rendering and just
-                # drain the backlog so the dispatcher can reach the `cancelled`
-                # response and end the turn promptly. `close(st)` below still
-                # seals whatever was rendered up to the cancel point.
-                (@atomic conn.cancelling) && continue
-                parse_update!(messages, st, u)
-            end
-        finally
-            close(st)                 # finish the trailing message + any open tools
-        end
-        result = take!(response)      # end_turn / cancelled — or ConnectionClosed on teardown
-        result isa Exception && throw(result)
-    end
+    return prompt_request(client.conn, params)
+end
+
+# Block until the turn settles; returns the stopReason result, throws on an rpc
+# error or a torn-down connection.
+function wait_turn!(span::PromptSpan)
+    result = take!(span.response)
+    result isa Exception && throw(result)
+    return result
 end
 
 # Drive `session/load` and collect the resumed session's replayed history as a
@@ -284,24 +341,24 @@ function cancel!(client::Client)
     conn = client.conn
     # Cancel targets the SESSION, not one request.
     #
-    # `active_turns` answers "which turn owns this update"; it is not a liveness
-    # signal, and using it as one is why stop used to be a no-op for the whole
-    # window in which the agent auto-wakes after backgrounded work and streams
-    # tools + prose with nothing registered. See `Connection.orphan_work`.
+    # Two independent reasons the agent may be working: we asked it to
+    # (`active_prompts`), or it woke itself up after backgrounded work finished
+    # (`unprompted_work`). Reading only the first is why stop used to be a no-op
+    # for the whole auto-wake window, while the user watched it run tools.
     #
-    # Still a no-op when GENUINELY idle (A8) — no turn and no un-prompted work
-    # since the last turn or cancel. That matters: `cancelling` gates the orphan
-    # branch, so latching it true over an idle gap would silently drop the
-    # agent's next burst of background work until a new prompt cleared it.
+    # Still a no-op when GENUINELY idle (A8) — no prompt open and no un-prompted
+    # work since the last request or cancel. That matters: `cancelling` gates the
+    # main thread, so latching it true over an idle gap would silently drop the
+    # agent's next burst of work until a new prompt cleared it.
     live = lock(conn.lock) do
-        !isempty(conn.active_turns) || (@atomic conn.orphan_work)
+        !isempty(conn.active_prompts) || (@atomic conn.unprompted_work)
     end
     live || return nothing
     @atomic conn.cancelling = true
     # Consumed: a second cancel arriving while still idle must no-op again. If
     # the agent ignores this one and keeps streaming, the dispatcher sets it
     # afresh, so a deliberate re-cancel still gets through (and still escalates).
-    @atomic conn.orphan_work = false
+    @atomic conn.unprompted_work = false
     send_notification(conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
     return nothing
@@ -323,4 +380,12 @@ function set_config_option!(client::Client, config_id::AbstractString,
              "value"     => String(value)))
 end
 
-Base.close(client::Client) = close(client.conn)
+# Close the connection FIRST (the dispatcher stops, so no further update can be
+# delivered), then the main stream — the coalescer drains what's buffered, seals
+# its state, and closes `messages`, which ends the consumer. A `deliver_update!`
+# racing us finds the channel closed and returns.
+function Base.close(client::Client)
+    close(client.conn)
+    isopen(client.updates) && close(client.updates)
+    return nothing
+end

@@ -7,8 +7,6 @@
 # message and drains that bubble's stream with `append!`. The wire-parse types
 # (`AgentMessageChunk`, `ToolCallNotif`, …) never escape this file.
 
-abstract type Message end
-
 const ToolContent = Union{TextContent, DiffContent, ImageContent}
 
 mutable struct AgentMessage <: Message
@@ -173,6 +171,22 @@ end
 drain_message!(m::Plan) = m
 drain_message!(m::ConfigUpdate) = m
 drain_message!(m::ModeUpdate) = m
+drain_message!(m::StreamFlush) = m
+
+# Same question as `is_agent_work(::SessionUpdate)`, asked of a coalesced
+# message: is this the agent DOING something, or telling us about the session?
+#
+# A renderer reads it to decide whether an AUTO-WAKE EPISODE has begun — the
+# agent talking with no prompt open. Session metadata (config/mode/usage/
+# commands) arrives on bind and at turn boundaries, so counting it would open an
+# episode on a chat that has done nothing.
+is_agent_work(::Message)        = true
+is_agent_work(::ConfigUpdate)   = false
+is_agent_work(::ModeUpdate)     = false
+is_agent_work(::UsageUpdate)    = false
+is_agent_work(::CommandsUpdate) = false
+is_agent_work(::StreamFlush)    = false
+
 
 # ── Wire → typed dispatch ────────────────────────────────────────────────────
 # One place maps Claude Code's tool name to a concrete `ToolCall` subtype.
@@ -295,12 +309,12 @@ GenericTool(id::AbstractString, kind::AbstractString, title::AbstractString,
                 "", Dict{String,Any}())
 
 # ── Subagent activity ────────────────────────────────────────────────────────
-# One subagent event, distilled from a `SubagentUpdate` for the turn's
-# `on_subagent` sink. NOT a `Message`: it is delivered out-of-band (a direct
-# sink call from the parse loop), never through the turn's message channel —
-# the sequential message consumer can be parked inside a long-running tool's
-# snapshot drain, which would starve a channel-delivered feed of exactly the
-# live updates it exists to show.
+# One subagent event, distilled from a `SubagentUpdate` for the subagent that
+# owns it. NOT a `Message`: it never travels the main thread's message channel —
+# that consumer can be parked inside a long-running tool's snapshot drain (often
+# the very Task tool the subagent belongs to), which would starve the feed of
+# exactly the live updates it exists to show. Built straight from the addressed
+# update by the owner's consumer; see `subagent_activity`.
 struct SubagentActivity
     parent_id::String    # the parent Task's tool_use id
     kind::Symbol         # :text | :thought | :tool
@@ -309,27 +323,25 @@ struct SubagentActivity
     status::String       # subagent tool status; "" for text/thought
 end
 
-# ── Per-turn parser ─────────────────────────────────────────────────────────
-# State local to a single prompt loop: the text message currently being
+# ── Stream parser ───────────────────────────────────────────────────────────
+# The coalescing state of ONE update stream: the text message currently being
 # streamed (if any) plus the set of tools still awaiting completion.
+#
+# A `TurnState` outlives any single turn — the main thread's stream is
+# continuous, and `close` is a BOUNDARY on it (end of prompt, start of the
+# next), not the end of its life. So `close` leaves the state clean and
+# reusable rather than spent.
 mutable struct TurnState
     current_message::Union{Message,Nothing}
     tools::Dict{String,ToolCall}
     # Everything the current text message has received so far — used by
     # `text!` to drop claude-agent-acp's handoff duplicate (see there).
     acc::String
-    # Out-of-band sink for subagent-tagged updates (`SubagentUpdate`), called
-    # with each `SubagentActivity` from the parse loop. `nothing` (the
-    # default) drops them — they must NEVER fall through into the main
-    # message stream. Must be fast and non-throwing; it runs on the turn's
-    # coalescer task.
-    on_subagent::Union{Function,Nothing}
 end
-TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "", nothing)
-TurnState(on_subagent::Union{Function,Nothing}) =
-    TurnState(nothing, Dict{String,ToolCall}(), "", on_subagent)
+TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "")
 
-# Closing the turn finishes the trailing message and any still-open tools.
+# Closing the stream at a boundary finishes the trailing message and any
+# still-open tools, and leaves the state ready for what comes next.
 #
 # Any tool still in `st.tools` is one the agent NEVER reported terminal for —
 # the turn ended (cancel, EOF, peer hang-up) before its `tool_call_update` with
@@ -348,6 +360,7 @@ function Base.close(st::TurnState)
         close(tc)
     end
     empty!(st.tools)
+    st.acc = ""            # the handoff-duplicate window ends with the message
     return nothing
 end
 
@@ -526,19 +539,15 @@ parse_update!(out, st, u::UsageUpdateNotif) =
 parse_update!(out, st, u::AvailableCommandsUpdateNotif) =
     (put!(out, CommandsUpdate(u.commands)); nothing)
 
-# Subagent-tagged updates: NEVER coalesced into the main stream (no
-# current_message touch, no st.tools entry, nothing put! on `out`) — that
-# interleaving is exactly the bug this arm exists to prevent. Distill the
-# update into a `SubagentActivity` and hand it to the turn's sink; without a
-# sink (or for update kinds that carry no feed signal — plans, config, user
-# echoes) the update is dropped.
+# Subagent-tagged updates never reach a main-thread coalescer: the dispatcher
+# addresses them to their owner before any stream logic runs. This arm exists
+# for the one path that still feeds raw updates through a parser directly — a
+# `session/load` replay, whose captured stream can contain subagent-tagged
+# frames from the recorded history. They are not the live conversation and have
+# no owner to belong to (the replay predates every message), so drop them here
+# rather than let them interleave into the resumed transcript.
 function parse_update!(out, st, u::SubagentUpdate)
-    act = subagent_activity(u.parent_tool_use_id, u.update)
-    if act === nothing || st.on_subagent === nothing
-        @debug "ACP: dropping subagent update (no sink / no feed signal)" parent_tool_use_id = u.parent_tool_use_id typeof(u.update)
-        return nothing
-    end
-    st.on_subagent(act)
+    @debug "ACP: dropping replayed subagent update" parent_tool_use_id = u.parent_tool_use_id typeof(u.update)
     return nothing
 end
 

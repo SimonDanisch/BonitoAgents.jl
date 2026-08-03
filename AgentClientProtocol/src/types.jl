@@ -116,6 +116,28 @@ parent_tool_use_id(::SessionUpdate) = nothing
 parent_tool_use_id(u::SubagentUpdate) = u.parent_tool_use_id
 
 """
+    tool_call_id(u::SessionUpdate) -> Union{String,Nothing}
+
+The tool call an update is about, or `nothing` for updates that aren't about a
+tool. Used to recover an owner the wire omitted: claude-agent-acp does NOT tag
+every frame of a subagent's tool — captured live, one tool arrives
+`tool_call`(tagged) → `tool_call_update`(UNTAGGED, carrying the toolResponse) →
+`tool_call_update`(tagged). The untagged frame is still that subagent's, and its
+`toolCallId` says so.
+"""
+tool_call_id(::SessionUpdate) = nothing
+tool_call_id(u::ToolCallNotif) = u.tool_call_id
+tool_call_id(u::ToolCallUpdateNotif) = u.tool_call_id
+tool_call_id(u::SubagentUpdate) = tool_call_id(u.update)
+
+# Whether an update reports its tool as finished, so a remembered owner can be
+# forgotten once its last frame has been delivered.
+tool_is_terminal(::SessionUpdate) = false
+tool_is_terminal(u::ToolCallNotif) = u.status in ("completed", "failed")
+tool_is_terminal(u::ToolCallUpdateNotif) = u.status in ("completed", "failed")
+tool_is_terminal(u::SubagentUpdate) = tool_is_terminal(u.update)
+
+"""
     is_agent_work(u::SessionUpdate) -> Bool
 
 Whether `u` is the agent DOING something, as opposed to telling us about the
@@ -123,10 +145,13 @@ session. Content the user watches appear — prose, thoughts, tool calls, plans 
 is work; `available_commands` / `current_mode` / `session_info` / `usage` are
 metadata that arrives on bind and at turn boundaries.
 
-The distinction matters because these updates also arrive with NO turn open
-(see `Connection.on_orphan_update`), and treating every one of them as
-"the agent is busy" latches liveness true on a chat that has done nothing:
-a fresh session emits `available_commands_update` right after `session/new`.
+The distinction matters because these updates also arrive with NO prompt open
+(see `Connection.unprompted_work`), and treating every one of them as "the agent
+is busy" latches liveness true on a chat that has done nothing: a fresh session
+emits `available_commands_update` right after `session/new`.
+
+`SubagentUpdate` is work, but reaches this only in tests — on the wire it is
+addressed to its owner before liveness is ever consulted.
 """
 is_agent_work(::SessionUpdate) = false
 is_agent_work(::AgentMessageChunk) = true
@@ -135,6 +160,74 @@ is_agent_work(::PlanUpdate) = true
 is_agent_work(::ToolCallNotif) = true
 is_agent_work(::ToolCallUpdateNotif) = true
 is_agent_work(::SubagentUpdate) = true
+
+# ── Autonomous cycles ────────────────────────────────────────────────────────
+# claude-agent-acp tags the `usage_update` it sends at a CYCLE'S RESULT with
+# `_meta["_claude/origin"].kind`, and that tag is the only end-of-episode signal
+# on the wire. When the agent auto-wakes after backgrounded work finishes, it
+# streams prose and tools with no prompt open — an episode with an obvious start
+# and, without this, no observable end at all.
+#
+# The set is the adapter's own `AUTONOMOUS_RESULT_ORIGINS` (acp-agent.js): work
+# the model did on its own. The user's turn is tagged `human`, and
+# `auto-continuation` continues the user's turn, so neither counts. Verified in
+# both captured wires — the auto-wake's last frame is a `usage_update` with
+# `kind = "task-notification"`.
+const AUTONOMOUS_ORIGINS = ("task-notification", "peer", "coordinator",
+                            "observer", "observer-activity")
+
+"""
+    is_autonomous_origin(kind) -> Bool
+
+Whether an origin tag marks the result of a cycle the model ran on its own.
+`nothing` (an untagged frame) is not a result at all, so it is not one.
+"""
+is_autonomous_origin(::Nothing) = false
+is_autonomous_origin(kind::AbstractString) = kind in AUTONOMOUS_ORIGINS
+
+# ── The message stream ───────────────────────────────────────────────────────
+# Whole, ordered messages coalesced from the raw `session/update` soup. The
+# concrete kinds live in messages.jl; the abstract type is here because
+# `Connection` needs the boundary marker below.
+abstract type Message end
+
+# A boundary on a stream, not content. Travels the stream like a message so it
+# arrives in wire order: the coalescer seals its state when it reaches one (the
+# trailing text bubble ends, tools the agent never resolved are force-failed),
+# then forwards it, and the consumer signals `done` once everything ahead of the
+# boundary is rendered.
+#
+# That is what makes "the turn is over" a checkable fact on a CONTINUOUS stream.
+# The main thread does not stop existing between prompts — the agent auto-wakes
+# and keeps talking on it — so end-of-turn cannot be "the channel closed". It is
+# a marker, and waiting on one is the render barrier end-of-turn cleanup needs.
+#
+# `done` is a LATCH, not a mailbox: the consumer CLOSES it, and every waiter —
+# one, none, or the same caller twice — is released. A one-shot `put!`/`take!`
+# looks equivalent and is not: the second `take!` blocks forever on an empty
+# channel. That is exactly what an error path does, since it wants the barrier
+# both before it renders the error and again in its cleanup.
+#
+# `bind(done, task)` composes with this: if the renderer dies, the channel closes
+# and the waiter is released the same way.
+struct StreamFlush <: Message
+    done::Channel{Nothing}
+end
+StreamFlush() = StreamFlush(Channel{Nothing}(1))
+
+# Release everyone waiting on this boundary. Idempotent.
+signal_rendered!(m::StreamFlush) = (isopen(m.done) && close(m.done); nothing)
+
+# Block until `m` has been rendered (or the renderer is gone). Idempotent, and
+# safe to call from several tasks.
+function wait_rendered(m::StreamFlush)
+    try
+        take!(m.done)
+    catch e
+        e isa InvalidStateException || rethrow()   # closed = signalled
+    end
+    return nothing
+end
 
 # ── Session config options ────────────────────────────────────────────────────
 # ACP "Session Config Options": the session-setup response MAY carry a list of

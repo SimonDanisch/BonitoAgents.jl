@@ -66,6 +66,14 @@ tool_call_status(id::AbstractString, status::AbstractString) =
     "\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"$id\"," *
     "\"status\":\"$status\"}}}"
 
+# A SUBAGENT's `agent_message_chunk`: the same update, tagged with the parent
+# Task's tool_use id, which is how claude-agent-acp names the owner.
+subagent_text_update(parent::AbstractString, text::AbstractString) =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\"," *
+    "\"update\":{\"sessionUpdate\":\"agent_message_chunk\"," *
+    "\"content\":{\"type\":\"text\",\"text\":\"$text\"}," *
+    "\"_meta\":{\"claudeCode\":{\"parentToolUseId\":\"$parent\"}}}}}"
+
 prompt_done(id::Integer, reason::AbstractString="end_turn") =
     result_frame(id, "{\"stopReason\":\"$reason\"}")
 
@@ -121,8 +129,8 @@ function run_scenario(cws, name::AbstractString, n::Integer = 0)
 
     elseif name == "concurrent_turns"
         # Two session/prompt turns. Stream one chunk for turn 1, resolve turn 1,
-        # stream one chunk for turn 2, resolve turn 2 — exercising oldest-first
-        # routing + handoff over the real wire.
+        # stream one chunk for turn 2, resolve turn 2 — the steering/handoff
+        # shape, over the real wire.
         answer_setup(cws) || return
         id1 = nothing; id2 = nothing
         while id1 === nothing || id2 === nothing
@@ -133,9 +141,9 @@ function run_scenario(cws, name::AbstractString, n::Integer = 0)
                 id1 === nothing ? (id1 = req_id(line)) : (id2 = req_id(line))
             end
         end
-        emit(cws, text_update("for-turn-1"))      # both open → oldest (turn 1)
+        emit(cws, text_update("for-turn-1"))      # both spans open
         emit(cws, prompt_done(id1))               # handoff: turn 1 resolved
-        emit(cws, text_update("for-turn-2"))      # now routes to turn 2
+        emit(cws, text_update("for-turn-2"))      # same stream, turn 2's span
         emit(cws, prompt_done(id2))
         drain_until_close(cws)
 
