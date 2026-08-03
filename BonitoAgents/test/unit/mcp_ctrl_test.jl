@@ -46,8 +46,19 @@ const BT = BonitoAgents
         # No user AGENTS.md → the appendix IS the built-in rules (never empty,
         # so every Claude session gets the house rules).
         @test BT.agents_prompt_appendix(state) == BT.BUILTIN_AGENT_RULES
-        @test occursin("Background commands", BT.BUILTIN_AGENT_RULES)
         @test occursin("bt_julia_eval", BT.BUILTIN_AGENT_RULES)
+        # Every background-capable tool is NAMED, so the agent is told what to
+        # reach for instead of inventing a shell incantation...
+        for tool in ("run_in_background", "bt_julia_continue", "Task")
+            @test occursin(tool, BT.BUILTIN_AGENT_RULES)
+        end
+        # ... and the shell forms that produce an UNTRACKED orphan are named
+        # too. Backgrounding this way yields no completion signal, no task-bar
+        # pill and no notification, so the agent falls back to polling — the
+        # zombie-watcher failure the rest of the rule is about.
+        for shell in ("nohup", "disown", "setsid", "screen -dm", "tmux new -d")
+            @test occursin(shell, BT.BUILTIN_AGENT_RULES)
+        end
         # User AGENTS.md composes AFTER the built-in rules.
         BT.set_global_agents_md!(state, "## House rules\nBe pedantic.")
         appendix = BT.agents_prompt_appendix(state)

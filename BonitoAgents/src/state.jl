@@ -433,14 +433,28 @@ end
 # session. (The dashboard textarea shows/edits only the user's AGENTS.md; these
 # rules are composed in at session bring-up via `agents_prompt_appendix`.)
 const BUILTIN_AGENT_RULES = """
-## Background commands
-Never start a long command detached (`&`/nohup) and then poll for it from a \
-second watcher task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, \
-and the like) — such monitors routinely never terminate (PID reuse keeps \
-`kill -0` succeeding) and pile up as zombie background tasks. Run the long \
-command itself as ONE background task (`run_in_background`) with any \
-post-processing (grep/summary) appended after it in the same command; you are \
-notified automatically when it completes.
+## Long-running work: use the tool, never shell backgrounding
+Every kind of long work has a tool that this app TRACKS — it shows in the task \
+bar while it runs, and you are notified automatically when it finishes:
+
+  * a shell command — `Bash` with `run_in_background: true`
+  * a whole sub-task — `Task`/`Agent` with `run_in_background: true`
+  * Julia — `bt_julia_eval`. It keeps running past its soft `timeout`, so pass \
+    a small `timeout`, go do other work, and pick the result up with \
+    `bt_julia_continue`. Never background Julia through Bash.
+
+Backgrounding by shell syntax instead — `&`, `nohup`, `disown`, `setsid`, \
+`screen -dm`, `tmux new -d` — produces an ORPHAN: no completion signal, nothing \
+in the task bar, and no notification. You are then left polling for it, which \
+is the failure the next paragraph is about. Don't do it; there is a tool for \
+every case above.
+
+Never start a long command detached and then poll for it from a second watcher \
+task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, and the like) — \
+such monitors routinely never terminate (PID reuse keeps `kill -0` succeeding) \
+and pile up as zombie background tasks. Run the long command itself as ONE \
+background task (`run_in_background`) with any post-processing (grep/summary) \
+appended after it in the same command.
 
 ## Julia
 When running Julia code, always prefer the `bt_julia_eval` tool over \
