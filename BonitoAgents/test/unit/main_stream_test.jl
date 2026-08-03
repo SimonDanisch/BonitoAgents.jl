@@ -270,6 +270,64 @@ end
     close(model)
 end
 
+@testset "an episode's todo list is finalized when the episode ends" begin
+    # An auto-wake episode builds its own todo list, and there is no end_turn to
+    # finish it. The old between-turn consumer finalized it at episode end; the
+    # one-stream refactor deleted that consumer and lost the behaviour, so the
+    # card sat in the bar frozen at whatever it reached until some LATER turn
+    # happened to end (observed live: `Todos 0/2` still pinned long after).
+    model, cli = live_model()
+    s = BT.shared(model)
+    feed!(cli, amc("Picking up where the background job left off. "))
+    feed!(cli, planupd([("step a", "in_progress"), ("step b", "pending")]))
+    BT.flush_main!(model)
+
+    @test s.autowake[] == true
+    t = s.live_todo[]
+    @test t isa BT.TodoListMsg
+    @test BT.in_taskbar(t)                 # live while the episode runs
+    @test t.finished_at === nothing
+
+    # The episode's own end marker finalizes it, exactly as a turn's end would.
+    BT.process!(model, ACP.UsageUpdate(1, 2, nothing, nothing, "task-notification"))
+    @test s.autowake[] == false
+    @test s.live_todo[] === nothing
+    @test !BT.in_taskbar(t)
+    @test t.finished_at !== nothing         # ... into history, not left hanging
+    close(model)
+end
+
+@testset "an orphan-swept todo card leaves the bar, it is not stranded" begin
+    # The sweep (a cancelled turn, an error, a restart) used to stamp
+    # `finished_at` and walk away. That makes the card un-live while it is still
+    # PINNED, so the next todo update builds a fresh list and reassigns
+    # `live_todo` — and the old card is then owned by nobody: `finish_live_todo!`
+    # only finalizes `live_todo`, and `isdone` cannot fire on entries that were
+    # never completed. It sat in the bar forever showing e.g. 0/2.
+    model, cli = live_model()
+    s = BT.shared(model)
+    feed!(cli, planupd([("step a", "in_progress"), ("step b", "pending")]))
+    BT.flush_main!(model)
+    old = s.live_todo[]
+    @test old isa BT.TodoListMsg
+    @test BT.in_taskbar(old)
+
+    BT.finalize_orphan!(old)
+    @test old.finished_at !== nothing
+    @test !BT.in_taskbar(old)              # the bit that was missing
+    @test BT.is_live(old) == false
+    @test s.live_todo[] === nothing        # and it gave up ownership
+
+    # The agent moves on with a brand new list: the old card is not still there.
+    feed!(cli, planupd([("step c", "in_progress")]))
+    BT.flush_main!(model)
+    fresh = s.live_todo[]
+    @test fresh isa BT.TodoListMsg && fresh !== old
+    @test BT.in_taskbar(fresh)
+    @test !any(t -> t === old, BT.chat_taskbar(model).items[])
+    close(model)
+end
+
 @testset "the task bar admits background work, and nothing else" begin
     # Membership is a FACT about the tool — `run_in_background`, or a todo list —
     # never a judgement about how long it has been running. The old policy

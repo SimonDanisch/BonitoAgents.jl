@@ -3159,6 +3159,16 @@ finalize_orphan!(m::ThoughtMsg) = close(m)
 finalize_orphan!(m::ToolMsg)    = (close(m); nothing)
 function finalize_orphan!(m::TodoListMsg)
     m.finished_at === nothing || return nothing
+    # A card that is IN the bar leaves it the one way out — `finished!` — because
+    # membership is the single truth about liveness (see TaskBar). Stamping
+    # `finished_at` here and walking away broke that: `is_live` went false while
+    # the card stayed pinned, so the next todo update took the FRESH-list branch
+    # and reassigned `live_todo`. The old card was then owned by nobody —
+    # `finish_live_todo!` only finalizes `live_todo`, and `isdone` can never fire
+    # on entries that were never completed — so it sat in the bar forever,
+    # counting up at whatever it had reached (observed live: `Todos 0/2`, long
+    # after the agent had moved on).
+    in_taskbar(m) && return finished!(m)
     m.finished_at = time()
     append_plan(m.chat.chat_session, m)
     chat_emit(m.chat, plan_update_dict(m))
@@ -4536,6 +4546,16 @@ function end_autowake!(chat::ChatModel)
     # Only an episode that was actually open has liveness to give back; a plain
     # turn boundary must not stomp the flag a running turn owns.
     was_open && (s.busy_active[] = (s.turns_active[] > 0))
+    # An episode that built a todo list finalizes it into history, exactly as a
+    # turn does — the episode is over and there is no held-open turn to keep it
+    # live. Without this the card sits in the bar, frozen at whatever it reached,
+    # until some LATER turn happens to end (observed: `Todos 0/2` still pinned
+    # long after the work moved on).
+    #
+    # Only when nothing else is running: under steering the live list belongs to
+    # the turn still in flight, and `begin_turn!` handles the plain-boundary case
+    # with the same guard.
+    was_open && lock(() -> s.turns_active[], s.lock) == 0 && finish_live_todo!(chat)
     return nothing
 end
 
