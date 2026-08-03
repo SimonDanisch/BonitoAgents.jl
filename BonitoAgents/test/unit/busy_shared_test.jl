@@ -17,9 +17,15 @@
     @test tab.busy_active !== parent.busy_active     # genuinely a child
 
     # A turn opens on the shared flag and is drained through the TAB's model.
+    # The span is settled before we drain it — `drain_turn!` waits on the
+    # response, then on the render barrier, and with no ACP session bound the
+    # barrier is a no-op (there is no renderer to wait for).
+    const ACP = BT.AgentClientProtocol
+    span = ACP.PromptSpan(1)
+    put!(span.response, Dict{String,Any}("stopReason" => "end_turn"))
     lock(() -> (parent.turns_active[] += 1), parent.lock)
     parent.busy_active[] = true
-    BT.drain_turn!(tab, [])
+    BT.drain_turn!(tab, span)
 
     @test parent.turns_active[] == 0
     @test parent.busy_active[] == false              # the bug: stayed true

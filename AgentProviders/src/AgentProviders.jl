@@ -16,7 +16,7 @@ export AgentProvider, BinAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent, MockAgent2
 export provider_name, label, icon, resumable_session
 export current_providers, find_provider, refresh_providers!
-export strip_injected_context, meaningful_prompt
+export strip_injected_context, meaningful_prompt, reports_autonomous_origin
 
 # `WorkerAgent` (BonitoAgents) also subtypes `AgentProvider`; the worker-spawned
 # binary providers are `BinAgent`s.
@@ -276,6 +276,20 @@ const ClaudeLike = Union{ClaudeCodeAgent, MockAgent, MockAgent2}
 fallback assumes a provider injects nothing and only trims whitespace.
 """
 strip_injected_context(::AgentProvider, raw::AbstractString) = String(strip(raw))
+
+"""
+    reports_autonomous_origin(p::AgentProvider) -> Bool
+
+Whether this provider tags the result of an autonomous cycle
+(`_meta["_claude/origin"]`), which is what bounds an auto-wake episode.
+
+It matters because an episode with a start and no end is a latch: the chat would
+claim the agent is working and never be able to take it back. Providers that
+don't send the tag get no episode tracking at all rather than a spinner nothing
+can stop.
+"""
+reports_autonomous_origin(::AgentProvider) = false
+reports_autonomous_origin(::ClaudeLike) = true
 
 function strip_injected_context(::ClaudeLike, raw::AbstractString)
     s = String(raw)

@@ -92,10 +92,14 @@ end
     @test BT.JuliaEvalToolMsg <: BT.JuliaEvalCall <: BT.MCPToolMsg
     @test BT.JuliaContinueToolMsg <: BT.JuliaEvalCall
 
-    # eval/continue RUN code → pin at once, ship code + timeout + ⊗ stoppable.
+    # eval/continue RUN code → ship code + timeout + ⊗ stoppable.
     ev = mcp("bt_julia_eval"; raw = Dict{String,Any}("code" => "1+1", "timeout" => 60,
                                                        "env_path" => "/p"))
-    @test BT.pin_immediately(ev) === true
+    # ... but they do NOT belong in the task bar. The bar is for BACKGROUND
+    # work — a detached bash, a background subagent, the todo list — and an eval
+    # blocks the agent while it runs, however long it takes. Membership is a
+    # fact about the tool, never a judgement about its duration.
+    @test BT.is_taskbar_item(ev) === false
     d = Dict{String,Any}(); BT.mcp_input_extras!(d, ev)
     @test d["code"] == "1+1" && d["stoppable"] === true && d["timeout_s"] == "60s"
     @test BT.executed_preview(ev) === nothing        # code preview is the eval-specific path

@@ -53,21 +53,40 @@ function run_suite(server)
         @test BA.is_pinned(model, "sub-poll-1")
 
         # (C) The subagent produces its FINAL response — a text message that ends
-        # its turn with `stop_reason":"end_turn"`. The bar's loop must finalize the
-        # pill (dropped from the bar) within a few 1 Hz ticks — no ⊗ needed.
+        # its turn with `stop_reason":"end_turn"`. That is the subagent's own
+        # deterministic finish, and the bar's loop must SEE it within a few 1 Hz
+        # ticks — no ⊗ needed.
+        #
+        # It does not end the pill. The agent still has to auto-wake and say what
+        # happened, and that used to be invisible because the pill vanished right
+        # here. The slot now stays and relabels; see `BgPhase`.
         open(outpath, "a") do io
             println(io, """{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done: found the marker."}]}}""")
         end
-        done = false
+        waiting = false
         t0 = time()
         while time() - t0 < 12
-            (!BA.in_taskbar(task) && !BA.is_pinned(model, "sub-poll-1")) && (done = true; break)
+            (task.phase isa BA.AwaitingReport) && (waiting = true; break)
             sleep(0.5)
         end
-        @test done
-        @test !BA.in_taskbar(task)
+        @test waiting
+        @test BA.in_taskbar(task)                       # still on screen...
+        @test BA.is_pinned(model, "sub-poll-1")
+        @test BA.taskbar_activity(task, time()) == "finished — waiting for the agent"
+        @test BA.tool_finished_at(task) === nothing     # ... and not finalized yet
+
+        # (D) The episode's boundary retires it. `end_autowake!` is what both the
+        # agent's own end-of-cycle marker and the next user turn call.
+        BA.end_autowake!(model)
+        @test task.phase isa BA.Reported
+        gone = false
+        t0 = time()
+        while time() - t0 < 12
+            (!BA.in_taskbar(task) && !BA.is_pinned(model, "sub-poll-1")) && (gone = true; break)
+            sleep(0.5)
+        end
+        @test gone
         @test BA.tool_finished_at(task) !== nothing
-        @test !BA.is_pinned(model, "sub-poll-1")
     end
     return server
 end

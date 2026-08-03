@@ -85,153 +85,125 @@ The router reads `parentToolUseId` only *after* deciding turn-ownership, to
 divert the update into the parent's feed. Dispatching on it first removes the
 guess entirely.
 
-## The model
+## The model, as built
 
-**Owners, not turns.** Two kinds:
+**One main stream.** The session's main thread is a single, continuous
+`Channel{Message}` on the `Client`, alive for as long as the ACP session is.
+The agent talks on it inside a prompt and between prompts; both are the same
+voice, so both go to the same coalescer and the same renderer.
 
-- the session's **main thread**
-- one per **subagent**, keyed by `parentToolUseId`
+**A prompt is a span, not a container.** `prompt!` sends the frame and returns a
+`PromptSpan` — an id, a response channel, and an end marker. `wait_turn!` blocks
+on the response for the stopReason. The turn's *content* never comes back
+through it.
 
-An owner has an inbox, its own state, and renders itself. The dispatcher becomes
-a demultiplexer: read the identity, deliver. No heuristic, no discard.
+**A boundary is a marker on the stream.** `StreamFlush` travels the stream like
+a message. The coalescer seals its state when it reaches one (trailing text
+bubble closed, tools the agent never resolved force-failed) and forwards it; the
+consumer signals `done` once everything ahead of it is rendered. The dispatcher
+puts a span's marker on the stream at the exact frame its response arrives, so a
+turn ends where the wire says it does.
 
-**A turn is a span, not an owner.** `active_turns` stops being a router and goes
-back to plain JSON-RPC id correlation: match a `stopReason` response to the
-request that asked for it. That needs no inference. The "oldest in-flight /
-handoff" logic exists only to split one stream into per-request buckets the
-protocol never separated, and it goes away.
+**A subagent owns its updates.** `parentToolUseId` names it, the dispatcher
+delivers to `on_owner_update` before anything else is consulted, and its owner —
+the parent `TaskToolMsg` — keeps its whole history and renders itself.
 
-**"Orphan" stops being a category.** An update with no open turn but a
-`parentToolUseId` belongs to that subagent. One with neither is the main thread
-speaking outside a request — the auto-wake after backgrounded work. Both have
-owners. Neither is exceptional.
+**"Orphan" is not a category.** An update with no prompt open is the main thread
+talking. There is nowhere for it to fall through to.
 
-## What this deletes
+### Where the design above was wrong
 
-- the orphan branch and `on_orphan_update`
-- the `cancelling` gate on it (and the latch-lifetime bug it caused)
-- `ChatModel.between_turn` — today a second copy of the turn renderer, built
-  solely because orphan updates had nowhere to go (#23 in the issue history)
-- `Connection.orphan_work` — liveness becomes "does any owner have work in
-  flight", which each owner knows about itself
-- `route_subagent_activity!` reaching into the parent `TaskToolMsg`
-- the shared 50-entry ring as a *data* bound; per-subagent history makes it a
-  display choice
+Two claims in the original draft did not survive contact with the code.
 
-## Background work does not touch the main loop
+**"Oldest-first routing is the handoff contract and has to survive."** It did
+not have to. That rule only existed to split one stream into per-request
+buckets the protocol never separated. With a single main stream there is nothing
+to split: the agent's words arrive in wire order and are rendered in wire order,
+and *which prompt is credited with them* is a question nobody has to answer. The
+handoff itself still happens — prompt 1 resolves while prompt 2 streams — and it
+now needs no modelling at all.
 
-A subagent runs in the background. Its updates should never reach the main
-message loop, and today they do: `route_subagent_activity!` mutates the parent
-`TaskToolMsg`, and the between-turn sink re-renders through the same `process!`
-the live turn uses.
+**"`is_agent_work` disappears, because metadata is addressed to the session, not
+to a working owner."** Wrong. `available_commands_update` is genuinely the main
+thread with no owner tag, so the distinction between the agent *doing* something
+and the agent *reporting on itself* is real and has to live somewhere. It stayed,
+and grew a second half: `is_agent_work(::SessionUpdate)` for liveness on the
+wire, `is_agent_work(::Message)` for the renderer's busy flag.
 
-As one message type owning its own state, a subagent receives its updates,
-maintains its own progress, and renders itself. The main loop does not see them.
-That is also what makes cancel meaningful per-owner: stopping the main thread
-does not touch a subagent's stream, and stopping a subagent does not touch the
-main thread.
+## What this deleted
 
-## Liveness and cancel fall out
+- `Connection.on_orphan_update` and the orphan branch
+- `ChatModel.between_turn` and its whole lazy pipeline —
+  `ensure_between_turn_sink!`, `between_turn_consumer!`, `teardown_between_turn!`,
+  `finish_between_turn!`, `handle_orphan_update!`. It was a second renderer built
+  because orphan updates had nowhere to go, and it disagreed with the first (#23)
+- `TurnState.on_subagent`, and the per-turn `TurnState` — one persistent state
+  per stream now, with `close` as a boundary rather than an end
+- the per-prompt update channel (`prompt_updates`); `session/load` still captures
+  the stream, because a replay genuinely is that request's result
+- `route_subagent_activity!` reaching through the turn into the parent
+- the shared 50-entry ring as a *data* bound. Per-subagent history makes it a
+  display choice (`TASK_FEED_WIRE_LIMIT`)
 
-Both were bolted on because the router could not answer them:
+## Liveness and cancel
 
-- **liveness**: an owner knows whether it has work in flight. The session is
-  working if any owner is. No `orphan_work` flag, no `is_agent_work`
-  classification of metadata — metadata is addressed to the session, not to a
-  working owner, so it never looked like work in the first place.
-- **cancel**: targets an owner. Cancelling the main thread cannot silence a
-  subagent, which is the bug that made background work disappear after a stop.
+- **liveness**: `active_prompts` says whether we asked for something;
+  `unprompted_work` says whether the agent is saying something. They are
+  different questions, and reading only the first is why stop was a no-op for
+  the whole auto-wake window.
+- **cancel**: gates the main thread only. A subagent's updates return before
+  `cancelling` is consulted, so stopping a turn cannot silence background work
+  the user never cancelled.
+- **the cancel verdict**: read off the response's `stopReason`, not off
+  `conn.cancelling`. That latch is dropped the moment the cancelled prompt
+  settles, which is strictly before end-of-turn cleanup runs — so asking it there
+  always said "not cancelled".
 
-## What does not get easier
+## What did not get easier
 
-Honest accounting — these constraints are in the current code for reasons, and
-they need re-satisfying in the new shape rather than assuming they evaporate:
+Honest accounting — these were in the old code for reasons, and they are still
+here:
 
-- **Head-of-line blocking.** The single dispatcher must not park on a slow
-  consumer, or a cancelled turn's response sits behind a token backlog. Per-owner
-  inboxes make this *better* (a slow subagent renderer no longer blocks the main
-  thread) but each `put!` still needs to be bounded and non-blocking.
-- **Teardown ordering.** Closing an owner has to reap its state without racing an
-  in-flight delivery — the same discipline `detach_subsession!` and
-  `stop_session!` already encode.
-- **Premature cancel is a doom loop.** The warning in `handle_command!` about
-  force-closing mid-turn leaving an orphaned `tool_use` that wedges every future
-  resume still applies per owner.
-- **The auto-wake owner is not obvious.** An untagged update with no open turn is
-  the main thread, but only by elimination. If a future agent emits untagged
-  updates for something else, that assumption breaks quietly — it should be an
-  explicit fallback with a log, not a silent default.
+- **Head-of-line blocking.** The dispatcher must not park on a slow consumer, or
+  a cancelled turn's response sits behind a token backlog. `deliver_update!`
+  still backpressures with a `cancelling` bail, and the dispatcher still drops
+  the main thread the moment cancel goes out.
+- **Teardown ordering.** `close(Client)` closes the connection first (so no
+  further update can be delivered), then the stream. `start_main_consumer!`
+  keeps `(task, client)` together so the old renderer is stopped through the very
+  stream it drains, rather than by hoping it has finished.
+- **Busy latches after an auto-wake.** There is no idle signal on the wire —
+  `session_state_changed` does not appear in either capture — so un-prompted work
+  has no end event, and `busy` stays true until the next turn clears it. That is
+  unchanged from before, not fixed by this.
+- **Premature cancel is still a doom loop.** The warning in `handle_command!`
+  about force-closing mid-turn leaving an orphaned `tool_use` still applies.
 
-## Why this is tractable now
+## Why this was tractable
 
-There is a corpus to refactor against, which there was not before:
+There was a corpus to refactor against:
 
 - `AgentClientProtocol/test/fixtures/real_stop_orphan_wire.jsonl` — real capture:
-  metadata after `end_turn` that must NOT arm, then a `tool_call` that must
+  metadata after `end_turn` that must NOT count as work, then a `tool_call` that
+  must
 - `BonitoAgents/test/fixtures/bg_subagent_wire.jsonl` — real capture of
   background-subagent activity flowing past `end_turn`
-- `orphan_cancel_test.jl` — cancel during un-prompted work; cancel does not
-  silence later background work; A8 idle no-op
+- `orphan_cancel_test.jl` — cancel during un-prompted work; a subagent streaming
+  while the main thread's cancel latch is set; A8 idle no-op
 - `e2e:queued_messages`, `e2e:chat_cancel`, `e2e:cancel_escalation`,
-  `e2e:leak_cycle`
+  `e2e:leak_cycle`, `e2e:subagent_feed`
 
-**Treat these as the specification.** The refactor should pass them unchanged.
-Any test that has to be edited to make the new design work is a behaviour change
-that needs arguing for on its own, not folded into a refactor.
+**Treated as the specification.** Six files named the internals being removed and
+necessarily changed:
 
-## Done in one pass, not staged
-
-An earlier draft staged this over five steps, starting with owners running
-*alongside* the router behind a fallback. That intermediate is a state nobody
-wants to ship: both code paths live at once, so it carries more total complexity
-than either endpoint and every behaviour has two implementations to keep
-agreeing. The value is in deleting the router, and a stage that keeps it is
-mostly ceremony.
-
-So: one coherent change, then test the whole application hard.
-
-### Blast radius
-
-Four source files, and the weight is not evenly spread:
-
-| file | lines |
-| --- | --- |
-| `BonitoAgents/src/chat.jl` | 7455 |
-| `AgentClientProtocol/src/connection.jl` | 609 |
-| `AgentClientProtocol/src/messages.jl` | 582 |
-| `AgentClientProtocol/src/client.jl` | 326 |
-
-### Which tests may change, and which may not
-
-This is the part that keeps "tests as specification" meaningful without a staged
-rollout. Six files name the internals being removed, so they necessarily change:
-
-    AgentClientProtocol/test/orphan_cancel_test.jl
     AgentClientProtocol/test/runtests.jl
-    BonitoAgents/test/e2e/subagent_feed.jl
-    BonitoAgents/test/unit/between_turn_test.jl
+    AgentClientProtocol/test/orphan_cancel_test.jl
+    AgentClientProtocol/test/mocks/acp_mock_agent.jl
+    BonitoAgents/test/unit/between_turn_test.jl   → unit/main_stream_test.jl
     BonitoAgents/test/unit/subagent_feed_test.jl
-    BonitoAgents/test/unit/session_config_test.jl
+    BonitoAgents/test/e2e/subagent_feed.jl
 
-Everything else — roughly thirty behavioural e2e items including `chat_cancel`,
+Everything else — the behavioural e2e items including `chat_cancel`,
 `cancel_escalation`, `chat_streaming_sustained`, `chat_remount`, `leak_cycle`,
-`queued_messages`, `yolo_mode` — never mentions them and **must pass unchanged**.
-Those describe what the user experiences; the six above describe how it is
-currently built.
-
-If one of the thirty has to be edited, that is a behaviour change and needs
-arguing on its own terms, not absorbing into the refactor.
-
-### Test plan for the single pass
-
-1. `AgentClientProtocol` suite, including both real captured wires.
-2. `BonitoWorker` suite (`Pkg.test`, real-agent integration included).
-3. Full `BonitoAgents` suite — all test items, not a subset. The interlocks that
-   matter (taskbar, persistence, virtual scroll, remount) are not in the files
-   this refactor touches, which is exactly why they are worth running.
-4. Real-agent run: background subagent, stop mid auto-wake, confirm the
-   transcript freezes and the subagent's own history is intact.
-5. Browser check of a long subagent run — the shared 50-entry ring is being
-   replaced by per-subagent history, so the visible failure mode (steps
-   disappearing from the middle of a long run) needs eyes on it, not just a
-   passing assertion.
+`queued_messages`, `yolo_mode` — describes what the user experiences, and passes
+unchanged.

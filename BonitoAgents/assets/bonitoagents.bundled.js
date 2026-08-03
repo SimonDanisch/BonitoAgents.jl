@@ -1569,7 +1569,7 @@ class BonitoChat {
     onTaskActivity(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node || !msg.entry) return;
-        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry);
+        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry, msg.total);
     }
     _ensureTaskFeed(node) {
         let feed = node.querySelector('.bt-task-feed');
@@ -1595,20 +1595,24 @@ class BonitoChat {
         }
         return feed;
     }
-    _upsertTaskFeedEntry(feed, e) {
+    _upsertTaskFeedEntry(feed, e, total) {
         const list = feed.querySelector('.bt-task-feed-list');
         let row = e.eid != null ? list.querySelector(`[data-eid="${CSS.escape(String(e.eid))}"]`) : null;
         if (!row) {
             row = document.createElement('div');
             row.dataset.eid = String(e.eid ?? '');
             list.appendChild(row);
-            while(list.children.length > 50)list.removeChild(list.firstChild);
+            while(list.children.length > 300)list.removeChild(list.firstChild);
         }
         row.className = `bt-task-feed-entry bt-task-feed-${e.kind || 'text'}` + (e.status ? ` bt-feed-${e.status}` : '');
         row.textContent = e.kind === 'tool' ? `⚙ ${e.label || ''}` : e.label || '';
         if (e.kind === 'tool' && e.status) row.title = e.status;
         const count = feed.querySelector('.bt-task-feed-count');
-        if (count) count.textContent = String(list.children.length);
+        if (count) {
+            const n = Number.isFinite(total) ? total : list.children.length;
+            feed.dataset.total = String(Math.max(n, Number(feed.dataset.total || 0)));
+            count.textContent = feed.dataset.total;
+        }
         if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
     }
     noteKey(msg) {
@@ -1764,7 +1768,7 @@ class BonitoChat {
                     });
                     if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
                         const feed = this._ensureTaskFeed(div);
-                        for (const e of msg.task_feed)this._upsertTaskFeedEntry(feed, e);
+                        for (const e of msg.task_feed)this._upsertTaskFeedEntry(feed, e, msg.task_feed_total);
                     }
                     const detachBtn = div.querySelector('.bt-tool-detach');
                     if (detachBtn) detachBtn.addEventListener('click', (e)=>{

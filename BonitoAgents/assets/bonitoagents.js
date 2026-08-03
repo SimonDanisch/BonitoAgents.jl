@@ -181,6 +181,10 @@ const filterKey = (msg) =>
 // Filter keys that start HIDDEN: their checkbox appears unchecked when the
 // key first occurs. ToolSearch calls are tool-discovery noise — opt-in.
 const DEFAULT_HIDDEN = ['tool:ToolSearch'];
+// Rows of subagent activity the DOM holds per Task bubble. Mirrors the server's
+// TASK_FEED_WIRE_LIMIT so a remount and a live run show the same window; the
+// subagent's full history lives on the server either way.
+const TASK_FEED_ROWS = 300;
 
 class BonitoChat {
     constructor(container, comm) {
@@ -2359,17 +2363,22 @@ class BonitoChat {
     }
 
     // ── Subagent activity feed (Task tool bubbles) ───────────────────────
-    // The server routes every parentToolUseId-tagged subagent update to its
-    // parent TaskToolMsg and mirrors it here as `task_activity` events; the
-    // bubble renders them as a bounded, most-recent-last, auto-scrolled feed
-    // in its own collapsible section between the header and the lazy body
-    // (same Collapsable behaviour the tool body / thought sections use).
-    // Remounts rebuild from the header's `task_feed` snapshot (createNode).
+    // Every parentToolUseId-tagged update is addressed to the subagent that
+    // owns it; the server keeps that subagent's WHOLE history and mirrors each
+    // step here as a `task_activity` event. The bubble renders them
+    // most-recent-last, auto-scrolled, in its own collapsible section between
+    // the header and the lazy body (same Collapsable behaviour the tool body /
+    // thought sections use). Remounts rebuild from the header's `task_feed`
+    // snapshot (createNode), which carries the tail plus the true total.
+    //
+    // TASK_FEED_ROWS bounds the DOM, not the data: the count shown is the
+    // subagent's real step count, which is what the user is asking when they
+    // look at a long run.
 
     onTaskActivity(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node || !msg.entry) return;
-        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry);
+        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry, msg.total);
     }
 
     _ensureTaskFeed(node) {
@@ -2401,7 +2410,7 @@ class BonitoChat {
         return feed;
     }
 
-    _upsertTaskFeedEntry(feed, e) {
+    _upsertTaskFeedEntry(feed, e, total) {
         const list = feed.querySelector('.bt-task-feed-list');
         let row = e.eid != null ?
             list.querySelector(`[data-eid="${CSS.escape(String(e.eid))}"]`) : null;
@@ -2409,15 +2418,22 @@ class BonitoChat {
             row = document.createElement('div');
             row.dataset.eid = String(e.eid ?? '');
             list.appendChild(row);
-            // Bounded mirror of the server's feed window.
-            while (list.children.length > 50) list.removeChild(list.firstChild);
+            // Bounded DOM. Matches the server's wire window so a remount and a
+            // live run converge on the same rows.
+            while (list.children.length > TASK_FEED_ROWS) list.removeChild(list.firstChild);
         }
         row.className = `bt-task-feed-entry bt-task-feed-${e.kind || 'text'}` +
             (e.status ? ` bt-feed-${e.status}` : '');
         row.textContent = e.kind === 'tool' ? `⚙ ${e.label || ''}` : (e.label || '');
         if (e.kind === 'tool' && e.status) row.title = e.status;
         const count = feed.querySelector('.bt-task-feed-count');
-        if (count) count.textContent = String(list.children.length);
+        // The subagent's real step count when the server sent one; the rows we
+        // are holding otherwise.
+        if (count) {
+            const n = Number.isFinite(total) ? total : list.children.length;
+            feed.dataset.total = String(Math.max(n, Number(feed.dataset.total || 0)));
+            count.textContent = feed.dataset.total;
+        }
         // Most-recent-last + auto-scroll while the section is open.
         if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
     }
@@ -2663,7 +2679,8 @@ class BonitoChat {
                 // header's snapshot (live growth rides task_activity events).
                 if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
                     const feed = this._ensureTaskFeed(div);
-                    for (const e of msg.task_feed) this._upsertTaskFeedEntry(feed, e);
+                    for (const e of msg.task_feed)
+                        this._upsertTaskFeedEntry(feed, e, msg.task_feed_total);
                 }
                 // Detach (bonito_app only): pop the embed into the floating
                 // window. Lives on the ⤢ header button — the conventional "open

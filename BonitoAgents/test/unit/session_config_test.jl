@@ -4,7 +4,7 @@
 # (that was removed with SubprocessTransport; the old top-level
 # `test_session_config.jl` still references it and is part of the #26 rewrite) and
 # no live agent: a never-started `WorkerAgent` backs the one `ChatModel` we need
-# (same pattern as busy_test / between_turn_test).
+# (same pattern as busy_test / main_stream_test).
 #
 #  Part A — header pills show a CATEGORY label + the RESOLVED value: the model
 #           "default" alias resolves to the real model (from its description
