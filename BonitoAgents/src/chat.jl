@@ -3271,10 +3271,35 @@ markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
         # partial, and warning would just reproduce the log flood it prevents.
         e isa BoundsError || rethrow()
         @debug "markdown_html: CommonMark BoundsError; showing text verbatim" exception = (e, catch_backtrace())
-        replace(esc_html(String(text)), "\n" => "<br>")
+        verbatim_html(text)
+    end
+    # RENDERING MUST NOT ERASE THE MESSAGE.
+    #
+    # The catch above only covers CommonMark THROWING. A parser version that
+    # instead returns successfully with the content dropped slips straight
+    # past it — and that is a real version, not a hypothetical: on the same
+    # half-formed table input where our pinned CommonMark raises the
+    # `BoundsError` described above, the newer fork CI resolves to emits a
+    # zero-column `<table>` with no cells, so `alpha | beta` renders as
+    # nothing at all. A message silently rendering blank is far worse than one
+    # rendering unstyled.
+    #
+    # So the guarantee is checked on the OUTPUT rather than inferred from which
+    # exception the parser happened to throw: if the source had words and none
+    # of them survive into the rendered text, show it verbatim instead. Keyed on
+    # words, not on emptiness — `---` legitimately renders to `<hr>` with no
+    # text at all, and must stay a horizontal rule.
+    words = [m.match for m in eachmatch(r"[A-Za-z0-9]+", String(text))]
+    if !isempty(words)
+        shown = replace(inner, r"<[^>]*>" => " ")
+        any(w -> occursin(w, shown), words) || (inner = verbatim_html(text))
     end
     "<div class=\"markdown-body\">" * inner * "</div>"
 end
+
+# The message with no markdown applied: escaped, line breaks kept. What we fall
+# back to whenever the parser can't render it without losing it.
+verbatim_html(text::AbstractString) = replace(esc_html(String(text)), "\n" => "<br>")
 
 # "new message" event. Streaming-open shape for agent/thought (seeded with the
 # first chunk); plain shape for user/tool/plan. `send!` adds the `n` count.

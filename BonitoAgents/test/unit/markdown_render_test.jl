@@ -38,6 +38,27 @@ const BT = BonitoAgents
     end
 end
 
+@testset "a render that would erase the message falls back to verbatim" begin
+    # The content-preservation guarantee above cannot rest on WHICH exception
+    # CommonMark throws. Our pinned version raises a BoundsError on a
+    # half-formed table; the newer fork CI resolves to returns successfully with
+    # a zero-column <table> and no cells, so the message rendered BLANK and only
+    # CI saw it. The guard therefore checks the OUTPUT.
+    #
+    # It is keyed on words surviving, not on the output having any text at all —
+    # these render to nothing by design and must keep doing so.
+    @test occursin("<hr", BT.markdown_html("---"))
+    @test occursin("<hr", BT.markdown_html("***"))
+    # ... while anything carrying words keeps them, however it is parsed.
+    for s in ["alpha | beta\n|-", "| alpha | beta |\n|::|::|\n| 1 | 2 |",
+              "# heading", "- item one\n- item two", "`code span`"]
+        h = BT.markdown_html(s)
+        for w in ["alpha", "beta", "heading", "item", "one", "two", "code", "span"]
+            occursin(w, s) && @test occursin(w, h)
+        end
+    end
+end
+
 @testset "markdown_html still renders well-formed markdown" begin
     @test occursin("<strong", BT.markdown_html("hello **world**"))
     @test occursin("<table", BT.markdown_html("| a | b |\n|---|---|\n| 1 | 2 |"))

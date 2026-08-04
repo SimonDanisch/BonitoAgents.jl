@@ -151,6 +151,7 @@ jobs:
           - scroll_persist
           - streaming_flood
           - errors
+          - resume_no_jserrors
           - lens
           - file_open
           - file_tree
@@ -192,12 +193,23 @@ jobs:
       - name: 'E2E — ${{ matrix.suite }}'
         # Run the suite's `@testitem` through runtests.jl (it owns the
         # SharedServer setup + ReTestItems harness); the bare `e2e/<suite>.jl`
-        # is just the TestKit logic and isn't standalone-runnable. The arg is a
-        # name filter → `e2e:<suite>`. ONE worker = one dev_server (no fan-out),
-        # hardcoded in runtests.jl — no env knob.
+        # is just the TestKit logic and isn't standalone-runnable. ONE worker =
+        # one dev_server (no fan-out), hardcoded in runtests.jl — no env knob.
+        #
+        # The filter is `Regex(join(ARGS,"|"))`, so it must be ANCHORED to the
+        # e2e namespace. A bare `file_tree` also matches `unit:file_tree`, which
+        # starts its OWN dev_server + worker subprocess inside this job's
+        # process — two servers and two workers at once, and the e2e tree then
+        # reads an empty/foreign project (reproduced locally: `e2e:file_tree`
+        # passes 19/19 alone and 10/19 under the bare filter). `lens` and
+        # `cross_worker` pulled in unit items the same way; the unit job already
+        # covers all of `unit:*`.
+        #
+        # Still a substring match, deliberately: `e2e:file_open` keeps picking up
+        # `e2e:file_open_fresh`, and `e2e:cross_worker` its `_sync_ui` sibling.
         run: |
           timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
-            julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '${{ matrix.suite }}'
+            julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl 'e2e:${{ matrix.suite }}'
 
   # ── Single required check for branch protection ───────────────────────────
   all-green:
