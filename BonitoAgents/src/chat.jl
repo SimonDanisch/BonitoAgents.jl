@@ -268,12 +268,22 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         error("ChatModel requires an agent (a WorkerAgent); none was provided")
     actual_agent = agent
     busy_active = Observable(false)
-    # Wire busy_active → sidebar status LED: a prompt going in-flight (or
-    # finishing) flips chat_status, which the sidebar wants to know about
-    # immediately, not on the next chat_signal edge. The listener is
-    # anchored to `busy_active` itself (lives as long as the ChatModel
-    # does, GCed with it), so there's no leak.
-    on(busy_active) do _; notify_chats!(state); end
+    # NB busy_active is deliberately NOT wired to `notify_chats!`.
+    #
+    # It used to be, to make the sidebar's status LED flip the instant a prompt
+    # went in flight. But `chat_signal` means "the set of chats CHANGED" (see
+    # its field doc), and the sidebar's body re-renders on it — so every turn
+    # boundary rebuilt the whole open-chats list, including each chat's file
+    # tree. An open tree was swapped out mid-interaction: a click landed on a
+    # row belonging to the outgoing DOM and did nothing, and the replacement
+    # tree came back collapsed. `e2e:file_tree` failed 2 of 3 runs on exactly
+    # that, and a user would see a tree that collapses whenever the agent
+    # starts talking.
+    #
+    # The LED needs no such thing: `sidebar_entry` renders it with a
+    # `dataStatus` attribute and the 1 Hz `recompute_status_dom!` updates that
+    # attribute IN PLACE, which is what the sidebar's own comment says the
+    # design is. Worst case the LED is a second late; nothing is rebuilt.
     model = ChatModel(
         ReentrantLock(),
         state, String(cwd), String(project_id),

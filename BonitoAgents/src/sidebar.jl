@@ -289,10 +289,16 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # online/offline transitions). The LED color is recomputed every second
     # by `recompute_status_dom!` on the OUTER aside (below) so a busy_active
     # flip mid-turn doesn't require a body re-render.
+    # Per-project file trees, kept ACROSS sidebar re-renders. Building a fresh
+    # one each render handed the replacement `active = false` and dropped the
+    # JS-toggled `.bt-tree-open` class with the old node, so an open tree
+    # collapsed and never reloaded. Session-scoped, pruned to the open projects.
+    trees = Dict{String,WorkerFileTree}()
     body = map(state.chat_signal, state.projects, state.workers) do _, projects, workers
         active_pid = current_view[]
         open_projs = open_chat_projects(state, projects)
         sort!(open_projs; by = p -> lowercase(p.name))
+        filter!(kv -> any(p -> p.id == kv.first, open_projs), trees)
 
         entries = Any[sidebar_entry("Home", home_icon, "", "Dashboard";
                                     active = active_pid == "")]
@@ -327,9 +333,11 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             # opens the tree INSIDE the pill (so it visibly belongs to the chat)
             # and, on first open, flips `tree.active` for the lazy worker scan.
             # stopPropagation keeps the click off the row's navigate handler.
-            tree = WorkerFileTree(state, p.id, pane)
-            hint = DOM.div("▾ files";
-                class = "bt-side-tree-hint", title = "Show project files",
+            tree = get!(() -> WorkerFileTree(state, p.id, pane), trees, p.id)
+            tree_open = tree.active[]
+            hint = DOM.div(tree_open ? "▴ hide files" : "▾ files";
+                class = "bt-side-tree-hint",
+                title = tree_open ? "Hide project files" : "Show project files",
                 onclick = js"""event => {
                     event.stopPropagation();
                     const chat = event.currentTarget.closest('.bt-side-chat');
@@ -349,7 +357,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                       # it stays put when the tree expands below it.
                       DOM.div(item, hint; class = "bt-side-chat-row"),
                       DOM.div(tree; class = "bt-side-tree-wrap");
-                      class = "bt-side-chat"))
+                      class = tree_open ? "bt-side-chat bt-tree-open" : "bt-side-chat"))
         end
         isempty(open_projs) && push!(entries,
             DOM.div("No open chats yet — open one from the dashboard.";

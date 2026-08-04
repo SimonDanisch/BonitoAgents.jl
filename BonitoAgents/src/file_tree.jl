@@ -23,10 +23,34 @@ struct WorkerFileTree
     project_id::String
     pane::PlotPane
     active::Observable{Bool}     # flipped true by the sidebar on first expand
+
+    # ── UI state, owned by the COMPONENT ────────────────────────────────────
+    # These were locals of `jsrender`, which meant a fresh set every time the
+    # sidebar re-rendered — and the sidebar re-renders on chat add/remove and on
+    # project/worker changes, none of which have anything to do with this tree.
+    # The consequences were all one bug: an open tree collapsed, its loaded
+    # directories were forgotten, and a click landed on a row whose `clicked`
+    # observable had died with the outgoing render, so expanding a folder or
+    # opening a file silently did nothing.
+    #
+    # Held here, the tree keeps its identity across renders: still open, still
+    # loaded, and a click always reaches a live observable.
+    tick::Observable{Int}                 # bump → re-render the body
+    search::Observable{String}
+    clicked::Observable{String}           # "<dir?>\t<path>" from a row click
+    expanded::Set{String}
+    children::Dict{String,Any}            # dir abspath → sorted entries
+    inflight::Set{String}                 # dirs whose list_dir RPC is running
+    index_files::Ref{Vector{String}}
+    index_ready::Ref{Bool}
+    root_loaded::Ref{Bool}
 end
 
 WorkerFileTree(state::ServerState, project_id::AbstractString, pane::PlotPane) =
-    WorkerFileTree(state, String(project_id), pane, Observable(false))
+    WorkerFileTree(state, String(project_id), pane, Observable(false),
+                   Observable(0), Observable(""), Observable(""),
+                   Set{String}(), Dict{String,Any}(), Set{String}(),
+                   Ref(String[]), Ref(false), Ref(false))
 
 # Cap on rendered search hits — keep the DOM small on a big index.
 const FILE_TREE_SEARCH_LIMIT = 300
@@ -120,17 +144,18 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
     server_cwd  = proj.server_path
     worker_id   = proj.worker_id
 
-    # Session-local UI state (plain locals — one consumer, this session).
-    expanded    = Set{String}()
-    children    = Dict{String,Any}()      # dir abspath → sorted entries
-    inflight    = Set{String}()           # dirs whose list_dir RPC is running
-    index_files = Ref(String[])
-    index_ready = Ref(false)
-    root_loaded = Ref(false)
+    # UI state lives on the component (see `WorkerFileTree`), so everything
+    # below survives a sidebar re-render.
+    expanded    = t.expanded
+    children    = t.children
+    inflight    = t.inflight
+    index_files = t.index_files
+    index_ready = t.index_ready
+    root_loaded = t.root_loaded
 
-    tick   = Observable(0)                 # bump → re-render the body
-    search = Observable("")                # search box text
-    clicked = Observable("")               # "<dir?>\t<path>" from a row click
+    tick    = t.tick
+    search  = t.search
+    clicked = t.clicked
     bump() = (tick[] = tick[] + 1)
 
     fetch_dir!(dir) = begin
