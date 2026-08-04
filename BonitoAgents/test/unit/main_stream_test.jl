@@ -164,28 +164,68 @@ end
     close(model)
 end
 
-@testset "closing a chat winds the renderer down (no leak)" begin
+@testset "the renderer dies with the SESSION, not with the model" begin
+    # `close(model)` deliberately leaves the ACP session alone: the model does
+    # not own the client, the agent does. `stop_session!` closes the model and
+    # then `stop!(agent; permanent=true)`, and THAT ends the renderer.
+    #
+    # Having the model close the client looked tidier and was a live bug — a
+    # teardown racing a fresh bring-up for the same project closed the stream
+    # the new session had just started rendering into, so replies reached
+    # `msgs_store` and disk but never the screen.
     model, cli = live_model()
     feed!(cli, amc("Work in progress. "))
     feed!(cli, toolnotif("t1", "some tool"))
     feed!(cli, amc("more streaming text"))
     consumer = BT.shared(model).main_consumer[].task
-    close(model)                       # closed mid-episode
+
+    close(model)                       # the chat is dead...
+    @test !isopen(BT.shared(model).user_messages)   # ... no further turns
+    sleep(0.3)
+    @test isopen(cli.updates)          # ... but the session is untouched
+    @test !istaskdone(consumer)        # ... and its renderer is still alive
+    close(model)                       # idempotent
+
+    # Closing the CLIENT is what winds it down, which is what `stop!(agent)` does.
+    close(cli)
     t0 = time()
     while !istaskdone(consumer) && time() - t0 < 5
         sleep(0.05)
     end
     @test istaskdone(consumer)
     @test !isopen(cli.updates)
-    close(model)                       # idempotent
 end
 
-@testset "a frame after close is dropped, not rendered" begin
-    # The stream is closed with the chat, so a frame the ACP connection delivers
-    # afterwards has nowhere to go — and nothing to resurrect. `deliver_update!`
-    # sees the closed channel and returns.
+@testset "re-binding the same client does not kill its renderer" begin
+    # `start!` is idempotent and hands the existing client back, so
+    # `start_chat_client!` reaches `start_main_consumer!` more than once for ONE
+    # client (a bring-up, then the first turn's lazy bind). Reaping the "old"
+    # consumer there would close `cli.updates` — the very stream the new one is
+    # about to read — and it would exit on its first iteration, leaving a dead
+    # renderer on a live connection.
+    model, cli = live_model()
+    first = BT.shared(model).main_consumer[].task
+
+    BT.start_main_consumer!(model, cli)          # same client, again
+    @test BT.shared(model).main_consumer[].task === first
+    @test !istaskdone(first)
+    @test isopen(cli.updates)
+
+    # ... and it still renders.
+    feed!(cli, amc("still here"))
+    BT.flush_main!(model)
+    @test any(m -> m isa BT.AgentMsg && m.text == "still here",
+              BT.shared(model).msgs_store)
+    close(model)
+end
+
+@testset "a frame after the session closes is dropped, not rendered" begin
+    # Once the SESSION is closed a frame the connection delivers has nowhere to
+    # go — and nothing to resurrect. `deliver_update!` sees the closed channel
+    # and returns.
     model, cli = live_model()
     close(model)
+    close(cli)
     consumer = BT.shared(model).main_consumer[].task
     t0 = time()
     while !istaskdone(consumer) && time() - t0 < 5
