@@ -4468,6 +4468,18 @@ end
 function start_main_consumer!(chat::ChatModel, cli)
     s = shared(chat)
     old = lock(() -> s.main_consumer[], s.lock)
+    # Already draining THIS session's stream? Then there is nothing to do, and
+    # falling through would be actively destructive: the teardown below closes
+    # `old.client.updates`, which for the same client IS `cli.updates` — the
+    # very stream we are about to consume. The coalescer ends, `messages`
+    # closes, and the fresh consumer exits on its first iteration, leaving the
+    # chat with a DEAD renderer on a LIVE connection. Replies then land in
+    # `msgs_store` and on disk and never reach the screen.
+    #
+    # `start_chat_client!` really does run more than once for one client:
+    # `start!` is idempotent and hands the existing one back (a bring-up
+    # followed by a lazy bind, `ensure_project_session!` then the first turn).
+    old !== nothing && old.client === cli && !istaskdone(old.task) && return nothing
     if old !== nothing && !istaskdone(old.task)
         # Closing `updates` winds the old coalescer down, which closes `messages`
         # and lets the consumer finish its buffered tail. `stop!(agent)` has
