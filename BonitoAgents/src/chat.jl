@@ -4297,12 +4297,18 @@ function Base.close(model::ChatModel)
     # session's update channel winds its coalescer down, which closes `messages`
     # and lets `main_consumer!` finish on its own. Non-blocking.
     #
-    # `stop!(agent)` normally closes the client too; doing it here as well means
-    # a chat closed without stopping its agent still reaps the renderer.
+    # The renderer is NOT torn down here. Its stream belongs to the ACP session,
+    # which this model does not own -- `stop_session!` closes the model and then
+    # `stop!(agent; permanent=true)`, and THAT closes the client, which ends the
+    # coalescer and the consumer. Reaching into the agent's client from here was
+    # redundant with that and actively wrong: a model teardown racing a fresh
+    # bring-up for the same project could close the stream the NEW session had
+    # just started rendering into, leaving replies in the store and off the
+    # screen (`e2e:auto_prompt`, which resumes a stopped session).
+    #
+    # A re-bind reaps any previous consumer itself (`start_main_consumer!`), so
+    # nothing leaks by leaving it alone.
     isopen(s.user_messages) && close(s.user_messages)
-    let mc = lock(() -> s.main_consumer[], s.lock)
-        mc === nothing || (isopen(mc.client.updates) && close(mc.client.updates))
-    end
     # Stop the TaskBar's own poll loop and drop its live tasks — otherwise the
     # 1 Hz loop spins forever, pinning the model (and its tasks) past teardown.
     close(s.taskbar)
