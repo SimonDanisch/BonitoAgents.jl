@@ -52,6 +52,27 @@ WorkerFileTree(state::ServerState, project_id::AbstractString, pane::PlotPane) =
                    Set{String}(), Dict{String,Any}(), Set{String}(),
                    Ref(String[]), Ref(false), Ref(false))
 
+"""
+    WorkerFileTree(prototype) -> WorkerFileTree
+
+A FRESH component sharing `prototype`'s state. The sidebar keeps one prototype
+per project and re-wraps it on every render.
+
+Why not just render the prototype again: Bonito tracks the objects it has
+rendered, and handing it the same one for a second, third, … render left it
+operating on nodes the previous render had already detached — surfacing as an
+unhandled `Cannot read properties of null (reading 'parentNode')` in the browser
+(caught by `e2e:outdated_worker`, which asserts a clean JS console). A new
+wrapper each render keeps Bonito's bookkeeping honest; sharing the fields is
+what actually matters, since that is where "still open, still loaded, clicks
+still land" lives.
+"""
+WorkerFileTree(t::WorkerFileTree) =
+    WorkerFileTree(t.state, t.project_id, t.pane, t.active,
+                   t.tick, t.search, t.clicked,
+                   t.expanded, t.children, t.inflight,
+                   t.index_files, t.index_ready, t.root_loaded)
+
 # Cap on rendered search hits — keep the DOM small on a big index.
 const FILE_TREE_SEARCH_LIMIT = 300
 

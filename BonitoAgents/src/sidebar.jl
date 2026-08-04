@@ -333,7 +333,10 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             # opens the tree INSIDE the pill (so it visibly belongs to the chat)
             # and, on first open, flips `tree.active` for the lazy worker scan.
             # stopPropagation keeps the click off the row's navigate handler.
-            tree = get!(() -> WorkerFileTree(state, p.id, pane), trees, p.id)
+            # A fresh component per render, sharing the project's persistent
+            # state (see the re-wrap constructor).
+            tree = WorkerFileTree(get!(() -> WorkerFileTree(state, p.id, pane),
+                                       trees, p.id))
             tree_open = tree.active[]
             hint = DOM.div(tree_open ? "▴ hide files" : "▾ files";
                 class = "bt-side-tree-hint",
