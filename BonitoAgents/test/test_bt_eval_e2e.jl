@@ -294,9 +294,11 @@ end
 
         # (4) The completed Output section is the SAME pin_end console in
         # SUMMARY state — scrollbar, capped to ~4 lines. Clicking its HEADER
-        # cycles the three states: summary → collapsed → full → summary. Each
-        # state has its OWN distinct disclosure marker (▸ collapsed, ▿ summary,
-        # ▾ full) so all three are visually distinguishable.
+        # cycles the three states: summary → full → collapsed → summary. The
+        # first click UNCAPS, because that is what someone looking at a 4-line
+        # window of a longer log wants; hiding it altogether is the second.
+        # Each state has its OWN distinct disclosure marker (▸ collapsed,
+        # ▿ summary, ▾ full) so all three are visually distinguishable.
         marker = () -> TK.eval_js(s,
             "getComputedStyle(($out_sec).querySelector('.bt-subsection-summary'), '::before').content")
         @test TK.wait_for(s, "Output section done: summary state, pinned console",
@@ -306,20 +308,20 @@ end
                           d.hasAttribute('open') && b.offsetHeight <= 110); })()""";
             timeout = 30) == true
         @test occursin("▿", marker())          # summary marker
-        # Cycle 1: summary → collapsed (header click; body hidden).
-        TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
-        @test TK.wait_for(s, "cycled to collapsed",
-            "!(($out_sec).hasAttribute('open'))"; timeout = 5) == true
-        @test occursin("▸", marker())          # collapsed marker (distinct)
-        # Cycle 2: collapsed → full (body back, taller than the summary cap).
+        # Cycle 1: summary → full (body uncapped, taller than the summary cap).
         TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
         @test TK.wait_for(s, "cycled to full (uncapped)",
             """(() => { const d = $out_sec;
                 return !!(d.hasAttribute('open') && d.dataset.state === 'full' &&
                     d.querySelector('.bt-subsection-body').offsetHeight > 110); })()""";
             timeout = 5) == true
-        @test occursin("▾", marker())          # full marker (distinct from the other two)
-        # Cycle 3: full → summary (back to the ~4-line window).
+        @test occursin("▾", marker())          # full marker (distinct)
+        # Cycle 2: full → collapsed (header click; body hidden).
+        TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
+        @test TK.wait_for(s, "cycled to collapsed",
+            "!(($out_sec).hasAttribute('open'))"; timeout = 5) == true
+        @test occursin("▸", marker())          # collapsed marker (distinct from the other two)
+        # Cycle 3: collapsed → summary (back to the ~4-line window).
         TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
         @test TK.wait_for(s, "cycled back to summary",
             """(() => { const d = $out_sec;
