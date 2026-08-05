@@ -339,23 +339,37 @@ end
 # that backlog in strict-FIFO order and the turn looks wedged; (2) we send the
 # `session/cancel` notification so the agent actually winds the turn down and
 # resolves the prompt with `stopReason: cancelled`.
-function cancel!(client::Client)
+"""
+    session_live(client) -> Bool
+
+Whether the agent has anything running that a cancel could reach.
+
+Cancel targets the SESSION, not one request, and there are two independent
+reasons the agent may be working: we asked it to (`active_prompts`), or it woke
+itself up after backgrounded work finished (`unprompted_work`). Reading only the
+first is why stop used to be a no-op for the whole auto-wake window, while the
+user watched it run tools.
+
+Exposed separately from [`cancel!`] because the two callers need OPPOSITE
+information from the same fact. `cancel!` wants "is there something to send a
+cancel to". A UI wants "is my spinner telling the truth" — and if it isn't, the
+answer is to reconcile its own state, NOT to discard whatever the user has
+queued up behind a turn that already ended.
+"""
+function session_live(client::Client)
     conn = client.conn
-    # Cancel targets the SESSION, not one request.
-    #
-    # Two independent reasons the agent may be working: we asked it to
-    # (`active_prompts`), or it woke itself up after backgrounded work finished
-    # (`unprompted_work`). Reading only the first is why stop used to be a no-op
-    # for the whole auto-wake window, while the user watched it run tools.
-    #
-    # Still a no-op when GENUINELY idle (A8) — no prompt open and no un-prompted
-    # work since the last request or cancel. That matters: `cancelling` gates the
-    # main thread, so latching it true over an idle gap would silently drop the
-    # agent's next burst of work until a new prompt cleared it.
-    live = lock(conn.lock) do
+    return lock(conn.lock) do
         !isempty(conn.active_prompts) || (@atomic conn.unprompted_work)
     end
-    live || return nothing
+end
+
+function cancel!(client::Client)
+    conn = client.conn
+    # A no-op when GENUINELY idle (A8) — no prompt open and no un-prompted work
+    # since the last request or cancel. That matters: `cancelling` gates the main
+    # thread, so latching it true over an idle gap would silently drop the
+    # agent's next burst of work until a new prompt cleared it.
+    session_live(client) || return false
     @atomic conn.cancelling = true
     # Consumed: a second cancel arriving while still idle must no-op again. If
     # the agent ignores this one and keeps streaming, the dispatcher sets it
@@ -363,7 +377,7 @@ function cancel!(client::Client)
     @atomic conn.unprompted_work = false
     send_notification(conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
-    return nothing
+    return true
 end
 
 # Set one of the session's configurable options (model / mode / effort / …).

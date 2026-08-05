@@ -732,6 +732,13 @@ struct Reported       <: BgPhase end
 # governs from there.
 const REPORT_WAIT_SECONDS = 45.0
 
+# How long `wait_rendered!` waits for the renderer to pass a stream marker before
+# starting the turn regardless. The barrier drains frames already in hand, so it
+# normally completes in milliseconds; this is deliberately far above that and
+# still finite, because the failure it guards is a hang and an unbounded wait
+# turns one stalled renderer into a permanently unusable chat.
+const RENDER_BARRIER_SECONDS = 10.0
+
 # The one-line stage description a pill shows next to its elapsed clock.
 phase_note(::Executing)      = ""
 phase_note(::AwaitingReport) = "finished — waiting for the agent"
@@ -4645,12 +4652,29 @@ function wait_rendered!(chat::ChatModel, marker::AgentClientProtocol.StreamFlush
     mc = lock(() -> shared(chat).main_consumer[], shared(chat).lock)
     mc === nothing && return nothing
     bind(marker.done, mc.task)   # renderer gone → we're woken, not stranded
-    try
-        AgentClientProtocol.wait_rendered(marker)
-    catch e
-        # `bind` rethrows a failed renderer's exception here; it was already
-        # logged + errormonitored, and there is nothing left to wait for.
-        e isa TaskFailedException || rethrow()
+    # `signal_rendered!` CLOSES the latch, so "rendered" is exactly a closed
+    # `done`, and `bind` closes it too if the renderer dies. Polling that one
+    # predicate needs no task of its own: an earlier cut spawned an `@async`
+    # waiter per boundary purely to have something to poll for completion, and
+    # that reliably blew the stack in `e2e:subagent_feed` (3/3, against 0/3
+    # without it). Waiting is not worth a task.
+    #
+    # BOUNDED, because `bind` only covers a renderer that DIED. One that is alive
+    # but not draining strands this wait forever — and `begin_turn!` waits here
+    # before it does anything else, so the chat's single `run_chat!` consumer
+    # stops: every message the user sends queues behind a turn that will never
+    # start, the spinner never clears, and stop can't reach an agent that isn't
+    # running. Observed live as a 53-minute wedge.
+    #
+    # The barrier is an ORDERING nicety (an auto-wake episode's messages persist
+    # before the turn's), so giving up on it costs store order in a case that is
+    # already broken. Blocking the chat forever costs the chat. It is normally
+    # sub-second — the wait is draining frames already in hand — so tripping this
+    # means a genuinely stuck renderer, and the warning is how we find out which.
+    if timedwait(() -> !isopen(marker.done), RENDER_BARRIER_SECONDS;
+                 pollint = 0.01) !== :ok
+        @warn "render barrier timed out — renderer alive but not draining; \
+               starting the turn anyway" project_id = chat.project_id
     end
     return nothing
 end
@@ -7336,6 +7360,32 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # it must not kill whatever turn happens to be running now.
     if cmd.seq >= 0 && cmd.seq != s.turn_seq[]
         @debug "dropping stale cancel" clicked_turn = cmd.seq current = s.turn_seq[]
+        return nothing
+    end
+
+    # Nothing to cancel means the indicator is LYING, and the honest response is
+    # to fix the indicator — not to punish the user for believing it.
+    #
+    # The stuck shape: an auto-wake episode opens `busy_active` off arriving
+    # frames, and its only end markers are a `usage_update` the agent tags with
+    # an autonomous origin (claude-agent-acp emits it conditionally, so it can
+    # simply be absent) and `begin_turn!`. When the tag never comes, the sole
+    # remaining exit is a new turn — and `busy_active` is exactly what makes the
+    # composer queue instead of send. Stop was the one control left, and it ran
+    # `drop_queued_sends!` unconditionally: it deleted the message that would
+    # have released the chat, then cancelled nothing, leaving the spinner up. No
+    # user-reachable way out; observed live as a 53-minute wedge over an agent
+    # that had been idle the whole time.
+    #
+    # So stop is also the RECONCILE: the user telling us it is not running is
+    # ground truth we can check, and `session_live` checks it. Queued messages
+    # are KEPT — the consumer is free to pick them up, which is what the user
+    # wanted when they typed them.
+    if !AgentClientProtocol.session_live(c)
+        end_autowake!(model)
+        lock(s.lock) do
+            s.busy_active[] = (s.turns_active[] > 0)
+        end
         return nothing
     end
 

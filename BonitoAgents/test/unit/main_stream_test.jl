@@ -49,6 +49,26 @@ function live_model()
     return model, cli
 end
 
+# The same chat with a renderer that is ALIVE but never drains `cli.messages`.
+# `start_main_consumer!` is deliberately NOT called, so nothing else is reading
+# the stream either — a marker put on it can only come back if someone bounds
+# the wait. Returns the gate that releases the fake renderer.
+function stalled_model()
+    state = BT.serve(; host = "127.0.0.1", port = 0, worker_secret = "x",
+                     state_dir = mktempdir(), working_dir = mktempdir())
+    agent = BT.WorkerAgent(state, "w1", "/p")
+    model = BT.ChatModel(state, mktempdir(); project_id = "proj", agent = agent)
+    conn  = ACP.Connection(IdleTransport(), ACP.DiscardHandler())
+    cli   = ACP.Client(conn, "sess", "/p")
+    agent.client = cli
+    gate  = Threads.Event()
+    task  = Base.errormonitor(@async (wait(gate); nothing))
+    lock(BT.shared(model).lock) do
+        BT.shared(model).main_consumer[] = (; task, client = cli)
+    end
+    return model, cli, gate
+end
+
 feed!(cli, u) = put!(cli.updates, u)
 
 amc(s) = ACP.AgentMessageChunk(ACP.TextContent(s))
@@ -465,6 +485,77 @@ end
     store = BT.shared(model).msgs_store
     @test count(m -> m isa BT.ToolMsg, store) == 50
     @test count(m -> m isa BT.AgentMsg, store) == 50
+    close(model)
+end
+
+# `begin_turn!` waits on this barrier before it does ANYTHING else, and the chat
+# has ONE serial `run_chat!` consumer. So an unbounded wait here is not a slow
+# turn — it is a chat that can never start another turn: every message queues
+# behind it, the spinner never clears, and stop cannot reach an agent that isn't
+# running. `bind` only covers a renderer that DIED; this covers one that is alive
+# and not draining. Seen live as a 53-minute wedge over an idle agent.
+@testset "the render barrier is bounded when the renderer stalls" begin
+    model, cli, gate = stalled_model()
+    marker = ACP.flush_main!(cli)
+    @test marker !== nothing
+    t0 = time()
+    BT.wait_rendered!(model, marker)          # must return, not hang
+    waited = time() - t0
+    @test waited >= BT.RENDER_BARRIER_SECONDS
+    @test waited < BT.RENDER_BARRIER_SECONDS + 5
+    notify(gate)
+    close(model)
+
+    # …and a renderer that IS draining is not slowed down by the bound.
+    healthy, hcli = live_model()
+    t1 = time()
+    BT.flush_main!(healthy)
+    @test time() - t1 < 2.0
+    close(healthy)
+end
+
+# Stop over a chat whose agent has ALREADY finished. The auto-wake episode
+# claimed liveness off arriving frames and its end marker (a `usage_update` the
+# agent tags with an autonomous origin) can simply be absent, leaving the only
+# other exit — `begin_turn!` — behind the very flag that makes the composer
+# queue. Stop used to drop the queued sends unconditionally: it deleted the
+# message that would have released the chat and cancelled nothing at all.
+@testset "stop reconciles a stale spinner instead of eating the message" begin
+    model, cli = live_model()
+    s = BT.shared(model)
+    feed!(cli, amc("background task finished, here's the report"))
+    BT.flush_main!(model)
+    @test s.autowake[] == true          # episode open, no prompt of ours
+    @test s.busy_active[] == true
+
+    BT.send_message!(model, BT.UserMsg("is it actually still running?"))
+    @test timedwait(() -> Base.n_avail(s.user_messages) == 1, 5.0) === :ok
+    bubble = last([m for m in s.msgs_store if m isa BT.UserMsg])
+    @test bubble.queued == true
+
+    BT.handle_command!(model, nothing, BT.CancelCommand())
+    # Nothing was live, so the spinner was the lie — that gets fixed…
+    @test s.busy_active[] == false
+    @test s.autowake[] == false
+    # …and what the user typed is still there to be sent.
+    @test Base.n_avail(s.user_messages) == 1
+    @test bubble.queued == true         # not relabelled "not sent"
+    @test (@atomic cli.conn.cancelling) == false
+    close(model)
+end
+
+# The other half: when the agent IS working, stop keeps its old teeth.
+@testset "stop still cancels and clears the queue when work is live" begin
+    model, cli = live_model()
+    s = BT.shared(model)
+    @atomic cli.conn.unprompted_work = true      # what the dispatcher sets on live work
+    @test ACP.session_live(cli) == true
+    BT.send_message!(model, BT.UserMsg("stop for real"))
+    @test timedwait(() -> Base.n_avail(s.user_messages) == 1, 5.0) === :ok
+
+    BT.handle_command!(model, nothing, BT.CancelCommand())
+    @test (@atomic cli.conn.cancelling) == true  # session/cancel went out
+    @test Base.n_avail(s.user_messages) == 0     # queue dropped, as stop means
     close(model)
 end
 
