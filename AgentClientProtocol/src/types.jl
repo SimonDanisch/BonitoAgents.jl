@@ -226,7 +226,13 @@ function parse_tool_content_item(d::AbstractDict)
 end
 
 function parse_location(d::AbstractDict)
-    ToolCallLocation(get(d, "path", ""), get(d, "line", nothing))
+    # `line` is spec'd as a scalar, but some agents send a non-scalar (a range
+    # `[start,end]`, or a malformed value). Coerce anything that isn't an integer
+    # to `nothing` instead of letting the `ToolCallLocation` constructor throw
+    # `convert(Union{Int,Nothing}, ::Vector)` — which previously surfaced as a
+    # swallowed "ACP dispatch failed" warning and dropped the whole frame.
+    line = get(d, "line", nothing)
+    ToolCallLocation(get(d, "path", ""), line isa Integer ? Int(line) : nothing)
 end
 
 # claude-agent-acp tags every tool_call(_update) with the real Claude Code

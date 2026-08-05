@@ -9,6 +9,7 @@ module BonitoWorker
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
 using Scratch: @get_scratch!
+import AgentProviders   # provider descriptors (find_provider) — the SSOT shared with the server
 
 # Per-install config directory, managed by Scratch.jl. Resolves to
 # `~/.julia/scratchspaces/<BonitoWorker-uuid>/config/` on every OS, so we get
@@ -608,7 +609,29 @@ Refuses to start if another live worker already holds the pidfile (a duplicate
 would fight it over the server's control-WS registration). Pass `force=true`
 to start anyway (e.g. you intend to replace a wedged instance you'll kill).
 """
+# Bind our lifetime to the spawning parent's (Linux only). `dev_server` sets
+# `BONITOAGENTS_DIE_WITH_PARENT` to its own PID; we then ask the kernel to SIGKILL
+# us the moment that parent dies — via `PR_SET_PDEATHSIG`, which fires even on an
+# OOM-kill / `kill -9` that skips the parent's atexit cleanup. Without this a
+# detached worker (we `setsid` to look like a real install) outlives an abnormally
+# -killed test runner and orphans its whole agent subtree → the process explosion.
+# Production leaves the var UNSET: the worker is a service meant to outlive its
+# launcher, so it stays detached.
+function _bind_lifetime_to_parent!()
+    Sys.islinux() || return nothing
+    want = tryparse(Int, get(ENV, "BONITOAGENTS_DIE_WITH_PARENT", ""))
+    want === nothing && return nothing
+    # PR_SET_PDEATHSIG (1) = SIGKILL (9).
+    ccall(:prctl, Cint, (Cint, Culong, Culong, Culong, Culong), 1, 9, 0, 0, 0)
+    # Race: pdeathsig only fires on a FUTURE parent death. If the parent already
+    # died (we've been reparented) before we set it, exit now instead of lingering.
+    ccall(:getppid, Cint, ()) == want ||
+        (@warn "BonitoWorker: spawning parent already gone; exiting"; exit(0))
+    return nothing
+end
+
 function start(; force::Bool = false)
+    _bind_lifetime_to_parent!()
     cfg = config_path()
     isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
                           "(`curl -fsSL <server-url>/install.jl | julia -`)")
@@ -703,6 +726,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             t = get(cmd, "type", "")
             if t == "open_session"
                 @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
+            elseif t == "close_session"
+                @async handle_close_session(cmd)
             elseif t == "open_transfer"
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
@@ -749,6 +774,13 @@ function report_open_session_failed(ws, sid::AbstractString, reason::AbstractStr
     return nothing
 end
 
+# Live agent subprocesses keyed by their cwd (= the server's `worker_path`, one
+# per chat). Lets a `close_session` control message reap the proc EXPLICITLY when
+# the acp dial-back ws goes half-open in a bind-vs-close race and the relay never
+# reaches its kill (see `handle_close_session`).
+const _SESSION_PROCS = Dict{String,Any}()
+const _SESSION_PROCS_LOCK = ReentrantLock()
+
 function handle_open_session(ws, server_url::String, secret::String, agent_bin::String,
                               cmd::AbstractDict;
                               agent_env::Dict{String,String} = Dict{String,String}())
@@ -762,45 +794,25 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
                           Dict{String,String}(get(cmd, "env", Dict{String,String}())))
     isempty(sid) && (@error "open_session missing sid"; return)
 
-    # Handle provider selection: the server may request a specific agent
-    # provider (e.g. "ClaudeCode", "MiMoCode", or "OpenCode"). If specified,
-    # resolve the correct binary for that provider; otherwise use the worker's
-    # default agent_bin.
-    provider_str = String(get(cmd, "provider", ""))
-    resolved_agent_bin = if !isempty(provider_str)
-        if provider_str == "MiMoCode"
-            mimo_bin = get(ENV, "MIMO_AGENT_ACP", "")
-            if isempty(mimo_bin)
-                mimo_bin_path = which_executable("mimo")
-                if mimo_bin_path === nothing
-                    mimo_path = joinpath(homedir(), ".mimocode", "bin", "mimo")
-                    mimo_bin = isfile(mimo_path) ? mimo_path : "mimo"
-                else
-                    mimo_bin = mimo_bin_path
-                end
-            end
-            mimo_bin
-        elseif provider_str == "OpenCode"
-            oc_bin = get(ENV, "OPENCODE_AGENT_ACP", "")
-            if isempty(oc_bin)
-                oc_bin_path = which_executable("opencode")
-                if oc_bin_path === nothing
-                    oc_path = joinpath(homedir(), ".opencode", "bin", "opencode")
-                    oc_bin = isfile(oc_path) ? oc_path : "opencode"
-                else
-                    oc_bin = oc_bin_path
-                end
-            end
-            oc_bin
-        elseif provider_str == "ClaudeCode"
-            agent_bin
-        else
-            @warn "BonitoWorker: unknown provider '$provider_str', falling back to default" sid
-            agent_bin
-        end
-    else
-        agent_bin
+    # Resolve the requested provider from the single AgentProviders registry — the
+    # SAME descriptors + list the server's dropdown is built from, so the two sides
+    # can't disagree. The provider arrives as a name string (a Julia type can't
+    # cross the JSON control-WS); its `bin`/`args`/`env` are resolved HERE,
+    # worker-side, so `Sys.which` runs on the machine that owns the binary. An
+    # unknown provider — or the mock when `BT_ENABLE_MOCK_AGENT` is unset — is
+    # rejected, not silently swapped for a default binary.
+    provider_str = String(get(cmd, "provider", "ClaudeCode"))
+    provider = try
+        AgentProviders.find_provider(provider_str)
+    catch e
+        return report_open_session_failed(ws, sid,
+            "unknown provider '$provider_str': $(sprint(showerror, e))")
     end
+    # Honor the worker's configured `agent_bin` for the default ClaudeCode provider
+    # (the installer points it at the local claude-agent-acp); every other provider
+    # uses the descriptor's worker-side resolved bin.
+    resolved_agent_bin = (provider_str == "ClaudeCode" && !isempty(agent_bin)) ?
+        agent_bin : provider.bin
 
     # Create the working dir if missing. A failure here (permissions, a file in
     # the way) is fatal for this session — narrow the catch to filesystem errors,
@@ -823,25 +835,18 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     # reachable. The server cannot reliably guess its own outward URL (see
     # `Bonito.online_url` behavior under `proxy_url="."`), so it stays out of
     # the URL-naming business.
-    # Provider-specific env: Claude uses CLAUDE_* vars, MiMo/OpenCode use their own.
-    provider_env = if provider_str == "ClaudeCode"
-        Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
-             "CLAUDE_MAX_TURNS"       => "100")
-    else
-        # MiMo and OpenCode don't need CLAUDE_* env vars
-        Dict{String,String}()
-    end
+    # Provider-specific env (e.g. Claude's CLAUDE_* vars) comes from the descriptor;
+    # the worker layers live ENV under it and the server-url on top. Live ENV stays
+    # the base so the agent inherits PATH etc.; `provider.env` and the per-session
+    # overrides win.
     env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
-                provider_env,
+                provider.env,
                 Dict("BONITOAGENTS_SERVER_URL"  => server_url),
                 env_overrides)
 
-    # `mimo`/`opencode` are multi-command CLIs whose ACP server lives under the
-    # `acp` subcommand; the bare binary launches their TUI and never speaks ACP
-    # (the `initialize` handshake would hang). `claude-agent-acp` speaks ACP
-    # directly, so it takes no subcommand.
-    agent_args = (provider_str == "MiMoCode" || provider_str == "OpenCode") ?
-        String["acp"] : String[]
+    # `provider.args` carries any required subcommand (e.g. `["acp"]` for
+    # mimo/opencode, whose ACP server lives under that subcommand).
+    agent_args = provider.args
     proc = try
         open(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd), "r+")
     catch e
@@ -849,6 +854,10 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
             "failed to spawn agent ($resolved_agent_bin $(join(agent_args, ' '))): $(sprint(showerror, e))")
     end
     @info "BonitoWorker: ACP session started" sid cwd pid=getpid() provider=provider_str
+    # Register the proc BEFORE the acp dial-back so a `close_session` (server's
+    # reliable reap over the control ws) can always find it, even if the dial /
+    # ack races with the server tearing the session down.
+    lock(_SESSION_PROCS_LOCK) do; _SESSION_PROCS[cwd] = proc end
 
     acp_url = ws_url(server_url, "/worker-acp")
     # Outer try/finally guarantees the agent process is reaped on EVERY exit
@@ -881,6 +890,11 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         # errors are reported too; harmless if the session already came up.
         report_open_session_failed(ws, sid, "ACP session error: $(sprint(showerror, e))")
     finally
+        # Deregister (only if still us — a fast reopen on the same cwd may have
+        # replaced the entry) so a late close_session can't kill a newer session.
+        lock(_SESSION_PROCS_LOCK) do
+            get(_SESSION_PROCS, cwd, nothing) === proc && delete!(_SESSION_PROCS, cwd)
+        end
         # Backstop reap: covers the paths the inner finally never reaches — dial
         # failure, rejected ack, or any throw before the relays start. Idempotent
         # with the inner kill (kill of an already-dead proc is a no-op).
@@ -889,12 +903,39 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     @info "BonitoWorker: ACP session ended" sid cwd
 end
 
+# Explicit reap requested by the server (stop_session! on a closed/evicted chat).
+# The normal teardown is the acp dial-back ws closing → the relay's finally kills
+# the proc. But if a bind raced with the close, that ws can be half-open — the
+# relay blocks in `receive` and never reaps. Killing the proc here closes its
+# stdin (the agent exits on EOF) and unblocks the relay. Idempotent: a no-op if
+# the session already tore down (entry gone) or the proc is already dead.
+function handle_close_session(cmd)
+    cwd = String(get(cmd, "cwd", ""))
+    isempty(cwd) && return
+    proc = lock(_SESSION_PROCS_LOCK) do; get(_SESSION_PROCS, cwd, nothing) end
+    proc === nothing && return
+    @info "BonitoWorker: close_session — reaping agent" cwd
+    kill_proc!(proc)
+end
+
 # Kill + close an agent process, tolerating an already-dead/closed one.
 function kill_proc!(proc)
+    # Gate on the OS PROCESS state, not `isopen(proc)` — `isopen` tracks the IO
+    # streams, and a relay that already ran `close(proc.in)` flips it false while
+    # the agent is still alive. The old `isopen(proc) && kill` then SKIPPED the
+    # kill and orphaned the subprocess (the leak_cycle straggler). SIGTERM for a
+    # clean exit, then SIGKILL as a guaranteed backstop: an agent reaped mid-start
+    # (still precompiling, or with its stdio already shut so it never sees the
+    # stdin-EOF) can outlive SIGTERM.
     try
-        isopen(proc) && kill(proc)
+        process_running(proc) && kill(proc)
     catch e
-        @warn "BonitoWorker: kill failed" exception=e
+        e isa Base.IOError || @warn "BonitoWorker: SIGTERM failed" exception=e
+    end
+    try
+        process_running(proc) && kill(proc, Base.SIGKILL)
+    catch e
+        e isa Base.IOError || @warn "BonitoWorker: SIGKILL failed" exception=e
     end
     try
         close(proc)
@@ -1497,6 +1538,17 @@ function relay_proc_to_ws(proc, ws)
         e isa Base.IOError              && return
         WebSockets.isclosed(ws)         && return
         @warn "BonitoWorker proc→ws relay error" exception=e
+    finally
+        # The agent produced no more output — it EXITED (e.g. crashed mid-turn, or
+        # was reaped on a normal close). Close the dial-back WS so the SERVER's ACP
+        # reader sees EOF and flips the session dead (header restart button),
+        # instead of hanging forever on a `session/prompt` response that will never
+        # arrive. Best-effort + idempotent: on a normal close the ws is already
+        # going down; the handler still reaps `proc` either way.
+        try
+            WebSockets.isclosed(ws) || close(ws)
+        catch
+        end
     end
 end
 

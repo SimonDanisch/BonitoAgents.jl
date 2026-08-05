@@ -145,9 +145,9 @@ mutable struct ChatModel
     taskbar_clock::Observable{Float64}
     taskbar_clock_on::Base.RefValue{Bool}
 
-    # Current agent KIND for this chat (a concrete BinAgent type, e.g.
-    # `ClaudeCodeAgent`). Observable so the UI provider-switcher can react. For
-    # a `WorkerAgent` this is `agent.kind`; for a `BinAgent` it's `typeof(agent)`.
+    # Current provider for this chat — the singleton descriptor the worker spawns
+    # (a `BinAgent`, e.g. the `ClaudeCodeAgent` singleton). Observable so the UI
+    # provider-switcher can react.
     provider::Observable{Any}
 
     # Pending permission / question asks for THIS chat: request key → (reply
@@ -165,10 +165,9 @@ mutable struct ChatModel
     tool_cache_order::Vector{String}
 end
 
-# The agent KIND tracked by the `provider` observable: for a worker session
-# it's the provider the worker spawns, for a local one it's the agent's own type.
-agent_kind(a::WorkerAgent) = a.kind
-agent_kind(a::BinAgent)    = typeof(a)
+# The provider tracked by the `provider` observable: the singleton descriptor the
+# worker spawns for this chat.
+agent_kind(a::WorkerAgent) = a.provider
 
 function ChatModel(state::ServerState, cwd::AbstractString;
     project_id::AbstractString="",
@@ -177,12 +176,12 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     chat_dir = chat_storage_dir(state, project_id, cwd)
     chat_session = load_session(chat_dir, cwd)
     msgs_store = load_history(chat_session)
-    # Default: a local Claude agent spawned on the server box. A caller (the
-    # dashboard) hands a `WorkerAgent` for remote sessions.
-    actual_agent = agent === nothing ?
-                   ClaudeCodeAgent(; cwd = String(cwd),
-                                   mcp = collect(AgentClientProtocol.MCPServer, mcp_servers)) :
-                   agent
+    # Every chat runs on a worker: the dashboard hands a `WorkerAgent`. There is
+    # no local/in-process agent fallback anymore — a chat cannot exist without a
+    # worker, so a missing agent is a programming error, not a silent default.
+    agent === nothing &&
+        error("ChatModel requires an agent (a WorkerAgent); none was provided")
+    actual_agent = agent
     busy_active = Observable(false)
     # Wire busy_active → sidebar status LED: a prompt going in-flight (or
     # finishing) flips chat_status, which the sidebar wants to know about
@@ -1492,8 +1491,21 @@ end
 # whose fetch outlived that window (or whose node was off-window at swap
 # time) kept its spinner forever; only a manual re-render, by then on the
 # isfile fast path, showed it.
-Bonito.jsrender(session::Bonito.Session, st::ShowTool) =
-    Bonito.jsrender(session, render_show_file(st))
+# A file that can't be fetched/rendered (missing on the worker, transfer
+# failed, unreadable) must degrade to a visible, self-contained error node —
+# NOT throw out of `jsrender`, where Bonito's generic `handle_render_error`
+# would swap in its own opaque placeholder (and the bt_show body would never
+# carry the `.bt-tool-error` the UI/tests key on).
+function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
+    body = try
+        render_show_file(st)
+    catch e
+        @warn "bt_show: could not render file" path = st.path exception = (e, catch_backtrace())
+        DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
+            class = "bt-tool-error")
+    end
+    return Bonito.jsrender(session, body)
+end
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
 # project tree map straight onto the server mirror (cwd ⟷ worker_path); an
@@ -1561,17 +1573,94 @@ const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
     ".ogg" => "video/ogg", ".mov" => "video/quicktime")
 const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
 
-function render_show_file(st::ShowTool)
-    path = fetch_show_file(st)
-    ext = lowercase(splitext(path)[2])
-    if ext in SHOW_IMAGE_EXTS
-        return DOM.img(src=Bonito.Asset(path),
-            style=Styles("max-width" => "100%", "display" => "block"))
-    elseif haskey(SHOW_VIDEO_MIME, ext)
-        return DOM.video(DOM.source(src=Bonito.Asset(path), type=SHOW_VIDEO_MIME[ext]);
-            controls=true,
-            style=Styles("max-width" => "100%", "display" => "block"))
+# Click-to-enlarge. Clones the media into a fullscreen overlay (Esc or backdrop
+# click closes). Self-contained so there's no global-JS dependency or load-order
+# coupling; shared by bt_show previews and inline Read-tool images.
+const LIGHTBOX_OPEN_JS = js"""
+event => {
+    event.stopPropagation();
+    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const media = wrap && wrap.querySelector('.bt-media');
+    if (!media) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'bt-lightbox-overlay';
+    const big = media.cloneNode(true);
+    big.classList.add('bt-lightbox-media');
+    if (big.tagName === 'VIDEO') { big.controls = true; big.autoplay = true; }
+    overlay.appendChild(big);
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
+    const onkey = e => { if (e.key === 'Escape') close(); };
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', onkey);
+    document.body.appendChild(overlay);
+}
+"""
+
+# A media element (image / video) with click-to-enlarge. `src` can be a streamed
+# proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
+# an <img>/<video> src. `mime` only matters for the <video><source> type. Images
+# enlarge on click; videos keep native controls for clicks and enlarge via the ⤢
+# button (so a frame click still plays/pauses).
+function media_element(src, mime::AbstractString, is_video::Bool)
+    inner = is_video ?
+        DOM.video(DOM.source(; src, type = mime); controls = true, class = "bt-media",
+            style = Styles("max-width" => "100%", "display" => "block")) :
+        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS,
+            style = Styles("max-width" => "100%", "display" => "block", "cursor" => "zoom-in"))
+    return DOM.div(inner,
+        DOM.button("⤢"; class = "bt-media-enlarge", type = "button",
+            title = "Enlarge", onclick = LIGHTBOX_OPEN_JS);
+        class = "bt-media-wrap")
+end
+
+# Source for a worker media file: a streamed proxied-asset url when the worker
+# bridge is live (range reads on demand, no whole-file copy), else the
+# copy-then-serve local Asset fallback (e.g. a reloaded chat with no live worker).
+function show_media_src(st::ShowTool)
+    eb = eval_bridge_for(st.state, st.project_id)
+    if eb !== nothing
+        proj = get(st.state.projects[], st.project_id, nothing)
+        worker_src = (isabspath(st.path) || proj === nothing) ? st.path :
+            joinpath(proj.worker_path, st.path)
+        try
+            return worker_asset_url(eb, worker_src)
+        catch e
+            @warn "bt_show: stream via bridge failed; copying instead" exception = (e, catch_backtrace()) path = st.path
+        end
     end
+    return Bonito.Asset(fetch_show_file(st))
+end
+
+# Not every ToolMsg subtype carries `raw_input` (Bash/Task/BonitoApp don't).
+tool_raw_input(m) = hasproperty(m, :raw_input) ? m.raw_input : Dict{String,Any}()
+
+# Inline image from a tool result (e.g. Read on a PNG ships an ACP ImageContent).
+# Stream it from the worker when we can resolve a file path + live bridge (so big
+# images don't ride as base64 through chat history); else fall back to the ACP
+# base64 the agent sent. Either way it gets the lightbox via `media_element`.
+function read_image_element(state::ServerState, project_id::AbstractString,
+                            m::ToolMsg, c::ImageContent)
+    fp = get(tool_raw_input(m), "file_path", nothing)
+    eb = isempty(project_id) ? nothing : eval_bridge_for(state, project_id)
+    if fp !== nothing && eb !== nothing
+        try
+            return media_element(worker_asset_url(eb, String(fp)), c.mime_type, false)
+        catch e
+            @warn "read image: stream via bridge failed; inlining base64" exception = (e, catch_backtrace())
+        end
+    end
+    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, false)
+end
+
+function render_show_file(st::ShowTool)
+    ext = lowercase(splitext(st.path)[2])
+    if ext in SHOW_IMAGE_EXTS
+        return media_element(show_media_src(st), "", false)
+    elseif haskey(SHOW_VIDEO_MIME, ext)
+        return media_element(show_media_src(st), SHOW_VIDEO_MIME[ext], true)
+    end
+    # Non-media: the bytes have to be on the server (Monaco / caption read them).
+    path = fetch_show_file(st)
     # Any non-binary file Monaco can show — known text extensions,
     # extensionless (Makefile, LICENSE), unknown extensions. Size-capped
     # like the editor, and NUL-sniffed so a mislabeled binary degrades to
@@ -1773,8 +1862,7 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
         elseif c isa DiffContent
             push!(parts, render_diff_block(c))
         elseif c isa ImageContent
-            push!(parts, DOM.img(src="data:$(c.mime_type);base64,$(c.data)",
-                style=Styles("max-width" => "100%")))
+            push!(parts, read_image_element(state, project_id, m, c))
         end
     end
     isempty(parts) && return DOM.div("(empty)", class="bt-tool-empty")
@@ -1947,9 +2035,27 @@ const MARKDOWN_LOCK = ReentrantLock()
 # is GitHub-style and already loaded into the shell) handles tables, code
 # blocks, lists, etc. — we don't have to duplicate the styling.
 markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
-    "<div class=\"markdown-body\">" *
-    sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text)))) *
-    "</div>"
+    inner = try
+        sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text))))
+    catch e
+        # We re-render on every streamed chunk, so the parser is routinely handed
+        # half-formed markdown — it must not be able to break message rendering.
+        # The one known failure is CommonMark's GFM table rule: a separator row
+        # that starts with `|` and is all `|-: ` passes its permissive
+        # `valid_table_spec`, but `parse_table_spec` (which needs `|dashes|`)
+        # returns an empty column spec, so `inline_modifier` indexes `spec[0]` →
+        # BoundsError. A streamed table trips exactly that on its way to `|---|`
+        # (`|`, `|-`, `| |`, …). Catch ONLY that and show the text verbatim
+        # (escaped, line breaks kept) — this preserves the content (tightening
+        # `valid_table_spec` instead makes CommonMark drop the header line) and
+        # the next chunk re-renders cleanly. Anything else is an unexpected bug
+        # and must surface, so rethrow. @debug not @warn: it fires per streamed
+        # partial, and warning would just reproduce the log flood it prevents.
+        e isa BoundsError || rethrow()
+        @debug "markdown_html: CommonMark BoundsError; showing text verbatim" exception = (e, catch_backtrace())
+        replace(esc_html(String(text)), "\n" => "<br>")
+    end
+    "<div class=\"markdown-body\">" * inner * "</div>"
 end
 
 # "new message" event. Streaming-open shape for agent/thought (seeded with the
@@ -2808,9 +2914,25 @@ end
 # for `drain_turn!`, or `nothing` when there's no client.
 function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     promote_queued_user_bubble!(chat)
-    cli = client(chat.agent)
-    cli === nothing && return nothing
     s = shared(chat)
+    # A turn can still be drained from the channel AFTER the chat is closed:
+    # `close(::ChatModel)` shuts `user_messages`, but the consumer keeps draining
+    # whatever was already buffered (a `for … in channel` finishes the buffer
+    # before exiting). Lazily binding here would spawn an agent + an LRU entry
+    # for a session that's already gone — an orphaned MockACP subprocess (the
+    # leak_cycle CI flake) and a stale `bound_lru` entry that never clears. The
+    # bind_lock can't catch this: the turn fires entirely AFTER stop_session!.
+    isopen(s.user_messages) || return nothing
+    cli = client(chat.agent)
+    if cli === nothing
+        try
+            start_chat_client!(chat)   # LAZY ACP: bind the agent on the first turn
+        catch e
+            @error "lazy ACP bind failed" project_id = chat.project_id exception = (e, catch_backtrace())
+        end
+        cli = client(chat.agent)
+    end
+    cli === nothing && return nothing
     lock(() -> s.turns_active[] += 1, s.lock)
     s.last_stream_at[] = time()
     s.busy_active[] || (s.busy_active[] = true)
@@ -3188,6 +3310,51 @@ function handle_elicitation_request(chat::ChatModel, params)
 end
 
 # ── Client lifecycle ───────────────────────────────────────────────────────
+
+# At most this many chats keep a live agent (ACP subprocess) at once. Lazy ACP
+# already means only chats you've MESSAGED bind; this caps even that so a server
+# can't accumulate unbounded agent processes. Generous — the rest still open
+# instantly and show history from disk.
+const BIND_CAP = 8
+
+# Record that `pid`'s agent just bound (MRU) and keep at most BIND_CAP agents
+# alive: when we exceed it, fully CLOSE the oldest IDLE session (`stop_session!`
+# reaps its agent + drops the model). With lazy ACP a re-open rebuilds the chat
+# from its on-disk history and re-binds on the next turn — and the fresh
+# ChatModel/agent avoids reusing one agent's `ws` Ref across generations.
+function note_bound!(state::ServerState, pid::AbstractString)
+    isempty(pid) && return nothing
+    victim_pid = lock(state.lock) do
+        # If the chat was closed (removed from chat_models) before this bind's
+        # note_bound! landed — a turn buffered past close that still lazily
+        # bound — don't (re)enter it into the LRU. stop_session! already pruned
+        # the pid under THIS lock; re-adding it here leaks a dead entry that
+        # nothing ever filters out again (the leak_cycle bound_lru leak).
+        haskey(state.chat_models, pid) || return ""
+        lru = state.bound_lru
+        filter!(!=(pid), lru)
+        push!(lru, pid)                       # most-recently-bound last
+        length(lru) <= BIND_CAP && return ""
+        for i in eachindex(lru)
+            cand = lru[i]
+            cand == pid && continue           # never evict the one we just bound
+            m = get(state.chat_models, cand, nothing)
+            m === nothing && (deleteat!(lru, i); return "")   # stale entry
+            shared(m).busy_active[] && continue               # don't cut a chat off mid-turn
+            return cand
+        end
+        return ""                             # everyone's busy — let it ride once
+    end
+    if !isempty(victim_pid)
+        p = get(state.projects[], victim_pid, nothing)
+        if p !== nothing
+            @info "LRU: closing idle chat to cap live agents" pid = victim_pid cap = BIND_CAP
+            stop_session!(state, p)           # reaps the agent + prunes bound_lru
+        end
+    end
+    return nothing
+end
+
 function start_chat_client!(model::ChatModel)
     # fs/* RPCs delegate to the stock FSRequestHandler; permission requests
     # render as interactive cards (see ChatPermissionHandler above).
@@ -3258,28 +3425,25 @@ function start_chat_client!(model::ChatModel)
     # Recording it makes the thread dedup/resume machinery (thread_dedup_key,
     # find_thread, the browser's imported-session hide) all agree on one chat.
     record_bound_session!(model, new_session_id)
+    shared(model).session_alive[] = true
+    note_bound!(model.state, model.project_id)
+    return nothing
+end
 
-    # Start the single consumer loop ONCE (it survives restarts, which only
-    # swap `client[]`). Runs on the shared parent so all per-session views and
-    # producers feed the one queue / one consumer.
+# Make a chat LIVE for VIEWING — cache it, start its consumer + poller — WITHOUT
+# binding an agent (the ACP subprocess is spawned lazily on the first turn).
+function register_chat_model!(model::ChatModel)
     s = shared(model)
     if s.consumer_task[] === nothing
         s.consumer_task[] = Base.errormonitor(@async run_chat!(s))
     end
-    # And the per-chat background-output poller (one task that ticks every
-    # second, walks THIS chat's live `BashToolMsg`s with `bg_running=true`).
-    # Idempotent: re-calls on restart find the existing task still alive and
-    # do nothing. The task ends when the chat closes.
     start_background_poller!(model.state, s)
-
-    # Cache the live model so the sidebar can swap to this chat instantly and
-    # test rigs can drive prompts via state.chat_models[pid] without the UI.
     if !isempty(model.project_id)
-        @info "registering chat model" project_id = model.project_id session_id = client(model.agent).session_id
+        @info "registering chat model" project_id = model.project_id
         lock(model.state.lock) do
             model.state.chat_models[model.project_id] = model
         end
-        notify_chats!(model.state)   # surface in the active-chats sidebar
+        notify_chats!(model.state)
     end
     return nothing
 end
@@ -3500,13 +3664,13 @@ end
 function record_bound_session!(model::ChatModel, session_id::AbstractString)
     pid = model.project_id
     (isempty(pid) || isempty(session_id)) && return
-    # Only persist a CLAUDE session id. The provider isn't persisted across server
-    # restarts (it resets to ClaudeCode by design), so recording e.g. a MiMo
-    # session id would make the next ClaudeCode bring-up `session/load` a session
-    # it never created — the exact error `switch_provider!` clears the id to
-    # avoid. Claude sessions are also the only ones the worker's discover scan
-    # surfaces, so this is exactly the set the thread dedup/resume needs.
-    agent_kind(model.agent) === ClaudeCodeAgent || return
+    # Only persist a session id for providers that support claude-style
+    # `session/load` re-attach (ClaudeCode, and the mock which mimics it).
+    # Recording e.g. a MiMo session id would make the next bring-up `session/load`
+    # a session that provider never created — the exact error `switch_provider!`
+    # clears the id to avoid. Claude sessions are also the only ones the worker's
+    # discover scan surfaces, so this is exactly the set thread dedup/resume needs.
+    resumable_session(agent_kind(model.agent)) || return
     haskey(model.state.projects[], pid) || return
     p = model.state.projects[][pid]
     p.resume_session_id == session_id && return
@@ -3873,6 +4037,14 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     state = model.state
     project_id = model.project_id
     cwd = model.cwd
+    # The folder shown to the user is the project's path ON THE WORKER — where the
+    # agent and `bt_julia_eval` actually run, and the same path the projects scan
+    # list shows (`ProjectInfo.worker_path`). `model.cwd` is the server-side mirror
+    # under the state dir (`/…/state/working/<worker>-<name>`), which is
+    # meaningless to the user. Fall back to `cwd` only when there's no project yet.
+    project_now = isempty(project_id) ? nothing : get(state.projects[], project_id, nothing)
+    worker_dir = (project_now === nothing || isempty(project_now.worker_path)) ?
+        cwd : project_now.worker_path
 
     status_dot = map(model.session_alive) do alive
         DOM.span(""; class=alive ? "bt-dot bt-dot-online" : "bt-dot bt-dot-offline",
@@ -3902,12 +4074,12 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
     title_node = if isempty(project_id)
-        DOM.div(DOM.span(fallback_title; title=cwd), class="bt-header-title")
+        DOM.div(DOM.span(fallback_title; title=worker_dir), class="bt-header-title")
     else
         DOM.input(; type = "text",
             class = "bt-header-title bt-header-title-edit",
             value = title_val,
-            title = "Chat title — click to edit · folder: $cwd",
+            title = "Chat title — click to edit · folder: $worker_dir",
             onchange  = js"event => $(title_edit).notify(event.target.value)",
             onkeydown = js"""event => {
                 if (event.key === 'Enter') { event.target.blur(); }
@@ -3917,6 +4089,12 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 }
             }""")
     end
+
+    # Project environment this chat's eval sessions run in (the Project.toml /
+    # working dir). A muted monospace sub-line under the title row so each tab
+    # makes its env unmistakable. Home-contracted for readability; full path on
+    # hover.
+    env_line = DOM.div(replace(worker_dir, homedir() => "~"); class="bt-header-env", title=worker_dir)
 
     # Session config (model / mode / effort …) as a plain-text second header
     # line; re-renders whenever the agent reports a change (bring-up,
@@ -4023,8 +4201,18 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # reads "Restarting…" so the click is acknowledged synchronously.
     restart_status = Observable("")
     restart_label  = map(s -> isempty(s) ? "Restart" : s, restart_status)
-    restart_class  = map(model.session_alive) do alive
-        alive ? "bt-header-restart" : "bt-header-restart bt-header-restart-dead"
+    restart_class  = map(model.session_alive, restart_status) do alive, status
+        # While a restart is running show the "working" state — NOT the red dead
+        # pulse — so the button reads as busy, not as a clickable failure. The
+        # handler also ignores clicks during a restart, but dropping the dead look
+        # is what stops a user (or an impatient poll) from trying to click again.
+        if status == "Restarting…"
+            "bt-header-restart bt-header-restart-busy"
+        elseif alive
+            "bt-header-restart"
+        else
+            "bt-header-restart bt-header-restart-dead"
+        end
     end
     restart_title  = map(model.session_alive, model.last_error) do alive, err
         alive  && return "Stop and respawn the agent process for this chat"
@@ -4037,6 +4225,13 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         onclick = js"event => $(restart_status).notify('__click__')")
     on(session, restart_status) do s
         s == "__click__" || return
+        # The dead-state button stays clickable through the seconds-long bring-up,
+        # so a quick second click (or an e2e poller that re-clicks until the dead
+        # class clears) would otherwise bump the restart generation and trigger a
+        # redundant second bring-up — which tears down the just-revived session and
+        # drops the next prompt. Ignore a click while a restart is already running.
+        sh = shared(model)
+        lock(() -> sh.restart_inflight[], sh.restart_lock) && return
         restart_status[] = "Restarting…"
         @async begin
             try
@@ -4063,32 +4258,34 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # as a bare, always-on attribute, which would select every option).
     provider_status = Observable("")
     provider_choice = Observable("")
-    # Each menu entry is an agent KIND (a concrete BinAgent type). The <option>
-    # value is its stable `provider_name` ("ClaudeCode", …); the label is its
-    # `label`. `cur` is the current kind type held by `model.provider`.
-    provider_opt(kind, cur) = DOM.option(label(kind());
-        (kind === cur ? (; value = provider_name(kind()), selected = true) :
-                        (; value = provider_name(kind())))...)
+    # Each menu entry is a provider singleton (a `BinAgent` descriptor). The
+    # <option> value is its stable `provider_name` ("ClaudeCode", …); the label is
+    # its `label`. `cur` is the current provider held by `model.provider`. The set
+    # offered is `current_providers()` — the mock appears only when its env is set.
+    provider_opt(p, cur) = DOM.option(label(p);
+        (p === cur ? (; value = provider_name(p), selected = true) :
+                     (; value = provider_name(p)))...)
     provider_select = map(session, model.provider) do cur
         DOM.select(
-            (provider_opt(kind, cur) for kind in AGENT_KINDS)...;
+            (provider_opt(p, cur) for p in current_providers())...;
             class = "bt-header-provider-select",
             title = "Switch AI agent backend",
             onchange = js"event => $(provider_choice).notify(event.target.value)")
     end
     on(session, provider_choice) do val
         isempty(val) && return
-        # Resolve the wire name back to the agent kind (default Claude).
-        new_kind = something(
-            findfirst(k -> provider_name(k()) == val, AGENT_KINDS),
-            nothing)
-        new_kind = new_kind === nothing ? ClaudeCodeAgent : AGENT_KINDS[new_kind]
+        # Resolve the wire name back to the provider singleton (default Claude).
+        new_provider = try
+            find_provider(val)
+        catch
+            find_provider("ClaudeCode")
+        end
         current = model.provider[]
-        new_kind === current && return
-        provider_status[] = "Switching to $(label(new_kind()))…"
+        new_provider === current && return
+        provider_status[] = "Switching to $(label(new_provider))…"
         @async begin
             try
-                switch_provider!(model, new_kind)
+                switch_provider!(model, new_provider)
                 # `switch_provider!` → `restart_chat_session!` swallows bring-up
                 # errors (sets `last_error`, keeps the chat object alive), so a
                 # failed switch returns normally. Surface it from the resulting
@@ -4126,6 +4323,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 restart_button;
                 class="bt-header-actions"),
             class="bt-header-row"),
+        env_line,
         # Lens search bar — always visible. JS (`_setupLens`) builds the input
         # + autocomplete + saved-lens chips inside it and wires it to `comm`.
         DOM.div(class="bt-lens-bar");
@@ -4135,51 +4333,38 @@ end
 # ── Provider switching ────────────────────────────────────────────────────────
 
 """
-    switch_provider!(model::ChatModel, new_kind::Type{<:BinAgent})
+    switch_provider!(model::ChatModel, new_provider::BinAgent)
 
 Switch the agent backend for a chat. This:
 1. Updates the provider observable
-2. Swaps the live agent INSTANCE to one running `new_kind` (preserving the
-   chat's cwd / handler / mcp / project context)
+2. Points the live `WorkerAgent` at `new_provider` (the worker spawns it on the
+   next bring-up; the chat's cwd / mcp / project context are preserved)
 3. Restarts the session with the new backend
 
 The provider choice is NOT persisted across server restarts — it resets
 to ClaudeCode on construction. This is by design: providers may not be
 available on all machines, so a hard-coded preference would break.
 """
-function switch_provider!(model::ChatModel, new_kind::Type{<:BinAgent})
+function switch_provider!(model::ChatModel, new_provider::BinAgent)
     s = shared(model)
-    s.provider[] = new_kind
+    s.provider[] = new_provider
     # Drop the previous provider's session config (model/mode pills) right away:
     # otherwise the header keeps showing e.g. Claude's model list while we bring
     # up MiMo, which reads as "switched, but the model picker is still Claude's".
     # `start_chat_client!` repopulates it from the new session's config.
     s.session_meta[] = Any[]
 
-    old = s.agent
-    if old isa WorkerAgent
-        # WorkerAgent: keep the worker wiring, change only WHICH provider it
-        # spawns. A switch must start a FRESH session: `resume_session_id` is the
-        # OLD provider's session id (e.g. a claude-agent-acp UUID). Asking MiMo to
-        # `session/load` a session it never created errors ("Internal error") and
-        # the restart fails — leaving the chat dead with no model picker. Clearing
-        # it routes start! through `session/new`; the chat's history is fed
-        # forward to the new agent as a one-shot prelude (see `arm_history_replay!`
-        # in start_chat_client!).
-        old.kind = new_kind
-        old.resume_session_id = nothing
-    else
-        # Local agent: a switch builds a FRESH instance of the new kind, so the
-        # old agent is orphaned — `restart_chat_session!` below `stop!`s the NEW
-        # `model.agent`, never `old`. Tear the old session down explicitly first or
-        # its subprocess leaks. `stop!` is idempotent + total; its config fields
-        # (`cwd`/`handler`) stay readable afterward.
-        stop!(old)
-        s.agent = new_agent(new_kind;
-            cwd = agent_cwd(old),
-            handler = old.handler,
-            mcp = s.mcp_servers)
-    end
+    # Every chat's agent is a `WorkerAgent`: keep the worker wiring, change only
+    # WHICH provider it spawns. A switch must start a FRESH session:
+    # `resume_session_id` is the OLD provider's session id (e.g. a
+    # claude-agent-acp UUID). Asking MiMo to `session/load` a session it never
+    # created errors ("Internal error") and the restart fails — leaving the chat
+    # dead with no model picker. Clearing it routes start! through `session/new`;
+    # the chat's history is fed forward to the new agent as a one-shot prelude
+    # (see `arm_history_replay!` in start_chat_client!).
+    old = s.agent::WorkerAgent
+    old.provider = new_provider
+    old.resume_session_id = nothing
 
     # Restart the session with the new provider
     restart_chat_session!(model)

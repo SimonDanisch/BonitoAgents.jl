@@ -12,7 +12,7 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
-const APP_ENV = abspath(joinpath(@__DIR__, "..", ".."))
+const APP_ENV = abspath(joinpath(@__DIR__, "..", "appenv"))
 
 # Each "app N" prompt renders a distinct, uniquely-marked live Bonito app.
 function agent_script(prompt::AbstractString)

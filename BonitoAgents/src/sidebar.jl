@@ -336,8 +336,13 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                                  active = active_pid == p.id, closeable = true,
                                  status = st)
             push!(entries,
-                  DOM.div(item, DOM.div(tree; class = "bt-side-tree-wrap"), hint;
-                          class = "bt-side-chat"))
+                  DOM.div(
+                      # `hint` lives INSIDE the row wrapper (not the outer chat
+                      # box) so its absolute bottom-right anchor is the ROW —
+                      # it stays put when the tree expands below it.
+                      DOM.div(item, hint; class = "bt-side-chat-row"),
+                      DOM.div(tree; class = "bt-side-tree-wrap");
+                      class = "bt-side-chat"))
         end
         isempty(open_projs) && push!(entries,
             DOM.div("No open chats yet — open one from the dashboard.";
@@ -496,14 +501,17 @@ const SidebarStyles = Bonito.Styles(
         "border-right" => "1px solid var(--bt-border)",
         "overflow-y" => "auto", "overflow-x" => "hidden",
         "display" => "flex", "flex-direction" => "column",
-        "padding" => "10px 0"),
+        # Small top padding so the first item (Home) rides up near the
+        # main-panel logo's line instead of sitting ~20px below it. The
+        # collapse rail below adds the rest of the offset.
+        "padding" => "4px 0 10px"),
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
     # Header rail: holds the VSCode-style sidebar toggle. Right-aligned when
     # expanded, centered when collapsed.
     CSS(".bt-side-header",
         "display" => "flex", "align-items" => "center", "justify-content" => "flex-end",
-        "padding" => "0 8px 6px", "flex-shrink" => "0"),
+        "padding" => "0 8px 2px", "flex-shrink" => "0"),
     CSS(".bt-side-collapse",
         "display" => "inline-flex", "align-items" => "center", "justify-content" => "center",
         "width" => "28px", "height" => "28px", "padding" => "0",
@@ -630,38 +638,37 @@ const SidebarStyles = Bonito.Styles(
     # ── Per-chat file tree ──────────────────────────────────────────────────
     # The chat row and its file tree share ONE pill: opening flips
     # `.bt-tree-open`, which tints the whole wrapper so the tree visibly belongs
-    # to the chat above it. `position: relative` anchors the bottom hint.
+    # to the chat above it.
     CSS(".bt-side-chat",
         "display" => "flex", "flex-direction" => "column",
-        "position" => "relative",
         "border-radius" => "var(--bt-radius-sm)",
         "transition" => "background 80ms"),
     CSS(".bt-side-chat.bt-tree-open",
-        "background" => "var(--bt-surface-2)", "padding-bottom" => "22px"),
-    # Expand/collapse affordance: a small "chip" button centered on the BOTTOM
-    # edge of the pill (absolute, so it never steals the title's width or reflows
-    # the list). Hidden until the chat is hovered; ALWAYS shown while open so the
-    # collapse control is obvious.
+        "background" => "var(--bt-surface-2)"),
+    # The row wrapper anchors the files affordance: `position: relative` here
+    # (NOT on the whole chat box) keeps the hint pinned to the ROW's bottom-right,
+    # so it stays in place when the tree expands below.
+    CSS(".bt-side-chat-row", "position" => "relative"),
+    # Files affordance: a minimal icon+label tucked into the row's bottom-right
+    # corner — no chip border / shadow / pill rounding, just text. Hidden until
+    # the chat is hovered; ALWAYS shown while open so the collapse control stays
+    # obvious.
     CSS(".bt-side-tree-hint",
-        "position" => "absolute", "left" => "50%", "bottom" => "3px",
-        "transform" => "translateX(-50%)",
-        "display" => "flex", "align-items" => "center", "gap" => "4px",
-        "padding" => "2px 9px",
-        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.25",
+        "position" => "absolute", "right" => "6px", "bottom" => "3px",
+        "display" => "flex", "align-items" => "center", "gap" => "3px",
+        "padding" => "0 2px",
+        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.2",
         "white-space" => "nowrap",
         "color" => "var(--bt-text-muted)",
-        "background" => "var(--bt-surface)",
-        "border" => "1px solid var(--bt-border)", "border-radius" => "10px",
-        "box-shadow" => "0 1px 3px rgba(15,23,42,0.12)",
+        "border-radius" => "var(--bt-radius-sm)",
         "cursor" => "pointer", "user-select" => "none",
         "opacity" => "0", "pointer-events" => "none",
-        "transition" => "opacity 100ms, color 100ms, border-color 100ms, background 100ms"),
-    CSS(".bt-side-chat:hover > .bt-side-tree-hint, .bt-side-chat.bt-tree-open > .bt-side-tree-hint",
+        "transition" => "opacity 100ms, color 100ms"),
+    CSS(".bt-side-chat:hover .bt-side-tree-hint, .bt-side-chat.bt-tree-open .bt-side-tree-hint",
         "opacity" => "1", "pointer-events" => "auto"),
-    # Stronger feedback on the chip's own hover — accent border + text + tint.
+    # Feedback on the affordance's own hover — just accent the text.
     CSS(".bt-side-tree-hint:hover",
-        "color" => "var(--bt-accent)", "border-color" => "var(--bt-accent)",
-        "background" => "var(--bt-surface-2)"),
+        "color" => "var(--bt-accent)"),
     # The tree itself — hidden until the chat carries `.bt-tree-open`.
     CSS(".bt-side-tree-wrap", "display" => "none"),
     CSS(".bt-side-chat.bt-tree-open > .bt-side-tree-wrap", "display" => "block"),
@@ -711,7 +718,13 @@ const SidebarStyles = Bonito.Styles(
         # dashboard" empty state: a 56px column has no room for a sentence.
         # The dashboard view that text refers to is already visible to the
         # right; hide on mobile so the sidebar stays purely icons.
-        CSS(".bt-side-empty", "display" => "none")),
+        CSS(".bt-side-empty", "display" => "none"),
+        # The per-chat "▾ files" affordance is absolutely positioned at the
+        # row's bottom-right; in the 56px icon rail it overlays the chat icon.
+        # The explicit `.bt-collapsed` path hides it (above) — the responsive
+        # 56px path must too, or a narrow window shows the menu over the icon.
+        CSS(".bt-side-tree-hint", "display" => "none"),
+        CSS(".bt-side-tree-wrap", "display" => "none")),
 )
 
 # ── Unified App ────────────────────────────────────────────────────────────
@@ -744,7 +757,14 @@ const UnifiedShellStyles = Bonito.Styles(
         # 100dvh, not 100vh (mobile URL-bar safe).
         "height"    => "100dvh",
         "display"   => "flex", "flex-direction" => "row",
-        "background"   => "var(--bt-bg)"),
+        "background"   => "var(--bt-bg)",
+        # Root font for the WHOLE shell. Without this only `.bt-dash` carried a
+        # font-family and everything else (sidebar, loading/error cards, chat)
+        # fell back to the browser default — i.e. Times serif. A modern system
+        # stack renders cleanly on every OS with no web-font fetch.
+        "font-family" => "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
+        "color"        => "var(--bt-text)",
+        "-webkit-font-smoothing" => "antialiased"),
     # Window-level toast — a transient notice (e.g. the editor open-guard's
     # "can't open <file>"). Fixed, centered near the bottom; JS flips
     # data-shown and clears it after ~3.2s (see plotpane_toast_layer).
@@ -1181,7 +1201,15 @@ function unified_main(session::Bonito.Session, state::ServerState,
     on(session, state.chat_signal) do _
         cur = alive[]
         keep = filter(pid -> haskey(state.chat_models, pid), cur)
-        length(keep) == length(cur) || (alive[] = keep)
+        # A worker MOVE (transfer_project! → ensure_project_session!) DELETES then
+        # RE-ADDS the chat model. The delete edge prunes the still-OPEN chat out of
+        # `alive` (filter above); the re-add edge must put it back, or its pane
+        # never re-materialises — it stays the current view but renders blank.
+        # `current_view` is cleared to "" on a real close, so this only revives a
+        # chat that's genuinely live again (a move), never an intentionally closed one.
+        cv = current_view[]
+        (!isempty(cv) && haskey(state.chat_models, cv) && !(cv in keep)) && push!(keep, cv)
+        keep == cur || (alive[] = keep)
     end
 
     container = DOM.div(dash_pane, chats_host, overlay_pane; class = "bt-main-views")

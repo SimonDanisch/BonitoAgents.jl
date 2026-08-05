@@ -1,0 +1,12 @@
+# Minimal env for the e2e app-embed tests' bt_show_app eval worker. The apps
+# only `using Bonito`, so this pins ONLY dev Bonito (v5, with the proxy API
+# bt_show_app needs). Pin the SAME git url+rev as the test env / CI, not a local
+# folder (the local layout isn't reproducible on CI). Pre-instantiated by
+# runtests.jl so the eval worker finds a resolved+precompiled env instead of
+# re-resolving the heavy test env (which timed app mounts out). Manifest is
+# generated locally and gitignored.
+[deps]
+Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+
+[sources]
+Bonito = {url = "https://github.com/SimonDanisch/Bonito.jl.git", rev = "master"}

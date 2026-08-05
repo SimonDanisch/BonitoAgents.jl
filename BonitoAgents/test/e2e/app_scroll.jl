@@ -26,7 +26,7 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
-const APP_ENV = abspath(joinpath(@__DIR__, "..", ".."))
+const APP_ENV = abspath(joinpath(@__DIR__, "..", "appenv"))
 
 # Tolerance (px) for "the chat held its scroll position" assertions. The bug
 # jumped the chat to the TOP — a full-range drop (~the whole scrollable height,

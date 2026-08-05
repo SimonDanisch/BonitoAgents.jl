@@ -21,7 +21,7 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
-const APP_ENV = abspath(joinpath(@__DIR__, "..", ".."))
+const APP_ENV = abspath(joinpath(@__DIR__, "..", "appenv"))
 const CYCLES = parse(Int, get(ENV, "APP_STRESS_CYCLES", "100"))
 const SWITCH_EVERY = 20   # do a chat-switch round-trip on every Nth cycle
 

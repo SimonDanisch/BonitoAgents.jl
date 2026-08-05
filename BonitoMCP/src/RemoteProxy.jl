@@ -215,6 +215,15 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             app = Base.include_string(Main, String(msg["code"]))
             register_app!(String(msg["app"]), app)
             send_control(d, Dict("op" => "reply", "id" => id, "val" => String(msg["app"])))
+        elseif op == "asset_url"
+            # Expose a worker-disk file to the browser through the NORMAL proxy
+            # asset path: `url` registers a `Bonito.Asset` on the bridge's asset
+            # server and fires `asset_add`, so the host builds the matching
+            # `RemoteAsset` and serves `/assets/<key>` with on-demand range reads.
+            # Returns that host-relative url to drop into a plain <img>/<video>
+            # src — no App/subsession needed for media.
+            url = Bonito.url(b.parent.asset_server, Bonito.Asset(abspath(String(msg["path"]))))
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => url))
         elseif op == "close"
             s = Bonito.get_session(b.parent, String(msg["sub"]))
             s === nothing || close(s)

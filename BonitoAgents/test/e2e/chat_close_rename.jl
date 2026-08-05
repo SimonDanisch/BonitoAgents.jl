@@ -76,6 +76,23 @@ function run_suite(server)
     server.agent_fn[] = (msg -> [TK.text("Echo: $msg")])
 
     @testset "close button + name persistence (UI)" begin
+        # ── Header shows the WORKER project path, not the server mirror ──────
+        # The folder line under the chat title must be the project's pwd on the
+        # worker (`ProjectInfo.worker_path`, what the projects scan list shows) —
+        # NOT `model.cwd` / `server_path`, the state-dir mirror that's meaningless
+        # to the user.
+        @testset "header folder line is the worker path" begin
+            pid = TK.new_chat(server; title = "PathProbe")
+            @test TK.wait_for(server, "header env present",
+                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); return !!(p && p.querySelector('.bt-header-env')); })()";
+                timeout = 10) == true
+            shown = TK.eval_js(server,
+                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); return p.querySelector('.bt-header-env').getAttribute('title'); })()")
+            proj = server.h.state.projects[][pid]
+            @test shown == proj.worker_path
+            @test shown != proj.server_path
+        end
+
         # ── Close removes the chat from the homebar ─────────────────────────
         @testset "✕ closes the chat: leaves the homebar, returns to dashboard" begin
             pid = TK.new_chat(server; title = "Closable")
@@ -83,9 +100,17 @@ function run_suite(server)
             @test TK.wait_for(server, "chat listed in homebar",
                 "[...document.querySelectorAll('.bt-side-item')].some(e => e.getAttribute('data-project-id') === $(repr(pid)))";
                 timeout = 10) == true
-            # Root fix for name-revert: a fresh chat binds its claude session id
-            # (so it's one tracked thread, not a duplicate in the threads browser).
-            @test bound_sid(server, pid) !== nothing
+            # Root fix for name-revert: a chat binds its claude session id (so it's
+            # one tracked thread, not a duplicate in the threads browser). With lazy
+            # ACP the bind happens ASYNC on the first message, so poll for it rather
+            # than assert instantly (the eager path bound synchronously at open).
+            @test let ok = false
+                for _ in 1:80
+                    bound_sid(server, pid) !== nothing && (ok = true; break)
+                    sleep(0.1)
+                end
+                ok
+            end
 
             @test click_close(server, pid) == "clicked"
             # The ✕ must actually remove the entry (the bug: it lingered).

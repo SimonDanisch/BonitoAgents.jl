@@ -37,7 +37,8 @@ function agent_script(prompt)
 end
 
 n_models(state) = length(state.chat_models)
-mock_count() = try parse(Int, strip(read(`pgrep -fc mock_claude_agent_acp.jl`, String))) catch; 0 end
+# `--` stops pgrep option parsing so the `-m …` pattern isn't read as a flag.
+mock_count() = try parse(Int, strip(read(`pgrep -fc -- "-m MockACP"`, String))) catch; 0 end
 rss_mb() = try parse(Int, split(read("/proc/self/statm", String))[2]) * 4096 / 1e6 catch; -1.0 end
 
 close_from_homebar(server, pid) = TK.eval_js(server, """(() => {
@@ -104,6 +105,11 @@ function run_suite(server)
         end
         @test n_pollers == 0
         @test wait_server(() -> mock_count() <= mocks_peak - CHURN_N)
+        # No agent left in the live-agent LRU after closing every chat. Guards the
+        # regression where a turn buffered past a chat's close lazily re-bound the
+        # already-dead session and pushed its pid into bound_lru AFTER stop_session!
+        # had pruned it — a stale entry nothing ever filtered out again.
+        @test wait_server(() -> isempty(state.bound_lru))
         @test length(state.pending_rpcs) <= 8
 
         # Coarse process-RSS backstop: opening + closing CHURN_N chats and a

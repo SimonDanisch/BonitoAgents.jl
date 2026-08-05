@@ -409,7 +409,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
                        project_id  = p.id,
                        mcp_servers = mcp,
                        agent       = agent)
-    start_chat_client!(model)        # also caches into state.chat_models
+    register_chat_model!(model)      # LAZY: register for viewing; bind on first turn
     fire_auto_prompt!(model)
     return model
 end
@@ -433,6 +433,7 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     model = lock(state.lock) do
         m = get(state.chat_models, p.id, nothing)
         m === nothing || delete!(state.chat_models, p.id)
+        filter!(!=(p.id), state.bound_lru)   # drop from the live-agent LRU
         m
     end
     # close is idempotent + total now; a real error here is worth surfacing.
@@ -448,8 +449,11 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         # the reader loop exits on its `while !conn.closed` guard (a plain
         # transport close would leave `conn.closed == false` and spin the reader
         # at 100% CPU). `stop!` is idempotent + total: a never-started agent just
-        # no-ops. This mirrors the restart path's `stop!(model.agent)`.
-        stop!(model.agent)
+        # no-ops. `permanent=true` latches the agent dead: a turn buffered past
+        # this close must not lazily re-bind it into an orphaned subprocess (the
+        # leak_cycle leak). Unlike the restart path's `stop!(model.agent)`, a
+        # closed chat never reuses THIS agent — a reopen builds a fresh one.
+        stop!(model.agent; permanent = true)
         notify_chats!(state)   # drop from the active-chats sidebar
     end
     release_project!(state, p)
@@ -2388,13 +2392,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # toggles visibility based on workers-empty. Keeps the install snippet
     # out of every render's hot path.
     #
-    # The server serves /install with User-Agent sniffing — curl gets the bash
-    # wrapper, PowerShell's `irm` gets the PS1 wrapper. Both wrappers verify
-    # `julia` is on PATH and then run the cross-platform install.jl. The /install
-    # URL gives us one shape per OS that mirrors the familiar `curl URL | sh`.
-    install_url  = "$(install_base_url(state))/install"
-    install_unix = "curl -fsSL $install_url | sh"
-    install_win  = "irm $install_url | iex"
+    # OS-explicit routes — we already know the platform per row, so we hit
+    # /install.sh and /install.ps1 directly instead of relying on /install's
+    # User-Agent sniff to guess. Both wrappers verify `julia` is on PATH and
+    # then run the cross-platform install.jl. This snippet matches the
+    # worker-install hint the server banner + install_server.sh print verbatim.
+    base         = install_base_url(state)
+    install_unix = "curl -fsSL $base/install.sh | sh"
+    install_win  = "irm $base/install.ps1 | iex"
     # Copy MUST work on plain-http origins too: `navigator.clipboard` is
     # undefined outside secure contexts (https / localhost), which is exactly
     # how a LAN-hosted BonitoAgents is reached — that's why the button "did
