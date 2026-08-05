@@ -11,11 +11,25 @@
     S  = BonitoAgents.YOLO_DONE_SENTINEL
     MX = BonitoAgents.YOLO_MAX_STREAK
 
-    @testset "the sentinel, on its own line, stops the loop" begin
-        for reply in (S, "  $S  ", "$S.", "**$S**", "> $S", "`$S`",
-                      "Everything is green and pushed.\n\n$S",
-                      "done\n$S\n")
+    @testset "the sentinel ALONE stops the loop" begin
+        # Whitespace and markdown decoration around it are fine — the agent may
+        # bold it or quote it — but the line has to be the entire answer.
+        for reply in (S, "  $S  ", "$S.", "**$S**", "> $S", "`$S`", "\n$S\n")
             @test B(reply)
+        end
+    end
+
+    @testset "a reply that also says anything else keeps the loop running" begin
+        # THE point of the rule. Stopping has to be a clean answer to "is there
+        # more you could do", not something a work message carries along at the
+        # end. An agent that writes up next steps and appends the sentinel used
+        # to stop the loop — while its own message was the clearest evidence
+        # there was more to do.
+        for reply in ("Everything is green and pushed.\n\n$S",
+                      "done\n$S\n",
+                      "$S\n\nNext: wire up the dashboard.",
+                      "## Next steps\n1. tests\n2. docs\n\n$S")
+            @test !B(reply)
         end
     end
 
@@ -46,7 +60,11 @@
     # `yolo_stop_reason` is pure (reply, produced, streak, last) so the whole
     # rule is checkable here without standing up a chat.
     @testset "stop reasons" begin
-        @test R(S, true, 0, "")               == ""          # declared: stop, silently
+        # Declared: stop, and SAY so. It was silent on the theory that the
+        # agent's message already reads as "done" — but an agent that ends a
+        # report of next steps with the sentinel leaves the loop stopping for no
+        # visible reason, which is what we hit in practice.
+        @test R(S, true, 0, "")               == "the agent signalled it was finished"
         @test R("working", false, 0, "")      != nothing      # produced nothing
         @test R("working", true, 0, "")       === nothing     # ordinary progress
         # Repeat = spinning.

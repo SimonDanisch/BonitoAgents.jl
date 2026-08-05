@@ -4863,26 +4863,18 @@ end
 const YOLO_DONE_SENTINEL = "YOLO-COMPLETE"
 
 const YOLO_CONTINUE_PROMPT = """
-You are being continued automatically. Nobody is reading in between, so a \
-question you ask here will not be answered — the next message is another \
-automatic continue.
+You are being continued automatically — nobody reads in between, so a question \
+here goes unanswered.
 
-Keep going while there is more you can usefully do on your own.
+Is there more you could usefully do on your own?
 
-Stop the loop by ending your reply with this line, on its own, as soon as ANY \
-of these is true:
-
-  - you have finished
-  - you need something only I can give: a decision, an answer, access, credentials
-  - you are repeating yourself, going in circles, or no longer making progress
+  - Yes → do it. Don't write up what to do next; there is no reader.
+  - No → reply with exactly this line and nothing else:
 
 $(YOLO_DONE_SENTINEL)
 
-Emit it for one of those reasons and no other, and never while you still intend \
-to carry on. Do not mention it otherwise. Anything else you write means you are \
-still working.
-
-Stopping to ask is not failure — it is faster than looping."""
+"No" means finished, or blocked on something only I can give, or going in \
+circles. Any other reply keeps the loop running."""
 
 # Composer placeholder while Yolo is armed — the message input doubles as the
 # reminders editor then (see `chat_input_area`).
@@ -4893,7 +4885,17 @@ const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Ent
 # bare mention mid-sentence does NOT count: it has to be the line's whole
 # content, which is what makes "No, everything is done." and "no, here's more"
 # distinguishable at all — neither bails unless the agent also says so.
-const YOLO_BAIL_RX = Regex("^[\\s>*_`#-]*" * YOLO_DONE_SENTINEL * "[\\s*_`.!]*\$", "im")
+# The sentinel must be the WHOLE reply — note the absence of the `m` flag, so
+# `^`/`$` anchor to the string rather than to any line within it. Markdown
+# decoration and surrounding whitespace are tolerated; a single word of prose is
+# not.
+#
+# With `m` this matched the sentinel on ANY line, so an agent could end a report
+# of next steps with it and stop the loop — observed in practice, and exactly
+# backwards: a reply that describes remaining work is the clearest possible
+# evidence there IS more to do. Stopping is now an answer on its own, which a
+# work message cannot smuggle out.
+const YOLO_BAIL_RX = Regex("^[\\s>*_`#-]*" * YOLO_DONE_SENTINEL * "[\\s*_`.!]*\$", "i")
 
 yolo_bail(text::AbstractString) = occursin(YOLO_BAIL_RX, strip(text))
 
@@ -4923,7 +4925,12 @@ prose. That ambiguity is exactly what the sentinel replaced.
 """
 function yolo_stop_reason(reply::AbstractString, produced::Bool,
                           streak::Integer, last::AbstractString)
-    yolo_bail(reply) && return ""                       # said so, explicitly
+    # Say so. The other stops explain themselves; this one used to be silent on
+    # the grounds that the agent's own last message already said it was done.
+    # That holds only when the message reads that way — and the failure we
+    # actually saw was an agent ending a REPORT OF NEXT STEPS with the sentinel,
+    # where the loop going quiet after "here is what to do next" is baffling.
+    yolo_bail(reply) && return "the agent signalled it was finished"
     produced || return "the turn ended without any output"
     streak + 1 >= YOLO_MAX_STREAK &&
         return "$(YOLO_MAX_STREAK) turns without finishing — send a message to continue"
