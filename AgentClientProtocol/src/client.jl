@@ -80,7 +80,9 @@ function coalesce_main!(conn::Connection, updates::Channel{Any},
     try
         for u in updates
             if u isa StreamFlush
-                close(st)              # seal the trailing bubble + any open tool
+                # Seal the trailing bubble ONLY. A live tool must survive a
+                # boundary — see `seal_message!`.
+                seal_message!(st)
                 put!(messages, u)      # ... then let the consumer catch up to here
                 continue
             end

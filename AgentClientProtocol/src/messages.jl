@@ -349,9 +349,28 @@ TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "")
 # snapshot through its `updates` channel BEFORE closing, so downstream consumers
 # (BonitoAgents's `process_update!`) see a terminal status and finalize naturally —
 # instead of draining a channel that just-closed with the status frozen mid-flight.
-function Base.close(st::TurnState)
+# Seal the trailing TEXT message at a boundary — and NOTHING else.
+#
+# A boundary is not the end of the stream. A tool call routinely spans one: an
+# eval runs for minutes while you send another message, and `begin_turn!` puts a
+# marker on the stream before it prompts. `close` force-fails every live tool
+# and empties `st.tools`, so past that point every `tool_call_update` for the
+# running eval finds no tool and is dropped — its card freezes at `in_progress`
+# with an empty CODE and OUTPUT while the eval is still going.
+#
+# Tools the agent genuinely abandons are not lost by leaving them here: the chat
+# layer's `sweep_turn_orphans!` finalises anything non-terminal at end of turn,
+# and it deliberately runs only for the LAST turn precisely so a handoff doesn't
+# force-fail its successor's live tools.
+function seal_message!(st::TurnState)
     st.current_message === nothing || close(st.current_message)
     st.current_message = nothing
+    st.acc = ""            # the handoff-duplicate window ends with the message
+    return nothing
+end
+
+function Base.close(st::TurnState)
+    seal_message!(st)
     for tc in values(st.tools)
         if !is_terminal(tc.status)
             tc.status = "failed"
@@ -360,7 +379,6 @@ function Base.close(st::TurnState)
         close(tc)
     end
     empty!(st.tools)
-    st.acc = ""            # the handoff-duplicate window ends with the message
     return nothing
 end
 

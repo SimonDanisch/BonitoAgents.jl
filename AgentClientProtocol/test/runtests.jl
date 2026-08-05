@@ -310,6 +310,51 @@ end
         relay_close!(m)
     end
 
+    # A boundary must not kill a tool that is still running. `close(TurnState)`
+    # force-fails every live tool, which is right at STREAM END and wrong at a
+    # boundary — and boundaries land mid-stream all the time (the dispatcher
+    # stamps one at every response, `begin_turn!` injects one before it
+    # prompts). A long `bt_julia_eval` spanning one lost its entry in
+    # `st.tools`, so every later update for it was dropped: the card sat at
+    # `in_progress` with an empty CODE and OUTPUT while the eval kept running.
+    @testset "a live tool survives a stream boundary" begin
+        st  = ACP.TurnState()
+        out = Channel{ACP.Message}(64)
+        mk(d) = ACP.parse_session_update(Dict{String,Any}(d))
+
+        ACP.parse_update!(out, st, mk(Dict(
+            "sessionUpdate" => "tool_call", "toolCallId" => "eval-1",
+            "kind" => "other", "title" => "bt_julia_eval", "status" => "in_progress",
+            "rawInput" => Dict("code" => "1+1"))))
+        tool = first(values(st.tools))
+        ACP.parse_update!(out, st, mk(Dict("sessionUpdate" => "agent_message_chunk",
+            "content" => Dict("type" => "text", "text" => "working"))))
+
+        ACP.seal_message!(st)                       # what a boundary does
+        @test st.current_message === nothing        # the bubble IS sealed
+        @test haskey(st.tools, "eval-1")            # the tool is NOT
+
+        # so its completion, which arrives after the boundary, still lands
+        ACP.parse_update!(out, st, mk(Dict(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "eval-1",
+            "status" => "completed",
+            "content" => [Dict("type" => "content",
+                               "content" => Dict("type" => "text", "text" => "2"))])))
+        @test tool.status == "completed"
+        @test any(c -> c isa ACP.TextContent && c.text == "2", tool.content)
+
+        # At true stream end an abandoned tool is still force-failed, so a tool
+        # the agent never resolved cannot leave the UI pulsing forever.
+        st2 = ACP.TurnState()
+        ACP.parse_update!(out, st2, mk(Dict(
+            "sessionUpdate" => "tool_call", "toolCallId" => "x",
+            "kind" => "other", "title" => "t", "status" => "in_progress")))
+        abandoned = first(values(st2.tools))
+        close(st2)
+        @test abandoned.status == "failed"
+        @test isempty(st2.tools)
+    end
+
     # ── A4: a stray blank frame does NOT tear the connection down ────────────
     # The mock emits blank frames around its frames; the real reader_loop must
     # skip them (not treat "" as EOF) and still deliver the response.
