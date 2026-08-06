@@ -107,6 +107,13 @@ mutable struct ChatModel
     # module-level table keyed by chat: per-object state belongs on the object.
     activity_timer::Ref{Any}
 
+    # What `main_consumer!` is rendering right now: `(kind, started_at)`, or
+    # `nothing` between messages. Pure diagnostics — the render barrier reports
+    # it when it times out, which turns "renderer alive but not draining" from
+    # an observation into a lead. A stalled renderer parks inside ONE `process!`,
+    # and this names which.
+    rendering::Ref{Any}
+
     # One-shot history prelude prepended to the next prompt after a session
     # change that lost claude's jsonl (see `arm_history_replay!`). Empty = none.
     pending_history_replay::Ref{String}
@@ -309,6 +316,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Ref{Any}(nothing),          # main_consumer (bound with the ACP session)
         Ref{AgentClientProtocol.SessionActivity}(AgentClientProtocol.Idle()),  # activity_seen
         Ref{Any}(nothing),          # activity_timer
+        Ref{Any}(nothing),          # rendering
         Ref(""),                    # pending_history_replay
         Dict{String,Vector{Any}}(), # pending_subagent (activity ahead of its parent Task)
         Observable(Dict{String,Any}()),
@@ -387,6 +395,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.main_consumer,           # shared → one main-thread renderer per chat
             m.activity_seen,           # shared → one edge detector per chat
             m.activity_timer,          # shared → one quiet-check per chat
+            m.rendering,               # shared → one renderer per chat
             m.pending_history_replay,
             m.pending_subagent,        # shared → one activity buffer per chat
             map(identity, session, m.comm),
@@ -4515,11 +4524,14 @@ function main_consumer!(chat::ChatModel, messages)
         # bubble and gave up on the rest), which was survivable when the consumer
         # died with the turn. This one outlives every turn, so it reports and
         # keeps going.
+        s.rendering[] = (nameof(typeof(m)), time())
         try
             process!(chat, m)
         catch e
             @error "rendering an agent message failed" project_id = chat.project_id exception = (e, catch_backtrace())
             close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, e))]")))
+        finally
+            s.rendering[] = nothing
         end
     end
     return nothing
@@ -4778,8 +4790,14 @@ function wait_rendered!(chat::ChatModel, marker::AgentClientProtocol.StreamFlush
     # means a genuinely stuck renderer, and the warning is how we find out which.
     if timedwait(() -> !isopen(marker.done), RENDER_BARRIER_SECONDS;
                  pollint = 0.01) !== :ok
-        @warn "render barrier timed out — renderer alive but not draining; \
-               starting the turn anyway" project_id = chat.project_id
+        # Name what it is stuck ON. A stalled renderer is parked inside a single
+        # `process!`, so the message kind plus how long it has been there points
+        # straight at the blocking call instead of leaving "not draining" as the
+        # whole story.
+        stuck     = lock(() -> shared(chat).rendering[], shared(chat).lock)
+        rendering = stuck === nothing ? :between_messages : first(stuck)
+        stuck_for = stuck === nothing ? 0.0 : round(time() - last(stuck), digits = 1)
+        @warn "render barrier timed out — renderer alive but not draining; starting the turn anyway" project_id = chat.project_id rendering stuck_for
     end
     return nothing
 end
