@@ -3110,8 +3110,7 @@ function Base.append!(m::AgentMsg, t::AbstractString)
         m.text *= t
         m.html = ""
     end
-    c = m.chat === nothing ? nothing : client(m.chat.agent)
-    (c !== nothing && (@atomic c.conn.cancelling)) || chat_emit(m.chat, wire_chunk(m, t))
+    chat_emit(m.chat, wire_chunk(m, t))
     return m
 end
 Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wire_chunk(m, t)); m)
@@ -3374,20 +3373,20 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     # channel, so the running chunk count is the only real-time proof that the
     # model is still churning. Shipped next to the "reasoning…" indicator.
     n = 0
-    c = client(chat.agent)
     last_emit = 0.0
     try
         for delta in m.updates
             text *= delta
             n += 1
-            # Mirror AgentMsg.append!: once stop is pressed, quit shipping per-
-            # chunk wire events (the one thing that keeps the turn "busy" after a
-            # cancel). The final active=false below still fires from the finally.
             # Throttled to ~6/s — the count is a liveness ticker, and a wire
-            # event per redacted token chunk (broadcast to every tab) was
-            # pure overhead at high token rates. A ≤150 ms-stale count is
-            # invisible; the finally's active=false handles teardown.
-            if !(c !== nothing && (@atomic c.conn.cancelling)) && time() - last_emit > 0.15
+            # event per redacted token chunk (broadcast to every tab) was pure
+            # overhead at high token rates. A ≤150 ms-stale count is invisible;
+            # the finally's active=false handles teardown.
+            #
+            # No cancel gate: a cancelled turn's chunks are still the agent's
+            # output, and the spinner is driven by the session's activity now,
+            # not by whether wire events happen to stop arriving.
+            if time() - last_emit > 0.15
                 last_emit = time()
                 chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true, "count" => n))
             end

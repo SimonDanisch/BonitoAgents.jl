@@ -221,41 +221,87 @@ mutable struct Connection
     dispatcher_task::Union{Task,Nothing}
     closed::Bool
 
-    # Set true by `cancel!`. The dispatcher then drops main-thread updates
-    # instead of delivering them, so a token backlog can't keep it from reaching
-    # the `cancelled` response (strict-FIFO head-of-line). Reset to false when
-    # the cancelled prompt settles, or when the next request starts. Atomic for
-    # cross-task visibility (set on the cancel task, read on the dispatcher).
+    # What the session is doing — see `SessionActivity`. ONE value, derived by
+    # `settle!` from facts we can each observe directly: whether a prompt of
+    # ours is open, whether the agent has streamed work, and how long it has
+    # been quiet. Atomic for cross-task visibility (written on the dispatcher
+    # and the cancel task, read from both plus the UI).
     #
-    # It gates the MAIN THREAD only. Subagent updates are addressed and return
-    # before this is consulted: cancelling a prompt must not silence background
-    # work the user never cancelled.
-    @atomic cancelling::Bool
+    # This deliberately does NOT gate delivery. An earlier `cancelling` flag
+    # made the dispatcher DROP main-thread updates so a token backlog could not
+    # keep it from reaching the `cancelled` response — which discarded real
+    # output unparsed and, for un-prompted work, never unset. Cancel now costs
+    # backlog-drain latency instead of the user's messages.
+    @atomic activity::SessionActivity
+    # `time()` of the last frame that counted as agent WORK. Bounds `Unprompted`,
+    # which the wire gives no end marker for.
+    @atomic last_work_at::Float64
     # `time()` of the FIRST cancel for the active turn (0.0 if none). Lets the
     # chat layer tell a deliberate re-cancel ("force it, it's wedged") from an
     # impatient double-click — only the former, after the agent's had a real
     # chance, escalates to a force-close. Reset to 0.0 at each turn start.
     @atomic cancel_at::Float64
-    # The main thread has streamed WORK with no prompt open, since the last
-    # request started or the last cancel went out.
-    #
-    # `active_prompts` says whether we asked for something; this says whether the
-    # agent is saying something. They stopped being the same question once the
-    # agent started auto-waking after backgrounded work. In the captured trace
-    # (BonitoAgents/test/fixtures/bg_subagent_wire.jsonl) it runs a tool and
-    # writes three message chunks across 27 s with no prompt open; asking
-    # `active_prompts` there says "idle" while the user is watching it work, so a
-    # stop click was dropped for the whole window.
-    #
-    # WORK, not traffic: session metadata (`available_commands_update` right
-    # after `session/new`, usage, mode) is the agent answering about itself, not
-    # doing something — see `is_agent_work`. Counting it made every chat look
-    # busy from the moment it bound.
-    #
-    # Cleared at each request start and by `cancel!`, so it means "work a cancel
-    # could still affect", not "work ever happened".
-    @atomic unprompted_work::Bool
 end
+
+# How long the main thread must be quiet before an `Unprompted` episode counts
+# as over.
+#
+# `active_prompts` says whether we asked for something; `Unprompted` says the
+# agent is saying something anyway. Those stopped being the same question once
+# it started auto-waking after backgrounded work: in the captured trace
+# (BonitoAgents/test/fixtures/bg_subagent_wire.jsonl) it runs a tool and writes
+# three message chunks across 27 s with no prompt open, so reading
+# `active_prompts` alone says "idle" while the user watches it work.
+#
+# The episode's END is the hard part — it is prose and tools that simply stop.
+# `AUTONOMOUS_ORIGINS` usually tags the last frame, but claude-agent-acp emits
+# that `usage_update` conditionally, so it cannot be the only way out; relying on
+# it is what left the spinner running over an idle agent. Quiet is observable
+# without the agent's cooperation, which is the property that matters.
+#
+# Sized off the same trace: the widest gap between consecutive frames of one
+# episode is ~19 s (the auto-wake latency after backgrounded work finishes), so
+# this sits comfortably past it without making a finished episode linger.
+const QUIET_SECONDS = 30.0
+
+"""
+    settle(activity, has_prompts, quiet_for) -> SessionActivity
+
+The transition function. Total over the state space, so there is no path that
+forgets to clear something — the old bugs were all "set here, cleared there, and
+here is a path where the clear never runs".
+
+`quiet_for` is seconds since the last frame that counted as agent WORK. Metadata
+(`available_commands_update` right after `session/new`, usage, mode) is the agent
+answering about itself, not doing something — see `is_agent_work` — and counting
+it made every chat look busy from the moment it bound.
+"""
+settle(::SessionActivity, has_prompts::Bool, quiet_for::Real) =
+    has_prompts ? Prompted() : (quiet_for < QUIET_SECONDS ? Unprompted() : Idle())
+# A cancel we sent outlives the quiet bound: it ends when the turn it cancelled
+# actually settles (its response), or when there is no prompt left to settle.
+settle(::Cancelling, has_prompts::Bool, ::Real) = has_prompts ? Cancelling() : Idle()
+
+"Recompute and store the session's activity. Returns the new value."
+function settle!(conn::Connection; worked::Bool = false)
+    now_t = time()
+    worked && (@atomic conn.last_work_at = now_t)
+    has_prompts = lock(() -> !isempty(conn.active_prompts), conn.lock)
+    quiet_for   = now_t - (@atomic conn.last_work_at)
+    next = settle((@atomic conn.activity), has_prompts, quiet_for)
+    @atomic conn.activity = next
+    return next
+end
+
+"""
+    session_activity(conn) -> SessionActivity
+
+The session's current activity, re-settled on read so a caller never sees a
+state the clock has already invalidated. `Unprompted` in particular expires on
+quiet, and nothing arrives to trigger that — the whole point is that it needs no
+frame from the agent to end.
+"""
+session_activity(conn::Connection) = settle!(conn)
 
 function Connection(transport::Transport, handler::Handler = DiscardHandler();
                     on_frame::Union{Function,Nothing} = nothing)
@@ -270,9 +316,9 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
                       PromptSpan[],                         # active_prompts
                       Channel{Any}(1024),
                       ReentrantLock(), nothing, nothing, false,
-                      false,                     # cancelling
-                      0.0,                       # cancel_at
-                      false)                     # unprompted_work
+                      Idle(),                    # activity
+                      0.0,                       # last_work_at
+                      0.0)                       # cancel_at
     conn.dispatcher_task = @async dispatcher_loop(conn)
     conn.reader_task     = @async reader_loop(conn)
     return conn
@@ -387,10 +433,17 @@ end
 # the dispatcher is safe for liveness — the consumer always drains eventually, so
 # space always frees.
 #
-# The one case the old drop-oldest was protecting (A7: keep the dispatcher free
-# to reach a `cancelled` response behind a backlog) is handled by bailing the
-# moment `cancelling` flips: the call site already stops delivering once
-# cancelling and the consumer fast-discards, so a parked put! can't wedge cancel.
+# A cancel does NOT change this. An earlier `cancelling` flag made both this
+# function and the dispatcher bail while a cancel was in flight, so the
+# dispatcher could reach the `cancelled` response without waiting for a slow
+# browser to drain. That bought latency with the user's output: the skipped
+# frames were discarded UNPARSED — never rendered, never stored, recoverable
+# only by reloading and replaying history. And because the flag gated the whole
+# main thread rather than the cancelled turn, it also silenced background work
+# nobody had cancelled.
+#
+# Cancel now costs backlog-drain latency instead, which is bounded by the
+# channel and visible in the UI as `Cancelling`.
 function deliver_update!(conn::Connection, ch::Channel, update)
     while true
         lock(ch)
@@ -403,11 +456,7 @@ function deliver_update!(conn::Connection, ch::Channel, update)
         finally
             unlock(ch)
         end
-        # Full: wait for the consumer to take one (backpressure, no data loss).
-        # A cancel in flight means we stop rendering this turn anyway — return so
-        # the dispatcher stays free to reach the turn's `cancelled` response.
-        (@atomic conn.cancelling) && return nothing
-        sleep(0.001)
+        sleep(0.001)   # full: wait for the consumer (backpressure, no data loss)
     end
 end
 
@@ -549,12 +598,11 @@ function deliver_owner!(conn::Connection, owner_id::AbstractString, update::Sess
     return nothing
 end
 
-# Reset the per-request cancel/liveness state. Any stray work from before this
-# request belongs to it now, and a fresh request renders normally.
+# Reset the per-request cancel state. Any stray work from before this request
+# belongs to it now. `activity` is not assigned here — `settle!` derives it from
+# `active_prompts`, which the caller is about to push to.
 function reset_turn_state!(conn::Connection)
-    @atomic conn.cancelling       = false
-    @atomic conn.cancel_at        = 0.0
-    @atomic conn.unprompted_work  = false
+    @atomic conn.cancel_at = 0.0
     return nothing
 end
 
@@ -674,21 +722,10 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
                 return nothing
             end
 
-            # DROP the main thread the moment cancel is requested. This single
-            # dispatcher task processes the inbox strictly in order, so if it
-            # BLOCKS below on a backed-up sink (slow browser / heavy token or
-            # tool-call stream), it can never reach the `cancelled` response
-            # sitting behind the backlog — the turn would look wedged for as
-            # long as the browser takes to drain. Once cancel is requested we
-            # aren't rendering any more of this turn anyway.
-            (@atomic conn.cancelling) && return nothing
-            # Record that the agent is WORKING, not merely talking: `cancel!`
-            # reads this to tell "idle" from "busy with no prompt open", which
-            # `active_prompts` alone cannot. Session metadata lands here too — a
-            # fresh session emits `available_commands_update` right after
-            # `session/new` — and counting that as work made every chat look
-            # busy from the moment it bound.
-            is_agent_work(update) && (@atomic conn.unprompted_work = true)
+            # Every main-thread frame is DELIVERED, cancel or no cancel. What a
+            # cancel changes is the session's `activity`, not what the user gets
+            # to see (see `deliver_update!`).
+            settle!(conn; worked = is_agent_work(update))
             deliver_main!(conn, update)
         end
         # Other notifications silently ignored.
@@ -718,25 +755,12 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
                 ended = conn.active_prompts[j]
                 deleteat!(conn.active_prompts, j)
             end
-            if isempty(conn.active_prompts)
-                # Drop the cancel latch as soon as the cancelled prompt is gone,
-                # not at the next prompt. `cancelling` exists to stop the
-                # dispatcher head-of-line blocking on the update backlog so it
-                # can reach the `cancelled` response — once the prompt is settled
-                # there is no backlog left to skip.
-                #
-                # Leaving it latched meant every un-prompted update in between
-                # was discarded: a background subagent the user never cancelled
-                # kept working while its output was thrown away, so stopping one
-                # turn made unrelated background work go silent until they
-                # happened to send another message.
-                @atomic conn.cancelling = false
-                # Work that streamed INSIDE this prompt was prompted. The flag
-                # means "the agent worked with no prompt open", so it only
-                # counts frames from here on (strict FIFO: everything earlier is
-                # already dispatched).
-                @atomic conn.unprompted_work = false
-            end
+            # Work that streamed INSIDE this prompt was prompted, so an
+            # `Unprompted` verdict must not inherit its recency: only frames
+            # from here on count (strict FIFO — everything earlier is already
+            # dispatched). Without this, ending a turn would leave the session
+            # looking un-prompted-busy for the whole quiet window.
+            isempty(conn.active_prompts) && (@atomic conn.last_work_at = 0.0)
             c = get(conn.pending, id, nothing)
             c === nothing || delete!(conn.pending, id)
             c

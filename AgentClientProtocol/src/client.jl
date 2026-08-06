@@ -86,11 +86,11 @@ function coalesce_main!(conn::Connection, updates::Channel{Any},
                 put!(messages, u)      # ... then let the consumer catch up to here
                 continue
             end
-            # Backlog from a cancelled turn: the dispatcher stopped delivering
-            # the moment cancel went out, but whatever was already buffered is
-            # still ahead of us. Skip it rather than render a turn the user
-            # stopped — the flush that follows seals what did get rendered.
-            (@atomic conn.cancelling) && continue
+            # Everything that reaches here is rendered. There is no cancel gate:
+            # frames the agent already sent are output it already produced, and
+            # discarding them here lost them for good (unparsed, so never stored
+            # either) — the user saw a dead chat and only got the backlog on a
+            # reload, which replays history from the agent.
             parse_update!(messages, st, u)
         end
     finally
@@ -346,7 +346,7 @@ Whether the agent has anything running that a cancel could reach.
 
 Cancel targets the SESSION, not one request, and there are two independent
 reasons the agent may be working: we asked it to (`active_prompts`), or it woke
-itself up after backgrounded work finished (`unprompted_work`). Reading only the
+itself up after backgrounded work finished (`Unprompted`). Reading only the
 first is why stop used to be a no-op for the whole auto-wake window, while the
 user watched it run tools.
 
@@ -356,12 +356,7 @@ cancel to". A UI wants "is my spinner telling the truth" — and if it isn't, th
 answer is to reconcile its own state, NOT to discard whatever the user has
 queued up behind a turn that already ended.
 """
-function session_live(client::Client)
-    conn = client.conn
-    return lock(conn.lock) do
-        !isempty(conn.active_prompts) || (@atomic conn.unprompted_work)
-    end
-end
+session_live(client::Client) = is_working(session_activity(client.conn))
 
 function cancel!(client::Client)
     conn = client.conn
@@ -370,11 +365,19 @@ function cancel!(client::Client)
     # thread, so latching it true over an idle gap would silently drop the
     # agent's next burst of work until a new prompt cleared it.
     session_live(client) || return false
-    @atomic conn.cancelling = true
-    # Consumed: a second cancel arriving while still idle must no-op again. If
-    # the agent ignores this one and keeps streaming, the dispatcher sets it
-    # afresh, so a deliberate re-cancel still gets through (and still escalates).
-    @atomic conn.unprompted_work = false
+    # `Cancelling` is a state, not a mute: delivery is untouched (see
+    # `deliver_update!`). It ends when the turn it cancelled settles, or
+    # immediately if there was no prompt to settle — so cancelling un-prompted
+    # work cannot leave the session stuck the way the old latch did.
+    # This cancel CONSUMES the work it acted on. Without clearing the recency,
+    # `Idle` is not a stable state: `settle` reads a recent `last_work_at` and
+    # resurrects `Unprompted` on the next read, so a cancelled un-prompted
+    # episode would keep re-reporting itself as live for the whole quiet window.
+    # Frames that arrive after this stamp it afresh — an agent that ignores the
+    # cancel and keeps streaming is still, correctly, working.
+    @atomic conn.last_work_at = 0.0
+    @atomic conn.activity = Cancelling()
+    settle!(conn)
     send_notification(conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
     return true

@@ -103,7 +103,7 @@ end
 
         # Now in the window: no prompt open, agent still working.
         take!(working)
-        @test timedwait(() -> (@atomic conn.unprompted_work), 5.0) === :ok
+        @test timedwait(() -> ACP.session_activity(conn) isa ACP.Unprompted, 5.0) === :ok
         @test isempty(conn.active_prompts)          # ...and nothing is registered
 
         # The un-prompted work is RENDERED, not dropped: it is the main thread
@@ -140,13 +140,13 @@ end
 #   26  in   RESPONSE stopReason=end_turn          the span closes
 #   27  in   session/update session_info_update    metadata — must NOT count
 #   28  in   session/update usage_update           metadata — must NOT count
-#   29  in   session/update tool_call              REAL WORK — sets unprompted_work
+#   29  in   session/update tool_call              REAL WORK — goes Unprompted
 #   30  out  session/cancel                        fires, and only now
 #
 # Both halves matter. An earlier capture had the cancel firing on frame 27's
 # metadata alone, which is what 05c12b8 removed: a session that has merely
-# reported its own state is idle, and cancelling there would latch `cancelling`
-# over an idle gap and swallow the agent's next burst of background work.
+# reported its own state is idle, and a stop there is a no-op the UI should read
+# as "my spinner is stale" rather than as something to act on.
 @testset "cancel during un-prompted work (real captured wire)" begin
     frames = [JSON.parse(l) for l in
               eachline(joinpath(@__DIR__, "fixtures", "real_stop_orphan_wire.jsonl"))]
@@ -236,7 +236,7 @@ end
         collect_main!(rendered, client)
         ACP.wait_turn!(ACP.prompt!(client, "replayed"))   # the RECORDED end_turn
         take!(ready)
-        @test timedwait(() -> (@atomic conn.unprompted_work), 10.0) === :ok
+        @test timedwait(() -> ACP.session_activity(conn) isa ACP.Unprompted, 10.0) === :ok
         @test isempty(conn.active_prompts)
 
         ACP.cancel!(client)
@@ -259,14 +259,15 @@ end
 # Two separate ways this used to go wrong, both asserted here:
 #
 #   1. A SUBAGENT running in the background is not part of any turn. Its updates
-#      are addressed to it by `parentToolUseId`, and the dispatcher delivers them
-#      before `cancelling` is ever consulted — so stopping the main thread cannot
-#      make a subagent go quiet. (It used to: subagent updates went through the
-#      same gate as the turn's own.)
-#   2. `cancelling` gates the main thread so the dispatcher can skip a cancelled
-#      turn's backlog and reach its `cancelled` response. It was only cleared by
-#      the NEXT request, so between the cancel and the user's next message every
-#      un-prompted update was dropped as well.
+#      are addressed to it by `parentToolUseId` and reach their owner directly,
+#      so stopping the main thread cannot make a subagent go quiet. (It used to:
+#      subagent updates went through the same gate as the turn's own.)
+#   2. A cancel used to MUTE the main thread — the dispatcher dropped updates so
+#      it could skip a cancelled turn's backlog and reach its `cancelled`
+#      response. The mute was cleared only by that response, so cancelling
+#      un-prompted work (which has no response coming) silenced the session
+#      until the user reloaded. Nothing is dropped now; `Cancelling` is a state,
+#      not a gate.
 @testset "cancel does not silence later background work" begin
     port  = freeport()
     ws_ch = Channel{Any}(1); hold = Channel{Nothing}(0)
@@ -293,7 +294,7 @@ end
                 req_method(line) == "session/cancel" && break
             end
             # A background subagent the user never cancelled, streaming while
-            # `cancelling` is still latched for the main thread.
+            # the main thread's cancel is still in flight.
             emit(cws, subagent_text_update("task-1", "subagent still going"))
             emit(cws, prompt_done(pid, "cancelled"))
             put!(settled, nothing)
@@ -318,20 +319,20 @@ end
         collect_main!(rendered, client)
         turn = ACP.prompt!(client, "go")
         ACP.cancel!(client)
-        @test (@atomic conn.cancelling)            # latched for the cancelled turn
+        @test ACP.session_activity(conn) isa ACP.Cancelling
 
-        # (1) The subagent streamed WHILE that latch was set, and still arrived.
+        # (1) The subagent streamed WHILE the cancel was in flight, and arrived.
         @test timedwait(() -> isready(owned), 5.0) === :ok
         @test first(take!(owned)) == "task-1"
 
         take!(settled)
         @test ACP.wait_turn!(turn)["stopReason"] == "cancelled"
 
-        # (2) Settled: the latch is gone, so the main thread's next burst lands.
-        # Measured as GROWTH past whatever the cancelled turn had already
-        # rendered — the point is that the stream did not go dead, not how much
-        # got through before the stop.
-        @test timedwait(() -> !(@atomic conn.cancelling), 5.0) === :ok
+        # (2) Settled: `Cancelling` ends with the turn it cancelled, so the main
+        # thread's next burst lands. Measured as GROWTH past whatever the
+        # cancelled turn had already rendered — the point is that the stream did
+        # not go dead, not how much got through before the stop.
+        @test timedwait(() -> !(ACP.session_activity(conn) isa ACP.Cancelling), 5.0) === :ok
         base = Base.n_avail(rendered)
         @test timedwait(() -> Base.n_avail(rendered) > base, 5.0) === :ok
     finally

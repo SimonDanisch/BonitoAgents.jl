@@ -540,7 +540,6 @@ end
     # …and what the user typed is still there to be sent.
     @test Base.n_avail(s.user_messages) == 1
     @test bubble.queued == true         # not relabelled "not sent"
-    @test (@atomic cli.conn.cancelling) == false
     close(model)
 end
 
@@ -548,14 +547,25 @@ end
 @testset "stop still cancels and clears the queue when work is live" begin
     model, cli = live_model()
     s = BT.shared(model)
-    @atomic cli.conn.unprompted_work = true      # what the dispatcher sets on live work
+    # What the dispatcher records when the agent works with no prompt of ours.
+    @atomic cli.conn.last_work_at = time()
+    @atomic cli.conn.activity = ACP.Unprompted()
     @test ACP.session_live(cli) == true
     BT.send_message!(model, BT.UserMsg("stop for real"))
     @test timedwait(() -> Base.n_avail(s.user_messages) == 1, 5.0) === :ok
 
     BT.handle_command!(model, nothing, BT.CancelCommand())
-    @test (@atomic cli.conn.cancelling) == true  # session/cancel went out
+    # The cancel went out and the liveness it acted on is consumed: with no
+    # prompt to settle, `Cancelling` resolves straight to `Idle`, so a second
+    # stop over the same gap no-ops rather than acting again.
+    @test ACP.session_activity(cli.conn) isa ACP.Idle
     @test Base.n_avail(s.user_messages) == 0     # queue dropped, as stop means
+    # ...and the session is NOT muted by any of it. Asserted on the STORE, not
+    # on `cli.messages`: the renderer this harness starts drains that channel,
+    # so its depth is 0 whether frames flow or not.
+    feed!(cli, amc("the subagent is still going"))
+    BT.flush_main!(model)
+    @test any(m -> m isa BT.AgentMsg && occursin("still going", m.text), s.msgs_store)
     close(model)
 end
 

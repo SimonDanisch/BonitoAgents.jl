@@ -249,18 +249,24 @@ end
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
         relay_close!(m)
 
-        # deliver_update! robustness unit-checks (no transport involved — these
-        # construct bare channels to assert the two non-flood invariants against
-        # the now-closed `conn`, which only reads `conn.cancelling`):
-        #   * a cancel in flight must NOT block on a full channel, so the single
-        #     dispatcher stays free to reach the turn's `cancelled` response;
+        # deliver_update! robustness unit-checks (no transport involved — bare
+        # channels against the now-closed `conn`):
+        #   * a full channel BACKPRESSURES and loses nothing, cancel or not. It
+        #     used to bail while a cancel was in flight so the dispatcher could
+        #     reach the `cancelled` response without waiting for a slow browser;
+        #     the skipped frames were discarded unparsed, which is how a stop
+        #     could make the agent's output disappear for good.
         #   * a closed channel is a no-op, not an error.
         mk(i) = ACP.UnknownUpdate("u$i", Dict{String,Any}())
         full = Channel{ACP.SessionUpdate}(2)
         put!(full, mk(1)); put!(full, mk(2))          # full, no consumer
-        @atomic conn.cancelling = true
-        cancel_task = @async ACP.deliver_update!(conn, full, mk(3))
-        @test timedwait(() -> istaskdone(cancel_task), 2.0) === :ok
+        blocked = @async ACP.deliver_update!(conn, full, mk(3))
+        sleep(0.3)
+        @test !istaskdone(blocked)                    # waits, does not discard
+        @test Base.n_avail(full) == 2
+        take!(full)                                   # make room
+        @test timedwait(() -> istaskdone(blocked), 2.0) === :ok
+        @test Base.n_avail(full) == 2                 # ...and mk(3) went in
 
         closed = Channel{ACP.SessionUpdate}(1); close(closed)
         @test ACP.deliver_update!(conn, closed, mk(1)) === nothing
@@ -429,8 +435,57 @@ end
         try
             sid = do_setup(conn)
             client = ACP.Client(conn, sid, pwd())
-            ACP.cancel!(client)
-            @test !(@atomic conn.cancelling)      # not latched → next turn renders
+            @test ACP.cancel!(client) == false            # nothing to cancel
+            @test ACP.session_activity(conn) isa ACP.Idle # ...and it stays idle
+        finally
+            close(conn)
+        end
+        @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
+    end
+
+    # A cancel never mutes the session, whatever it was cancelling.
+    #
+    # There used to be a `cancelling` flag that made the dispatcher DROP
+    # main-thread updates, so it could skip a cancelled prompt's backlog and
+    # reach that prompt's `cancelled` response. It was cleared only by that
+    # response — so cancelling UN-PROMPTED work (an auto-wake episode, a
+    # background subagent), which has no response of ours coming, latched it
+    # forever and every later frame was discarded unparsed. The agent kept
+    # working and streaming while the client binned all of it; the chat looked
+    # dead until a reload, whose `session/load` replayed the backlog at once.
+    @testset "a cancel never mutes the session" begin
+        m = spawn_mock("setup_then_idle"); conn = m.conn
+        try
+            sid    = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+
+            # No prompt of ours is open; the agent is working on its own.
+            @atomic conn.last_work_at = time()
+            @atomic conn.activity = ACP.Unprompted()
+            @test ACP.session_live(client) == true
+            @test ACP.cancel!(client) == true            # the cancel DOES go out
+            # No prompt to settle, so it does not sit in `Cancelling`; and the
+            # cancel consumes the work recency it acted on, so it lands on
+            # `Idle` rather than re-reporting itself live for the quiet window.
+            @test ACP.session_activity(conn) isa ACP.Idle
+
+            put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("still working")))
+            @test timedwait(() -> Base.n_avail(client.messages) >= 1, 5.0) === :ok
+            msg = take!(client.messages)
+            @test msg isa ACP.AgentMessage && msg.text == "still working"
+
+            # With a prompt of ours open, the cancel is a STATE, and the frames
+            # behind it still arrive — that is the whole change. Asserted on the
+            # DELIVERED TEXT: consecutive chunks coalesce onto the open bubble,
+            # so the message count would not grow even when nothing is dropped.
+            span = ACP.PromptSpan(9992)
+            lock(() -> push!(conn.active_prompts, span), conn.lock)
+            @test ACP.cancel!(client) == true
+            @test ACP.session_activity(conn) isa ACP.Cancelling
+            put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("backlog")))
+            @test timedwait(() -> isready(msg.updates), 5.0) === :ok
+            @test take!(msg.updates) == "backlog"
         finally
             close(conn)
         end
@@ -573,13 +628,15 @@ end
         @test last(owned)[1] == "task-1"               # the terminal frame still lands
         @test !haskey(conn.tool_owners, "sub-t2")      # ... and then it is dropped
 
-        # Cancelling the MAIN thread must not silence a subagent: the owner path
-        # returns before `cancelling` is ever consulted.
-        @atomic conn.cancelling = true
-        ACP.dispatch_message(conn, plain(chunk("dropped")))
+        # A cancel in flight silences NEITHER stream. The main thread's frames
+        # are output the agent already produced, and the subagent was never
+        # cancelled at all — it is addressed by `parentToolUseId` and reaches
+        # its owner without consulting session state.
+        @atomic conn.activity = ACP.Cancelling()
+        ACP.dispatch_message(conn, plain(chunk("still rendered")))
         ACP.dispatch_message(conn, tagged(chunk("still mine")))
-        @test length(main)  == 3                       # main thread went quiet
-        @test length(owned) == 7                       # subagent did not
+        @test length(main)  == 4
+        @test length(owned) == 7
         close(conn)
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
         relay_close!(m)

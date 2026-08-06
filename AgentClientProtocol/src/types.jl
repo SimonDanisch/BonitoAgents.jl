@@ -146,9 +146,9 @@ is work; `available_commands` / `current_mode` / `session_info` / `usage` are
 metadata that arrives on bind and at turn boundaries.
 
 The distinction matters because these updates also arrive with NO prompt open
-(see `Connection.unprompted_work`), and treating every one of them as "the agent
-is busy" latches liveness true on a chat that has done nothing: a fresh session
-emits `available_commands_update` right after `session/new`.
+(see `Unprompted`), and treating every one of them as "the agent is busy" makes a
+chat that has done nothing look busy: a fresh session emits
+`available_commands_update` right after `session/new`.
 
 `SubagentUpdate` is work, but reaches this only in tests — on the wire it is
 addressed to its owner before liveness is ever consulted.
@@ -184,6 +184,53 @@ Whether an origin tag marks the result of a cycle the model ran on its own.
 """
 is_autonomous_origin(::Nothing) = false
 is_autonomous_origin(kind::AbstractString) = kind in AUTONOMOUS_ORIGINS
+
+# ── What the session is doing ────────────────────────────────────────────────
+# ONE value, replacing the pile of independent booleans this used to be
+# (`unprompted_work`, `cancelling`, and — a layer up — `busy_active` and
+# `autowake`). Each of those was a latch whose SET and CLEAR lived on different
+# code paths, and each had at least one path where the clear never ran:
+#
+#   * `cancelling` was cleared by a cancelled prompt's response, so cancelling
+#     UN-prompted work latched it forever and the session went silent until the
+#     user reloaded.
+#   * `busy_active`/`autowake` were cleared by a `usage_update` the agent tags
+#     with an autonomous origin — which claude-agent-acp emits conditionally and
+#     can simply omit — so the spinner ran over an idle agent, and because the
+#     composer queues while busy, the chat became unusable.
+#
+# The rule this type enforces: EVERY state has an exit that does not depend on
+# the agent volunteering anything.
+abstract type SessionActivity end
+
+"Nothing of ours is open and the agent is not streaming."
+struct Idle <: SessionActivity end
+
+"At least one `session/prompt` of ours is open. Ends at its response."
+struct Prompted <: SessionActivity end
+
+"""
+The agent is working with no prompt of ours open — it auto-woke after
+backgrounded work finished, or a background subagent is reporting.
+
+This is the one state the wire gives no end marker for: an auto-wake episode is
+prose and tools that simply stop. `AUTONOMOUS_ORIGINS` tags the usual last frame
+but is not guaranteed, so it is treated as a hint, never as the only way out —
+`quiet_since` bounds the state instead (see `settle`).
+"""
+struct Unprompted <: SessionActivity end
+
+"A cancel is on the wire and we are waiting for the turn to wind down."
+struct Cancelling <: SessionActivity end
+
+"""
+Whether the agent has work in flight that a cancel could reach.
+
+`Idle` is the only state where stop has nothing to do — and that is exactly the
+moment a UI should treat its own spinner as stale rather than act on it.
+"""
+is_working(::SessionActivity) = true
+is_working(::Idle) = false
 
 # ── The message stream ───────────────────────────────────────────────────────
 # Whole, ordered messages coalesced from the raw `session/update` soup. The
