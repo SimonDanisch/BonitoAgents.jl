@@ -4379,6 +4379,12 @@ function Base.close(model::ChatModel)
     # Stop the TaskBar's own poll loop and drop its live tasks — otherwise the
     # 1 Hz loop spins forever, pinning the model (and its tasks) past teardown.
     close(s.taskbar)
+    # And the quiet-check `Timer`, which RE-ARMS itself while an episode is
+    # open. An unclosed libuv timer is not just a leak: Julia refuses to finish
+    # PRECOMPILATION while an event source is alive, so one left behind by the
+    # `@compile_workload` stalls the build with "waiting for IO to finish"
+    # until it expires.
+    cancel_quiet_check!(model)
     return nothing
 end
 
@@ -5148,18 +5154,26 @@ function drain_turn!(chat::ChatModel, turn)
             sweep_pending_asks!(chat)
             finish_live_todo!(chat)
             # Empty turn: the agent resolved without emitting any message (no
-            # text, tool, or thought) and it wasn't an error or a user cancel.
-            # The common cause is a just-switched provider that isn't
-            # authenticated (its prompts return an empty `end_turn`). Surface a
-            # hint rather than leave the user staring at silence.
+            # text, tool, or thought). Surface something rather than leave the
+            # user staring at silence — but only ASSERT a cause we actually know.
+            #
+            # `stopReason` is not enough on its own. A stop the agent did not
+            # report back as `cancelled` still ends the turn empty, and blaming
+            # the user's plan or credentials for their own stop is worse than
+            # saying nothing: it sent people off checking logins over a turn they
+            # had cancelled themselves. `cancel_at` is stamped when stop is
+            # pressed and reset at each request start, so it answers "was this
+            # turn stopped" independently of what the agent chose to call it.
             cancelled = stop_reason == "cancelled"
+            stopped   = (c = client(chat.agent);
+                         c !== nothing && (@atomic c.conn.cancel_at) > 0)
             if !errored && !cancelled &&
                lock(() -> length(s.msgs_store), s.lock) == nstore0
-                close(send!(chat, AgentMsg(chat,
-                    "_The agent ended the turn without a reply. The selected " *
-                    "model may be unavailable on your plan, or the provider may " *
-                    "need authentication — try picking a different model, or " *
-                    "check the provider's login/credentials._")))
+                close(send!(chat, AgentMsg(chat, stopped ?
+                    "_Stopped — the turn ended with no reply._" :
+                    "_The agent ended the turn without a reply. If you just " *
+                    "switched model or provider, it may be unavailable on your " *
+                    "plan or need authentication._")))
             end
             # Yolo mode: keep the agent going autonomously until it answers `no`.
             if shared(chat).yolo[] && !errored && !cancelled
