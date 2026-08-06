@@ -92,7 +92,20 @@ mutable struct ChatModel
     # exactly what made the spinner run forever over an idle chat. On a provider
     # that doesn't tag it (`reports_autonomous_origin`) we don't track episodes
     # at all rather than start something we can't stop.
-    autowake::Ref{Bool}
+    # The `SessionActivity` this chat has already reacted to. NOT a copy of the
+    # truth — the connection owns that, and `session_activity` re-derives it on
+    # read — but the edge detector: crossing INTO `Unprompted` starts the pills
+    # waiting on an autonomous cycle, crossing OUT retires them. Storing the
+    # last-seen value is what turns a level into an edge; storing the level
+    # itself is what made this a latch.
+    activity_seen::Ref{AgentClientProtocol.SessionActivity}
+
+    # One live `Timer` while an `Unprompted` episode is open, `nothing`
+    # otherwise. `Unprompted` ends on QUIET — which means no frame arrives to
+    # announce it, so nothing would republish `busy_active` and the spinner
+    # would keep running over an agent that stopped talking. A field, not a
+    # module-level table keyed by chat: per-object state belongs on the object.
+    activity_timer::Ref{Any}
 
     # One-shot history prelude prepended to the next prompt after a session
     # change that lost claude's jsonl (see `arm_history_replay!`). Empty = none.
@@ -294,7 +307,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Channel{UserMessage}(64),
         Any[],                      # pending_sends (user bubbles not yet prompted)
         Ref{Any}(nothing),          # main_consumer (bound with the ACP session)
-        Ref(false),                 # autowake (auto-wake episode in progress)
+        Ref{AgentClientProtocol.SessionActivity}(AgentClientProtocol.Idle()),  # activity_seen
+        Ref{Any}(nothing),          # activity_timer
         Ref(""),                    # pending_history_replay
         Dict{String,Vector{Any}}(), # pending_subagent (activity ahead of its parent Task)
         Observable(Dict{String,Any}()),
@@ -371,7 +385,8 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.user_messages,           # shared queue → all sessions feed one consumer
             m.pending_sends,           # shared → reconcile sees every tab's unsent bubbles
             m.main_consumer,           # shared → one main-thread renderer per chat
-            m.autowake,                # shared → one episode state per chat
+            m.activity_seen,           # shared → one edge detector per chat
+            m.activity_timer,          # shared → one quiet-check per chat
             m.pending_history_replay,
             m.pending_subagent,        # shared → one activity buffer per chat
             map(identity, session, m.comm),
@@ -738,6 +753,11 @@ const REPORT_WAIT_SECONDS = 45.0
 # still finite, because the failure it guards is a hang and an unbounded wait
 # turns one stalled renderer into a permanently unusable chat.
 const RENDER_BARRIER_SECONDS = 10.0
+
+# How often an open `Unprompted` episode re-checks whether it has gone quiet.
+# Well under `AgentClientProtocol.QUIET_SECONDS` so the spinner clears promptly
+# once the episode expires, rather than a whole quiet window later.
+const QUIET_CHECK_SECONDS = 5.0
 
 # The one-line stage description a pill shows next to its elapsed clock.
 phase_note(::Executing)      = ""
@@ -3440,11 +3460,17 @@ end
 # Context/cost telemetry (after every assistant message): pure header
 # metadata, no bubble, no persistence — the next turn refreshes it.
 function process!(chat::ChatModel, m::AgentClientProtocol.UsageUpdate)
-    # The end of an autonomous cycle — the ONLY end-of-episode signal on the
-    # wire. claude-agent-acp tags a cycle's result `usage_update` with its
-    # origin; `task-notification` and friends mean the model did that work on
-    # its own, so the auto-wake episode this closes is over.
-    AgentClientProtocol.is_autonomous_origin(m.origin_kind) && end_autowake!(chat)
+    # claude-agent-acp tags a cycle's RESULT `usage_update` with its origin;
+    # `task-notification` and friends mean the model did that work on its own, so
+    # the episode this closes is over. A HINT, not the contract: the adapter
+    # emits this conditionally, and treating it as the only way out is what left
+    # the spinner running over an idle agent. `Unprompted` expires on quiet
+    # regardless; this just ends it promptly when the agent does say so.
+    if AgentClientProtocol.is_autonomous_origin(m.origin_kind)
+        c = client(chat.agent)
+        c === nothing || (@atomic c.conn.last_work_at = 0.0)
+        refresh_activity!(chat)
+    end
     shared(chat).usage[] = (used = m.used, size = m.size,
                             cost = m.cost_amount, origin = m.origin_kind)
     return nothing
@@ -4458,16 +4484,11 @@ function main_consumer!(chat::ChatModel, messages)
             AgentClientProtocol.signal_rendered!(m)
             continue
         end
-        # An auto-wake episode begins the first time the agent does WORK on the
-        # main thread with no prompt of ours open. `begin_autowake!` is the only
-        # place liveness is claimed off arriving frames, and it is safe to do so
-        # there precisely because that episode has an end marker (see `BgPhase`
-        # / `AUTONOMOUS_ORIGINS`) — unlike the old unconditional set, which had
-        # no way back.
-        if AgentClientProtocol.is_agent_work(m) &&
-           lock(() -> s.turns_active[], s.lock) == 0
-            begin_autowake!(chat)
-        end
+        # The connection already decided what the session is doing (the
+        # dispatcher settles it as each frame lands). All this does is react to
+        # the EDGE and republish the spinner — the renderer never invents
+        # liveness of its own, which is what let it be turned on and never off.
+        refresh_activity!(chat)
         # NB the renderer deliberately does NOT touch `busy_active` directly. It reads
         # "a prompt of ours is in flight", which is a fact with both an
         # unambiguous start and an unambiguous end (see `begin_turn!` /
@@ -4555,66 +4576,145 @@ end
 #
 # Returns as a no-op if there is no session yet, or if the stream is being torn
 # down — `bind` makes a dead consumer close the marker instead of hanging us.
-autowake_active(chat::ChatModel) = shared(chat).autowake[]
+"""
+    session_activity(chat) -> SessionActivity
 
-# Whether this chat's agent tells us when an autonomous cycle ends. Without that
-# marker an episode has no observable end, so we don't open one.
-autowake_trackable(chat::ChatModel) =
-    AgentProviders.reports_autonomous_origin(shared(chat).provider[])
+What this chat's agent is doing, straight from the connection (which re-derives
+it on read). `Idle` when there is no session yet — a chat with no agent bound is
+not working.
+"""
+function session_activity(chat::ChatModel)
+    c = client(chat.agent)
+    c === nothing && return AgentClientProtocol.Idle()
+    return AgentClientProtocol.session_activity(c.conn)
+end
 
-# The agent started talking with no prompt of ours open. Show it — spinner on,
-# and every task waiting to be reported on moves to "agent reporting back".
-function begin_autowake!(chat::ChatModel)
-    autowake_trackable(chat) || return nothing
+"""
+    busy(chat) -> Bool
+
+Whether to claim the agent is working. DERIVED, never stored: a turn of ours is
+open, or the connection says the agent is doing something on its own.
+
+`turns_active` is not redundant with `Prompted` — it covers the window between
+claiming a turn slot and the prompt actually reaching the wire, where the
+connection has no span yet but the user has already pressed send.
+"""
+busy(chat::ChatModel) =
+    lock(() -> shared(chat).turns_active[], shared(chat).lock) > 0 ||
+    AgentClientProtocol.is_working(session_activity(chat))
+
+# An auto-wake episode is now just `Unprompted`, so "is the agent reporting back
+# on its own" is a question about the session, not a flag of ours.
+autowake_active(chat::ChatModel) = session_activity(chat) isa AgentClientProtocol.Unprompted
+
+"""
+    refresh_activity!(chat) -> SessionActivity
+
+Re-read the session's activity, run whatever the EDGE calls for, and republish
+`busy_active`. The single writer — this is what replaced four call sites each
+assigning the spinner from its own idea of the state.
+
+`busy_active` stays an Observable because the UI subscribes to it, but it is a
+CACHE of `busy(chat)`, never an independent fact. Written unconditionally, not
+set-if-changed: every write re-broadcasts to every open tab, which is what
+repairs a tab whose bridge missed an update — a guarded write can never fix one,
+because the value is already what we would set.
+"""
+function refresh_activity!(chat::ChatModel)
+    s   = shared(chat)
+    act = session_activity(chat)
+    was = lock(() -> s.activity_seen[], s.lock)
+    lock(() -> (s.activity_seen[] = act), s.lock)
+
+    entered_unprompted = act isa AgentClientProtocol.Unprompted &&
+                         !(was isa AgentClientProtocol.Unprompted)
+    left_unprompted    = was isa AgentClientProtocol.Unprompted &&
+                         !(act isa AgentClientProtocol.Unprompted)
+    entered_unprompted && enter_unprompted!(chat)
+    left_unprompted    && leave_unprompted!(chat)
+
+    s.busy_active[] = busy(chat)
+    act isa AgentClientProtocol.Unprompted ? schedule_quiet_check!(chat) :
+                                             cancel_quiet_check!(chat)
+    return act
+end
+
+# Re-check an open `Unprompted` episode after it can have gone quiet.
+#
+# Nothing else will: the episode ends because frames STOP, so there is no frame
+# to react to. Without this the spinner keeps running over an agent that has
+# finished — the exact complaint that started this refactor. One timer per chat,
+# replaced rather than stacked; it re-arms itself only while the episode is
+# still open, so it stops on its own.
+function schedule_quiet_check!(chat::ChatModel)
     s = shared(chat)
-    # Compare-and-set: only the frame that OPENS the episode does the work, so
-    # every later frame of the same episode is free.
-    started = lock(s.lock) do
-        s.autowake[] && return false
-        s.autowake[] = true
-        return true
+    lock(s.lock) do
+        t = s.activity_timer[]
+        t isa Timer && isopen(t) && return nothing        # one is already pending
+        s.activity_timer[] = Timer(QUIET_CHECK_SECONDS) do _
+            # `refresh_activity!` re-settles, runs the leave-edge if the episode
+            # is over, and schedules the next check if it is not.
+            refresh_activity!(chat)
+        end
+        return nothing
     end
-    started || return nothing
+    return nothing
+end
+
+function cancel_quiet_check!(chat::ChatModel)
+    s = shared(chat)
+    lock(s.lock) do
+        t = s.activity_timer[]
+        t isa Timer && isopen(t) && close(t)
+        s.activity_timer[] = nothing
+        return nothing
+    end
+    return nothing
+end
+
+# The agent started talking with no prompt of ours open: every task waiting to be
+# reported on moves to "agent reporting back".
+function enter_unprompted!(chat::ChatModel)
     for t in chat_taskbar(chat).items[]
         t isa BashToolMsg || t isa TaskToolMsg || continue
         report_started!(t)
     end
-    s.busy_active[] = true
     return nothing
 end
 
-# The episode ended: either the agent's own end-of-cycle marker, or the boundary
-# a new user turn draws. Retire the pills that were waiting on it and stop
-# claiming the agent is working.
-function end_autowake!(chat::ChatModel)
-    s = shared(chat)
-    was_open = lock(s.lock) do
-        open = s.autowake[]
-        s.autowake[] = false
-        return open
-    end
-    # Sweep UNCONDITIONALLY. A background task can finish and be followed by no
-    # auto-wake at all — the agent had nothing to add, or the provider never
-    # tags one — and its pill must not outlive this boundary either. A task
-    # still EXECUTING is untouched: background work outlives turns, which is the
-    # whole point of it.
+"""
+    retire_reporting!(chat)
+
+Every pill that was waiting to be reported on is finished for good.
+
+A BOUNDARY action, not an edge one — it must run whether or not an episode
+actually opened. A background task can finish and be followed by no auto-wake at
+all (the agent had nothing to add), and its pill must not outlive the boundary
+either; making this edge-only left such a pill stuck at `AwaitingReport`
+forever. A task still EXECUTING is untouched: background work outlives turns,
+which is the whole point of it. `report_finished!` is a guarded transition, so
+running this twice over one boundary is a no-op.
+"""
+function retire_reporting!(chat::ChatModel)
     for t in chat_taskbar(chat).items[]
         t isa BashToolMsg || t isa TaskToolMsg || continue
         report_finished!(t)
     end
-    # Only an episode that was actually open has liveness to give back; a plain
-    # turn boundary must not stomp the flag a running turn owns.
-    was_open && (s.busy_active[] = (s.turns_active[] > 0))
+    return nothing
+end
+
+# The episode ended: retire its pills and finalize the todo list it built.
+function leave_unprompted!(chat::ChatModel)
+    s = shared(chat)
+    retire_reporting!(chat)
     # An episode that built a todo list finalizes it into history, exactly as a
-    # turn does — the episode is over and there is no held-open turn to keep it
-    # live. Without this the card sits in the bar, frozen at whatever it reached,
-    # until some LATER turn happens to end (observed: `Todos 0/2` still pinned
-    # long after the work moved on).
+    # turn does — there is no held-open turn to keep it live. Without this the
+    # card sits in the bar frozen at whatever it reached (observed: `Todos 0/2`
+    # still pinned long after the work moved on).
     #
     # Only when nothing else is running: under steering the live list belongs to
-    # the turn still in flight, and `begin_turn!` handles the plain-boundary case
-    # with the same guard.
-    was_open && lock(() -> s.turns_active[], s.lock) == 0 && finish_live_todo!(chat)
+    # the turn still in flight.
+    lock(() -> s.turns_active[], s.lock) == 0 && finish_live_todo!(chat)
     return nothing
 end
 
@@ -4767,9 +4867,13 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     # agent is still working (`drain_turn!` does it for the last real turn).
     lock(() -> s.turns_active[], s.lock) == 0 && finish_live_todo!(chat)
     # A boundary the agent cannot omit: whatever the episode did or didn't
-    # report, it is over now. This is what bounds an episode on a provider that
-    # never sends the end marker.
-    end_autowake!(chat)
+    # report, a new turn of ours ends it. `refresh_activity!` runs the leave-EDGE
+    # (which also finalizes the episode's todo list) and republishes the
+    # spinner; `retire_reporting!` is the BOUNDARY half, and runs even when no
+    # episode was ever open — a task can finish with the agent having nothing to
+    # say about it, and its pill still has to go.
+    refresh_activity!(chat)
+    retire_reporting!(chat)
     # A turn can still be drained from the channel AFTER the chat is closed:
     # `close(::ChatModel)` shuts `user_messages`, but the consumer keeps draining
     # whatever was already buffered (a `for … in channel` finishes the buffer
@@ -4803,13 +4907,14 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     end
     cli === nothing && return nothing
     lock(() -> s.turns_active[] += 1, s.lock)
-    # Unconditional, NOT set-if-changed. Every write here is also a re-broadcast
-    # to every open tab, and that is the point: a tab whose bridge missed an
-    # update (a WS blip, a reconnect) shows the wrong indicator, and a guarded
-    # write can never repair it — the value is already what we would set, so
-    # nothing ships and the tab stays wrong through every message you send. That
-    # is the "stuck on Waiting for your next instruction" shape.
-    s.busy_active[] = true
+    # The slot is claimed, so `busy` is now true by derivation — publish it.
+    # (`refresh_activity!` writes unconditionally, which is the point: every
+    # write re-broadcasts to every open tab, and that is what repairs a tab whose
+    # bridge missed an update. A guarded write never can — the value is already
+    # what we would set, so nothing ships and the tab stays wrong through every
+    # message you send. That is the "stuck on Waiting for your next instruction"
+    # shape.)
+    refresh_activity!(chat)
     # Ship the turn's sequence number — a stop-click echoes it back so the
     # cancel can be scoped to THIS turn (see CancelCommand).
     seq = (s.turn_seq[] += 1)
@@ -4836,8 +4941,8 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
         # busy tracks `turns_active > 0` (false here).
         lock(s.lock) do
             s.turns_active[] -= 1
-            s.busy_active[] = (s.turns_active[] > 0)
         end
+        refresh_activity!(chat)
         rethrow()
     end
 end
@@ -5009,10 +5114,11 @@ function drain_turn!(chat::ChatModel, turn)
         # todo list would zombie a list the successor is still working.
         last_turn = lock(() -> (s.turns_active[] -= 1) == 0, s.lock)
         if last_turn
-            # SHARED, not `chat.busy_active`: the per-tab one is a session-scoped
-            # child (parent→child only), so writing it left the parent stuck true
-            # and every other tab/reload rendering "working" forever.
-            s.busy_active[] = false
+            # Derived, and published on the SHARED model: the per-tab
+            # `busy_active` is a session-scoped child (parent→child only), so
+            # writing that one left the parent stuck true and every other
+            # tab/reload rendering "working" forever.
+            refresh_activity!(chat)
             # The turn added messages (agent reply, tools, …) → refresh the
             # lens autocomplete vocabulary so new tool/type keys are
             # suggestable. (Emitted on mount too, but that's before any
@@ -5509,7 +5615,12 @@ function bring_up_once!(model::ChatModel)
                 sleep(0.02)
             end
         end
-        s.busy_active[] = false
+        # The old session is gone, so nothing it was doing counts any more.
+        # Forget the edge we last saw with it — otherwise the next session's
+        # first `Unprompted` would look like a continuation of the dead one's
+        # episode and skip the enter-edge.
+        lock(() -> (s.activity_seen[] = AgentClientProtocol.Idle()), s.lock)
+        refresh_activity!(s)
         chat_emit(s, Dict{String,Any}("type" => "thinking", "active" => false))
         sweep_turn_orphans!(s)
         # JS-side reset: drop any UI state attached to the dead session before
@@ -7388,10 +7499,7 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # are KEPT — the consumer is free to pick them up, which is what the user
     # wanted when they typed them.
     if !AgentClientProtocol.session_live(c)
-        end_autowake!(model)
-        lock(s.lock) do
-            s.busy_active[] = (s.turns_active[] > 0)
-        end
+        refresh_activity!(model)
         return nothing
     end
 

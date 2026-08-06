@@ -69,7 +69,14 @@ function stalled_model()
     return model, cli, gate
 end
 
-feed!(cli, u) = put!(cli.updates, u)
+# Put an update on the main stream exactly as the dispatcher would: settle the
+# session's activity from it, THEN deliver. Liveness is decided where frames
+# really arrive, not by the renderer — so a harness that skipped the settle
+# would be testing a code path production does not have.
+function feed!(cli, u)
+    ACP.settle!(cli.conn; worked = ACP.is_agent_work(u))
+    put!(cli.updates, u)
+end
 
 amc(s) = ACP.AgentMessageChunk(ACP.TextContent(s))
 toolnotif(id, title) = ACP.ToolCallNotif(id, title, "execute", "completed",
@@ -258,11 +265,10 @@ end
 end
 
 @testset "the busy indicator follows the episode, and the episode ENDS" begin
-    # `busy_active` may be set from arriving frames — but ONLY as an auto-wake
-    # episode, which has an end marker. Setting it unconditionally was a latch
-    # with no key: nothing could turn it off again, so the spinner span forever
-    # over an idle chat and `note_bound!` (which skips busy chats) stopped being
-    # able to evict anything.
+    # `busy_active` is DERIVED from the session's activity, never latched. It
+    # used to be assigned from five places, one of which could turn it on with
+    # no path that turned it off — so the spinner ran forever over an idle chat
+    # and `note_bound!` (which skips busy chats) stopped evicting anything.
     model, cli = live_model()
     s = BT.shared(model)
     @test s.busy_active[] == false
@@ -277,12 +283,13 @@ end
     @test length(BT.shared(model).msgs_store) == 3
     @test s.turns_active[] == 0          # with no prompt of ours open
     # ... and the chat says so, because it can take it back.
-    @test s.autowake[] == true
+    @test BT.session_activity(model) isa ACP.Unprompted
     @test s.busy_active[] == true
 
-    # The end marker takes it back. THIS is what the old code had no way to do.
+    # The agent's own end-of-cycle tag ends it promptly. It is a HINT, not the
+    # contract — `Unprompted` expires on quiet even when it never arrives.
     BT.process!(model, ACP.UsageUpdate(1, 2, nothing, nothing, "task-notification"))
-    @test s.autowake[] == false
+    @test BT.session_activity(model) isa ACP.Idle
     @test s.busy_active[] == false
     close(model)
 end
@@ -310,10 +317,10 @@ end
     @test BT.isdone(pill) == false                        # ... and not retired
 
     # (2) The agent auto-wakes: un-prompted work on the main thread.
-    @test s.autowake[] == false
+    @test !(BT.session_activity(model) isa ACP.Unprompted)
     feed!(cli, amc("The background job finished. "))
     BT.flush_main!(model)
-    @test s.autowake[] == true
+    @test BT.session_activity(model) isa ACP.Unprompted
     @test pill.phase isa BT.Reporting
     @test BT.taskbar_activity(pill, time()) == "agent reporting back"
     @test s.busy_active[] == true                         # spinner, bounded this time
@@ -321,9 +328,9 @@ end
     # (3) The episode's own end marker — an autonomous-origin usage_update.
     # `human` must NOT end it: that is the user's own turn.
     BT.process!(model, ACP.UsageUpdate(10, 100, nothing, nothing, "human"))
-    @test s.autowake[] == true
+    @test BT.session_activity(model) isa ACP.Unprompted
     BT.process!(model, ACP.UsageUpdate(10, 100, nothing, nothing, "task-notification"))
-    @test s.autowake[] == false
+    @test BT.session_activity(model) isa ACP.Idle
     @test pill.phase isa BT.Reported
     @test s.busy_active[] == false                        # and the spinner stops
     @test BT.isdone(pill) == true                         # the bar retires it next poll
@@ -342,7 +349,7 @@ end
     feed!(cli, planupd([("step a", "in_progress"), ("step b", "pending")]))
     BT.flush_main!(model)
 
-    @test s.autowake[] == true
+    @test BT.session_activity(model) isa ACP.Unprompted
     t = s.live_todo[]
     @test t isa BT.TodoListMsg
     @test BT.in_taskbar(t)                 # live while the episode runs
@@ -350,7 +357,7 @@ end
 
     # The episode's own end marker finalizes it, exactly as a turn's end would.
     BT.process!(model, ACP.UsageUpdate(1, 2, nothing, nothing, "task-notification"))
-    @test s.autowake[] == false
+    @test BT.session_activity(model) isa ACP.Idle
     @test s.live_todo[] === nothing
     @test !BT.in_taskbar(t)
     @test t.finished_at !== nothing         # ... into history, not left hanging
@@ -462,11 +469,14 @@ end
 
     feed!(cli, amc("reporting with no end marker"))
     BT.flush_main!(model)
-    @test s.autowake[] == true
+    @test BT.session_activity(model) isa ACP.Unprompted
     @test pill.phase isa BT.Reporting
 
-    BT.end_autowake!(model)          # what `begin_turn!` calls at the boundary
-    @test s.autowake[] == false
+    # The episode goes quiet with no end marker at all. `Unprompted` expires on
+    # its own — that is the property the old `autowake` latch did not have.
+    @atomic cli.conn.last_work_at = 0.0
+    BT.refresh_activity!(model)
+    @test BT.session_activity(model) isa ACP.Idle
     @test pill.phase isa BT.Reported
     @test s.busy_active[] == false
     close(model)
@@ -514,32 +524,46 @@ end
     close(healthy)
 end
 
-# Stop over a chat whose agent has ALREADY finished. The auto-wake episode
-# claimed liveness off arriving frames and its end marker (a `usage_update` the
-# agent tags with an autonomous origin) can simply be absent, leaving the only
-# other exit — `begin_turn!` — behind the very flag that makes the composer
-# queue. Stop used to drop the queued sends unconditionally: it deleted the
-# message that would have released the chat and cancelled nothing at all.
-@testset "stop reconciles a stale spinner instead of eating the message" begin
+# The wedge, and why it is now unrepresentable.
+#
+# An auto-wake episode used to claim liveness with a latch of its own, whose only
+# exits were an end marker the agent may never send and `begin_turn!` — and
+# `busy_active` is exactly what makes the composer queue instead of send. So the
+# one way out ran through the thing that was broken. Stop was the last control
+# left, and it dropped the queued sends unconditionally: it deleted the message
+# that would have released the chat and cancelled nothing at all. Observed live
+# as a 53-minute wedge over an agent that had been idle the whole time.
+#
+# `busy_active` is derived now, so "spinner on while the session is idle" is not
+# a state anyone can construct.
+@testset "an episode nobody ends still lets go of the spinner" begin
     model, cli = live_model()
     s = BT.shared(model)
     feed!(cli, amc("background task finished, here's the report"))
     BT.flush_main!(model)
-    @test s.autowake[] == true          # episode open, no prompt of ours
+    @test BT.session_activity(model) isa ACP.Unprompted   # no prompt of ours
     @test s.busy_active[] == true
 
-    BT.send_message!(model, BT.UserMsg("is it actually still running?"))
+    # No end marker EVER arrives — the agent simply stops talking. This is the
+    # case the old latch had no answer for.
+    @atomic cli.conn.last_work_at = 0.0
+    BT.refresh_activity!(model)
+    @test BT.session_activity(model) isa ACP.Idle
+    @test s.busy_active[] == false
+
+    # So the composer SENDS rather than queueing behind a turn that will never
+    # come...
+    BT.send_message!(model, BT.UserMsg("is it actually still running?")) 
     @test timedwait(() -> Base.n_avail(s.user_messages) == 1, 5.0) === :ok
     bubble = last([m for m in s.msgs_store if m isa BT.UserMsg])
-    @test bubble.queued == true
+    @test bubble.queued == false
 
+    # ...and a stop that finds nothing to cancel KEEPS what the user typed
+    # instead of relabelling it "not sent".
     BT.handle_command!(model, nothing, BT.CancelCommand())
-    # Nothing was live, so the spinner was the lie — that gets fixed…
-    @test s.busy_active[] == false
-    @test s.autowake[] == false
-    # …and what the user typed is still there to be sent.
     @test Base.n_avail(s.user_messages) == 1
-    @test bubble.queued == true         # not relabelled "not sent"
+    @test bubble.queued == false
+    @test s.busy_active[] == false
     close(model)
 end
 
@@ -547,10 +571,11 @@ end
 @testset "stop still cancels and clears the queue when work is live" begin
     model, cli = live_model()
     s = BT.shared(model)
-    # What the dispatcher records when the agent works with no prompt of ours.
-    @atomic cli.conn.last_work_at = time()
-    @atomic cli.conn.activity = ACP.Unprompted()
+    # A real un-prompted episode, settled the way the dispatcher settles it.
+    feed!(cli, amc("still working on the background job"))
+    BT.flush_main!(model)
     @test ACP.session_live(cli) == true
+    @test s.busy_active[] == true
     BT.send_message!(model, BT.UserMsg("stop for real"))
     @test timedwait(() -> Base.n_avail(s.user_messages) == 1, 5.0) === :ok
 
