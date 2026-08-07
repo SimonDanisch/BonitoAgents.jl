@@ -32,6 +32,31 @@
 #                         test prove the cancel-then-restart escalation
 #                         works against an uncooperative agent.
 #
+# ── Badly-behaved cancel (the shapes that actually broke us) ────────────────
+# Every cancel bug we shipped lived in the gap between "the client asked to
+# stop" and "the agent finished stopping". The scenarios above are all polite:
+# they break their loop on `cancelled[]` and answer `cancelled` immediately, so
+# that gap is zero and the interesting states never occur. These three make it
+# real.
+#
+#   cancel_orphan_tool  — open a tool, then on cancel answer `cancelled`
+#                         WITHOUT ever sending a terminal frame for it. The
+#                         real adapter does this when its interrupt floor
+#                         elapses. A tool's update channel closes on its
+#                         terminal frame and the chat's consumer BLOCKS
+#                         draining it, so an orphan parks the renderer: the
+#                         agent keeps talking and nothing shows up until a
+#                         reload replays it.
+#   slow_cancel         — keep streaming for BT_MOCK_ACP_CANCEL_DELAY_MS after
+#                         the cancel before answering. Models
+#                         claude-agent-acp's `DEFAULT_FORCE_CANCEL_GRACE_MS`
+#                         (30 s) wait for the SDK to yield. The window a
+#                         message can be typed into, and lost.
+#   swallow_next_prompt — once cancelled, answer the NEXT prompt `end_turn`
+#                         with no output at all, the way the adapter settles a
+#                         turn queued during an interrupt ("no in-flight SDK
+#                         work to interrupt"). The user's message vanishes.
+#
 # Stdin EOF → exit(0). The `LocalTransport` close(); `kill` cycle relies on
 # this: closing stdin makes us drop out of the dispatcher loop cleanly.
 
@@ -54,6 +79,9 @@ DISPATCHER_ADDR::String = ""
 # a `session/cancel` — simulates a wedged agent that ignores cancel, so a test can
 # exercise the chat's re-cancel → force-close escalation.
 IGNORE_CANCEL::Bool     = false
+# How long `slow_cancel` keeps streaming after `session/cancel` before it
+# answers. The real floor is 30 s; tests want it short but non-zero.
+CANCEL_DELAY_MS::Int    = 1500
 
 function _configure!()
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
@@ -62,6 +90,7 @@ function _configure!()
     global CHUNK_MS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNK_MS", "0")))
     global DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
     global IGNORE_CANCEL   = get(ENV, "BT_MOCK_ACP_IGNORE_CANCEL", "") == "1"
+    global CANCEL_DELAY_MS = parse(Int, String(get(ENV, "BT_MOCK_ACP_CANCEL_DELAY_MS", "1500")))
     return nothing
 end
 
@@ -247,6 +276,50 @@ function handle_prompt(prompt_id, scenario::AbstractString)
         end
         tool_call_update("tc-b", Dict("status" => "completed"))
         resp(prompt_id, Dict("stopReason" => "end_turn"))
+    elseif scenario == "cancel_orphan_tool"
+        # A tool is running when the stop lands, and it NEVER reports terminal.
+        tool_call("in_progress"; id = "orphan-1", title = "long tool")
+        while !cancelled[]
+            sleep(0.05)
+        end
+        # Deliberately no `tool_call_update` for orphan-1 — that is the whole
+        # point. Keep TALKING first, THEN answer: these chunks arrive while the
+        # client is still parked on the orphan's stream, so they only ever reach
+        # the screen if the response's boundary releases it. A client that never
+        # releases shows none of this, which is exactly what the test asserts.
+        for i in 1:3
+            agent_chunk("after-cancel$i "); sleep(0.05)
+        end
+        resp(prompt_id, Dict("stopReason" => "cancelled"))
+    elseif scenario == "slow_cancel"
+        # Stream until cancelled, then keep going for the grace window before
+        # answering — the adapter's interrupt floor, where a typed message can
+        # be swallowed.
+        # Paced deliberately: `pause()` is a no-op at the default CHUNK_MS=0, and
+        # an unpaced loop floods the socket faster than the client can drain,
+        # which tests the buffer rather than the cancel.
+        i = 0
+        while !cancelled[]
+            i += 1; agent_chunk("pre$i "); sleep(0.1)
+        end
+        t0 = time()
+        while time() - t0 < CANCEL_DELAY_MS / 1000
+            agent_chunk("winddown "); sleep(0.1)
+        end
+        resp(prompt_id, Dict("stopReason" => "cancelled"))
+    elseif scenario == "swallow_next_prompt"
+        # First prompt streams and honors the cancel. EVERY later prompt is
+        # answered `end_turn` with no output — the adapter settling a turn that
+        # was queued while it was interrupting.
+        if cancelled[]
+            resp(prompt_id, Dict("stopReason" => "end_turn"))
+        else
+            i = 0
+            while !cancelled[]
+                i += 1; agent_chunk("work$i "); sleep(0.1)
+            end
+            resp(prompt_id, Dict("stopReason" => "cancelled"))
+        end
     elseif scenario == "crash"
         # Mimic an agent that segfaulted mid-turn: no response, just exit.
         exit(1)

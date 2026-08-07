@@ -381,7 +381,7 @@ stays untouched).
 function scrub_mock_env!()
     for k in ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
               "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
-              "BT_MOCK_ACP_IGNORE_CANCEL")
+              "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_CANCEL_DELAY_MS")
         delete!(ENV, k)
     end
     get(ENV, "BT_DEFAULT_PROVIDER", "") in ("MockCode", "MockCode2") &&
@@ -406,6 +406,8 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       browser_width::Int  = 1280,
                       browser_height::Int = 820,
                       ignore_cancel::Bool = false,
+                      scenario::Union{String,Nothing} = nothing,
+                      cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
                       kwargs...)
     ensure_display!()
@@ -453,6 +455,18 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
+    # Opt-in: run a BUILT-IN MockACP scenario instead of the dispatcher. The
+    # dispatcher is scripted from the test process and is therefore always a
+    # well-behaved agent — it answers when the script says to. The badly-behaved
+    # cancel shapes (`cancel_orphan_tool`, `slow_cancel`, `swallow_next_prompt`)
+    # have to live in the mock itself, because what they model is the agent NOT
+    # doing what the client expects.
+    if scenario !== nothing
+        agent_env["BT_MOCK_ACP_SCENARIO"] = scenario
+        delete!(agent_env, "BT_MOCK_ACP_DISPATCHER")
+    end
+    cancel_delay_ms === nothing ||
+        (agent_env["BT_MOCK_ACP_CANCEL_DELAY_MS"] = string(cancel_delay_ms))
 
     h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
