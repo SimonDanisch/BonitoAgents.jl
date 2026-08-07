@@ -259,8 +259,19 @@ abstract type Message end
 # and the waiter is released the same way.
 struct StreamFlush <: Message
     done::Channel{Nothing}
+    # Whether the span this boundary ends was ABANDONED — i.e. it resolved
+    # `cancelled`, so any tool of its that never reported terminal never will.
+    #
+    # The coalescer needs the distinction because a tool's `updates` channel is
+    # closed on its terminal frame, and the CONSUMER blocks draining that
+    # channel. A handed-off turn's live tool must survive (a `bt_julia_eval`
+    # still running when the next prompt goes out); a CANCELLED turn's live tool
+    # must be released, or the consumer waits on a channel nothing will ever
+    # close and the whole chat stops rendering — messages pile up unseen until a
+    # reload replays them.
+    abandoned::Bool
 end
-StreamFlush() = StreamFlush(Channel{Nothing}(1))
+StreamFlush(abandoned::Bool = false) = StreamFlush(Channel{Nothing}(1), abandoned)
 
 # Release everyone waiting on this boundary. Idempotent.
 signal_rendered!(m::StreamFlush) = (isopen(m.done) && close(m.done); nothing)

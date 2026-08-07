@@ -361,6 +361,46 @@ end
         @test isempty(st2.tools)
     end
 
+    # A CANCELLED span must release its live tools; a normal handoff must not.
+    #
+    # A tool's `updates` channel is closed on its terminal frame, and the chat's
+    # consumer BLOCKS draining that channel. So a tool that never reports
+    # terminal parks the consumer forever: the agent keeps producing, nothing
+    # renders, and the messages only appear when a reload replays history.
+    # Reported exactly that — "stop took forever, my message did nothing, then I
+    # restarted and got 10 messages at once".
+    #
+    # `close(TurnState)` used to run at EVERY boundary, which released the tool
+    # but also force-failed a `bt_julia_eval` that was legitimately still running
+    # across the next prompt. The distinction is whether the span was abandoned.
+    @testset "a cancelled span releases its tools; a handoff does not" begin
+        mk(d) = ACP.parse_session_update(Dict{String,Any}(d))
+        live_tool(st, out, id) = ACP.parse_update!(out, st, mk(Dict(
+            "sessionUpdate" => "tool_call", "toolCallId" => id,
+            "kind" => "other", "title" => "still running", "status" => "in_progress")))
+
+        # Handoff: the tool survives, its stream stays open for later updates.
+        st1  = ACP.TurnState(); out1 = Channel{ACP.Message}(64)
+        live_tool(st1, out1, "eval-1")
+        tool1 = first(values(st1.tools))
+        ACP.seal_message!(st1)                       # what a plain boundary does
+        @test haskey(st1.tools, "eval-1")
+        @test isopen(tool1.updates)                  # ...and still streaming
+
+        # Cancelled span: the tool is released, so nothing can block on it.
+        st2  = ACP.TurnState(); out2 = Channel{ACP.Message}(64)
+        live_tool(st2, out2, "eval-2")
+        tool2 = first(values(st2.tools))
+        close(st2)                                   # what an ABANDONED boundary does
+        @test tool2.status == "failed"
+        @test !isopen(tool2.updates)                 # the consumer is freed
+        @test isempty(st2.tools)
+
+        # And the flag rides the boundary marker itself.
+        @test ACP.StreamFlush().abandoned == false
+        @test ACP.StreamFlush(true).abandoned == true
+    end
+
     # ── A4: a stray blank frame does NOT tear the connection down ────────────
     # The mock emits blank frames around its frames; the real reader_loop must
     # skip them (not treat "" as EOF) and still deliver the response.

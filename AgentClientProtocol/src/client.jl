@@ -80,9 +80,12 @@ function coalesce_main!(conn::Connection, updates::Channel{Any},
     try
         for u in updates
             if u isa StreamFlush
-                # Seal the trailing bubble ONLY. A live tool must survive a
-                # boundary — see `seal_message!`.
-                seal_message!(st)
+                # Seal the trailing bubble. A live tool normally SURVIVES a
+                # boundary (the next prompt must not kill a running eval) — but
+                # a span that resolved `cancelled` leaves its tools with no
+                # terminal frame coming, and the consumer blocks draining a
+                # channel nothing will close. Release those.
+                u.abandoned ? close(st) : seal_message!(st)
                 put!(messages, u)      # ... then let the consumer catch up to here
                 continue
             end

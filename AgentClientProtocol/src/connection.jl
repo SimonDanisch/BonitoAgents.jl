@@ -769,7 +769,13 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
         # so the coalescer seals the turn's trailing bubble at exactly the frame
         # the agent resolved it, and a concurrent prompt's opening text can't be
         # swept into it. Outside the lock: the sink is a bounded channel put.
-        ended === nothing || deliver_main!(conn, ended.flush)
+        # Stamp the boundary with whether this span was cancelled: its live tools
+        # are abandoned and must be released, unlike a normal handoff's.
+        if ended !== nothing
+            cancelled = haskey(msg, "result") && msg["result"] isa AbstractDict &&
+                        get(msg["result"], "stopReason", "") == "cancelled"
+            deliver_main!(conn, StreamFlush(ended.flush.done, cancelled))
+        end
         if ch !== nothing
             if haskey(msg, "error")
                 put!(ch, ErrorException(get(msg["error"], "message", "rpc error")))
