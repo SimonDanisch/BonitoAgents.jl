@@ -92,7 +92,7 @@ function create_project!(state::ServerState, name::String, src_path::String,
     haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
-        error("Project name must be alphanumeric/_/- only")
+        error("Project name can't contain / or \\ or start with a dot")
     isempty(src_path) && error("Source path is required (pick a folder).")
     isdir(src_path)   || error("Source path is not a directory: $src_path")
 
@@ -182,8 +182,8 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     maybe_start = p -> start_session && ensure_project_session!(state, p)
     haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty (folder has no basename?)")
-    occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
-        error("Project name must be alphanumeric/_/- only — got '$name'")
+    valid_project_name(name) ||
+        error("Project name can't contain / or \\ or start with a dot — got '$name'")
     isempty(worker_path) && error("Worker path is required (pick a folder).")
 
     # Threads: a folder can hold several conversations, identified by
@@ -687,7 +687,7 @@ function copy_to!(state::ServerState, p::ProjectInfo, target_worker_id::Abstract
         error("Unknown worker: $target_id")
     target_w = state.workers[][target_id]
     occursin(r"^[a-zA-Z0-9_\-]+$", String(name)) ||
-        error("Project name must be alphanumeric/_/- only — got '$name'")
+        error("Project name can't contain / or \\ or start with a dot — got '$name'")
 
     target_path = joinpath(target_w.projects_root, String(name))
     existing = find_project_by_location(state, target_id, target_path)
@@ -1872,6 +1872,25 @@ end
 breadcrumb_root_label(full::AbstractString) =
     length(full) >= 3 && full[2] == ':' ? String(full[1:2]) : "/"
 
+"""
+    valid_project_name(name) -> Bool
+
+Whether `name` is usable as a project name.
+
+It has to be a safe single PATH COMPONENT, because moving a project to another
+worker lands it at `joinpath(w.projects_root, p.name)`. That rules out path
+separators and `..`, and leading dots (a hidden directory, and `.`/`..`
+themselves). It does NOT rule out spaces: the old rule was an
+alphanumeric-plus-underscore-and-hyphen regex, which rejected "Mantle DNN" for
+no reason a filesystem cares about.
+"""
+function valid_project_name(name::AbstractString)
+    isempty(name)                 && return false
+    occursin(r"[/\\]", name)      && return false
+    startswith(name, ".")         && return false
+    return true
+end
+
 # Folder picker component
 """
 Slim server-side folder picker. `selected` is an Observable{String} the caller
@@ -2321,9 +2340,15 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 # a server-local folder with `isdir`, then push it over), so it
                 # rejected a perfectly good worker path with "Source path is not
                 # a directory".
+                # Fall back to the folder the picker is CURRENTLY showing. Only
+                # the Choose button writes `selected`, so navigating into a
+                # folder and pressing Create used to fail with "Worker path is
+                # required" while the breadcrumb showed that very folder.
+                chosen = String(strip(np_remote_picker.selected[]))
+                isempty(chosen) && (chosen = String(strip(np_remote_picker.cur[])))
                 p = create_project_from_worker!(state,
                                  String(strip(np_worker[])),
-                                 String(strip(np_remote_picker.selected[]));
+                                 chosen;
                                  name = nm,
                                  progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
@@ -2331,7 +2356,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 np_name[] = ""; np_remote_picker.selected[] = ""; np_worker[] = ""
                 current_view !== nothing && (current_view[] = p.id)
             catch e
-                error_obs[] = "Failed to create project: $e"
+                error_obs[] = "Failed to create project: " * sprint(showerror, e)
             finally
                 busy_clear!(busy)
             end

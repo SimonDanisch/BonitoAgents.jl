@@ -5175,13 +5175,18 @@ function drain_turn!(chat::ChatModel, turn)
             # text, tool, or thought). Surface something rather than leave the
             # user staring at silence — but only ASSERT a cause we actually know.
             #
-            # `stopReason` is not enough on its own. A stop the agent did not
-            # report back as `cancelled` still ends the turn empty, and blaming
-            # the user's plan or credentials for their own stop is worse than
-            # saying nothing: it sent people off checking logins over a turn they
-            # had cancelled themselves. `cancel_at` is stamped when stop is
-            # pressed and reset at each request start, so it answers "was this
-            # turn stopped" independently of what the agent chose to call it.
+            # Do NOT diagnose. This used to assert a cause — "the model may be
+            # unavailable on your plan, or the provider may need
+            # authentication" — and it was wrong both times a user reported it,
+            # sending them off checking logins over a turn that had simply been
+            # stopped.
+            #
+            # `cancel_at` is not enough to tell: it is stamped when stop is
+            # pressed and CLEARED by `reset_turn_state!` at the next request, so
+            # the turn that comes back empty is usually the one AFTER the
+            # cancelled one — the agent is still unwinding, and the stamp is
+            # already gone. Rather than chase that, say what is observable (no
+            # reply) and offer the possibilities without picking one.
             cancelled = stop_reason == "cancelled"
             stopped   = (c = client(chat.agent);
                          c !== nothing && (@atomic c.conn.cancel_at) > 0)
@@ -5189,9 +5194,9 @@ function drain_turn!(chat::ChatModel, turn)
                lock(() -> length(s.msgs_store), s.lock) == nstore0
                 close(send!(chat, AgentMsg(chat, stopped ?
                     "_Stopped — the turn ended with no reply._" :
-                    "_The agent ended the turn without a reply. If you just " *
-                    "switched model or provider, it may be unavailable on your " *
-                    "plan or need authentication._")))
+                    "_The agent ended the turn without a reply. This often " *
+                    "follows a stop, and can also mean the selected model is " *
+                    "unavailable or the provider needs authentication._")))
             end
             # Yolo mode: keep the agent going autonomously until it answers `no`.
             if shared(chat).yolo[] && !errored && !cancelled
