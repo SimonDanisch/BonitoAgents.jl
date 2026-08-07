@@ -567,6 +567,39 @@ end
     close(model)
 end
 
+# A message typed right after a stop must NOT be handed over mid-cancel.
+#
+# claude-agent-acp's `cancel` settles queued turns that have not started yet —
+# "they have no in-flight SDK work to interrupt" — so a prompt arriving while it
+# is interrupting is resolved on the spot WITHOUT RUNNING. Seen live: a Write was
+# stopped, the correction was typed immediately, and it came back as an empty
+# turn with the instruction silently dropped. The agent never saw it.
+@testset "a prompt waits for a cancel to settle instead of being swallowed" begin
+    model, cli = live_model()
+    s = BT.shared(model)
+
+    # A real turn, then a stop: `Cancelling` holds until the turn settles.
+    span = ACP.PromptSpan(4242)
+    lock(() -> push!(cli.conn.active_prompts, span), cli.conn.lock)
+    @test ACP.cancel!(cli) == true
+    @test ACP.session_activity(cli.conn) isa ACP.Cancelling
+
+    # begin_turn! must not hand the prompt over yet.
+    held = @async BT.await_cancel_settled!(model)
+    sleep(0.5)
+    @test !istaskdone(held)
+
+    # The cancelled turn settles → the wait releases.
+    lock(() -> empty!(cli.conn.active_prompts), cli.conn.lock)
+    @test timedwait(() -> istaskdone(held), 5.0) === :ok
+    @test !(ACP.session_activity(cli.conn) isa ACP.Cancelling)
+
+    # And with nothing cancelling, it is a straight no-op.
+    t0 = time(); BT.await_cancel_settled!(model)
+    @test time() - t0 < 0.5
+    close(model)
+end
+
 # The other half: when the agent IS working, stop keeps its old teeth.
 @testset "stop still cancels and clears the queue when work is live" begin
     model, cli = live_model()

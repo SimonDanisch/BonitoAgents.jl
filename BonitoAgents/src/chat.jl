@@ -4802,6 +4802,41 @@ function wait_rendered!(chat::ChatModel, marker::AgentClientProtocol.StreamFlush
     return nothing
 end
 
+# Longest we hold a new prompt while a cancel winds down. Sized off the agent's
+# own floor: claude-agent-acp waits `DEFAULT_FORCE_CANCEL_GRACE_MS` (30 s) for
+# the SDK to yield to `query.interrupt()` before forcing `cancelled`, so this
+# has to outlast that or we would hand the prompt over at the worst moment.
+const CANCEL_SETTLE_SECONDS = 35.0
+
+"""
+    await_cancel_settled!(chat)
+
+Hold a new prompt until a cancel in flight has finished winding down.
+
+Sending into that window LOSES THE MESSAGE. claude-agent-acp's `cancel` settles
+queued turns that have not started yet — "they have no in-flight SDK work to
+interrupt" — so a prompt that arrives while it is interrupting is resolved on
+the spot without ever running. Observed exactly that: a Write was stopped, the
+user immediately typed a correction, and it came back as an empty turn with the
+instruction silently dropped. The agent never saw it.
+
+`Cancelling` ends when the turn it cancelled settles, so this is a wait on a
+state with a real exit, not a sleep. Bounded anyway — if the agent never honors,
+starting the turn is still better than swallowing it, and `drain_turn!`'s
+escalation path owns the wedged-agent case.
+"""
+function await_cancel_settled!(chat::ChatModel)
+    c = client(chat.agent)
+    c === nothing && return nothing
+    AgentClientProtocol.session_activity(c.conn) isa AgentClientProtocol.Cancelling ||
+        return nothing
+    ok = timedwait(CANCEL_SETTLE_SECONDS; pollint = 0.05) do
+        !(AgentClientProtocol.session_activity(c.conn) isa AgentClientProtocol.Cancelling)
+    end
+    ok === :ok || @warn "cancel did not settle before the next prompt; sending anyway" project_id = chat.project_id
+    return nothing
+end
+
 # One-line, length-capped feed label: subagent text chunks carry newlines and
 # stream long; the feed rows / taskbar line are single-line.
 function feed_label(s::AbstractString)
@@ -4881,6 +4916,7 @@ const TASK_FEED_WIRE_LIMIT = 300
 function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     promote_queued_user_bubble!(chat)
     s = shared(chat)
+    await_cancel_settled!(chat)
     # A new prompt is the boundary of any auto-wake episode that streamed since
     # the last turn: seal it and wait, so its messages persist + finalize before
     # the turn's own messages (store order).
