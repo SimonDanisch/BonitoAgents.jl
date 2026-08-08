@@ -5040,6 +5040,15 @@ $(YOLO_DONE_SENTINEL)
 "No" means finished, or blocked on something only I can give, or going in \
 circles. Any other reply keeps the loop running."""
 
+# Appended to the next nudge when the agent just repeated itself. Not a warning
+# about a limit — there isn't one — but a correction: an agent that restates its
+# last answer is usually finished and reaching for a way to say so in prose.
+const YOLO_REPEAT_NUDGE = """
+That was the same answer as last time. Repeating it does not end the loop — \
+nothing here reads prose. If you are finished, reply with exactly \
+$(YOLO_DONE_SENTINEL) and nothing else. Otherwise pick the next concrete thing \
+and do it."""
+
 # Composer placeholder while Yolo is armed — the message input doubles as the
 # reminders editor then (see `chat_input_area`).
 const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Enter to lock in"
@@ -5063,10 +5072,6 @@ const YOLO_BAIL_RX = Regex("^[\\s>*_`#-]*" * YOLO_DONE_SENTINEL * "[\\s*_`.!]*\$
 
 yolo_bail(text::AbstractString) = occursin(YOLO_BAIL_RX, strip(text))
 
-# Hard ceiling on consecutive auto-continues since the last real user message.
-# The sentinel makes "finished" exact, but an agent that never emits it would
-# run until the user notices. Generous: this is a backstop, not a work limit.
-const YOLO_MAX_STREAK = 25
 
 # Reply reduced for comparing one turn against the next: case and whitespace
 # carry no meaning here, and near-identical prose is what a spinning agent
@@ -5088,7 +5093,7 @@ Every branch is a FACT about the turn rather than a reading of the agent's
 prose. That ambiguity is exactly what the sentinel replaced.
 """
 function yolo_stop_reason(reply::AbstractString, produced::Bool,
-                          streak::Integer, last::AbstractString)
+                          streak::Integer)
     # The sentinel is an ANSWER, never a way to end your own turn.
     #
     # The shape is always: the turn ends, we ask "is there more you could do?",
@@ -5104,24 +5109,40 @@ function yolo_stop_reason(reply::AbstractString, produced::Bool,
     # IS an answer to our nudge.
     streak > 0 && yolo_bail(reply) && return "the agent signalled it was finished"
     produced || return "the turn ended without any output"
-    streak + 1 >= YOLO_MAX_STREAK &&
-        return "$(YOLO_MAX_STREAK) turns without finishing — send a message to continue"
-    # Same reply twice running: it is restating, not progressing. Only when the
-    # reply is non-empty, since a turn that ends on a tool call has none and two
-    # such turns in a row are ordinary work, not a spin.
-    norm = yolo_norm(reply)
-    isempty(norm) && return nothing
-    norm == last && return "the agent repeated itself — it looks stuck"
     return nothing
+end
+
+"""
+    yolo_repeating(reply, last) -> Bool
+
+Whether this reply is the previous one again — restating rather than
+progressing.
+
+NOT a stop. Going in circles is something to TELL the agent about, not a reason
+to end its work: the loop exists to run unattended, and an agent repeating
+itself is usually one that has finished and does not realise the sentinel is how
+it says so. The next nudge points that out (see `yolo_user_msg`).
+
+Only meaningful for a non-empty reply — a turn ending on a tool call has none,
+and two of those in a row is ordinary work.
+"""
+function yolo_repeating(reply::AbstractString, last::AbstractString)
+    norm = yolo_norm(reply)
+    return !isempty(norm) && norm == last
 end
 
 # The visible (dim/system-styled) auto-continue bubble the Yolo loop enqueues.
 # Appends the chat's user-editable reminders (if any) so the agent doesn't drift
 # over many autonomous turns.
-function yolo_user_msg(chat::ChatModel)
+function yolo_user_msg(chat::ChatModel; repeated::Bool = false)
     reminders = strip(shared(chat).yolo_reminders[])
-    text = isempty(reminders) ? YOLO_CONTINUE_PROMPT :
-        YOLO_CONTINUE_PROMPT * "\n\nKeep these in mind as you continue:\n" * reminders
+    text = YOLO_CONTINUE_PROMPT
+    # Said the same thing twice. There is no turn limit — the loop runs until the
+    # agent says it is done — so the useful response to going in circles is to
+    # point out that repeating is not how you leave, and that the sentinel is.
+    repeated && (text *= "\n\n" * YOLO_REPEAT_NUDGE)
+    isempty(reminders) ||
+        (text *= "\n\nKeep these in mind as you continue:\n" * reminders)
     return UserMsg(String(text), false, 0, true, nothing)
 end
 
@@ -5254,8 +5275,8 @@ function drain_turn!(chat::ChatModel, turn)
                 # A missing reply is NOT a bail: a turn ending on a tool call has
                 # no closing text, which used to stop Yolo silently.
                 produced = lock(() -> length(s.msgs_store), s.lock) > nstore0
-                stop_reason = yolo_stop_reason(reply, produced,
-                                               s.yolo_streak[], s.yolo_last[])
+                stop_reason = yolo_stop_reason(reply, produced, s.yolo_streak[])
+                repeated    = yolo_repeating(reply, s.yolo_last[])
                 if stop_reason !== nothing
                     # Every stop is VISIBLE. A loop that just goes quiet reads as
                     # a hang; saying why is the difference between "it finished"
@@ -5269,7 +5290,7 @@ function drain_turn!(chat::ChatModel, turn)
                     s.yolo_streak[] += 1
                     s.yolo_last[] = yolo_norm(reply)
                     Base.errormonitor(@async try
-                        send_message!(chat, yolo_user_msg(chat))
+                        send_message!(chat, yolo_user_msg(chat; repeated = repeated))
                     catch e
                         @warn "yolo auto-continue send failed" project_id = chat.project_id exception = (e, catch_backtrace())
                     end)
