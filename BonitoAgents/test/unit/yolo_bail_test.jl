@@ -11,7 +11,7 @@
     S  = BonitoAgents.YOLO_DONE_SENTINEL
     MX = BonitoAgents.YOLO_MAX_STREAK
 
-    @testset "the sentinel ALONE stops the loop" begin
+    @testset "the S ALONE stops the loop" begin
         # Whitespace and markdown decoration around it are fine — the agent may
         # bold it or quote it — but the line has to be the entire answer.
         for reply in (S, "  $S  ", "$S.", "**$S**", "> $S", "`$S`", "\n$S\n")
@@ -22,7 +22,7 @@
     @testset "a reply that also says anything else keeps the loop running" begin
         # THE point of the rule. Stopping has to be a clean answer to "is there
         # more you could do", not something a work message carries along at the
-        # end. An agent that writes up next steps and appends the sentinel used
+        # end. An agent that writes up next steps and appends the S used
         # to stop the loop — while its own message was the clearest evidence
         # there was more to do.
         for reply in ("Everything is green and pushed.\n\n$S",
@@ -49,7 +49,7 @@
         # Mid-sentence, or talked ABOUT, must not end the loop — otherwise the
         # agent explaining the protocol would silently stop it.
         @test !B("I will print $S when I am finished.")
-        @test !B("The sentinel is $S, but I am still working.")
+        @test !B("The S is $S, but I am still working.")
     end
 
     @testset "normalisation folds case and whitespace" begin
@@ -62,9 +62,12 @@
     @testset "stop reasons" begin
         # Declared: stop, and SAY so. It was silent on the theory that the
         # agent's message already reads as "done" — but an agent that ends a
-        # report of next steps with the sentinel leaves the loop stopping for no
+        # report of next steps with the S leaves the loop stopping for no
         # visible reason, which is what we hit in practice.
-        @test R(S, true, 0, "")               == "the agent signalled it was finished"
+        #
+        # `streak >= 1` because the S only counts as an ANSWER — see the
+        # "only counts once we have asked" testset below.
+        @test R(S, true, 1, "")               == "the agent signalled it was finished"
         @test R("working", false, 0, "")      != nothing      # produced nothing
         @test R("working", true, 0, "")       === nothing     # ordinary progress
         # Repeat = spinning.
@@ -78,4 +81,28 @@
         @test occursin(string(MX), R("fresh", true, MX - 1, ""))
         @test R("fresh", true, MX - 2, "") === nothing
     end
+# The sentinel is an ANSWER, never a way for the agent to end its own turn.
+#
+# Reported live: the agent finished a turn by writing `YOLO-COMPLETE` at the
+# bottom of a report that still listed open work, and the loop stopped without
+# ever having asked. The shape is always: turn ends → we ask → the keyword
+# answers. `streak` is the count of questions asked, so 0 means nobody asked.
+@testset "the sentinel only counts once we have asked" begin
+    # Turn 0 — the one that STARTED the loop. Nothing has been asked, so the
+    # agent cannot leave by writing the keyword itself.
+    @test R(S, true, 0, "") === nothing
+    @test R("all done here.\n\n$(S)", true, 0, "") === nothing
+    # ...and ordinary progress keeps going, as before.
+    @test R("did some work", true, 0, "") === nothing
+
+    # Once we HAVE asked, the same reply ends it.
+    @test R(S, true, 1, "") == "the agent signalled it was finished"
+    @test R(S, true, 3, "") == "the agent signalled it was finished"
+
+    # The other stops are about the loop's health, not about answering, so they
+    # apply whether or not a question was asked.
+    @test R("", false, 0, "") == "the turn ended without any output"
+    @test R("same", true, 1, N("same")) == "the agent repeated itself — it looks stuck"
+end
+
 end

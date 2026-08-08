@@ -5089,12 +5089,20 @@ prose. That ambiguity is exactly what the sentinel replaced.
 """
 function yolo_stop_reason(reply::AbstractString, produced::Bool,
                           streak::Integer, last::AbstractString)
-    # Say so. The other stops explain themselves; this one used to be silent on
-    # the grounds that the agent's own last message already said it was done.
-    # That holds only when the message reads that way — and the failure we
-    # actually saw was an agent ending a REPORT OF NEXT STEPS with the sentinel,
-    # where the loop going quiet after "here is what to do next" is baffling.
-    yolo_bail(reply) && return "the agent signalled it was finished"
+    # The sentinel is an ANSWER, never a way to end your own turn.
+    #
+    # The shape is always: the turn ends, we ask "is there more you could do?",
+    # and only THEN does the keyword finish the loop. Honouring it on any reply
+    # let the agent leave by writing it at the bottom of its own message — which
+    # it did, ending a report of open work with `YOLO-COMPLETE` and stopping a
+    # loop that had more to do.
+    #
+    # `streak` is how many times we have asked: 0 on the turn that started the
+    # loop, incremented once per auto-continue. So `streak > 0` is exactly "this
+    # reply answers a question we asked". In Yolo the composer is the reminders
+    # editor and no user message can slip through, so every turn past the first
+    # IS an answer to our nudge.
+    streak > 0 && yolo_bail(reply) && return "the agent signalled it was finished"
     produced || return "the turn ended without any output"
     streak + 1 >= YOLO_MAX_STREAK &&
         return "$(YOLO_MAX_STREAK) turns without finishing — send a message to continue"
