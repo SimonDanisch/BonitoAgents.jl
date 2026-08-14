@@ -4968,6 +4968,130 @@ function build_history_prelude(model::ChatModel)::String
     return String(take!(io))
 end
 
+# ── Human-readable Markdown export (the "Export" header button) ───────────────
+# A clean, self-contained .md of the WHOLE chat: messages, tool calls (with the
+# full body loaded from tools/<id>.json), code, todo lists. Images and file
+# references are given as PATHS, never base64 — with a caveat marker, because a
+# path points at the file as it is NOW, which may differ from the moment in the
+# chat (overwritten later in the conversation or by another process). Distinct
+# from `chat.md` (the app's compact reload format, tool bodies summarized).
+
+# `⚠️` marks a value that is a path, not a snapshot — explained once in the header.
+file_ref_md(path::AbstractString) = isempty(path) ? "" : string('`', path, "` ⚠️")
+
+# Fence a code/output block, guarding against a stray ``` in the content.
+function fenced(io::IO, body::AbstractString; lang::AbstractString = "")
+    fence = occursin("```", body) ? "````" : "```"
+    println(io, fence, lang)
+    println(io, rstrip(body))
+    println(io, fence)
+end
+
+# The tool's INPUT (command / file / code / query), per subtype. Default: the
+# ACP title (the raw call string) as inline code.
+function tool_input_md(io::IO, m::ToolMsg)
+    t = tool_title(m); isempty(t) || println(io, '`', t, '`')
+end
+function tool_input_md(io::IO, m::BashToolMsg)
+    m.description === nothing || isempty(m.description) || println(io, "_", m.description, "_\n")
+    fenced(io, m.command; lang = "sh")
+end
+tool_input_md(io::IO, m::Union{EditToolMsg,ReadToolMsg}) =
+    isempty(m.file_path) || println(io, "File: ", file_ref_md(m.file_path))
+tool_input_md(io::IO, m::ShowToolMsg) =
+    isempty(m.path) || println(io, "File: ", file_ref_md(m.path))
+tool_input_md(io::IO, m::SearchToolMsg) =
+    isempty(m.path) || println(io, "Path: ", file_ref_md(m.path))
+tool_input_md(io::IO, m::JuliaEvalCall) =
+    isempty(m.code) || fenced(io, m.code; lang = "julia")
+
+# The tool BODY (output / diffs / images), loaded from tools/<id>.json.
+function render_tool_body_md(io::IO, content)
+    isempty(content) && return
+    for c in content
+        if c isa AgentClientProtocol.TextContent
+            t = strip(c.text)
+            # Tool outputs often arrive ALREADY as a fenced markdown block
+            # (```console …```); emit those verbatim so we don't double-fence.
+            isempty(t) ? nothing : startswith(t, "```") ? println(io, t) : fenced(io, t)
+        elseif c isa AgentClientProtocol.DiffContent
+            println(io, "Edited ", file_ref_md(c.path))
+            io2 = IOBuffer()
+            for l in split(something(c.old_text, ""), '\n'); println(io2, "- ", l); end
+            for l in split(c.new_text, '\n'); println(io2, "+ ", l); end
+            fenced(io, String(take!(io2)); lang = "diff")
+        elseif c isa AgentClientProtocol.ImageContent
+            println(io, "🖼️ _[image · ", c.mime_type,
+                " — not embedded; images are referenced by path only (see above) and may have changed since] ⚠️_")
+        end
+        println(io)
+    end
+end
+
+# One message → Markdown. A fallback keeps an unknown/future kind from breaking
+# the export.
+render_md(io::IO, m::ChatMsg, chat_dir) = println(io, "<!-- (unrendered ", typeof(m), ") -->")
+render_md(io::IO, m::UserMsg, chat_dir)    = (println(io, "## 🧑 User\n"); println(io, m.text))
+render_md(io::IO, m::AgentMsg, chat_dir)   = (println(io, "## 🤖 Assistant\n"); println(io, m.text))
+render_md(io::IO, m::SummaryMsg, chat_dir) = (println(io, "## 📝 Summary (/compact)\n"); println(io, m.text))
+function render_md(io::IO, m::ThoughtMsg, chat_dir)
+    println(io, "### 💭 Reasoning\n")
+    for l in split(m.text, '\n'); println(io, "> ", l); end
+end
+function render_md(io::IO, m::TodoListMsg, chat_dir)
+    println(io, "### ✅ Todo\n")
+    for e in m.entries
+        println(io, "- [", e.status == "completed" ? "x" : " ", "] ", e.content)
+    end
+end
+function render_md(io::IO, m::ToolMsg, chat_dir)
+    name   = isempty(m.message.name) ? tool_kind(m) : m.message.name
+    status = tool_status(m)
+    println(io, "### 🔧 ", name, isempty(status) ? "" : string(" · ", status), "\n")
+    tool_input_md(io, m); println(io)
+    render_tool_body_md(io, tool_content_for_render(m, chat_dir))
+end
+
+export_filename(model::ChatModel)::String = begin
+    p = isempty(model.project_id) ? nothing : get(model.state.projects[], model.project_id, nothing)
+    base = p === nothing ? basename(rstrip(model.cwd, '/')) : project_display_title(p)
+    slug = replace(strip(base), r"[^\w .-]+" => "", " " => "-")
+    (isempty(slug) ? "chat" : slug) * "-" * Dates.format(now(UTC), "yyyy-mm-dd") * ".md"
+end
+
+"""
+    export_chat_markdown(model) -> String
+
+Render the whole chat to a clean, self-contained Markdown document.
+"""
+function export_chat_markdown(model::ChatModel)::String
+    s = shared(model)
+    sess = model.chat_session
+    p = isempty(model.project_id) ? nothing : get(model.state.projects[], model.project_id, nothing)
+    title = p === nothing ? basename(rstrip(model.cwd, '/')) : project_display_title(p)
+    io = IOBuffer()
+    println(io, "# ", title, "\n")
+    println(io, "- **Project:** `", sess.cwd, "`")
+    println(io, "- **Session:** `", sess.session_id, "`")
+    println(io, "- **Created:** ", sess.created)
+    println(io, "- **Exported:** ", Dates.format(now(UTC), "yyyy-mm-dd HH:MM"), " UTC\n")
+    println(io, "> ⚠️ **Files are linked by path, not captured as snapshots.** Every value marked ⚠️ ",
+        "below (image results, edited/read files, search roots) is a path on disk — the file may have ",
+        "changed since this point in the chat, whether overwritten later in the conversation or by another ",
+        "process. Read a ⚠️ path as \"the file at this path *now*\", not as it was at the time.\n")
+    println(io, "---\n")
+    msgs = lock(() -> copy(s.msgs_store), model.lock)
+    for m in msgs
+        try
+            render_md(io, m, model.chat_dir)
+        catch e
+            println(io, "<!-- export error on ", typeof(m), ": ", sprint(showerror, e), " -->")
+        end
+        println(io)
+    end
+    return String(take!(io))
+end
+
 # Arm a one-shot history replay for the next prompt. Builds the prelude
 # **now** (so any messages the user types between arming and sending are
 # their own conversation, not part of the replay) and stashes it on the
@@ -5689,6 +5813,17 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         class   = restart_class,
         title   = restart_title,
         onclick = js"event => $(restart_status).notify('__click__')")
+
+    # Export the chat as a clean Markdown file — a native download link to the
+    # `/export/<pid>` route (built on demand from this live ChatModel). Hidden
+    # for legacy chats without a project id (nothing to key the route on).
+    export_button = isempty(project_id) ? DOM.span() :
+        DOM.a("⤓ Export";
+            href     = "/export/$(project_id)",
+            download = export_filename(model),
+            class    = "bt-header-export",
+            title    = "Download this chat as a Markdown file")
+
     on(session, restart_status) do s
         s == "__click__" || return
         # The dead-state button stays clickable through the seconds-long bring-up,
@@ -5836,6 +5971,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 provider_select,
                 xsync_control,
                 sync_button,
+                export_button,
                 compact_button,
                 restart_button;
                 class="bt-header-actions"),
