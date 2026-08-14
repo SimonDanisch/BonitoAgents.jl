@@ -496,6 +496,12 @@ const BASE_CSS = [
         "border-radius" => "var(--bt-radius-sm)",
         "cursor" => "pointer", "white-space" => "nowrap"),
     CSS(".bt-menu-item:hover", "background" => "var(--bt-surface-2)"),
+    # The chat's "Export as Markdown" item is an <a download>, not a <button>:
+    # strip the anchor defaults (underline, link colours) so it reads exactly
+    # like its sibling items.
+    CSS(".bt-menu-item.bt-header-export",
+        "text-decoration" => "none", "color" => "var(--bt-text)"),
+    CSS(".bt-menu-item.bt-header-export:visited", "color" => "var(--bt-text)"),
     CSS(".bt-menu-sep",
         "height" => "1px", "background" => "var(--bt-border)", "margin" => "4px 6px"),
     CSS(".bt-menu-danger", "color" => "var(--bt-error)"),

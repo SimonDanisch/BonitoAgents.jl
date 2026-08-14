@@ -150,6 +150,7 @@ function serve(; host::String        = "127.0.0.1",
     add_acp_log_routes!(srv, state)
     add_download_routes!(srv, state)
     add_invite_routes!(srv, state)
+    add_export_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
     add_share_routes!(srv, state)
     # Nothing to say: reaching it is the answer (`login_guard`).
@@ -411,6 +412,37 @@ function acp_log_response(state::ServerState, project_id::AbstractString)
         ["Content-Type"  => "text/plain; charset=utf-8",
          "Cache-Control" => "no-cache"],
         body = read(path, String))
+end
+
+# /export/<pid> — download the chat as a clean, self-contained Markdown file
+# (`export_chat_markdown`). Built on demand from the live ChatModel, so the
+# chat must be open (which it is whenever the Export item is on screen). Like
+# every chat-keyed route, it answers only who may see the chat (`request_sees_chat`).
+const EXPORT_ROUTE_RE = r"^/export/([A-Za-z0-9_-]+)/?(?:$|\?)"
+
+function add_export_routes!(srv::Bonito.Server, state::ServerState)
+    Bonito.route!(srv, EXPORT_ROUTE_RE => function(context)
+        pid = String(context.match.captures[1])
+        request_sees_chat(state, context.request, pid) || return unknown_chat(pid)
+        export_response(state, pid)
+    end)
+end
+
+function export_response(state::ServerState, project_id::AbstractString)
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid project id\n")
+    model = lock(() -> get(state.chat_models, String(project_id), nothing), state.lock)
+    model === nothing &&
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "no open chat for project '$project_id' — open it first\n")
+    md    = export_chat_markdown(model)
+    fname = export_filename(model)
+    return HTTP.Response(200,
+        ["Content-Type"        => "text/markdown; charset=utf-8",
+         "Content-Disposition" => "attachment; filename=\"$fname\"",
+         "Cache-Control"       => "no-cache"],
+        body = md)
 end
 
 # /download/<pid>?path=<worker-abs-path> — stream a worker file back to the
