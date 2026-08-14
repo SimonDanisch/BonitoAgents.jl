@@ -395,6 +395,21 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-header-restart:hover",
         "background" => "var(--bt-surface-2)"),
+    # Export button — same bordered pill as the others, but it's an <a download>
+    # so it needs the anchor resets (no underline, inherited color, inline-flex).
+    CSS(".bt-header-export",
+        "display" => "inline-flex", "align-items" => "center",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "text-decoration" => "none",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "cursor" => "pointer",
+        "white-space" => "nowrap",
+        "transition" => "background 80ms"),
+    CSS(".bt-header-export:hover",
+        "background" => "var(--bt-surface-2)"),
     # Session-dead flash: replaces the old session-ended banner. The
     # permanent restart button itself becomes the failure indicator —
     # gentle red pulse on a danger-tinted background so it's hard to
