@@ -136,20 +136,6 @@ stream_route(s::JuliaSession) = s.is_temp ? TEMP_KEY : String(s.env_path)
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
 
-# Env overrides for the eval worker so it behaves like a bare
-# `julia --project=env_path`. The BonitoAgentsApp bundle launcher exports a fixed
-# `JULIA_LOAD_PATH` (bundle project + stdlib, with NO `@`); Malt workers inherit
-# the parent env, so without this override the worker resolves packages against
-# the BUNDLE's project and ignores `--project=env_path` entirely. Malt's `env`
-# kwarg can only SET vars (it routes through `Base.byteenv`, which can't express
-# removal), so we reset `JULIA_LOAD_PATH` to Julia's documented default — exactly
-# what an un-set `JULIA_LOAD_PATH` would yield: `@` (the active project, i.e.
-# env_path via --project), `@v#.#` (shared default env), `@stdlib`. Keeps the
-# worker on the PROJECT's Bonito/WGLMakie, never the bundle's precompiled copies;
-# JULIA_DEPOT_PATH is left as-is so the worker keeps a writable precompile depot.
-const DEFAULT_LOAD_PATH = join(["@", "@v#.#", "@stdlib"], Sys.iswindows() ? ";" : ":")
-worker_env() = ["JULIA_LOAD_PATH" => DEFAULT_LOAD_PATH]
-
 # Build the exeflags vector. Handles juliaup `+channel` syntax + custom flags.
 function build_exeflags(env_path, julia_cmd)::Vector{String}
     # `--color=yes`: the worker's stdout is a Pipe (not a tty), so colored tools
@@ -339,7 +325,6 @@ function start!(s::JuliaSession)
     s.worker = Malt.Worker(
         monitor_stdout = false,
         monitor_stderr = false,
-        env            = worker_env(),
         exeflags       = build_exeflags(s.env_path, s.julia_cmd),
     )
     # Before anything can spawn: everything the eval starts inherits this group.
@@ -354,9 +339,9 @@ function start!(s::JuliaSession)
     # closes in kill_session!.
     s.stream_forward = Threads.@spawn stream_forward_loop!(s)
 
-    # The worker is a plain `julia --project=env_path`: `--project` sets the env,
-    # and `worker_env()` resets JULIA_LOAD_PATH to Julia's default so the inherited
-    # bundle JULIA_LOAD_PATH can't shadow it (see worker_env). Packages resolve
+    # The worker is a plain `julia --project=env_path`, and we do not touch its
+    # environment at all — nothing upstream sets JULIA_LOAD_PATH, so there is
+    # nothing to repair here. Packages resolve
     # exactly as the user's env dictates — we do NOT stack any extra entry. If
     # bt_show_app needs a proxy-aware Bonito, the project's env must declare it
     # (surfaced as a dial_error otherwise); we never silently inject a Bonito.

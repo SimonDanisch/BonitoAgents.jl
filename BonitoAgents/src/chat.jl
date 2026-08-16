@@ -2806,15 +2806,19 @@ function read_image_element(state::ServerState, project_id::AbstractString,
     fp = m isa Union{EditToolMsg,ReadToolMsg} && !isempty(m.file_path) ?
         m.file_path : nothing
     fname = fp === nothing ? "" : basename(String(fp))
+    # kimi's ReadMediaFile also ships VIDEO as an ImageContent-shaped block
+    # (recovered from its rawOutput parts); a video mime in an <img> renders
+    # nothing, so pick the element from the mime rather than assuming image.
+    is_video = startswith(c.mime_type, "video/")
     eb = isempty(project_id) ? nothing : eval_bridge_for(state, project_id)
     if fp !== nothing && eb !== nothing
         try
-            return media_element(worker_asset_url(eb, String(fp)), c.mime_type, false; filename = fname)
+            return media_element(worker_asset_url(eb, String(fp)), c.mime_type, is_video; filename = fname)
         catch e
             @warn "read image: stream via bridge failed; inlining base64" exception = (e, catch_backtrace())
         end
     end
-    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, false; filename = fname)
+    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, is_video; filename = fname)
 end
 
 function render_show_file(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)

@@ -451,6 +451,44 @@ function parse_tool_content_item(d::AbstractDict)
     end
 end
 
+# kimi's acp-adapter JSON-stringifies any non-string tool RESULT into a single
+# text block (`toolResultToAcpContent`), so a ReadMediaFile result reaches the
+# wire as ONE TextContent holding the JSON of
+#     [text("<image path=…>"), image_url(data-uri), text("</image>")]
+# — which the UI renders as a giant base64 blob. The SAME part array rides
+# verbatim in `rawOutput`, so re-materialize real content blocks from it: text
+# parts stay text (minus kimi's <image …>/</video> scaffolding, whose path is
+# already in `locations`), and `image_url`/`video_url` data URIs become
+# ImageContent, the shape the renderer's media branch understands. Returns
+# `nothing` when rawOutput isn't such an array — every other agent, kimi's own
+# string results, an unrecognized part, or a non-data-URI media URL — leaving
+# `content` untouched rather than partially rewritten.
+const MEDIA_DATA_URI_RE = r"^data:([^;,]+);base64,(.*)$"s
+
+function media_parts_content(rout)
+    rout isa AbstractVector || return nothing
+    ismedia(p) = p isa AbstractDict &&
+                 get(p, "type", "") in ("image_url", "video_url")
+    any(ismedia, rout) || return nothing
+    content = []
+    for p in rout
+        if p isa AbstractDict && get(p, "type", "") == "text"
+            t = get(p, "text", "")
+            occursin(r"^</?(?:image|video)(?:\s+path=\"[^\"]*\")?>$", t) && continue
+            push!(content, TextContent(t))
+        elseif ismedia(p)
+            u = get(p, "imageUrl", get(p, "videoUrl", Dict()))
+            u = u isa AbstractDict ? get(u, "url", "") : ""
+            m = match(MEDIA_DATA_URI_RE, u)
+            m === nothing && return nothing
+            push!(content, ImageContent(String(m.captures[2]), String(m.captures[1])))
+        else
+            return nothing
+        end
+    end
+    return content
+end
+
 function parse_location(d::AbstractDict)
     # `line` is spec'd as a scalar, but some agents send a non-scalar (a range
     # `[start,end]`, or a malformed value). Coerce anything that isn't an integer
@@ -588,6 +626,14 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
             rout = get(params, "rawOutput", nothing)
             rout isa AbstractString && !isempty(rout) &&
                 (content = [TextContent(String(rout))])
+        end
+        # Media results (kimi's ReadMediaFile) arrive only as a JSON-stringified
+        # blob in `content`; the structured part array is in `rawOutput` — see
+        # `media_parts_content`. Terminal frames only, same no-race rationale as
+        # the rawOutput-string normalization above.
+        if get(params, "status", nothing) in ("completed", "failed")
+            media = media_parts_content(get(params, "rawOutput", nothing))
+            media !== nothing && (content = media)
         end
         locs = [parse_location(l) for l in get(params, "locations", [])]
         name, rinput = parse_claude_meta(params)
