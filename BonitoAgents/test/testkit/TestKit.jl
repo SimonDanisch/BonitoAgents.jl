@@ -54,6 +54,40 @@ import BonitoWorker
 import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
 
+# `Pkg.test` runs the test process with `JULIA_LOAD_PATH="@:<testdir>"` — note
+# the missing `@stdlib`. Every process spawned from here inherits it, including
+# the Malt EVAL workers, which then cannot load a single stdlib: `using Markdown`
+# inside an eval fails with "Package Markdown not found in current path", against
+# a committed evalenv that correctly expects stdlibs to come from `@stdlib`.
+# Production never sees this — nothing exports the variable there (see
+# BonitoAgentsApp's `worker_command`, which passes `--project` on the command
+# line precisely so descendants keep a clean environment) — so clearing it here
+# RESTORES production conditions rather than faking them.
+#
+# Safe for this process: Julia reads the variable into `LOAD_PATH` once at
+# startup and never re-reads it, so our own resolution is untouched and only
+# children change. And TestKit is loaded inside ReTestItems' test workers, never
+# in the parent, so the runner's own worker spawning is unaffected.
+function __init__()
+    delete!(ENV, "JULIA_LOAD_PATH")
+    return nothing
+end
+
+# Re-pointing an MCP dial-back must never abort a bring-up or a teardown — the
+# server it pointed at may already be gone, and half-torn-down state is worse
+# than none. But it must not be SILENT either: a dial-back that failed to reset
+# is precisely how a live bridge leaks from one suite into the next, where it
+# shows up much later as embeds that render and are dead. Warn and continue.
+function reset_dialback_or_warn(reset!::Function, what::AbstractString)
+    try
+        reset!()
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "TestKit: could not reset the $what dial-back" exception = e
+    end
+    return nothing
+end
+
 export TestServer, dev_server, add_worker!,
        text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update, kimi_tool, REPLAY_FN,
        post_turn,
@@ -476,7 +510,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     SERVER_CONTEXT[] = (url = h.url, secret = h.secret, project_id = Ref(""))
     # Clean slate for the MCP control dial-back (armed lazily on the first eval,
     # see invoke_mcp) in case a prior test tore down without close().
-    try BonitoMCP.reset_ctrl_dialback!() catch end
+    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server bring-up)")
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
                        Ref{Any}(nothing), Ref(false))
@@ -673,8 +707,8 @@ function Base.close(s::TestServer)
     # dev_server re-dials fresh — this replaces the old `refresh_eval_session!`
     # test hack, tying eval-session lifecycle to the dev_server like production
     # ties it to the agent's MCP child.
-    try BonitoMCP.reset_ctrl_dialback!() catch end
-    try BonitoMCP.reset_eval_dialback!() catch end
+    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server teardown)")
+    reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server teardown)")
     ctx = s.browser[]
     ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
@@ -880,9 +914,11 @@ end
 
 # (Removed `refresh_eval_session!`.) It `restart!`-ed the whole eval worker at
 # each test's START to dodge a stale per-env dial-back — a racy stand-in that
-# also threw away warm compile state. The dial-back is now re-pointed at
-# dev_server CLOSE (`BonitoMCP.reset_eval_dialback!` in `Base.close(::TestServer)`),
-# deterministically and without killing the worker, so tests never need it.
+# also threw away warm compile state. The dial-back is now re-pointed
+# deterministically, without killing the worker, at the two points where the
+# bridge's identity changes: dev_server CLOSE (`Base.close(::TestServer)`, the
+# server changed) and `new_chat` (the PROJECT changed — the server keys bridges
+# by project id). Tests never need to ask for it.
 
 """
     wait_for(s, label, js_predicate; timeout = 8) -> Bool
@@ -1143,8 +1179,43 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
              timeout = 90)
     sleep(0.5)
     pid = current_chat_id(s)
+    # `SERVER_CONTEXT` is a single global, set by whichever `dev_server` ran
+    # LAST — but a suite can drive a server that isn't that one. `e2e:bt_eval`
+    # stands up (and closes) eight of its own servers; every later SharedServer
+    # item then hands the eval worker the URL of a server that no longer exists,
+    # and the dial dies with `connect: Connection refused` on `/eval-ws`. The
+    # embed still renders its snapshot, so the symptom is a live app that never
+    # updates — which is what took `e2e:eval_embed_park` down (13 failures) in a
+    # full-suite run while it passed alone. Point the context at the server we
+    # are actually driving, and drop the stale bridge so the next eval re-dials.
     ctx = SERVER_CONTEXT[]
-    ctx === nothing || (ctx.project_id[] = pid)
+    if ctx === nothing || ctx.url != s.h.url
+        SERVER_CONTEXT[] = (url = s.h.url, secret = s.h.secret, project_id = Ref(""))
+        ctx = SERVER_CONTEXT[]
+        reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server changed)")
+    end
+    if ctx !== nothing
+        # Re-point the eval dial-back whenever the PROJECT changes — the same
+        # reason `Base.close(::TestServer)` re-points it when the SERVER changes.
+        #
+        # The server registers one eval bridge per PROJECT
+        # (`state.eval_workers[project_id]`, set when the worker's eval dials
+        # `/eval-ws` carrying that id). The MCP eval-session pool, though, is
+        # keyed by env_path and process-global, and `ensure_eval_dialed!`
+        # short-circuits on `s.dialed_back` — it never dials a second time. So a
+        # second chat that evals in the SAME env inherits the first chat's
+        # already-dialed session, no bridge is ever registered for the new
+        # project, and its live embeds render from their snapshot but have no
+        # browser↔worker route: they look right and are dead.
+        #
+        # In production each chat gets its own MCP process, so each dials once
+        # for its own project. Dropping the bridge here (the worker stays warm,
+        # so no compile cost) reproduces that per-chat dial in one test process.
+        if ctx.project_id[] != pid
+            ctx.project_id[] = pid
+            reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (new chat)")
+        end
+    end
     return pid
 end
 

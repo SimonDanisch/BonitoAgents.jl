@@ -12,7 +12,8 @@ using Test
 import BonitoAgents, Bonito
 const BT = BonitoAgents
 
-mkbridge() = BT.make_eval_bridge("proj", nothing, Bonito.HTTPAssetServer())  # ws=nothing ⇒ disconnected
+# (prefix, owning project, ws=nothing ⇒ disconnected, asset host)
+mkbridge() = BT.make_eval_bridge("proj", "unit-eval-bridge", nothing, Bonito.HTTPAssetServer())
 
 # A browser connection whose write is slow (simulates a CPU-bound / WGLMakie tab
 # draining its socket slowly) — the condition that head-of-line-blocked the relay.

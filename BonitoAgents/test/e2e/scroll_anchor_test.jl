@@ -62,9 +62,15 @@
     # equal to its DOM pixels, so inflating rendered rows would fabricate a
     # map/DOM contradiction production cannot reach. Returns the number of
     # inflated entries.
+    # Returns the inflated count PLUS what the churn's own `updateDOM` decided,
+    # sampled right after `refresh()`: `_anchorDebugG` is written by every
+    # `_captureAnchor`, so a value that still reads `st: 0` proves the capture
+    # never ran for this churn (initialLoad / a live sticky key-anchor both skip
+    # it) — which is a different bug from "captured and restored wrongly", and
+    # the failure message could not tell them apart.
     INFLATE = """(() => {
         const ch = $CH;
-        if (ch.rendered.size === 0) return 0;
+        if (ch.rendered.size === 0) return {inflated: 0};
         const winStart = Math.min(...ch.rendered);
         let inflated = 0;
         for (let i = 0; i < winStart; i++) {
@@ -73,7 +79,12 @@
             inflated++;
         }
         ch.refresh();
-        return inflated;
+        return {inflated,
+                dbg:         JSON.stringify(ch._anchorDebugG ?? null),
+                initialLoad: !!ch.initialLoad,
+                sticky:      !!ch._keyAnchor,
+                winStart,
+                scrollTop:   Math.round(ch.container.scrollTop)};
     })()"""
 
     @testset "height churn above the viewport must not move the view" begin
@@ -107,8 +118,9 @@
             return { probe, inflated };
         })()""")
         before = r["probe"]
+        churn  = r["inflated"]           # the INFLATE probe's own report
         @test before !== nothing
-        @test Int(r["inflated"]) > 3     # the churn genuinely hit rows above
+        @test Int(churn["inflated"]) > 3     # the churn genuinely hit rows above
         # Poll until the top marker STABILISES (the compensation is a synchronous
         # bump plus a few async correction passes; all settle well under 1s even
         # under load), then assert the view didn't move. No fixed-sleep gamble —
@@ -127,7 +139,7 @@
         @test after !== nothing
         ok = after !== nothing && after["text"] == before["text"] &&
              abs(Int(after["off"]) - Int(before["off"])) <= 3
-        ok || @info "scroll_anchor churn FAILED" before after anchor =
+        ok || @info "scroll_anchor churn FAILED" before after churn anchor_now =
             TK.eval_js(s, "JSON.stringify(($CH)._anchorDebugG ?? null)")
         @test after["text"] == before["text"]
         @test abs(Int(after["off"]) - Int(before["off"])) <= 3

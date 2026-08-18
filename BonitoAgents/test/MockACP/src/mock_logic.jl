@@ -164,7 +164,19 @@ pause() = CHUNK_MS > 0 && sleep(CHUNK_MS / 1000)
 
 # Track whether the agent is currently honoring cancel — toggled by the
 # `session/cancel` handler (also drives "ignore_cancel" which clears it).
+# PER-PROMPT: `session/prompt` clears it, so a streaming loop that watches it
+# runs afresh for each turn.
 const cancelled = Ref(false)
+
+# Whether a cancel has EVER been seen. Sticky, precisely because `cancelled` is
+# not: a scenario about what happens to prompts sent AFTER an interrupt cannot
+# ask `cancelled[]`, which the arriving prompt has already cleared. That is what
+# broke `swallow_next_prompt` — it read `cancelled[]` to decide whether to
+# swallow, so the very prompt it was meant to swallow had reset the flag and it
+# took the streaming branch instead, looping forever on a cancel that was never
+# coming. The chat then stayed legitimately busy and the suite blamed the
+# product (`e2e:cancel_misbehaving`'s "chat is usable again" timeout).
+const INTERRUPTED = Ref(false)
 
 # Drive ONE `session/prompt`. The dispatcher catches throws so a scenario
 # can `exit(1)` to simulate a crash without crashing the dispatcher first.
@@ -310,8 +322,9 @@ function handle_prompt(prompt_id, scenario::AbstractString)
     elseif scenario == "swallow_next_prompt"
         # First prompt streams and honors the cancel. EVERY later prompt is
         # answered `end_turn` with no output — the adapter settling a turn that
-        # was queued while it was interrupting.
-        if cancelled[]
+        # was queued while it was interrupting. Keys on the STICKY latch: the
+        # per-prompt `cancelled` was cleared by this very prompt's arrival.
+        if INTERRUPTED[]
             resp(prompt_id, Dict("stopReason" => "end_turn"))
         else
             i = 0
@@ -865,6 +878,7 @@ function dispatch_loop()
             # Notification — no response. Flip the flag so the current
             # prompt's loop (if it's checking) exits and replies cancelled.
             cancelled[] = true
+            INTERRUPTED[] = true      # sticky; survives the next prompt's reset
         end
         # Anything else: silently ignore. The real agent does the same
         # for unknown methods.

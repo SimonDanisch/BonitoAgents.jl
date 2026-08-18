@@ -626,6 +626,7 @@ class BonitoChat {
         }
         this._startSettle();
         this.refresh();
+        if (this.initialLoad && !this._rangeMissing()) this._runInitialMountCascade();
         this._startPrefetch();
     }
     _startSettle() {
@@ -819,23 +820,27 @@ class BonitoChat {
         }
         if (this._scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
-        if (this.initialLoad) {
-            this.initialLoad = true;
-            this.setFollowMode(true);
-            this.scrollToBottom();
-            requestAnimationFrame(()=>{
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-            });
-            setTimeout(()=>{
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-            }, 100);
-            setTimeout(()=>{
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-                this.initialLoad = false;
-            }, 300);
-        } else if (this.followMode) {
-            this._queueScrollToBottom();
-        }
+        if (this.initialLoad) this._runInitialMountCascade();
+        else if (this.followMode) this._queueScrollToBottom();
+    }
+    _runInitialMountCascade() {
+        this.setFollowMode(true);
+        this.scrollToBottom();
+        requestAnimationFrame(()=>{
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        });
+        setTimeout(()=>{
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        }, 100);
+        setTimeout(()=>{
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+            this.initialLoad = false;
+        }, 300);
+    }
+    _rangeMissing() {
+        const [s, e] = this.visibleRange();
+        for(let i = s; i <= e; i++)if (!this.cache.has(i)) return true;
+        return false;
     }
     _measureNodes(pairs) {
         if (!this.measureEl || pairs.length === 0) return;
@@ -2752,7 +2757,7 @@ class BonitoChat {
             this._cancelPendingScroll();
         }
         if (this.followMode) return;
-        if (atBot) {
+        if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
             this.setFollowMode(true);
             this._queueScrollToBottom();
         } else {

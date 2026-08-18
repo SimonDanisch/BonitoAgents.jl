@@ -71,7 +71,15 @@
             # clears and the session is marked dead. (last_error races between the
             # escalate hint and the ConnectionClosed showerror, so we only assert
             # SOMETHING was surfaced, not its exact text.)
-            @test poll_until(() -> !model.busy_active[]; timeout = 15)
+            # Budget sized off the code's OWN bounded wait, not a guess: busy
+            # clears in `drain_turn!`'s finally, which first calls
+            # `wait_rendered!` — capped at `RENDER_BARRIER_SECONDS` (10 s) — and
+            # here the renderer is parked on the wedged agent's flood, so that
+            # cap is genuinely spent before the turn slot is released. A 15 s
+            # deadline sat right on top of 10 s + teardown and failed ~1 run in 3
+            # in isolation. Raising it weakens nothing: busy must still clear,
+            # just not faster than the barrier the product documents.
+            @test poll_until(() -> !model.busy_active[]; timeout = 45)
             @test model.session_alive[] == false
             @test !isempty(model.last_error[])
         end

@@ -108,8 +108,9 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
     # Status LED (green pulse / yellow / red) nestled as a presence badge on the
     # icon's bottom-right corner (anchored to the icon, so it stays put whether
     # the rail is expanded or collapsed to icons). `data-status` lets the CSS
-    # pick the colour + animation; the 1Hz `recompute_status_dom!` JS updates the
-    # attr in place. Home entry has no LED (status === nothing).
+    # pick the colour + animation; the `status_obs` JS handler further down
+    # updates the attr in place whenever a status signal fires (no polling, no
+    # body re-render). Home entry has no LED (status === nothing).
     icon_node = if status === nothing
         icon
     else
@@ -286,9 +287,10 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     #   red         — worker offline / missing
     # Re-renders on structural change (`chat_signal` for chat add/remove,
     # `state.projects` for project add/remove, `state.workers` for worker
-    # online/offline transitions). The LED color is recomputed every second
-    # by `recompute_status_dom!` on the OUTER aside (below) so a busy_active
-    # flip mid-turn doesn't require a body re-render.
+    # online/offline transitions) — deliberately NOT on `turn_signal`. The LED
+    # colour follows a turn instead through `status_obs` on the OUTER aside
+    # (below), which rewrites the `data-status` attr in place, so a busy_active
+    # flip mid-turn never rebuilds this body (an open file tree would collapse).
     # Per-project file trees, kept ACROSS sidebar re-renders. Building a fresh
     # one each render handed the replacement `active = false` and dropped the
     # JS-toggled `.bt-tree-open` class with the old node, so an open tree
@@ -462,11 +464,14 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # never touches Observable refcounts in the body subsession, so the
     # GLOBAL_OBJECT_CACHE notes at the top still hold.
     #
-    # Triggers: any state change that can flip a chat's status fires
-    # `chat_signal` server-side. `chat_models` additions/removals already
-    # call `notify_chats!`; the `ChatModel` constructor anchors an
-    # `on(busy_active) → notify_chats!` so a prompt going in-flight (or
+    # Triggers: any state change that can flip a chat's status fires one of the
+    # two server-side signals. `chat_models` additions/removals call
+    # `notify_chats!`; the `ChatModel` constructor anchors an
+    # `on(busy_active) → notify_turn!` so a prompt going in-flight (or
     # finishing) fans straight through to the sidebar without any polling.
+    # The LED subscribes to BOTH — `turn_signal` deliberately does not re-render
+    # the body (that is the whole reason it exists; see its field doc), and this
+    # attribute-only update is exactly the kind of consumer it is for.
     status_obs = Observable(Dict{String,String}())
     function recompute_status!()
         # Snapshot (pid, project) pairs under the lock (T17) so we don't iterate
@@ -486,6 +491,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     end
     recompute_status!()
     on(session, state.chat_signal) do _; recompute_status!(); end
+    on(session, state.turn_signal) do _; recompute_status!(); end
     on(session, state.workers)     do _; recompute_status!(); end
     on(session, state.projects)    do _; recompute_status!(); end
 
@@ -1395,7 +1401,12 @@ function unified_app(state::ServerState)
             stage,
             # Window-level toast layer (position:fixed) — flashes "can't open …"
             # from the editor open-guard. One per window, bound to pane.toast.
-            plotpane_toast_layer(session, pane);
+            plotpane_toast_layer(session, pane),
+            # Window-level file-viewer driver: gives every rendered file body its
+            # behaviour (image dimensions, table sort, 3D mount) no matter how it
+            # was delivered — a chat bubble's bt_show preview, a workspace panel,
+            # or a node the workspace moved between them. See `file_view_driver`.
+            file_view_driver(session);
             class = "bt-shell")
         # Wire the bt_show_app detach controller once the shell is in the DOM:
         # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all

@@ -992,6 +992,12 @@ class BonitoChat {
         }
         this._startSettle();
         this.refresh();
+        // `refresh()` requests only rows it does not already have. When the
+        // window is fully cached — the streaming case, where this turn appended
+        // its own bubbles before the count landed — no request goes out, so
+        // `onRange` never runs and never clears `initialLoad`. Run the cascade
+        // here instead of waiting for a range that is not coming.
+        if (this.initialLoad && !this._rangeMissing()) this._runInitialMountCascade();
         this._startPrefetch();
     }
 
@@ -1288,27 +1294,41 @@ class BonitoChat {
         // mid-drag insertion is the thumb flicker.
         if (this._scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
-        if (this.initialLoad) {
-            // Initial mount: scroll to bottom and lock follow mode on.
-            // Multiple scroll attempts cover the period during which
-            // child Monaco editors / images are still laying out and
-            // pushing scrollHeight around.
-            this.initialLoad = true; // cleared below after the last scroll
-            this.setFollowMode(true);
-            this.scrollToBottom();
-            requestAnimationFrame(() => {
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-            });
-            setTimeout(() => {
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-            }, 100);
-            setTimeout(() => {
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-                this.initialLoad = false;
-            }, 300);
-        } else if (this.followMode) {
-            this._queueScrollToBottom();
-        }
+        if (this.initialLoad) this._runInitialMountCascade();
+        else if (this.followMode) this._queueScrollToBottom();
+    }
+
+    // Initial mount: scroll to bottom and lock follow mode on. The repeated
+    // attempts cover the period during which child Monaco editors / images are
+    // still laying out and pushing scrollHeight around.
+    //
+    // This also owns the ONLY clear of `initialLoad`, which is why it must run
+    // on every path that arms the flag rather than just on an arriving range —
+    // see the call in `applyCount`. While the flag is set, `updateDOM` skips
+    // `_captureAnchor`, so a latched flag silently disables anchor
+    // compensation for the chat's whole life.
+    _runInitialMountCascade() {
+        this.setFollowMode(true);
+        this.scrollToBottom();
+        requestAnimationFrame(() => {
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        });
+        setTimeout(() => {
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        }, 100);
+        setTimeout(() => {
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+            this.initialLoad = false;
+        }, 300);
+    }
+
+    // Is any row the current window needs absent from the cache? If so a
+    // `msgs.request` is in flight and `onRange` will run; if not, nothing is
+    // coming and the caller must not wait for it.
+    _rangeMissing() {
+        const [s, e] = this.visibleRange();
+        for (let i = s; i <= e; i++) if (!this.cache.has(i)) return true;
+        return false;
     }
 
     // Measure freshly-created (detached) nodes in the hidden off-screen
@@ -4008,7 +4028,9 @@ class BonitoChat {
             this._cancelPendingScroll();
         }
         if (this.followMode) return;
-        if (atBot) {
+        if (atBot || (scrollTop > prevTop &&
+                      scrollHeight - scrollTop - clientHeight < clientHeight &&
+                      !this.lastMessageFullyOutOfView())) {
             this.setFollowMode(true);
             // Pin the viewport. The chase rAF defers while the gesture is
             // still in flight and re-arms itself (see _queueScrollToBottom),
@@ -4016,12 +4038,11 @@ class BonitoChat {
             // disengage meanwhile cancels it as always.
             this._queueScrollToBottom();
         } else {
-            // Off-bottom without re-engaging: any pending chase yields to
-            // the user's position. Re-engagement requires actually reaching
-            // the bottom (AT_BOTTOM_PX) or clicking the jump-to-bottom pill
-            // — the old "within one viewport of bottom" shortcut was too
-            // aggressive on mobile, snapping the view while the user was
-            // still reading the previous sentence.
+            // Off-bottom AND outside the re-engage zone (the last message is
+            // fully hidden, or more than a viewport of gap remains): any
+            // pending chase yields to the user's position. The zone check
+            // above is what keeps this from being the only way back — see the
+            // asymmetry note in this function's header.
             this._cancelPendingScroll();
         }
     }
