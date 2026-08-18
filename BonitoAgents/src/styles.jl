@@ -39,6 +39,21 @@ const ChatStyles = Bonito.Styles(
         "--bt-status-offline" => "#dc2626"),
 
     # ── Reset ────────────────────────────────────────────────────────────────
+    # This is a LIGHT app, and it has to SAY so. Without `color-scheme`, a user
+    # whose desktop is in dark mode gets the UA's DARK defaults for every native
+    # control that doesn't set its own colour: the "new project" worker dropdown
+    # rendered white-on-white and read as an empty box, with nothing in any
+    # stylesheet to blame for the white text. It fixes that whole class at once —
+    # selects, inputs, scrollbars, the native pickers — rather than one
+    # hard-coded colour per control (which is what forcing Monaco's "vs" theme in
+    # chat.jl already had to do).
+    #
+    # `html:root` rather than plain `:root`: BonitoWidgets ships
+    # `@media (prefers-color-scheme: dark) { :root { color-scheme: dark } }`, which
+    # has the SAME specificity and lands later in the cascade, so a plain `:root`
+    # here silently loses. The extra type selector wins on specificity instead of
+    # on source order, which no amount of include-order shuffling can undo.
+    CSS("html:root", "color-scheme" => "light"),
     CSS("html, body",
         "height" => "100%", "margin" => "0", "padding" => "0",
         "overflow" => "hidden"),
@@ -1179,19 +1194,24 @@ const ChatStyles = Bonito.Styles(
         "text-decoration" => "underline",
         "text-decoration-color" => "var(--bt-accent)"),
 
-    # ── Plotpane file editor ─────────────────────────────────────────────────
-    # Editable Monaco over a project file, mounted into #bt-plotpane-mount by
-    # `EditFileCommand`. Fills the pane; the header carries the path, a save
-    # status line, and the Save button.
+    # ── File view panel (workspace tab) ──────────────────────────────────────
+    # `FilePanel` (file_view.jl): one chrome for every file kind. The header
+    # carries the kind glyph, the WORKER path, a size/kind badge, a save status
+    # line and the actions; the body holds the rendered view and (for text-backed
+    # files) an editable Monaco, with `data-view` deciding which is on screen.
     CSS(".bt-file-editor",
         "display" => "flex", "flex-direction" => "column",
-        "height" => "100%", "min-height" => "0"),
+        "height" => "100%", "min-height" => "0",
+        "background" => "var(--bt-surface)"),
     CSS(".bt-file-editor-header",
-        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "6px 10px",
         "border-bottom" => "1px solid var(--bt-border)",
         "background" => "var(--bt-surface-2)",
         "flex-shrink" => "0"),
+    CSS(".bt-fv-icon",
+        "color" => "var(--bt-text-faint)", "font-size" => "13px",
+        "flex-shrink" => "0", "line-height" => "1"),
     CSS(".bt-file-editor-path",
         "font-family" => "ui-monospace, monospace",
         "font-size" => "11.5px",
@@ -1200,19 +1220,425 @@ const ChatStyles = Bonito.Styles(
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap",
         # Path truncates from the LEFT so the filename (the part that
-        # matters) stays visible.
+        # matters) stays visible. Needs `.bt-path-ltr` around the text —
+        # see `path_span`.
         "direction" => "rtl", "text-align" => "left"),
+    # The inner half of the left-truncation trick. `direction: rtl` on the box
+    # is what puts the ellipsis on the left, but it also makes the bidi
+    # algorithm treat the text as RTL, and a leading "/" is a NEUTRAL character
+    # — so `/tmp/x.png` renders as `tmp/x.png/`, a wrong path on every file
+    # header. Isolating the text as its own LTR run fixes the order while the
+    # box keeps truncating from the left. `isolate` rather than `bidi-override`
+    # so a genuinely RTL filename still reads correctly inside.
+    CSS(".bt-path-ltr", "direction" => "ltr", "unicode-bidi" => "isolate"),
+    CSS(".bt-fv-badge",
+        "font-size" => "10px", "text-transform" => "uppercase",
+        "letter-spacing" => "0.04em",
+        "color" => "var(--bt-text-faint)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "999px", "padding" => "1px 7px",
+        "flex-shrink" => "0", "white-space" => "nowrap"),
+    CSS(".bt-fv-size, .bt-fv-dims",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "flex-shrink" => "0", "white-space" => "nowrap"),
     CSS(".bt-file-editor-status",
         "font-size" => "11px",
         "color" => "var(--bt-text-faint)",
         "flex-shrink" => "0",
-        "white-space" => "nowrap"),
+        "white-space" => "nowrap",
+        "max-width" => "40%", "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-fv-actions",
+        "display" => "flex", "align-items" => "center", "gap" => "4px",
+        "flex-shrink" => "0", "margin-left" => "auto"),
+    CSS(".bt-fv-act",
+        "border" => "1px solid transparent", "background" => "transparent",
+        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
+        "font-size" => "13px", "line-height" => "1",
+        "padding" => "3px 6px", "border-radius" => "var(--bt-radius-sm)"),
+    CSS(".bt-fv-act:hover",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+        "border-color" => "var(--bt-border)"),
+    # Segmented Preview|Source switch. The active half is filled, so which view
+    # you're in is readable without hunting for a highlight.
+    CSS(".bt-fv-segmented",
+        "display" => "inline-flex", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)", "overflow" => "hidden",
+        "margin-right" => "4px"),
+    CSS(".bt-fv-seg",
+        "border" => "none", "background" => "transparent", "cursor" => "pointer",
+        "font-size" => "11px", "padding" => "3px 9px",
+        "color" => "var(--bt-text-muted)"),
+    CSS(".bt-fv-seg + .bt-fv-seg", "border-left" => "1px solid var(--bt-border)"),
+    CSS(".bt-fv-seg:hover", "background" => "var(--bt-surface)"),
+    CSS(""".bt-fv-seg[data-active="1"]""",
+        "background" => "var(--bt-accent)", "color" => "#fff"),
+
     CSS(".bt-file-editor-body",
         "flex" => "1 1 auto", "min-height" => "0",
-        "overflow" => "hidden"),
+        "overflow" => "hidden", "display" => "flex", "flex-direction" => "column"),
+    # `data-view` picks the half on screen. Both stay MOUNTED: toggling must not
+    # lose the editor's cursor/scroll/unsaved edits or re-run a mesh upload.
+    CSS(""".bt-file-view[data-view="preview"] > .bt-file-editor-body > .bt-fv-source""",
+        "display" => "none"),
+    CSS(""".bt-file-view[data-view="source"] > .bt-file-editor-body > .bt-fv-rendered""",
+        "display" => "none"),
+    CSS(".bt-fv-rendered, .bt-fv-source",
+        "flex" => "1 1 auto", "min-height" => "0", "min-width" => "0",
+        "display" => "flex", "flex-direction" => "column", "overflow" => "auto"),
     # The Monaco wrapper chain must pass full height down to the editor div.
-    CSS(".bt-file-editor-body > div, .bt-file-editor-body .monaco-editor-div",
+    CSS(".bt-fv-source > div, .bt-fv-editor, .bt-fv-source .monaco-editor-div",
         "height" => "100%", "min-height" => "0"),
+    CSS(".bt-fv-error", "margin" => "12px"),
+    CSS(".bt-fv-loading",
+        "padding" => "16px", "font-size" => "12.5px",
+        "color" => "var(--bt-text-faint)", "font-style" => "italic"),
+    CSS(".bt-fv-error-title", "font-weight" => "600"),
+    CSS(".bt-fv-error-detail",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
+        "margin-top" => "4px", "opacity" => "0.85"),
+
+    # Image stage: a checkerboard so transparency reads as transparency, and the
+    # image centred + contained rather than pinned to the top-left.
+    CSS(".bt-fv-image-stage",
+        "flex" => "1 1 auto", "min-height" => "0",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "padding" => "12px", "overflow" => "auto",
+        "background-color" => "var(--bt-surface)",
+        "background-image" => string(
+            "linear-gradient(45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
+            "linear-gradient(-45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
+            "linear-gradient(45deg, transparent 75%, rgba(15,23,42,0.06) 75%),",
+            "linear-gradient(-45deg, transparent 75%, rgba(15,23,42,0.06) 75%)"),
+        "background-size" => "18px 18px",
+        "background-position" => "0 0, 0 9px, 9px -9px, -9px 0"),
+    # An IMAGE is shown at its own size, shrunk to fit. `max-height: 100%` on the
+    # <img> ALONE does nothing: the percentage resolves against `.bt-media-wrap`,
+    # whose own height comes from its content, so a 1500px-tall image kept every
+    # pixel and ran off the bottom of the tab. The wrap has to be a flex box
+    # that is allowed to shrink (`min-height: 0`) before the image inside it can.
+    CSS(".bt-fv-image-stage .bt-media-wrap",
+        "max-height" => "100%", "min-height" => "0", "display" => "flex"),
+    CSS(".bt-fv-image-stage img.bt-media",
+        "max-height" => "100%", "min-height" => "0", "object-fit" => "contain"),
+    # A VIDEO instead FILLS its stage and letterboxes, the way every video player
+    # behaves. Left at its intrinsic size a small clip renders as a handful of
+    # pixels with the browser's controls collapsed into nothing: you can see the
+    # file but you cannot play it, which is the one thing a video tab is for.
+    # Sized on the WRAP (whose containing block is the stage, and so has a real
+    # size) rather than by a minimum on the video — a percentage minimum there
+    # resolves against the shrink-to-fit wrapper and comes out as zero.
+    CSS(".bt-fv-video-stage .bt-media-wrap", "width" => "100%", "height" => "100%"),
+    CSS(".bt-fv-video-stage video.bt-media",
+        "width" => "100%", "height" => "100%", "object-fit" => "contain"),
+
+    # Video gets a stage of its own: centred, on a dark backdrop (the neutral
+    # surround every video player uses), and CONTAINED — `media_element` caps
+    # width only, so without the max-height here a portrait or 4K clip pushes its
+    # own controls off the bottom of the tab.
+    CSS(".bt-fv-video-stage",
+        "flex" => "1 1 auto", "min-height" => "0",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "padding" => "12px", "overflow" => "auto",
+        "background" => "#1b1d21"),
+    CSS(".bt-fv-audio-wrap",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
+        "align-items" => "center", "justify-content" => "center",
+        "padding" => "24px", "flex" => "1 1 auto"),
+    CSS(".bt-fv-audio", "width" => "min(520px, 100%)"),
+    CSS(".bt-fv-audio-name",
+        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "font-family" => "ui-monospace, monospace"),
+
+    CSS(".bt-fv-markdown",
+        "padding" => "16px 22px", "overflow" => "auto",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    # Inside a chat bubble the preview is one block among many — no pane padding,
+    # and capped so a 900-line README doesn't bury the rest of the turn.
+    CSS(".bt-tool-body .bt-fv-markdown",
+        "padding" => "0", "max-height" => "420px"),
+
+    # Frames (pdf / html). `border:none` + a surface background so a page that
+    # doesn't set its own doesn't render as a grey void.
+    CSS(".bt-fv-frame-wrap",
+        "flex" => "1 1 auto", "min-height" => "0", "display" => "flex"),
+    CSS(".bt-fv-frame",
+        "flex" => "1 1 auto", "width" => "100%", "border" => "none",
+        "background" => "#fff", "min-height" => "0"),
+    CSS(".bt-tool-body .bt-fv-frame-wrap", "height" => "480px"),
+
+    # ── Table (csv / tsv) ────────────────────────────────────────────────────
+    CSS(".bt-fv-table-wrap",
+        "display" => "flex", "flex-direction" => "column",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-fv-table-bar",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "padding" => "6px 10px", "flex-shrink" => "0",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-fv-table-filter",
+        "flex" => "0 1 260px", "font-size" => "12px",
+        "padding" => "3px 8px", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)"),
+    CSS(".bt-fv-table-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
+    CSS(".bt-fv-table-scroll",
+        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto"),
+    CSS(".bt-tool-body .bt-fv-table-scroll", "max-height" => "420px"),
+    CSS(".bt-fv-table",
+        "border-collapse" => "separate", "border-spacing" => "0",
+        "font-size" => "12px", "font-family" => "ui-monospace, monospace",
+        "width" => "max-content", "min-width" => "100%"),
+    CSS(".bt-fv-table th",
+        # Sticky header: scrolling a 5000-row table without losing the column
+        # names is most of what makes this better than looking at the raw text.
+        "position" => "sticky", "top" => "0", "z-index" => "1",
+        "background" => "var(--bt-surface-2)",
+        "border-bottom" => "1px solid var(--bt-border)",
+        "padding" => "5px 10px", "text-align" => "left",
+        "white-space" => "nowrap", "font-weight" => "600"),
+    CSS(".bt-fv-table td",
+        "padding" => "3px 10px", "white-space" => "nowrap",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-fv-table tbody tr:hover td", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-fv-table .bt-fv-num", "text-align" => "right"),
+    CSS(".bt-fv-table .bt-fv-rownum",
+        "color" => "var(--bt-text-faint)", "text-align" => "right",
+        "user-select" => "none",
+        "position" => "sticky", "left" => "0",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-table th.bt-fv-rownum", "background" => "var(--bt-surface-2)", "z-index" => "2"),
+    CSS(".bt-fv-sortable", "cursor" => "pointer", "user-select" => "none"),
+    CSS(".bt-fv-sort-arrow", "opacity" => "0.35", "margin-left" => "6px"),
+    CSS(".bt-fv-sortable:hover .bt-fv-sort-arrow", "opacity" => "0.8"),
+
+    # ── Notebook ─────────────────────────────────────────────────────────────
+    CSS(".bt-fv-notebook",
+        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto",
+        "padding" => "12px 16px", "display" => "flex", "flex-direction" => "column",
+        "gap" => "10px"),
+    CSS(".bt-fv-nb-cell",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)", "overflow" => "hidden"),
+    CSS(".bt-fv-nb-md", "padding" => "2px 14px", "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-nb-source", "background" => "var(--bt-surface-2)", "padding" => "6px 8px"),
+    CSS(".bt-fv-nb-outputs",
+        "border-top" => "1px solid var(--bt-border)", "padding" => "8px 12px",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-nb-text",
+        "margin" => "0", "font-family" => "ui-monospace, monospace",
+        "font-size" => "11.5px", "white-space" => "pre-wrap",
+        "max-height" => "320px", "overflow" => "auto"),
+    CSS(".bt-fv-nb-image", "max-width" => "100%", "display" => "block"),
+    CSS(".bt-fv-more",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "font-style" => "italic", "padding" => "4px 2px"),
+
+    # ── Hex dump ─────────────────────────────────────────────────────────────
+    CSS(".bt-fv-hex-wrap",
+        "display" => "flex", "flex-direction" => "column",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-fv-hex-bar",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "padding" => "6px 10px", "flex-shrink" => "0"),
+    CSS(".bt-fv-hex-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
+    CSS(".bt-fv-hex",
+        "margin" => "0", "padding" => "0 12px 12px",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
+        "line-height" => "1.5", "color" => "var(--bt-text-muted)",
+        "overflow" => "auto", "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-tool-body .bt-fv-hex", "max-height" => "360px"),
+
+    # ── 3D geometry ──────────────────────────────────────────────────────────
+    CSS(".bt-mesh-view",
+        "position" => "relative", "flex" => "1 1 auto",
+        "min-height" => "0", "display" => "flex"),
+    # Inline (chat bubble) has no panel to fill, so it needs an explicit box.
+    CSS(""".bt-mesh-view[data-mode="inline"]""", "height" => "360px"),
+    CSS(".bt-mesh-canvas",
+        "flex" => "1 1 auto", "width" => "100%", "height" => "100%",
+        "display" => "block", "touch-action" => "none", "cursor" => "grab"),
+    CSS(".bt-mesh-canvas:active", "cursor" => "grabbing"),
+    CSS(".bt-mesh-toolbar",
+        "position" => "absolute", "top" => "8px", "right" => "8px",
+        "display" => "flex", "gap" => "4px"),
+    CSS(".bt-mesh-btn",
+        "border" => "1px solid var(--bt-border)", "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
+        "border-radius" => "var(--bt-radius-sm)", "padding" => "3px 7px",
+        "font-size" => "13px", "line-height" => "1"),
+    CSS(".bt-mesh-btn:hover", "color" => "var(--bt-text)"),
+    CSS(""".bt-mesh-btn[data-on="1"]""",
+        "background" => "var(--bt-accent)", "color" => "#fff", "border-color" => "var(--bt-accent)"),
+    CSS(".bt-mesh-btn:disabled", "opacity" => "0.4", "cursor" => "default"),
+    CSS(".bt-mesh-status",
+        "position" => "absolute", "left" => "10px", "bottom" => "8px",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "pointer-events" => "none"),
+
+    # ── Change review tab (review.jl) ────────────────────────────────────────
+    CSS(".bt-review",
+        "display" => "flex", "flex-direction" => "column",
+        "height" => "100%", "min-height" => "0",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-rv-repo", "flex" => "0 1 auto"),
+    CSS(".bt-rv-stat",
+        "font-size" => "11px", "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap"),
+    CSS(".bt-rv-base",
+        "width" => "130px", "font-size" => "11px", "padding" => "3px 8px",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+        "font-family" => "ui-monospace, monospace"),
+    CSS(".bt-rv-hint",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "padding" => "4px 12px", "flex-shrink" => "0",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-rv-body",
+        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto",
+        "padding" => "8px 10px 24px"),
+    CSS(".bt-rv-empty, .bt-rv-binary",
+        "padding" => "14px", "font-size" => "12.5px", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-rv-error", "margin" => "12px"),
+
+    # Pending-comment tray. Hidden entirely when empty (and in ask mode, where
+    # nothing ever collects) so the diff gets the space.
+    CSS(".bt-rv-tray-wrap", "flex-shrink" => "0"),
+    CSS(".bt-rv-tray",
+        "display" => "flex", "flex-wrap" => "wrap", "gap" => "6px",
+        "padding" => "8px 12px", "background" => "var(--bt-surface-2)",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    # Hidden only when EMPTY. Deliberately NOT hidden in ask mode: comments you
+    # collected in feedback mode are still pending, and hiding them while
+    # leaving the Send button live would mean sending something you can't see.
+    CSS(""".bt-rv-tray[data-empty="1"]""", "display" => "none"),
+    CSS(".bt-rv-chip",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "6px",
+        "max-width" => "320px", "cursor" => "pointer",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "999px",
+        "background" => "var(--bt-surface)", "padding" => "2px 4px 2px 9px",
+        "font-size" => "11.5px"),
+    CSS(".bt-rv-chip:hover", "border-color" => "var(--bt-accent)"),
+    CSS(".bt-rv-chip-n", "color" => "var(--bt-text-faint)"),
+    CSS(".bt-rv-chip-loc",
+        "font-family" => "ui-monospace, monospace", "color" => "var(--bt-accent)",
+        "white-space" => "nowrap"),
+    CSS(".bt-rv-chip-text",
+        "color" => "var(--bt-text-muted)", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "white-space" => "nowrap"),
+    CSS(".bt-rv-chip-drop",
+        "border" => "none", "background" => "transparent", "cursor" => "pointer",
+        "color" => "var(--bt-text-faint)", "font-size" => "11px",
+        "padding" => "2px 5px", "border-radius" => "999px"),
+    CSS(".bt-rv-chip-drop:hover", "color" => "var(--bt-error)", "background" => "var(--bt-surface-2)"),
+
+    # Per-file section.
+    CSS(".bt-rv-file",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)",
+        "margin-bottom" => "10px", "overflow" => "hidden", "background" => "var(--bt-surface)"),
+    CSS(".bt-rv-file > summary",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "padding" => "6px 10px", "cursor" => "pointer", "user-select" => "none",
+        "background" => "var(--bt-surface-2)", "font-size" => "12px",
+        "position" => "sticky", "top" => "0", "z-index" => "2"),
+    CSS(".bt-rv-file-status",
+        "font-size" => "10px", "text-transform" => "uppercase",
+        "letter-spacing" => "0.04em", "color" => "var(--bt-text-faint)",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "999px",
+        "padding" => "1px 7px", "flex-shrink" => "0"),
+    CSS(""".bt-rv-file-status[data-status="added"]""",
+        "color" => "var(--bt-success)", "border-color" => "var(--bt-success)"),
+    CSS(""".bt-rv-file-status[data-status="deleted"]""",
+        "color" => "var(--bt-error)", "border-color" => "var(--bt-error)"),
+    # Left-truncating like `.bt-file-editor-path`, and with the same `.bt-path-ltr`
+    # requirement on its text.
+    CSS(".bt-rv-file-path",
+        "font-family" => "ui-monospace, monospace", "flex" => "1 1 auto",
+        "min-width" => "0", "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap", "direction" => "rtl", "text-align" => "left"),
+    # Send with an empty tray: still clickable (pressing it is how you learn what
+    # it does — it answers "no comments to send"), just not dressed as the thing
+    # you came here to press.
+    CSS(""".bt-rv-send[data-empty="1"]""",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text-faint)",
+        "border" => "1px solid var(--bt-border)"),
+    CSS(""".bt-rv-send[data-empty="1"]:hover""",
+        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-rv-plus-count", "color" => "var(--bt-success)", "font-size" => "11px"),
+    CSS(".bt-rv-minus-count", "color" => "var(--bt-error)", "font-size" => "11px"),
+    # "Open the whole file" — revealed on section hover so a long diff's headers
+    # stay quiet.
+    CSS(".bt-rv-open",
+        "border" => "1px solid transparent", "background" => "transparent",
+        "color" => "var(--bt-text-faint)", "cursor" => "pointer",
+        "font-size" => "12px", "line-height" => "1", "padding" => "2px 6px",
+        "border-radius" => "var(--bt-radius-sm)", "opacity" => "0"),
+    CSS(".bt-rv-file > summary:hover .bt-rv-open", "opacity" => "1"),
+    CSS(".bt-rv-open:hover",
+        "color" => "var(--bt-accent)", "border-color" => "var(--bt-border)",
+        "background" => "var(--bt-surface)"),
+
+    CSS(".bt-rv-hunk-head",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11px",
+        "color" => "var(--bt-text-faint)", "background" => "var(--bt-surface-2)",
+        "padding" => "3px 10px", "border-top" => "1px solid var(--bt-border)",
+        "white-space" => "pre", "overflow" => "hidden", "text-overflow" => "ellipsis"),
+
+    # One diff row: two gutter numbers, the code, and the + affordance.
+    CSS(".bt-rv-line",
+        "display" => "flex", "align-items" => "flex-start",
+        "font-family" => "ui-monospace, monospace", "font-size" => "12px",
+        "line-height" => "1.5", "position" => "relative"),
+    CSS(".bt-rv-line:hover", "background" => "rgba(59,130,246,0.06)"),
+    CSS(".bt-rv-num",
+        "flex" => "0 0 44px", "text-align" => "right", "padding" => "0 8px 0 0",
+        "color" => "var(--bt-text-faint)", "user-select" => "none",
+        "white-space" => "nowrap"),
+    CSS(".bt-rv-code",
+        "flex" => "1 1 auto", "min-width" => "0", "white-space" => "pre-wrap",
+        "word-break" => "break-word", "padding-right" => "28px"),
+    CSS(".bt-rv-add", "background" => "rgba(16,185,129,0.10)"),
+    CSS(".bt-rv-del", "background" => "rgba(239,68,68,0.10)"),
+    CSS(".bt-rv-note", "color" => "var(--bt-text-faint)", "font-style" => "italic"),
+    # `+` reveals on row hover — always-visible buttons on every line of a
+    # thousand-line diff are pure noise.
+    CSS(".bt-rv-plus",
+        "position" => "absolute", "right" => "4px", "top" => "1px",
+        "display" => "none", "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-accent)",
+        "border-radius" => "var(--bt-radius-sm)", "cursor" => "pointer",
+        "font-size" => "11px", "line-height" => "1", "padding" => "2px 6px"),
+    CSS(".bt-rv-line:hover .bt-rv-plus", "display" => "block"),
+    CSS(".bt-rv-plus:hover", "background" => "var(--bt-accent)", "color" => "#fff"),
+    # A line you already commented on keeps a marker, so a long pass shows where
+    # you've been.
+    CSS(""".bt-rv-line[data-commented="1"]""",
+        "box-shadow" => "inset 3px 0 0 var(--bt-accent)"),
+    # While the composer is open, the lines the comment will cover are lit up —
+    # otherwise a shift-click range is invisible until after you've sent it.
+    # Attribute + class outranks the plain `.bt-rv-add` / `.bt-rv-del` tints.
+    CSS(""".bt-rv-line[data-selected="1"]""",
+        "background" => "rgba(59,130,246,0.16)"),
+    CSS(".bt-rv-flash", "animation" => "bt-rv-flash 1.2s ease-out"),
+    CSS("@keyframes bt-rv-flash",
+        CSS("0%",   "background" => "rgba(59,130,246,0.35)"),
+        CSS("100%", "background" => "transparent")),
+
+    # Inline comment composer, inserted under the row it belongs to.
+    CSS(".bt-rv-form",
+        "display" => "flex", "flex-direction" => "column", "gap" => "6px",
+        "padding" => "8px 10px 10px 52px",
+        "background" => "var(--bt-surface-2)",
+        "border-top" => "1px solid var(--bt-border)",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-rv-input",
+        "width" => "100%", "min-height" => "62px", "resize" => "vertical",
+        "font-family" => "inherit", "font-size" => "12.5px",
+        "padding" => "6px 8px", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)"),
+    CSS(".bt-rv-form-actions", "display" => "flex", "gap" => "8px", "align-items" => "center"),
+    CSS(".bt-rv-form-cancel",
+        "border" => "none", "background" => "transparent", "cursor" => "pointer",
+        "color" => "var(--bt-text-muted)", "font-size" => "12px"),
     # Live stdout tail of a RUNNING bt_julia_eval: a small terminal-style
     # pane under the header (~4 lines, auto-scrolled to the newest output by
     # the client). Removed when the eval completes — the body's "Output"

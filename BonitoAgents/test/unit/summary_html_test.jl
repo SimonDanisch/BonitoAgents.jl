@@ -55,4 +55,33 @@
         @test occursin("PLAINMARK_z", r)
         @test !occursin("base64", r)
     end
+
+    @testset "every display value is a Node — the LIVE embed's contract" begin
+        # The live re-render (`update_session_dom!` → `render_subsession` →
+        # `session_dom`) accepts an `App` or a `Node` and NOTHING else. Bonito
+        # renders a few values as raw text — `jsrender(::Session, ::String)`
+        # returns the string itself — which is fine as a node's child but not as
+        # an App's root, so `display_app("some string")` used to raise a
+        # MethodError that Bonito swallowed into an error page. The snapshot
+        # render wraps text and looked correct, so the failure only appeared once
+        # the bridge went live: the chat showed the value, then replaced it with
+        # a stacktrace. Assert the contract directly, for the raw-text types AND
+        # the rich ones that must keep rendering as they did.
+        for v in Any["a plain string", :a_symbol, "multi\nline",
+                     "\e[31mred ansi\e[0m", SubString("abcdef", 2, 4),
+                     42, 3.5, true, [1, 2, 3], Dict(:a => 1), 1 // 2, sqrt]
+            sess = Bonito.Session(Bonito.NoConnection();
+                                  asset_server = Bonito.NoServer())
+            dom = Bonito.rendered_dom(sess, RP.display_app(v))
+            @test dom isa Bonito.Hyperscript.Node
+        end
+        # The text itself survives the wrapping — a Node that renders the wrong
+        # thing would satisfy the check above.
+        @test occursin("STRMARK_q", RP.summary_html("STRMARK_q"))
+        @test occursin("symmark_q", RP.summary_html(:symmark_q))
+        # Multi-line results keep their breaks (RichText is `pre-wrap`), which is
+        # why this path uses RichText rather than a bare `<div>`.
+        @test occursin("firstMARK_a\nsecondMARK_b",
+                       RP.summary_html("firstMARK_a\nsecondMARK_b"))
+    end
 end

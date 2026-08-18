@@ -288,22 +288,28 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         error("ChatModel requires an agent (a WorkerAgent); none was provided")
     actual_agent = agent
     busy_active = Observable(false)
-    # NB busy_active is deliberately NOT wired to `notify_chats!`.
+    # NB busy_active is wired to `notify_turn!` — NOT to `notify_chats!`.
     #
-    # It used to be, to make the sidebar's status LED flip the instant a prompt
-    # went in flight. But `chat_signal` means "the set of chats CHANGED" (see
-    # its field doc), and the sidebar's body re-renders on it — so every turn
-    # boundary rebuilt the whole open-chats list, including each chat's file
-    # tree. An open tree was swapped out mid-interaction: a click landed on a
-    # row belonging to the outgoing DOM and did nothing, and the replacement
-    # tree came back collapsed. `e2e:file_tree` failed 2 of 3 runs on exactly
-    # that, and a user would see a tree that collapses whenever the agent
-    # starts talking.
+    # It used to be the latter, to make the sidebar's status LED flip the
+    # instant a prompt went in flight. But `chat_signal` means "the set of chats
+    # CHANGED" (see its field doc), and the sidebar's body re-renders on it — so
+    # every turn boundary rebuilt the whole open-chats list, including each
+    # chat's file tree. An open tree was swapped out mid-interaction: a click
+    # landed on a row belonging to the outgoing DOM and did nothing, and the
+    # replacement tree came back collapsed. `e2e:file_tree` failed 2 of 3 runs
+    # on exactly that, and a user would see a tree that collapses whenever the
+    # agent starts talking.
     #
-    # The LED needs no such thing: `sidebar_entry` renders it with a
-    # `dataStatus` attribute and the 1 Hz `recompute_status_dom!` updates that
-    # attribute IN PLACE, which is what the sidebar's own comment says the
-    # design is. Worst case the LED is a second late; nothing is rebuilt.
+    # Dropping the hook outright was the wrong correction, though: the
+    # dashboard's overview cards read a chat's MESSAGES, and their whole
+    # contract (overview.jl's header) is that they follow turn boundaries. With
+    # no signal at all they froze at whatever the chat looked like when it was
+    # created — `e2e:overview` caught exactly that ("1 message" for a chat that
+    # had already answered, and no live update on the next turn).
+    #
+    # So the two audiences get two signals. `turn_signal` fans out to the
+    # content views (overview cards, the sidebar's IN-PLACE LED update) and
+    # rebuilds no lists.
     model = ChatModel(
         ReentrantLock(),
         state, String(cwd), String(project_id),
@@ -356,6 +362,19 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     # (a page reload didn't hit this: the live store's messages kept their ref).
     for m in msgs_store
         m isa UserMsg && m.chat === nothing && (m.chat = model)
+    end
+    # Turn boundaries → `turn_signal` (see the note at `busy_active` above).
+    # Deduped against the last value we ACTED on, because `refresh_activity!`
+    # writes `busy_active` unconditionally — that re-broadcast is deliberate
+    # (it repairs a tab whose bridge missed an update) but it means the raw
+    # observable fires many times per turn, and every fire here would rebuild
+    # the overview grid. A transition is what "a turn started / finished"
+    # actually is.
+    busy_seen = Ref(busy_active[])
+    on(busy_active) do b
+        b == busy_seen[] && return
+        busy_seen[] = b
+        notify_turn!(model.state)
     end
     return model
 end
@@ -1812,22 +1831,17 @@ function augment_generic_header!(d::Dict, chat_dir::AbstractString)
     return d
 end
 
-# Extensions the ✎ editor refuses outright: media that has dedicated viewers
-# (images/video render inline) and binary formats Monaco would just garble.
-# Everything else — including extensionless files like Makefile/LICENSE and
-# unknown extensions — is offered for editing; a content-level binary sniff
-# in `FileEditor`'s jsrender catches what the extension check can't.
+# Extensions Monaco would just garble: archives, executables, model weights,
+# fonts. Everything else — including extensionless files like Makefile/LICENSE
+# and unknown extensions — is offered as text; a content-level NUL sniff catches
+# what the extension check can't. `file_kind` (file_view.jl) consults this LAST,
+# after the kinds that have a real viewer, so a `.pdf` or `.png` never reaches
+# it. See `editor_openable` there for the predicate built on top.
 const EDITOR_BINARY_EXTS = (".pdf", ".zip", ".tar", ".gz", ".tgz", ".bz2",
     ".xz", ".7z", ".exe", ".dll", ".so", ".dylib", ".bin", ".wasm", ".o",
-    ".a", ".class", ".jar", ".ico", ".ttf", ".otf", ".woff", ".woff2",
+    ".a", ".class", ".jar", ".ttf", ".otf", ".woff", ".woff2",
     ".eot", ".jld2", ".arrow", ".parquet", ".sqlite", ".db", ".h5",
     ".hdf5", ".npy", ".npz", ".pkl", ".gguf", ".onnx", ".pt", ".safetensors")
-
-function editor_openable(path::AbstractString)
-    ext = lowercase(splitext(path)[2])
-    return !(ext in SHOW_IMAGE_EXTS || haskey(SHOW_VIDEO_MIME, ext) ||
-             ext in EDITOR_BINARY_EXTS)
-end
 
 # Does a tool title look like a file path (vs a label like "bash", a
 # sentence, or a URL)? Tools that operate on a file conventionally title
@@ -1858,15 +1872,16 @@ tool_path_hint(m::Union{EditToolMsg,ReadToolMsg}) =
 tool_path_hint(m::SearchToolMsg)   = isempty(m.path) ? nothing : m.path
 tool_path_hint(m::ShowToolMsg)     = isempty(m.path) ? nothing : m.path
 
-# The worker-side file path a tool's ✎ "open in editor" button should edit.
+# The worker-side file path a tool's ✎ "open this file" button targets.
 # Sources, in priority order: a `bt_show` reference in the output, an edit
 # tool's diff target, a path argument from the call's rawInput
 # (`d["path_hint"]` — claude's Read/Edit/Write carry `file_path` there),
 # or a title that IS a path. The title check is strict (`path_like_title`)
 # because real agents title display strings — claude's Read is titled
 # "Read CONVENTIONS.md", which is NOT a path; its real path arrives via
-# rawInput. `nothing` ⇒ no button (no path found, or a media/binary file
-# the editor can't usefully open).
+# rawInput. `nothing` ⇒ no button (no path found). There is deliberately NO
+# kind filter: the viewer opens every file kind, so a bt_show of a PNG gets the
+# button too, and clicking it opens the image in its own tab.
 function editable_path_from(d::AbstractDict, content)
     ref = find_show_reference(content)
     p = ref === nothing ? nothing : parse_show_path(ref)
@@ -1887,7 +1902,6 @@ function editable_path_from(d::AbstractDict, content)
         path_like_title(t) && (p = t)
     end
     p === nothing && return nothing
-    editor_openable(p) || return nothing
     return String(p)
 end
 
@@ -2512,12 +2526,11 @@ function render_search_results(text::AbstractString)
         if m !== nothing
             path = String(m.captures[1])
             push!(rows, DOM.div(
-                # The hit's path is a clickable link (delegated chat listener
-                # → plotpane editor); media/binary hits stay plain text.
-                editor_openable(path) ?
-                    DOM.span(path; class="bt-search-path bt-path-link",
-                             dataPath=path) :
-                    DOM.span(path; class="bt-search-path"),
+                # Every hit's path is a clickable link (delegated chat listener
+                # → workspace file tab). No kind filter: the file viewer opens
+                # anything, so a search that turns up a .png must still be one
+                # click from seeing it.
+                DOM.span(path; class="bt-search-path bt-path-link", dataPath=path),
                 DOM.span(":" * String(m.captures[2]); class="bt-search-line"),
                 DOM.code(strip(String(m.captures[3])); class="bt-search-snippet");
                 class="bt-search-row"))
@@ -2640,45 +2653,149 @@ end
 # `<dst>.partial` at any time — an earlier prune-on-success optimization would
 # hand them two different locks. One ReentrantLock per distinct file ever
 # fetched is a trivial, bounded cost.
+#
+# `state.show_mirror_stamps` is keyed the SAME way and has the same lifetime —
+# both grow with the number of distinct files ever mirrored, and neither is
+# pruned. Don't prune one without the other: dropping a stamp only costs an
+# extra re-fetch, but dropping a LOCK reintroduces the race above (a task that
+# already took the old lock races a task that gets a fresh one). Both counts are
+# reported by `bt_dev_memory`, so growth is visible rather than guessed at.
+
+# The worker-side absolute path a ShowTool refers to. Relative paths are
+# resolved against the project's worker root (NOT the server mirror's cwd —
+# those two only coincide because the mirror shadows the tree).
+function show_worker_path(st::ShowTool)
+    isabspath(st.path) && return String(st.path)
+    proj = get(st.state.projects[], st.project_id, nothing)
+    proj === nothing && return String(st.path)
+    return joinpath(proj.worker_path, st.path)
+end
+
+# Is our mirror copy the CURRENT version, given the worker's stamp right now?
+#
+# The whole point of #34: paths are reused (a re-rendered plot, a re-recorded
+# video, an edited source file all keep their name), so "the file exists on the
+# server" says nothing about whether it's the file the user just asked to see.
+# The worker's `(size, mtime)` is the version stamp; we remember the stamp each
+# transfer landed and compare against a fresh stat.
+#
+# Returns `true` (reuse the mirror) only on a POSITIVE match. Anything else — no
+# recorded stamp, a stamp that moved, `current === nothing` because the worker is
+# unreachable — returns `false` and we re-fetch, because serving the wrong bytes
+# silently is the failure mode we're fixing. (The caller falls back to a stale
+# mirror only when the re-fetch itself is impossible; see `fetch_show_file`.)
+#
+# Takes the stat as an ARGUMENT rather than making one: a single
+# `fetch_show_file` needs the worker's stamp for both the cache decision and the
+# post-transfer sanity check, and each stat is a round-trip to another machine.
+function mirror_is_current(st::ShowTool, server_dst::AbstractString, current)
+    (current === nothing || !isfile(server_dst)) && return false
+    stamp = lock(st.state.lock) do
+        get(st.state.show_mirror_stamps, String(server_dst), nothing)
+    end
+    return stamp !== nothing && current.size == stamp.size && current.mtime == stamp.mtime
+end
+
+# The worker's current `(size, mtime)` for `worker_src`, or `nothing` when we
+# can't ask (no project, worker down, stat error, not a file).
+function worker_file_stamp(st::ShowTool, worker_src::AbstractString)
+    proj = get(st.state.projects[], st.project_id, nothing)
+    proj === nothing && return nothing
+    info = try
+        stat_worker_path(st.state, proj.worker_id, worker_src)
+    catch e
+        e isa WorkerUnreachableError && return nothing
+        @warn "show: stat failed" path = worker_src exception = e
+        return nothing
+    end
+    return info.isfile ? (size = info.size, mtime = info.mtime) : nothing
+end
+
+# Record the version stamp a completed transfer corresponds to — but ONLY when
+# the file didn't move under us mid-transfer. `before` is the stamp we saw when
+# we decided to fetch; if the worker's stamp differs now, the bytes we just
+# pulled are of indeterminate vintage, so we record NOTHING and the next read
+# re-fetches. Erring toward an extra transfer is the whole point: the bug being
+# fixed is showing the wrong bytes confidently.
+function record_mirror_stamp!(st::ShowTool, server_dst::AbstractString,
+                              worker_src::AbstractString, before)
+    after = worker_file_stamp(st, worker_src)
+    (before === nothing || after === nothing || before != after) && return nothing
+    lock(st.state.lock) do
+        st.state.show_mirror_stamps[String(server_dst)] = (size = after.size, mtime = after.mtime)
+    end
+    return nothing
+end
 
 # Resolve `st.path` to a file on the SERVER's disk, fetching it from the worker
-# if we don't already have it. Blocks for the transfer (multi-GB videos take
-# a while — receive_file streams into `<dst>.partial` and renames, so isfile
-# never sees a torso). Throws if it can't be obtained.
+# if our copy isn't the worker's CURRENT version. Blocks for the transfer
+# (multi-GB videos take a while — receive_file streams into `<dst>.partial` and
+# renames, so isfile never sees a torso). Throws if it can't be obtained.
 #
-# `refresh=true` re-fetches even when a mirror copy exists (#34): the agent
-# edits files ON THE WORKER, so for the file EDITOR the first-ever-fetched
-# copy is stale the moment a turn touches the file. Media previews keep the
-# cheap cache (tool outputs are new paths; multi-GB videos must not re-stream
-# per render). With no worker attached, refresh falls back to the existing
-# mirror copy rather than failing — stale beats nothing when offline.
-function fetch_show_file(st::ShowTool; refresh::Bool = false)
+# Freshness (#34): the agent edits/regenerates files ON THE WORKER and paths get
+# reused, so "we already have a file at this destination" is not a cache hit.
+# `mirror_is_current` compares the worker's `(size, mtime)` against the stamp we
+# recorded for this mirror copy; only a match skips the transfer. That single
+# rule covers the file editor, bt_show previews, and the file viewer alike — the
+# old design had the editor pass `refresh = true` and everything else silently
+# serve whatever landed first.
+#
+# `refresh = true` skips even the stamp check (an unconditional re-transfer).
+# With no worker attached, both paths fall back to the existing mirror copy
+# rather than failing — stale beats nothing when offline.
+#
+# `stamp` lets a caller that ALREADY stat'd the file (the file panel, which needs
+# the size for its header) hand that stat in instead of paying for a second
+# round-trip to another machine.
+function fetch_show_file(st::ShowTool; refresh::Bool = false, stamp = missing)
     server_dst = show_server_path(st)
-    !refresh && isfile(server_dst) && return server_dst   # already mirrored or cached
+    worker_src = show_worker_path(st)
+    # ONE stat for the whole call: it decides the cache question AND is the
+    # `before` half of the post-transfer sanity check below.
+    current = refresh ? nothing :
+              (stamp === missing ? worker_file_stamp(st, worker_src) : stamp)
+    !refresh && mirror_is_current(st, server_dst, current) && return server_dst
     dst_lock = lock(st.state.lock) do
         get!(ReentrantLock, st.state.show_fetch_inflight, server_dst)
     end
     return lock(dst_lock) do
-        !refresh && isfile(server_dst) && return server_dst    # the racer fetched it
+        # A racer may have fetched it while we waited. Re-check against the stamp
+        # we already have rather than stat'ing again: the racer's copy is at
+        # least as new as `current`, and if the file has moved on since, the next
+        # read re-stats and catches it.
+        !refresh && mirror_is_current(st, server_dst, current) && return server_dst
         proj = get(st.state.projects[], st.project_id, nothing)
         if proj === nothing
-            refresh && isfile(server_dst) && return server_dst
+            isfile(server_dst) && return server_dst
             error("bt_show: file not on server and no worker to fetch from: $(st.path)")
         end
-        worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
         mkpath(dirname(server_dst))
-        fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
+        before = refresh ? worker_file_stamp(st, worker_src) : current
+        try
+            fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
+        catch e
+            # Offline / transfer failure with a copy already on disk: showing the
+            # last known version beats showing an error card. Loudly, though —
+            # what's on screen is NOT what's on the worker.
+            isfile(server_dst) || rethrow()
+            @warn "show: transfer failed; showing the last mirrored copy" path = worker_src exception = e
+            return server_dst
+        end
+        record_mirror_stamp!(st, server_dst, worker_src, before)
         return server_dst
     end
 end
 
-# MIME inferred from extension → the right element. Media point `src` at a
-# served `Bonito.Asset` (range-capable); text goes through Monaco; anything
-# else gets a caption. `<video>`/`<img>` get explicit `type`/element so we
-# cover webp/bmp/mov and emit correct MIME types.
+# The media extension tables `file_kind` (file_view.jl) dispatches on. Media
+# points `src` at a range-capable url so `<video>` scrubs without a full copy;
+# `<video>`/`<img>` get an explicit `type`/element so webp/bmp/mov emit correct
+# MIME types. `.ogg` is AUDIO here (`.ogv` is the video container) — the old
+# mapping put an .ogg music file into a `<video>` element, which renders a black
+# rectangle with a play button.
 const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
-    ".ogg" => "video/ogg", ".mov" => "video/quicktime")
-const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+    ".ogv" => "video/ogg", ".mov" => "video/quicktime", ".m4v" => "video/mp4")
+const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
+    ".avif", ".ico")
 
 # Click-to-enlarge. Clones the media into a fullscreen overlay (Esc or backdrop
 # click closes). Self-contained so there's no global-JS dependency or load-order
@@ -2821,33 +2938,28 @@ function read_image_element(state::ServerState, project_id::AbstractString,
     return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, is_video; filename = fname)
 end
 
-function render_show_file(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
-    ext = lowercase(splitext(st.path)[2])
-    if ext in SHOW_IMAGE_EXTS
-        return media_element(show_media_src(st, session), "", false; filename = basename(st.path))
-    elseif haskey(SHOW_VIDEO_MIME, ext)
-        return media_element(show_media_src(st, session), SHOW_VIDEO_MIME[ext], true; filename = basename(st.path))
-    end
-    # Non-media: the bytes have to be on the server (Monaco / caption read them).
-    path = fetch_show_file(st)
-    # Any non-binary file Monaco can show — known text extensions,
-    # extensionless (Makefile, LICENSE), unknown extensions. Size-capped
-    # like the editor, and NUL-sniffed so a mislabeled binary degrades to
-    # the caption fallback instead of garbage.
-    if editor_openable(path) && filesize(path) <= FILE_EDITOR_MAX_BYTES
-        bytes = read(path)
-        if !(0x00 in view(bytes, 1:min(length(bytes), 8192)))
-            return monaco_readonly(String(bytes), detect_language(path))
-        end
-    end
-    return DOM.div("$(basename(path)) · $(filesize(path)) bytes"; class="bt-tool-empty")
-end
+# The inline (chat-bubble) body of a `bt_show`. Delegates to the SAME per-kind
+# renderers the workspace file tab uses (`file_view.jl`) — the only thing bt_show
+# adds is that it's read-only and lives in a collapsible bubble. Kept as its own
+# name because `jsrender(::ShowTool)` and the tests both call it.
+render_show_file(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing) =
+    render_file(file_kind(st.path), InlineView(), FileView(st, InlineView()), session)
 
-# ── File editor (plotpane Monaco) ───────────────────────────────────────────
-# `✎` on a Read / bt_show tool opens the file in an EDITABLE Monaco editor
-# docked in the plotpane. The edit targets the server-side mirror of the file
-# (fetched from the worker on demand, exactly like ShowTool); Save writes the
-# mirror AND pushes the file back to the worker so the agent sees the change.
+# ── File editor (the workspace tab's editable Monaco) ───────────────────────
+# The editing half of the file viewer (`file_view.jl`): a Monaco bound to a file
+# that lives ON THE WORKER. The server-side mirror is an implementation detail of
+# getting the bytes here and back — the file the user is editing, and the path
+# the header shows, is the worker's.
+#
+# Save is therefore only "saved" when the WORKER file is written. Writing just
+# the mirror and reporting success is the failure this design rules out: the
+# agent reads the worker, so a mirror-only save is an edit that silently never
+# happened. `save_editor!` writes the mirror, pushes, and THROWS if the push
+# can't happen — the status line and the buffer's dirty flag both follow that.
+#
+# Rendered as the panel's BODY only: the path, status line, Save button and
+# Ctrl+S live in the shared `FilePanel` header so every file kind gets the same
+# chrome.
 
 # Refuse to open monsters — Monaco on a multi-MB file freezes the tab.
 const FILE_EDITOR_MAX_BYTES = 2 * 1024 * 1024
@@ -2856,21 +2968,28 @@ struct FileEditor
     state::ServerState
     project_id::String
     server_path::String    # absolute file path on the server (mirror/cache)
-    worker_path::String    # absolute file path on the worker; "" ⇒ no push
+    worker_path::String    # absolute file path on the worker — the real target
     # Julia → JS: replace the buffer with fresh worker content — but ONLY if
     # the buffer is clean (getValue() === __btOriginal); unsaved edits win.
     # Fired by `open_project_file!` when activating an already-open panel (#34).
     reload::Observable{String}
-    # Julia → JS: a save reached the disk — the current buffer IS the new
+    # Julia → JS: a save reached the worker — the current buffer IS the new
     # baseline. Kept separate from `reload` (no setValue) and only fired on
     # save SUCCESS: a failed save must leave the buffer "dirty" so a later
     # refresh can't clobber edits that never landed.
     mark_clean::Observable{String}
+    # JS → Julia: the Save button / Ctrl+S ships the buffer's current text.
+    # Lives on the struct (not inside `jsrender`) so the FilePanel header can
+    # drive it — the button is up there, the editor is down here.
+    save_content::Observable{Union{Nothing,String}}
+    # Julia → JS: the header's status line ("saved 14:03:22 · pushed to worker").
+    status::Observable{String}
 end
 FileEditor(state::ServerState, project_id::AbstractString, server_path::AbstractString,
            worker_path::AbstractString) =
     FileEditor(state, String(project_id), String(server_path), String(worker_path),
-               Observable(""), Observable(""))
+               Observable(""), Observable(""),
+               Observable{Union{Nothing,String}}(nothing), Observable(""))
 
 function Bonito.jsrender(session::Session, fe::FileEditor)
     isfile(fe.server_path) ||
@@ -2878,7 +2997,7 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
             class = "bt-tool-error"))
     filesize(fe.server_path) <= FILE_EDITOR_MAX_BYTES ||
         return Bonito.jsrender(session, DOM.div(
-            "file too large for the editor ($(filesize(fe.server_path)) bytes)";
+            "file too large for the editor ($(format_bytes(filesize(fe.server_path))))";
             class = "bt-tool-error"))
     bytes = read(fe.server_path)
     # The extension check (`editor_openable`) is a heuristic — verify on
@@ -2889,12 +3008,11 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
             "binary file — not opening in the editor: $(basename(fe.server_path))";
             class = "bt-tool-error"))
     end
-    text = String(bytes)
-    save_content = Observable{Union{Nothing,String}}(nothing)   # JS → Julia on save
-    status = Observable("")                                      # Julia → JS status line
     editor = BonitoBook.MonacoEditor(
-        text;
-        language = detect_language(fe.server_path),
+        String(bytes);
+        # Language from the WORKER path: the mirror can land in a cache dir with
+        # a mangled name, and syntax highlighting must follow the real file.
+        language = detect_language(isempty(fe.worker_path) ? fe.server_path : fe.worker_path),
         readOnly = false,
         lineNumbers = "on",
         minimap = Dict(:enabled => false),
@@ -2912,32 +3030,21 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
                 ed.__btOriginal = ed.getValue();
             });
         }""")
-    save_btn = DOM.button("Save";
-        class = "bt-btn bt-btn-sm bt-file-editor-save",
-        title = "Save to the server mirror and push to the worker (Ctrl+S)",
-        onclick = js"""event => {
-            const root = event.target.closest('.bt-file-editor');
-            const div  = root && root.querySelector('.monaco-editor-div');
-            const ed   = div && div.__btEditor;
-            if (ed) $(save_content).notify(ed.getValue());
-        }""")
-    on(session, save_content) do content
+    on(session, fe.save_content) do content
         content === nothing && return
         try
-            write(fe.server_path, content)
-            pushed = push_editor_save_to_worker(fe)
-            # Only a save that REACHED the disk moves the clean baseline; a
+            save_editor!(fe, content)
+            # Only a save that reached the WORKER moves the clean baseline; a
             # failed save leaves the buffer dirty so a refresh can't clobber
             # edits that never landed.
             safe_set!(fe.mark_clean, content)
-            safe_set!(status, "saved $(Dates.format(now(), "HH:MM:SS"))" *
-                              (pushed ? " · pushed to worker" : ""))
+            safe_set!(fe.status, "saved to the worker · $(Dates.format(now(), "HH:MM:SS"))")
         catch e
-            @warn "file editor save failed" path = fe.server_path exception = e
-            safe_set!(status, "save failed: $(sprint(showerror, e))")
+            @warn "file editor save failed" worker_path = fe.worker_path exception = e
+            safe_set!(fe.status, "save failed: $(first(split(sprint(showerror, e), '\n')))")
         end
     end
-    body_div = DOM.div(editor; class = "bt-file-editor-body")
+    body_div = DOM.div(editor; class = "bt-fv-editor")
     # Refresh from the worker (panel re-activation, #34): replace ONLY a clean
     # buffer — unsaved edits always win over whatever changed on the worker.
     onjs(session, fe.reload, js"""(txt) => {
@@ -2952,36 +3059,31 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
         const ed = $(body_div).querySelector('.monaco-editor-div')?.__btEditor;
         if (ed) ed.__btOriginal = txt;
     }""")
-    header = DOM.div(
-        DOM.span(fe.server_path; class = "bt-file-editor-path", title = fe.server_path),
-        DOM.span(status; class = "bt-file-editor-status"),
-        save_btn;
-        class = "bt-file-editor-header")
-    node = DOM.div(header, body_div; class = "bt-file-editor")
-    # Ctrl+S inside the editor saves (capture phase beats Monaco's default).
-    Bonito.onload(session, node, js"""(root) => {
-        root.addEventListener('keydown', (e) => {
-            if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-                e.preventDefault();
-                e.stopPropagation();
-                root.querySelector('.bt-file-editor-save')?.click();
-            }
-        }, true);
-    }""")
-    return Bonito.jsrender(session, node)
+    return Bonito.jsrender(session, body_div)
 end
 
-# Best-effort push of the saved file to the project's worker. Returns whether
-# the push happened; failure to push is reported via the thrown error (the
-# save handler surfaces it), a missing worker just means "mirror-only save".
-function push_editor_save_to_worker(fe::FileEditor)
+"""
+    save_editor!(fe::FileEditor, content)
+
+Write `content` to the file the editor is bound to — the one ON THE WORKER.
+
+The server mirror is written first (it's what a later reload compares against),
+then pushed. THROWS when the push can't happen: a project with no reachable
+worker means the user's edit did not land where the agent will read it, and
+saying "saved" then would be a lie. The one case that legitimately stops at the
+mirror is a view with no worker path at all (an ad-hoc local render), which has
+no worker to disagree with.
+"""
+function save_editor!(fe::FileEditor, content::AbstractString)
+    write(fe.server_path, content)
     isempty(fe.worker_path) && return false
     proj = get(fe.state.projects[], fe.project_id, nothing)
-    proj === nothing && return false
-    haskey(fe.state.worker_control_ws, proj.worker_id) || return false
-    send_file_to_worker!(fe.state, proj.worker_id, fe.server_path, fe.worker_path;
-        handoff_timeout = 15.0)
-    return true
+    proj === nothing &&
+        error("no project bound to this view — can't push $(basename(fe.worker_path)) to a worker")
+    haskey(fe.state.worker_control_ws, proj.worker_id) &&
+        return (send_file_to_worker!(fe.state, proj.worker_id, fe.server_path, fe.worker_path;
+                                     handoff_timeout = 15.0); true)
+    error("worker '$(proj.worker_id)' is not connected — $(basename(fe.worker_path)) was NOT saved")
 end
 
 function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
@@ -6828,6 +6930,67 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
 
+    # ── Review button ──────────────────────────────────────────────────────
+    # Opens the change-review tab (review.jl): the project's git diff with a
+    # comment affordance on every line. Lives next to Compact because it's the
+    # other "what just happened in this chat" control. Needs the window's
+    # workspace, so it's inert in a chat rendered outside the unified shell.
+    review_status = Observable("")
+    review_button = DOM.button(map(s -> isempty(s) ? "Review" : s, review_status);
+        class   = "bt-header-compact bt-header-review",
+        title   = "Review this project's uncommitted changes — ask about or comment on any line",
+        onclick = js"event => $(review_status).notify('__click__')")
+    on(session, review_status) do s
+        s == "__click__" || return
+        review_status[] = ""
+        pane = model.plotpane
+        if pane === nothing
+            safe_set!(review_status, "no workspace")
+            return
+        end
+        isempty(project_id) && (safe_set!(review_status, "no project"); return)
+        try
+            open_review!(pane, model)
+        catch e
+            @warn "opening the review tab failed" project_id exception = (e, catch_backtrace())
+            safe_set!(review_status, "review failed")
+        end
+    end
+
+    # ── Debug BonitoAgents ─────────────────────────────────────────────────
+    # Same destination as the dashboard's button, one click from wherever the
+    # user noticed the problem — which is the whole point of having it here.
+    # Only rendered when this install has a source checkout to debug (a bundled
+    # app has none) and when we're in the unified shell (it navigates the window).
+    debug_status = Observable("")
+    debug_button = if bonitoagents_repo_root() === nothing || model.plotpane === nothing
+        nothing
+    else
+        DOM.button(map(s -> isempty(s) ? "Debug" : s, debug_status);
+            class   = "bt-header-compact bt-header-debug",
+            title   = "Open a chat on BonitoAgents' own source, with live introspection " *
+                      "into the server running this window",
+            onclick = js"event => $(debug_status).notify('__click__')")
+    end
+    on(session, debug_status) do s
+        s == "__click__" || return
+        debug_status[] = ""
+        pane = model.plotpane
+        pane === nothing && return
+        Base.errormonitor(@async try
+            p = ensure_debug_project!(state; worker_id = project_now === nothing ? "" :
+                                                        project_now.worker_id)
+            ensure_project_session!(state, p)
+            pane.navigate[] = p.id
+        catch e
+            @warn "opening the debug chat failed" exception = (e, catch_backtrace())
+            # The failures here are all things the user can act on (no checkout,
+            # no worker with it), so put the reason where they'll see it.
+            safe_set!(debug_status, "debug failed")
+            show_toast!(pane, first(split(sprint(showerror, e), '\n')))
+        end)
+    end
+
     # (The Yolo toggle lives in the composer — see `chat_input_area` — not in
     # the header: it repurposes the message input as the reminders editor, so
     # the control sits next to what it changes.)
@@ -6930,7 +7093,9 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 provider_select,
                 xsync_control,
                 sync_button,
+                review_button,
                 compact_button,
+                debug_button,
                 restart_button;
                 class="bt-header-actions"),
             class="bt-header-row"),
@@ -7780,11 +7945,9 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
     path = if !isempty(cmd.path)
         # Direct path-link click (diff header, search hit, agent-message
         # path). A trailing `:line` from grep-style hits is display sugar.
-        # Do NOT pre-filter on `editor_openable` here (#35): the user clicked a
-        # real link, so a binary / oversize / missing target must produce a
-        # TOAST via `open_project_file!`'s open-guard, not a silent no-op. The
-        # guard's `editor_openable` check runs first and toasts "not a text
-        # file" before any worker round-trip.
+        # No pre-filtering by kind (#35): the user clicked a real link, so it
+        # either opens in the viewer or produces a TOAST via
+        # `open_project_file!`'s open-guard — never a silent no-op.
         replace(String(cmd.path), r":\d+$" => "")
     else
         msg = lock(model.lock) do
@@ -7811,40 +7974,34 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
     open_file!(pane, model, path)
 end
 
-# Build the FileEditor for `path`: fetch the worker file to the server mirror
-# (may block on a transfer, may throw on an error), then construct the editor.
-# THROWS on failure — `open_file!` catches and flashes a toast rather than
-# leaving an empty/error panel behind (the user clicked a link; a dead panel
-# reads as "nothing happened").
+# Build the workspace-tab view of `path` — a `FilePanel`, which picks the right
+# renderer for the file's kind and (for text-backed kinds) fetches the bytes to
+# the server mirror. Blocks on that transfer and THROWS on failure;
+# `open_project_file!` catches and flashes a toast rather than leaving an
+# empty/error panel behind (the user clicked a link; a dead panel reads as
+# "nothing happened").
 file_panel_content(model::ChatModel, path::AbstractString) =
     file_panel_content(model.state, model.project_id, model.cwd, path)
 
-function file_panel_content(state::ServerState, project_id::AbstractString,
-                            server_cwd::AbstractString, path::AbstractString)
-    st = ShowTool(state, project_id, server_cwd, path)
-    # refresh: the editor must show what's on the worker NOW, not the mirror
-    # copy from the first-ever open (#34 — "file open often opens an old file").
-    server_file = fetch_show_file(st; refresh = true)
-    proj = get(state.projects[], project_id, nothing)
-    worker_abs = proj === nothing ? "" :
-        (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
-    return FileEditor(state, project_id, server_file, worker_abs)
-end
+file_panel_content(state::ServerState, project_id::AbstractString,
+                   server_cwd::AbstractString, path::AbstractString) =
+    FilePanel(state, project_id, server_cwd, path)
 
 # Ask the worker to stat the file BEFORE fetching — return a human-readable
-# refusal (shown as a toast) when it isn't an openable text file, else `nothing`.
-# Catches the cases that otherwise stream bytes only to show an empty editor: a
-# directory, a missing path, a binary/media extension, or a file too big for
-# Monaco (we already know the size, so we never fetch it). Parameterized by
-# (state, project_id) so the sidebar file-tree shares it without a ChatModel.
+# refusal (shown as a toast) when we can't open it, else `nothing`.
+#
+# The refusals are now only about the file being un-openable AT ALL — missing, a
+# directory, not a regular file, or too large for the viewer its kind gets.
+# "Not a text file" is no longer one of them: images, video, PDFs, notebooks,
+# meshes and opaque blobs all have a viewer, so clicking any of them opens a tab
+# (the whole point of the file viewer). We still stat FIRST so we never start a
+# transfer that ends in an empty panel.
 open_guard_reject_reason(model::ChatModel, path::AbstractString) =
     open_guard_reject_reason(model.state, model.project_id, path)
 
 function open_guard_reject_reason(state::ServerState, project_id::AbstractString,
                                   path::AbstractString)
     name = basename(String(path))
-    editor_openable(path) ||
-        return "Can't open $name — not a text file"
     proj = get(state.projects[], project_id, nothing)
     proj === nothing && return nothing      # no worker to stat → let the fetch try
     worker_src = isabspath(path) ? String(path) : joinpath(proj.worker_path, path)
@@ -7865,8 +8022,12 @@ function open_guard_reject_reason(state::ServerState, project_id::AbstractString
     info.exists || return "Can't open $name — not found on the worker"
     info.isdir  && return "Can't open $name — it's a folder"
     info.isfile || return "Can't open $name — not a regular file"
-    info.size > FILE_EDITOR_MAX_BYTES &&
-        return "Can't open $name — too large to edit ($(format_bytes(info.size)))"
+    # Per-kind cap: a 4 GB mp4 opens fine (it streams), a 4 GB .log does not.
+    kind = file_kind(path)
+    limit = view_size_limit(kind)
+    info.size > limit &&
+        return "Can't open $name — $(format_bytes(info.size)) is too large to open as " *
+               "$(kind_label(kind)) (limit $(format_bytes(limit)))"
     return nothing
 end
 
@@ -7888,13 +8049,16 @@ end
     open_file!(pane::PlotPane, model::ChatModel, path)
 
 Open `path` (a worker-side file path) as a PANEL in the window's
-[`Workspace`](@ref BonitoWidgets.Workspace) — an editable Monaco the user can
-tab / split / float next to the chat and any other open files. Re-opening a path
-activates its existing panel (the editor keeps cursor/scroll/unsaved edits — the
-Workspace renders it once and only ever moves its node). Fetches the file to the
-server mirror first (from the worker if needed); failures land as an error card
-in the panel instead of a silent log line — the user clicked a link and must see
-SOMETHING happen.
+[`Workspace`](@ref BonitoWidgets.Workspace) — a [`FilePanel`](@ref) the user can
+tab / split / float next to the chat and any other open files. ANY file opens:
+the panel renders it as whatever it is (image, video, markdown, table, notebook,
+3D geometry, PDF, source, or a hex dump), with an editable Monaco behind a
+Source toggle for anything text-backed.
+
+Re-opening a path activates its existing panel — the editor keeps cursor/scroll/
+unsaved edits, since the Workspace renders it once and only ever moves its node
+— and refreshes it from the worker. A refusal or a failed fetch flashes a toast
+and opens NO panel; the user clicked a link and must see SOMETHING happen.
 """
 open_file!(pane::PlotPane, model::ChatModel, path::AbstractString) =
     open_project_file!(pane, model.state, model.project_id, model.cwd, path)
@@ -7911,40 +8075,42 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
                             server_cwd::AbstractString, path::AbstractString)
     ws = pane.workspace[]
     ws === nothing && return nothing
+    # Identify the tab by the file's absolute WORKER path, never by the string we
+    # were handed. The two ways in disagree: the file tree passes an absolute
+    # path, a tool pill passes whatever the agent printed (usually relative to
+    # the chat's cwd). Keyed on the raw string those are two different tabs for
+    # ONE file — you edit in one, save, and the other quietly holds the old text.
+    # Worse, tab disambiguation then dresses the pair up as `uxprobe/notes.md`
+    # and `notes.md`, which reads as two genuinely different files.
+    path = show_worker_path(ShowTool(state, String(project_id), String(server_cwd), String(path)))
     id = file_tab_id(path)
     existing = findfirst(p -> p.id == id, ws.panels[])
     if existing !== nothing
         BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
-        # The buffer was loaded when the panel first opened; the agent may
-        # have edited the file on the worker since (#34). Re-fetch and offer
-        # the fresh content to the editor — its JS side applies it only to a
-        # CLEAN buffer, so unsaved edits are never clobbered. Async: the
-        # activation must not wait on a worker round-trip.
-        fe = ws.panels[][existing].content
-        fe isa FileEditor && Base.errormonitor(@async try
+        # The content was loaded when the panel first opened; the agent may have
+        # edited the file on the worker since (#34). Async — the activation must
+        # not wait on a worker round-trip.
+        panel = ws.panels[][existing].content
+        panel isa FilePanel && Base.errormonitor(@async try
             # Same worker-liveness gate as a fresh open; an unreachable /
             # invalid target just keeps showing what we already have.
-            reason = open_guard_reject_reason(state, project_id, path)
-            if reason === nothing
-                st = ShowTool(state, project_id, server_cwd, path)
-                fetch_show_file(st; refresh = true)
-                safe_set!(fe.reload, read(fe.server_path, String))
-            end
+            open_guard_reject_reason(state, project_id, path) === nothing &&
+                refresh_file_panel!(panel)
         catch e
-            @warn "file editor refresh-on-activate failed" path exception = e
+            @warn "file panel refresh-on-activate failed" path exception = e
         end)
         return nothing
     end
     # Fetch (worker transfer — can take seconds) off the event task, then add the
-    # editor as the panel's DIRECT content. NOT via a placeholder + reactive
-    # `DOM.div(Observable)` swap: that inserts auto-height `bonito-fragment`
-    # wrappers between the panel and `.bt-file-editor`, breaking its `height:100%`
-    # chain (Monaco collapses to ~1px). `add_panel!` dedupes by id, so racing
-    # re-clicks still land one panel.
+    # panel as the workspace panel's DIRECT content. NOT via a placeholder +
+    # reactive `DOM.div(Observable)` swap: that inserts auto-height
+    # `bonito-fragment` wrappers between the panel and `.bt-file-view`, breaking
+    # its `height:100%` chain (Monaco collapses to ~1px). `add_panel!` dedupes by
+    # id, so racing re-clicks still land one panel.
     Base.errormonitor(@async begin
-        # Pre-fetch guard: a folder / missing / binary / oversize file flashes a
-        # toast and opens NO panel, instead of streaming bytes into an empty
-        # editor (the worker stat is the gate — see open_guard_reject_reason).
+        # Pre-fetch guard: a folder / missing / oversize file flashes a toast and
+        # opens NO panel, instead of streaming bytes into an empty view (the
+        # worker stat is the gate — see open_guard_reject_reason).
         reason = open_guard_reject_reason(state, project_id, path)
         if reason !== nothing
             show_toast!(pane, reason)
@@ -7953,13 +8119,32 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         elem = try
             file_panel_content(state, project_id, server_cwd, path)
         catch e
-            @warn "file editor open failed" path exception = e
+            @warn "file open failed" path exception = e
             show_toast!(pane, "Can't open $(basename(String(path))) — $(open_error_brief(e))")
             return
         end
         BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
             label = basename(path), closable = true))
+        relabel_file_tabs!(ws)
     end)
+    return nothing
+end
+
+# Give every open file tab a label that identifies it. Runs after each open, over
+# ALL of them, because a new tab can make an EXISTING label ambiguous — the tab
+# that has to grow is usually the one that was already there. `Panel.label` is an
+# Observable, so this is a live rename rather than a rebuild.
+#
+# Closing a tab can leave its former partner longer than it now needs to be; that
+# corrects itself on the next open, and a label that is too specific still names
+# the right file.
+function relabel_file_tabs!(ws)
+    panels = [p for p in ws.panels[] if startswith(p.id, "file:")]
+    length(panels) < 2 && return nothing
+    paths = [p.id[length("file:") + 1:end] for p in panels]
+    for (p, l) in zip(panels, disambiguate_labels(paths))
+        p.label[] == l || (p.label[] = l)
+    end
     return nothing
 end
 

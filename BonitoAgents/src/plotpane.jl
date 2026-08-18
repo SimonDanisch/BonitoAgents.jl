@@ -32,9 +32,15 @@ struct PlotPane
     # that auto-dismisses in JS — reachable from the editor open-guard via
     # `model.plotpane` so a file we can't open says so instead of opening blank.
     toast       :: Observable{String}
+    # "Show this project in this window" — a project id pulse that
+    # `install_workspace!` forwards to the window's `current_view`. Chat-side
+    # code reaches the window through `model.plotpane` and nothing else, so this
+    # is how a chat navigates the window (the header's Debug button opens the
+    # debug chat with it). Empty string = no-op.
+    navigate    :: Observable{String}
 end
 
-PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""), Observable(""))
+PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""), Observable(""), Observable(""))
 
 """
     show_toast!(pane::PlotPane, msg)

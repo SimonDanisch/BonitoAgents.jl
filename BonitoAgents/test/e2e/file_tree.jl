@@ -7,16 +7,19 @@
 #   * expanding a directory lazy-loads its children
 #   * the search box fuzzy-filters the project file index to a flat hit list
 #   * clicking a file opens it as a Monaco panel (the guarded open path)
-#   * the open-guard: a binary / oversize / folder file flashes a toast and
-#     opens NO panel (instead of streaming bytes into an empty editor)
+#   * clicking a BINARY file opens it too — as a hex dump. The viewer has a view
+#     for every kind now, so the old "not a text file" refusal is gone.
+#   * the open-guard's remaining job: a file that can't be opened AT ALL (here,
+#     one past the text-view size cap) flashes a toast and opens NO panel
 #
 using Test
 isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
 using .TestKit
 const TK = TestKit
 
-# A project with a small known tree: nested dirs, a binary file (open-guard),
-# and a .git/ that must NOT show up in the search index.
+# A project with a small known tree: nested dirs, a binary file (hex view), an
+# oversize text file (open-guard), and a .git/ that must NOT show up in the
+# search index.
 const CWD = mktempdir()
 mkpath(joinpath(CWD, "src"))
 mkpath(joinpath(CWD, "test"))
@@ -25,7 +28,8 @@ write(joinpath(CWD, "Project.toml"),         "name = \"X\"\n")
 write(joinpath(CWD, "src", "main.jl"),        "println(\"hi from main\")\n")
 write(joinpath(CWD, "test", "runtests.jl"),   "using Test\n")
 write(joinpath(CWD, ".git", "config"),        "[core]\n")
-write(joinpath(CWD, "blob.bin"),              repeat("x", 4096))  # binary ext → guard
+write(joinpath(CWD, "blob.bin"),              repeat("x", 4096))  # binary ext → hex view
+write(joinpath(CWD, "huge.txt"),              repeat("a", 3_000_000))  # > the 2 MB text cap → guard
 # Ranking fixture: an EXACT basename match buried deep, plus a shallow file the
 # query only matches as a scattered subsequence — the exact one must rank first.
 mkpath(joinpath(CWD, "pkg"));        write(joinpath(CWD, "pkg", "zebra.jl"),          "module Zebra end\n")
@@ -62,9 +66,10 @@ function run_suite(server)
                 "document.querySelector('.bt-side-chat.bt-tree-open') !== null"; timeout = 18) == true
             @test TK.wait_for(server, "root rows loaded",
                 "document.querySelectorAll('.bt-side-tree-wrap .bt-tree-row').length >= 4"; timeout = 36) == true
-            # Dirs first (alpha), then files (alpha): pkg/src/test/z, then blob.bin/Project.toml.
+            # Dirs first (alpha), then files (case-insensitive alpha):
+            # pkg/src/test/z, then blob.bin/huge.txt/Project.toml.
             @test TK.eval_js(server, labels(".bt-side-tree-wrap .bt-tree-row .bt-tree-label")) ==
-                  ["pkg", "src", "test", "z", "blob.bin", "Project.toml"]
+                  ["pkg", "src", "test", "z", "blob.bin", "huge.txt", "Project.toml"]
         end
 
         @testset "expanding a directory lazy-loads its children" begin
@@ -104,13 +109,30 @@ function run_suite(server)
                 "(document.querySelector('$(panel_sel(abs)) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('hi from main')"; timeout = 36) == true
         end
 
-        @testset "the open-guard toasts on a binary file and opens NO panel" begin
-            before = TK.eval_js(server, "document.querySelectorAll('.bw-ws-panel').length")
+        @testset "a binary file opens as a hex dump" begin
+            # It used to toast "not a text file". Every kind has a view now, so
+            # clicking opaque bytes shows you the bytes.
             TK.eval_js(server, "$(row_for("blob.bin"))?.click(); true")
+            @test TK.wait_for(server, "blob.bin opens as a hex view",
+                """(() => {
+                    const v = [...document.querySelectorAll('.bw-ws-panel .bt-file-view')]
+                        .find(e => (e.querySelector('.bt-file-editor-path')?.textContent || '')
+                                   .endsWith('/blob.bin'));
+                    return !!v && v.dataset.kind === 'binary'
+                        && !!v.querySelector('pre.bt-fv-hex')
+                        && v.querySelector('.monaco-editor-div') === null;
+                })()"""; timeout = 36) == true
+        end
+
+        @testset "the open-guard toasts on an un-openable file and opens NO panel" begin
+            # What's left for the guard: things no viewer can help with. A text
+            # file past the editor's size cap is the case a user actually hits.
+            before = TK.eval_js(server, "document.querySelectorAll('.bw-ws-panel').length")
+            TK.eval_js(server, "$(row_for("huge.txt"))?.click(); true")
             @test TK.wait_for(server, "guard toast shown",
                 "document.querySelector('.bt-toast')?.dataset.shown === 'true'"; timeout = 30) == true
             toast_text = TK.eval_js(server, "document.querySelector('.bt-toast .bt-toast-text').textContent")
-            @test occursin("blob.bin", toast_text) && occursin("Can't open", toast_text)
+            @test occursin("huge.txt", toast_text) && occursin("Can't open", toast_text)
             sleep(1.0)
             @test TK.eval_js(server, "document.querySelectorAll('.bw-ws-panel').length") == before
         end

@@ -672,6 +672,9 @@ function connect_and_serve(; server_url::String,
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             agent_bin::String     = find_agent_bin(),
                             retry_delay::Real     = 5.0)
+    # Stamped once, for the debug chat's uptime readout (`worker_state`). Not a
+    # `const` computed at load: that bakes the precompiling machine's clock.
+    WORKER_STARTED[] == 0.0 && (WORKER_STARTED[] = time())
     while true
         try
             run_control_session(; server_url, secret, worker_id, name, mcp_command,
@@ -776,6 +779,10 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_scan_sessions(ws, cmd)
             elseif t == "clone_repo"
                 @async handle_clone_repo(ws, cmd)
+            elseif t == "git_diff"
+                @async handle_git_diff(ws, cmd)
+            elseif t == "worker_state"
+                @async handle_worker_state(ws, cmd)
             elseif t == "ping"
                 WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
             else
@@ -1098,8 +1105,13 @@ end
 # a transfer that ends in an empty editor.
 #
 #     {type:"stat_path", request_id, path}
-#  -> {type:"stat_path_response", request_id, path, exists, isfile, isdir, size}
+#  -> {type:"stat_path_response", request_id, path, exists, isfile, isdir, size, mtime}
 #     {type:"stat_path_response", request_id, error:"..."}  on failure
+#
+# `mtime` (Unix seconds, Float64) is the file's version stamp: the server pairs
+# it with `size` as the freshness key for its mirror copy, so a file REGENERATED
+# at the same path (a re-rendered plot, a re-recorded video) is re-fetched
+# instead of served from the first-ever transfer. 0.0 when there's no file.
 function handle_stat_path(ws, cmd::AbstractDict)
     request_id = String(get(cmd, "request_id", ""))
     raw_path   = String(get(cmd, "path", ""))
@@ -1113,7 +1125,8 @@ function handle_stat_path(ws, cmd::AbstractDict)
              "exists"     => ispath(raw_path),
              "isfile"     => isf,
              "isdir"      => isdir(raw_path),
-             "size"       => isf ? filesize(raw_path) : 0)
+             "size"       => isf ? filesize(raw_path) : 0,
+             "mtime"      => isf ? mtime(raw_path) : 0.0)
     catch e
         Dict("type"       => "stat_path_response",
              "request_id" => request_id,
@@ -2173,6 +2186,218 @@ function find_agent_bin()
     bin = which_executable("claude-agent-acp")
     bin !== nothing && return bin
     return "claude-agent-acp"
+end
+
+# ── git diff RPC (backs the change-review tab) ───────────────────────────────
+# The review tab asks "what has changed in this folder?" and gets back ONE
+# unified patch, parsed on the server (review.jl). Doing the parse there rather
+# than here keeps this side to plumbing and makes the parser testable headlessly.
+#
+#     {type:"git_diff", request_id, path, base?}
+#  -> {type:"git_diff_response", request_id, repo, branch, head, base, patch}
+#     {type:"git_diff_response", request_id, error:"..."}
+#
+# `base` empty ⇒ the working tree against HEAD, i.e. everything the agent has
+# touched and not committed — the common case for reviewing a turn's work.
+# Otherwise it's the working tree against that ref (a branch, a tag, a sha), for
+# reviewing a whole feature branch.
+#
+# UNTRACKED files are included as synthetic "new file" patches. Without them a
+# review of an agent's work silently misses every file it CREATED, which is
+# usually the most important thing to look at.
+
+# Run a git command in `dir`, returning (ok, stdout). Never throws: a non-zero
+# exit is an answer here (no commits yet, not a repo, unknown ref), and each
+# caller decides what that means.
+function git_capture(dir::AbstractString, args::Cmd)
+    out = IOBuffer()
+    ok = try
+        # LC_ALL/GIT_* pinned so we parse a stable, un-localised, un-paged,
+        # un-coloured output no matter how the user's git is configured.
+        cmd = setenv(`git -C $dir $args`,
+                     merge(ENV, Dict("LC_ALL" => "C", "GIT_PAGER" => "cat",
+                                     "GIT_OPTIONAL_LOCKS" => "0", "GIT_CONFIG_NOSYSTEM" => "1")))
+        success(pipeline(cmd; stdout = out, stderr = devnull))
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "git_capture failed" dir args exception = e
+        false
+    end
+    return (ok = ok, out = String(take!(out)))
+end
+
+# The empty-tree object. Diffing against it is how you get "everything is new"
+# on a repo with no commits yet — `git diff HEAD` there just fails.
+const GIT_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# Untracked files are capped: a review pane is not the place to render a
+# node_modules someone forgot to ignore, and a 5 MB generated file adds nothing.
+const GIT_UNTRACKED_MAX_FILES = 200
+const GIT_UNTRACKED_MAX_BYTES = 512 * 1024
+
+# A synthetic unified-diff section for an untracked file, so it reads exactly
+# like a git-reported addition. Binary / oversized files get the same "Binary
+# files differ" line git itself emits, so the server's parser needs no special
+# case for them.
+function untracked_patch(root::AbstractString, rel::AbstractString)
+    abs = joinpath(root, rel)
+    isfile(abs) || return ""
+    header = "diff --git a/$(rel) b/$(rel)\nnew file mode 100644\n"
+    sz = filesize(abs)
+    sz > GIT_UNTRACKED_MAX_BYTES &&
+        return header * "Binary files /dev/null and b/$(rel) differ\n"
+    bytes = try
+        read(abs)
+    catch e
+        e isa InterruptException && rethrow()
+        # Returning "" would drop the file from the review with nothing said —
+        # the reviewer would see a diff that silently omits a new file. Say it
+        # in the log AND in the patch, so the omission is visible where the
+        # decision is being made. (A `git status` race — the file vanished
+        # between listing and reading — is the common case; a permission
+        # problem is the other.)
+        @warn "untracked_patch: could not read a new file; it is listed but not shown" path = abs exception = e
+        return header * "Binary files /dev/null and b/$(rel) differ\n"
+    end
+    0x00 in view(bytes, 1:min(length(bytes), 8192)) &&
+        return header * "Binary files /dev/null and b/$(rel) differ\n"
+    text = String(bytes)
+    lines = split(text, '\n')
+    # A file with a trailing newline splits into a final empty element that is
+    # NOT a line of the file.
+    endswith(text, '\n') && !isempty(lines) && pop!(lines)
+    isempty(lines) && return header * "--- /dev/null\n+++ b/$(rel)\n"
+    io = IOBuffer()
+    print(io, header, "--- /dev/null\n+++ b/$(rel)\n@@ -0,0 +1,$(length(lines)) @@\n")
+    for l in lines
+        println(io, "+", l)
+    end
+    endswith(text, '\n') || println(io, "\\ No newline at end of file")
+    return String(take!(io))
+end
+
+function git_diff_response(request_id::AbstractString, path::AbstractString,
+                           base::AbstractString)
+    try
+        isempty(path) && error("missing path")
+        isdir(path) || error("not a directory: $path")
+        top = git_capture(path, `rev-parse --show-toplevel`)
+        top.ok || error("not a git repository: $path")
+        root = strip(top.out)
+
+        head_res = git_capture(root, `rev-parse --short HEAD`)
+        head = head_res.ok ? strip(head_res.out) : ""
+        branch_res = git_capture(root, `rev-parse --abbrev-ref HEAD`)
+        branch = branch_res.ok ? strip(branch_res.out) : ""
+
+        # Empty base ⇒ working tree vs HEAD (vs the empty tree on a fresh repo,
+        # where HEAD doesn't resolve). An explicit base is used verbatim so the
+        # user can review against a branch, tag or sha.
+        effective = isempty(base) ? (isempty(head) ? GIT_EMPTY_TREE : "HEAD") : base
+        diff = git_capture(root, `diff --no-color --no-ext-diff --find-renames -U3 $effective --`)
+        diff.ok || error("git diff against '$(effective)' failed (unknown ref?)")
+        patch = diff.out
+
+        untracked = git_capture(root, `ls-files --others --exclude-standard -z`)
+        if untracked.ok
+            rels = filter(!isempty, split(untracked.out, '\0'))
+            for rel in Iterators.take(rels, GIT_UNTRACKED_MAX_FILES)
+                patch *= untracked_patch(root, String(rel))
+            end
+        end
+
+        return Dict("type" => "git_diff_response", "request_id" => request_id,
+                    "repo" => root, "branch" => branch, "head" => head,
+                    "base" => effective, "patch" => patch)
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict("type" => "git_diff_response", "request_id" => request_id,
+                    "error" => sprint(showerror, e))
+    end
+end
+
+function handle_git_diff(ws, cmd::AbstractDict)
+    response = git_diff_response(String(get(cmd, "request_id", "")),
+                                 String(get(cmd, "path", "")),
+                                 String(get(cmd, "base", "")))
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "git_diff response failed" exception = e
+    end
+end
+
+# ── worker self-report (the debug chat's view of THIS process) ───────────────
+# The server can describe itself (BonitoAgents' dev_api.jl); this is the other
+# half. A "why is this chat stuck" question is usually answered on the worker:
+# an agent process that died, a session whose dial-back socket is gone, a worker
+# that's been up for a week and grown to several GB.
+#
+#     {type:"worker_state", request_id}
+#  -> {type:"worker_state_response", request_id, …}
+
+const WORKER_STARTED = Ref(0.0)   # set on the first connect_and_serve
+
+# Resident set size in bytes on Linux, `Sys.maxrss()` (the PEAK) elsewhere —
+# the `kind` field says which, because "is it growing" needs the current value.
+function worker_rss()
+    if Sys.islinux() && isfile("/proc/self/statm")
+        fields = split(read("/proc/self/statm", String))
+        length(fields) >= 2 &&
+            return (bytes = parse(Int, fields[2]) * Sys.PAGESIZE, kind = "current")
+    end
+    return (bytes = Sys.maxrss(), kind = "peak")
+end
+
+function worker_state_response(request_id::AbstractString)
+    try
+        sessions = lock(_SESSION_PROCS_LOCK) do
+            [Dict("cwd" => cwd,
+                  # A session whose agent has exited but whose entry is still
+                  # here is exactly the "chat looks alive, nothing happens" bug.
+                  "agent_running" => !process_exited(e.proc),
+                  # No guard: we hold the `Process` in `_SESSION_PROCS`, so its
+                  # handle is alive and `getpid` can't fail. If that assumption
+                  # ever breaks, the enclosing try reports it as an `error` field
+                  # rather than quietly reporting a session with no pid.
+                  "agent_pid" => Int(getpid(e.proc)),
+                  "acp_socket" => e.ws !== nothing)
+             for (cwd, e) in _SESSION_PROCS]
+        end
+        rss = worker_rss()
+        gc = Base.gc_num()
+        return Dict("type" => "worker_state_response", "request_id" => request_id,
+                    "pid" => getpid(),
+                    "uptime_s" => WORKER_STARTED[] == 0.0 ? 0.0 :
+                                  round(time() - WORKER_STARTED[]; digits = 1),
+                    "julia" => string(VERSION),
+                    "threads" => Threads.nthreads(),
+                    "hostname" => gethostname(),
+                    "project" => something(Base.active_project(), ""),
+                    "worker_package" => something(pkgdir(@__MODULE__), ""),
+                    "agent_bin" => something(find_agent_bin(), ""),
+                    "mcp_args" => mcp_args(),
+                    "rss_bytes" => rss.bytes,
+                    "rss_kind" => rss.kind,
+                    "gc_live_bytes" => Base.gc_live_bytes(),
+                    "total_allocated" => gc.allocd + gc.total_allocd,
+                    "gc_time_ns" => gc.total_time,
+                    "sessions" => sessions,
+                    "session_count" => length(sessions))
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict("type" => "worker_state_response", "request_id" => request_id,
+                    "error" => sprint(showerror, e))
+    end
+end
+
+function handle_worker_state(ws, cmd::AbstractDict)
+    response = worker_state_response(String(get(cmd, "request_id", "")))
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "worker_state response failed" exception = e
+    end
 end
 
 end # module BonitoWorker
