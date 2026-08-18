@@ -1418,6 +1418,9 @@ function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
             branch = String(get(resp, "branch", "")),
             head   = String(get(resp, "head", "")),
             base   = String(get(resp, "base", "")),
+            # "" when the project IS the repo root; otherwise the sub-path the
+            # diff was limited to.
+            scope  = String(get(resp, "scope", "")),
             patch  = String(get(resp, "patch", "")))
 end
 

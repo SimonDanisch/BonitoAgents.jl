@@ -297,4 +297,21 @@ end
     @test haskey(BonitoWorker.git_diff_response("r5", "", ""), "error")
 end
 
+@testset "display_path strips the scope prefix" begin
+    # Rows in a scoped diff drop the folder prefix they all share. The result is
+    # not cosmetic: it is what `data-file` carries to the agent and what ⤢ opens,
+    # so mangling it breaks both.
+    dp = BonitoAgents.display_path
+    @test dp("pkg/member.jl", "pkg/")   == "member.jl"
+    @test dp("pkg/sub/deep.jl", "pkg/") == "sub/deep.jl"
+    @test dp("member.jl", "")           == "member.jl"   # project IS the repo root
+    @test dp("other/x.jl", "pkg/")      == "other/x.jl"  # not under the prefix: untouched
+
+    # String indices are BYTES while `length` counts CHARACTERS, so slicing at
+    # `length(prefix)` mangles any non-ASCII folder name — `bücher/a.jl` came out
+    # as `/a.jl`, i.e. a path that opens nothing.
+    @test dp("bücher/a.jl", "bücher/")  == "a.jl"
+    @test dp("größe/x/y.jl", "größe/")  == "x/y.jl"
+end
+
 end

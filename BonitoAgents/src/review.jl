@@ -356,18 +356,41 @@ function review_line_row(file::AbstractString, l::DiffLine)
         class = cls, dataFile = String(file), dataLine = string(lineno), dataSide = side)
 end
 
-function review_file_section(f::DiffFile)
+# Paths in a patch are relative to the git ROOT; everything downstream of this
+# tab wants them relative to the PROJECT. The agent's working directory is the
+# project folder, so a root-relative `pkg/member.jl` sent as a comment location
+# points at `pkg/pkg/member.jl` from where it is standing; `open_project_file!`
+# resolves a relative path against the project too. And on screen the shared
+# prefix is pure noise — the folder the whole tab is about, pushing the filename
+# right, which is what the left-truncation exists to prevent.
+#
+# So strip it once, here, and use the result for display, `data-file` and the ⤢
+# target alike. The file header's `title` keeps the root-relative path, so
+# hovering still tells you where the file sits in the repository.
+# `chopprefix`, not an index slice: `length` counts CHARACTERS while string
+# indices are BYTES, so slicing at `length(prefix)` mangles any path whose folder
+# name isn't ASCII — `bücher/a.jl` came out as `/a.jl`. These paths are what the
+# agent is told and what ⤢ opens, so a mangled one is a broken feature, not a
+# cosmetic slip.
+display_path(path::AbstractString, prefix::AbstractString) =
+    isempty(prefix) ? path : chopprefix(path, prefix)
+
+function review_file_section(f::DiffFile, prefix::AbstractString = "")
     nlines = sum(h -> length(h.lines), f.hunks; init = 0)
+    shown_path = display_path(f.path, prefix)
     head = DOM.summary(
         DOM.span(diff_status_label(f); class = "bt-rv-file-status", dataStatus = string(f.status)),
-        path_span(f.status === :renamed ? "$(f.old_path) → $(f.path)" : f.path;
+        # `title` keeps the root-relative path, so hovering still tells you where
+        # the file really is inside the repository.
+        path_span(f.status === :renamed ?
+                      "$(display_path(f.old_path, prefix)) → $(shown_path)" : shown_path;
                   class = "bt-rv-file-path", title = f.path),
         DOM.span("+$(f.additions)"; class = "bt-rv-plus-count"),
         DOM.span("−$(f.deletions)"; class = "bt-rv-minus-count"),
         # Open the WHOLE file in its own tab. A separate button rather than a
         # clickable path, so it doesn't fight the <details> disclosure toggle.
         DOM.button("⤢"; class = "bt-rv-open", type = "button",
-                   title = "Open this file", dataOpen = f.path))
+                   title = "Open this file", dataOpen = shown_path))
     body = if f.binary
         DOM.div("binary file — no textual diff"; class = "bt-rv-binary")
     elseif isempty(f.hunks)
@@ -375,7 +398,7 @@ function review_file_section(f::DiffFile)
     else
         DOM.div((DOM.div(
                     DOM.div(h.header; class = "bt-rv-hunk-head"),
-                    (review_line_row(f.path, l) for l in h.lines)...;
+                    (review_line_row(shown_path, l) for l in h.lines)...;
                     class = "bt-rv-hunk") for h in f.hunks)...;
                 class = "bt-rv-hunks")
     end
@@ -430,7 +453,11 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
                 DOM.div(first(split(sprint(showerror, e), '\n')); class = "bt-fv-error-detail");
                 class = "bt-tool-error bt-rv-error")
         end
-        safe_set!(repo_txt, res.repo)
+        # Name what is actually on screen. The diff is scoped to the project's
+        # folder, so showing a bare repo root next to it would claim more than the
+        # tab is showing whenever the project sits inside a bigger checkout.
+        safe_set!(repo_txt, isempty(res.scope) ? res.repo :
+                            rstrip(res.repo, '/') * "/" * res.scope)
         safe_set!(branch_txt, isempty(res.branch) ? res.head : res.branch)
         files = parse_unified_diff(res.patch)
         if isempty(files)
@@ -456,7 +483,9 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
             "$(length(files)) file$(length(files) == 1 ? "" : "s") · +$(adds) −$(dels)" *
             (dropped > 0 ? " · $(dropped) more file$(dropped == 1 ? "" : "s") not shown " *
                            "(diff past $(REVIEW_MAX_LINES) lines)" : ""))
-        return DOM.div((review_file_section(f) for f in shown)...; class = "bt-rv-files")
+        # Rows drop the scope prefix they all share; the header carries it instead.
+        prefix = isempty(res.scope) ? "" : rstrip(res.scope, '/') * "/"
+        return DOM.div((review_file_section(f, prefix) for f in shown)...; class = "bt-rv-files")
     end
 
     refresh_diff!() = Base.errormonitor(@async begin
@@ -564,11 +593,12 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         isempty(rel) && return
         pane = model.plotpane
         pane === nothing && (safe_set!(rp.status, "no workspace to open into"); return)
-        # Diff paths are relative to the REPO root, which may be above the
-        # project's own directory (a project inside a monorepo).
-        root = repo_txt[]
-        open_project_file!(pane, model.state, model.project_id, model.cwd,
-                           isempty(root) ? String(rel) : joinpath(root, String(rel)))
+        # `rel` is relative to the PROJECT (the rows strip the scope prefix — see
+        # `display_path`), and `open_project_file!` resolves a relative path
+        # against the project's worker path. So it goes straight through. It used
+        # to be joined with the repo root instead, which broke the moment the
+        # header started naming the scope: `<repo>/pkg` + `pkg/member.jl`.
+        open_project_file!(pane, model.state, model.project_id, model.cwd, String(rel))
     end
 
     on(session, rp.drop) do i

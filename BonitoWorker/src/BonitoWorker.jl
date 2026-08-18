@@ -1112,6 +1112,13 @@ end
 # it with `size` as the freshness key for its mirror copy, so a file REGENERATED
 # at the same path (a re-rendered plot, a re-recorded video) is re-fetched
 # instead of served from the first-ever transfer. 0.0 when there's no file.
+#
+# The pair only works if the mtime is FINE-GRAINED enough to separate two writes
+# that land in the same second at the same size — otherwise the key silently says
+# "unchanged" for a file that changed, which is the exact bug it exists to fix.
+# Measured, not assumed: `mtime` resolves to well under a millisecond (two
+# same-size writes 6ms apart differ), and the JSON round-trip on this wire keeps
+# the full Float64 — `1.7870720314021704e9` survives serialize+parse unchanged.
 function handle_stat_path(ws, cmd::AbstractDict)
     request_id = String(get(cmd, "request_id", ""))
     raw_path   = String(get(cmd, "path", ""))
@@ -2294,11 +2301,21 @@ function git_diff_response(request_id::AbstractString, path::AbstractString,
         # where HEAD doesn't resolve). An explicit base is used verbatim so the
         # user can review against a branch, tag or sha.
         effective = isempty(base) ? (isempty(head) ? GIT_EMPTY_TREE : "HEAD") : base
-        diff = git_capture(root, `diff --no-color --no-ext-diff --find-renames -U3 $effective --`)
+
+        # Scope the diff to the FOLDER that was asked about, not the whole
+        # repository. A project is routinely a package inside a bigger checkout,
+        # and reviewing `dev/Foo` should not hand you every change in the
+        # monorepo. `.` (project == repo root) means no pathspec at all, which
+        # keeps the common case byte-identical to before.
+        rel = relpath(abspath(path), root)
+        scope = (rel == "." || startswith(rel, "..")) ? String[] : [rel]
+
+        diff = git_capture(root,
+            `diff --no-color --no-ext-diff --find-renames -U3 $effective -- $scope`)
         diff.ok || error("git diff against '$(effective)' failed (unknown ref?)")
         patch = diff.out
 
-        untracked = git_capture(root, `ls-files --others --exclude-standard -z`)
+        untracked = git_capture(root, `ls-files --others --exclude-standard -z -- $scope`)
         if untracked.ok
             rels = filter(!isempty, split(untracked.out, '\0'))
             for rel in Iterators.take(rels, GIT_UNTRACKED_MAX_FILES)
@@ -2308,7 +2325,11 @@ function git_diff_response(request_id::AbstractString, path::AbstractString,
 
         return Dict("type" => "git_diff_response", "request_id" => request_id,
                     "repo" => root, "branch" => branch, "head" => head,
-                    "base" => effective, "patch" => patch)
+                    "base" => effective, "patch" => patch,
+                    # "" ⇒ the whole repo; otherwise the sub-path the diff was
+                    # limited to, so the UI can say so rather than showing a repo
+                    # root next to a diff that is not the repo's.
+                    "scope" => isempty(scope) ? "" : first(scope))
     catch e
         e isa InterruptException && rethrow()
         return Dict("type" => "git_diff_response", "request_id" => request_id,
