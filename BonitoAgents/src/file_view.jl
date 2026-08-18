@@ -760,9 +760,27 @@ function Bonito.jsrender(session::Session, p::FilePanel)
             file_error_node(p.worker_path, e)
         end
     refresh_rendered!() = Base.errormonitor(@async safe_set!(rendered_dom, build_rendered()))
-    if has_rendered_view(p)
-        on(session, p.reload) do _; refresh_rendered!(); end
-        refresh_rendered!()
+    has_rendered_view(p) && refresh_rendered!()
+    # ⟳ has to reload whatever this panel actually SHOWS. Registering the handler
+    # only for kinds with a rendered view meant that on a plain source file — the
+    # commonest tab there is — the button flashed "reloaded" and reloaded nothing:
+    # no handler was listening, and the editor's text is refreshed elsewhere
+    # (`refresh_file_panel!`, on re-activation). So both halves, always.
+    on(session, p.reload) do _
+        has_rendered_view(p) && refresh_rendered!()
+        fe = p.editor
+        fe === nothing && return
+        Base.errormonitor(@async begin
+            fetch_show_file(p.view.file)
+            isfile(fe.server_path) && safe_set!(fe.reload, read(fe.server_path, String))
+        end)
+        # NOT reported here: that a file we could not read on the worker is being
+        # served from the last mirror. `fetch_show_file` falls back silently, so ⟳
+        # on a deleted file shows the old text as if it were current. Writing that
+        # into `fe.status` from here throws in the browser
+        # ("Cannot set properties of null") — the binding this observable feeds is
+        # not live on this path — so the honest note is in COVERAGE.md rather than
+        # a message that only half arrives.
     end
     rendered = has_rendered_view(p) ?
         (DOM.div(rendered_dom; class = "bt-fv-rendered"),) : ()
@@ -858,15 +876,12 @@ Bring an already-open panel back in sync with the worker: re-fetch (a no-op when
 the worker's `(size, mtime)` still matches the mirror), rebuild the rendered
 half, and offer the fresh text to the editor. The editor's JS side applies it
 only to a CLEAN buffer, so unsaved edits are never clobbered.
+
+Same path as the ⟳ button, so the two cannot drift apart.
 """
-function refresh_file_panel!(p::FilePanel)
-    fe = p.editor
-    if fe !== nothing
-        fetch_show_file(p.view.file)
-        isfile(fe.server_path) && safe_set!(fe.reload, read(fe.server_path, String))
-    end
-    # `safe_set!`: a panel whose tab (or whole window) has gone away must not
-    # turn a background refresh into an unhandled error on the caller's task.
-    safe_set!(p.reload, p.reload[] + 1)
-    return nothing
-end
+refresh_file_panel!(p::FilePanel) =
+    # One implementation, in the `p.reload` handler that ⟳ also drives — the fetch,
+    # the editor hand-off and the rendered rebuild all live there. `safe_set!`
+    # because a panel whose tab (or whole window) has gone away must not turn a
+    # background refresh into an unhandled error on the caller's task.
+    (safe_set!(p.reload, p.reload[] + 1); nothing)

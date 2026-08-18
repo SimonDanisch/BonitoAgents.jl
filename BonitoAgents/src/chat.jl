@@ -2984,12 +2984,19 @@ struct FileEditor
     save_content::Observable{Union{Nothing,String}}
     # Julia → JS: the header's status line ("saved 14:03:22 · pushed to worker").
     status::Observable{String}
+    # JS → Julia: does the buffer differ from what was last saved/loaded? Drives
+    # the tab's unsaved-changes marker. Closing a tab discards the buffer without
+    # asking, so the marker is the ONLY warning you get that work is about to go —
+    # which makes it worth a round-trip per edit-burst (the JS side only notifies
+    # on TRANSITIONS, so typing does not chatter).
+    dirty::Observable{Bool}
 end
 FileEditor(state::ServerState, project_id::AbstractString, server_path::AbstractString,
            worker_path::AbstractString) =
     FileEditor(state, String(project_id), String(server_path), String(worker_path),
                Observable(""), Observable(""),
-               Observable{Union{Nothing,String}}(nothing), Observable(""))
+               Observable{Union{Nothing,String}}(nothing), Observable(""),
+               Observable(false))
 
 function Bonito.jsrender(session::Session, fe::FileEditor)
     isfile(fe.server_path) ||
@@ -3025,9 +3032,23 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
         # remember the on-disk baseline so refreshes can tell a clean buffer
         # from unsaved edits (see the `reload` observable).
         js_init_func = js"""(me) => {
+            const dirty = $(fe.dirty);
             me.editor.then(ed => {
                 me.editor_div.__btEditor = ed;
                 ed.__btOriginal = ed.getValue();
+                // Report only when the clean/dirty state FLIPS, not per keystroke:
+                // the tab marker is the only warning before a close discards the
+                // buffer, and it costs one round-trip per burst rather than per
+                // character. Hung on the editor rather than kept in a closure so
+                // the reload / mark-clean handlers below can re-sync after they
+                // move `__btOriginal` — a save changes the BASELINE, not the
+                // content, so no change event fires and the marker would stick.
+                ed.__btDirty = false;
+                ed.__btSyncDirty = () => {
+                    const now = ed.getValue() !== ed.__btOriginal;
+                    if (now !== ed.__btDirty) { ed.__btDirty = now; dirty.notify(now); }
+                };
+                ed.onDidChangeModelContent(() => ed.__btSyncDirty());
             });
         }""")
     on(session, fe.save_content) do content
@@ -3053,11 +3074,12 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
         if (txt !== ed.getValue()) {
             ed.setValue(txt);
             ed.__btOriginal = txt;
+            ed.__btSyncDirty?.();
         }
     }""")
     onjs(session, fe.mark_clean, js"""(txt) => {
         const ed = $(body_div).querySelector('.monaco-editor-div')?.__btEditor;
-        if (ed) ed.__btOriginal = txt;
+        if (ed) { ed.__btOriginal = txt; ed.__btSyncDirty?.(); }
     }""")
     return Bonito.jsrender(session, body_div)
 end
@@ -8126,9 +8148,19 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
             label = basename(path), closable = true))
         relabel_file_tabs!(ws)
+        # Mark the tab while the buffer differs from what was last saved. Closing
+        # a tab discards it WITHOUT asking, so this dot is the only warning you
+        # get that unsaved work is about to go.
+        fe = elem isa FilePanel ? elem.editor : nothing
+        fe === nothing || on(fe.dirty) do _
+            relabel_file_tabs!(ws)
+        end
     end)
     return nothing
 end
+
+# Is this panel's editor holding unsaved edits right now?
+panel_is_dirty(p) = p isa FilePanel && p.editor !== nothing && p.editor.dirty[]
 
 # Give every open file tab a label that identifies it. Runs after each open, over
 # ALL of them, because a new tab can make an EXISTING label ambiguous — the tab
@@ -8140,9 +8172,13 @@ end
 # the right file.
 function relabel_file_tabs!(ws)
     panels = [p for p in ws.panels[] if startswith(p.id, "file:")]
-    length(panels) < 2 && return nothing
+    isempty(panels) && return nothing
     paths = [p.id[length("file:") + 1:end] for p in panels]
-    for (p, l) in zip(panels, disambiguate_labels(paths))
+    # A lone tab needs no disambiguation, but it can still be dirty — so the
+    # basename is the baseline here rather than an early return.
+    names = length(panels) == 1 ? [basename(paths[1])] : disambiguate_labels(paths)
+    for (p, name) in zip(panels, names)
+        l = (panel_is_dirty(p.content) ? "● " : "") * name
         p.label[] == l || (p.label[] = l)
     end
     return nothing

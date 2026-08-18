@@ -1285,8 +1285,18 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-fv-rendered, .bt-fv-source",
         "flex" => "1 1 auto", "min-height" => "0", "min-width" => "0",
         "display" => "flex", "flex-direction" => "column", "overflow" => "auto"),
-    # The Monaco wrapper chain must pass full height down to the editor div.
-    CSS(".bt-fv-source > div, .bt-fv-editor, .bt-fv-source .monaco-editor-div",
+    # The Monaco wrapper chain must pass full height down to the editor div —
+    # EVERY link of it. BonitoBook's editor component brings its own unclassed
+    # wrapper between `.bt-fv-editor` and `.monaco-editor-div`, and that div was
+    # not covered here: it collapsed to its content height (5px), Monaco's own
+    # `height: 100%` resolved against those 5px, and the source view of every
+    # text file rendered as a single clipped line with empty space under it.
+    #
+    # It survived because nothing measured the editor: the panel, the body and the
+    # `.bt-fv-editor` above it are all full height, `getValue()` returns the file
+    # regardless, and the e2e assertion checks `.bt-file-editor-body` — all of
+    # which are fine while the thing you actually read is 5px tall.
+    CSS(".bt-fv-source > div, .bt-fv-editor, .bt-fv-editor > div, .bt-fv-source .monaco-editor-div",
         "height" => "100%", "min-height" => "0"),
     CSS(".bt-fv-error", "margin" => "12px"),
     CSS(".bt-fv-loading",

@@ -336,6 +336,58 @@ function run_suite(server)
             })()""") == 1
         end
 
+        @testset "⟳ reloads a plain source file" begin
+            # The reload handler used to be registered only for kinds that HAVE a
+            # rendered view, so on a source file — the commonest tab there is — ⟳
+            # flashed "reloaded" with nothing listening: the editor kept whatever
+            # it was opened with. Change the file underneath it and press the
+            # button the user presses.
+            TK.eval_js(server, open_file("plain.jl"))
+            @test TK.wait_for(server, "source open with its original text",
+                "(document.querySelector('$(view_sel("plain.jl")) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('const X = 1')";
+                timeout = 40) == true
+            write(joinpath(VIEW_CWD, "plain.jl"), "const X = 99  # changed underneath\n")
+            TK.eval_js(server, """(() => {
+                document.querySelector('$(view_sel("plain.jl")) [data-fv-action="reload"]').click();
+                return true; })()""")
+            @test TK.wait_for(server, "the editor picks the new text up",
+                "(document.querySelector('$(view_sel("plain.jl")) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('const X = 99')";
+                timeout = 40) == true
+        end
+
+        @testset "an unsaved buffer is marked on its tab" begin
+            # Closing a tab discards the buffer without asking, so this marker is
+            # the only warning that unsaved work is about to go. It also has to
+            # come BACK OFF on save: the save moves the baseline without changing
+            # the content, so no editor change event fires and a naive
+            # implementation leaves the dot stuck on forever.
+            TK.eval_js(server, open_file("notes.md"))
+            @test TK.wait_for(server, "editor ready", """(() => {
+                const v = document.querySelector('$(view_sel("notes.md"))');
+                v?.querySelector('[data-fv-view="source"]')?.click();
+                return !!v?.querySelector('.monaco-editor-div')?.__btEditor;
+            })()"""; timeout = 40) == true
+            label_of(name) = """(() => ([...document.querySelectorAll('.bw-tab-label')]
+                .map(t => t.textContent).find(t => t.includes($(TK.json(name)))) || ''))()"""
+
+            TK.eval_js(server, """(() => {
+                const ed = document.querySelector('$(view_sel("notes.md")) .monaco-editor-div').__btEditor;
+                ed.setValue(ed.getValue() + "\\nunsaved edit\\n");
+                return true; })()""")
+            @test TK.wait_for(server, "tab shows the unsaved marker",
+                "$(label_of("notes.md")).startsWith('●')"; timeout = 30) == true
+
+            TK.eval_js(server, """(() => {
+                document.querySelector('$(view_sel("notes.md")) .bt-file-editor-save').click();
+                return true; })()""")
+            @test TK.wait_for(server, "marker clears once the save landed",
+                """(() => {
+                    const l = $(label_of("notes.md"));
+                    const s = document.querySelector('$(view_sel("notes.md")) .bt-file-editor-status');
+                    return !l.startsWith('●') && (s?.textContent || '').includes('saved to the worker');
+                })()"""; timeout = 40) == true
+        end
+
         @testset "no JS errors" begin
             @test isempty(TK.js_errors(server))
         end

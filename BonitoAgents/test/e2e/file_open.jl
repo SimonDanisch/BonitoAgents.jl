@@ -70,8 +70,22 @@ function run_suite(server)
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel("hello.jl"))').length") == 1
             # The editor must actually FILL the panel — regression guard for the
             # 1px-high collapse when the panel wrapper doesn't carry height down.
+            #
+            # Measure the MONACO DIV, not the body around it. The body stayed full
+            # height while an unclassed wrapper inside it collapsed to 5px, so the
+            # source view of every text file was one clipped line over empty space
+            # and this assertion passed the whole time.
             @test TK.wait_for(server, "editor has real height",
-                "(document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor-body')?.offsetHeight || 0) > 200"; timeout = 30) == true
+                """(() => {
+                    const p = document.querySelector('$(panel_sel("hello.jl"))');
+                    const body = p?.querySelector('.bt-file-editor-body');
+                    const ed = p?.querySelector('.monaco-editor-div');
+                    if (!body || !ed) return false;
+                    const bh = body.getBoundingClientRect().height;
+                    const eh = ed.getBoundingClientRect().height;
+                    // the editor fills the body, rather than merely sitting in it
+                    return bh > 200 && eh > 200 && eh >= bh - 40;
+                })()"""; timeout = 30) == true
         end
 
         @testset "rapid repeated opens of one path make exactly ONE panel" begin
