@@ -28,6 +28,65 @@ one landed, plus the few that can't be reproduced in a headless window.
   audit still runs, and the failure is re-surfaced as a final failing testset.
 - **Leak audit** at the end asserts server-side bounds (models / pollers /
   mock subprocs / worker-ws / pending) and logs the counts.
+- **Eval-bridge isolation per chat**: the server registers one eval bridge per
+  PROJECT (`state.eval_workers[project_id]`), while the MCP eval-session pool is
+  keyed by env_path, is process-global, and never dials twice. In one test
+  process that meant the SECOND chat to eval in a given env inherited the first
+  chat's dial: no bridge was ever registered for it, so its live embeds rendered
+  from their snapshot but had no browser↔worker route — they looked right and
+  were dead. `new_chat` now re-points the dial-back when the project id changes
+  (the worker stays warm), which is what production gets for free by giving each
+  chat its own MCP process. Symptom if this regresses: an eval-embed suite
+  passes ALONE and fails when another eval suite ran first, its liveness
+  assertions timing out while the embed's DOM is present. Reproducer:
+  `test_args=["e2e:app_reload", "e2e:app_scroll"]`.
+- **A clean environment for spawned workers**: `Pkg.test` runs us under
+  `JULIA_LOAD_PATH="@:<testdir>"`, which is missing `@stdlib`, and every process
+  we spawn inherits it — so an eval worker could not load a single stdlib
+  (`using Markdown` → "Package Markdown not found in current path") even though
+  its committed env correctly expects stdlibs to come from `@stdlib`. The same
+  path also silently switched evals to FILE scope, because the worker's REPL
+  soft-scope transform failed to resolve and fell back to `identity`; a
+  top-level `for` assigning a global then died with "UndefVarError: acc not
+  defined in local scope", which reads as a bug in the test's own code.
+  Fixed at the source in `BonitoMCP.worker_env()` (a spawned worker gets Julia's
+  DEFAULT load path when one was inherited) plus `Base.require` for REPL, and
+  `TestKit.__init__` clears the variable so the whole spawned tree is clean.
+  `unit:eval_worker_env` pins all of it headlessly. Symptom if this regresses:
+  an eval case fails on `using <any stdlib>`, or a REPL-semantics case fails,
+  under `Pkg.test` while the same env works from a shell.
+- **Eval projects are COMMITTED, never built at runtime** (`test/evalenv`,
+  `test/altenv`; warmed up in runtests.jl). A project assembled with
+  `mktempdir` fails two ways at once: with no Bonito declared it resolves
+  whatever the machine's global `@v#.#` env holds — a registered Bonito v4 has
+  no `proxy_send`, the bridge gate (`MIN_BRIDGE_BONITO`) correctly refuses, and
+  every live embed renders "(result not live — worker gone and no snapshot)" on
+  that machine only — and it pays a cold precompile on first touch, so the same
+  assertions time out on a cold depot and pass on a warm one. Both were observed
+  here. Symptom if this regresses: an eval assertion that passes for you and
+  fails for someone else, or passes on a re-run.
+
+## Agent subprocesses ORPHAN when a worker is killed
+
+The worker spawns its agent with `open(Cmd(…), "r+")` (BonitoWorker.jl:914) — a
+plain child in the worker's own process group. A SIGKILLed worker does not take
+that child with it, so every test that kills a worker (`worker_lifecycle` does it
+on purpose) leaves a `MockACP` process behind, and they ACCUMULATE across runs.
+Measured on 2026-08-18: **3 orphans per full suite run** (0 before → 3 after, on a
+clean box), which had reached 55 live orphans — the oldest 41 hours — over a few
+days of running the suite.
+
+They are individually small and completely silent, and the way you find out is a
+*phantom failure*: with the box near 80% memory, `e2e:worker_lifecycle` took 27s
+instead of its usual 7s and timed out waiting for "0 workers online". Killing the
+orphans and re-running the same item on a quiet box: 5.8s, green. So before
+believing a timing-shaped e2e failure, check `pgrep -cf "[M]ock[A]CP"` — and get a
+quiet-box baseline before blaming the diff.
+
+In production the same mechanism orphans the real `claude-agent-acp` process
+whenever a worker dies abnormally. Fixing it properly means giving the agent its
+own process group and killing the group on worker exit, plus reaping strays at
+worker startup — NOT yet done.
 
 ## Known product bug surfaced by the soak
 
@@ -36,6 +95,20 @@ one landed, plus the few that can't be reproduced in a headless window.
 mounted (cost ≈ mounted × streamed — a client-side cross-chat accumulation, not a
 deadlock and not server-side). Running the flood early isolates its real target
 (the `deliver_update!` deadlock regression) from this separate, still-open bug.
+
+`e2e:bt_eval` is INTERMITTENTLY red (roughly every other full run as of
+2026-08-17), always on the same rendering — a tool body reading
+"(result not live — worker gone and no snapshot)" where the value belongs. It
+moves between testsets (`test_bt_eval_e2e.jl:105`, the simple `1 + 41` case, and
+`:494`, the two-`env_path` case), so a green run proves nothing; repeat before
+concluding anything. Two contributing causes are known and documented at their
+sites in `remote_app.jl`: (a) the eval-bridge registry holds ONE bridge per
+project while eval sessions are pooled per `env_path`, so a chat evaluating in
+two envs has its first bridge evicted by its second, and (b) `RemoteRef`'s
+static snapshot is always empty, so a slow or lost live mount has nothing to
+fall back to and shows the not-live note instead of the value. Fixing (b)
+requires reworking the "LIVE fragment" assertions, which currently rely on the
+absence of a snapshot to detect deadness.
 
 Closing an INACTIVE app tab loses the embed. A bt_show_app docked as a tab can be
 closed fine when it's the ACTIVE tab (embed returns to its bubble), but closing it
@@ -62,7 +135,10 @@ it, so it covers the working path; the inactive-close fix is still open.
 | _(missing)_ `app_multi.jl` | NOT PORTED. Deleted with `bt_show_app`; the behaviour still exists via eval embeds (several live apps detached at once, driven independently, surviving a chat switch, closed one-by-one) but nothing covers it. `app_scroll.jl` covers the single-app case. |
 | `app_tabs.jl`         | THREE apps docked into ONE window as TABS (via the float's ⤢ dock button): switch between tabs (active app visible, others hidden), each stays LIVE as a tab (Julia round-trip), then close the tabs (active-tab close → embed back to its bubble). KNOWN BUG (see below): closing an INACTIVE app tab loses the embed — the suite always activates a tab before closing it (the working + natural path) |
 | `scroll_persist.jl`   | new content follows to bottom (followMode), overflow, history survives a browser reconnect |
-| `file_tree.jl`        | per-chat sidebar file tree: ▸ toggle reveals + lazy-loads the worker project root (dirs first), expanding a dir lazy-loads children, the search box fuzzy-filters the project file index (`.git/` excluded), clicking a file opens a Monaco panel; the editor open-guard toasts (and opens NO panel) on a binary/oversize/folder/missing target |
+| `file_tree.jl`        | per-chat sidebar file tree: ▸ toggle reveals + lazy-loads the worker project root (dirs first), expanding a dir lazy-loads children, the search box fuzzy-filters the project file index (`.git/` excluded), clicking a file opens a Monaco panel, clicking a BINARY file opens a hex view; the open-guard toasts (and opens NO panel) only for what no viewer can show (oversize / folder / missing / unreachable worker) |
+| `file_view.jl`        | the rich file viewer: png (image stage + reported pixel size, no editor), md (rendered by default, Source toggle holding the real text, Save writes the WORKER file and the preview follows), csv (sortable table of the right shape), obj (server-side parse → BTMESH1 blob → WebGL viewer reporting the decoded triangle/vertex counts, in singular for one triangle), .bin (hex dump, never Monaco), mp4 (video stage, centred, a 1600px-tall clip FITTED so its controls stay on screen) and a tall png held to the same rule, pdf (the frame is pointed at its file from inside the document — see Headless limitations); every panel header names the WORKER path, and renders it in reading order rather than letting `direction: rtl` move the leading `/` to the end |
+| `review.jl`           | change-review tab: the Review button opens the project's git diff incl. UNTRACKED files (marked added) with both sides' line numbers; Ask sends the question to the chat immediately with its code context; Feedback batches into the tray (counted on the Send button), sends ONE numbered instruction and only then clears; shift-click covers a BLOCK and the range + every line in it reach the agent; chips drop; ⟳ re-reads the tree; ⤢ opens the file itself |
+| `debug_chat.jl`       | "Debug BonitoAgents": the dashboard button opens the chat AND navigates to it, rooted at this server's own checkout; the same button in a chat header goes to the same place; pressing it again reuses the one chat |
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |
 | `todo_taskbar.jl`     | live todo as a pinned panel, plan update mutates it in place (done/active), turn end finalizes to one bubble + drops the pin |
@@ -115,3 +191,15 @@ unit test stays — it is headless, not a UI test).
   ignores synthetic `wheel`/`scrollTop` and even `webContents.sendInputEvent`
   mouseWheel (verified three ways; see `scroll_persist.jl`'s header). `profile_scroll.jl`
   (the old profiling harness) went with the tier.
+
+- **Whether a PDF actually PAINTS.** Chromium renders a PDF through an
+  out-of-process viewer, and a live one is indistinguishable in the DOM from a
+  dead one: both frames navigate, and both contain an `<embed
+  type="application/pdf" src="about:blank">`. That is not a curiosity — it is how
+  a real bug hid here. An `<iframe src=…>` that arrived already-sourced through
+  Bonito's node insertion never got a live view, so every PDF tab was the
+  viewer's dark backdrop and nothing else, while every DOM assertion passed.
+  Found by screenshotting, fixed by assigning `src` from inside the document
+  (`initFrame`, assets/fileview.js). `file_view.jl` therefore asserts the
+  PLUMBING (`data-frame-src` → `src`, with `data-fv-ready`); a regression in the
+  paint itself needs an eyeball on a screenshot.

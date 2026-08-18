@@ -85,11 +85,34 @@ enumerates.
 
 - Sidebar **project file tree**: lazy directory loading, fuzzy full-index
   search (VSCode-style), download affordances.
-- **Monaco file editor** that saves back to the worker (`Ctrl+S`). Opening
-  always fetches the file fresh from the worker; re-activating an open panel
-  live-updates a clean buffer and never clobbers unsaved edits. A pre-open
-  guard refuses folders, binaries and oversized files with a clear toast.
-- File paths in tool pills are clickable and open in the editor.
+- **Rich file viewer**: clicking ANY file opens it as a workspace tab rendered
+  as what it is — images on a transparency checkerboard with their pixel size,
+  range-streamed video and audio, rendered markdown, CSV/TSV as a sortable and
+  filterable table with a sticky header, Jupyter notebooks with their outputs,
+  3D geometry (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in an interactive
+  WebGL view, PDF and HTML in a sandboxed frame, source in Monaco, and opaque
+  bytes as a hex dump. Anything text-backed (markdown, HTML, CSV, SVG) has a
+  Preview/Source toggle over the same editor. Images and video sit centred on a
+  stage and are fitted to it, so a portrait clip keeps its controls on screen.
+- Tabs are named to be **told apart**: a file is its basename until another open
+  file shares it, and then both grow leftwards until they differ — `a/types.jl`
+  and `b/types.jl` rather than two tabs both reading `types.jl`.
+- `bt_show` previews in the chat run the SAME renderers, so a file looks the
+  same whether the agent showed it or you opened it.
+- The editor is bound to the file **on the worker**: the header shows the
+  worker path and `Ctrl+S` writes it there, failing loudly rather than saving
+  only the server's mirror copy. Mirrored files are re-fetched exactly when the
+  worker's `(size, mtime)` changed, so a regenerated file at a reused path is
+  never served stale; re-activating an open panel refreshes a clean buffer and
+  never clobbers unsaved edits.
+- File paths in tool pills and search hits are clickable and open in the viewer.
+- **Change review tab**: the project's git diff (including files the agent
+  created) with a comment affordance on every line, in two modes — *Ask* sends
+  the question to the chat immediately with the code context attached, and
+  *Feedback* batches comments and delivers them as one numbered instruction —
+  Send counts what it will deliver and only looks like the primary action once
+  it has something to say. Compare against the working tree or any branch, tag
+  or commit.
 - **VSCode-style workspace** (BonitoWidgets): chat, editors and app embeds as
   panels that drag into tab groups, split, float, and dock back.
 
@@ -128,5 +151,14 @@ enumerates.
 - Black-box e2e suite driving a real dev server through headless Electron
   (DOM in, rendered DOM out; no server introspection; retries forbidden), plus
   fast headless unit items.
+- **Debug BonitoAgents**: a one-click chat (dashboard and every chat header)
+  whose working directory is the server's own source checkout, so the agent can
+  read, edit and open a PR against the running application. It additionally gets
+  `bt_dev_*` tools that read the LIVE process — workers, projects, chats and
+  eval bridges, the server's own log ring, memory and per-registry leak
+  counters (with an optional GC and deep `summarysize` pass), the worker's
+  account of itself — plus orchestration ops (open a chat, send a message,
+  restart a session, move a project between machines). The tools are attached
+  by a persisted per-project flag, so no ordinary chat can see them.
 - Recorded walkthrough (`examples/walkthrough.jl`) with an animated cursor.
 - Bonito-based documentation site (`docs/`).

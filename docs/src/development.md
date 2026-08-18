@@ -41,6 +41,28 @@ tool calls with diff and terminal content, forms, plans, subagent feeds,
 live-app pushes, pacing delays and mid-turn cancellation, so most UI behavior
 can be scripted in a few lines.
 
+## Debugging BonitoAgents itself
+
+The dashboard (and every chat header) has a **Debug BonitoAgents** button. It
+opens a chat whose working directory is the checkout this server is running
+from, so the agent can read the source, edit it, and open a PR the ordinary way.
+It's offered only when the install IS a checkout and a connected worker has it —
+there is nothing to debug against otherwise.
+
+That chat additionally gets `bt_dev_*` MCP tools that read the **live process**,
+which is the part the filesystem can't tell you:
+
+| Tool | What it answers |
+|------|-----------------|
+| `bt_dev_inspect` | live workers, projects, chats and eval bridges — plus `section="worker"`, what a worker says about ITSELF (its agent processes, their sockets). When that disagrees with what the server believes, the disagreement is the bug. |
+| `bt_dev_logs` | the server's own `@info`/`@warn`/`@error` ring, filterable by level and substring, with the source location of each record. |
+| `bt_dev_memory` | RSS, GC live bytes and every registry that has historically grown without bound, with an optional GC and a deep `summarysize` pass. For a leak: take a reading, exercise the suspect path, read again with `gc = true`, compare what grew. |
+| `bt_dev_control` | drive the server as a user would — open a chat, send a message, restart a session, rescan a worker, move a project to another machine. |
+
+The tools are attached by a per-project `dev_mode` flag that only this button
+sets, so no ordinary chat can see them — not even one whose working directory
+happens to be the checkout.
+
 ## The walkthrough videos
 
 Two recorders under [`examples/`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/examples)

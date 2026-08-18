@@ -36,11 +36,35 @@ or reconnect are queued rather than dropped.
 ## Files and the editor
 
 Every file path in the transcript is a link, and the sidebar has a lazy,
-searchable project file tree (hover a chat, then "▾ files"). Opening a file
-fetches it fresh from the worker, so the editor always shows what is on disk
-now, and puts it in a Monaco editor panel that saves back to the worker
-(`Ctrl+S`). Re-activating an already-open file re-checks the worker and
-live-updates a clean buffer; your unsaved edits are never overwritten.
+searchable project file tree (hover a chat, then "▾ files"). Clicking **any**
+file opens it as a workspace tab, rendered as what it is: an image on a
+transparency checkerboard with its pixel size, video and audio streamed from the
+worker, markdown rendered, a CSV as a sortable and filterable table, a notebook
+with its outputs, 3D geometry in an interactive view, a PDF in the browser's own
+viewer, an HTML page in a sandboxed frame, source in Monaco, and anything opaque
+as a hex dump. Anything text-backed has a Preview/Source toggle over the same
+editor. Images and video are centred and fitted to the tab, so a portrait clip
+keeps its controls on screen.
+
+Tabs are named so you can tell them apart: a file is its basename until another
+open file shares it, at which point both grow leftwards until they differ
+(`a/types.jl` and `b/types.jl`, not two tabs both reading `types.jl`).
+
+The editor is bound to the file **on the worker** — the header shows the worker
+path and `Ctrl+S` writes it there, failing loudly rather than silently saving
+only the server's copy. Opening re-fetches exactly when the worker's copy
+changed, so you never get yesterday's file at a reused path; re-activating an
+already-open tab refreshes a clean buffer and never overwrites unsaved edits.
+
+## Reviewing changes
+
+**Review** in the chat header opens the project's git diff as a tab — including
+files the agent just created, which a plain `git diff` leaves out. Every line
+has a `+`; shift-click a second one to cover a block. Two modes: **Ask** sends
+the question straight into the chat with the file, line and surrounding code
+attached, and **Feedback** collects comments and delivers them as one numbered
+instruction when you press Send. Compare against the working tree or any branch,
+tag or commit, and `⤢` on a file header opens the whole file.
 
 ## The workspace
 
@@ -57,8 +81,9 @@ a chat from your desk or your pocket.
 ## Media and live apps
 
 Agents push results into the chat through the built-in Julia tools
-([Julia Tools & Live Apps](@ref)). `bt_show` renders a worker-side file: images
-and videos inline with a lightbox, text as syntax-highlighted code. And
+([Julia Tools & Live Apps](@ref)). `bt_show` renders a worker-side file with the
+same viewers the file tabs use — images and video inline with a lightbox,
+rendered markdown, tables, geometry, source. And
 whatever `bt_julia_eval` **returns** renders as a live value: a plot, a table,
 or a running Bonito app whose logic executes in the worker's Julia session, so a
 slider drag or button click round trips to real code. Live embeds detach from
