@@ -96,7 +96,9 @@ enumerates.
   stage and are fitted to it, so a portrait clip keeps its controls on screen.
 - Tabs are named to be **told apart**: a file is its basename until another open
   file shares it, and then both grow leftwards until they differ — `a/types.jl`
-  and `b/types.jl` rather than two tabs both reading `types.jl`.
+  and `b/types.jl` rather than two tabs both reading `types.jl`. A tab with
+  unsaved edits carries a dot; closing one discards the buffer without asking,
+  so that dot is the warning.
 - `bt_show` previews in the chat run the SAME renderers, so a file looks the
   same whether the agent showed it or you opened it.
 - The editor is bound to the file **on the worker**: the header shows the
@@ -112,7 +114,8 @@ enumerates.
   *Feedback* batches comments and delivers them as one numbered instruction —
   Send counts what it will deliver and only looks like the primary action once
   it has something to say. Compare against the working tree or any branch, tag
-  or commit.
+  or commit. The diff is scoped to the PROJECT's folder, so a package inside a
+  larger checkout shows its own changes rather than the whole monorepo's.
 - **VSCode-style workspace** (BonitoWidgets): chat, editors and app embeds as
   panels that drag into tab groups, split, float, and dock back.
 

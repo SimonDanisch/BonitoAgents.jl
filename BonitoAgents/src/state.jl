@@ -532,6 +532,11 @@ You also have `bt_dev_*` tools that read the **running process**:
 - `bt_dev_memory` — memory and per-registry counters, with an optional GC and a
   deep `summarysize` pass. For a suspected leak: take a reading, exercise the
   suspect path, take another with `gc = true`, compare what grew.
+  It sees THIS process only. Leaks that live outside it are invisible here, and
+  one is known: agent subprocesses are spawned as plain children, so a worker
+  that is killed orphans them and nothing reaps them (measured at ~3 per full
+  test-suite run). Clean counters here do not mean "no leak" — for that class,
+  count the processes on the machine.
 - `bt_dev_control` — drive the server the way a user would (open a chat, send a
   message, restart a session, move a project between machines).
 

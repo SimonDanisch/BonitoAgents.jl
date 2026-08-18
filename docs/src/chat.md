@@ -48,7 +48,9 @@ keeps its controls on screen.
 
 Tabs are named so you can tell them apart: a file is its basename until another
 open file shares it, at which point both grow leftwards until they differ
-(`a/types.jl` and `b/types.jl`, not two tabs both reading `types.jl`).
+(`a/types.jl` and `b/types.jl`, not two tabs both reading `types.jl`). A tab
+whose editor holds unsaved edits carries a dot — closing a tab throws the buffer
+away without asking, so that marker is the warning you get.
 
 The editor is bound to the file **on the worker** — the header shows the worker
 path and `Ctrl+S` writes it there, failing loudly rather than silently saving
@@ -65,6 +67,10 @@ the question straight into the chat with the file, line and surrounding code
 attached, and **Feedback** collects comments and delivers them as one numbered
 instruction when you press Send. Compare against the working tree or any branch,
 tag or commit, and `⤢` on a file header opens the whole file.
+
+The diff covers the **project's folder**, not the whole repository — a package
+that lives inside a larger checkout shows its own changes instead of every
+change in the monorepo.
 
 ## The workspace
 

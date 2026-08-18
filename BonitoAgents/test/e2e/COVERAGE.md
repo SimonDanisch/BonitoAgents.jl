@@ -88,6 +88,23 @@ whenever a worker dies abnormally. Fixing it properly means giving the agent its
 own process group and killing the group on worker exit, plus reaping strays at
 worker startup — NOT yet done.
 
+## ⟳ on a file that vanished shows the old text as if it were current
+
+`fetch_show_file` falls back to the last mirrored copy whenever the transfer
+fails — the right call for a worker that briefly went away, and indistinguishable
+from a fresh read for the user. Delete a file on the worker, press ⟳, and the
+button flashes "reloaded" over the bytes it fetched minutes ago. The server logs
+`show: transfer failed; showing the last mirrored copy`; the UI says nothing.
+
+Reporting it in the panel status is what you would reach for, and it does not
+work: writing `fe.status` from the reload path throws in the browser ("Cannot set
+properties of null"), because the binding that observable feeds is not live
+there. Fixing this properly means giving the panel a status channel that survives
+the reload path — NOT yet done.
+
+(Distinguishing "deleted" from "worker unreachable" needs care too:
+`worker_file_stamp` returns `nothing` for both.)
+
 ## Known product bug surfaced by the soak
 
 `streaming_flood.jl` runs EARLY (2nd) on purpose. A large message burst paints in
@@ -138,6 +155,7 @@ it, so it covers the working path; the inactive-close fix is still open.
 | `file_tree.jl`        | per-chat sidebar file tree: ▸ toggle reveals + lazy-loads the worker project root (dirs first), expanding a dir lazy-loads children, the search box fuzzy-filters the project file index (`.git/` excluded), clicking a file opens a Monaco panel, clicking a BINARY file opens a hex view; the open-guard toasts (and opens NO panel) only for what no viewer can show (oversize / folder / missing / unreachable worker) |
 | `file_view.jl`        | the rich file viewer: png (image stage + reported pixel size, no editor), md (rendered by default, Source toggle holding the real text, Save writes the WORKER file and the preview follows), csv (sortable table of the right shape), obj (server-side parse → BTMESH1 blob → WebGL viewer reporting the decoded triangle/vertex counts, in singular for one triangle), .bin (hex dump, never Monaco), mp4 (video stage, centred, a 1600px-tall clip FITTED so its controls stay on screen) and a tall png held to the same rule, pdf (the frame is pointed at its file from inside the document — see Headless limitations); every panel header names the WORKER path, and renders it in reading order rather than letting `direction: rtl` move the leading `/` to the end |
 | `review.jl`           | change-review tab: the Review button opens the project's git diff incl. UNTRACKED files (marked added) with both sides' line numbers; Ask sends the question to the chat immediately with its code context; Feedback batches into the tray (counted on the Send button), sends ONE numbered instruction and only then clears; shift-click covers a BLOCK and the range + every line in it reach the agent; chips drop; ⟳ re-reads the tree; ⤢ opens the file itself |
+| `review_scope.jl`     | the review diff is SCOPED to the project's folder: a package inside a bigger checkout lists its own change and its own untracked file, NOT a sibling's; rows drop the shared prefix while `data-file` stays relative to the PROJECT (the agent's cwd — a root-relative path would send it to `pkg/pkg/…`); the header names the folder, not the repository above it. Its own dev_server AND its own single chat: two review panels in one window cannot be told apart by `querySelector` (answers about the first) nor by "which is visible" (an inactive panel still has an `offsetParent`) |
 | `debug_chat.jl`       | "Debug BonitoAgents": the dashboard button opens the chat AND navigates to it, rooted at this server's own checkout; the same button in a chat header goes to the same place; pressing it again reuses the one chat |
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |
@@ -191,6 +209,23 @@ unit test stays — it is headless, not a UI test).
   ignores synthetic `wheel`/`scrollTop` and even `webContents.sendInputEvent`
   mouseWheel (verified three ways; see `scroll_persist.jl`'s header). `profile_scroll.jl`
   (the old profiling harness) went with the tier.
+
+- **Drags that rely on POINTER CAPTURE.** `webContents.sendInputEvent` mouse
+  moves do not honour `setPointerCapture`, so a handler that captures on
+  `pointerdown` and then reads `pointermove` (BonitoWidgets' split gutter does
+  exactly this) only sees the moves that happen to land on the element itself.
+  A 300px synthetic drag of the 9px gutter moved the split by 8px, which reads
+  exactly like "resize is broken". It is not: dispatching the same
+  `PointerEvent`s directly at the gutter moves it 298px. Before filing a
+  drag-shaped bug, dispatch the events at the element and see whether the
+  handler was ever the problem. (Tab-drag-to-split does work through
+  `sendInputEvent` — it does not use capture.)
+
+- **Keys that insert TEXT.** `sendInputEvent({type:'keyDown'})` alone does not
+  type anything: the browser inserts on the `char` event. Testing Shift+Enter
+  with keyDown only shows "the composer refuses newlines" when the composer is
+  fine. Send keyDown → char → keyUp for anything that should produce a
+  character.
 
 - **Whether a PDF actually PAINTS.** Chromium renders a PDF through an
   out-of-process viewer, and a live one is indistinguishable in the DOM from a
