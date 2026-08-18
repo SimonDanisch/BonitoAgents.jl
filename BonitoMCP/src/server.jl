@@ -71,12 +71,15 @@ function dispatch!(out, req::AbstractDict)
             "name" => t.name,
             "description" => t.description,
             "inputSchema" => t.input_schema,
-        ) for t in TOOLS]
+        ) for t in available_tools()]
         send_response!(out, id, Dict("tools" => tools))
     elseif method == "tools/call"
         tool_name = get(params, "name", "")
         args = get(params, "arguments", Dict{String,Any}())
-        idx = findfirst(t -> t.name == tool_name, TOOLS)
+        # `available_tools()` and not `TOOLS`: a gated-off tool must be as absent
+        # to a caller that guessed its name as it is to `tools/list`.
+        tools = available_tools()
+        idx = findfirst(t -> t.name == tool_name, tools)
         if idx === nothing
             send_error!(out, id, -32602, "Unknown tool: $tool_name")
         else
@@ -85,7 +88,7 @@ function dispatch!(out, req::AbstractDict)
             track = tool_name in EVAL_TOOL_NAMES
             track && note_inflight_request!(id, get(args, "env_path", nothing))
             try
-                result = TOOLS[idx].handler(args)
+                result = tools[idx].handler(args)
                 send_response!(out, id, result)
             catch e
                 bt = sprint(showerror, e, catch_backtrace())
@@ -217,8 +220,11 @@ Run the stdio MCP loop. Blocks until stdin closes.
 """
 function run_stdio(; in::IO = stdin, out::IO = stdout)
     log_info("$(SERVER_NAME) v$(SERVER_VERSION) listening on stdio (protocol $(PROTOCOL_VERSION))")
-    log_info("Registered $(length(TOOLS)) tool(s): " *
-             join((t.name for t in TOOLS), ", "))
+    let avail = available_tools()
+        log_info("Registered $(length(avail)) tool(s): " * join((t.name for t in avail), ", ") *
+                 (length(avail) == length(TOOLS) ? "" :
+                  " ($(length(TOOLS) - length(avail)) gated off)"))
+    end
     # BonitoAgents-hosted runs get a control dial-back so the chat UI can
     # interrupt in-flight evals per tool (no-op standalone; see ctrl_ws.jl).
     start_ctrl_dialback!()

@@ -8,14 +8,31 @@ module BonitoMCPHelper
 
 using Base64
 
-# Soft-scope transform for REPL-style top-level eval (see `repl_eval`). REPL is
-# a stdlib (always in the sysimage), so this import is essentially free; fall
-# back to hard scope (identity) only if it somehow can't resolve.
+# Soft-scope transform for REPL-style top-level eval (see `repl_eval`).
+#
+# `Base.require` rather than `@eval import REPL; REPL.softscope`: the latter
+# creates the `REPL` binding and READS it inside one top-level expression, and
+# under Julia 1.12's stricter world-age rules for global bindings a
+# freshly-created binding is not reliably visible in the world the same
+# expression is running in. `require` hands back the module object, so there is
+# no binding to see.
+#
+# The fallback must be LOUD. Degrading to `identity` silently swaps the eval's
+# scoping rules for the life of the worker — `acc = 0; for i in 1:5; acc += i;
+# end` then dies with "UndefVarError: acc not defined in local scope", which
+# reads as a bug in the user's code, not as "REPL didn't load". The two ways it
+# actually happens: a LOAD_PATH without `@stdlib` (a parent process exporting
+# `JULIA_LOAD_PATH` — `Pkg.test` does exactly that), or a transient failure
+# while precompiling/loading REPL.
+const REPL_PKGID = Base.PkgId(Base.UUID("3fa0cd96-eef1-5676-8a61-b3b8758bbffb"), "REPL")
+
 const SOFTSCOPE = try
-    @eval import REPL
-    REPL.softscope
+    getfield(Base.require(REPL_PKGID), :softscope)
 catch e
     e isa InterruptException && rethrow()
+    @warn "bt_julia_eval: could not load REPL, so evals fall back to FILE (hard) scope — " *
+          "a top-level `for`/`while` will NOT be able to assign a global. " *
+          "Usually a LOAD_PATH without `@stdlib`." exception = (e, catch_backtrace()) load_path = LOAD_PATH
     identity
 end
 

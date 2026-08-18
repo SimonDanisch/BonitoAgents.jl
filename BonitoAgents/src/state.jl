@@ -116,6 +116,13 @@ mutable struct ProjectInfo
     # record what the user chose and re-assert it on every bring-up — see
     # `apply_session_config!`. Persisted so resume restores the original settings.
     desired_config::Dict{String,String}
+    # "Debug BonitoAgents" chat: this project's cwd is the BonitoAgents source
+    # checkout, and its agent gets the `bt_dev_*` introspection tools (see
+    # dev_api.jl / BonitoMCP tools/dev.jl). Persisted, because the flag is what
+    # keeps the tools attached across a server restart — and because it must NOT
+    # be re-derivable from the path: pointing an ordinary chat at the checkout
+    # should not silently hand it the server's controls.
+    dev_mode::Bool
     # Searchable file index (worker-derived, runtime-only). See ProjectFileIndex.
     file_index::ProjectFileIndex
 end
@@ -123,7 +130,7 @@ end
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
                 nothing, nothing, :unsynced, nothing, nothing, nothing, nothing,
-                false, Dict{String,String}(), ProjectFileIndex())
+                false, Dict{String,String}(), false, ProjectFileIndex())
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
 # call shape working for tests / fixtures that build a WorkerInfo by hand.
@@ -219,6 +226,15 @@ mutable struct ServerState
     # is meaningless; only the notification matters.
     chat_signal :: Observable{Int}
 
+    # Bumped (via `notify_turn!`) whenever an OPEN chat's content changes — a
+    # turn starting or ending. Distinct from `chat_signal` on purpose: that one
+    # means "the SET of chats changed" and the sidebar body re-renders on it, so
+    # firing it per turn swapped an open file tree out mid-interaction (see the
+    # note in `ChatModel`). Views that care about a chat's CONTENT (the
+    # dashboard's overview cards, the sidebar's in-place status LEDs) subscribe
+    # here instead and update without rebuilding the chat list.
+    turn_signal :: Observable{Int}
+
     # Live worker connections (name → HTTP.WebSocket)
     worker_control_ws :: Dict{String,Any}
 
@@ -260,6 +276,12 @@ mutable struct ServerState
     # Per-path serialization lock for fetched `bt_show` files (server_dst => lock);
     # a process-level coordination pool, server-scoped here so it dies with the server.
     show_fetch_inflight :: Dict{String,ReentrantLock}
+    # Freshness key for each mirrored worker file: server_dst => the worker-side
+    # `(size, mtime)` the mirror copy was fetched FROM. Paths get reused (a
+    # re-rendered plot, an edited source), so the mere existence of a mirror file
+    # is not a cache hit — only a stamp that still matches the worker's current
+    # stat is. See `fetch_show_file` / `mirror_is_current`.
+    show_mirror_stamps :: Dict{String,@NamedTuple{size::Int, mtime::Float64}}
     # LRU of project_ids whose agent is currently BOUND, most-recently last. Capped:
     # binding past the cap closes the oldest idle session (reaps its agent; lazy
     # ACP re-binds it from disk history on the next turn). Bounds agent processes.
@@ -307,6 +329,7 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,ProjectInfo}()),   # projects
         Dict{String,Any}(),                       # chat_models
         Observable(0),                            # chat_signal
+        Observable(0),                            # turn_signal
         Dict{String,Any}(),                       # worker_control_ws
         Dict{String,Channel{Any}}(),              # pending_rpcs
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
@@ -317,6 +340,7 @@ function ServerState(; state_dir::String,
         Dict{String,Channel{String}}(),           # eval_stream_sinks
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
+        Dict{String,@NamedTuple{size::Int, mtime::Float64}}(),  # show_mirror_stamps
         String[],                                 # bound_lru
         Observable(Dict{String,String}()),        # default_session_config (load_settings! below)
         Observable(Any[]),                        # last_config_options
@@ -349,6 +373,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             map(identity, session, s.projects),
             s.chat_models,
             map(identity, session, s.chat_signal),
+            map(identity, session, s.turn_signal),
             s.worker_control_ws,
             s.pending_rpcs,
             map(identity, session, s.discovered),
@@ -359,6 +384,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.eval_stream_sinks,
             s.session_inflight,
             s.show_fetch_inflight,
+            s.show_mirror_stamps,
             s.bound_lru,               # shared registry — one per server
             # SHARED (not bridged): the home writes these and
             # `effective_session_config` reads them off the parent at bring-up, so
@@ -471,6 +497,54 @@ function agents_prompt_appendix(s::ServerState)
     user = global_agents_md(s)
     return isempty(user) ? BUILTIN_AGENT_RULES : BUILTIN_AGENT_RULES * "\n\n" * user
 end
+
+"""
+    agents_prompt_appendix(state, project_id) -> String
+
+The system-prompt appendix for ONE chat: the server-wide rules plus, for a
+`dev_mode` project, the briefing that tells the agent where it is and what the
+`bt_dev_*` tools are for. Delivered as system prompt rather than as an opening
+message so the debug chat costs nothing until the user actually asks something.
+"""
+function agents_prompt_appendix(s::ServerState, project_id::AbstractString)
+    base = agents_prompt_appendix(s)
+    isempty(project_id) && return base
+    p = get(s.projects[], String(project_id), nothing)
+    (p === nothing || !p.dev_mode) && return base
+    return base * "\n\n" * DEV_MODE_BRIEFING
+end
+
+# What a "Debug BonitoAgents" chat's agent is told about its own situation. Kept
+# short and concrete: the tools carry their own documentation, so this only has
+# to establish WHERE it is and which of the two things in front of it (the source
+# tree, the live process) answers which kind of question.
+const DEV_MODE_BRIEFING = """
+# Debugging BonitoAgents itself
+
+This chat's working directory is the **BonitoAgents source checkout** for the
+server you are running inside. Editing a file here edits the code of the live
+application; `git` works normally, so you can branch, commit and open a PR.
+
+You also have `bt_dev_*` tools that read the **running process**:
+
+- `bt_dev_inspect` — live workers, projects, chats and eval bridges.
+- `bt_dev_logs` — the server's own `@info`/`@warn`/`@error` ring.
+- `bt_dev_memory` — memory and per-registry counters, with an optional GC and a
+  deep `summarysize` pass. For a suspected leak: take a reading, exercise the
+  suspect path, take another with `gc = true`, compare what grew.
+- `bt_dev_control` — drive the server the way a user would (open a chat, send a
+  message, restart a session, move a project between machines).
+
+Two rules that matter here more than in a normal chat:
+
+1. **The source tree and the running process are different things.** Code you
+   edit does not take effect until the server restarts (Revise picks up most
+   changes in a dev server; a bundled install does not). Say which one you are
+   describing.
+2. **`bt_dev_control` has real effects on the user's live session** — sending a
+   message starts a turn that costs tokens, moving a project writes files on
+   another machine. Say what you are about to do before you do it.
+"""
 
 """
     derive_initials(name) -> String
@@ -587,13 +661,19 @@ function safe_notify!(obs::Observable)
     return nothing
 end
 
-# Signal that chat state changed (a chat opened/closed, or a turn started/
-# finished via the ChatModel busy hook) so chat-list consumers (sidebar,
-# recent-chats overview) re-render. Always raised on the ROOT: the per-session
-# Observable bridges are one-way (root → child), so notifying a session view
-# would reach only that one session — the old behaviour, which left every
-# OTHER tab (and any tab opened later) stale until an unrelated global event.
+# Signal that the SET of chats changed (a chat opened or closed) so chat-list
+# consumers re-render. Always raised on the ROOT: the per-session Observable
+# bridges are one-way (root → child), so notifying a session view would reach
+# only that one session — the old behaviour, which left every OTHER tab (and any
+# tab opened later) stale until an unrelated global event.
 notify_chats!(s::ServerState) = safe_notify!(root_state(s).chat_signal)
+
+# Signal that an open chat's CONTENT changed (a turn started or finished). Same
+# root-routing rule as `notify_chats!`, different audience: this one must NOT
+# rebuild the chat list, only the views that read a chat's messages (overview
+# cards) or its status (sidebar LEDs). See `turn_signal`'s field doc for why the
+# two are separate.
+notify_turn!(s::ServerState) = safe_notify!(root_state(s).turn_signal)
 
 # ── Persistence ───────────────────────────────────────────────────────────
 # Atomic JSON write: serialise to a UNIQUE sibling temp file first, then rename
@@ -727,6 +807,7 @@ function save_projects!(s::ServerState)
                      "auto_prompt"   => p.auto_prompt,
                      "title"         => p.title,
                      "dismissed"     => p.dismissed,
+                     "dev_mode"      => p.dev_mode,
                      "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
         atomic_write_json(projects_file(s), data)
@@ -762,6 +843,9 @@ function load_projects!(s::ServerState)
             # Pre-`dismissed` projects.json entries default to shown (false), so
             # an upgrade doesn't suddenly hide anyone's existing open chats.
             p.dismissed = get(d, "dismissed", false) === true
+            # Absent ⇒ false. An upgrade must not turn existing chats into debug
+            # chats, and the flag is the only thing that grants the dev tools.
+            p.dev_mode = get(d, "dev_mode", false) === true
             dc = get(d, "desired_config", nothing)
             if dc isa AbstractDict
                 for (k, v) in dc

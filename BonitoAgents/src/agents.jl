@@ -108,7 +108,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     # Only Claude honours the `_meta.systemPrompt.preset` append. The appendix
     # is the BUILT-IN house rules + the user's editable AGENTS.md.
     prompt_meta = a.provider isa ClaudeCodeAgent ?
-        system_prompt_meta(agents_prompt_appendix(a.state)) : Dict{String,Any}()
+        system_prompt_meta(agents_prompt_appendix(a.state, project_id)) : Dict{String,Any}()
 
     sid, ch = register_rpc!(a.state)
     send_command(a.state, a.worker_id, Dict(

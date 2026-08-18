@@ -388,6 +388,10 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "kill_file_writers_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "git_diff_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "worker_state_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "open_session_failed"
                         # M9/M13: worker couldn't spawn/dial the ACP session; fail the
                         # pending open_session (keyed by `sid`) now instead of waiting
@@ -395,6 +399,15 @@ function handle_worker_control(state::ServerState, ws)
                         sid = String(get(cmd, "sid", ""))
                         deliver_rpc_error!(state, sid,
                             String(get(cmd, "error", "worker failed to open ACP session")))
+                    else
+                        # This dispatch is an allow-list, so a NEW worker RPC whose
+                        # reply type isn't added above lands here — and its caller
+                        # would otherwise just sit out its full timeout with no
+                        # clue why. Say it out loud instead. (A newer worker
+                        # talking to an older server hits this too, which is
+                        # exactly the same thing worth knowing.)
+                        @warn "Worker control: unhandled reply type — the caller will time out" *
+                              " (add an arm for it in handle_worker_control)" type=t worker_id=worker_id maxlog=5
                     end
                 catch e
                     @warn "Worker control frame error" exception=e
@@ -863,10 +876,12 @@ end
 
 """
     stat_worker_path(state, worker_name, path; timeout=5.0)
-        -> (exists, isfile, isdir, size, path)
+        -> (exists, isfile, isdir, size, mtime, path)
 
 Stat a single `path` on the worker (the editor open-guard asks before fetching).
-Throws if the worker is disconnected or the RPC errors.
+`(size, mtime)` is the file's version stamp — [`fetch_show_file`](@ref) uses it
+as the freshness key for the server mirror. Throws if the worker is disconnected
+or the RPC errors.
 """
 function stat_worker_path(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
@@ -890,6 +905,11 @@ function stat_worker_path(state::ServerState, worker_name::String, path::Abstrac
             isfile = Bool(get(resp, "isfile", false)),
             isdir  = Bool(get(resp, "isdir", false)),
             size   = Int(get(resp, "size", 0)),
+            # A worker predating the mtime field reports 0.0 — that pins the
+            # fingerprint to `size` alone, which is weaker but never WRONG
+            # (a same-size rewrite just isn't detected), and the file-editor's
+            # `refresh = true` path bypasses the fingerprint entirely.
+            mtime  = Float64(get(resp, "mtime", 0.0)),
             path   = String(get(resp, "path", path)))
 end
 
@@ -1338,6 +1358,67 @@ function clone_repo_on_worker(state::ServerState, worker_name::String,
     haskey(resp, "error") &&
         error("clone_repo '$url' on '$worker_name': $(resp["error"])")
     return String(resp["dst_path"])
+end
+
+"""
+    worker_state(state, worker_id; timeout = 15.0) -> Dict
+
+Ask a worker to describe ITSELF: pid, uptime, memory, the agent binary it
+resolves, and its live agent sessions (with whether each agent process is still
+running and whether its ACP socket is up). The other half of the debug chat's
+picture — the server knows what it *asked* the worker to do, this is what the
+worker actually has.
+"""
+function worker_state(state::ServerState, worker_id::AbstractString; timeout::Real = 15.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("worker_state on '$worker_id'", "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict("type" => "worker_state", "request_id" => rid))
+        take_pending!(state, ch, rid, timeout, "worker_state on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("worker_state on '$worker_id': unexpected response shape")
+    haskey(resp, "error") && error(String(resp["error"]))
+    return Dict{String,Any}(resp)
+end
+
+"""
+    git_diff_on_worker(state, worker_id, path; base = "", timeout = 60.0)
+        -> (repo, branch, head, base, patch)
+
+Ask the worker for one unified diff of the git repository containing `path` —
+what the change-review tab shows. `base` empty means the working tree against
+`HEAD` (everything uncommitted, which is what an agent's turn produces);
+otherwise it's the working tree against that ref. Untracked files are included
+as synthetic "new file" sections, so files the agent CREATED are reviewable too.
+
+The patch comes back as raw text and is parsed by [`parse_unified_diff`](@ref)
+here on the server. `timeout` is generous: a first diff of a big repo (cold
+page cache, thousands of files) can take a while.
+"""
+function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
+                            path::AbstractString; base::AbstractString = "",
+                            timeout::Real = 60.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("git_diff on '$worker_id'", "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict(
+            "type" => "git_diff", "request_id" => rid,
+            "path" => String(path), "base" => String(base)))
+        take_pending!(state, ch, rid, timeout, "git_diff on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("git_diff on '$worker_id': unexpected response shape")
+    haskey(resp, "error") && error(String(resp["error"]))
+    return (repo   = String(get(resp, "repo", "")),
+            branch = String(get(resp, "branch", "")),
+            head   = String(get(resp, "head", "")),
+            base   = String(get(resp, "base", "")),
+            patch  = String(get(resp, "patch", "")))
 end
 
 """

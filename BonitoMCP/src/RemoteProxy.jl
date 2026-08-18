@@ -516,15 +516,22 @@ function bound_for_render(s::AbstractString)
 end
 bound_for_render(@nospecialize x) = x
 
-# A returned String renders through Bonito's plain-text child path
-# (`jsrender(::Session, ::String)` returns the string as-is), which never hits
-# the `render_mime` ANSI handling — so a result string carrying ANSI codes
-# (e.g. from `sprint` with color) would show raw escapes while the SAME text on
-# stdout renders as a colored terminal block. Route ANSI strings through
-# `RichText` so both paths display alike.
+# `jsrender(::Session, ::String)` hands the string straight back. That is legal
+# as a node's CHILD but not as an App's ROOT: `session_dom` has methods for `App`
+# and `Node` only, so a bare-text result raised a MethodError there — which
+# Bonito catches and turns into an error page. The SNAPSHOT render (`show_html`)
+# wraps the text and looked right, so the chat displayed the value and then
+# REPLACED it with a stacktrace the moment the live bridge re-rendered it
+# (`update_session_dom!` → `render_subsession` → `session_dom`).
+#
+# Returning a Node is the fix, and `RichText` is the right one: it is already
+# where ANSI strings go, so a result string renders alike with or without escape
+# codes (previously they took different paths and only one of them worked), and
+# its `white-space: pre-wrap` keeps a multi-line result's line breaks. `Symbol`
+# reaches the same raw-text path; `nothing` is handled inside Bonito.
 display_value(@nospecialize x) = x
-display_value(s::AbstractString) =
-    Bonito.has_ansi_codes(String(s)) ? Bonito.RichText(String(s)) : s
+display_value(s::AbstractString) = Bonito.RichText(String(s))
+display_value(s::Symbol) = Bonito.RichText(repr(s))
 # Callables would be swallowed by `App`'s handler constructor (`App(sqrt)`
 # reads as "sqrt IS the app" and rejects its signature) — show them as the
 # REPL would instead. Matches `App`'s handler dispatch surface exactly

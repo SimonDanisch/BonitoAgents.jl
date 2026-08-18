@@ -21,16 +21,29 @@ struct Tool
     description::String
     input_schema::Dict{String,Any}
     handler::Function          # (args::Dict)::Dict (CallToolResult shape)
+    # Runtime visibility gate, consulted on every `tools/list` / `tools/call`.
+    #
+    # It has to be a runtime check rather than "just don't call register!": this
+    # array is built at LOAD time and PRECOMPILED into the pkgimage, so a
+    # registration guarded by an `ENV` test would bake whatever the environment
+    # looked like on the machine that precompiled the package — not the one this
+    # process was spawned with. The dev tools (tools/dev.jl) use this to appear
+    # only in a debug chat.
+    available::Function        # () -> Bool
 end
 
 const TOOLS = Tool[]
 
 function register!(name::AbstractString, description::AbstractString,
-                   input_schema::AbstractDict, handler)
+                   input_schema::AbstractDict, handler;
+                   available::Function = () -> true)
     push!(TOOLS, Tool(String(name), String(description),
-                      Dict{String,Any}(input_schema), handler))
+                      Dict{String,Any}(input_schema), handler, available))
     return nothing
 end
+
+"The tools this process currently offers — the registry minus every gated-off one."
+available_tools() = [t for t in TOOLS if t.available()]
 
 include("server.jl")
 include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)
@@ -38,6 +51,7 @@ include("ctrl_ws.jl")          # control dial-back to BonitoAgents (per-tool int
 include("context.jl")          # the one MCPServer value (SERVER) owning all process state
 include("tools/eval.jl")
 include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
+include("tools/dev.jl")        # bt_dev_* — server introspection; only in a debug chat
 include("apps.jl")             # Apps — the App/Context interface apps implement
 
 # `RemoteProxy.jl` is NOT included here — it references `Bonito.*` types and

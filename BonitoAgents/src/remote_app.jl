@@ -26,6 +26,11 @@ const TAG_CTRL = UInt8('C')
 # worker→browser frames relay onto.
 mutable struct EvalBridge
     prefix::String                       # bridge parent.id == route_to_remote namespace
+    # The owning chat. Nothing reads it today — the registry is keyed by project,
+    # so the key IS this value — but it is what lets a bridge be found by
+    # anything other than that key, which the env_path fix noted in
+    # `handle_eval_ws` needs. Kept deliberately rather than re-derived later.
+    project_id::String
     ws::Any                              # dial-back websocket; swapped on reconnect under wlock
     wlock::ReentrantLock                 # serialize frame sends to the worker AND ws-swap
     asset_host::Bonito.ChildAssetServer
@@ -54,10 +59,10 @@ end
 const PARKED_BYTE_CAP = 64 * 1024 * 1024  # 64 MB per bridge
 
 # Reconnects compare prefix (== BRIDGE[].parent.id on the worker): same prefix
-# means same BRIDGE[] / same routes, swap WS; different prefix means worker
-# restart, hard-replace. `ws === nothing` ⇒ disconnected, awaiting redial.
-make_eval_bridge(prefix::AbstractString, ws, host) = EvalBridge(
-    String(prefix), ws, ReentrantLock(), host,
+# means same BRIDGE[] / same routes, swap WS. `ws === nothing` ⇒ disconnected,
+# awaiting redial.
+make_eval_bridge(prefix::AbstractString, project_id::AbstractString, ws, host) = EvalBridge(
+    String(prefix), String(project_id), ws, ReentrantLock(), host,
     Dict{Int,Channel{Any}}(), ReentrantLock(),
     Threads.Atomic{Int}(0),
     Dict{String,Any}(), Dict{String,String}(), ReentrantLock(), ReentrantLock(),
@@ -375,7 +380,31 @@ function handle_eval_ws(state::ServerState, ws)
     # Existing dial for this project? Decide reconnect vs. replace by comparing
     # `prefix` against `BRIDGE[].parent.id` on the worker side. Same prefix ⇒
     # same `BRIDGE[]` (routes intact) ⇒ swap WS into the existing EvalBridge.
-    # Different prefix ⇒ worker restarted ⇒ stale routes, hard-replace.
+    # Different prefix ⇒ stale routes ⇒ hard-replace.
+    #
+    # ⚠ KNOWN LIMITATION — a different prefix does NOT always mean the worker
+    # restarted. The registry is keyed by PROJECT, but eval SESSIONS are keyed by
+    # `env_path` (BonitoMCP's `JuliaSession` pool), so one chat that evals in two
+    # envs has two live workers dialing this same project_id, and the second
+    # evicts the first here. That is what `test_bt_eval_e2e.jl`'s "env_path
+    # isolation" testset intermittently reports as "(result not live — worker
+    # gone and no snapshot)".
+    #
+    # Keying this registry by `prefix` instead (so both envs keep a bridge) was
+    # tried on 2026-08-17 and REVERTED: it regressed `eval_embed_park` and
+    # `two_tab` into a flood of `Cannot read properties of null (reading
+    # 'parentNode')` rejections in the browser. A genuinely restarted worker's
+    # old bridge then survives, and its host-side wiring keeps relaying to a tab
+    # whose DOM is gone — the retire path below (`clear_bridge_wiring!`) is what
+    # stops that today. Whether prefix-keying actually fixes the env_path testset
+    # was NOT established (the runs meant to show it never executed), so treat
+    # that as an open question, not a known-good design.
+    #
+    # Doing this properly needs the dial handshake to carry `env_path`, so "same
+    # project + same env, new prefix" (a restart ⇒ retire) can be told from
+    # "different env" (⇒ coexist), and the retire path kept for the former.
+    # Until then one bridge per project stands, and the two-env case is the
+    # known cost.
     #
     # The get-and-install is done under `state.lock` so it's atomic w.r.t.
     # `teardown_eval_bridge!` (which mutates state.eval_workers under the same lock) —
@@ -390,7 +419,7 @@ function handle_eval_ws(state::ServerState, ws)
             lock(existing.wlock) do; existing.ws = ws; end
             (existing, existing, nothing)          # fail its orphaned pending below
         else
-            fresh = make_eval_bridge(prefix, ws, Bonito.HTTPAssetServer(state.srv))
+            fresh = make_eval_bridge(prefix, project_id, ws, Bonito.HTTPAssetServer(state.srv))
             state.eval_workers[project_id] = fresh
             @info "eval worker dialed back (ws) — raw bridge installed" project_id prefix
             (fresh, nothing, existing)             # retire the old (different-prefix) bridge below
@@ -399,9 +428,10 @@ function handle_eval_ws(state::ServerState, ws)
     to_fail === nothing ||
         fail_pending!(to_fail, "eval bridge reconnected; in-flight request dropped")
     if to_retire !== nothing
-        @info "eval worker replaced (new prefix; worker restarted?)" project_id old_prefix = to_retire.prefix new_prefix = prefix
-        # Old bridge is a dead worker process — fail orphans, drop its asset host,
-        # and clear its host-side wiring so the fresh bridge re-attaches cleanly.
+        @info "eval bridge displaced by a new dial on the same project (worker restart, OR a second env_path — see the note above)" project_id old_prefix = to_retire.prefix new_prefix = prefix
+        # Old bridge is (usually) a dead worker process — fail orphans, drop its
+        # asset host, and clear its host-side wiring so the fresh bridge
+        # re-attaches cleanly and the old one stops relaying to this tab.
         fail_pending!(to_retire, "eval bridge replaced by a new worker; in-flight request dropped")
         try
             close(to_retire.asset_host)
@@ -477,8 +507,8 @@ end
 # requests, drops host-side wiring, and evicts from state.eval_workers. Idempotent.
 function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
     eb = lock(state.lock) do
-        e = get(state.eval_workers, project_id, nothing)
-        e === nothing || delete!(state.eval_workers, project_id)
+        e = get(state.eval_workers, String(project_id), nothing)
+        e === nothing || delete!(state.eval_workers, String(project_id))
         e
     end
     eb === nothing && return nothing
@@ -541,6 +571,13 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
                     # matching running eval's tail. High-volume, so handled first.
                     route_eval_chunk!(state, project_id,
                         String(get(d, "route", "")), String(get(d, "chunk", "")))
+                elseif get(d, "type", "") == "dev_request"
+                    # The other direction: a debug chat's `bt_dev_*` tool asking
+                    # the server about itself (dev_api.jl). Answered on its own
+                    # task — a `memory` call with `deep=true` walks the object
+                    # graph for seconds and must not stall this read loop (which
+                    # also carries eval stdout and interrupt replies).
+                    @async handle_dev_request(state, ws, d)
                 else
                     rid = get(d, "request_id", nothing)
                     rid isa AbstractString && !isempty(rid) &&
@@ -562,6 +599,35 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
         @info "MCP control channel closed" project_id
     end
     return
+end
+
+"""
+    handle_dev_request(state, ws, frame)
+
+Answer a `{type:"dev_request", dev_id, op, args}` frame from a debug chat's MCP
+process (see `dev_api.jl` for the ops). ALWAYS replies — an op that throws comes
+back as `ok:false` with the message, because the tool on the other side is
+waiting on a channel and a dropped reply would hang it until its timeout.
+"""
+function handle_dev_request(state::ServerState, ws, frame::AbstractDict)
+    id = get(frame, "dev_id", nothing)
+    reply = try
+        args = get(frame, "args", Dict{String,Any}())
+        result = dev_request(state, String(get(frame, "op", "")),
+                             args isa AbstractDict ? args : Dict{String,Any}())
+        Dict{String,Any}("op" => "dev_reply", "dev_id" => id, "ok" => true, "result" => result)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "dev request failed" op = get(frame, "op", "") exception = (e, catch_backtrace())
+        Dict{String,Any}("op" => "dev_reply", "dev_id" => id, "ok" => false,
+                         "error" => sprint(showerror, e))
+    end
+    try
+        HTTP.WebSockets.send(ws, JSON.json(reply))
+    catch e
+        @warn "dev reply send failed" exception = e
+    end
+    return nothing
 end
 
 # Sink registry key: one live eval tail per (chat, eval session). `route` is the
@@ -631,10 +697,17 @@ end
 # dial-backs (worker-control WS + eval WS) keyed off the same proven URL
 # and avoids the server having to guess its own outward-facing address.
 function eval_dialback_env(state::ServerState, project_id::AbstractString)
-    return Dict{String,String}(
+    env = Dict{String,String}(
         "BONITOAGENTS_SECRET"     => state.worker_secret,
         "BONITOAGENTS_PROJECT_ID" => String(project_id),
     )
+    # The ONE thing that turns on the `bt_dev_*` server-introspection tools in
+    # that chat's MCP process. Keyed on the project's persisted `dev_mode` flag,
+    # so a normal chat can never see them — not even one whose cwd happens to be
+    # the BonitoAgents checkout.
+    p = get(state.projects[], String(project_id), nothing)
+    p !== nothing && p.dev_mode && (env["BONITOAGENTS_DEV_TOOLS"] = "1")
+    return env
 end
 
 # ── Host-side page-root wiring (per stable browser tab root session) ─────────
@@ -796,6 +869,9 @@ function result_descriptor(payload::AbstractString)
     d isa AbstractDict || return nothing
     ref = get(d, "remote_ref", nothing)
     ref isa AbstractString || return nothing
+    # (The descriptor also carries `repr`, the worker's own rendering. It is NOT
+    # decoded here — see the note in `remote_result` for why the static snapshot
+    # stays empty.)
     return (ref = String(ref), errored = get(d, "errored", false) === true)
 end
 
@@ -828,5 +904,23 @@ end
 function remote_result(state::ServerState, payload::AbstractString, project_id::AbstractString)
     desc = result_descriptor(payload)
     desc === nothing && return RemoteRef(nothing, "", String(payload))
+    # NB the holder id carries no worker identity — `RemoteProxy.remote_ref`
+    # returns `Bonito.Session(parent).id`, and Bonito mints child ids as bare
+    # uuids — so there is nothing here to bind the ref to the worker that minted
+    # it. With one bridge per project that is fine; see the two-env limitation
+    # noted at `handle_eval_ws`.
+    #
+    # The snapshot is deliberately EMPTY here, even though the descriptor
+    # carries the worker's `repr` and the "Static-first" note above describes
+    # showing it. Passing it through was tried on 2026-08-17 and backed out: for
+    # a display type `repr` is `RemoteProxy.summary_html`, i.e. the app's real
+    # markup — so the static placeholder would carry the very classes that
+    # `test_bt_eval_e2e.jl`'s "renders as a LIVE Bonito fragment" testset uses to
+    # tell a live mount from a text fallback ("A text-fallback repr would NOT
+    # carry that class"). Wiring the fallback up is a real improvement — a slow
+    # mount currently shows "(result not live)" where the value belongs — but it
+    # has to come WITH a liveness assertion a static snapshot cannot satisfy
+    # (the interactive-counter testset below is the shape that works), or it
+    # silently guts that coverage.
     return RemoteRef(eval_bridge_for(state, project_id), desc.ref, "")
 end
