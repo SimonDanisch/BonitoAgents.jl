@@ -388,6 +388,86 @@ function run_suite(server)
                 })()"""; timeout = 40) == true
         end
 
+        @testset "the editor follows its panel when the panel changes size" begin
+            # Monaco's own `automaticLayout` is OFF here, because it is a
+            # ResizeObserver that calls `layout()` from inside its own delivery
+            # cycle — which made this suite fail on "ResizeObserver loop
+            # completed with undelivered notifications" every time a workspace
+            # split resized a file panel (the `no JS errors` gate below is what
+            # caught it). The replacement lays out on the next frame instead, so
+            # what needs pinning is that it still lays out AT ALL: drop the
+            # observer and the editor silently keeps the width it mounted with,
+            # which no other assertion here would notice.
+            #
+            # The width is forced with an inline style rather than by dragging
+            # the split gutter: the gutter relies on pointer capture, which
+            # `sendInputEvent` does not honour (see COVERAGE.md). The observer
+            # cannot tell the two apart — it sees a box that changed.
+            TK.eval_js(server, open_file("notes.md"))
+            @test TK.wait_for(server, "editor ready", """(() => {
+                const v = document.querySelector('$(view_sel("notes.md"))');
+                v?.querySelector('[data-fv-view="source"]')?.click();
+                return !!v?.querySelector('.monaco-editor-div')?.__btEditor;
+            })()"""; timeout = 40) == true
+
+            # Wait for the panel to be VISIBLE, not merely present. An inactive
+            # workspace tab measures 0×0, which makes the shrink below compute a
+            # NEGATIVE width — invalid CSS, silently ignored, nothing resizes,
+            # and the assertion reads as "the relayout is broken". `__btEditor`
+            # exists while hidden, so the editor-ready wait above does not cover
+            # this.
+            @test TK.wait_for(server, "notes.md panel is the visible one",
+                """(document.querySelector('$(panel_sel("notes.md"))')
+                    ?.getBoundingClientRect().width || 0) > 200"""; timeout = 20) == true
+
+            ed_width = """document.querySelector('$(view_sel("notes.md")) .monaco-editor-div')
+                .__btEditor.getLayoutInfo().width"""
+            before = TK.eval_js(server, ed_width)
+            # Stash the panel's OWN inline width and put that exact string back
+            # afterwards. Clearing it instead (`style.width = ''`) removes what
+            # the Workspace wrote there for its split sizing, so the panel never
+            # returns to the width it had and the shared window stays perturbed
+            # for every later item.
+            TK.eval_js(server, """(() => {
+                const p = document.querySelector('$(panel_sel("notes.md"))');
+                p.dataset.btPrevWidth = p.style.width;
+                p.style.width = (p.getBoundingClientRect().width - 160) + 'px';
+                return true; })()""")
+            @test TK.wait_for(server, "monaco re-laid out to the narrower panel",
+                "$(ed_width) < $(before) - 100"; timeout = 10) == true
+            narrow_w = TK.eval_js(server, ed_width)
+
+            # Give the width back and check it grows again: a one-directional
+            # fix (only ever shrinking) would pass the assertion above.
+            TK.eval_js(server, """(() => {
+                const p = document.querySelector('$(panel_sel("notes.md"))');
+                p.style.width = p.dataset.btPrevWidth || '';
+                delete p.dataset.btPrevWidth;
+                return true; })()""")
+            # Measured against the NARROW width, not against `before`. The panel's
+            # absolute width is not reproducible across a shared-server run — by
+            # the time this item runs, other panels and a wrapped tab strip have
+            # moved it, and it came back 15px short of `before` in a full soak
+            # while having grown back perfectly well. What is under test is that
+            # the relayout follows the panel UP as well as down.
+            #
+            # Polled rather than through `wait_for`, which raises on timeout and
+            # reports only its label: the width we actually reached is what says
+            # whether the RELAYOUT failed or the PANEL did.
+            restored_w = narrow_w
+            restored_ok = false
+            for _ in 1:50
+                restored_w = TK.eval_js(server, ed_width)
+                if restored_w > narrow_w + 100
+                    restored_ok = true
+                    break
+                end
+                sleep(0.2)
+            end
+            restored_ok || @info "editor never regained its width" before narrow_w restored_w
+            @test restored_ok
+        end
+
         @testset "no JS errors" begin
             @test isempty(TK.js_errors(server))
         end

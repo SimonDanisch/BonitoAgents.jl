@@ -3022,6 +3022,15 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
         language = detect_language(isempty(fe.worker_path) ? fe.server_path : fe.worker_path),
         readOnly = false,
         lineNumbers = "on",
+        # OFF, and replaced by a deferred observer in js_init_func below. Monaco
+        # implements `automaticLayout` with a ResizeObserver whose callback calls
+        # `layout()` — work done inside the delivery cycle on the very element
+        # being observed. `e2e:file_view` failed on it deterministically ("
+        # ResizeObserver loop completed with undelivered notifications", twice)
+        # once a workspace split resized a file panel. The read-only editors
+        # (`monaco_readonly` + MONACO_RESIZE_INIT) have been off it for the same
+        # reason; this editable one was the last holdout.
+        automaticLayout = false,
         minimap = Dict(:enabled => false),
         scrollbar = Dict(:vertical => "auto", :horizontal => "auto"),
         mouseWheelScrollSensitivity = 1,
@@ -3036,6 +3045,40 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
             me.editor.then(ed => {
                 me.editor_div.__btEditor = ed;
                 ed.__btOriginal = ed.getValue();
+                // What `automaticLayout` was doing, minus the loop: lay out on
+                // the NEXT frame so the work happens outside the observer's
+                // delivery cycle. The editor fills its panel (the height chain
+                // in styles.jl), so a bare `layout()` — which measures the
+                // container — is the right call; sizing it explicitly is what
+                // MONACO_RESIZE_INIT does instead, because those editors are
+                // sized to CONTENT height. Dropping the observer entirely was
+                // not an option: the editor would stop following its panel
+                // across a split drag or a window resize.
+                const host = me.editor_div;
+                let lw = -1, lh = -1, pending = false;
+                const relayout = () => {
+                    const w = host.clientWidth, h = host.clientHeight;
+                    if (w === lw && h === lh) return;
+                    lw = w; lh = h;
+                    ed.layout();
+                };
+                const ro = new ResizeObserver(() => {
+                    if (pending) return;
+                    pending = true;
+                    requestAnimationFrame(() => { pending = false; relayout(); });
+                });
+                ro.observe(host);
+                // Tear down when the editor leaves the DOM, scoped to the
+                // PARENT's direct children rather than a document-wide subtree
+                // observer — see MONACO_RESIZE_INIT for why that distinction
+                // matters on a page full of editors.
+                const parent = host.parentElement;
+                if (parent) {
+                    const mo = new MutationObserver(() => {
+                        if (!host.isConnected) { ro.disconnect(); mo.disconnect(); }
+                    });
+                    mo.observe(parent, { childList: true });
+                }
                 // Report only when the clean/dirty state FLIPS, not per keystroke:
                 // the tab marker is the only warning before a close discards the
                 // buffer, and it costs one round-trip per burst rather than per

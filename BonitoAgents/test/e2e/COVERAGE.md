@@ -16,10 +16,18 @@ one landed, plus the few that can't be reproduced in a headless window.
 - ONE dev server + browser + mock agent for ALL suites (a soak; state accumulates
   by design). Each `run_suite(server)` swaps the shared agent callback and drives
   the one DOM page.
-- **No-JS-errors gate**: after every suite the runner samples the error sink
-  (`window.onerror` + `unhandledrejection`, installed in `open_browser`) and
-  asserts it empty, attributed to that suite, then clears it. Driving the real DOM
-  is only worth it if we also notice when the DOM throws.
+- **No-JS-errors gate**: a suite samples the error sink (`window.onerror` +
+  `unhandledrejection`, installed in `open_browser`) and asserts it empty.
+  Driving the real DOM is only worth it if we also notice when the DOM throws.
+  ⚠ **It is NOT attributed, and NOT cleared between items.** The old `run_all.jl`
+  cleared after every suite; under ReTestItems nothing does, and only a handful
+  of items call `clear_js_errors` themselves (`overview`, `chat_controls`,
+  `layout_fixes`, `subagent_feed`, `resume_no_jserrors`). So on the shared
+  server `isempty(js_errors(s))` means "nothing threw since the last item that
+  happened to clear", not "this item was clean" — a failure can have been
+  produced by any item since. Before reading a red gate as "this suite broke
+  it", re-run that item ALONE; that is what separated a pre-existing Monaco
+  resize loop from an unrelated diff here.
 - **Un-hangable**: every bridge round-trip (`eval_js`, `js_errors`,
   `clear_js_errors`) is watchdog-bounded and throws a typed `BridgeTimeout`;
   `wait_for` treats a busy poll as "not yet" and retries within its own budget. A
@@ -154,7 +162,7 @@ it, so it covers the working path; the inactive-close fix is still open.
 | `app_tabs.jl`         | THREE apps docked into ONE window as TABS (via the float's ⤢ dock button): switch between tabs (active app visible, others hidden), each stays LIVE as a tab (Julia round-trip), then close the tabs (active-tab close → embed back to its bubble). KNOWN BUG (see below): closing an INACTIVE app tab loses the embed — the suite always activates a tab before closing it (the working + natural path) |
 | `scroll_persist.jl`   | new content follows to bottom (followMode), overflow, history survives a browser reconnect |
 | `file_tree.jl`        | per-chat sidebar file tree: ▸ toggle reveals + lazy-loads the worker project root (dirs first), expanding a dir lazy-loads children, the search box fuzzy-filters the project file index (`.git/` excluded), clicking a file opens a Monaco panel, clicking a BINARY file opens a hex view; the open-guard toasts (and opens NO panel) only for what no viewer can show (oversize / folder / missing / unreachable worker) |
-| `file_view.jl`        | the rich file viewer: png (image stage + reported pixel size, no editor), md (rendered by default, Source toggle holding the real text, Save writes the WORKER file and the preview follows), csv (sortable table of the right shape), obj (server-side parse → BTMESH1 blob → WebGL viewer reporting the decoded triangle/vertex counts, in singular for one triangle), .bin (hex dump, never Monaco), mp4 (video stage, centred, a 1600px-tall clip FITTED so its controls stay on screen) and a tall png held to the same rule, pdf (the frame is pointed at its file from inside the document — see Headless limitations); every panel header names the WORKER path, and renders it in reading order rather than letting `direction: rtl` move the leading `/` to the end |
+| `file_view.jl`        | the rich file viewer: png (image stage + reported pixel size, no editor), md (rendered by default, Source toggle holding the real text, Save writes the WORKER file and the preview follows), csv (sortable table of the right shape), obj (server-side parse → BTMESH1 blob → WebGL viewer reporting the decoded triangle/vertex counts, in singular for one triangle), .bin (hex dump, never Monaco), mp4 (video stage, centred, a 1600px-tall clip FITTED so its controls stay on screen) and a tall png held to the same rule, pdf (the frame is pointed at its file from inside the document — see Headless limitations); every panel header names the WORKER path, and renders it in reading order rather than letting `direction: rtl` move the leading `/` to the end; and the editor re-lays-out when its panel changes width (Monaco's own `automaticLayout` is off — it calls `layout()` from inside its ResizeObserver's delivery cycle, which is what made this suite's no-JS-errors gate fail on "ResizeObserver loop completed with undelivered notifications"; the replacement defers to the next frame, and the test pins that it still follows the panel in BOTH directions) |
 | `review.jl`           | change-review tab: the Review button opens the project's git diff incl. UNTRACKED files (marked added) with both sides' line numbers; Ask sends the question to the chat immediately with its code context; Feedback batches into the tray (counted on the Send button), sends ONE numbered instruction and only then clears; shift-click covers a BLOCK and the range + every line in it reach the agent; chips drop; ⟳ re-reads the tree; ⤢ opens the file itself |
 | `review_scope.jl`     | the review diff is SCOPED to the project's folder: a package inside a bigger checkout lists its own change and its own untracked file, NOT a sibling's; rows drop the shared prefix while `data-file` stays relative to the PROJECT (the agent's cwd — a root-relative path would send it to `pkg/pkg/…`); the header names the folder, not the repository above it. Its own dev_server AND its own single chat: two review panels in one window cannot be told apart by `querySelector` (answers about the first) nor by "which is visible" (an inactive panel still has an `offsetParent`) |
 | `debug_chat.jl`       | "Debug BonitoAgents": the dashboard button opens the chat AND navigates to it, rooted at this server's own checkout; the same button in a chat header goes to the same place; pressing it again reuses the one chat |
