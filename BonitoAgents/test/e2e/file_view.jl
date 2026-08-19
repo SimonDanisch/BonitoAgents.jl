@@ -74,6 +74,47 @@ open_file(path) = """(() => { document.querySelector('.bt-messages').__bt_chat.c
 panel_sel(path) = ".bw-ws-panel[data-panel-id=\"file:$(isabspath(path) ? path : joinpath(VIEW_CWD, path))\"]"
 view_sel(path)  = "$(panel_sel(path)) .bt-file-view"
 
+# Poll the mesh viewer's status line and, when it never says what we expect,
+# report what it DOES say. `mount` (assets/meshview.js) writes its own failures
+# there — "3D viewer failed: <err>", "WebGL is not available in this window" —
+# so the text separates a slow decode from a dead GL context. A bare `wait_for`
+# timeout says only "timed out", which is the same message for both and sends
+# you looking in the wrong place.
+function mesh_status_reaches(server, path, pred; timeout = 40)
+    sel = "$(view_sel(path)) .bt-mesh-status"
+    deadline = time() + timeout
+    text = ""
+    stalls = 0
+    while time() < deadline
+        # A stalled bridge is "not yet", not a failure — the same rule
+        # `wait_for` applies, and it matters here: this suite mounts a PDF
+        # plugin, a video and two WebGL contexts, and the renderer intermittently
+        # stops answering for tens of seconds (measured at ~1 run in 3, and it
+        # predates this helper). Aborting on the first stall would make a
+        # renderer problem read as a broken MESH. Counted rather than swallowed,
+        # so the report below says which of the two it was.
+        # The default budget rather than a tight one, for the same reason
+        # `wait_for` uses it: a short timeout abandons a request that is still
+        # in flight, and there is no upside to racing the bridge when we are
+        # going to poll again in 250ms anyway.
+        v = try
+            TK.eval_js(server, "document.querySelector('$(sel)')?.textContent || ''")
+        catch e
+            e isa TK.BridgeTimeout || rethrow()
+            stalls += 1
+            nothing
+        end
+        if v !== nothing
+            text = String(v)
+            pred(text) && return true
+        end
+        sleep(0.25)
+    end
+    @info "mesh status never matched" path status_text = text bridge_stalls = stalls
+    return false
+end
+
+
 function run_suite(server)
     server.agent_fn[] = _ -> [TK.text("ready"), TK.end_turn()]
 
@@ -190,12 +231,44 @@ function run_suite(server)
             # The status line is written by the JS AFTER it fetched and decoded the
             # BTMESH1 blob — so this asserts the whole server-parse → blob →
             # browser-decode path, with the exact triangle count of the fixture.
-            @test TK.wait_for(server, "viewer reports 2 triangles / 4 vertices",
-                """(() => {
-                    const s = document.querySelector('$(view_sel("square.obj")) .bt-mesh-status');
-                    const t = s?.textContent || '';
-                    return t.includes('2 triangles') && t.includes('4 vertices');
-                })()"""; timeout = 40) == true
+            @test mesh_status_reaches(server, "square.obj",
+                t -> occursin("2 triangles", t) && occursin("4 vertices", t))
+        end
+
+        @testset "the 3D viewer survives losing its graphics context" begin
+            # Chromium's GPU process exits under load ("GPU process exited
+            # unexpectedly: exit_code=512"), taking every live WebGL context
+            # with it. That was reaching the user as a permanently dead viewer
+            # reading "shader compile failed:" with an EMPTY log — the viewer
+            # implemented no part of the context-loss protocol, so nothing ever
+            # asked for the context back and nothing rebuilt the GL objects.
+            #
+            # `WEBGL_lose_context` is the standard way to drive exactly this
+            # condition on purpose; forcing it here is the same kind of move as
+            # the synthetic ClipboardEvent in chat_attach.
+            # Grab the extension ONCE and hang it on the canvas. Two traps here,
+            # both hit on the way: an extension object cannot be returned through
+            # the bridge (it is not JSON), and re-querying it after the loss
+            # gives `null`, so `restoreContext()` would run on nothing. Always
+            # return a boolean, and keep the handle across the loss.
+            @test TK.eval_js(server, """(() => {
+                const c = document.querySelector('$(view_sel("square.obj")) canvas.bt-mesh-canvas');
+                const gl = c && c.getContext('webgl');
+                c.__btLoseExt = gl && gl.getExtension('WEBGL_lose_context');
+                return !!c.__btLoseExt;
+            })()""") === true
+
+            lose_ext = "document.querySelector('$(view_sel("square.obj")) canvas.bt-mesh-canvas').__btLoseExt"
+            TK.eval_js(server, "$(lose_ext).loseContext(); true")
+            @test TK.wait_for(server, "the viewer says the context went away",
+                """(document.querySelector('$(view_sel("square.obj")) .bt-mesh-status')
+                    ?.textContent || '').includes('context lost')"""; timeout = 15) == true
+
+            TK.eval_js(server, "$(lose_ext).restoreContext(); true")
+            # And it rebuilds itself: the geometry line comes back on its own,
+            # without reopening the tab. Before the fix this stayed dead.
+            @test mesh_status_reaches(server, "square.obj",
+                t -> occursin("2 triangles", t) && occursin("4 vertices", t))
         end
 
         @testset "opaque bytes get a hex dump, never Monaco" begin
@@ -309,13 +382,9 @@ function run_suite(server)
 
         @testset "the geometry viewer counts in singular" begin
             TK.eval_js(server, open_file("one.obj"))
-            @test TK.wait_for(server, "a one-triangle file reads '1 triangle'",
-                """(() => {
-                    const s = document.querySelector('$(view_sel("one.obj")) .bt-mesh-status');
-                    const t = s?.textContent || '';
-                    return t.includes('1 triangle ') && !t.includes('1 triangles')
-                        && t.includes('3 vertices');
-                })()"""; timeout = 40) == true
+            @test mesh_status_reaches(server, "one.obj",
+                t -> occursin("1 triangle ", t) && !occursin("1 triangles", t) &&
+                     occursin("3 vertices", t))
         end
 
         @testset "the same file opened both ways is ONE tab" begin

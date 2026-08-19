@@ -121,6 +121,77 @@ mounted (cost ≈ mounted × streamed — a client-side cross-chat accumulation,
 deadlock and not server-side). Running the flood early isolates its real target
 (the `deliver_update!` deadlock regression) from this separate, still-open bug.
 
+## A failed page load used to desync the Electron command stream (FIXED)
+
+Symptom, seen twice in `e2e:file_view` before it was understood: an
+`AssertionError: Invalid response format from Electron` in one testset, and then
+a later assertion failing against a value from a completely different query —
+`@test isempty(TK.js_errors(server))` evaluating as `isempty(1066)`, where 1066
+was a Monaco layout width.
+
+Cause: `connection` is a strict request/response stream (`req_response_js` writes
+one command and reads one line, under `app.comm_lock`), but ElectronCall's
+`did-fail-load` was a plain `.on` handler that wrote an `{error: …}` line onto
+that stream every time a load failed — unprompted, for the life of the window.
+That line is read as the reply to whatever command is in flight; it has no
+"status" key, so the caller dies on the assert, and **from that moment the stream
+is off by one**: every later request receives the previous request's answer, for
+the rest of the session. Aborted loads are ordinary (a swapped iframe src, a
+cancelled navigation), which is why this surfaced in the one suite that mounts a
+PDF frame, a video and swapped `src`s — and why it looked like random nonsense.
+
+Fixed in `ElectronCall/src/main.js`: the window-creation command is answered
+exactly once, by whichever load event lands first; every later `did-fail-load`
+goes to the notification socket. Pinned by "A failed load must not desync the
+command stream" in ElectronCall's own `test/runtests.jl`, which reproduces it
+deterministically with an iframe on a blocked port (ERR_UNSAFE_PORT, no network
+needed) and then checks five distinguishable answers come back to their own
+calls. Against the unfixed file that test yields
+`["AssertionError: Invalid response format …", 100, 200, 300, 400]` — the
+off-by-one, exactly.
+
+Worth remembering as a debugging shape: **an assertion failing against a value
+that cannot possibly come from its own query is not noise.** Four plausible
+mechanisms were proposed and disproved before the real one (abandoned request
+under timeout, a competing reader, JSON newline escaping, a tight polling loop);
+what found it was reading every writer of the socket, not more theorising.
+
+## The SECOND WebGL context in a window is dead on arrival
+
+Open two `.obj` files at once and the second tab's viewer shows
+`3D viewer failed: vertex shader compile failed:` — an empty info log, and
+`gl.isContextLost()` is FALSE. The first panel's viewer, with the identical
+`VERT_SRC` constant, compiled fine seconds earlier in the same window. Same
+source, live context, no log: the context was handed out but cannot compile,
+which is what a browser at its per-page WebGL budget does rather than formally
+losing the context.
+
+How far it reaches is NOT established. Chromium allows ~16 contexts per page,
+so two should be nowhere near the budget — but this suite runs on Xvfb software
+GL, where the ceiling can be far lower, and nobody has yet opened two `.obj`
+tabs on a machine with a real GPU. So treat "every user with two 3D tabs" as
+unproven and "headless/software GL" as measured. Either way the viewer taking a
+fresh context per panel is what makes it fragile; the fix is to share one, or
+to drop the context of panels that are not visible and re-acquire on show —
+a design call, NOT yet made.
+
+Measured 2026-08-19 on a quiet box: `e2e:file_view` hits it on `one.obj` (the
+second `.obj` the suite opens), and it predates the diff that found it — a
+control run with the working tree stashed hit the same assertion.
+
+It took three layers off to see this, all of which are now gone:
+`wait_for` reports a plain timeout for a dead viewer and a slow decode alike;
+the failure lands on whichever assertion happens to be polling, so it moved
+between the two `.obj` cases and read as "the mesh viewer is flaky"; and
+`meshview.js` had been writing the real reason into `.bt-mesh-status` the whole
+time with nobody reading it. `mesh_status_reaches` in `file_view.jl` now prints
+that status line on failure (and tolerates a stalled bridge the way `wait_for`
+does, but COUNTS the stalls instead of swallowing them), and `compile()` names
+the shader and whether the context was lost — an empty log alone reads as a
+GLSL bug and sends you into the wrong file.
+
+
+
 `e2e:bt_eval` is INTERMITTENTLY red (roughly every other full run as of
 2026-08-17), always on the same rendering — a tool body reading
 "(result not live — worker gone and no snapshot)" where the value belongs. It

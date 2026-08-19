@@ -41,9 +41,12 @@ void main() {
 // NOT enough, the shader has to opt in with an `#extension` directive — and that
 // directive must be the FIRST line. Without this the shader fails to COMPILE,
 // which is a very quiet way for a viewer to show nothing at all.
-const fragSource = (hasDerivatives) => `
-${hasDerivatives ? "#extension GL_OES_standard_derivatives : enable" : ""}
-precision mediump float;
+// (The template opens on the SAME line as the directive on purpose: leading
+// blank lines are legal whitespace per the spec, but the invariant above says
+// "first line", and code that quietly contradicts its own comment is how the
+// next person loses an afternoon.)
+const fragSource = (hasDerivatives) =>
+`${hasDerivatives ? "#extension GL_OES_standard_derivatives : enable\n" : ""}precision mediump float;
 varying vec3 vNormal;
 varying vec3 vViewPos;
 uniform vec3 uColor;
@@ -72,8 +75,27 @@ function compile(gl, type, src) {
     gl.compileShader(sh);
     if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
         const log = gl.getShaderInfoLog(sh);
+        // A LOST context also reports every compile as failed, with an EMPTY
+        // log — which reads exactly like a broken shader and sends you into the
+        // GLSL instead of into context management. Say which one it is: "failed
+        // (context lost)" is a different bug from "failed: 'dFdx' undeclared".
+        const which = type === gl.VERTEX_SHADER ? "vertex" : "fragment";
         gl.deleteShader(sh);
-        throw new Error("shader compile failed: " + log);
+        // Report the GL STATE, not just "it failed". A compile that fails with
+        // an empty info log tells you nothing on its own, and every guess about
+        // why (context lost? too many contexts? zero-sized canvas?) is testable
+        // only from these values. Name the shader too — the vertex one compiles
+        // first, so "the fragment shader is broken" would be an assumption.
+        const cv = gl.canvas;
+        const state = [
+            "lost=" + gl.isContextLost(),
+            "err=" + gl.getError(),
+            "canvas=" + (cv ? cv.width + "x" + cv.height : "none"),
+            "buffer=" + gl.drawingBufferWidth + "x" + gl.drawingBufferHeight,
+            "connected=" + !!(cv && cv.isConnected),
+            "renderer=" + (gl.getParameter(gl.RENDERER) || "?"),
+        ].join(" ");
+        throw new Error(which + " shader compile failed [" + state + "]: " + log);
     }
     return sh;
 }
@@ -202,6 +224,43 @@ function boundingSphere(positions) {
  */
 export async function mount(root, url) {
     const status = root.querySelector(".bt-mesh-status");
+
+    // The WebGL context-loss protocol, which this viewer did not implement at
+    // all. Chromium's GPU process can exit under load ("GPU process exited
+    // unexpectedly: exit_code=512" in the browser log) and take every live
+    // context with it. What that looks like from in here is NOT an obvious
+    // failure: `isContextLost()` still reads false (the loss is delivered
+    // asynchronously, after the call that already failed), `getError()` is 0,
+    // and shader compilation fails with an EMPTY info log — which reads exactly
+    // like a broken shader and sends you into the GLSL.
+    //
+    // Two halves, and BOTH are required: the browser only restores a context if
+    // `webglcontextlost` is preventDefault()ed, and only a `webglcontextrestored`
+    // handler can rebuild the GL objects (programs, buffers) that died with it.
+    // Without the pair, one GPU hiccup leaves a permanently dead viewer.
+    const canvas = root.querySelector("canvas.bt-mesh-canvas");
+    if (canvas && !canvas.__btLossWired) {
+        canvas.__btLossWired = true;
+        canvas.addEventListener("webglcontextlost", (e) => {
+            e.preventDefault();          // without this there is no restore
+            if (status) status.textContent = "3D viewer: graphics context lost, waiting for it to come back…";
+            console.warn("bt-mesh: webglcontextlost");
+        });
+        canvas.addEventListener("webglcontextrestored", () => {
+            console.warn("bt-mesh: webglcontextrestored — rebuilding the viewer");
+            // Re-runs the whole GL setup against the restored context. Also
+            // covers the case where the FIRST mount failed because the GPU was
+            // already down: the listeners outlive that failure, so the viewer
+            // repairs itself when the process comes back instead of staying
+            // dead until the tab is reopened.
+            mountViewer(root, url, status).catch(err2 => {
+                if (status) status.textContent = "3D viewer failed after restore: " +
+                    (err2 && err2.message || err2);
+                console.error("bt-mesh: remount after restore failed", err2);
+            });
+        });
+    }
+
     try {
         return await mountViewer(root, url, status);
     } catch (err) {

@@ -16,9 +16,7 @@ void main() {
     vViewPos = mv.xyz;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }`;
-const fragSource = (hasDerivatives)=>`
-${hasDerivatives ? "#extension GL_OES_standard_derivatives : enable" : ""}
-precision mediump float;
+const fragSource = (hasDerivatives)=>`${hasDerivatives ? "#extension GL_OES_standard_derivatives : enable\n" : ""}precision mediump float;
 varying vec3 vNormal;
 varying vec3 vViewPos;
 uniform vec3 uColor;
@@ -45,8 +43,18 @@ function compile(gl, type, src) {
     gl.compileShader(sh);
     if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
         const log = gl.getShaderInfoLog(sh);
+        const which = type === gl.VERTEX_SHADER ? "vertex" : "fragment";
         gl.deleteShader(sh);
-        throw new Error("shader compile failed: " + log);
+        const cv = gl.canvas;
+        const state = [
+            "lost=" + gl.isContextLost(),
+            "err=" + gl.getError(),
+            "canvas=" + (cv ? cv.width + "x" + cv.height : "none"),
+            "buffer=" + gl.drawingBufferWidth + "x" + gl.drawingBufferHeight,
+            "connected=" + !!(cv && cv.isConnected),
+            "renderer=" + (gl.getParameter(gl.RENDERER) || "?")
+        ].join(" ");
+        throw new Error(which + " shader compile failed [" + state + "]: " + log);
     }
     return sh;
 }
@@ -252,6 +260,22 @@ function boundingSphere(positions) {
 }
 async function mount(root, url) {
     const status = root.querySelector(".bt-mesh-status");
+    const canvas = root.querySelector("canvas.bt-mesh-canvas");
+    if (canvas && !canvas.__btLossWired) {
+        canvas.__btLossWired = true;
+        canvas.addEventListener("webglcontextlost", (e)=>{
+            e.preventDefault();
+            if (status) status.textContent = "3D viewer: graphics context lost, waiting for it to come back…";
+            console.warn("bt-mesh: webglcontextlost");
+        });
+        canvas.addEventListener("webglcontextrestored", ()=>{
+            console.warn("bt-mesh: webglcontextrestored — rebuilding the viewer");
+            mountViewer(root, url, status).catch((err2)=>{
+                if (status) status.textContent = "3D viewer failed after restore: " + (err2 && err2.message || err2);
+                console.error("bt-mesh: remount after restore failed", err2);
+            });
+        });
+    }
     try {
         return await mountViewer(root, url, status);
     } catch (err) {
