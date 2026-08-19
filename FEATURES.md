@@ -71,6 +71,10 @@ enumerates.
   live line counts, monitored until their writer exits, with per-task stop.
 - Inline **images and videos** with hover copy/download and a click
   **lightbox**; code blocks with hover copy/download.
+- **Image attachments** on the way in: paste, drag-drop, or the composer's
+  attach button, which on a phone opens the camera/gallery sheet. Queued
+  images show as removable thumbnails and render inline in your own message
+  (up to 10 per message, 5 MB each).
 - **Virtualized transcript**: only the visible window is in the DOM, history
   backfills lazily in the background (paused for hidden panes), and the reading
   position is content-anchored, so geometry churn, tab switches and reconnects

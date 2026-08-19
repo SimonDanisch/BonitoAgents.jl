@@ -393,6 +393,12 @@ mutable struct TestServer
     # tests (no GUI) don't pay the Electron cost.
     browser::Ref{Any}                  # ElectronCall.Testing.TestContext | nothing
     closed::Ref{Bool}
+    # Default window size for `open_browser`, from `dev_server`'s
+    # browser_width/browser_height. Held here rather than dropped on the floor:
+    # they used to be accepted and then ignored, so a test asking for a phone
+    # viewport got 1280px and every layout assertion in it passed for the wrong
+    # reason.
+    browser_size::Tuple{Int,Int}
 end
 
 # The dispatcher's TCP server starts BEFORE `dev_server` returns so the
@@ -513,7 +519,8 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server bring-up)")
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
-                       Ref{Any}(nothing), Ref(false))
+                       Ref{Any}(nothing), Ref(false),
+                       (browser_width, browser_height))
 end
 
 # Dispatcher loop per mock-agent connection. Reads one `{"prompt": "..."}`
@@ -765,7 +772,8 @@ second call closes the prior window and opens a fresh one.
 # the whole e2e suite exercises rAF-paced scroll/animation code, so faithful
 # timing is the correct default. Pass `offscreen = false` to opt a specific test
 # back onto the plain hidden-window path (e.g. to bisect an OSR-only difference).
-function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
+function open_browser(s::TestServer; width::Int = s.browser_size[1],
+                       height::Int = s.browser_size[2],
                        route::AbstractString = "/", offscreen::Bool = true)
     ensure_display!()
     old = s.browser[]

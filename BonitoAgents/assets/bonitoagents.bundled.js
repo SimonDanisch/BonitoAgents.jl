@@ -483,6 +483,9 @@ class BonitoChat {
         if (this._onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this._onAppClickCapture, true);
         }
+        if (this._onAppChange && this.app) {
+            this.app.removeEventListener('change', this._onAppChange);
+        }
         if (this._onEscapeKey) {
             document.removeEventListener('keydown', this._onEscapeKey, true);
         }
@@ -2474,6 +2477,8 @@ class BonitoChat {
         this.attachments = new Map();
         this._attachIdCounter = 0;
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        this.ATTACH_MAX_COUNT = 10;
+        this._attachPending = 0;
         this._onPaste = (e)=>{
             const items = e.clipboardData?.items;
             if (!items) return;
@@ -2518,9 +2523,28 @@ class BonitoChat {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this._cancel();
+            } else if (e.target.closest('.bt-attach-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this.app.querySelector('.bt-attach-input')?.click();
             }
         };
         this.app.addEventListener('click', this._onAppClickCapture, true);
+        this._onAppChange = (e)=>{
+            if (this.destroyed) return;
+            const input = e.target.closest('.bt-attach-input');
+            if (!input || !input.files) return;
+            for (const f of input.files){
+                if (f.type && f.type.startsWith('image/')) {
+                    this._attachAddBlob(f, f.type, f.name || `picked-${Date.now()}.png`);
+                } else {
+                    this._showAttachError(`${f.name || 'That file'} is not an image; only images can be attached`);
+                }
+            }
+            input.value = '';
+            this.textInput?.focus();
+        };
+        this.app.addEventListener('change', this._onAppChange);
         this._onTextInputKeyCapture = (e)=>{
             if (this._cmdAcHandleKey(e)) return;
             if (e.key !== 'Enter' || e.shiftKey) return;
@@ -2641,13 +2665,19 @@ class BonitoChat {
         return false;
     }
     _attachAddBlob(blob, mime, filename) {
+        if (this.attachments.size + this._attachPending >= this.ATTACH_MAX_COUNT) {
+            this._showAttachError(`At most ${this.ATTACH_MAX_COUNT} images per message`);
+            return;
+        }
         if (blob.size > this.ATTACH_MAX_BYTES) {
             this._showAttachError(`Image too large (${(blob.size / 1024 / 1024).toFixed(1)} MB, ` + `max ${this.ATTACH_MAX_BYTES / 1024 / 1024} MB)`);
             return;
         }
         const id = `att-${++this._attachIdCounter}`;
         const reader = new FileReader();
+        this._attachPending++;
         reader.onload = ()=>{
+            this._attachPending--;
             if (this.destroyed) return;
             this.attachments.set(id, {
                 blob,
@@ -2657,7 +2687,10 @@ class BonitoChat {
             });
             this._renderAttachments();
         };
-        reader.onerror = ()=>this._showAttachError('Failed to read image');
+        reader.onerror = ()=>{
+            this._attachPending--;
+            this._showAttachError('Failed to read image');
+        };
         reader.readAsDataURL(blob);
     }
     _attachRemove(id) {

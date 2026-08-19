@@ -7172,9 +7172,10 @@ end
 # Icons live as standalone SVG files under assets/icons/ and ship as
 # Bonito.Asset (hashed URL, served by the same machinery as bonitoagents.js).
 # Colors are baked into the SVGs since <img> doesn't inherit currentColor.
-send_icon()  = bonito_asset("icons", "send.svg")
-stop_icon()  = bonito_asset("icons", "stop.svg")
-check_icon() = bonito_asset("icons", "check.svg")
+send_icon()   = bonito_asset("icons", "send.svg")
+stop_icon()   = bonito_asset("icons", "stop.svg")
+check_icon()  = bonito_asset("icons", "check.svg")
+attach_icon() = bonito_asset("icons", "attach.svg")
 icon_img(asset, alt) = DOM.img(src=asset, alt=alt, draggable="false",
     style=Styles("pointer-events" => "none",
         "user-select" => "none"))
@@ -7241,6 +7242,28 @@ function chat_input_area(session::Session, model::ChatModel)
         title = map(y -> y ? "Lock in reminders (Enter)" : "Send (Enter)", model.yolo))
     stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
         class="bt-stop-btn", title="Stop generation")
+    # Attaching an image had exactly two ways in: paste and drag-drop. Neither
+    # exists on a phone, so the feature was desktop-only by accident. A file
+    # input is the one affordance a mobile browser turns into the native
+    # camera/gallery sheet — hence `accept="image/*"` (what the pipeline
+    # supports: `_attachAddBlob` reads a data URL for the thumbnail strip).
+    #
+    # The input is hidden and driven by the button, because a raw file input
+    # can't be styled to match and reads as a form control in a chat composer.
+    #
+    # `image/*` rather than the exact list in `ATTACHMENT_EXTENSIONS`: the wide
+    # form is what mobile browsers recognise as "offer the camera/gallery
+    # sheet", and narrowing it can leave an HEIF-shooting phone staring at an
+    # empty gallery. The cost is that a format the server doesn't store (HEIC
+    # off some Android pickers — iOS Safari transcodes to JPEG for `image/*`,
+    # so it doesn't arise there) queues a thumbnail and is refused on send with
+    # a mime message, rather than being unselectable. A late clear error beats
+    # an empty picker.
+    attach_input = DOM.input(; type = "file", accept = "image/*", multiple = true,
+                               class = "bt-attach-input", tabindex = "-1",
+                               ariaHidden = "true")
+    attach_btn = DOM.button(icon_img(attach_icon(), "Attach"); type = "button",
+        class = "bt-attach-btn", title = "Attach an image")
     # Prefill/draft swap for Yolo mode. Runs as an inline script child (the
     # ES6Module/init-script idiom): `$(text_input)` is a direct node ref, the
     # interpolated observables are live proxies. Toggle ON stashes the user's
@@ -7275,6 +7298,7 @@ function chat_input_area(session::Session, model::ChatModel)
     """
     DOM.div(
         DOM.div(
+            attach_btn, attach_input,
             text_input,
             DOM.div(
                 yolo_bar,

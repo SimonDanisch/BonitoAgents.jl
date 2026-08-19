@@ -140,6 +140,7 @@ it, so it covers the working path; the inactive-close fix is still open.
 |-----------------------|------------------------------------------------------------------------|
 | `workflows.jl`        | dashboard, new-project folder picker, chat reply, edit tool + diff expand, bash tool, thinking, agent switch |
 | `chat_features.jl`    | streaming accumulation, markdown (h1/ul/pre/strong/a), responsive layout (480/1280), multi-chat switching |
+| `attach_mobile.jl`    | the composer at PHONE width (390×780, its own server + window since `open_browser` sizes at open time and the shared one is 1280): the mobile media block is actually active, the attach button keeps a ≥40px tap target and stays fully on screen, neither the input row nor the input area overflows sideways, the textarea keeps >50% of the row, tapping the button drives the hidden file input, a picked image queues a thumbnail without pushing the composer off screen, and focus lands back in the textarea |
 | `chat_close_rename.jl`| homebar ✕ closes a chat (leaves the list, back to dashboard, model torn down, `dismissed` persisted); closing one leaves the others; header rename is consistent in homebar + header and persists across a chat switch; a fresh chat binds its claude session id (the "name reverts to first message" root fix); reopening a closed chat restores it under its title |
 | `header_collapse.jl`  | narrow-pane header: below the container breakpoint ONE ⋯ toggle replaces the action cluster + env line + lens bar; checking it (glyph → ✕) expands them all in flow as a full-width stack under the toggle (controls stretch + center); unchecking collapses; a checked toggle never leaks into the wide layout |
 | `app_reload.jl`       | a live eval-result app (RemoteRef embed) survives a real browser page reload twice: remount is fully self-contained (fresh instance at 0, click round-trips through the eval bridge), and a history-replayed Edit pill stays expandable |
@@ -191,7 +192,9 @@ unit test stays — it is headless, not a UI test).
 - `test_follow_pill.jl` → `follow_pill_test.jl`; `test_scroll_chase.jl` →
   `scroll_chase_test.jl` (black-box, driving the real scroller — the legacy tests
   poked internal state; the ports keep the load-bearing invariant black-box).
-- `test_chat_attach.jl` → `chat_attach_test.jl` (synthetic ClipboardEvent, no OS dialog).
+- `test_chat_attach.jl` → `chat_attach_test.jl` (synthetic ClipboardEvent, no OS
+  dialog; also covers the attach button, the `change`-driven picker path and the
+  10-image queue cap).
 - `test_chat_cancel.jl` → `chat_cancel_test.jl` / `cancel_escalation_test.jl`.
 - `test_worker_move.jl` → `worker_move_test.jl`; `test_cross_worker_sync_ui.jl` →
   `cross_worker_sync_ui_test.jl`; the backend reconcile (`same_name_siblings` /
@@ -220,6 +223,15 @@ unit test stays — it is headless, not a UI test).
   drag-shaped bug, dispatch the events at the element and see whether the
   handler was ever the problem. (Tab-drag-to-split does work through
   `sendInputEvent` — it does not use capture.)
+
+- **The native FILE DIALOG.** Clicking the composer's attach button opens an
+  OS-modal picker that nothing in-page can dismiss, so a real click would hang
+  the run forever. `chat_attach_test.jl` stubs the hidden input's own `.click`
+  and counts calls: the delegated button handler, the `change` listener and
+  `_attachAddBlob` all still run for real, and the File that reaches them is a
+  genuine browser `File` assigned through `input.files = dataTransfer.files`.
+  What is NOT covered is the picker's own behaviour — whether `accept="image/*"`
+  really surfaces the camera sheet is the browser's contract, not ours.
 
 - **Keys that insert TEXT.** `sendInputEvent({type:'keyDown'})` alone does not
   type anything: the browser inserts on the `char` event. Testing Shift+Enter

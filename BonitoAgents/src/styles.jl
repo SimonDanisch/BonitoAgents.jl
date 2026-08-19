@@ -2623,6 +2623,28 @@ const ChatStyles = Bonito.Styles(
         "background" => "rgba(239,68,68,0.08)",
         "border-color" => "var(--bt-error)"),
 
+    # ── Attach ───────────────────────────────────────────────────────────────
+    # Sits at the START of the input row, left of the text field, where every
+    # chat app puts it. 40px square: below ~40 a touch target is a coin toss,
+    # and this button exists FOR touch — paste and drag-drop already cover the
+    # desktop, and neither exists on a phone.
+    CSS(".bt-attach-btn",
+        "flex" => "0 0 auto", "align-self" => "flex-end",
+        "width" => "40px", "height" => "40px",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "background" => "transparent", "border" => "1px solid transparent",
+        "border-radius" => "999px", "cursor" => "pointer", "padding" => "0",
+        "transition" => "background 80ms, border-color 80ms"),
+    CSS(".bt-attach-btn:hover",
+        "background" => "var(--bt-surface-2)",
+        "border-color" => "var(--bt-border)"),
+    # `display: none` would make the input unclickable in some browsers even
+    # via `.click()`; keep it in the layout but out of sight and out of the tab
+    # order (the button is the real control).
+    CSS(".bt-attach-input",
+        "position" => "absolute", "width" => "1px", "height" => "1px",
+        "opacity" => "0", "pointer-events" => "none"),
+
     # ── Spinner (used by bt_show preview while streaming from worker) ────────
     CSS(".bt-spinner",
         "width" => "14px", "height" => "14px",

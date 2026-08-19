@@ -840,6 +840,9 @@ class BonitoChat {
         if (this._onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this._onAppClickCapture, true);
         }
+        if (this._onAppChange && this.app) {
+            this.app.removeEventListener('change', this._onAppChange);
+        }
         if (this._onEscapeKey) {
             document.removeEventListener('keydown', this._onEscapeKey, true);
         }
@@ -3659,6 +3662,14 @@ class BonitoChat {
         this.attachments = new Map();
         this._attachIdCounter = 0;
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        // Queue length cap. The file picker makes "select all" in a phone
+        // gallery a single tap, so an unbounded queue is one gesture away from
+        // dozens of multi-MB data URLs in memory and one enormous message.
+        this.ATTACH_MAX_COUNT = 10;
+        // Counts blobs whose FileReader is still running. `attachments` only
+        // grows in the async onload, so a synchronous loop over 40 picked files
+        // would see size 0 forty times and let every one of them through.
+        this._attachPending = 0;
 
         // Paste — clipboardData.items carries File entries for images.
         this._onPaste = (e) => {
@@ -3716,9 +3727,45 @@ class BonitoChat {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this._cancel();
+            } else if (e.target.closest('.bt-attach-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                // Resolved at click time, not cached — same reason as the
+                // send/stop buttons above.
+                this.app.querySelector('.bt-attach-input')?.click();
             }
         };
         this.app.addEventListener('click', this._onAppClickCapture, true);
+
+        // File picker — the third way to attach an image, and the only one a
+        // phone has. Paste needs a clipboard holding a file, drag-drop needs a
+        // pointer; neither exists on touch, so attaching was desktop-only by
+        // accident. A plain <input type=file> is what a mobile browser turns
+        // into the camera/gallery sheet. `change` bubbles, so this delegates
+        // off the chat root like the clicks do.
+        this._onAppChange = (e) => {
+            if (this.destroyed) return;
+            const input = e.target.closest('.bt-attach-input');
+            if (!input || !input.files) return;
+            for (const f of input.files) {
+                if (f.type && f.type.startsWith('image/')) {
+                    this._attachAddBlob(f, f.type, f.name || `picked-${Date.now()}.png`);
+                } else {
+                    // `accept` is a hint, not a rule — most pickers still offer
+                    // "all files". Say so instead of dropping it on the floor.
+                    this._showAttachError(
+                        `${f.name || 'That file'} is not an image; only images can be attached`);
+                }
+            }
+            // Clear, or picking the SAME file twice fires no `change` at all
+            // and the second attempt looks broken.
+            input.value = '';
+            // Land back in the composer: after the picker closes focus is on
+            // nothing, so the next keystroke would go nowhere and on a phone
+            // you'd have to tap the field before typing a caption.
+            this.textInput?.focus();
+        };
+        this.app.addEventListener('change', this._onAppChange);
 
         // Enter-to-send on the textarea (Shift+Enter newline as usual).
         this._onTextInputKeyCapture = (e) => {
@@ -3872,6 +3919,11 @@ class BonitoChat {
     }
 
     _attachAddBlob(blob, mime, filename) {
+        if (this.attachments.size + this._attachPending >= this.ATTACH_MAX_COUNT) {
+            this._showAttachError(
+                `At most ${this.ATTACH_MAX_COUNT} images per message`);
+            return;
+        }
         if (blob.size > this.ATTACH_MAX_BYTES) {
             this._showAttachError(
                 `Image too large (${(blob.size / 1024 / 1024).toFixed(1)} MB, ` +
@@ -3880,7 +3932,9 @@ class BonitoChat {
         }
         const id = `att-${++this._attachIdCounter}`;
         const reader = new FileReader();
+        this._attachPending++;
         reader.onload = () => {
+            this._attachPending--;
             if (this.destroyed) return;
             this.attachments.set(id, {
                 blob, mime, filename,
@@ -3888,7 +3942,10 @@ class BonitoChat {
             });
             this._renderAttachments();
         };
-        reader.onerror = () => this._showAttachError('Failed to read image');
+        reader.onerror = () => {
+            this._attachPending--;
+            this._showAttachError('Failed to read image');
+        };
         reader.readAsDataURL(blob);
     }
 
