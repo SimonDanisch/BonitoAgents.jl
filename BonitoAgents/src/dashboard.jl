@@ -1184,6 +1184,12 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-addr-icon-btn:hover",
         "background" => "var(--bt-surface-2)",
         "color" => "var(--bt-accent)"),
+    # The labelled variant: small and quiet so it doesn't compete with the
+    # breadcrumb it sits next to, but readable rather than a lone glyph.
+    CSS(".bt-addr-edit-btn",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "4px",
+        "font-size" => "11.5px", "white-space" => "nowrap"),
+    CSS(".bt-addr-edit-glyph", "font-size" => "12px", "line-height" => "1"),
     CSS(".bt-picker-loading",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "color" => "var(--bt-text-muted)",
@@ -1824,9 +1830,13 @@ function address_bar(cur::Observable{String}, editing::Observable{Bool})
             push!(nodes, DOM.div("";
                 class = "bt-addr-filler",
                 onclick = js"event => $(editing).notify(true)"))
-            push!(nodes, DOM.button("✎";
-                class    = "bt-addr-icon-btn",
-                title    = "Edit path",
+            # LABELLED, not a bare glyph. Typing a path is the fast way to this
+            # picker — clicking down a deep tree is the slow one — and a 23px "✎"
+            # with the explanation only in its tooltip meant you had to already
+            # know it was there. The word is what makes the shortcut findable.
+            push!(nodes, DOM.button(DOM.span("✎"; class = "bt-addr-edit-glyph"), "Type path";
+                class    = "bt-addr-icon-btn bt-addr-edit-btn",
+                title    = "Type a path instead of clicking through the tree",
                 onclick  = js"event => $(editing).notify(true)"))
             DOM.div(nodes...;
                 class   = "bt-addr-bar",

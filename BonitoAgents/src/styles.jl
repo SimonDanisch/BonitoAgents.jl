@@ -1231,6 +1231,12 @@ const ChatStyles = Bonito.Styles(
     # box keeps truncating from the left. `isolate` rather than `bidi-override`
     # so a genuinely RTL filename still reads correctly inside.
     CSS(".bt-path-ltr", "direction" => "ltr", "unicode-bidi" => "isolate"),
+    # A shortcut rendered ON its button. Quiet enough not to compete with the
+    # verb, present enough to be learnable without hovering for a tooltip.
+    CSS(".bt-btn-kbd",
+        "margin-left" => "6px", "opacity" => "0.7",
+        "font-size" => "10.5px", "font-family" => "ui-monospace, monospace",
+        "letter-spacing" => "0.02em"),
     CSS(".bt-fv-badge",
         "font-size" => "10px", "text-transform" => "uppercase",
         "letter-spacing" => "0.04em",
@@ -1608,16 +1614,29 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-rv-add", "background" => "rgba(16,185,129,0.10)"),
     CSS(".bt-rv-del", "background" => "rgba(239,68,68,0.10)"),
     CSS(".bt-rv-note", "color" => "var(--bt-text-faint)", "font-style" => "italic"),
-    # `+` reveals on row hover — always-visible buttons on every line of a
-    # thousand-line diff are pure noise.
+    # `+` is FAINT on every line and full-strength on row hover. It used to be
+    # `display: none` until hover, on the reasoning that a visible button on every
+    # line of a thousand-line diff is pure noise — which is right, and is why this
+    # is a low-opacity glyph with no chrome rather than a button per line. But
+    # hidden-until-hover also means nothing on screen says the diff is
+    # commentable, and that is the one thing this tab is for: you have to already
+    # know, or brush a line by accident. Faint-always reads as texture in the
+    # gutter and still answers "can I click here?".
+    #
+    # Opacity rather than `display`, so the element keeps its box and hovering
+    # can't shift the row.
     CSS(".bt-rv-plus",
         "position" => "absolute", "right" => "4px", "top" => "1px",
-        "display" => "none", "border" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface)", "color" => "var(--bt-accent)",
+        "display" => "block", "opacity" => "0.25",
+        "border" => "1px solid transparent", "background" => "transparent",
+        "color" => "var(--bt-accent)", "transition" => "opacity 80ms",
         "border-radius" => "var(--bt-radius-sm)", "cursor" => "pointer",
         "font-size" => "11px", "line-height" => "1", "padding" => "2px 6px"),
-    CSS(".bt-rv-line:hover .bt-rv-plus", "display" => "block"),
-    CSS(".bt-rv-plus:hover", "background" => "var(--bt-accent)", "color" => "#fff"),
+    CSS(".bt-rv-line:hover .bt-rv-plus",
+        "opacity" => "1", "border-color" => "var(--bt-border)",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-rv-plus:hover",
+        "opacity" => "1", "background" => "var(--bt-accent)", "color" => "#fff"),
     # A line you already commented on keeps a marker, so a long pass shows where
     # you've been.
     CSS(""".bt-rv-line[data-commented="1"]""",

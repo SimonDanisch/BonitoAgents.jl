@@ -718,9 +718,13 @@ function file_panel_header(session::Session, p::FilePanel)
             DOM.button("Preview"; class = "bt-fv-seg", type = "button", dataFvView = "preview"),
             DOM.button("Source"; class = "bt-fv-seg", type = "button", dataFvView = "source");
             class = "bt-fv-segmented"),) : ()
+    # The shortcut is ON the button, not only in its tooltip. Ctrl+S is the one
+    # thing people try here without looking, and a tooltip is invisible to anyone
+    # who never hovers a button they already know how to click.
     save_btn = p.editor === nothing ? () :
-        (DOM.button("Save"; class = "bt-btn bt-btn-sm bt-file-editor-save", type = "button",
-                    title = "Write this file on the worker (Ctrl+S)"),)
+        (DOM.button("Save", DOM.span("Ctrl+S"; class = "bt-btn-kbd");
+                    class = "bt-btn bt-btn-sm bt-file-editor-save", type = "button",
+                    title = "Write this file on the worker"),)
     status = p.editor === nothing ? Observable("") : p.editor.status
     return DOM.div(
         DOM.span(kind_icon(p.kind); class = "bt-fv-icon"),

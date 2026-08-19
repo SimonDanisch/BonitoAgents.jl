@@ -101,6 +101,21 @@ function run_suite(server)
             })()""") === true
         end
 
+        @testset "the comment affordance is visible without hovering" begin
+            # It used to be `display: none` until row hover, so nothing on screen
+            # said the diff was commentable — you had to already know, or brush a
+            # line by accident. Faint-but-present is the compromise: still quiet
+            # enough for a thousand-line diff, but discoverable.
+            @test TK.eval_js(server, """(() => {
+                const p = document.querySelector('$(REVIEW) .bt-rv-line .bt-rv-plus');
+                if (!p) return false;
+                const cs = getComputedStyle(p);
+                return cs.display !== 'none'
+                    && parseFloat(cs.opacity) > 0.1
+                    && p.getBoundingClientRect().width > 0;
+            })()""") === true
+        end
+
         @testset "Ask sends the question to the chat immediately" begin
             TK.eval_js(server, """(() => {
                 document.querySelector('$(REVIEW) [data-rv-mode="ask"]').click(); return true; })()""")
