@@ -482,6 +482,25 @@ and pile up as zombie background tasks. Run the long command itself as ONE \
 background task (`run_in_background`) with any post-processing (grep/summary) \
 appended after it in the same command.
 
+## Waiting for it: `bt_wait`, never a sleeper
+The tools above START work; none of them WAIT for it. `run_in_background` \
+returns immediately, so if you have nothing else to do the turn simply ends and \
+you are called again seconds later. Turns fire far faster than wall-clock, so \
+"start a `sleep` and check next turn" spawns one orphaned sleeper per cycle — \
+observed live: 130 of them, each firing its own notification on expiry.
+
+When you need to be idle until something finishes, call `bt_wait`. It BLOCKS \
+this turn (a tool call is the only thing that can), leaves no background task \
+and fires no notification:
+
+  * `bt_wait(seconds: 300, reason: "blender render")` — just wait.
+  * `bt_wait(seconds: 600, until: "test -f out/done.flag")` — wait, but return \
+    the moment the condition holds.
+
+`seconds` is required and capped at an hour; hitting the bound is a normal \
+result, so for longer work just call it again. Waiting in ONE long call is \
+cheaper than many short turns, so do not shrink it to poll faster.
+
 ## Julia
 When running Julia code, always prefer the `bt_julia_eval` tool over \
 `julia -e ...`/scripts via Bash: it keeps a persistent session (loaded \

@@ -647,8 +647,20 @@ function invoke_mcp(client, ev::AbstractDict)
     println(client, JSON.json(open_ev)); flush(client)
 
     ctx = SERVER_CONTEXT[]
-    runner() = tool == "bt_julia_continue" ?
-        BonitoMCP.julia_continue_handler(args) : BonitoMCP.julia_eval_handler(args)
+    # Dispatch by NAME through the registry, the way a real MCP process does.
+    # This used to hardcode the two eval handlers and fall through to
+    # `julia_eval_handler` for everything else — so `mcp_call("bt_wait")` ran the
+    # eval handler with no `code` and came back "error: empty code" in
+    # milliseconds. The test then measured a turn that was never blocked and had
+    # no way to tell that from a broken tool. Any registered tool is callable now.
+    reg = BonitoMCP.available_tools()
+    hit = findfirst(t -> t.name == tool, reg)
+    runner() = hit === nothing ?
+        Dict{String,Any}("content" => Any[Dict("type" => "text",
+            "text" => "TestKit: no MCP tool named `$tool` (have: " *
+                      join((t.name for t in reg), ", ") * ")")],
+            "isError" => true) :
+        reg[hit].handler(args)
     # Faithful MCP-process behaviour: arm the /mcp-ws control dial-back (idempotent)
     # so the eval's live stdout streams over the REAL wire to the chat's tail, same
     # as production. Env vars (incl. project_id) are set by with_bridge_env, which
@@ -1098,6 +1110,64 @@ function to_dashboard(s::TestServer)
 end
 
 """
+    worker_log_tail(s; lines = 40) -> String
+
+The end of this dev_server's worker log, formatted for appending to an error —
+or `""` when the worker looks healthy or has no log to show.
+
+Why this exists: when the SHARED server's worker dies, every later item fails on
+`new_chat` with the same "scan_sessions … timed out — worker may be offline or
+stuck". One run produced 34 identical copies of it and not one word about the
+cause; the worker's own log was right there on disk and nothing looked at it. The
+server-side throw (`worker_client.jl`) cannot do this — a production worker is on
+another machine and has no log we can read — so it belongs here, where we spawned
+the worker ourselves and know where it writes.
+"""
+function worker_log_tail(s::TestServer; lines::Int = 40)
+    cfg = try
+        s.h.worker_config
+    catch e
+        e isa InterruptException && rethrow()
+        return ""
+    end
+    # HOW it died, first — this is the part that always has an answer. The log
+    # often does not: a worker taken down by SIGKILL loses everything Julia had
+    # buffered, so `worker.log` is empty in exactly the case worth diagnosing.
+    # Exit code and signal survive that, and they separate the three stories the
+    # bare "worker may be offline or stuck" cannot: killed by a signal, exited on
+    # its own with a code, or still running (so it is wedged, not gone).
+    signalled = false
+    state = if s.h.worker_proc === nothing
+        "no worker process handle"
+    elseif process_running(s.h.worker_proc)
+        "RUNNING (so: wedged, not dead)"
+    else
+        p = s.h.worker_proc
+        sig = try p.termsignal catch; 0 end
+        code = try p.exitcode catch; -1 end
+        signalled = sig != 0
+        signalled ? "killed by signal $sig" : "exited with code $code"
+    end
+    # Only where it is true: a RUNNING worker with an empty log has simply not
+    # said anything yet, which is a different (and less alarming) fact.
+    why_empty = signalled ? " (a signalled worker loses its buffered output)" : ""
+
+    path = joinpath(String(cfg), "worker.log")
+    isfile(path) || return "\n\n── worker: $state; no log at $path ──"
+    txt = try
+        read(path, String)
+    catch e
+        e isa InterruptException && rethrow()
+        return "\n\n── worker: $state; log unreadable: $(sprint(showerror, e)) ──"
+    end
+    ls = split(chomp(txt), '\n')
+    isempty(strip(txt)) &&
+        return "\n\n── worker: $state; log at $path is EMPTY$why_empty ──"
+    return "\n\n── worker: $state — last $(min(lines, length(ls))) of $(length(ls)) " *
+           "log lines ──\n" * join(ls[max(1, end - lines + 1):end], "\n")
+end
+
+"""
     new_chat(s; cwd = mktempdir(), title = basename(cwd)) -> String
 
 Create a fresh chat the way a user does: from the dashboard, "+ New project",
@@ -1173,7 +1243,8 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
         timeout = 90)
     err = eval_js(s, "(() => { const e = document.querySelector('.bt-error'); " *
                      "return e ? (e.innerText||'').trim() : ''; })()")
-    isempty(String(err)) || error("new_chat: the dashboard rejected Create — $(err)")
+    isempty(String(err)) || error("new_chat: the dashboard rejected Create — $(err)" *
+                                  worker_log_tail(s))
     # The ACP session binds asynchronously; until it does, the sidebar hasn't
     # marked the new chat active and a re-render can briefly drop `.bt-text-input`.
     # Gate on the new chat actually being SELECTED (non-empty active pid) AND its
