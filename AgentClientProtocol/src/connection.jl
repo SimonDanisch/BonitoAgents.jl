@@ -51,7 +51,7 @@ transport_eof(::Transport) = false
 #                                                       result or throw)
 #
 # Session updates are NOT handled here — they are addressed to their owner (the
-# session's main thread, or a subagent) and reach it through `on_main_update` /
+# session's main thread, or a subagent) and reach it through `main_stream` /
 # `on_owner_update`, which `Client` turns into bounded, ordered streams.
 #
 # Why dispatch instead of a `::Function` field on `Connection`:
@@ -101,11 +101,20 @@ mutable struct Connection
     # (see `notify_frame`).
     on_frame::Union{Function,Nothing}
 
-    # Sink for the session's MAIN THREAD: EVERY untagged `session/update`,
-    # whether or not a prompt happens to be in flight. Called as
-    # `on_main_update(update::SessionUpdate)` on the dispatcher task — keep it
-    # fast + non-throwing. `Client` installs it (one persistent coalescer per
-    # session); `nothing` = drop.
+    # The session's MAIN THREAD: EVERY untagged `session/update`, whether or not
+    # a prompt happens to be in flight, is delivered here on the dispatcher task.
+    # `Client` installs it (one persistent coalescer drains it); `nothing` = drop.
+    #
+    # A CHANNEL, not a callback, so that the connection can END it. Teardown is
+    # the one place every death runs through — agent crash, worker gone, socket
+    # severed, explicit close — and it already finishes everything else that can
+    # be in flight there (capture channels closed, spans stranded and flushed,
+    # pending RPCs failed). The main stream is in flight in exactly the same
+    # sense, and when it was reachable only through a callback the connection had
+    # no way to finish it: the coalescer sat in `for u in updates` forever, so
+    # `client.messages` never closed and the consumer task never returned. Owning
+    # the channel makes the end structural instead of something a holder of the
+    # `Client` has to remember to do.
     #
     # There is deliberately no per-prompt update stream. The main thread is ONE
     # stream that the agent speaks on continuously: inside a prompt, and also
@@ -118,7 +127,7 @@ mutable struct Connection
     #
     # Subagent-tagged updates do NOT come here; they are addressed by
     # `parentToolUseId` and go to `on_owner_update` instead.
-    on_main_update::Union{Function,Nothing}
+    main_stream::Union{Channel{Any},Nothing}
 
     # Sink for updates that NAME their owner. Called as
     # `on_owner_update(owner_id::String, update::SessionUpdate)` for every
@@ -154,7 +163,7 @@ mutable struct Connection
     tool_owners::Dict{String,String}
 
     # Requests that CAPTURE the update stream for themselves instead of letting
-    # it reach `on_main_update`. Exactly one method does this: `session/load`,
+    # it reach `main_stream`. Exactly one method does this: `session/load`,
     # where the agent re-streams the resumed session's whole history as
     # `session/update` notifications. That replay is not the live conversation
     # and must not render as it — it is the request's own result, arriving in
@@ -309,7 +318,7 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
                       Dict{Int,Channel{Any}}(), 0,
                       handler,
                       on_frame,
-                      nothing,                              # on_main_update  (Client installs)
+                      nothing,                              # main_stream     (Client installs)
                       nothing,                              # on_owner_update (set post-bind)
                       Dict{String,String}(),                # tool_owners
                       Pair{Int,Channel{SessionUpdate}}[],   # capture
@@ -379,6 +388,13 @@ function dispatcher_loop(conn::Connection)
         for sp in stranded
             deliver_main!(conn, sp.flush)
         end
+        # And the STREAM itself always ends, on exactly the same two events. The
+        # coalescer's `for u in main_stream` returns, which runs its `finally`:
+        # any half-built message is sealed, live tools are force-failed, a live
+        # plan is sealed, and `client.messages` closes so the consumer returns.
+        # Everything that can be mid-flight is finished by the connection dying,
+        # with nothing for the layer above to notice or handle.
+        close_main_stream!(conn)
     end
 end
 
@@ -560,17 +576,29 @@ end
 """
     deliver_main!(conn, update)
 
-Hand a main-thread update to `on_main_update`. Same discipline as
-`deliver_owner!`; see there for why `invokelatest`.
+Put a main-thread update on the session's main stream, with the same
+backpressure-never-drop discipline as every other update (see
+`deliver_update!`). A closed or absent stream drops.
 """
 function deliver_main!(conn::Connection, update::Union{SessionUpdate,StreamFlush})
-    sink = conn.on_main_update
-    sink === nothing && return nothing
-    try
-        Base.invokelatest(sink, update)
-    catch e
-        @warn "on_main_update threw" exception = (e, catch_backtrace())
-    end
+    ch = conn.main_stream
+    ch === nothing && return nothing
+    deliver_update!(conn, ch, update)
+    return nothing
+end
+
+# End the session's main stream. Called from teardown ONLY, after every stranded
+# span has had its flush delivered — the marker has to be on the stream before
+# the stream ends, or a caller waiting on `span.flush` waits forever.
+#
+# Closing (rather than leaving it open with a dead coalescer) is what the rest of
+# the code already expects of a torn-down stream: `flush_main!` catches the
+# `InvalidStateException` and reports "no stream" instead of handing back a
+# marker nobody will ever signal.
+function close_main_stream!(conn::Connection)
+    ch = conn.main_stream
+    ch === nothing && return nothing
+    isopen(ch) && close(ch)
     return nothing
 end
 
@@ -633,7 +661,7 @@ end
 
 # Send a `session/prompt` and open a span over the main stream. Returns the
 # `PromptSpan`. The prompt's CONTENT does not come back through here — it is the
-# main thread speaking, and it goes to `on_main_update` like everything else the
+# main thread speaking, and it goes to `main_stream` like everything else the
 # main thread says.
 function prompt_request(conn::Connection, params)
     reset_turn_state!(conn)

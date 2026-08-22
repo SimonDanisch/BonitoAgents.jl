@@ -109,7 +109,31 @@ end
 
 struct Plan <: Message
     entries::Vector{PlanEntry}
+    # False = this plan's stream is over; it will never be updated again.
+    #
+    # The protocol has no "plan ended" frame: the agent resends the whole entry
+    # list, and each ENTRY carries pending/in_progress/completed. That is enough
+    # for a plan the agent finishes (every entry completed) but says nothing
+    # about one it ABANDONS — the turn is cancelled, the agent dies, the worker
+    # goes away — and an abandoned plan's entries simply stay where they were.
+    # A consumer with only the entries to go on cannot tell "still working on
+    # 0/4" from "stopped, having done 0/4", so it shows it as live forever
+    # (observed: todo pills counting past 35 hours).
+    #
+    # This is the STREAM's answer, and `close_turn!` is the single place it is
+    # given — the same one that force-fails live tools, on the same events. It is
+    # not the only way a plan ends (an agent that works its entries to terminal
+    # ends it by status, and an episode that simply STOPS is visible to a
+    # consumer as `session_activity` — neither needs a frame). It is the one that
+    # covers a stream dying under a live plan, which nothing else can see.
+    #
+    # The entries are left EXACTLY as the agent last reported them: sealing is a
+    # property of the plan, not a status we forge onto its entries. Tools get
+    # `failed` here because the protocol HAS that status for a tool; plan entries
+    # have no equivalent, and inventing one would misreport what the agent said.
+    live::Bool
 end
+Plan(entries::Vector{PlanEntry}) = Plan(entries, true)
 
 # Session-config changes mid-turn. Metadata, not content: they don't open a
 # bubble and don't close the currently-streaming message.
@@ -337,8 +361,13 @@ mutable struct TurnState
     # Everything the current text message has received so far — used by
     # `text!` to drop claude-agent-acp's handoff duplicate (see there).
     acc::String
+    # The last plan the agent sent, or `nothing` once it has been sealed. Held
+    # for the same reason `tools` is: it is a LIVE thing the stream can end in
+    # the middle of, and whatever ends the stream has to finish it. The agent
+    # always resends the whole list, so last-one-wins is the whole state.
+    plan::Union{Vector{PlanEntry},Nothing}
 end
-TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "")
+TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "", nothing)
 
 # Closing the stream at a boundary finishes the trailing message and any
 # still-open tools, and leaves the state ready for what comes next.
@@ -359,7 +388,7 @@ TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "")
 # with an empty CODE and OUTPUT while the eval is still going.
 #
 # Tools the agent genuinely abandons are not lost by leaving them here: the chat
-# layer's `sweep_turn_orphans!` finalises anything non-terminal at end of turn,
+# layer closes each bubble in its drain `finally`,
 # and it deliberately runs only for the LAST turn precisely so a handoff doesn't
 # force-fail its successor's live tools.
 function seal_message!(st::TurnState)
@@ -369,7 +398,12 @@ function seal_message!(st::TurnState)
     return nothing
 end
 
-function Base.close(st::TurnState)
+# Finish EVERYTHING the stream can end in the middle of. Takes `out` (rather
+# than being a `close(st)` you can call anywhere) on purpose: sealing the plan
+# needs the main stream, and a one-argument version would be a second door that
+# a future caller could walk through while forgetting the plan — which is how
+# plans came to outlive their episodes in the first place.
+function close_turn!(out::Channel, st::TurnState)
     seal_message!(st)
     for tc in values(st.tools)
         if !is_terminal(tc.status)
@@ -379,6 +413,15 @@ function Base.close(st::TurnState)
         close(tc)
     end
     empty!(st.tools)
+    if st.plan !== nothing
+        entries = st.plan
+        st.plan = nothing
+        # Bounded channel, so this CAN block if the consumer stopped draining —
+        # the same exposure every `put!(out, …)` in the parse loop already has,
+        # and reaching here means the loop was draining until a moment ago. Not
+        # risk-free, but the alternative (dropping the seal) is the bug.
+        isopen(out) && put!(out, Plan(entries, false))
+    end
     return nothing
 end
 
@@ -543,6 +586,9 @@ end
 
 function parse_update!(out, st, u::PlanUpdate)
     st.current_message === nothing || (close(st.current_message); st.current_message = nothing)
+    # Remember it, so whatever ends the stream can seal it. The agent resends
+    # the whole list every time, so the newest one is the state.
+    st.plan = u.entries
     put!(out, Plan(u.entries))
     return nothing
 end
