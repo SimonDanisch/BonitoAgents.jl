@@ -987,6 +987,18 @@ class BonitoChat {
         }
         return a;
     }
+    _holdsFullscreen(node) {
+        if (!node) return false;
+        const fs = document.fullscreenElement || document.webkitFullscreenElement;
+        if (fs && (node === fs || node.contains(fs))) return true;
+        for (const v of node.querySelectorAll('video')){
+            if (v.webkitDisplayingFullscreen || v.webkitPresentationMode === 'fullscreen') return true;
+        }
+        return false;
+    }
+    _fullscreenActive() {
+        return this._holdsFullscreen(this.container) || !!(document.fullscreenElement || document.webkitFullscreenElement);
+    }
     updateDOM(s, e) {
         if (s > e) return;
         const sticky = this._activeKeyAnchor();
@@ -1002,7 +1014,7 @@ class BonitoChat {
                         this.applyVisibility(idx, node);
                         this.touchApp(idx);
                     }
-                } else {
+                } else if (this._holdsFullscreen(node)) {} else {
                     if (this.observed.delete(idx) && node) this._ro.unobserve(node);
                     node?.remove();
                     this.rendered.delete(idx);
@@ -2777,6 +2789,7 @@ class BonitoChat {
         this._attachClear();
     }
     onViewportResize() {
+        if (this._fullscreenActive()) return;
         const vv = window.visualViewport;
         const app = this.app || this.container.closest('.bt-app');
         if (app) app.style.height = vv.height + 'px';
