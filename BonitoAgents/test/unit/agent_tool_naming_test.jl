@@ -22,7 +22,7 @@
         for l in eachline(joinpath(fixtures, file))
             ACP.parse_update!(out, st, ACP.parse_session_update(JSON.parse(l)))
         end
-        close(st); close(out)
+        ACP.close_turn!(out, st); close(out)
         return only([x for x in collect(out) if x isa ACP.ToolCall])
     end
 
@@ -53,7 +53,7 @@
             for l in eachline(joinpath(fixtures, file))
                 ACP.parse_update!(out, st, ACP.parse_session_update(JSON.parse(l)))
             end
-            close(st); close(out)
+            ACP.close_turn!(out, st); close(out)
             for tc in collect(out)
                 tc isa ACP.ToolCall || continue
                 m = BonitoAgents.replayed_tool_msg(tc)

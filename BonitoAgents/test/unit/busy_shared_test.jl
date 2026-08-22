@@ -23,10 +23,13 @@
     const ACP = BT.AgentClientProtocol
     span = ACP.PromptSpan(1)
     put!(span.response, Dict{String,Any}("stopReason" => "end_turn"))
-    lock(() -> (parent.turns_active[] += 1), parent.lock)
-    parent.busy_active[] = true
-    BT.drain_turn!(tab, span)
+    BT.with_turn_slot!(tab) do
+        # Claimed through the TAB, but the slot and the spinner are the parent's.
+        @test parent.turn_in_flight[] == true
+        @test parent.busy_active[] == true
+        BT.drain_turn!(tab, span)
+    end
 
-    @test parent.turns_active[] == 0
+    @test parent.turn_in_flight[] == false
     @test parent.busy_active[] == false              # the bug: stayed true
 end

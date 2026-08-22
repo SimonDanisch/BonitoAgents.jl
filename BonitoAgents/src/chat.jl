@@ -230,10 +230,20 @@ mutable struct ChatModel
     # detect stale stream events from a previous turn (see `drain_turn!`).
     turn_seq::Ref{Int}
 
-    # Count of active `prompt!` turns (normally 0 or 1). Two turns are only
-    # possible when a restart races an in-flight prompt — bounded by the CAS
-    # guard in `restart_chat_session!`.
-    turns_active::Ref{Int}
+    # Is the consumer inside a turn? NOT a question about the agent — that one is
+    # `session_activity`, and the two differ at both ends: we hold this while
+    # bringing a session up (before any span exists) and while rendering the
+    # turn's tail (after the span resolved and ACP is already `Idle`).
+    #
+    # A Bool, not the count it used to be. `run_chat!` is the sole consumer and
+    # AWAITS each turn, so there is never more than one — true since 15e1f76 made
+    # the drain awaited instead of spawned, though the counter and its
+    # `last_turn` branch (unconditionally true) outlived that by weeks. Verified
+    # by instrumenting the claim across the unit suite and the cancel / queued /
+    # restart e2e items: never above one.
+    #
+    # Claimed and released by `with_turn_slot!` ONLY — see there.
+    turn_in_flight::Ref{Bool}
 
     # Current provider for this chat — the singleton descriptor the worker spawns
     # (a `BinAgent`, e.g. the `ClaudeCodeAgent` singleton). Observable so the UI
@@ -345,7 +355,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         nothing,                    # plotpane: window-scoped, set per session view
         Ref{Any}(nothing),          # live_todo
         Ref(0),                     # turn_seq
-        Ref(0),                     # turns_active
+        Ref(false),                 # turn_in_flight
         # Provider observable tracks the AGENT (the source of truth): the kind
         # the worker spawns for a WorkerAgent, the agent's own type locally.
         Observable{Any}(agent_kind(actual_agent)),
@@ -437,7 +447,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             nothing,                   # plotpane: per WINDOW — ChatPaneRef sets it
             m.live_todo,               # shared Ref — one live list per chat
             m.turn_seq,                # shared counter
-            m.turns_active,            # shared counter
+            m.turn_in_flight,          # shared → one turn slot per chat
             any_bridge(session, m.provider),  # per-tab provider bridge (Any-typed: provider type varies across a switch)
             m.pending_asks,            # shared → asks resolve against the parent
             m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
@@ -521,7 +531,7 @@ mutable struct AgentMsg <: ChatMsg
     # True between `send!` (streaming start) and `close` (turn-end finalize).
     # The orphan sweep keys on this so an ACP session that drops mid-stream
     # — and never runs the normal `close` — gets the bubble finalized + the
-    # `agent_final` wire event emitted from `sweep_turn_orphans!`. Also makes
+    # `agent_final` wire event emitted when the drain closes the bubble. Also makes
     # `close` idempotent: re-close on an already-final bubble is a no-op
     # instead of double-appending to chat.md.
     in_flight::Bool
@@ -1143,36 +1153,15 @@ is_live(t::TodoListMsg) =
     any(e -> e.status in ("pending", "in_progress"), t.entries)
 is_live(::ChatMsg) = false
 
-# "This tool started but never reached terminal status" — used by the
-# `run_turn!` end-of-turn sweep as a defense-in-depth backstop. Keyed on
-# `status` (NOT `is_live`) so it does NOT match a backgrounded bash whose
-# tool_call already reported `"completed"` at launch (those have a separate
-# lifecycle owned by the bg poller).
-is_turn_orphan(m::ToolMsg)    = !(tool_status(m) in ("completed", "failed"))
-# Streaming AgentMsg / ThoughtMsg whose `close` never ran (session died
-# mid-stream so `process_update!` / `process!` exited via exception before
-# their close-in-finally). The sweep's `close(m)` ships the missing wire
-# final and persists to chat.md — without this they'd remain forever as
-# half-rendered streaming bubbles in JS and missing from disk.
-is_turn_orphan(m::AgentMsg)   = m.in_flight
-is_turn_orphan(m::ThoughtMsg) = m.in_flight
-# Live plan (any pending/in_progress entry) whose driving agent disappeared:
-# `close(::TodoListMsg)` stamps `finished_at` so the JS taskbar removes
-# the slot and the next agent's first `TodoWrite` starts a fresh plan
-# instead of absorbing into the abandoned one. A plan whose entries are
-# all-done already has `finished_at` set; `is_live` is false; we skip.
-is_turn_orphan(m::TodoListMsg) = is_live(m)
-# NOTE: a background `BashToolMsg` (status="completed", in the bar) is
-# DELIBERATELY NOT an orphan. The shell IS a child of the ACP subprocess
-# we just killed — it may or may not have died with its parent depending
-# on process-group / nohup setup. What's stable is the OUTPUT FILE
-# already on disk (and the tail RPC over the WS to the worker), so the
-# poller's existing "fd closed / no growth" detection finalises the
-# bubble naturally if the shell did die, or keeps streaming if it
-# didn't. Force-failing in the sweep would discard accumulated output
-# and skip the natural completion event — worse UX than letting the
-# poller settle it.
-is_turn_orphan(::ChatMsg)     = false
+# (There is no `is_turn_orphan` / `sweep_turn_orphans!` any more. It scanned the
+# whole store at end-of-turn and INFERRED, from a message's status, that its
+# author had gone away. Nothing needs inferring: a message ends when its own
+# stream ends, and every `process_update!` closes its bubble in a `finally` —
+# which cannot be skipped, so the "an exception got past the close" case it was
+# written for did not exist. The one real hole was a single statement sitting
+# OUTSIDE that try (`pin_tool!`); it is inside now. When the connection dies,
+# ACP's `close_turn!` force-fails every live tool and seals the plan, the drain
+# loops end, and the finallys run. See `seal_live_todo!` for the todo half.)
 
 # A background-or-streamy task that deserves a taskbar slot. Default false;
 # Bash with `run_in_background`, Task/Agent with `run_in_background`, and
@@ -1238,7 +1227,33 @@ taskbar_item_for(m::TodoListMsg) = todo_taskbar_item(m)
 # background tasks are ever IN the bar (see `is_taskbar_item`), so these read the
 # per-type DETERMINISTIC completion signal — never `is_background`, never a
 # `task_running`/`bg_running` flag (membership is the one liveness truth).
-isdone(m::TodoListMsg) = !any(e -> e.status in ("pending", "in_progress"), m.entries)
+# A todo list is done when the agent has WORKED it done — every entry terminal —
+# or when the EPISODE that owns it is over, whichever comes first. The second arm
+# is not a nicety: the protocol has no "plan ended" frame, so a list the agent
+# ABANDONS (turn cancelled, agent moved on, worker gone) never reaches all-
+# terminal and, on entries alone, stays live forever. That is the `Todos 0/4`
+# pill that was still counting 35 hours later.
+#
+# Asked, not announced. `session_activity` re-derives itself on read (an
+# `Unprompted` episode expires on QUIET — nothing arrives to announce that), and
+# this runs on the bar's own 1 Hz poll, so there is no exit path anyone has to
+# remember to wire up. Its predecessor was the opposite: `finish_live_todo!`
+# called at three hand-picked turn boundaries, and the one nobody thought of —
+# the worker disconnect, which is not a turn boundary — is the bug.
+function isdone(m::TodoListMsg)
+    all(e -> !(e.status in ("pending", "in_progress")), m.entries) && return true
+    chat = m.chat
+    chat === nothing && return false        # a replayed card: no session to ask
+    c = client(chat.agent)
+    # NOT `session_activity(chat)`, which reports `Idle` for "no session bound"
+    # as well as "the session finished". Those are different answers to this
+    # question: an unbound chat has no episode to have ENDED, so nothing here is
+    # over. (A session that dies is covered without this — the connection's
+    # teardown seals the plan in ACP, which is immediate rather than waiting on
+    # `Unprompted`'s quiet expiry.)
+    c === nothing && return false
+    return !AgentClientProtocol.session_live(c)
+end
 
 # For a BACKGROUND task, leaving the bar is the end of a three-stage story, not
 # the moment the task itself stopped — the agent still has to come back and tell
@@ -2868,7 +2883,14 @@ event => {
 # button (so a frame click still plays/pauses).
 function media_element(src, mime::AbstractString, is_video::Bool; filename::AbstractString = "")
     inner = is_video ?
+        # `playsinline` is not cosmetic: without it iOS Safari force-enters its
+        # own fullscreen the moment you press play, so every tap on a video went
+        # through the fullscreen path whether the user asked for it or not — and
+        # straight into the bug where the render window detached the node under
+        # it. Inline is the right default anyway; fullscreen stays available from
+        # the native controls, as a choice.
         DOM.video(DOM.source(; src, type = mime); controls = true, class = "bt-media",
+            playsinline = true,
             style = Styles("max-width" => "100%", "display" => "block")) :
         DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS,
             style = Styles("max-width" => "100%", "display" => "block", "cursor" => "zoom-in"))
@@ -3354,46 +3376,10 @@ Base.close(m::UserMsg) = (append_user(m.chat.chat_session, m); nothing)
 # runs at INITIAL emit (a fresh `TodoListMsg` that couldn't absorb into
 # a prior bubble), so it must NOT touch `finished_at` — otherwise a
 # brand-new plan with pending entries lands non-live and the JS taskbar
-# misses it. The orphan sweep on `restart_chat_session!` uses the
-# `finalize_orphan!` verb below, NOT this close.
+# misses it. Ending a list is `seal_live_todo!`, NOT this close.
 Base.close(m::TodoListMsg) =
     (append_plan(m.chat.chat_session, m); nothing)
 
-# `finalize_orphan!` — what the restart orphan sweep calls. For most
-# kinds it IS `close` (their normal finalize): AgentMsg / ThoughtMsg
-# close is already idempotent + ships the trailing wire_final; ToolMsg
-# close force-fails non-terminal status + emits the terminal
-# tool_update. For TodoListMsg the two are distinct verbs: `close` is
-# the initial-persist step the live-emit path uses, while
-# `finalize_orphan!` is the "your driving agent went away — stop being
-# live so a fresh one doesn't absorb into you" path. Splitting them
-# avoids the trap where the initial-emit close accidentally drops
-# liveness off a plan whose entries are still pending.
-finalize_orphan!(m::AgentMsg)   = close(m)
-finalize_orphan!(m::ThoughtMsg) = close(m)
-# The orphan sweep force-finalizes a non-terminal tool.
-finalize_orphan!(m::ToolMsg)    = (close(m); nothing)
-function finalize_orphan!(m::TodoListMsg)
-    m.finished_at === nothing || return nothing
-    # A card that is IN the bar leaves it the one way out — `finished!` — because
-    # membership is the single truth about liveness (see TaskBar). Stamping
-    # `finished_at` here and walking away broke that: `is_live` went false while
-    # the card stayed pinned, so the next todo update took the FRESH-list branch
-    # and reassigned `live_todo`. The old card was then owned by nobody —
-    # `finish_live_todo!` only finalizes `live_todo`, and `isdone` can never fire
-    # on entries that were never completed — so it sat in the bar forever,
-    # counting up at whatever it had reached (observed live: `Todos 0/2`, long
-    # after the agent had moved on).
-    in_taskbar(m) && return finished!(m)
-    m.finished_at = time()
-    append_plan(m.chat.chat_session, m)
-    chat_emit(m.chat, plan_update_dict(m))
-    return nothing
-end
-# Default for kinds we don't sweep (UserMsg, SummaryMsg, BashToolMsg in
-# background mode, …). Explicit no-op so dispatch never falls into a
-# generic `close` for something we deliberately don't want finalised.
-finalize_orphan!(::ChatMsg) = nothing
 # Close is TOTAL: every reachable status finalizes. If the status isn't already
 # terminal (cancel mid-tool, EOF, an upstream backstop that closed `updates`
 # without a final snap), treat that as failure — flip to "failed", emit one
@@ -3882,7 +3868,9 @@ function process_update!(b::ChatMsg, m::AgentClientProtocol.Message)
         # is now idempotent + emits `agent_final`/`thought_final`, so the
         # browser sees a finalized bubble instead of one stuck in
         # `bt-stream-active`. If we somehow miss this path the orphan
-        # sweep catches it via `is_turn_orphan(::AgentMsg) = m.in_flight`.
+        # (This is the ONLY thing that closes it — a `finally` cannot be skipped,
+        # which is why the end-of-turn orphan sweep that used to back this up was
+        # covering a case that could not happen.)
         close(b)
     end
     return nothing
@@ -3895,8 +3883,12 @@ end
 # header fields the update path touches.
 function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     h = b.message
-    pin_tool!(h.chat, b)
     try
+        # INSIDE the try. `send!` already put this bubble in the store, so a
+        # throw out here left it there streaming with nothing to close it — the
+        # single window that the end-of-turn orphan sweep existed to cover, for
+        # one line. Under the try it closes itself, where the failure happens.
+        pin_tool!(h.chat, b)
         persist_tool_content!(h.chat.chat_dir, m)
         cache_tool_content!(h.chat, m.id, m.content)
         # The "new" wire event (send!, inside process!) fired BEFORE this
@@ -4119,8 +4111,8 @@ end
 # the generic ToolMsg handling.
 function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
     h = b.message
-    pin_tool!(h.chat, b)
     try
+        pin_tool!(h.chat, b)          # inside the try — see the ToolMsg method
         persist_tool_content!(h.chat.chat_dir, m)
         for snap in m.updates
             h.status  = snap.status
@@ -4366,8 +4358,47 @@ function process!(::ChatModel, m::AgentClientProtocol.TodoWriteCall)
     return nothing
 end
 
-process!(chat::ChatModel, m::AgentClientProtocol.Plan) =
-    process_todo!(chat, m.entries)
+# A SEALED plan (`live = false`) is ACP telling us this list's stream is over and
+# will never update again: the turn was cancelled, the agent died, the worker went
+# away, the connection was torn down. There is nothing to update and nothing to
+# decide here; the list leaves the bar with the statuses it had.
+#
+# This is the half no consumer can work out for itself. The other half — an
+# episode that simply ENDS, which is the ordinary case — needs no message at all:
+# `isdone` asks the session what it is doing (see there). Between them there is no
+# exit path left for anyone to forget, which is the point: the predecessor was
+# `finish_live_todo!` called at three hand-picked turn boundaries, and the one
+# nobody thought of (a worker disconnect is not a turn boundary) is why todo pills
+# were still counting 35 hours later.
+function process!(chat::ChatModel, m::AgentClientProtocol.Plan)
+    m.live || return seal_live_todo!(chat)
+    return process_todo!(chat, m.entries)
+end
+
+# The live list stops being live, keeping its entries exactly as they are. The
+# ONE verb for that, with the sealed `Plan` above as its only caller — so it is
+# driven by ACP stating the stream ended, never by anyone inferring it from a
+# status. (This is what used to be `finalize_orphan!(::TodoListMsg)`, reached
+# from the turn-end/restart sweep. The sweep guessed; this is told.)
+#
+# A card that is IN the bar leaves it the one way out — `finished!` — because
+# membership is the single truth about liveness (see TaskBar). Stamping
+# `finished_at` here and walking away broke that: `is_live` went false while the
+# card stayed pinned, so the next todo update took the FRESH-list branch and
+# reassigned `live_todo`. The old card was then owned by nobody — this path only
+# finalizes `live_todo`, and `isdone` can never fire on entries that were never
+# completed — so it sat in the bar forever, counting up at whatever it had
+# reached (observed live: `Todos 0/2`, long after the agent had moved on).
+function seal_live_todo!(chat::ChatModel)
+    m = shared(chat).live_todo[]
+    m isa TodoListMsg || return nothing
+    m.finished_at === nothing || return nothing
+    in_taskbar(m) && return finished!(m)
+    m.finished_at = time()
+    append_plan(m.chat.chat_session, m)
+    chat_emit(m.chat, plan_update_dict(m))
+    return nothing
+end
 
 # `source = t` lets the slot re-derive its rows from the LIVE message on each
 # clock tick (`taskbar_todo_rows` below) — entries update in-place, so a static
@@ -4488,40 +4519,46 @@ plan_update_dict(m::TodoListMsg) = merge(msg_to_dict(m),
 # response frame.
 function run_chat!(chat::ChatModel)
     for user_msg in chat.user_messages
-        # The prompt REGISTRATION + wire send happen HERE, in the consumer,
-        # so prompts hit the wire in user order (an all-async spawn could
-        # schedule turn 2's registration before turn 1's). Only the drain
-        # of the turn's update stream runs in its own task.
-        turn = try
-            begin_turn!(chat, user_msg)
-        catch e
-            @error "starting chat turn failed" exception = (e, catch_backtrace())
-            # Don't drop silently: surface the failure the way `drain_turn!`
-            # does, so a turn that couldn't even start (e.g. the session died as
-            # we sent the prompt — a worker crash, or a restart we didn't catch
-            # in `begin_turn!`'s wait) shows an offline state / error instead of
-            # the user's already-rendered message vanishing with no reply.
-            ec = innermost_cause(e)
-            if is_session_dead_error(ec)
-                chat.session_alive[] = false
-                chat.last_error[] = sprint(showerror, ec)
-            else
-                close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, ec))]")))
+        # The slot is held across the WHOLE turn — bring-up, prompt, drain,
+        # cleanup — by one scope that releases it however this body leaves. That
+        # is the only claim and the only release; `busy` reads it and nothing
+        # else writes it.
+        with_turn_slot!(chat) do
+            # The prompt REGISTRATION + wire send happen HERE, in the consumer,
+            # so prompts hit the wire in user order (an all-async spawn could
+            # schedule turn 2's registration before turn 1's). Only the drain
+            # of the turn's update stream runs in its own task.
+            turn = try
+                begin_turn!(chat, user_msg)
+            catch e
+                @error "starting chat turn failed" exception = (e, catch_backtrace())
+                # Don't drop silently: surface the failure the way `drain_turn!`
+                # does, so a turn that couldn't even start (e.g. the session died as
+                # we sent the prompt — a worker crash, or a restart we didn't catch
+                # in `begin_turn!`'s wait) shows an offline state / error instead of
+                # the user's already-rendered message vanishing with no reply.
+                ec = innermost_cause(e)
+                if is_session_dead_error(ec)
+                    chat.session_alive[] = false
+                    chat.last_error[] = sprint(showerror, ec)
+                else
+                    close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, ec))]")))
+                end
+                nothing
             end
-            nothing
-        end
-        turn === nothing && continue
-        # AWAITED, not spawned. Spawning it let the loop come straight back
-        # around and `begin_turn!` the next message while this turn was still
-        # streaming — so every queued bubble was promoted (and its prompt put on
-        # the wire) within milliseconds of being typed. That is why the queued
-        # badge never appeared, why two quick sends both claimed "next up", and
-        # why stop could not drain a queue: there wasn't one on our side, only
-        # the agent's own promptQueueing. One turn at a time, as documented.
-        try
-            drain_turn!(chat, turn)
-        catch e
-            @error "chat turn failed" exception = (e, catch_backtrace())
+            turn === nothing && return
+            # AWAITED, not spawned. Spawning it let the loop come straight back
+            # around and `begin_turn!` the next message while this turn was still
+            # streaming — so every queued bubble was promoted (and its prompt put on
+            # the wire) within milliseconds of being typed. That is why the queued
+            # badge never appeared, why two quick sends both claimed "next up", and
+            # why stop could not drain a queue: there wasn't one on our side, only
+            # the agent's own promptQueueing. One turn at a time, as documented.
+            try
+                drain_turn!(chat, turn)
+            catch e
+                @error "chat turn failed" exception = (e, catch_backtrace())
+            end
         end
     end
     return nothing
@@ -4784,13 +4821,48 @@ end
 Whether to claim the agent is working. DERIVED, never stored: a turn of ours is
 open, or the connection says the agent is doing something on its own.
 
-`turns_active` is not redundant with `Prompted` — it covers the window between
-claiming a turn slot and the prompt actually reaching the wire, where the
-connection has no span yet but the user has already pressed send.
+`turn_in_flight` is not redundant with `Prompted`, and the interesting half is
+the TAIL, not the head. `register_prompt!` runs before the wire send, so the gap
+at the start is microseconds. The gap at the end is not: the span resolves (ACP
+goes `Idle` at once — the dispatcher zeroes `last_work_at` when the last span
+goes) while we are still waiting on the render barrier and running end-of-turn
+cleanup. Dropping this term would report the chat as free while its single
+consumer is still occupied, so a message sent into that window would render
+without the queued badge and then sit behind the turn anyway.
 """
 busy(chat::ChatModel) =
-    lock(() -> shared(chat).turns_active[], shared(chat).lock) > 0 ||
+    lock(() -> shared(chat).turn_in_flight[], shared(chat).lock) ||
     AgentClientProtocol.is_working(session_activity(chat))
+
+"""
+    with_turn_slot!(f, chat)
+
+Claim the consumer's turn slot for the duration of `f`, publishing the spinner on
+both edges.
+
+ONE lexical scope owns the claim and the release, so no path out of `f` — an
+early return from `begin_turn!`, a throw, a cancel, a closed channel — can leave
+the slot held and the chat stuck reporting "working" forever. It used to be a
+counter bumped in `begin_turn!` and dropped in `drain_turn!`'s `finally`: correct
+for the two callers that existed, but a contract BETWEEN two functions is the
+shape that eventually gets a third caller who doesn't know about it.
+"""
+function with_turn_slot!(f, chat::ChatModel)
+    s = shared(chat)
+    lock(() -> (s.turn_in_flight[] = true), s.lock)
+    # `refresh_activity!` writes unconditionally, which is the point: every write
+    # re-broadcasts to every open tab, and that is what repairs a tab whose bridge
+    # missed an update. A guarded write never can — the value is already what we
+    # would set, so nothing ships and the tab stays wrong through every message
+    # you send. That is the "stuck on Waiting for your next instruction" shape.
+    refresh_activity!(chat)
+    try
+        return f()
+    finally
+        lock(() -> (s.turn_in_flight[] = false), s.lock)
+        refresh_activity!(chat)
+    end
+end
 
 # An auto-wake episode is now just `Unprompted`, so "is the agent reporting back
 # on its own" is a question about the session, not a flag of ours.
@@ -4892,29 +4964,14 @@ function retire_reporting!(chat::ChatModel)
     return nothing
 end
 
-# The episode ended: retire its pills and finalize the todo list it built.
+# The episode ended: retire its pills.
+#
+# It does NOT finalize the episode's todo list, though it used to. That list goes
+# when `isdone` next asks the session what it is doing and hears `Idle` — an
+# answer this edge does not have to deliver, and which is equally available on
+# paths that never reach here (a dead worker, a quiet episode nobody ends).
 function leave_unprompted!(chat::ChatModel)
-    s = shared(chat)
     retire_reporting!(chat)
-    # An episode that built a todo list finalizes it into history, exactly as a
-    # turn does — there is no held-open turn to keep it live. Without this the
-    # card sits in the bar frozen at whatever it reached (observed: `Todos 0/2`
-    # still pinned long after the work moved on).
-    #
-    # Only when nothing else is running: under steering the live list belongs to
-    # the turn still in flight.
-    lock(() -> s.turns_active[], s.lock) == 0 && finish_live_todo!(chat)
-    return nothing
-end
-
-function finish_live_todo!(chat::ChatModel)
-    # A live todo list dies with the episode that built it: finalize it (zombied
-    # — the statuses show how far it got) into the chat history; the taskbar slot
-    # drops. Called at both ends of a turn, since an auto-wake episode builds its
-    # own list with no end_turn of its own to finish it.
-    let t = shared(chat).live_todo[]
-        t isa TodoListMsg && finished!(t)
-    end
     return nothing
 end
 
@@ -5092,17 +5149,11 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     # the last turn: seal it and wait, so its messages persist + finalize before
     # the turn's own messages (store order).
     flush_main!(chat)
-    # That episode had no end_turn of its own, so its todo list is finalized
-    # here. ONLY when nothing else is running: under steering a live list belongs
-    # to the turn still in flight, and finalizing it would zombie a list the
-    # agent is still working (`drain_turn!` does it for the last real turn).
-    lock(() -> s.turns_active[], s.lock) == 0 && finish_live_todo!(chat)
     # A boundary the agent cannot omit: whatever the episode did or didn't
     # report, a new turn of ours ends it. `refresh_activity!` runs the leave-EDGE
-    # (which also finalizes the episode's todo list) and republishes the
-    # spinner; `retire_reporting!` is the BOUNDARY half, and runs even when no
-    # episode was ever open — a task can finish with the agent having nothing to
-    # say about it, and its pill still has to go.
+    # and republishes the spinner; `retire_reporting!` is the BOUNDARY half, and
+    # runs even when no episode was ever open — a task can finish with the agent
+    # having nothing to say about it, and its pill still has to go.
     refresh_activity!(chat)
     retire_reporting!(chat)
     # A turn can still be drained from the channel AFTER the chat is closed:
@@ -5137,53 +5188,41 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
         cli = client(chat.agent)
     end
     cli === nothing && return nothing
-    lock(() -> s.turns_active[] += 1, s.lock)
-    # The slot is claimed, so `busy` is now true by derivation — publish it.
-    # (`refresh_activity!` writes unconditionally, which is the point: every
-    # write re-broadcasts to every open tab, and that is what repairs a tab whose
-    # bridge missed an update. A guarded write never can — the value is already
-    # what we would set, so nothing ships and the tab stays wrong through every
-    # message you send. That is the "stuck on Waiting for your next instruction"
-    # shape.)
-    refresh_activity!(chat)
+    # (The turn slot is already held — `with_turn_slot!` claimed it around this
+    # whole call, so the waits and the lazy bind above are inside it too. That is
+    # deliberate: the user has pressed send, and a spinner that only lights once
+    # the agent is up reads as "Waiting for your next instruction" through the
+    # entire bring-up.)
+    #
     # Ship the turn's sequence number — a stop-click echoes it back so the
     # cancel can be scoped to THIS turn (see CancelCommand).
     seq = (s.turn_seq[] += 1)
     chat_emit(chat, Dict{String,Any}("type" => "turn_begin", "seq" => seq))
-    try
-        # The turn's CONTENT does not come back from here — it is the main
-        # thread talking, and `main_consumer!` is already rendering it. What we
-        # get is the span: a one-shot response channel that settles with the
-        # stopReason.
-        turn = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
-            images=user_msg.images)
-        # The prompt is registered + on the wire: the oldest pending bubble
-        # (FIFO — matches the channel order under `send_message!`, same pairing
-        # `promote_queued_user_bubble!` relies on) has now been SEEN by the
-        # agent, so it stops counting as a fresh/unsent message for reconciles.
-        # On a throw below the bubble stays pending — the agent never got it.
-        lock(s.lock) do
-            isempty(s.pending_sends) || popfirst!(s.pending_sends)
-        end
-        return turn
-    catch e
-        # Failed to even send: release the slot we claimed; surface the error
-        # like a failed turn would. A failed start releases the last turn, so
-        # busy tracks `turns_active > 0` (false here).
-        lock(s.lock) do
-            s.turns_active[] -= 1
-        end
-        refresh_activity!(chat)
-        rethrow()
+    # The turn's CONTENT does not come back from here — it is the main thread
+    # talking, and `main_consumer!` is already rendering it. What we get is the
+    # span: a one-shot response channel that settles with the stopReason.
+    turn = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
+        images=user_msg.images)
+    # The prompt is registered + on the wire: the oldest pending bubble
+    # (FIFO — matches the channel order under `send_message!`, same pairing
+    # `promote_queued_user_bubble!` relies on) has now been SEEN by the
+    # agent, so it stops counting as a fresh/unsent message for reconciles.
+    # A throw above leaves the bubble pending — the agent never got it.
+    lock(s.lock) do
+        isempty(s.pending_sends) || popfirst!(s.pending_sends)
     end
+    return turn
 end
 
 # Test seam: the old single-call entry, used by unit tests that drive one
-# turn synchronously.
+# turn synchronously. Takes the turn slot exactly as `run_chat!` does, so a test
+# driving a turn through here sees the same `busy` the app does.
 function run_turn!(chat::ChatModel, user_msg::UserMessage)
-    turn = begin_turn!(chat, user_msg)
-    turn === nothing && return nothing
-    return drain_turn!(chat, turn)
+    return with_turn_slot!(chat) do
+        turn = begin_turn!(chat, user_msg)
+        turn === nothing && return nothing
+        return drain_turn!(chat, turn)
+    end
 end
 
 # ── Yolo mode (autonomous auto-continue) ────────────────────────────────────
@@ -5319,11 +5358,12 @@ end
 
 function drain_turn!(chat::ChatModel, turn)
     s = shared(chat)
-    # Busy simply tracks `turns_active > 0`: the agent settles the turn with
-    # `end_turn` at the result (verified in claude-agent-acp — it deliberately
-    # does NOT hold the turn open waiting on detached background work), so a
-    # turn ends when the answer is done. A detached background task lives in the
-    # taskbar, not in a held-open turn, so there's no mid-turn dimming to do.
+    # Busy tracks the turn slot this runs inside (`with_turn_slot!`): the agent
+    # settles the turn with `end_turn` at the result (verified in
+    # claude-agent-acp — it deliberately does NOT hold the turn open waiting on
+    # detached background work), so a turn ends when the answer is done. A
+    # detached background task lives in the taskbar, not in a held-open turn, so
+    # there's no mid-turn dimming to do.
     #
     # Track whether the turn produced ANY visible message, so a turn that ends
     # with nothing (e.g. a freshly-switched provider that isn't authenticated
@@ -5364,108 +5404,95 @@ function drain_turn!(chat::ChatModel, turn)
     finally
         # The barrier: cleanup below reads the store, so everything this turn
         # said has to be IN it. We wait on the turn's OWN end marker rather than
-        # injecting one, so a concurrent (steering) turn's opening text is not
-        # swept into this turn's last bubble.
+        # injecting one, so nothing that arrives after it is swept into this
+        # turn's last bubble.
         wait_rendered!(chat, turn.flush)
-        # End-of-turn cleanup belongs to the LAST active turn only. On a
-        # handoff (this turn resolved because a newer prompt took over the
-        # stream) the conversation is still going: sweeping orphans here
-        # would force-fail the successor's live tools, and finalizing the
-        # todo list would zombie a list the successor is still working.
-        last_turn = lock(() -> (s.turns_active[] -= 1) == 0, s.lock)
-        if last_turn
-            # Derived, and published on the SHARED model: the per-tab
-            # `busy_active` is a session-scoped child (parent→child only), so
-            # writing that one left the parent stuck true and every other
-            # tab/reload rendering "working" forever.
-            refresh_activity!(chat)
-            # The turn added messages (agent reply, tools, …) → refresh the
-            # lens autocomplete vocabulary so new tool/type keys are
-            # suggestable. (Emitted on mount too, but that's before any
-            # messages exist.)
-            emit_lens_vocab(chat)
-            # Defensive thinking=off. `process!(::Thought)` already emits this
-            # in its own finally, but in the multi-thought turn case the LAST
-            # thought may not be reached if an exception unwinds through the
-            # renderer; this one-line backstop guarantees the JS indicator is
-            # cleared regardless. Idempotent in the JS handler.
-            chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => false))
-            # Defense in depth: anything still in non-terminal status at end-of-turn is
-            # an orphan — the `process_update!` per-tool drain SHOULD have finalized it
-            # via `close(b)` once the ACP `close(::TurnState)` backstop force-failed
-            # any tool the agent never resolved (see messages.jl). This sweep catches
-            # the case where `process!` itself threw before reaching that close. Keyed
-            # on `is_turn_orphan` — `ToolMsg` keys on status, `AgentMsg`/`ThoughtMsg`
-            # on `in_flight`, so background bashes (status already "completed" at
-            # launch) and live worker apps are correctly left alone, but a half-
-            # streamed agent reply / thought lands properly finalized in JS.
-            sweep_turn_orphans!(chat)
-            # A cancelled turn can abandon a pending permission/question card —
-            # the agent's request died with the turn, but the blocked handler
-            # would otherwise wait out its full timeout and the card would
-            # linger on screen. Resolve this chat's pending asks now (the reply
-            # lands on a dead request id, which the agent ignores).
-            sweep_pending_asks!(chat)
-            finish_live_todo!(chat)
-            # Empty turn: the agent resolved without emitting any message (no
-            # text, tool, or thought). Surface something rather than leave the
-            # user staring at silence — but only ASSERT a cause we actually know.
-            #
-            # Do NOT diagnose. This used to assert a cause — "the model may be
-            # unavailable on your plan, or the provider may need
-            # authentication" — and it was wrong both times a user reported it,
-            # sending them off checking logins over a turn that had simply been
-            # stopped.
-            #
-            # `cancel_at` is not enough to tell: it is stamped when stop is
-            # pressed and CLEARED by `reset_turn_state!` at the next request, so
-            # the turn that comes back empty is usually the one AFTER the
-            # cancelled one — the agent is still unwinding, and the stamp is
-            # already gone. Rather than chase that, say what is observable (no
-            # reply) and offer the possibilities without picking one.
-            cancelled = stop_reason == "cancelled"
-            stopped   = (c = client(chat.agent);
-                         c !== nothing && (@atomic c.conn.cancel_at) > 0)
-            if !errored && !cancelled &&
-               lock(() -> length(s.msgs_store), s.lock) == nstore0
-                close(send!(chat, AgentMsg(chat, stopped ?
-                    "_Stopped — the turn ended with no reply._" :
-                    "_The agent ended the turn without a reply. This often " *
-                    "follows a stop, and can also mean the selected model is " *
-                    "unavailable or the provider needs authentication._")))
+        # This cleanup used to be gated on being the LAST of several active
+        # turns. There are no several: `run_chat!` AWAITS each turn (15e1f76 —
+        # before that the drain was spawned and turns really did overlap), so
+        # the gate was always open. It is gone rather than left as a comforting
+        # no-op, because a dead guard reads like a live invariant.
+        #
+        # Published on the SHARED model: the per-tab
+        # `busy_active` is a session-scoped child (parent→child only), so
+        # writing that one left the parent stuck true and every other
+        # tab/reload rendering "working" forever.
+        refresh_activity!(chat)
+        # The turn added messages (agent reply, tools, …) → refresh the
+        # lens autocomplete vocabulary so new tool/type keys are
+        # suggestable. (Emitted on mount too, but that's before any
+        # messages exist.)
+        emit_lens_vocab(chat)
+        # Defensive thinking=off. `process!(::Thought)` already emits this
+        # in its own finally, but in the multi-thought turn case the LAST
+        # thought may not be reached if an exception unwinds through the
+        # renderer; this one-line backstop guarantees the JS indicator is
+        # cleared regardless. Idempotent in the JS handler.
+        chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => false))
+        # A cancelled turn can abandon a pending permission/question card —
+        # the agent's request died with the turn, but the blocked handler
+        # would otherwise wait out its full timeout and the card would
+        # linger on screen. Resolve this chat's pending asks now (the reply
+        # lands on a dead request id, which the agent ignores).
+        sweep_pending_asks!(chat)
+        # Empty turn: the agent resolved without emitting any message (no
+        # text, tool, or thought). Surface something rather than leave the
+        # user staring at silence — but only ASSERT a cause we actually know.
+        #
+        # Do NOT diagnose. This used to assert a cause — "the model may be
+        # unavailable on your plan, or the provider may need
+        # authentication" — and it was wrong both times a user reported it,
+        # sending them off checking logins over a turn that had simply been
+        # stopped.
+        #
+        # `cancel_at` is not enough to tell: it is stamped when stop is
+        # pressed and CLEARED by `reset_turn_state!` at the next request, so
+        # the turn that comes back empty is usually the one AFTER the
+        # cancelled one — the agent is still unwinding, and the stamp is
+        # already gone. Rather than chase that, say what is observable (no
+        # reply) and offer the possibilities without picking one.
+        cancelled = stop_reason == "cancelled"
+        stopped   = (c = client(chat.agent);
+                     c !== nothing && (@atomic c.conn.cancel_at) > 0)
+        if !errored && !cancelled &&
+           lock(() -> length(s.msgs_store), s.lock) == nstore0
+            close(send!(chat, AgentMsg(chat, stopped ?
+                "_Stopped — the turn ended with no reply._" :
+                "_The agent ended the turn without a reply. This often " *
+                "follows a stop, and can also mean the selected model is " *
+                "unavailable or the provider needs authentication._")))
+        end
+        # Yolo mode: keep the agent going autonomously until it answers `no`.
+        if shared(chat).yolo[] && !errored && !cancelled
+            # This turn's messages are msgs_store[nstore0+1:end] (nstore0
+            # captured at turn start). Find the LAST AgentMsg among them =
+            # the agent's final reply.
+            reply = lock(s.lock) do
+                idx = findlast(m -> m isa AgentMsg, @view s.msgs_store[(nstore0+1):end])
+                idx === nothing ? "" : s.msgs_store[nstore0+idx].text
             end
-            # Yolo mode: keep the agent going autonomously until it answers `no`.
-            if shared(chat).yolo[] && !errored && !cancelled
-                # This turn's messages are msgs_store[nstore0+1:end] (nstore0
-                # captured at turn start). Find the LAST AgentMsg among them =
-                # the agent's final reply.
-                reply = lock(s.lock) do
-                    idx = findlast(m -> m isa AgentMsg, @view s.msgs_store[(nstore0+1):end])
-                    idx === nothing ? "" : s.msgs_store[nstore0+idx].text
-                end
-                # A missing reply is NOT a bail: a turn ending on a tool call has
-                # no closing text, which used to stop Yolo silently.
-                produced = lock(() -> length(s.msgs_store), s.lock) > nstore0
-                stop_reason = yolo_stop_reason(reply, produced, s.yolo_streak[])
-                repeated    = yolo_repeating(reply, s.yolo_last[])
-                if stop_reason !== nothing
-                    # Every stop is VISIBLE. A loop that just goes quiet reads as
-                    # a hang; saying why is the difference between "it finished"
-                    # and "it gave up". Declining via the sentinel is the one
-                    # silent case — the agent's own last message already says it.
-                    isempty(stop_reason) ||
-                        close(send!(chat, AgentMsg(chat, "_Yolo stopped: $(stop_reason)._")))
-                    s.yolo_streak[] = 0
-                    s.yolo_last[] = ""
-                else
-                    s.yolo_streak[] += 1
-                    s.yolo_last[] = yolo_norm(reply)
-                    Base.errormonitor(@async try
-                        send_message!(chat, yolo_user_msg(chat; repeated = repeated))
-                    catch e
-                        @warn "yolo auto-continue send failed" project_id = chat.project_id exception = (e, catch_backtrace())
-                    end)
-                end
+            # A missing reply is NOT a bail: a turn ending on a tool call has
+            # no closing text, which used to stop Yolo silently.
+            produced = lock(() -> length(s.msgs_store), s.lock) > nstore0
+            stop_reason = yolo_stop_reason(reply, produced, s.yolo_streak[])
+            repeated    = yolo_repeating(reply, s.yolo_last[])
+            if stop_reason !== nothing
+                # Every stop is VISIBLE. A loop that just goes quiet reads as
+                # a hang; saying why is the difference between "it finished"
+                # and "it gave up". Declining via the sentinel is the one
+                # silent case — the agent's own last message already says it.
+                isempty(stop_reason) ||
+                    close(send!(chat, AgentMsg(chat, "_Yolo stopped: $(stop_reason)._")))
+                s.yolo_streak[] = 0
+                s.yolo_last[] = ""
+            else
+                s.yolo_streak[] += 1
+                s.yolo_last[] = yolo_norm(reply)
+                Base.errormonitor(@async try
+                    send_message!(chat, yolo_user_msg(chat; repeated = repeated))
+                catch e
+                    @warn "yolo auto-continue send failed" project_id = chat.project_id exception = (e, catch_backtrace())
+                end)
             end
         end
     end
@@ -5487,24 +5514,6 @@ function sweep_pending_asks!(chat::ChatModel)
             put!(ch, default)
         catch e
             e isa InvalidStateException || rethrow()
-        end
-    end
-    return nothing
-end
-
-function sweep_turn_orphans!(chat::ChatModel)
-    orphans = lock(chat.lock) do
-        ChatMsg[m for m in chat.msgs_store if is_turn_orphan(m)]
-    end
-    for m in orphans
-        try
-            # Dispatch to the kind-specific orphan verb (close for agent/
-            # thought/tool, the dedicated final stamp for TodoListMsg).
-            # Going through `close` directly would force a live plan into
-            # its initial-persist path AGAIN instead of finalising it.
-            finalize_orphan!(m)
-        catch e
-            @warn "turn-orphan sweep finalize failed" id = msg_id(m) exception = e
         end
     end
     return nothing
@@ -5854,7 +5863,7 @@ end
 # and the state dies with the chat. Two concurrent restart calls would otherwise
 # both close(old_client), both wait, both call start_chat_client! — at best one
 # losing its newly-spawned client, at worst deadlocking because each blocks the
-# consumer task's `sweep_turn_orphans!` from acquiring `model.lock`. `restart_lock`
+# consumer task from acquiring `model.lock`. `restart_lock`
 # guards the brief read-test-set; `restart_inflight` elects the single worker; and
 # `restart_gen` is the monotonic "restart requested" counter — every call bumps it
 # and the in-flight worker re-runs the bring-up until it has satisfied the LATEST
@@ -5879,7 +5888,7 @@ function bring_up_once!(model::ChatModel)
             # Wait for the in-flight turn (if any) to actually exit so its
             # try/catch/finally in `run_turn!` runs to completion BEFORE we
             # boot a fresh client (it emits the trailing `thinking=false`, runs
-            # `sweep_turn_orphans!`, clears `busy_active`). Racing past it lets
+            # clears `busy_active`). Racing past it lets
             # the new client emit chunks against the same comm while the old
             # finally is still running — undefined wire ordering. Bounded so a
             # wedged consumer can't block us forever.
@@ -5895,7 +5904,10 @@ function bring_up_once!(model::ChatModel)
         lock(() -> (s.activity_seen[] = AgentClientProtocol.Idle()), s.lock)
         refresh_activity!(s)
         chat_emit(s, Dict{String,Any}("type" => "thinking", "active" => false))
-        sweep_turn_orphans!(s)
+        # (No orphan sweep. Closing the old client ends its stream, and ACP's
+        # teardown force-fails every live tool + seals the plan on the way out;
+        # the drain loops then run their own finallys. Nothing here has to walk
+        # the store deciding who was left behind.)
         # JS-side reset: drop any UI state attached to the dead session before
         # the new client can emit against it.
         chat_emit(s, Dict{String,Any}("type" => "session_reset"))
@@ -6252,7 +6264,11 @@ keep_in_history(m::AgentClientProtocol.AgentMessage) = !isempty(strip(m.text))
 keep_in_history(m::AgentClientProtocol.UserMessage)  = !isempty(strip(m.text))
 keep_in_history(m::AgentClientProtocol.Thought)      = false
 keep_in_history(m::AgentClientProtocol.ToolCall)     = true
-keep_in_history(m::AgentClientProtocol.Plan)         = true
+# A SEALED plan is not a history entry — it is the end-of-life signal for a list
+# already replayed above it, so adopting it would append a second, identical todo
+# card to the resumed conversation. (Replay ends like any other stream, so
+# `close_turn!` seals whatever plan the history left live.)
+keep_in_history(m::AgentClientProtocol.Plan)         = m.live
 # Metadata messages (config/mode/usage/commands) are session state, not
 # history. Explicit methods, not a `::Message` fallback: a NEW message kind
 # reaching the reconciler should fail loudly so its history policy is a

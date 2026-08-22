@@ -1,19 +1,16 @@
 @testitem "unit:busy" tags = [:unit] begin
 
-# Busy contract (post-quiescence-refactor): the chat spinner
-# (`busy_active::Observable{Bool}`) simply reflects "a turn is open" —
-# `busy = turns_active > 0`. The agent settles the turn with `end_turn` at the
-# result (verified in claude-agent-acp) and deliberately does NOT hold the turn
-# open waiting on detached background work, so there is no mid-turn dimming and
-# no wire-silence / tool-liveness machinery. A detached background task lives in
-# the taskbar, not in a held-open turn.
+# Busy contract: the chat spinner (`busy_active::Observable{Bool}`) reflects "the
+# consumer is inside a turn" — the slot `with_turn_slot!` holds. The agent settles
+# the turn with `end_turn` at the result (verified in claude-agent-acp) and
+# deliberately does NOT hold the turn open waiting on detached background work, so
+# there is no mid-turn dimming and no wire-silence / tool-liveness machinery. A
+# detached background task lives in the taskbar, not in a held-open turn.
 #
-# These tests drive the real tool lifecycle functions (`process_update!`,
-# `finished!`) headlessly — no worker, no live agent, no Electron — plus
-# the `begin_turn!`/`drain_turn!` turn accounting, and assert:
-#   • busy is true while a turn is open, false once the turn ends,
-#   • the KEY change: busy STAYS true while a turn is held open even with a live
-#     background bash (no more "off when only a bg shell remains").
+# These drive the REAL claim/release. They used to assign `turns_active` and
+# `busy_active` by hand and assert what they had just written, which is why they
+# stayed green through everything: nothing under test ran. `with_turn_slot!` is now
+# the only thing that touches either, so a test can enter it and look.
 
 using Test
 using BonitoAgents
@@ -47,24 +44,31 @@ function launch_bg_bash!(model, id)
     return m
 end
 
-@testset "busy = turns_active > 0" begin
+@testset "busy follows the consumer's turn slot" begin
 
     @testset "busy true while a turn is open, false after it ends" begin
         model = headless_model()
-        @test model.turns_active[] == 0
+        @test model.turn_in_flight[] == false
         @test model.busy_active[] == false
 
-        # Open a turn: begin_turn! bumps the counter and lights the spinner.
-        lock(() -> (model.turns_active[] += 1), model.lock)
-        model.busy_active[] = true
-        @test model.busy_active[] == true
+        BT.with_turn_slot!(model) do
+            # The claim edge PUBLISHES — the spinner is not something the caller
+            # sets alongside; `busy` is derived and `refresh_activity!` ships it.
+            @test model.turn_in_flight[] == true
+            @test model.busy_active[] == true
+        end
+        @test model.turn_in_flight[] == false
+        @test model.busy_active[] == false      # ...and the release edge clears it
+    end
 
-        # Close the turn: drain_turn!'s finally decrements and, on the last turn,
-        # clears the spinner.
-        last_turn = lock(() -> (model.turns_active[] -= 1) == 0, model.lock)
-        @test last_turn
-        model.busy_active[] = false
-        @test model.turns_active[] == 0
+    @testset "the slot is released even when the turn throws" begin
+        # The reason claim and release live in ONE scope. When they were a pair
+        # spanning `begin_turn!` and `drain_turn!`, any path that left between
+        # them stranded the slot — and a stranded slot is a chat that reports
+        # "working" forever, with no way back short of a restart.
+        model = headless_model()
+        @test_throws ErrorException BT.with_turn_slot!(() -> error("boom"), model)
+        @test model.turn_in_flight[] == false
         @test model.busy_active[] == false
     end
 
@@ -76,29 +80,26 @@ end
         @test BT.is_live(m) == true
 
         # ...and a turn is open (the agent is blocked on foreground work while the
-        # bg shell streams). The KEY change: busy must NOT dim just because the
-        # only live tool is a background shell — it tracks the open turn.
-        lock(() -> (model.turns_active[] += 1), model.lock)
-        model.busy_active[] = true
-        @test model.busy_active[] == true
-
-        # The bg shell finishing does not touch busy; only the turn ending does.
-        BT.finished!(m)                      # bar's loop calls this when the fd closes
-        @test model.busy_active[] == true    # turn still open ⇒ still busy
-
+        # bg shell streams). busy must NOT dim just because the only live tool is
+        # a background shell — it tracks the open turn.
+        BT.with_turn_slot!(model) do
+            @test model.busy_active[] == true
+            # The bg shell finishing does not touch busy; only the turn ending does.
+            BT.finished!(m)                  # bar's loop calls this when the fd closes
+            BT.refresh_activity!(model)      # even re-derived, the slot rules
+            @test model.busy_active[] == true
+        end
         # Turn ends → spinner clears, even though a taskbar task may linger.
-        lock(() -> (model.turns_active[] -= 1), model.lock)
-        model.busy_active[] = false
         @test model.busy_active[] == false
     end
 
     @testset "a detached bg task lives in the taskbar, not a held-open turn" begin
         model = headless_model()
         # Background launch ends the turn immediately (end_turn at the result):
-        # turns_active is 0, busy is off, but the task is still live for the
+        # no slot is held, busy is off, but the task is still live for the
         # taskbar poller.
         m = launch_bg_bash!(model, "bg2")
-        @test model.turns_active[] == 0
+        @test model.turn_in_flight[] == false
         @test model.busy_active[] == false
         @test BT.in_taskbar(m) == true       # membership IS liveness
         @test BT.is_taskbar_item(m) == true

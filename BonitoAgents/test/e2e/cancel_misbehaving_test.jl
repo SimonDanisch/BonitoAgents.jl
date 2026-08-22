@@ -105,7 +105,7 @@ function busy_diag(s)
     cli  = BA.client(m.agent)
     conn = cli === nothing ? nothing : cli.conn
     return (; pid,
-            turns_active   = lock(() -> sh.turns_active[], sh.lock),
+            turn_in_flight = lock(() -> sh.turn_in_flight[], sh.lock),
             busy           = BA.busy(m),
             activity       = string(BA.session_activity(m)),
             active_prompts = conn === nothing ? -1 :
@@ -144,7 +144,7 @@ end
         # the arriving prompt itself cleared, so it took the STREAMING branch
         # and looped forever — the chat was busy because the agent genuinely
         # never stopped talking. Fixed in MockACP with a sticky `INTERRUPTED`
-        # latch; the diagnostic below is what named it (turns_active = 1,
+        # latch; the diagnostic below is what named it (turn slot held,
         # activity = Prompted, active_prompts = 1 ⇒ a prompt on the wire that
         # never settled, not a lost turn slot on our side).
         #
@@ -160,7 +160,7 @@ end
         catch e
             e isa InterruptException && rethrow()
             # `busy` is a derivation of exactly two things, and the spinner alone
-            # cannot say which one is stuck: OUR turn slot (`turns_active`, held
+            # cannot say which one is stuck: OUR turn slot (`turn_in_flight`, held
             # by a `drain_turn!` that never finished) or the CONNECTION's view
             # (`Cancelling` persists while any prompt is active — see
             # `settle(::Cancelling, …)`). Naming the half is the whole

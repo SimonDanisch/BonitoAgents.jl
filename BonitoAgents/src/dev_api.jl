@@ -281,7 +281,7 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "last_error"     => sh.last_error[],
         "yolo"           => sh.yolo[],
         "provider"       => string(sh.provider[]),
-        "turns_active"   => sh.turns_active[],
+        "turn_in_flight" => sh.turn_in_flight[],
         "turn_seq"       => sh.turn_seq[],
         "taskbar_items"  => length(sh.taskbar.items[]),
         "pending_sends"  => lock(() -> length(sh.pending_sends), sh.lock),

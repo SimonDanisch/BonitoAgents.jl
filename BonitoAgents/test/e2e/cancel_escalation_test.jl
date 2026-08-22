@@ -52,9 +52,21 @@
             # Kick off a turn: streams the long story; the ignore-cancel mock won't
             # stop on `session/cancel`, so the turn stays busy.
             BA.send_message!(model, BA.UserMsg(model, "stream a long story"))
-            @test poll_until(() -> model.busy_active[]; timeout = 30)
-            c = BA.client(model.agent)
+            # Wait for the PROMPT to be on the wire, not merely for `busy`. Those
+            # are no longer the same instant: the turn slot is claimed before the
+            # lazy ACP bind, so `busy` goes true while `client(agent)` is still
+            # nothing — deliberately, since the user has pressed send and the
+            # spinner should not read "waiting for your next instruction" through
+            # the whole bring-up. A cancel needs an open span to reach anything
+            # (it is a documented no-op when idle), so `Prompted` is the wait.
+            c = nothing
+            @test poll_until(timeout = 30) do
+                c = BA.client(model.agent)
+                c !== nothing &&
+                    BA.session_activity(model) isa BA.AgentClientProtocol.Prompted
+            end
             @test c !== nothing
+            @test model.busy_active[]
 
             # 1) Graceful cancel — SWALLOWED by the wedged agent; the turn stays busy.
             BA.handle_command!(model, nothing, BA.CancelCommand())

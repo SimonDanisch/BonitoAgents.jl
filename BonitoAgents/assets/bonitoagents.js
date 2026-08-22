@@ -1552,6 +1552,32 @@ class BonitoChat {
         return a;
     }
 
+    // Is this node the one currently held fullscreen (or does it contain it)?
+    //
+    // Two mechanisms, because iOS is the platform this matters on and iOS is the
+    // one that does not implement the first: Safari plays `<video>` fullscreen
+    // through its own presentation mode WITHOUT ever setting
+    // `document.fullscreenElement`, so a check on that alone reads "not
+    // fullscreen" on exactly the device where the bug shows up.
+    _holdsFullscreen(node) {
+        if (!node) return false;
+        const fs = document.fullscreenElement || document.webkitFullscreenElement;
+        if (fs && (node === fs || node.contains(fs))) return true;
+        for (const v of node.querySelectorAll('video')) {
+            if (v.webkitDisplayingFullscreen ||
+                v.webkitPresentationMode === 'fullscreen') return true;
+        }
+        return false;
+    }
+
+    // Anything fullscreen anywhere in this pane. Used to tell a viewport change
+    // caused BY fullscreen apart from the soft keyboard, which is the only thing
+    // the viewport handler is actually there for.
+    _fullscreenActive() {
+        return this._holdsFullscreen(this.container) ||
+               !!(document.fullscreenElement || document.webkitFullscreenElement);
+    }
+
     updateDOM(s, e) {
         if (s > e) return;
         // Anchor BEFORE any mutation; restored after the spacer writes below.
@@ -1576,6 +1602,19 @@ class BonitoChat {
                         this.applyVisibility(idx, node);
                         this.touchApp(idx);   // just left the viewport
                     }
+                } else if (this._holdsFullscreen(node)) {
+                    // Whatever the user is watching FULLSCREEN stays mounted and
+                    // visible. Detaching it drops the browser out of fullscreen
+                    // instantly, and parking it (display:none, the app branch
+                    // above) does the same — so this one is left alone entirely
+                    // and trimmed on the next range update after fullscreen ends.
+                    //
+                    // This is not a corner case on mobile, it is the NORMAL path:
+                    // entering a video's native fullscreen resizes the visual
+                    // viewport, `onViewportResize` chases the tail, the chat
+                    // scrolls away from the video, and the very node the user is
+                    // watching is the one this loop would drop. Symptom: fullscreen
+                    // opens and closes again immediately.
                 } else {
                     // Leaving the window: unobserve so the live observer set
                     // stays bounded to the rendered window. A detached node
@@ -4053,6 +4092,14 @@ class BonitoChat {
         // OUR pane, not document.querySelector('.bt-app') — that grabbed the
         // FIRST pane in the document, so every kept-alive instance resized
         // the same (wrong) one.
+        //
+        // NOT while something is fullscreen. Entering a video's fullscreen
+        // resizes the visual viewport too, and chasing the tail then scrolls the
+        // chat away from the very video being watched — which used to end the
+        // fullscreen outright (the node left the render window and was detached).
+        // `updateDOM` now refuses to drop it, but the scroll is still wrong: the
+        // user asked for fullscreen, not for the conversation to move.
+        if (this._fullscreenActive()) return;
         const vv  = window.visualViewport;
         const app = this.app || this.container.closest('.bt-app');
         if (app) app.style.height = vv.height + 'px';
