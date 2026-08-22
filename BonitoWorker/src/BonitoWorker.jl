@@ -643,6 +643,11 @@ function start(; force::Bool = false)
         return nothing
     end
     claim_pidfile!()
+    # AFTER the pidfile is ours: that is the proof no other incarnation of this
+    # worker is alive, which is exactly what makes killing anything carrying our
+    # id safe. Before the claim, a duplicate start would reap the RUNNING
+    # worker's agents.
+    reap_stray_agents!()
     config = JSON.parse(read(cfg, String))
     worker_id = load_or_generate_worker_id()
     connect_and_serve(;
@@ -904,14 +909,27 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     # overrides win.
     env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
                 provider.env,
-                Dict("BONITOAGENTS_SERVER_URL"  => server_url),
+                Dict("BONITOAGENTS_SERVER_URL"  => server_url,
+                     # Our OWN mark on the agent and everything it spawns. Read
+                     # back by `reap_stray_agents!` at startup to tell an agent
+                     # left behind by a PREVIOUS incarnation of this worker from
+                     # one belonging to a worker that is alive right now — the
+                     # id is stable across restarts, the pid is not.
+                     AGENT_OWNER_ENV => load_or_generate_worker_id()),
                 env_overrides)
 
     # `provider.args` carries any required subcommand (e.g. `["acp"]` for
     # mimo/opencode/kimi, whose ACP server lives under that subcommand).
     agent_args = provider.args
     proc = try
-        open(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd), "r+")
+        # `detach` = `setsid()` in the child before exec, so the agent leads its
+        # OWN process group and everything it spawns (the MCP servers, and the
+        # Julia eval workers under those) is in that group. Without it the agent
+        # sat in ours: `kill_proc!` reached the agent alone and its children were
+        # orphaned one level down, which is how a killed chat left julia
+        # processes running. It does NOT make the agent survive us on purpose —
+        # `kill_proc!` now signals the group explicitly.
+        open(detach(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd)), "r+")
     catch e
         return report_open_session_failed(ws, sid,
             "failed to spawn agent ($resolved_agent_bin $(join(agent_args, ' '))): $(sprint(showerror, e))")
@@ -993,6 +1011,100 @@ function handle_close_session(cmd)
     entry.ws === nothing || try entry.ws.close_transport!() catch end
 end
 
+# The env var every agent (and everything it spawns) is stamped with, naming the
+# worker that owns it. See the spawn in `start_agent_session` and
+# `reap_stray_agents!`.
+const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
+
+"""
+    kill_process_group!(proc)
+
+SIGKILL the process GROUP `proc` leads (it does, via `detach` at spawn), so the
+agent's children go with it. No-op on Windows, on a dead proc, or — the guard
+that matters — if the group turns out to be our own: signalling that would take
+the worker down with it.
+"""
+function kill_process_group!(proc)
+    Sys.isunix() || return nothing
+    pid = try
+        getpid(proc)
+    catch e
+        e isa InterruptException && rethrow()
+        return nothing            # already reaped; nothing to signal
+    end
+    pid > 0 || return nothing
+    pgid = Int(ccall(:getpgid, Cint, (Cint,), pid))
+    # -1 = the process is gone (its group with it). Equal to ours = `detach`
+    # didn't take; killing it would be suicide.
+    (pgid <= 0 || pgid == Int(ccall(:getpgid, Cint, (Cint,), 0))) && return nothing
+    ccall(:kill, Cint, (Cint, Cint), -pgid, 9)
+    return nothing
+end
+
+"""
+    reap_stray_agents!() -> Int
+
+Kill agent processes left behind by a PREVIOUS incarnation of this worker, and
+return how many. Called once at startup.
+
+This is the half that `kill_process_group!` cannot cover: a worker killed with
+SIGKILL runs no cleanup at all, so its agents survive, get reparented to init,
+and are invisible from then on. Measured: 3 per full e2e run, accumulating to 55
+live orphans (oldest 41 hours) over a few days — individually small, collectively
+enough memory pressure to make unrelated tests fail on timing.
+
+Ownership is read from `/proc/<pid>/environ`, matching OUR stable `worker_id`.
+That is deliberately narrower than "any agent": another worker running right now
+on the same machine has a different id, and its agents are none of our business.
+A previous incarnation of ourselves has the SAME id — and by the time we are
+starting, it is not running.
+"""
+reap_stray_agents!() = reap_agents_owned_by(load_or_generate_worker_id())
+
+"""
+    reap_agents_owned_by(worker_id) -> Int
+
+The same sweep for an EXPLICIT worker id. `dev_server` needs this: every test
+server gets a throwaway config dir, hence a fresh id, so the startup sweep above
+can never match a previous run's leftovers — it is looking for an id that has
+never existed before. The server knows the id it handed out, so it can reap on
+the way down instead.
+
+Only call this once the worker owning `worker_id` is gone, or you will kill the
+agents of a session that is still in use.
+"""
+function reap_agents_owned_by(worker_id::AbstractString)
+    (Sys.isunix() && isdir("/proc")) || return 0
+    isempty(worker_id) && return 0
+    # The trailing NUL matters. `/proc/<pid>/environ` is a NUL-SEPARATED blob, so
+    # a bare `NAME=<id>` also matches `NAME=<id>-something` — and worker ids are
+    # not prefix-free. Without the terminator this reaps another worker's LIVE
+    # agents, which the test for it caught on the first run.
+    mark = AGENT_OWNER_ENV * "=" * worker_id * "\0"
+    me   = getpid()
+    n    = 0
+    for entry in readdir("/proc")
+        pid = tryparse(Int, entry)
+        (pid === nothing || pid == me) && continue
+        environ = try
+            read("/proc/$pid/environ", String)
+        catch e
+            e isa InterruptException && rethrow()
+            continue              # gone between readdir and read, or not ours to read
+        end
+        occursin(mark, environ) || continue
+        try
+            ccall(:kill, Cint, (Cint, Cint), Cint(pid), 9)
+            n += 1
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "BonitoWorker: could not reap stray agent" pid exception = e
+        end
+    end
+    n > 0 && @info "BonitoWorker: reaped orphaned agent processes" count = n worker_id
+    return n
+end
+
 # Kill + close an agent process, tolerating an already-dead/closed one.
 function kill_proc!(proc)
     # Gate on the OS PROCESS state, not `isopen(proc)` — `isopen` tracks the IO
@@ -1012,6 +1124,15 @@ function kill_proc!(proc)
     catch e
         e isa Base.IOError || @warn "BonitoWorker: SIGKILL failed" exception=e
     end
+    # The agent's CHILDREN. `detach` at spawn made the agent its own group
+    # leader, so one signal to `-pgid` reaches the MCP servers it started and the
+    # Julia eval workers under those. Killing only the agent left those running:
+    # they are what actually holds the memory (a julia eval worker is hundreds of
+    # MB; the node agent is tens).
+    #
+    # Sent AFTER the agent is down, and guarded so we can never signal our own
+    # group — same belt-and-braces as BonitoMCP's `reap_process_tree`.
+    kill_process_group!(proc)
     try
         close(proc)
     catch e

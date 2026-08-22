@@ -91,10 +91,26 @@ orphans and re-running the same item on a quiet box: 5.8s, green. So before
 believing a timing-shaped e2e failure, check `pgrep -cf "[M]ock[A]CP"` — and get a
 quiet-box baseline before blaming the diff.
 
-In production the same mechanism orphans the real `claude-agent-acp` process
-whenever a worker dies abnormally. Fixing it properly means giving the agent its
-own process group and killing the group on worker exit, plus reaping strays at
-worker startup — NOT yet done.
+In production the same mechanism orphaned the real `claude-agent-acp` process
+whenever a worker died abnormally.
+
+**FIXED** (see `BonitoWorker/test/test_agent_reaping.jl`): the agent is spawned
+`detach`ed so it leads its own process group, `kill_proc!` signals that GROUP —
+which is what finally reaches the MCP servers and the julia eval workers under
+them, the processes that actually hold the memory — and `start()` calls
+`reap_stray_agents!` once the pidfile is claimed, killing anything still carrying
+this worker's id. The pidfile claim is what makes that safe: it proves no other
+incarnation of us is alive. `dev_server` reaps on CLOSE via
+`reap_agents_owned_by(<its worker id>)`, because the startup sweep cannot help
+here: every test server gets a throwaway config dir, so the next one looks for an
+id that has never existed.
+
+Measured over full-suite runs: **3–4 orphans before, 1 after.** The last one is
+the EXTRA worker `TestKit.add_worker!` spawns (cross_worker / worker_zombie) —
+TestKit knows that worker's id but never reaps it, so it is the same gap one
+level out. Matching is on `NAME=<id>\0` from
+`/proc/<pid>/environ`; without the NUL a bare prefix match also killed a DIFFERENT
+worker's live agents (caught by the test on its first run).
 
 ## ⟳ on a file that vanished shows the old text as if it were current
 
@@ -240,6 +256,8 @@ it, so it covers the working path; the inactive-close fix is still open.
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |
 | `todo_taskbar.jl`     | live todo as a pinned panel, plan update mutates it in place (done/active), turn end finalizes to one bubble + drops the pin |
+| `bt_wait.jl`          | `bt_wait` through the real chat: the turn is WALL-CLOCK blocked for the requested seconds (the whole contract — a unit test on the handler cannot see it), the real handler ran (its `reason` is echoed in the card), and the task bar did NOT grow (no pill, no notification — the difference from a background sleeper) |
+| `todo_worker_death.jl` | a plan the agent NEVER finishes, then SIGKILL of the chat's own worker: the pin drops and the list lands in history with the statuses it had (`▶○`, not a forged `✓`). Own dev_server — it kills the main worker. The gap that let todo pills count for 35 h: `todo_taskbar` covers the turn-end path, which always worked; nothing covered the machine going away |
 | `tool_rendering.jl`   | tool kinds: multi-edit diff stack, search rows, bt_julia_eval stdout/result sections, read-as-code, move/fetch header summaries, execute status pill pending→in_progress→completed |
 | `lens.jl`             | lens search bar: vocabulary, autocomplete, apply filter (only matching messages visible), clear, save chip + persist + delete |
 | `errors.jl`           | an error reply renders an inline `[error: …]` bubble; busy clears after the failed turn |
