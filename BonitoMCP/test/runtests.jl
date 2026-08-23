@@ -10,5 +10,11 @@ using Test
     include("test_running_response_shape.jl")
     include("test_eval_cancel.jl")
     include("test_process_reaping.jl")
+    include("test_wait.jl")
+    # ⚠ LAST on purpose: this one needs `Bonito`, which is not in the test
+    # target, so it errors and takes the rest of the file with it. That was
+    # invisible while `Pkg.test` could not resolve `Test` at all and the suite
+    # never ran; it needs a decision about WHICH Bonito the test env pins
+    # (registry vs the dev checkout) before it can be fixed properly.
     include("test_remote_proxy.jl")
 end

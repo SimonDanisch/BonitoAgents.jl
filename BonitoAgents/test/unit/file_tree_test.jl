@@ -46,6 +46,10 @@ end
         write(joinpath(root, "src", "main.jl"), "println(1)\n")     # 11 bytes
         write(joinpath(root, "big.txt"),  repeat("a", 3_000_000))   # > 2 MB editor cap
         write(joinpath(root, ".git", "config"), "[core]\n")         # must be index-excluded
+        # An image, so the open-guard case below stats a file that EXISTS — the
+        # old assertion ("not a text file") never needed one, because the kind
+        # check short-circuited before any stat.
+        write(joinpath(root, "logo.png"), UInt8[0x89, 0x50, 0x4E, 0x47, fill(0x00, 32)...])
 
         @testset "list_dir returns per-entry sizes + dir flags" begin
             ld = BT.list_worker_dir(h.state, wid, root)
@@ -73,12 +77,23 @@ end
         end
 
         @testset "stat_path: file vs dir vs missing" begin
-            f = BT.stat_worker_path(h.state, wid, joinpath(root, "src", "main.jl"))
+            src = joinpath(root, "src", "main.jl")
+            f = BT.stat_worker_path(h.state, wid, src)
             @test f.exists && f.isfile && !f.isdir && f.size == 11
             d = BT.stat_worker_path(h.state, wid, joinpath(root, "src"))
             @test d.exists && d.isdir && !d.isfile
             m = BT.stat_worker_path(h.state, wid, joinpath(root, "nope.jl"))
             @test !m.exists && !m.isfile
+
+            # `mtime` is the other half of the mirror freshness key (#34): a file
+            # REWRITTEN at the same path must report a different stamp, or the
+            # server keeps serving its first-ever copy forever.
+            @test f.mtime > 0
+            sleep(0.05)
+            write(src, "changed!!!!")          # same length, different content
+            f2 = BT.stat_worker_path(h.state, wid, src)
+            @test f2.mtime != f.mtime
+            write(src, "println(1)\n")         # restore for the tests below
         end
 
         @testset "list_project_files excludes .git, returns rel paths" begin
@@ -100,8 +115,9 @@ end
             @test occursin("folder",       BT.open_guard_reject_reason(h.state, pid, "src"))
             @test occursin("not found",    BT.open_guard_reject_reason(h.state, pid, "nope.jl"))
             @test occursin("too large",    BT.open_guard_reject_reason(h.state, pid, "big.txt"))
-            # Binary/media extension is rejected on the name alone (no stat needed).
-            @test occursin("not a text file", BT.open_guard_reject_reason(h.state, pid, "logo.png"))
+            # An image is NOT a refusal any more: the file viewer opens every
+            # kind, so the guard only stops files that can't be opened at all.
+            @test BT.open_guard_reject_reason(h.state, pid, "logo.png") === nothing
         end
 
         @testset "project file index: cache + single-flight" begin

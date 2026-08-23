@@ -46,14 +46,18 @@ function run_suite(server)
             m !== nothing && m.agent.client !== nothing
         end
 
-        # No resume → stays lazy: no client until the first turn.
+        # No resume, no local history → ALSO binds eagerly, for a different
+        # reason: the chat's config pills (model, permission mode) ride the
+        # `session/new` result, so lazy binding left a fresh thread showing
+        # neither until the user had already sent something. See the
+        # `eager_bind` branch in `bring_up_project_session!` — this test used to
+        # assert the opposite and was not updated when that changed.
         pfresh = BA.create_project_from_worker!(state, wid, mktempdir();
             name = "freshChat", resume_session_id = nothing, start_session = true)
-        # Give the (would-be) bring-up a chance to run, then assert it did NOT.
-        sleep(3.0)
-        mf = get(state.chat_models, pfresh.id, nothing)
-        @test mf !== nothing
-        @test mf.agent.client === nothing
+        @test poll_until(timeout = 30) do
+            m = get(state.chat_models, pfresh.id, nothing)
+            m !== nothing && m.agent.client !== nothing
+        end
     end
     return server
 end

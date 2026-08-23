@@ -50,7 +50,8 @@ checkpoint entirely.
 ### The result is the live value
 
 Whatever the eval returns is rendered into the chat as a **live embed**, not a
-text repr. A number, an array, a `DataFrame`, an image, and, crucially, a
+text repr. A string (with its line breaks kept), a number, an array, a
+`DataFrame`, an image, and, crucially, a
 Bonito `App` or a WGLMakie figure, which stay *interactive*: a slider drag or a
 button click round trips to the Julia object still living in the worker's
 session. The value is held in the worker and rendered on demand
@@ -100,13 +101,20 @@ the context window.
 
 ## `bt_show`, a file into the chat
 
-`bt_show(path)` renders a worker-side file into the transcript: images and
-videos inline (click for a lightbox), text files as syntax-highlighted code.
+`bt_show(path)` renders a worker-side file into the transcript, as whatever the
+file is: images and video inline (click for a lightbox), audio with a player,
+markdown rendered, CSV as a sortable table, notebooks with their outputs, 3D
+geometry (`.obj`/`.stl`/`.ply`/`.glb`/`.gltf`) in an interactive view, PDF in the
+browser's own viewer, HTML in a sandboxed frame, source as syntax-highlighted
+code, and opaque bytes as a hex dump. These are the same renderers you get when you open the file as a tab,
+so a file looks the same whichever way you reached it.
+
 `bt_julia_eval` already auto-saves rich values (Makie / Plots figures, color
 matrices) to `<env>/.bonitoAgents/show/` and reports the path, so the usual flow
 is: eval a figure, then `bt_show` its path when the user should see the picture
-rather than interact with it. The file is fetched from the worker on demand, so
-a plot the agent just wrote to `/tmp/plot.png` shows up seconds later.
+rather than interact with it. The file is fetched from the worker on demand — and
+re-fetched exactly when the worker's copy changed, so re-rendering a plot to the
+same `/tmp/plot.png` shows the NEW picture, not the one from the first `bt_show`.
 
 ## Live apps, from one returned value
 

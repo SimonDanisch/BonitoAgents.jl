@@ -8,6 +8,8 @@
 #      `interrupt_project_eval!` sends `interrupt_eval` and gets the
 #      `interrupt_result` reply (0 interrupted — no eval in flight, but the
 #      whole path server → MCP process → reply → pending_rpcs is exercised).
+#      The SAME socket also carries the debug chat's `bt_dev_*` requests in the
+#      opposite direction (MCP → server → reply), which is exercised here too.
 #   2. `system_prompt_meta`: empty text ⇒ no `_meta` (params byte-identical
 #      to before); non-empty ⇒ the claude_code preset with `append`.
 #   3. `global_agents_md` round-trip through the state dir.
@@ -107,6 +109,51 @@ const BT = BonitoAgents
 
             # Unknown project fails fast with a clear error.
             @test_throws ErrorException BT.interrupt_project_eval!(state, "nope")
+
+            # ── the OTHER direction: the debug chat's dev tools ──────────────
+            # Same socket, MCP → server. This is the only place the request
+            # framing on both sides is exercised against a real wire; every
+            # other dev-API test calls `dev_request` directly and would pass
+            # even if the two halves disagreed about the frame shape.
+            @testset "dev_request round-trip (MCP → server → reply)" begin
+                BT.install_log_ring!()
+                @info "unit:mcp_ctrl dev probe"
+
+                overview = BonitoMCP.call_server("inspect"; section = "overview")
+                @test overview isa AbstractDict
+                @test overview["pid"] == getpid()
+                @test haskey(overview["counts"], "projects")
+
+                logs = BonitoMCP.call_server("logs"; limit = 50,
+                                             contains = "unit:mcp_ctrl dev probe")
+                @test logs["matched"] >= 1
+
+                mem = BonitoMCP.call_server("memory"; gc = false)
+                @test mem["live_bytes_after"] > 0
+
+                # An op the server rejects comes back as an ERROR the tool can
+                # report — not a hang until the timeout, which is what a dropped
+                # reply would look like.
+                @test_throws Exception BonitoMCP.call_server("no-such-op")
+                @test_throws Exception BonitoMCP.call_server("inspect"; section = "bogus")
+
+                # And through the registered TOOL, exactly as the agent calls it
+                # — including the gate that decides whether it exists at all.
+                withenv("BONITOAGENTS_DEV_TOOLS" => "1") do
+                    tool = only(filter(t -> t.name == "bt_dev_inspect",
+                                       BonitoMCP.available_tools()))
+                    res = tool.handler(Dict{String,Any}("section" => "overview"))
+                    @test res["isError"] == false
+                    @test occursin("\"pid\"", res["content"][1]["text"])
+                    # A bad section is a tool error with a usable message.
+                    bad = tool.handler(Dict{String,Any}("section" => "bogus"))
+                    @test bad["isError"] == true
+                    @test occursin("bogus", bad["content"][1]["text"])
+                end
+                withenv("BONITOAGENTS_DEV_TOOLS" => nothing) do
+                    @test !any(t -> t.name == "bt_dev_inspect", BonitoMCP.available_tools())
+                end
+            end
         finally
             # Teardown order matters: stop the dial loop (so it doesn't
             # reconnect against the closing server), then close the live

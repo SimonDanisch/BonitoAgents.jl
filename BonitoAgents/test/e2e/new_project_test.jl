@@ -9,7 +9,7 @@
 #   2. Form text was WHITE ON WHITE. The page inherits `color-scheme: dark` from
 #      the OS, so an `<input>` that sets a light `background` but no `color` got
 #      the UA's `fieldtext` = white. You typed a folder/project name into an
-#      invisible field. (`:root { color-scheme: light }` + explicit `color`.)
+#      invisible field. (`html:root { color-scheme: light }` + explicit `color`.)
 #   3. Create refused the folder the breadcrumb was pointing at — only the
 #      Choose button ever wrote `selected` — with "Pick a folder on the worker
 #      first" about that very folder.

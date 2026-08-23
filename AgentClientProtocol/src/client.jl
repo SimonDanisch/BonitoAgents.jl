@@ -67,7 +67,7 @@ function Client(conn::Connection, session_id::AbstractString, cwd::AbstractStrin
     # The main sink is the session's own, installed here rather than by the
     # embedder: there is exactly one main thread per session and it always has
     # somewhere to go. Nothing to forget to wire, nothing to drop.
-    conn.on_main_update = u -> deliver_update!(conn, updates, u)
+    conn.main_stream = updates
     return client
 end
 
@@ -85,7 +85,7 @@ function coalesce_main!(conn::Connection, updates::Channel{Any},
                 # a span that resolved `cancelled` leaves its tools with no
                 # terminal frame coming, and the consumer blocks draining a
                 # channel nothing will close. Release those.
-                u.abandoned ? close(st) : seal_message!(st)
+                u.abandoned ? close_turn!(messages, st) : seal_message!(st)
                 put!(messages, u)      # ... then let the consumer catch up to here
                 continue
             end
@@ -97,7 +97,7 @@ function coalesce_main!(conn::Connection, updates::Channel{Any},
             parse_update!(messages, st, u)
         end
     finally
-        close(st)
+        close_turn!(messages, st)
         close(messages)
     end
     return nothing
@@ -317,7 +317,7 @@ function collect_replayed_updates(updates, response)
                 parse_update!(out, st, u)
             end
         finally
-            close(st)
+            close_turn!(out, st)
             close(out)
         end
     end)
@@ -406,6 +406,11 @@ end
 # delivered), then the main stream — the coalescer drains what's buffered, seals
 # its state, and closes `messages`, which ends the consumer. A `deliver_update!`
 # racing us finds the channel closed and returns.
+#
+# The connection's own teardown closes the main stream too, so this is not the
+# only way it ends (that is the point — a severed transport must end it with
+# nobody calling anything). Doing it here as well makes an explicit close
+# immediate rather than dependent on the dispatcher task getting scheduled.
 function Base.close(client::Client)
     close(client.conn)
     isopen(client.updates) && close(client.updates)

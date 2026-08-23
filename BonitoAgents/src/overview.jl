@@ -8,12 +8,24 @@
 # `chat.md` (messages, mtime = last activity), `.bt-attachments/` (user
 # images) and the bt_show server mirror — so the section survives restarts
 # with no extra bookkeeping. For LIVE chats the in-memory msgs_store is used
-# instead of re-parsing chat.md, and the cards re-render on `chat_signal`
-# (chat open/close + every turn boundary via the busy_active hook) and
-# `projects` (title edits), which is what keeps them up to date.
+# instead of re-parsing chat.md, and the cards re-render on `turn_signal`
+# (every turn boundary, via the ChatModel's busy_active hook), `chat_signal`
+# (chat open/close) and `projects` (title edits), which is what keeps them up
+# to date.
 
 const OVERVIEW_LIMIT = 6           # cards shown
 const OVERVIEW_SNIPPETS = 3        # user prompts per card
+
+# How far back a card looks for its thumbnail. The scan is NOT free: for every
+# `ToolMsg` it passes it calls `tool_content_for_render`, which falls through to
+# a DISK READ for anything past the tool-content cache cap
+# (`TOOL_CONTENT_CACHE_CAP`, 256). Unbounded, a long chat with no image walked
+# its ENTIRE history and paid a file read per tool — survivable when the cards
+# only rebuilt on chat open/close, but they now also rebuild on every turn
+# boundary (see `turn_signal`), which put that walk in the middle of streaming.
+# An image hundreds of messages back is not "the last image the chat displayed"
+# in any useful sense, so the bound costs nothing real.
+const OVERVIEW_IMAGE_SCAN = 200
 
 struct ChatCardData
     pid         :: String
@@ -60,8 +72,9 @@ end
 #     cache (`show_server_path`; no worker fetch from here — a cache miss
 #     just means "no thumbnail" until the chat renders it once).
 function overview_image(state::ServerState, p::ProjectInfo,
-                        msgs::Vector{ChatMsg}, chat_dir::AbstractString)
-    for m in Iterators.reverse(msgs)
+                        msgs::Vector{ChatMsg}, chat_dir::AbstractString;
+                        limit::Int = OVERVIEW_IMAGE_SCAN)
+    for m in Iterators.take(Iterators.reverse(msgs), limit)
         if m isa UserMsg
             _, rels = split_attachment_suffix(m.text)
             for rel in Iterators.reverse(rels)
@@ -229,14 +242,21 @@ function overview_card_dom(state::ServerState, c::ChatCardData)
         dataProjectId = c.pid)
 end
 
-# The header section. Re-renders the card grid on `chat_signal` (turn
-# boundaries + chat open/close) and `projects` (title edit / rename / new
-# project). One delegated click handler on the LONG-LIVED wrapper routes card
-# clicks to `current_view` — per-card handlers would re-register on every
-# refresh.
+# The header section. Re-renders the card grid on `turn_signal` (a chat's
+# content changed — every turn boundary), `chat_signal` (chat open/close) and
+# `projects` (title edit / rename / new project). One delegated click handler on
+# the LONG-LIVED wrapper routes card clicks to `current_view` — per-card
+# handlers would re-register on every refresh.
+#
+# Cost note for anyone adding a signal here: a rebuild runs `recent_chat_cards`,
+# which stats one `chat.md` per project and — for the `OVERVIEW_LIMIT` chats it
+# actually shows — copies each OPEN chat's `msgs_store` under its lock
+# (`overview_msgs`). That is bounded and fine at turn granularity (twice a turn,
+# six chats), but it is not free per frame: don't wire this to a signal that
+# fires per streamed chunk.
 function recent_chats_dom(session::Bonito.Session, state::ServerState,
                           current_view::Union{Observable{String},Nothing})
-    grid = map(state.chat_signal, state.projects) do _, _projects
+    grid = map(state.chat_signal, state.turn_signal, state.projects) do _, _turn, _projects
         cards = recent_chat_cards(state)
         isempty(cards) && return DOM.div("No chats yet — create a project below.";
                                           class = "bt-ov-empty")

@@ -65,6 +65,13 @@ function serve(; host::String        = "0.0.0.0",
     wd = isvalid(working_dir) ? String(working_dir) :
          joinpath(homedir(), "bonitoagents-server")
 
+    # Start recording our own log output BEFORE anything else can log, so the
+    # debug chat's `bt_dev_logs` sees the whole life of the server rather than
+    # "everything after the first browser connected". Idempotent + process-wide
+    # (the logger is); a second `serve()` in the same process shares the ring.
+    install_log_ring!()
+    SERVER_STARTED[] == 0.0 && (SERVER_STARTED[] = time())
+
     state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret,
                           heartbeat_interval = heartbeat_interval,
                           heartbeat_deadline = heartbeat_deadline)

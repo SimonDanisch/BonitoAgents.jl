@@ -15,7 +15,7 @@
 # stream: boundaries hold, tools survive, plans finalize.
 #
 # Updates are put straight onto the session's raw stream (`client.updates`),
-# which is exactly what `Connection.on_main_update` does. What's under test here
+# which IS the connection's `main_stream`. What's under test here
 # is the rendering, not the addressing — that's `unit:subagent_feed` and the ACP
 # dispatcher suite.
 
@@ -110,14 +110,22 @@ bg_task_call(id) = ACP.TaskCall(id, "other", "Run tests", "in_progress",
     close(model)
 end
 
-@testset "an un-prompted plan is finalized into history at the boundary" begin
+@testset "an un-prompted plan is finalized when its stream ends" begin
     model, cli = live_model()
     feed!(cli, amc("Working on it. "))
     feed!(cli, toolnotif("t1", "read file"))
     feed!(cli, planupd([("step a", "completed"), ("step b", "in_progress")]))
     feed!(cli, amc("Now the second part."))
-    BT.flush_main!(model)
-    BT.finish_live_todo!(model)    # what `begin_turn!` / end-of-turn cleanup does
+    BT.flush_main!(model)          # a BOUNDARY: the plan must SURVIVE it, like a
+    @test BT.shared(model).live_todo[] !== nothing   # long-running tool does
+
+    # Now the stream ENDS. That is what a dead worker looks like from here: no
+    # frame announces it, nobody calls a finalize verb. ACP seals the plan in
+    # `close_turn!` and the renderer acts on the sealed `Plan` like any other
+    # message — which is the whole point of moving this out of our turn edges.
+    close(cli)
+    cons = lock(() -> BT.shared(model).main_consumer[].task, BT.shared(model).lock)
+    @test timedwait(() -> istaskdone(cons), 10.0) === :ok
 
     store = BT.shared(model).msgs_store
     todos = filter(m -> m isa BT.TodoListMsg, store)
@@ -281,7 +289,7 @@ end
 
     # It rendered — the work is visible, which is the point...
     @test length(BT.shared(model).msgs_store) == 3
-    @test s.turns_active[] == 0          # with no prompt of ours open
+    @test s.turn_in_flight[] == false     # with no prompt of ours open
     # ... and the chat says so, because it can take it back.
     @test BT.session_activity(model) isa ACP.Unprompted
     @test s.busy_active[] == true
@@ -355,22 +363,50 @@ end
     @test BT.in_taskbar(t)                 # live while the episode runs
     @test t.finished_at === nothing
 
-    # The episode's own end marker finalizes it, exactly as a turn's end would.
+    # The episode's own end marker ends it, exactly as a turn's end would — and
+    # the list goes with the episode. Nothing pushes that: `isdone` ASKS the
+    # session what it is doing, and the bar's own poll acts on the answer. (Which
+    # is also why an episode that ends by going QUIET, with no end marker at all,
+    # needs no separate handling.)
     BT.process!(model, ACP.UsageUpdate(1, 2, nothing, nothing, "task-notification"))
     @test BT.session_activity(model) isa ACP.Idle
+    @test BT.isdone(t) == true                                # the decision...
+    @test timedwait(() -> !BT.in_taskbar(t), 5.0) === :ok     # ...and the bar acts
     @test s.live_todo[] === nothing
-    @test !BT.in_taskbar(t)
     @test t.finished_at !== nothing         # ... into history, not left hanging
     close(model)
 end
 
-@testset "an orphan-swept todo card leaves the bar, it is not stranded" begin
-    # The sweep (a cancelled turn, an error, a restart) used to stamp
-    # `finished_at` and walk away. That makes the card un-live while it is still
-    # PINNED, so the next todo update builds a fresh list and reassigns
-    # `live_todo` — and the old card is then owned by nobody: `finish_live_todo!`
-    # only finalizes `live_todo`, and `isdone` cannot fire on entries that were
-    # never completed. It sat in the bar forever showing e.g. 0/2.
+@testset "a live list is NOT retired while a turn is still in flight" begin
+    # The other side of the same coin, and the risk in asking a status instead of
+    # counting: get it wrong and a list gets retired out from under an agent that
+    # is still working it. Under steering a prompt is open while an earlier
+    # episode's list is live, and the list belongs to the work still running.
+    # This is what the old `turns_active == 0` gate was for; it is now just what
+    # `Prompted` means.
+    model, cli = live_model()
+    s = BT.shared(model)
+    feed!(cli, planupd([("step a", "in_progress"), ("step b", "pending")]))
+    BT.flush_main!(model)
+    t = s.live_todo[]
+    @test t isa BT.TodoListMsg
+    @test BT.in_taskbar(t)
+
+    ACP.prompt_request(cli.conn, Dict())     # a span opens and never resolves
+    @test BT.session_activity(model) isa ACP.Prompted
+    @test BT.isdone(t) == false
+    sleep(1.5)                               # let the bar poll at least once
+    @test BT.in_taskbar(t)                   # ... and leave it alone
+    @test s.live_todo[] === t
+    close(model)
+end
+
+@testset "a sealed todo card leaves the bar, it is not stranded" begin
+    # Sealing used to stamp `finished_at` and walk away. That makes the card
+    # un-live while it is still PINNED, so the next todo update builds a fresh
+    # list and reassigns `live_todo` — and the old card is then owned by nobody:
+    # this path only finalizes `live_todo`, and `isdone` cannot fire on entries
+    # that were never completed. It sat in the bar forever showing e.g. 0/2.
     model, cli = live_model()
     s = BT.shared(model)
     feed!(cli, planupd([("step a", "in_progress"), ("step b", "pending")]))
@@ -379,7 +415,10 @@ end
     @test old isa BT.TodoListMsg
     @test BT.in_taskbar(old)
 
-    BT.finalize_orphan!(old)
+    # The verb the sealed `Plan` drives. (There is no orphan-sweep arm for todos
+    # any more — the sweep inferred death from "still has open entries", which is
+    # the guess this whole rebuild removed.)
+    BT.seal_live_todo!(model)
     @test old.finished_at !== nothing
     @test !BT.in_taskbar(old)              # the bit that was missing
     @test BT.is_live(old) == false
@@ -482,10 +521,41 @@ end
     close(model)
 end
 
+@testset "a tool the agent never resolves is finished by the stream, not a sweep" begin
+    # The one thing the deleted end-of-turn orphan sweep DID do: force-fail a tool
+    # left non-terminal. If nothing does that now, an unresolved tool card pulses
+    # forever — the exact bug shape this whole rebuild removed, one type over.
+    # ACP owns it: `close_turn!` force-fails every live tool when the stream ends.
+    model, cli = live_model()
+    live = ACP.ToolCallNotif("t-live", "grep something", "search", "in_progress",
+        ACP.ToolContent[], ACP.ToolCallLocation[], "Grep",
+        Dict{String,Any}(), Dict{String,Any}())
+    feed!(cli, live)
+    tool = nothing
+    @test timedwait(5.0) do
+        tool = lock(() -> findfirst(m -> m isa BT.ToolMsg,
+                                    BT.shared(model).msgs_store), BT.shared(model).lock)
+        tool !== nothing
+    end === :ok
+    b = lock(() -> BT.shared(model).msgs_store[tool], BT.shared(model).lock)
+    @test BT.tool_status(b) == "in_progress"      # live, and nothing has ended it
+
+    # The stream ends — a worker dying, a session closing, a cancel. ACP flips the
+    # tool terminal and closes its channel, which is what lets the renderer's
+    # `for snap in m.updates` return and run its `finally`.
+    close(cli)
+    cons = lock(() -> BT.shared(model).main_consumer[].task, BT.shared(model).lock)
+    @test timedwait(() -> istaskdone(cons), 10.0) === :ok
+    @test BT.tool_status(b) == "failed"           # ...not left pulsing
+    @test BT.is_live(b) == false                  # the card stops, timer frozen
+    @test BT.tool_finished_at(b) !== nothing      # and it is stamped, so it persists
+    close(model)
+end
+
 @testset "a flush waits for the render, it does not just seal" begin
     # The barrier end-of-turn cleanup depends on: after `flush_main!` returns,
-    # everything ahead of the marker is IN the store — so empty-turn detection,
-    # Yolo's "what did it reply", and the orphan sweep all read a settled state.
+    # everything ahead of the marker is IN the store — so empty-turn detection
+    # and Yolo's "what did it reply" read a settled state.
     model, cli = live_model()
     for i in 1:50
         feed!(cli, amc("chunk $i "))

@@ -727,10 +727,13 @@ end
 # Dashboard styles — modern surface + spacing system, status dots, smooth transitions
 const DashboardStyles = Bonito.Styles(
     # ── Tokens ───────────────────────────────────────────────────────────────
+    # `html:root`, not `:root`, and its own rule: the dashboard can be mounted
+    # without ChatStyles, so it can't rely on that sheet's copy — and BonitoWidgets'
+    # `@media (prefers-color-scheme: dark) { :root { color-scheme: dark } }` has the
+    # same specificity as a plain `:root` and lands later. See the long note on the
+    # matching rule in styles.jl.
+    CSS("html:root", "color-scheme" => "light"),
     CSS(":root",
-        # Light-only app — see the same declaration in styles.jl's token block.
-        # Both are emitted; the dashboard can be mounted without ChatStyles.
-        "color-scheme"       => "light",
         "--bt-bg"            => "#fafaf9",
         "--bt-surface"       => "#ffffff",
         "--bt-surface-2"     => "#f8fafc",
@@ -1049,7 +1052,7 @@ const DashboardStyles = Bonito.Styles(
         "padding-top" => "8px"),
     # An input that paints its own `background` must paint its own `color` too —
     # otherwise the text is the UA's `fieldtext` and follows the OS color scheme
-    # while the background stays our light token. `:root { color-scheme: light }`
+    # while the background stays our light token. `html:root { color-scheme: light }`
     # already pins that, this is the belt to its braces.
     CSS(".bt-form input, .bt-form select",
         "padding" => "8px 10px",
@@ -1179,6 +1182,12 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-addr-icon-btn:hover",
         "background" => "var(--bt-surface-2)",
         "color" => "var(--bt-accent)"),
+    # The labelled variant: small and quiet so it doesn't compete with the
+    # breadcrumb it sits next to, but readable rather than a lone glyph.
+    CSS(".bt-addr-edit-btn",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "4px",
+        "font-size" => "11.5px", "white-space" => "nowrap"),
+    CSS(".bt-addr-edit-glyph", "font-size" => "12px", "line-height" => "1"),
     CSS(".bt-picker-loading",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "color" => "var(--bt-text-muted)",
@@ -1779,7 +1788,7 @@ const DashboardStyles = Bonito.Styles(
 # downstream validation that fixes it, because every value it hands out is
 # already the wrong one.
 """
-    address_bar(cur, editing) → Bonito DOM node
+    address_bar(cur, editing, typed) → Bonito DOM node
 
 `cur::Observable{String}` is the path being browsed; `editing::Observable{Bool}`
 toggles between breadcrumb mode and text-input mode. Both are mutated in
@@ -1848,9 +1857,13 @@ function address_bar(cur::Observable{String}, editing::Observable{Bool},
             push!(nodes, DOM.div("";
                 class = "bt-addr-filler",
                 onclick = js"event => $(editing).notify(true)"))
-            push!(nodes, DOM.button("✎";
-                class    = "bt-addr-icon-btn",
-                title    = "Edit path",
+            # LABELLED, not a bare glyph. Typing a path is the fast way to this
+            # picker — clicking down a deep tree is the slow one — and a 23px "✎"
+            # with the explanation only in its tooltip meant you had to already
+            # know it was there. The word is what makes the shortcut findable.
+            push!(nodes, DOM.button(DOM.span("✎"; class = "bt-addr-edit-glyph"), "Type path";
+                class    = "bt-addr-icon-btn bt-addr-edit-btn",
+                title    = "Type a path instead of clicking through the tree",
                 onclick  = js"event => $(editing).notify(true)"))
             DOM.div(nodes...;
                 class   = "bt-addr-bar",
@@ -3063,9 +3076,51 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             DOM.div("Applied to new & unconfigured chats; a chat's own picks override.";
                     class = "bt-defaults-hint"),
             session_defaults_bar(session, state);
-            class = "bt-section");
+            class = "bt-section"),
+
+        debug_section(session, state, current_view);
 
         class = "bt-dash")
+end
+
+# ── "Debug BonitoAgents" ────────────────────────────────────────────────────
+# Opens a chat whose working directory is this server's own source checkout, with
+# the `bt_dev_*` introspection tools attached (dev_api.jl). Lives at the bottom of
+# the dashboard: it's a power tool, not part of the normal flow, but it should be
+# ONE click away when something is wrong.
+#
+# It is only offered when the source is actually a checkout — a bundled install
+# has nothing to debug against, and a button that always failed would be worse
+# than no button.
+function debug_section(session::Bonito.Session, state::ServerState,
+                       current_view::Union{Observable{String},Nothing})
+    root = bonitoagents_repo_root()
+    (root === nothing || current_view === nothing) && return DOM.div()
+    status = Observable("")
+    btn = DOM.button(map(s -> isempty(s) ? "Debug BonitoAgents" : s, status);
+        class = "bt-btn bt-btn-secondary bt-debug-btn",
+        title = "Open a chat on this server's own source ($(root)) with live " *
+                "introspection into the running process",
+        onclick = js"event => $(status).notify('__click__')")
+    on(session, status) do s
+        s == "__click__" || return
+        status[] = "Opening…"
+        Base.errormonitor(@async try
+            open_debug_chat!(state, current_view)
+            safe_set!(status, "")
+        catch e
+            @warn "opening the debug chat failed" exception = (e, catch_backtrace())
+            safe_set!(status, first(split(sprint(showerror, e), '\n')))
+        end)
+    end
+    return DOM.div(
+        DOM.h2("Debug this server"),
+        DOM.div("Opens a chat on $(root) — the source of the server you're " *
+                "looking at — with tools that read its live state: workers, chats, " *
+                "eval bridges, logs and memory. Edits there are edits to this app.";
+                class = "bt-defaults-hint"),
+        btn;
+        class = "bt-section")
 end
 
 # ── Cross-worker sync modal ─────────────────────────────────────────────────

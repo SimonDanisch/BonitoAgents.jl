@@ -95,7 +95,7 @@
             ta.dispatchEvent(evt);
             if (!evt.clipboardData || evt.clipboardData.files.length === 0) {
                 const chat = document.querySelector('$(P).bt-messages').__bt_chat;
-                chat._attachAddBlob(file, file.type, file.name);
+                chat.attachAddBlob(file, file.type, file.name);
             }
             return true;
         })()""")
@@ -116,7 +116,7 @@
             app.dispatchEvent(drop);
             if (!drop.dataTransfer || drop.dataTransfer.files.length === 0) {
                 const chat = document.querySelector('$(P).bt-messages').__bt_chat;
-                chat._attachAddBlob(file, file.type, file.name);
+                chat.attachAddBlob(file, file.type, file.name);
             }
             return true;
         })()""")
@@ -181,7 +181,7 @@
         const big  = new Uint8Array(6 * 1024 * 1024);
         const file = new File([big], 'huge.png', {type: 'image/png'});
         document.querySelector('$(P).bt-messages').__bt_chat
-            ._attachAddBlob(file, file.type, file.name);
+            .attachAddBlob(file, file.type, file.name);
         return true;
     })()""")
     @test TK.wait_for(s, "error chip appears",
@@ -201,7 +201,7 @@
         const bytes = new Uint8Array([0xff, 0xd8, 0xff]);
         const file  = new File([bytes], 'foo.pdf', {type: 'application/pdf'});
         document.querySelector('$(P).bt-messages').__bt_chat
-            ._attachAddBlob(file, file.type, file.name);
+            .attachAddBlob(file, file.type, file.name);
         return true;
     })()""")
     @test TK.wait_for(s, "pdf thumb queued (JS doesn't gate mime)",
@@ -214,7 +214,7 @@
     # Cleanup the bad thumb + chip before the text-only check.
     TK.eval_js(s, """(() => {
         const chat = document.querySelector('$(P).bt-messages').__bt_chat;
-        chat._attachClear();
+        chat.attachClear();
         const c = document.querySelector('$(P).bt-attach-error'); if (c) c.remove();
         return true;
     })()""")
@@ -243,7 +243,7 @@
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         const file = new File([bytes], 'inline-probe.png', {type: 'image/png'});
         document.querySelector('$(P).bt-messages').__bt_chat
-            ._attachAddBlob(file, file.type, file.name);
+            .attachAddBlob(file, file.type, file.name);
         return true;
     })()""")
     @test TK.wait_for(s, "probe thumb queued",
@@ -274,6 +274,116 @@
             const img = b && b.querySelector('.bt-user-att-img');
             return !!(img && img.complete && img.naturalWidth > 0);
         })()"""; timeout = 10)
+
+    # ── Attach BUTTON → the file picker (the only path a phone has) ───────────
+    # Both routes above need hardware a phone doesn't have: paste needs a
+    # clipboard holding a file, drop needs a pointer. So attaching used to be
+    # desktop-only, and the button is the fix.
+    #
+    # A real click would open a NATIVE file dialog, which is modal and would
+    # hang the run forever — so we stub the input's own `.click` to count calls.
+    # That stubs a BROWSER api, not our code: the delegated handler, the
+    # `change` listener and `_attachAddBlob` all run for real below.
+    @test TK.eval_js(s, "document.querySelector('$(P).bt-attach-input') !== null")
+    # `accept` is what makes a mobile browser offer camera/gallery instead of a
+    # generic file tree.
+    @test occursin("image/", String(TK.eval_js(s,
+        "document.querySelector('$(P).bt-attach-input').getAttribute('accept') || ''")))
+    # Tap target, measured on the rendered box (not read back out of the
+    # stylesheet): under ~40px a touch is a coin toss, and touch is the point.
+    btn_box = TK.eval_js(s, """(() => {
+        const r = document.querySelector('$(P).bt-attach-btn').getBoundingClientRect();
+        return {w: r.width, h: r.height};
+    })()""")
+    @test btn_box["w"] >= 40
+    @test btn_box["h"] >= 40
+
+    TK.eval_js(s, """(() => {
+        const inp = document.querySelector('$(P).bt-attach-input');
+        window.__btPickerOpened = 0;
+        inp.__realClick = inp.click.bind(inp);
+        inp.click = () => { window.__btPickerOpened++; };
+        return true;
+    })()""")
+    TK.click(s, "$(P).bt-attach-btn")
+    @test TK.wait_for(s, "attach button opens the picker",
+        "window.__btPickerOpened === 1"; timeout = 5)
+
+    # A genuine File through the genuine `change` path → thumbnail queued.
+    # `input.files` is assignable from a DataTransfer's FileList in Chromium,
+    # so this is the same object the picker would hand us.
+    TK.eval_js(s, """(() => {
+        const bytes = $(js_bytes_from_hex(TINY_PNG_HEX));
+        const file  = new File([bytes], 'picked.png', {type: 'image/png'});
+        const dt = new DataTransfer(); dt.items.add(file);
+        const inp = document.querySelector('$(P).bt-attach-input');
+        inp.files = dt.files;
+        inp.dispatchEvent(new Event('change', {bubbles: true}));
+        return true;
+    })()""")
+    @test TK.wait_for(s, "picked file queues a thumbnail",
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 1"; timeout = 5)
+    # Cleared after handling, or picking the SAME file twice fires no second
+    # `change` and the second attempt silently does nothing.
+    @test TK.eval_js(s, "document.querySelector('$(P).bt-attach-input').value === ''")
+
+    # Non-image via the picker: `accept` is a hint, every desktop picker still
+    # offers "all files". The user has to be told, not ignored.
+    TK.eval_js(s, """(() => {
+        const c = document.querySelector('$(P).bt-attach-error'); if (c) c.remove();
+        const file = new File([new Uint8Array([1,2,3])], 'notes.zip',
+                              {type: 'application/zip'});
+        const dt = new DataTransfer(); dt.items.add(file);
+        const inp = document.querySelector('$(P).bt-attach-input');
+        inp.files = dt.files;
+        inp.dispatchEvent(new Event('change', {bubbles: true}));
+        return true;
+    })()""")
+    @test TK.wait_for(s, "non-image is refused out loud",
+        "document.querySelector('$(P).bt-attach-error') !== null"; timeout = 5)
+    @test occursin("not an image", lowercase(String(
+        TK.eval_js(s, "document.querySelector('$(P).bt-attach-error')?.innerText || ''"))))
+    @test attach_count() == 1   # the png stays queued, the zip never joins it
+
+    # ── Queue length is capped ────────────────────────────────────────────────
+    # "Select all" in a phone gallery is one tap, so the picker can hand over
+    # dozens of multi-MB images in a single `change`. The cap lives in
+    # `_attachAddBlob` (so paste and drop are covered too) and has to survive a
+    # SYNCHRONOUS burst: `attachments` only grows in the async FileReader
+    # onload, so a naive `size >= MAX` check reads 0 for every file in the loop
+    # and lets all of them through. 12 picked at once, 10 kept.
+    TK.eval_js(s, """(() => {
+        const chat = document.querySelector('$(P).bt-messages').__bt_chat;
+        chat.attachClear();
+        const c = document.querySelector('$(P).bt-attach-error'); if (c) c.remove();
+        const bytes = $(js_bytes_from_hex(TINY_PNG_HEX));
+        const dt = new DataTransfer();
+        for (let i = 0; i < 12; i++) {
+            dt.items.add(new File([bytes], `burst-\${i}.png`, {type: 'image/png'}));
+        }
+        const inp = document.querySelector('$(P).bt-attach-input');
+        inp.files = dt.files;
+        inp.dispatchEvent(new Event('change', {bubbles: true}));
+        return true;
+    })()""")
+    @test TK.wait_for(s, "queue capped at 10",
+        "document.querySelectorAll('$(P).bt-attachment-thumb').length === 10"; timeout = 5)
+    # And it STAYS 10. `wait_for` would pass the instant the count is right,
+    # which says nothing about the two extra readers still in flight; give them
+    # time to land and then look again.
+    sleep(1)
+    @test attach_count() == 10
+    @test occursin("at most", lowercase(String(
+        TK.eval_js(s, "document.querySelector('$(P).bt-attach-error')?.innerText || ''"))))
+
+    # Restore the real `click` and leave the composer clean for js_errors.
+    TK.eval_js(s, """(() => {
+        const inp = document.querySelector('$(P).bt-attach-input');
+        if (inp.__realClick) { inp.click = inp.__realClick; delete inp.__realClick; }
+        document.querySelector('$(P).bt-messages').__bt_chat.attachClear();
+        const c = document.querySelector('$(P).bt-attach-error'); if (c) c.remove();
+        return true;
+    })()""")
 
     @test isempty(TK.js_errors(s))
 end

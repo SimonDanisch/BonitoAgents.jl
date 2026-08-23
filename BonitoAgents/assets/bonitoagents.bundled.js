@@ -486,6 +486,9 @@ class BonitoChat {
         if (this.onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this.onAppClickCapture, true);
         }
+        if (this.onAppChange && this.app) {
+            this.app.removeEventListener('change', this.onAppChange);
+        }
         if (this.onEscapeKey) {
             document.removeEventListener('keydown', this.onEscapeKey, true);
         }
@@ -629,6 +632,7 @@ class BonitoChat {
         }
         this.startSettle();
         this.refresh();
+        if (this.initialLoad && !this.rangeMissing()) this.runInitialMountCascade();
         this.startPrefetch();
     }
     startSettle() {
@@ -822,23 +826,27 @@ class BonitoChat {
         }
         if (this.scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
-        if (this.initialLoad) {
-            this.initialLoad = true;
-            this.setFollowMode(true);
-            this.scrollToBottom();
-            requestAnimationFrame(()=>{
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-            });
-            setTimeout(()=>{
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-            }, 100);
-            setTimeout(()=>{
-                if (!this.destroyed && this.followMode) this.scrollToBottom();
-                this.initialLoad = false;
-            }, 300);
-        } else if (this.followMode) {
-            this.queueScrollToBottom();
-        }
+        if (this.initialLoad) this.runInitialMountCascade();
+        else if (this.followMode) this.queueScrollToBottom();
+    }
+    runInitialMountCascade() {
+        this.setFollowMode(true);
+        this.scrollToBottom();
+        requestAnimationFrame(()=>{
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        });
+        setTimeout(()=>{
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        }, 100);
+        setTimeout(()=>{
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+            this.initialLoad = false;
+        }, 300);
+    }
+    rangeMissing() {
+        const [s, e] = this.visibleRange();
+        for(let i = s; i <= e; i++)if (!this.cache.has(i)) return true;
+        return false;
     }
     measureNodes(pairs) {
         if (!this.measureEl || pairs.length === 0) return;
@@ -982,6 +990,18 @@ class BonitoChat {
         }
         return a;
     }
+    holdsFullscreen(node) {
+        if (!node) return false;
+        const fs = document.fullscreenElement || document.webkitFullscreenElement;
+        if (fs && (node === fs || node.contains(fs))) return true;
+        for (const v of node.querySelectorAll('video')){
+            if (v.webkitDisplayingFullscreen || v.webkitPresentationMode === 'fullscreen') return true;
+        }
+        return false;
+    }
+    fullscreenActive() {
+        return this.holdsFullscreen(this.container) || !!(document.fullscreenElement || document.webkitFullscreenElement);
+    }
     updateDOM(s, e) {
         if (s > e) return;
         const sticky = this.activeKeyAnchor();
@@ -997,7 +1017,7 @@ class BonitoChat {
                         this.applyVisibility(idx, node);
                         this.touchApp(idx);
                     }
-                } else {
+                } else if (this.holdsFullscreen(node)) {} else {
                     if (this.observed.delete(idx) && node) this.messageHeightObserver.unobserve(node);
                     node?.remove();
                     this.rendered.delete(idx);
@@ -2503,6 +2523,8 @@ class BonitoChat {
         this.attachments = new Map();
         this.attachIdCounter = 0;
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        this.ATTACH_MAX_COUNT = 10;
+        this.attachPending = 0;
         this.onPaste = (e)=>{
             const items = e.clipboardData?.items;
             if (!items) return;
@@ -2547,9 +2569,28 @@ class BonitoChat {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this.cancel();
+            } else if (e.target.closest('.bt-attach-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this.app.querySelector('.bt-attach-input')?.click();
             }
         };
         this.app.addEventListener('click', this.onAppClickCapture, true);
+        this.onAppChange = (e)=>{
+            if (this.destroyed) return;
+            const input = e.target.closest('.bt-attach-input');
+            if (!input || !input.files) return;
+            for (const f of input.files){
+                if (f.type && f.type.startsWith('image/')) {
+                    this.attachAddBlob(f, f.type, f.name || `picked-${Date.now()}.png`);
+                } else {
+                    this.showAttachError(`${f.name || 'That file'} is not an image; only images can be attached`);
+                }
+            }
+            input.value = '';
+            this.textInput?.focus();
+        };
+        this.app.addEventListener('change', this.onAppChange);
         this.onTextInputKeyCapture = (e)=>{
             if (this.cmdAcHandleKey(e)) return;
             if (e.key !== 'Enter' || e.shiftKey) return;
@@ -2670,13 +2711,19 @@ class BonitoChat {
         return false;
     }
     attachAddBlob(blob, mime, filename) {
+        if (this.attachments.size + this.attachPending >= this.ATTACH_MAX_COUNT) {
+            this.showAttachError(`At most ${this.ATTACH_MAX_COUNT} images per message`);
+            return;
+        }
         if (blob.size > this.ATTACH_MAX_BYTES) {
             this.showAttachError(`Image too large (${(blob.size / 1024 / 1024).toFixed(1)} MB, ` + `max ${this.ATTACH_MAX_BYTES / 1024 / 1024} MB)`);
             return;
         }
         const id = `att-${++this.attachIdCounter}`;
         const reader = new FileReader();
+        this.attachPending++;
         reader.onload = ()=>{
+            this.attachPending--;
             if (this.destroyed) return;
             this.attachments.set(id, {
                 blob,
@@ -2686,7 +2733,10 @@ class BonitoChat {
             });
             this.renderAttachments();
         };
-        reader.onerror = ()=>this.showAttachError('Failed to read image');
+        reader.onerror = ()=>{
+            this.attachPending--;
+            this.showAttachError('Failed to read image');
+        };
         reader.readAsDataURL(blob);
     }
     attachRemove(id) {
@@ -2748,7 +2798,7 @@ class BonitoChat {
             }
         }, 4500);
     }
-    async _submit() {
+    async submit() {
         const text = this.textInput.value;
         const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
         if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
@@ -2773,6 +2823,7 @@ class BonitoChat {
         this.attachClear();
     }
     onViewportResize() {
+        if (this.fullscreenActive()) return;
         const vv = window.visualViewport;
         const app = this.app || this.container.closest('.bt-app');
         if (app) app.style.height = vv.height + 'px';
@@ -2786,7 +2837,7 @@ class BonitoChat {
             this.cancelPendingScroll();
         }
         if (this.followMode) return;
-        if (atBot) {
+        if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
             this.setFollowMode(true);
             this.queueScrollToBottom();
         } else {

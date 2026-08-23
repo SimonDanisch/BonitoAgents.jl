@@ -356,7 +356,7 @@ end
             "sessionUpdate" => "tool_call", "toolCallId" => "x",
             "kind" => "other", "title" => "t", "status" => "in_progress")))
         abandoned = first(values(st2.tools))
-        close(st2)
+        ACP.close_turn!(out, st2)
         @test abandoned.status == "failed"
         @test isempty(st2.tools)
     end
@@ -391,7 +391,7 @@ end
         st2  = ACP.TurnState(); out2 = Channel{ACP.Message}(64)
         live_tool(st2, out2, "eval-2")
         tool2 = first(values(st2.tools))
-        close(st2)                                   # what an ABANDONED boundary does
+        ACP.close_turn!(out2, st2)                   # what an ABANDONED boundary does
         @test tool2.status == "failed"
         @test !isopen(tool2.updates)                 # the consumer is freed
         @test isempty(st2.tools)
@@ -414,6 +414,111 @@ end
             close(conn)
         end
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
+    end
+
+    # ── A plan ALWAYS ends, exactly like a span and a tool ───────────────────
+    # The protocol has no "plan ended" frame. An agent that abandons a plan just
+    # stops sending updates, so entries sit at whatever they reached — and a
+    # consumer that only sees entries shows it as live forever (real symptom:
+    # todo pills counting past 35 hours). `close_turn!` is the single place that
+    # settles it, on the same events that settle a span.
+    @testset "close_turn! seals a live plan; a boundary does not" begin
+        out = Channel{ACP.Message}(16)
+        st  = ACP.TurnState()
+        ACP.parse_update!(out, st,
+            ACP.PlanUpdate([ACP.PlanEntry("write the thing", "medium", "in_progress")]))
+
+        live = take!(out)
+        @test live isa ACP.Plan
+        @test live.live
+
+        # A BOUNDARY is not the end of the stream: a plan spans one exactly like a
+        # long-running tool, so sealing here would kill a plan still being worked.
+        ACP.seal_message!(st)
+        @test st.plan !== nothing
+        @test !isready(out)
+
+        ACP.close_turn!(out, st)
+        sealed = take!(out)
+        @test sealed isa ACP.Plan
+        @test sealed.live == false
+        # Entries are reported as the agent last left them — we do not forge a
+        # status the agent never sent.
+        @test [e.status for e in sealed.entries] == ["in_progress"]
+        @test [e.content for e in sealed.entries] == ["write the thing"]
+
+        # Idempotent: nothing left to seal, so nothing is emitted.
+        ACP.close_turn!(out, st)
+        @test !isready(out)
+    end
+
+    @testset "close_turn! with no plan emits nothing" begin
+        out = Channel{ACP.Message}(4)
+        st  = ACP.TurnState()
+        ACP.close_turn!(out, st)
+        @test !isready(out)
+    end
+
+    # The case that was actually broken in production: the WORKER goes away. No
+    # frame announces it — the socket just dies. Over a REAL severed WebSocket,
+    # the consumer must still see the plan settle.
+    @testset "a severed connection seals the live plan" begin
+        m = spawn_mock("plan_then_idle"); conn = m.conn
+        try
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+
+            plans = ACP.Plan[]
+            cons = @async for msg in client.messages
+                msg isa ACP.Plan && push!(plans, msg)
+            end
+            # The plan arrives INSIDE a turn (the mock waits for the prompt), so
+            # there is a consumer for it — and the prompt is deliberately never
+            # resolved: the agent is still "working" when the socket dies.
+            ACP.prompt_request(conn, Dict())
+
+            @test timedwait(() -> !isempty(plans), 5.0) === :ok
+            @test plans[1].live                      # live while the agent is there
+
+            kill_peer!(m)                            # the worker vanishes
+            @test timedwait(() -> istaskdone(cons), 10.0) === :ok
+            @test length(plans) >= 2
+            @test plans[end].live == false           # ... and settles on its own
+            @test [e.status for e in plans[end].entries] == ["in_progress"]
+        finally
+            close(conn)
+        end
+        relay_close!(m)
+    end
+
+    # The invariant the plan seal rests on, asserted on its own: a severed
+    # connection ENDS the session's main stream. It did not use to. The stream
+    # was reachable from the connection only through a callback, so teardown —
+    # which finishes every other in-flight thing — had no way to finish this one:
+    # the coalescer sat in `for u in main_stream` forever, `client.messages`
+    # never closed, and the consumer task never returned. Nobody had called
+    # `close(client)`, and with the worker already gone nobody was going to.
+    @testset "a severed connection ends the main stream" begin
+        m = spawn_mock("plan_then_idle"); conn = m.conn
+        try
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+            cons = @async (for _ in client.messages; end; :ended)
+            ACP.prompt_request(conn, Dict())
+
+            kill_peer!(m)
+            @test timedwait(() -> istaskdone(cons), 10.0) === :ok
+            @test fetch(cons) === :ended               # the consumer RETURNED
+            @test !isopen(client.messages)
+            @test !isopen(client.updates)
+            # And a flush asked for after the stream is gone reports that, rather
+            # than handing back a marker nobody is left to signal — which is the
+            # other half of "tasks that run forever".
+            @test ACP.flush_main!(client) === nothing
+        finally
+            close(conn)
+        end
         relay_close!(m)
     end
 
@@ -596,9 +701,15 @@ end
         m = spawn_mock("two_turns_hang"); conn = m.conn
         do_setup(conn)
         sleep(0.2)                                 # let setup's own updates settle
-        main  = ACP.SessionUpdate[]
-        owned = Tuple{String,ACP.SessionUpdate}[]
-        conn.on_main_update  = u -> push!(main, u)
+        # The main stream is a channel (that is what lets teardown END it), so
+        # stand in for the Client's coalescer with a plain one. `main()` drains
+        # whatever the dispatcher has put there so far and accumulates it, which
+        # keeps every assertion below synchronous with the dispatch above it.
+        stream  = Channel{Any}(64)
+        drained = ACP.SessionUpdate[]
+        main()  = append!(drained, (take!(stream) for _ in 1:Base.n_avail(stream)))
+        owned   = Tuple{String,ACP.SessionUpdate}[]
+        conn.main_stream     = stream
         conn.on_owner_update = (owner, u) -> push!(owned, (owner, u))
 
         tagged(inner) = Dict{String,Any}("jsonrpc" => "2.0", "method" => "session/update",
@@ -621,9 +732,9 @@ end
 
         # The main thread saw only its own two chunks — no subagent prose, no
         # subagent tool. Interleaving those is the failure this addressing removes.
-        @test length(main) == 2
-        @test all(u -> u isa ACP.AgentMessageChunk, main)
-        @test [ACP.text_of(u) for u in main] == ["main ", "still main"]
+        @test length(main()) == 2
+        @test all(u -> u isa ACP.AgentMessageChunk, main())
+        @test [ACP.text_of(u) for u in main()] == ["main ", "still main"]
 
         # The subagent got its whole stream, tagged with its own id.
         @test length(owned) == 3
@@ -647,7 +758,7 @@ end
             "sessionUpdate" => "tool_call_update", "toolCallId" => "sub-t2",
             "_meta" => Dict("claudeCode" => Dict("toolName" => "Bash",
                 "toolResponse" => Dict("stdout" => "hi"))))))
-        @test length(main) == 2                        # NOT the main thread's
+        @test length(main()) == 2                      # NOT the main thread's
         @test last(owned)[1] == "task-1"               # ... it went to the subagent
         @test ACP.tool_call_id(last(owned)[2]) == "sub-t2"
 
@@ -657,7 +768,7 @@ end
         ACP.dispatch_message(conn, plain(Dict{String,Any}(
             "sessionUpdate" => "tool_call_update", "toolCallId" => "main-only",
             "status" => "completed")))
-        @test length(main) == 3
+        @test length(main()) == 3
         @test length(owned) == 5
 
         # The association is forgotten once the tool is terminal, so a long
@@ -675,7 +786,7 @@ end
         @atomic conn.activity = ACP.Cancelling()
         ACP.dispatch_message(conn, plain(chunk("still rendered")))
         ACP.dispatch_message(conn, tagged(chunk("still mine")))
-        @test length(main)  == 4
+        @test length(main())  == 4
         @test length(owned) == 7
         close(conn)
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
@@ -731,7 +842,7 @@ end
     for f in frames
         ACP.parse_update!(out, st, ACP.parse_session_update(f))
     end
-    close(st); close(out)
+    ACP.close_turn!(out, st); close(out)
     tools = [x for x in collect(out) if x isa ACP.ToolCall]
     @test length(tools) == 1
     tc = tools[1]
@@ -764,7 +875,7 @@ end
     for f in frames
         ACP.parse_update!(out, st, ACP.parse_session_update(f))
     end
-    close(st); close(out)
+    ACP.close_turn!(out, st); close(out)
     tools = [x for x in collect(out) if x isa ACP.ToolCall]
     @test length(tools) == 3
     rd, sh, ag = tools
@@ -819,7 +930,7 @@ end
     for f in (call, mid, fin)
         ACP.parse_update!(out, st, ACP.parse_session_update(f))
     end
-    close(st); close(out)
+    ACP.close_turn!(out, st); close(out)
     tc = only([x for x in collect(out) if x isa ACP.ToolCall])
     @test tc isa ACP.MCPCall
     @test tc.tool_name == "bt_julia_eval"

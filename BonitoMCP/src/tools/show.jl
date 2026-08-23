@@ -20,13 +20,24 @@
 const SHOW_KNOWN_MIMES = Dict{String,String}(
     ".png" => "image/png",   ".jpg" => "image/jpeg",  ".jpeg" => "image/jpeg",
     ".gif" => "image/gif",   ".webp" => "image/webp", ".svg" => "image/svg+xml",
-    ".bmp" => "image/bmp",
+    ".bmp" => "image/bmp",   ".avif" => "image/avif", ".ico" => "image/x-icon",
     ".mp4" => "video/mp4",   ".webm" => "video/webm", ".mov" => "video/quicktime",
-    ".html" => "text/html",  ".htm" => "text/html",
+    ".ogv" => "video/ogg",   ".m4v" => "video/mp4",
+    ".mp3" => "audio/mpeg",  ".wav" => "audio/wav",   ".ogg" => "audio/ogg",
+    ".flac" => "audio/flac", ".m4a" => "audio/mp4",   ".opus" => "audio/opus",
+    ".html" => "text/html",  ".htm" => "text/html",   ".pdf" => "application/pdf",
     ".json" => "application/json",
     ".md" => "text/markdown", ".txt" => "text/plain",  ".log" => "text/plain",
     ".jl" => "text/x-julia",  ".py" => "text/x-python", ".js" => "text/javascript",
-    ".csv" => "text/csv",
+    ".csv" => "text/csv",     ".tsv" => "text/tab-separated-values",
+    ".ipynb" => "application/x-ipynb+json",
+    # Geometry: no registered types for most of these, so `model/*` is the
+    # closest honest answer. The chat picks its viewer from the EXTENSION
+    # (`file_kind`), not from this — the mime only rides along in the reference
+    # text for the reader's benefit.
+    ".obj" => "model/obj",   ".stl" => "model/stl",   ".ply" => "model/ply",
+    ".off" => "model/off",   ".glb" => "model/gltf-binary",
+    ".gltf" => "model/gltf+json",
 )
 
 function show_mime_from_path(path::AbstractString)
@@ -63,17 +74,29 @@ end
 const SHOW_DESCRIPTION = """
 Display a file from the worker's disk in the chat as a collapsible preview.
 
-Trivial: just hand it a path. The chat-side renderer fetches the file
-lazily and inlines a preview based on the file's extension:
+Trivial: just hand it a path. The chat-side renderer fetches the file lazily and
+inlines the best view for it — the same viewer the user gets when they open the
+file in a tab:
 
-  • image/png · jpeg · gif · webp · svg · bmp → inline `<img>`
-  • video/mp4 · webm · mov                    → `<video controls>`
-  • text/html                                 → sandboxed `<iframe>`
-  • text/* and code files                     → Monaco editor
-  • anything else                             → caption only
+  • png · jpg · gif · webp · svg · bmp · avif · ico → inline `<img>` (click to enlarge)
+  • mp4 · webm · mov · ogv                          → `<video controls>`, range-streamed
+  • mp3 · wav · flac · ogg · m4a · opus             → `<audio controls>`
+  • md                                              → RENDERED markdown
+  • csv · tsv                                       → a sortable, filterable table
+  • ipynb                                           → notebook cells with their outputs
+  • obj · stl · ply · off · glb · gltf              → an interactive 3D view of the geometry
+  • pdf · html                                      → the rendered document (sandboxed)
+  • source / text / unknown / extensionless         → Monaco, syntax-highlighted
+  • binary                                          → a hex + ASCII dump of the head
 
 The file's bytes never enter your conversation context. You only emit a
 reference; the chat does the rest.
+
+Showing the SAME path twice is fine and does the right thing: the chat re-fetches
+whenever the worker's copy has changed, so re-rendering a plot to
+`/tmp/plot.png` and showing it again displays the NEW picture, not the first one.
+Reach for a fresh filename when you want both versions side by side, not to dodge
+a stale preview.
 
 Common flow:
   1. Run `bt_julia_eval` for any value with rich output (Makie / Plots
@@ -83,9 +106,10 @@ Common flow:
   2. Pass that path to `bt_show` (or any other path on the worker) when
      you want the user to see the file inline.
 
-Use this for: showing a Makie figure you just rendered; surfacing a log
-or HTML report you just generated; displaying any image / video on the
-worker's disk.
+Use this for: showing a Makie figure you just rendered; surfacing a log or HTML
+report you just generated; displaying any image / video / dataset / model on the
+worker's disk. If in doubt, show it — every file type has a viewer, and a
+preview the user can look at beats a paragraph describing one.
 """
 
 register!(

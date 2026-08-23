@@ -138,7 +138,7 @@
             # (the old ~1.5fps path never fired the chase in time to interfere).
             TK.eval_js(s, """
                 (() => { const ch = $CHAT, c = document.querySelector('.bt-messages');
-                    if (ch) { ch.setFollowMode(false); if (ch._cancelPendingScroll) ch._cancelPendingScroll(); }
+                    if (ch) { ch.setFollowMode(false); if (ch.cancelPendingScroll) ch.cancelPendingScroll(); }
                     if (c) { c.scrollTop = 0; c.dispatchEvent(new Event('scroll')); }
                     return true; })()
                 """)

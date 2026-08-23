@@ -250,6 +250,23 @@ function Base.close(h::DevHandle)
     if h.worker_proc !== nothing
         stop_worker_proc!(h.worker_proc)
     end
+    # ...and the agents that worker started. It cannot do this itself: it is
+    # killed, often with SIGKILL, so it runs no cleanup — and the agents are in
+    # their OWN process groups (BonitoWorker spawns them `detach`ed so an agent's
+    # MCP servers and eval workers die with it), so they do not go down with the
+    # worker either.
+    #
+    # BonitoWorker's own startup sweep does not cover this case: every dev_server
+    # gets a THROWAWAY config dir, so the next one looks for an id that has never
+    # existed. We know the id we handed out, so we reap on the way down. Without
+    # this the e2e suite leaked ~3 agent processes per full run, which is how the
+    # box ended up at 93% memory and unrelated tests started failing on timing.
+    try
+        BonitoWorker.reap_agents_owned_by(strip(read(joinpath(h.worker_config, "worker_id"), String)))
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "dev_server: could not reap the worker's agents" exception = e
+    end
     # Drop the env we set so this process is left as we found it (the detached
     # worker already inherited it at spawn; this just prevents leakage into
     # later dev_server / test runs in the same Julia session).

@@ -86,9 +86,11 @@ function seed_temp_env_with_bonito!(env_dir::AbstractString)
 end
 
 # The minimum Bonito version with the remote-app proxy API that the live-render
-# bridge needs. The eval worker uses the PROJECT's own Bonito (we never touch its
-# LOAD_PATH); if that Bonito is older, the bridge setup errors clearly and only
-# live-render display is affected — plain `bt_julia_eval` text output is untouched.
+# bridge needs. The eval worker uses the PROJECT's own Bonito — we never stack an
+# entry onto its search path to supply one (`worker_env` only ever RESTORES the
+# default when a parent leaked `JULIA_LOAD_PATH`). If that Bonito is older, the
+# bridge setup errors clearly and only live-render display is affected — plain
+# `bt_julia_eval` text output is untouched.
 const MIN_BRIDGE_BONITO = v"5"
 
 # ── JuliaSession ────────────────────────────────────────────────────────────
@@ -135,6 +137,34 @@ end
 stream_route(s::JuliaSession) = s.is_temp ? TEMP_KEY : String(s.env_path)
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
+
+"""
+    worker_env() -> Vector{String}
+
+Environment overrides for a spawned eval worker. Empty unless there is something
+to REPAIR.
+
+The one thing worth repairing is an inherited `JULIA_LOAD_PATH`. An eval worker
+gets `--project=<env_path>` and is supposed to resolve packages exactly as
+`julia --project=<env_path>` would in a clean shell. That only holds if nothing
+upstream exported `JULIA_LOAD_PATH` — and things do: `Pkg.test` runs its test
+process with `JULIA_LOAD_PATH="@:<testdir>"`, which has no `@stdlib`, so an eval
+worker inheriting it cannot load a single stdlib (`using Markdown` →
+"Package Markdown not found in current path"). Any host that embeds BonitoMCP
+inside such a process hands its workers the same broken path.
+
+We do not GUESS a value: we restore Julia's DEFAULT (`@`, `@v#.#`, `@stdlib`),
+which is precisely "the project on the command line decides, with the usual
+fallbacks". BonitoAgents itself no longer leaks the variable (see
+`BonitoAgentsApp.worker_command`, which passes `--project` on the command line
+for exactly this reason), so in normal use this returns an empty vector and
+nothing is touched.
+"""
+function worker_env()
+    haskey(ENV, "JULIA_LOAD_PATH") || return String[]
+    sep = Sys.iswindows() ? ';' : ':'
+    return ["JULIA_LOAD_PATH=" * join(("@", "@v#.#", "@stdlib"), sep)]
+end
 
 # Build the exeflags vector. Handles juliaup `+channel` syntax + custom flags.
 function build_exeflags(env_path, julia_cmd)::Vector{String}
@@ -325,6 +355,7 @@ function start!(s::JuliaSession)
     s.worker = Malt.Worker(
         monitor_stdout = false,
         monitor_stderr = false,
+        env            = worker_env(),
         exeflags       = build_exeflags(s.env_path, s.julia_cmd),
     )
     # Before anything can spawn: everything the eval starts inherits this group.
@@ -339,12 +370,12 @@ function start!(s::JuliaSession)
     # closes in kill_session!.
     s.stream_forward = Threads.@spawn stream_forward_loop!(s)
 
-    # The worker is a plain `julia --project=env_path`, and we do not touch its
-    # environment at all — nothing upstream sets JULIA_LOAD_PATH, so there is
-    # nothing to repair here. Packages resolve
-    # exactly as the user's env dictates — we do NOT stack any extra entry. If
+    # The worker is a plain `julia --project=env_path`: packages resolve exactly
+    # as the user's env dictates and we do NOT stack any extra entry. If
     # bt_show_app needs a proxy-aware Bonito, the project's env must declare it
     # (surfaced as a dial_error otherwise); we never silently inject a Bonito.
+    # `worker_env()` is what makes that claim TRUE rather than merely intended —
+    # see its comment.
 
     # Auto-Revise (best-effort) + load our format helper. The trailing
     # `; nothing` is load-bearing: include() returns the module object and

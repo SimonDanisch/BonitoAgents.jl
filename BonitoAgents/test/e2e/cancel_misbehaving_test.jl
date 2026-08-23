@@ -92,6 +92,28 @@ end
 
 =#
 
+# The server-side halves of `busy` (see `BonitoAgents.busy`), for a spinner that
+# will not clear. Read straight off the live model — this is a diagnostic on
+# failure only, never an assertion, so it does not make the suite depend on
+# internals the way driving the chat through them would.
+function busy_diag(s)
+    st  = s.h.state
+    pid = TK.current_chat_id(s)
+    m   = get(st.chat_models, pid, nothing)
+    m === nothing && return (; pid, model = "no ChatModel for this project")
+    sh   = BA.shared(m)
+    cli  = BA.client(m.agent)
+    conn = cli === nothing ? nothing : cli.conn
+    return (; pid,
+            turn_in_flight = lock(() -> sh.turn_in_flight[], sh.lock),
+            busy           = BA.busy(m),
+            activity       = string(BA.session_activity(m)),
+            active_prompts = conn === nothing ? -1 :
+                             lock(() -> length(conn.active_prompts), conn.lock),
+            pending_sends  = lock(() -> length(sh.pending_sends), sh.lock),
+            queued         = isopen(sh.user_messages) ? "open" : "closed")
+end
+
 # ── 2. A message typed during the cancel window must not be swallowed ────────
 # Shipped bug: claude-agent-acp settles turns queued while it is interrupting
 # ("they have no in-flight SDK work to interrupt") — so a prompt sent inside the
@@ -115,16 +137,38 @@ end
         @test TK.wait_for(s, "the typed message is not lost",
             "(() => { const t = document.body.innerText; " *
             "return t.includes('STOP AND DO THIS INSTEAD'); })()"; timeout = 20) == true
-        # UNRESOLVED: this times out. Either the chat really does stay busy after
-        # a prompt the agent settled without running — a bug worth having — or
-        # this is the wrong observable. Left asserting the correct behaviour
-        # rather than relaxed to pass; the suite is kept out of the CI matrix
-        # until it is understood. Needs MockACP's stderr in the test log to tell
-        # the two apart.
-        @test TK.wait_for(s, "chat is usable again (not stuck busy)",
-            "(() => { const b = document.querySelector('.bt-busy'); " *
-            "return !!b && !b.classList.contains('bt-busy-active'); })()";
-            timeout = 40) == true
+        # This assertion carried an UNRESOLVED note for a long time, weighing
+        # "the chat really does stay busy" against "this is the wrong
+        # observable". It was NEITHER: the mock never swallowed the prompt.
+        # `swallow_next_prompt` keyed on the per-prompt `cancelled` flag, which
+        # the arriving prompt itself cleared, so it took the STREAMING branch
+        # and looped forever — the chat was busy because the agent genuinely
+        # never stopped talking. Fixed in MockACP with a sticky `INTERRUPTED`
+        # latch; the diagnostic below is what named it (turn slot held,
+        # activity = Prompted, active_prompts = 1 ⇒ a prompt on the wire that
+        # never settled, not a lost turn slot on our side).
+        #
+        # The probe is scoped to the VISIBLE pane for the same reason `stop!`
+        # above is: a bare `document.querySelector('.bt-busy')` can resolve to a
+        # pane this testset isn't driving.
+        settled = try
+            TK.wait_for(s, "chat is usable again (not stuck busy)",
+                "(() => { const b = [...document.querySelectorAll('.bt-busy')]" *
+                ".find(e => e.offsetParent !== null); " *
+                "return !!b && !b.classList.contains('bt-busy-active'); })()";
+                timeout = 40)
+        catch e
+            e isa InterruptException && rethrow()
+            # `busy` is a derivation of exactly two things, and the spinner alone
+            # cannot say which one is stuck: OUR turn slot (`turn_in_flight`, held
+            # by a `drain_turn!` that never finished) or the CONNECTION's view
+            # (`Cancelling` persists while any prompt is active — see
+            # `settle(::Cancelling, …)`). Naming the half is the whole
+            # difference between a client bug and a protocol bug.
+            @info "cancel_misbehaving: chat stayed busy" diag = busy_diag(s)
+            false
+        end
+        @test settled == true
     finally
         close(s)
     end

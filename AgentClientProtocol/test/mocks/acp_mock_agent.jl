@@ -74,6 +74,12 @@ subagent_text_update(parent::AbstractString, text::AbstractString) =
     "\"content\":{\"type\":\"text\",\"text\":\"$text\"}," *
     "\"_meta\":{\"claudeCode\":{\"parentToolUseId\":\"$parent\"}}}}}"
 
+# A `plan` session/update with one entry at the given status.
+plan_update(content::AbstractString, status::AbstractString) =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\"," *
+    "\"update\":{\"sessionUpdate\":\"plan\",\"entries\":[" *
+    "{\"content\":\"$content\",\"priority\":\"medium\",\"status\":\"$status\"}]}}}"
+
 prompt_done(id::Integer, reason::AbstractString="end_turn") =
     result_frame(id, "{\"stopReason\":\"$reason\"}")
 
@@ -119,6 +125,23 @@ function run_scenario(cws, name::AbstractString, n::Integer = 0)
         # A2 / A8-idle / A4b: complete setup, then sit quietly reading frames until
         # the peer closes. We never stream and never answer further requests.
         answer_setup(cws) || return
+        drain_until_close(cws)
+
+    elseif name == "plan_then_idle"
+        # A plan the agent NEVER finishes: wait for the prompt (so the client's
+        # consumer exists — a plan emitted before it would have no sink), send
+        # one entry left `in_progress`, then go quiet WITHOUT resolving the
+        # prompt. The test severs the socket from here: the abandoned-plan case,
+        # which no protocol frame reports.
+        answer_setup(cws) || return
+        pid = nothing
+        while pid === nothing
+            line = recv_frame(cws)
+            line === nothing && return
+            isempty(line) && continue
+            req_method(line) == "session/prompt" && (pid = req_id(line))
+        end
+        emit(cws, plan_update("write the thing", "in_progress"))
         drain_until_close(cws)
 
     elseif name == "setup_then_swallow"

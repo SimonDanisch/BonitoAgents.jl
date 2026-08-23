@@ -25,15 +25,19 @@ write(joinpath(CWD, "second.jl"), "const SECOND = 42\n")
 # shared-FS short-circuit — the path a remote worker always takes.
 const OUTSIDE = mktempdir()
 write(joinpath(OUTSIDE, "remote.jl"), "const REMOTE_FETCHED = 99\n")
-# A binary file: the editor can't open it, so a direct path-link click must
-# TOAST ("not a text file") — never silently do nothing (the #35 bug).
+# An image: NOT a refusal any more — the file viewer opens it in an image panel.
 write(joinpath(CWD, "logo.png"),
       UInt8[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, fill(0x00, 64)...])
+# A directory: still un-openable, so it must TOAST rather than silently do
+# nothing (the #35 bug) — that's what's left of the open-guard's refusals.
+mkpath(joinpath(CWD, "subdir"))
 
 # The browser command a `.bt-path-link` click fires (same EditFileCommand path).
 open_file(path) = """(() => { document.querySelector('.bt-messages').__bt_chat.comm.notify(
     {type:'edit_file', path: $(TK.json(path))}); return true; })()"""
-panel_sel(path)  = ".bw-ws-panel[data-panel-id=\"file:$(path)\"]"
+# A file tab is identified by its ABSOLUTE worker path however it was opened
+# (see `open_project_file!`), so a relative path resolves against the chat's cwd.
+panel_sel(path)  = ".bw-ws-panel[data-panel-id=\"file:$(isabspath(path) ? path : joinpath(CWD, path))\"]"
 # Count file tabs whose label matches one of our files.
 file_tab_count  = "[...document.querySelectorAll('.bw-tab-label')].filter(l => /hello\\.jl|second\\.jl/.test(l.textContent)).length"
 active_tab_label = "(document.querySelector('.bw-tab.bw-active .bw-tab-label')?.textContent || '')"
@@ -66,8 +70,22 @@ function run_suite(server)
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel("hello.jl"))').length") == 1
             # The editor must actually FILL the panel — regression guard for the
             # 1px-high collapse when the panel wrapper doesn't carry height down.
+            #
+            # Measure the MONACO DIV, not the body around it. The body stayed full
+            # height while an unclassed wrapper inside it collapsed to 5px, so the
+            # source view of every text file was one clipped line over empty space
+            # and this assertion passed the whole time.
             @test TK.wait_for(server, "editor has real height",
-                "(document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor-body')?.offsetHeight || 0) > 200"; timeout = 30) == true
+                """(() => {
+                    const p = document.querySelector('$(panel_sel("hello.jl"))');
+                    const body = p?.querySelector('.bt-file-editor-body');
+                    const ed = p?.querySelector('.monaco-editor-div');
+                    if (!body || !ed) return false;
+                    const bh = body.getBoundingClientRect().height;
+                    const eh = ed.getBoundingClientRect().height;
+                    // the editor fills the body, rather than merely sitting in it
+                    return bh > 200 && eh > 200 && eh >= bh - 40;
+                })()"""; timeout = 30) == true
         end
 
         @testset "rapid repeated opens of one path make exactly ONE panel" begin
@@ -117,16 +135,35 @@ function run_suite(server)
             @test TK.eval_js(server, "document.querySelectorAll('$(panel_sel(abs))').length") == 1
         end
 
-        @testset "clicking a binary path link toasts, opens no panel" begin
-            # #35: a direct path-link click for a non-text file used to be a
-            # silent no-op (the handler pre-filtered on editor_openable and
-            # bailed before the open-guard). It must flash the refusal toast.
+        @testset "clicking an image path link opens the IMAGE viewer" begin
+            # The file viewer opens every kind, so a .png link is no longer a
+            # refusal (it used to toast "not a text file"): it opens a panel that
+            # renders the image, with no Monaco and no Save button.
             TK.eval_js(server, open_file("logo.png"))
-            @test TK.wait_for(server, "not-a-text-file toast for the binary",
-                "[...document.querySelectorAll('.bt-toast-text')].some(t => (t.textContent||'').includes('logo.png'))";
+            @test TK.wait_for(server, "logo.png panel",
+                "!!document.querySelector('$(panel_sel("logo.png"))')"; timeout = 36) == true
+            @test TK.wait_for(server, "it renders as an image, not source",
+                """(() => {
+                    const p = document.querySelector('$(panel_sel("logo.png")) .bt-file-view');
+                    if (!p) return false;
+                    return p.dataset.kind === 'image'
+                        && !!p.querySelector('.bt-fv-image-stage img.bt-media')
+                        && p.querySelector('.monaco-editor-div') === null
+                        && p.querySelector('.bt-file-editor-save') === null;
+                })()"""; timeout = 30) == true
+            # …and the header names the WORKER file, not the server mirror.
+            @test TK.eval_js(server,
+                "document.querySelector('$(panel_sel("logo.png")) .bt-file-editor-path').textContent.endsWith('logo.png')") == true
+        end
+
+        @testset "a folder still toasts and opens no panel" begin
+            # The guard's remaining job: things that cannot be opened AT ALL.
+            TK.eval_js(server, open_file("subdir"))
+            @test TK.wait_for(server, "folder refusal toast",
+                "[...document.querySelectorAll('.bt-toast-text')].some(t => (t.textContent||'').includes('subdir'))";
                 timeout = 15) == true
             @test TK.eval_js(server,
-                "document.querySelectorAll('$(panel_sel("logo.png"))').length") == 0
+                "document.querySelectorAll('$(panel_sel("subdir"))').length") == 0
         end
 
         @testset "a real .bt-path-link click opens the editor" begin
