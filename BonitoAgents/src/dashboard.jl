@@ -1915,7 +1915,7 @@ breadcrumb_root_label(full::AbstractString) =
 Whether `name` is usable as a project name.
 
 It has to be a safe single PATH COMPONENT, because moving a project to another
-worker lands it at `joinpath(w.projects_root, p.name)`. That rules out path
+worker lands it at `worker_join(w.projects_root, p.name)`. That rules out path
 separators and `..`, and leading dots (a hidden directory, and `.`/`..`
 themselves). It does NOT rule out spaces: the old rule was an
 alphanumeric-plus-underscore-and-hyphen regex, which rejected "Mantle DNN" for

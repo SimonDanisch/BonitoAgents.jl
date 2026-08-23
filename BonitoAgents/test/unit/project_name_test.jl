@@ -9,7 +9,7 @@
 #
 # `project_name_from_path` is now the one derivation. The name is a DIRECTORY
 # COMPONENT (the server mirror is `<working_dir>/<worker>-<name>`, and moving a
-# project lands it at `joinpath(w.projects_root, p.name)`), so whatever it
+# project lands it at `worker_join(w.projects_root, p.name)`), so whatever it
 # returns has to satisfy `valid_project_name`.
 @testitem "unit:project_name" tags = [:unit] begin
     P = BonitoAgents.project_name_from_path

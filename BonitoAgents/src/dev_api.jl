@@ -586,7 +586,12 @@ function dev_control(state::ServerState, ::Val{:move_project}, args::AbstractDic
     w = state.workers[][dst_worker]
     isopen(w) || error("worker '$dst_worker' is offline — can't copy to it")
 
-    dst_worker_path = joinpath(w.projects_root, src.name)
+    # `worker_join`, not `joinpath`: the root is the DESTINATION WORKER's, which
+    # may be a different OS than this server. A server-side separator here also
+    # makes the `find_project_by_location` lookup below miss the sibling that
+    # already exists (stored paths are normalized), so a re-run would create a
+    # duplicate instead of moving into it. Same rule as `transfer_project!`.
+    dst_worker_path = worker_join(w.projects_root, src.name)
     dst = find_project_by_location(state, dst_worker, dst_worker_path)
     created = dst === nothing
     if created
