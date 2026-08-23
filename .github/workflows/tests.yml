@@ -181,8 +181,10 @@ jobs:
           - lens
           - media
           - multipane
+          - new_project
           - outdated_worker
           - overview
+          - panel_move_scroll
           - queued_messages
           - render_error
           - resume_discover

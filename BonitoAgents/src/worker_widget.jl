@@ -19,6 +19,21 @@ mutable struct WorkerCard
     initials_obs     :: Observable{String}
 end
 
+# Where the folder picker should open for `worker_id`: the worker's own working
+# directory, which it reports as `projects_root` (BonitoWorker defaults it to the
+# `pwd()` the operator installed from). That is the folder the user thinks of as
+# "where my projects are" — the picker used to open at the worker's $HOME
+# instead, which on a machine that keeps its code elsewhere meant browsing down
+# from `/home/<user>` on every single create.
+#
+# "" if the worker hasn't said hello yet; `list_dir` reads that as $HOME, which
+# is the only sensible fallback when we don't know any better.
+function worker_start_dir(state::ServerState, worker_id::AbstractString)
+    w = get(state.workers[], String(worker_id), nothing)
+    w === nothing && return ""
+    return normalize_worker_path(w.projects_root)
+end
+
 function WorkerCard(state::ServerState, worker_id::AbstractString;
                      error_obs::Observable{String},
                      picker_state::Observable{String},
@@ -36,7 +51,8 @@ function WorkerCard(state::ServerState, worker_id::AbstractString;
                 error_obs, picker_state, discover_state,
                 busy, discover_busy, discover_results,
                 do_import, trigger_scan,
-                RemoteFolderPicker(state, worker_id),
+                RemoteFolderPicker(state, String(worker_id),
+                                   worker_start_dir(state, worker_id)),
                 Observable(initial_name),
                 Observable(initial_initials))
 end
@@ -64,7 +80,19 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, new_proj_btn.value) do clicked
         clicked || return
-        c.picker_state[]   = c.picker_state[] == wid ? "" : wid
+        opening = c.picker_state[] != wid
+        # EVERY open starts at the worker's working directory — not just the
+        # first. The picker instance is stable per card (that's what keeps a
+        # Bonito re-render from resetting it mid-browse), so without this it
+        # reopens wherever the last create left it, or worse onto a path typed
+        # into the address bar that never existed: the folder rows then come
+        # back empty and "+ New folder" fails on the missing parent, with no way
+        # back but retyping. `reset_to_worker!` also clears the stale selection
+        # and error, and re-reads `projects_root` in case the worker reconnected
+        # from somewhere else. Same thing the dashboard's New Project form does
+        # via its `on(np_worker)` listener.
+        opening && reset_to_worker!(c.remote_picker, wid, worker_start_dir(state, wid))
+        c.picker_state[]   = opening ? wid : ""
         c.error_obs[]      = ""
     end
 
@@ -196,7 +224,13 @@ function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::
     on(session, create_btn.value) do clicked
         clicked || return
         is_busy_idle(c.busy[]) || return
+        # Only the Choose button writes `selected`; navigating writes `cur`. So
+        # fall back to the folder the picker is CURRENTLY showing — pressing
+        # Create with the breadcrumb pointing at the folder you want used to fail
+        # with "Pick a folder on the worker first" about that very folder. Same
+        # fallback the dashboard's New Project form does.
         chosen = String(strip(rp.selected[]))
+        isempty(chosen) && (chosen = picker_path(rp))
         if isempty(chosen)
             c.error_obs[] = "Pick a folder on the worker first (Browse → Choose)."
             return

@@ -21,8 +21,8 @@
 # the form's Worker `<select>` (rendered from `state.workers`, one <option> per
 # worker, value = worker_id) to the OTHER worker before clicking Create. Same
 # `name` + different worker_id ⇒ `same_name_siblings` returns the sibling and
-# the ⇄ control appears. This is fully real: `create_project!` rsyncs the picked
-# folder to the server mirror and pushes it onto each worker, so the live
+# the ⇄ control appears. This is fully real: `create_project_from_worker!`
+# registers the picked WORKER folder on each worker, so the live
 # `inspect_project` the modal calls has real content to summarise on both sides.
 
 @testitem "e2e:cross_worker_sync_ui" tags = [:e2e] begin
@@ -63,13 +63,13 @@
             TK.to_dashboard(s)
             TK.click_text(s, "+ New project")
             TK.wait_for(s, "new-project form",
-                "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
+                "[...document.querySelectorAll('.bt-np-name')].some(e => e.offsetParent)";
                 timeout = 30)
             # Select the target worker FIRST. Switching the worker RESETS the
             # folder picker to that worker's projects_root (the picked folder is
             # worker-specific — dashboard.jl `on(np_worker)` → reset_to_worker!),
             # so it MUST come before picking the folder, or the selection is wiped
-            # and Create fails with "Source path is required". The form's select
+            # and Create registers the wrong folder. The form's select
             # carries one <option value=worker_id>name</option> per worker.
             picked = TK.eval_js(s, """(() => {
                 const sel = document.querySelector('.bt-np-worker-select');
@@ -100,7 +100,7 @@
                 timeout = 30)
             TK.click_text(s, "Choose")
             # Name the project (same name on both ⇒ siblings).
-            TK.set_input(s, "input", PROJNAME; placeholder = "e.g. my-project")
+            TK.set_input(s, ".bt-np-name", PROJNAME)
             TK.click_text(s, "Create")
             # Chat view renders after the ACP session binds (mock-agent cold
             # start can take a while) and the new chat becomes the active row.

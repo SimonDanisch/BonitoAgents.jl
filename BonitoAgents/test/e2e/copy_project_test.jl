@@ -118,8 +118,12 @@
                 """document.querySelector('input[placeholder="e.g. my-project-copy"]')?.value || ''""")
             @test occursin("copy", String(name_val))
 
+            # The hint states the ONE name rule the server enforces (a single
+            # path component). It used to promise "Letters, digits, _ and -
+            # only", which was a stricter rule than create applies — see
+            # `valid_project_name` / `copy_to!`.
             has_hint = TK.eval_js(server,
-                "document.body.innerText.includes('Letters, digits')")
+                "document.body.innerText.includes('folder on the target worker')")
             @test has_hint === true
 
             TK.screenshot(server, joinpath(tempdir(), "copy_project_form_initial.png"))

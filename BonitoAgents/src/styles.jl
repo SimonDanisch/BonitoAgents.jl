@@ -1,6 +1,13 @@
 const ChatStyles = Bonito.Styles(
     # ── Tokens (shared with the dashboard) ────────────────────────────────────
     CSS(":root",
+        # This app is light-only: every token below is a light value, and the
+        # widget chrome (BonitoWidgets Theme, Monaco "vs") is pinned light too.
+        # Without saying so, form controls keep the UA's `fieldtext`, which
+        # follows the OS `prefers-color-scheme` — on a dark desktop that's WHITE,
+        # and any input that sets a light `background` without also setting
+        # `color` renders white-on-white (the "names aren't visible" report).
+        "color-scheme"       => "light",
         "--bt-bg"            => "#fafaf9",
         "--bt-surface"       => "#ffffff",
         "--bt-surface-2"     => "#f8fafc",

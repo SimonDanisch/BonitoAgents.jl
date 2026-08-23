@@ -49,16 +49,6 @@ function release_projects_for_worker!(state::ServerState, worker_id::String)
     foreach(p -> release_project!(state, p), targets)
 end
 
-"""
-Create a new project on the named worker. Steps:
-1. Seed `<server_working_dir>/<name>` from the picked source folder (if not
-   already there).
-2. Mirror to `<worker.projects_root>/<name>` (via rsync — local or ssh).
-3. Build the project's ChatModel (its `WorkerAgent` asks the worker over
-   its control WS to spawn an ACP session and dial back) and cache it in
-   `state.chat_models[id]` so `unified_main` can render it when the user
-   selects this project in the sidebar.
-"""
 # ── Foreign (worker) path hygiene ───────────────────────────────────────────
 # A worker can run a different OS than the server, so `ProjectInfo.worker_path`
 # is a path string the server only ever STORES and echoes back — it must never
@@ -86,59 +76,49 @@ normalize_worker_path(p::AbstractString) =
 # project whose every session bring-up fails with an inexplicable cwd.
 mangled_windows_path(p::AbstractString) = occursin(r"^[A-Za-z]:[^\\/]", p)
 
-function create_project!(state::ServerState, name::String, src_path::String,
-                          worker_name::String;
-                          progress = nothing)
-    haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
-    isempty(name) && error("Project name must not be empty")
-    occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
-        error("Project name can't contain / or \\ or start with a dot")
-    isempty(src_path) && error("Source path is required (pick a folder).")
-    isdir(src_path)   || error("Source path is not a directory: $src_path")
+# Join a project NAME onto a worker's `projects_root`. NOT `joinpath`: that uses
+# the SERVER's separator, so a Windows worker's `C:\Users\x\projects` came out as
+# `C:\Users\x\projects/Name`. The root is normalized to forward slashes first, so
+# a plain join is both correct and consistent with every other path we store.
+worker_join(root::AbstractString, name::AbstractString) =
+    rstrip(normalize_worker_path(root), '/') * "/" * String(name)
 
-    w = state.workers[][worker_name]
-    server_path = compute_server_path(state, worker_name, name)
-    # NOT `joinpath`: that uses the SERVER's separator, so a Windows worker's
-    # `C:\Users\x\projects` would come out as `C:\Users\x\projects/Name`.
-    # `normalize_worker_path` has already made it forward-slash, so a plain
-    # join is both correct and consistent with what we store everywhere else.
-    worker_path = rstrip(normalize_worker_path(w.projects_root), '/') * "/" * name
+# Creating a project is a WORKER-ONLY operation. There is deliberately no
+# server-side counterpart of `create_project_from_worker!`: the server has no
+# checkout to create a project from, only a mirror it may later be asked to sync.
+# The removed `create_project!` validated a SERVER-local folder (`isdir`),
+# rsync'd it into the working dir and pushed it to the worker — so every path in
+# it was a server path, and pointing the (worker) folder picker at it failed with
+# "Source path is not a directory" for a folder that exists on the worker. It had
+# no callers left; both create forms go through `create_project_from_worker!`.
 
-    # Idempotent re-import: if the same folder on the same worker is already
-    # registered, return the existing entry instead of creating a duplicate.
-    existing = find_project_by_location(state, worker_name, worker_path)
-    if existing !== nothing
-        @info "create_project!: existing project at this worker_path; reusing" id=existing.id name=existing.name
-        ensure_project_session!(state, existing)
-        return existing
-    end
+"""
+    worker_dir_or_error(state, worker_id, path) -> String
 
-    id = string(uuid4())[1:8]
+Confirm `path` is an existing DIRECTORY **on the worker**, and return the
+worker's own absolute form of it.
 
-    # 1. Seed the canonical server-side copy from the picked source (local
-    # rsync; this is always on the server box, no SSH).
-    if abspath(src_path) != abspath(server_path)
-        notify_progress(progress, :phase, (msg = "Seeding server-side mirror…",))
-        @info "Seeding server-side mirror" src_path server_path
-        mkpath(state.working_dir)
-        run(`rsync -az $(rstrip(src_path, '/'))/ $(rstrip(server_path, '/'))/`)
-    end
+The server cannot answer this question. The folder lives on the worker, so an
+`isdir` here would stat the wrong machine — returning false for a folder that
+exists, or (worse) true for a same-named folder on the server box that has
+nothing to do with it. So we ask, and we store what the worker's own `abspath`
+says: no separator guessing, no server filesystem in the loop.
 
-    # 2. Push server → worker over the worker's WS (no SSH, no inbound port).
-    @info "Pushing project to worker" worker=worker_name dst=worker_path
-    sync_dir_to_worker!(state, worker_name, server_path, worker_path; on_progress = progress)
-
-    p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
-    lock(state.lock) do
-        state.projects[][id] = p
-        save_projects!(state)
-    end
-    safe_notify!(state.projects)
-
-    # 3 + 4: build the chat app + register the route.
-    notify_progress(progress, :phase, (msg = "Starting chat session…",))
-    ensure_project_session!(state, p)
-    return p
+This is the guard for the address bar. The picker's folder rows can only ever
+produce paths the worker just listed, but the bar is a free-text field — a typo
+there registered a project whose every session bring-up then failed with an
+inexplicable cwd. It also catches the folder that was deleted, renamed or
+unmounted between listing it and pressing Create.
+"""
+function worker_dir_or_error(state::ServerState, worker_id::AbstractString,
+                              path::AbstractString)
+    wid = String(worker_id)
+    w   = get(state.workers[], wid, nothing)
+    who = w === nothing ? wid : w.name
+    st  = stat_worker_path(state, wid, path)
+    st.exists || error("No such folder on $who: $path")
+    st.isdir  || error("Not a folder on $who (it's a file): $path")
+    return normalize_worker_path(st.path)
 end
 
 """
@@ -160,7 +140,7 @@ restarts.
 """
 function create_project_from_worker!(state::ServerState, worker_name::String,
                                       worker_path::String;
-                                      name::String = basename(rstrip(normalize_worker_path(worker_path), '/')),
+                                      name::String = project_name_from_path(worker_path),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
                                       start_session::Bool = true,
@@ -168,9 +148,9 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     # A worker may run a different OS than the server, so `worker_path` is a
     # FOREIGN path the server only stores and echoes back — normalize it once,
     # HERE, before it is stored or used to derive anything. See
-    # `normalize_worker_path`. (`name`'s default above uses the normalized form
-    # too: `basename` of a backslash path on a Linux server returns the WHOLE
-    # string, which made the project name the entire path.)
+    # `normalize_worker_path`. (`name`'s default above normalizes first too:
+    # `basename` of a backslash path on a Linux server returns the WHOLE string,
+    # which made the project name the entire path — see `project_name_from_path`.)
     mangled_windows_path(worker_path) && error(
         "Worker path '$worker_path' lost its separators (a Windows path whose " *
         "backslashes were eaten). It can't be repaired — re-pick the folder.")
@@ -592,7 +572,7 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
         error("Worker '$(target_w.name)' is offline")
     target_id == p.worker_id && return p   # no-op
 
-    target_path = joinpath(target_w.projects_root, p.name)
+    target_path = worker_join(target_w.projects_root, p.name)
     notify_progress(progress, :phase,
         (msg = "Stopping session on $(p.worker_id)…",))
     stop_session!(state, p)
@@ -686,10 +666,16 @@ function copy_to!(state::ServerState, p::ProjectInfo, target_worker_id::Abstract
     haskey(state.workers[], target_id) ||
         error("Unknown worker: $target_id")
     target_w = state.workers[][target_id]
-    occursin(r"^[a-zA-Z0-9_\-]+$", String(name)) ||
+    # ONE name rule app-wide (`valid_project_name`), not a second, stricter one
+    # here: this used to demand `^[a-zA-Z0-9_\-]+$` while REPORTING the
+    # valid_project_name rule, so copying a project the create flow had happily
+    # named "Mantle DNN" failed with a message that described a different rule.
+    # Everything past "it must stay one path component" is the target
+    # filesystem's call, and it makes it below when the copy lands.
+    valid_project_name(String(name)) ||
         error("Project name can't contain / or \\ or start with a dot — got '$name'")
 
-    target_path = joinpath(target_w.projects_root, String(name))
+    target_path = worker_join(target_w.projects_root, name)
     existing = find_project_by_location(state, target_id, target_path)
     existing === nothing ||
         error("$(target_w.name) already has a project at $(target_path)")
@@ -742,6 +728,9 @@ end
 const DashboardStyles = Bonito.Styles(
     # ── Tokens ───────────────────────────────────────────────────────────────
     CSS(":root",
+        # Light-only app — see the same declaration in styles.jl's token block.
+        # Both are emitted; the dashboard can be mounted without ChatStyles.
+        "color-scheme"       => "light",
         "--bt-bg"            => "#fafaf9",
         "--bt-surface"       => "#ffffff",
         "--bt-surface-2"     => "#f8fafc",
@@ -1058,12 +1047,17 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-form label",
         "color" => "var(--bt-text-muted)", "font-size" => "13px",
         "padding-top" => "8px"),
+    # An input that paints its own `background` must paint its own `color` too —
+    # otherwise the text is the UA's `fieldtext` and follows the OS color scheme
+    # while the background stays our light token. `:root { color-scheme: light }`
+    # already pins that, this is the belt to its braces.
     CSS(".bt-form input, .bt-form select",
         "padding" => "8px 10px",
         "border" => "1px solid var(--bt-border-strong)",
         "border-radius" => "var(--bt-radius-sm)",
         "font-size" => "14px",
         "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
         "width" => "100%", "box-sizing" => "border-box",
         "outline" => "none",
         "transition" => "border-color 120ms, box-shadow 120ms"),
@@ -1119,6 +1113,7 @@ const DashboardStyles = Bonito.Styles(
         "flex" => "1 1 0", "min-width" => "0",
         "padding" => "6px 8px",
         "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",   # see `.bt-form input` — never inherit fieldtext
         "border" => "1px solid var(--bt-border-strong)",
         "border-radius" => "var(--bt-radius-sm)",
         "font-size" => "13px"),
@@ -1772,7 +1767,17 @@ const DashboardStyles = Bonito.Styles(
 
 # Windows-style address bar: clickable breadcrumb segments by default;
 # clicking the empty area or the ✎ button switches to a text input where the
-# user can type/paste a path. Enter commits, Esc cancels.
+# user can type/paste a path. Enter commits, Esc cancels — and so does LOSING
+# FOCUS, which is the whole reason this comment exists:
+#
+# Enter used to be the ONLY way to commit. Type a path, then click "+ New
+# folder" (or the folder-name box, or Choose) and the bar went on showing the
+# path you typed while `cur` still held the previous one — so the new folder was
+# created in the OLD directory, and Choose copied the OLD directory into
+# `selected`, both while the UI pointed somewhere else. A picker whose displayed
+# location isn't its actual location is a UI that lies; there is no amount of
+# downstream validation that fixes it, because every value it hands out is
+# already the wrong one.
 """
     address_bar(cur, editing) → Bonito DOM node
 
@@ -1788,7 +1793,8 @@ response to user clicks/keystrokes.
 # without losing Windows-correctness.
 js_path(p::AbstractString) = replace(String(p), '\\' => '/')
 
-function address_bar(cur::Observable{String}, editing::Observable{Bool})
+function address_bar(cur::Observable{String}, editing::Observable{Bool},
+                      typed::Observable{String})
     map(cur, editing) do path, edit
         if edit
             DOM.input(
@@ -1797,15 +1803,33 @@ function address_bar(cur::Observable{String}, editing::Observable{Bool})
                 class   = "bt-addr-input",
                 autofocus = true,
                 onfocus = js"event => event.target.select()",
+                # Mirror every keystroke into `typed` so the picker's actions can
+                # read what the bar SHOWS without waiting for a commit. This is
+                # the load-bearing part; Enter/blur below are just navigation.
+                oninput = js"event => $(typed).notify(event.target.value.replace(/\\/g, '/'))",
                 # Normalize user-typed backslashes to forward slashes in JS
                 # before notifying — same reason as `js_path` above.
+                # `dataset.done` marks the edit as already resolved so the blur
+                # that follows Enter (re-render pulls the focused node) or
+                # Escape (an explicit discard) doesn't commit a second time.
                 onkeydown = js"""event => {
                     if (event.key === 'Enter') {
+                        event.target.dataset.done = '1';
                         $(cur).notify(event.target.value.replace(/\\/g, '/'));
                         $(editing).notify(false);
                     } else if (event.key === 'Escape') {
+                        event.target.dataset.done = '1';
                         $(editing).notify(false);
                     }
+                }""",
+                # Clicking straight from the path field onto "+ New folder" /
+                # Choose / a folder row must NOT leave the typed path
+                # uncommitted — see the note above this function.
+                onblur = js"""event => {
+                    if (event.target.dataset.done) return;
+                    event.target.dataset.done = '1';
+                    $(cur).notify(event.target.value.replace(/\\/g, '/'));
+                    $(editing).notify(false);
                 }""")
         else
             paths = breadcrumb_paths(js_path(path))
@@ -1891,65 +1915,52 @@ function valid_project_name(name::AbstractString)
     return true
 end
 
+"""
+    project_name_from_path(worker_path) -> String
+
+Default project name for a folder picked on a worker: **the folder's own name**.
+
+ONE derivation for every create path — the worker card's "+ Project", the
+dashboard's "New project" (whose Name field is optional) and
+`create_project_from_worker!`'s `name` default. They used to disagree, and the
+dashboard form had no derivation at all: leaving Name blank produced
+"Project name must not be empty (folder has no basename?)" for a folder that
+was right there in the breadcrumb.
+
+The name is NOT scrubbed to an alphanumeric whitelist. It only has to satisfy
+`valid_project_name` — the containment invariant that keeps it ONE path
+component — because that is the only thing the server can know without a
+filesystem. Whether "Mantle DNN" or "π-solver" is a usable directory is the
+FILESYSTEM's call, and it gets to make it when `ensure_project_session!` runs
+`mkpath` on the mirror: a real errno beats a guess, and a name the disk accepts
+is one we had no business rewriting.
+
+The path is a FOREIGN path (the worker may run another OS), so the last
+forward-slash segment is taken directly rather than trusting the server's
+`basename`. A bare drive root (`C:/`) has no folder name to take.
+"""
+function project_name_from_path(worker_path::AbstractString)
+    trimmed = rstrip(normalize_worker_path(worker_path), '/')
+    segs    = split(trimmed, '/'; keepempty = false)
+    name    = isempty(segs) ? "" : String(last(segs))
+    # "C:" left alone by the rstrip above is a drive root, not a folder.
+    length(segs) == 1 && occursin(r"^[A-Za-z]:$", name) && (name = "")
+    # A leading dot would make the mirror a hidden directory, and covers "."/"..".
+    # `String` because `lstrip` hands back a SubString and the `name::String`
+    # kwarg of `create_project_from_worker!` refuses one (a TypeError the user
+    # sees as "Failed to import: expected String, got SubString").
+    name = String(lstrip(name, '.'))
+    return valid_project_name(name) ? name : "project"
+end
+
 # Folder picker component
-"""
-Slim server-side folder picker. `selected` is an Observable{String} the caller
-listens to. Renders as: address bar + Up / Choose buttons + a flat list of
-subdirectories below the bar.
-"""
-mutable struct FolderPicker
-    cur::Observable{String}        # current directory being browsed
-    selected::Observable{String}   # final chosen directory
-    expanded::Observable{Bool}
-    editing::Observable{Bool}      # address bar in text-edit mode
-end
-
-FolderPicker(start::String = pwd()) = FolderPicker(
-    Observable(js_path(abspath(start))), Observable(""), Observable(false), Observable(false))
-
-function folder_picker_render(session::Bonito.Session, p::FolderPicker)
-    up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
-                               title = "Up one level")
-    choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
-
-    on(session, up_btn.value) do clicked
-        clicked || return
-        parent = js_path(dirname(rstrip(p.cur[], '/')))
-        isempty(parent) || parent == p.cur[] || (p.cur[] = parent)
-    end
-    on(session, choose_btn.value) do clicked
-        clicked || return
-        p.selected[] = p.cur[]
-    end
-
-    # Always show the listing — drop the explicit Browse-to-expand mode.
-    p.expanded[] = true
-
-    list = map(p.cur) do path
-        entries = try
-            sort!(filter(n -> isdir(joinpath(path, n)) && !startswith(n, "."),
-                         readdir(path)))
-        catch e
-            return DOM.div("error: $e"; class = "bt-picker", style = Styles("color" => "#b91c1c"))
-        end
-        rows = isempty(entries) ?
-            [DOM.div("(no subfolders)";
-                class = "bt-picker-row", style = Styles("color" => "var(--bt-text-faint)"))] :
-            [DOM.div("📁 $name";
-                class   = "bt-picker-row",
-                onclick = js"event => $(p.cur).notify($(js_path(joinpath(path, name))));")
-             for name in entries]
-        DOM.div(rows...; class = "bt-picker")
-    end
-
-    DOM.div(
-        DOM.div(
-            address_bar(p.cur, p.editing),
-            up_btn, choose_btn;
-            class = "bt-picker-cur"),
-        list)
-end
-
+#
+# There is only ONE picker, and it browses the WORKER. The server-side
+# `FolderPicker` that used to live here (`readdir`/`isdir` on the server's own
+# filesystem) is gone: it made the create form offer folders that exist on the
+# server box and nowhere else, which is how server paths leaked into a
+# worker-only flow. Every folder shown below comes from a `list_dir` RPC.
+#
 # Remote folder picker — reads the worker's filesystem over its control WS via
 # `list_worker_dir`. Async: the WS round-trip would otherwise block Bonito's map
 # during render and freeze the UI for hundreds of ms per browse click.
@@ -1962,6 +1973,12 @@ mutable struct RemoteFolderPicker
     selected::Observable{String}
     expanded::Observable{Bool}
     editing::Observable{Bool}          # address bar in text-edit mode
+    # Live text of the address bar WHILE it is being edited. `cur` is where we
+    # are actually listing; `typed` is what the bar is showing. They diverge for
+    # as long as an edit is uncommitted, and reading the wrong one is how "+ New
+    # folder" created its folder in the previously-browsed directory while the
+    # bar pointed somewhere else. Always go through `picker_path`.
+    typed::Observable{String}
     entries::Observable{Vector{PickerEntry}}
     loading::Observable{Bool}
     err::Observable{String}
@@ -1972,9 +1989,32 @@ end
 RemoteFolderPicker(state::ServerState, worker_name::String, start::String = "") =
     RemoteFolderPicker(
         state, worker_name, Observable(start), Observable(""), Observable(false),
-        Observable(false),
+        Observable(false), Observable(""),
         Observable(PickerEntry[]), Observable(false), Observable(""),
         Ref(0), Ref(false))
+
+"""
+    picker_path(p::RemoteFolderPicker) -> String
+
+The folder the picker is POINTING AT — the address bar's live text while it is
+being edited, otherwise the folder being browsed.
+
+Every action that consumes a path (Choose, "+ New folder", Create) must go
+through this rather than reading `cur` directly. `cur` only advances when an
+edit is COMMITTED (Enter, or losing focus), so a user who types a path and
+clicks straight onto a button leaves `cur` on the previous directory while the
+bar displays the new one — and the action then silently operates on the folder
+they navigated away from. Focus/blur is also not something to stake correctness
+on: it doesn't fire at all in an offscreen renderer, and its ordering against
+the click that caused it isn't guaranteed to survive the round-trip to Julia.
+"""
+function picker_path(p::RemoteFolderPicker)
+    if p.editing[]
+        t = String(strip(p.typed[]))
+        isempty(t) || return t
+    end
+    return String(strip(p.cur[]))
+end
 
 # Reset the picker to a new worker (called when the user switches the worker
 # select in the New Project form). Updates worker_name and navigates to
@@ -2033,16 +2073,31 @@ function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPic
                                title = "Up one level")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
+    # Entering edit mode seeds `typed` from where we are, so an untouched bar
+    # still reports the right path (and a stale value from a previous edit can
+    # never leak into `picker_path`).
+    on(session, p.editing) do edit
+        edit && (p.typed[] = js_path(p.cur[]))
+    end
+
     on(session, up_btn.value) do clicked
         clicked || return
-        cur = p.cur[]
+        cur = picker_path(p)
         isempty(cur) && return
         parent = js_path(dirname(rstrip(cur, '/')))
-        !isempty(parent) && parent != cur && (p.cur[] = parent)
+        !isempty(parent) && parent != cur && (p.editing[] = false; p.cur[] = parent)
     end
     on(session, choose_btn.value) do clicked
         clicked || return
-        p.selected[] = p.cur[]
+        # `picker_path`, not `cur`: Choose must confirm the folder the bar is
+        # SHOWING. Copying a stale `cur` here is why pressing Choose didn't
+        # rescue a typed-but-uncommitted path either.
+        chosen = picker_path(p)
+        p.selected[] = chosen
+        # Confirming resolves the edit: back to breadcrumbs, and list what was
+        # chosen so the picker isn't showing a different folder's contents.
+        p.editing[] = false
+        p.cur[]     = chosen
     end
 
     # Picker is always visible — kick off the initial fetch on first render.
@@ -2079,13 +2134,24 @@ function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPic
     on(session, new_btn.value) do clicked
         clicked || return
         nm = strip(new_name[])
-        parent = p.cur[]
+        # The folder the picker is POINTING AT — no Choose needed, and correct
+        # even mid-edit. Choose only writes `selected`, which this has never
+        # consulted and must not: "create it where I'm looking" is the point.
+        parent = picker_path(p)
         isempty(nm) && (p.err[] = "Enter a folder name first."; return)
-        isempty(parent) && return
+        # Empty `cur` means the first `list_dir` hasn't come back yet (the
+        # worker resolves "" to its $HOME and we re-navigate). This used to
+        # `return` silently, so the click did nothing at all with no feedback.
+        isempty(parent) &&
+            (p.err[] = "Still loading this worker's folders — try again in a moment."; return)
         @async try
             created = make_worker_dir(p.state, p.worker_name, parent, nm)
             safe_set!(new_name, "")
             safe_set!(p.err, "")
+            # Leave edit mode BEFORE navigating: we've just resolved the typed
+            # path, so the bar must go back to showing breadcrumbs for the
+            # folder we actually landed in.
+            safe_set!(p.editing, false)
             safe_set!(p.cur, js_path(created))   # navigate in; listener re-lists
         catch e
             safe_set!(p.err, sprint(showerror, e))
@@ -2094,7 +2160,7 @@ function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPic
 
     DOM.div(
         DOM.div(
-            address_bar(p.cur, p.editing),
+            address_bar(p.cur, p.editing, p.typed),
             up_btn, choose_btn;
             class = "bt-picker-cur"),
         DOM.div(
@@ -2209,10 +2275,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # Initialized empty; seeded with the selected worker's projects_root when
     # the New Project button is clicked (or the worker select changes).
     np_remote_picker = RemoteFolderPicker(state, "", "")
+    # Choose pre-fills the Name with the SAME derivation a blank Name would get
+    # at submit, so what the field shows is what you'd get either way. (It used
+    # to be a raw `basename`, which could pre-fill a name the submit then
+    # rejected — e.g. a folder starting with a dot.)
     on(session, np_remote_picker.selected) do sel
         isempty(strip(np_name[])) || return
         isempty(sel) && return
-        np_name[] = basename(rstrip(sel, '/'))
+        np_name[] = project_name_from_path(sel)
     end
     # When the user switches workers in the form, navigate the picker to the
     # new worker's projects_root so it starts at a sensible location.
@@ -2238,14 +2308,16 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                          by = p -> p.name)
         cp_src_project[] = isempty(wid_projs) ? "" : first(wid_projs).id
     end
-    # When source project changes, seed the copy name (sanitized for copy_to!
-    # which requires ^[a-zA-Z0-9_\-]+$).
+    # Seed the copy name from the source's OWN name. No scrub: `copy_to!` now
+    # applies `valid_project_name` like every other create path, so a project
+    # called "Mantle DNN" seeds "Mantle DNN-copy" rather than the
+    # "Mantle-DNN-copy" the old whitelist invented for a name it had itself
+    # accepted at create time.
     on(session, cp_src_project) do pid
         isempty(pid) && return
         p = get(state.projects[], pid, nothing)
         p === nothing && return
-        safe = replace(p.name, r"[^a-zA-Z0-9_\-]" => "-")
-        cp_new_name[] = safe * "-copy"
+        cp_new_name[] = p.name * "-copy"
     end
 
     # ── Sync-to-server click handler ─────────────────────────────────────────
@@ -2330,25 +2402,40 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     on(session, np_submit.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return   # guard: ignore clicks while busy
-        nm = String(strip(np_name[]))
-        busy_start!(busy, "Creating $(nm)")
+        # The picker browses the WORKER's filesystem and a project lives on the
+        # worker — the server copy is only a sync target, never an active
+        # checkout. So this resolves a WORKER path and hands it straight to
+        # `create_project_from_worker!`; nothing here touches the server's disk.
+        #
+        # Fall back to the folder the picker is CURRENTLY showing. Only the
+        # Choose button writes `selected`, so navigating into a folder and
+        # pressing Create used to fail with "Worker path is required" while the
+        # breadcrumb showed that very folder.
+        chosen = String(strip(np_remote_picker.selected[]))
+        isempty(chosen) && (chosen = picker_path(np_remote_picker))
+        if isempty(chosen)
+            error_obs[] = "Pick a folder on the worker first."
+            return
+        end
+        typed = String(strip(np_name[]))
+        # `busy_start!` is the double-click latch, so it has to run
+        # SYNCHRONOUSLY — before the worker has confirmed the path below. Label
+        # it from the path we have; the authoritative name is derived from the
+        # worker's answer.
+        busy_start!(busy, "Creating $(isempty(typed) ? project_name_from_path(chosen) : typed)")
         @async begin
             try
-                # The picker browses the WORKER's filesystem, and a project lives
-                # on the worker — the server copy is only a sync target, never an
-                # active checkout. `create_project!` means the opposite (validate
-                # a server-local folder with `isdir`, then push it over), so it
-                # rejected a perfectly good worker path with "Source path is not
-                # a directory".
-                # Fall back to the folder the picker is CURRENTLY showing. Only
-                # the Choose button writes `selected`, so navigating into a
-                # folder and pressing Create used to fail with "Worker path is
-                # required" while the breadcrumb showed that very folder.
-                chosen = String(strip(np_remote_picker.selected[]))
-                isempty(chosen) && (chosen = String(strip(np_remote_picker.cur[])))
-                p = create_project_from_worker!(state,
-                                 String(strip(np_worker[])),
-                                 chosen;
+                # Ask the WORKER's filesystem, not the picker's memory: `chosen`
+                # can come from the free-text address bar, and the folder can be
+                # gone by now. `real` is the worker's own abspath.
+                wid  = String(strip(np_worker[]))
+                real = worker_dir_or_error(state, wid, chosen)
+                # Name is OPTIONAL: blank means "name it after the folder", the
+                # same default every other create path uses. It used to go
+                # through as "" and come back as "Project name must not be empty
+                # (folder has no basename?)" — about a folder just picked.
+                nm = isempty(typed) ? project_name_from_path(real) : typed
+                p = create_project_from_worker!(state, wid, real;
                                  name = nm,
                                  progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
@@ -2549,10 +2636,10 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         # same folder. Bail synchronously if a long-op is already running; the
         # synchronous `busy_start!` just below then latches this one.
         is_busy_idle(busy[]) || return nothing
-        proj_name = name !== nothing ? name :
-            let n = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
-                isempty(n) ? "project" : n
-            end
+        # Label for the busy card only — `busy_start!` has to run SYNCHRONOUSLY
+        # (it is the double-click latch), and the authoritative name can't be
+        # derived until the worker has confirmed the path below.
+        proj_name = name !== nothing ? name : project_name_from_path(path)
         title = resume_session_id === nothing ?
             "Importing $(proj_name)" :
             "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
@@ -2560,14 +2647,20 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         @async begin
             try
                 @info "do_import: starting" worker=w_name path resume=resume_session_id
+                # Ask the WORKER's filesystem whether this folder is really there
+                # and take ITS abspath. The picker's rows come from a `list_dir`
+                # the worker answered, but the address bar is free text and a
+                # discovered session's cwd can have been renamed since the scan.
+                real  = worker_dir_or_error(state, w_name, path)
+                pname = name !== nothing ? name : project_name_from_path(real)
                 # `start_session=false` so the registration finishes fast and we
                 # can flip `current_view` early — the chat bring-up itself
                 # (ensure_project_session!) is then driven by
                 # `project_loading_view`, which shows a full-panel spinner while
                 # it runs. Otherwise the user stares at the dashboard for ~10s
                 # of ACP `session/load` with only a tiny pill at the top.
-                p = create_project_from_worker!(state, w_name, path;
-                    name = proj_name,
+                p = create_project_from_worker!(state, w_name, real;
+                    name = pname,
                     resume_session_id = resume_session_id,
                     start_session = false,
                     progress = (stage, info) -> busy_event!(busy, stage, info))
@@ -2602,8 +2695,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
 
-    text_input(obs::Observable, ph::String) = DOM.input(
-        type = "text", placeholder = ph,
+    # `class` is the stable hook the e2e suite queries by. Keying a test on the
+    # placeholder TEXT means rewording a user-facing hint silently breaks the
+    # suite — same reason `.bt-np-worker-select` exists.
+    text_input(obs::Observable, ph::String; class::String = "") = DOM.input(
+        type = "text", placeholder = ph, class = class,
         value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
         oninput = js"event => $(obs).notify(event.target.value)")
 
@@ -2630,7 +2726,9 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 class = "bt-np-worker-select",
                 onchange = js"event => $(np_worker).notify(event.target.value)")
         end,
-        DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
+        DOM.label("Name"),
+        text_input(np_name, "optional — defaults to the folder's name";
+                   class = "bt-np-name"),
         DOM.label("Folder on worker"), DOM.div(
             remote_folder_picker_render(session, np_remote_picker),
             map(np_remote_picker.selected) do sel
@@ -2691,7 +2789,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         worker_select(cp_tgt_worker, "bt-cp-tgt-worker"),
         DOM.label("Name on target"),
         text_input(cp_new_name, "e.g. my-project-copy"),
-        DOM.div("Letters, digits, _ and - only.";
+        DOM.div("It becomes a folder on the target worker: no / or \\, no leading dot.";
                 style = Styles("font-size" => "11px",
                                "color"     => "var(--bt-text-muted)",
                                "margin-top" => "-4px")),

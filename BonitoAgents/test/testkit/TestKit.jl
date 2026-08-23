@@ -1062,11 +1062,10 @@ chat view is open. Returns the new chat's project id.
 """
 function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
                                    title::AbstractString = "")
-    # `title` is used as the PROJECT NAME, which the dashboard validates as
-    # alphanumeric/_/- (it is also a directory name). The kwarg reads like a
-    # display label, so a caller naturally passes "Real stop" and gets a Create
-    # the server rejects. Sanitise the same way `github_project_name` does
-    # rather than making every caller know the rule.
+    # `title` is used as the PROJECT NAME, which is also a directory name. The
+    # server's rule is only `valid_project_name` (one path component), so a
+    # space would now go through — but the suite asserts on these names in
+    # selectors and sidebar text, so keep deriving a boring, quotable one.
     raw  = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
     name = replace(raw, r"[^A-Za-z0-9_\-]" => "-")
     leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
@@ -1079,7 +1078,7 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # a cold isolated run). Generous timeout: the FIRST new_chat against a fresh
     # server also compiles the whole new-project / folder-picker UI server-side.
     click_text_until(s, "+ New project",
-        "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
+        "[...document.querySelectorAll('.bt-np-name')].some(e => e.offsetParent)";
         timeout = 30)
     # Flip the breadcrumb to a text field. The ✎ button's onclick (notify
     # `editing=true`) is wired by Bonito only after the element mounts, so on a
@@ -1103,7 +1102,7 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
         "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($leaf))";
         timeout = 30)
     click_text(s, "Choose")
-    set_input(s, "input", name; placeholder = "e.g. my-project")
+    set_input(s, ".bt-np-name", name)
     # Gate on the form being SUBMITTABLE before clicking Create. Both fields are
     # filled asynchronously — the name via an `input` event whose notify has to
     # round-trip to Julia, the worker by the open handler setting `np_worker` to
@@ -1113,7 +1112,7 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # on "chat view opened" with nothing saying why.
     wait_for(s, "new-project form ready (worker + name)",
         "(() => { const w = document.querySelector('.bt-np-worker-select'); " *
-        "const n = [...document.querySelectorAll('input')].find(e => (e.placeholder||'') === 'e.g. my-project'); " *
+        "const n = document.querySelector('.bt-np-name'); " *
         "return !!w && !!w.value && !!n && n.value.length > 0; })()";
         timeout = 30)
     click_text(s, "Create")

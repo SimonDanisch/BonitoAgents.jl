@@ -99,12 +99,17 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
     haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     ref = parse_github_url(url)
     proj_name = something(name, github_project_name(ref))
-    occursin(r"^[a-zA-Z0-9_\-]+$", proj_name) ||
+    # Same ONE name rule as every other create path (`valid_project_name`): a
+    # single path component. `github_project_name` already reduces a repo slug to
+    # that shape, so this only ever fires on an explicit `name=`.
+    valid_project_name(proj_name) ||
         error("Derived project name '$proj_name' is invalid; pass `name=` explicitly")
 
     w = state.workers[][worker_name]
     server_path = compute_server_path(state, worker_name, proj_name)
-    worker_path = joinpath(w.projects_root, proj_name)
+    # `worker_join`, not `joinpath` — the root is the WORKER's, so the SERVER's
+    # separator has no business in it. See dashboard.jl's path-hygiene block.
+    worker_path = worker_join(w.projects_root, proj_name)
 
     # Idempotent re-clone: a project at the same `(worker, worker_path)` is
     # treated as the canonical one; we don't reclone, but we do refresh the
