@@ -325,7 +325,7 @@ unit test stays — it is headless, not a UI test).
   OS-modal picker that nothing in-page can dismiss, so a real click would hang
   the run forever. `chat_attach_test.jl` stubs the hidden input's own `.click`
   and counts calls: the delegated button handler, the `change` listener and
-  `_attachAddBlob` all still run for real, and the File that reaches them is a
+  `attachAddBlob` all still run for real, and the File that reaches them is a
   genuine browser `File` assigned through `input.files = dataTransfer.files`.
   What is NOT covered is the picker's own behaviour — whether `accept="image/*"`
   really surfaces the camera sheet is the browser's contract, not ours.

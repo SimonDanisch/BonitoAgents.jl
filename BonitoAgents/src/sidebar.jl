@@ -1066,7 +1066,7 @@ end
 #   "Loading the chat…"         this card, pane DOM shipping + mounting
 #   "Rendering messages…"       chat module mounted, settle watch running
 #
-# The chat module drives the hand-offs: `_startSettle` (bonitoagents.js)
+# The chat module drives the hand-offs: `startSettle` (bonitoagents.js)
 # dispatches `bt-chat-settling` / `bt-chat-settled` window events carrying
 # the pane pid, and mirrors them as `data-bt-settling` / `data-bt-settled`
 # flags on the `.bt-chatpane` so a card that mounts AFTER an event fired

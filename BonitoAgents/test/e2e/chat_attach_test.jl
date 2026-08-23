@@ -26,10 +26,10 @@
 #   {dataTransfer: dt})`. Under Electron's Chromium the *constructed* event
 #   does NOT reliably forward `clipboardData`/`dataTransfer` onto the dispatched
 #   instance (the composer's `e.clipboardData?.items` / `e.dataTransfer.files`
-#   come back empty), so the legacy test already carried an `_attachAddBlob`
+#   come back empty), so the legacy test already carried an `attachAddBlob`
 #   fallback. We keep BOTH paths: dispatch the real event first (exercising the
-#   composer's `_onPaste`/`_onDrop` wiring), and if no thumbnail materialised
-#   within the event tick, fall back to the chat's `_attachAddBlob(file, mime,
+#   composer's `onPaste`/`onDrop` wiring), and if no thumbnail materialised
+#   within the event tick, fall back to the chat's `attachAddBlob(file, mime,
 #   name)` helper (the same private method the listeners call). The File itself
 #   is always a genuine browser `File` built from a Uint8Array — the bytes flow
 #   blob → FileReader → data URL exactly as in production.
@@ -81,7 +81,7 @@
     attach_count() = TK.eval_js(s, "document.querySelectorAll('$(P).bt-attachment-thumb').length")
 
     # Build a real File in JS, dispatch the real ClipboardEvent against the
-    # textarea, and fall back to the composer's `_attachAddBlob` if the
+    # textarea, and fall back to the composer's `attachAddBlob` if the
     # constructed event didn't forward the File (Chromium-under-Electron quirk).
     function paste_image(filename, hex; mime = "image/png")
         TK.eval_js(s, """(() => {
@@ -175,7 +175,7 @@
         "document.querySelector('$(P).bt-text-input').value === ''"; timeout = 5)
 
     # ── Oversize image is rejected client-side (no thumb, "too large" chip) ───
-    # A 6 MB Uint8Array trips the .size guard in `_attachAddBlob` before any
+    # A 6 MB Uint8Array trips the .size guard in `attachAddBlob` before any
     # bytes are read; we never ship it across the wire.
     TK.eval_js(s, """(() => {
         const big  = new Uint8Array(6 * 1024 * 1024);
@@ -283,7 +283,7 @@
     # A real click would open a NATIVE file dialog, which is modal and would
     # hang the run forever — so we stub the input's own `.click` to count calls.
     # That stubs a BROWSER api, not our code: the delegated handler, the
-    # `change` listener and `_attachAddBlob` all run for real below.
+    # `change` listener and `attachAddBlob` all run for real below.
     @test TK.eval_js(s, "document.querySelector('$(P).bt-attach-input') !== null")
     # `accept` is what makes a mobile browser offer camera/gallery instead of a
     # generic file tree.
@@ -348,7 +348,7 @@
     # ── Queue length is capped ────────────────────────────────────────────────
     # "Select all" in a phone gallery is one tap, so the picker can hand over
     # dozens of multi-MB images in a single `change`. The cap lives in
-    # `_attachAddBlob` (so paste and drop are covered too) and has to survive a
+    # `attachAddBlob` (so paste and drop are covered too) and has to survive a
     # SYNCHRONOUS burst: `attachments` only grows in the async FileReader
     # onload, so a naive `size >= MAX` check reads 0 for every file in the loop
     # and lets all of them through. 12 picked at once, 10 kept.

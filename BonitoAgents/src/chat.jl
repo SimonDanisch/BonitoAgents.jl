@@ -7181,7 +7181,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 class="bt-header-actions"),
             class="bt-header-row"),
         env_line,
-        # Lens search bar — always visible. JS (`_setupLens`) builds the input
+        # Lens search bar — always visible. JS (`setupLens`) builds the input
         # + autocomplete + saved-lens chips inside it and wires it to `comm`.
         DOM.div(class="bt-lens-bar");
         class="bt-header")
@@ -7241,7 +7241,7 @@ icon_img(asset, alt) = DOM.img(src=asset, alt=alt, draggable="false",
 
 function chat_input_area(session::Session, model::ChatModel)
     # The input widgets are JS-owned: `BonitoChat` (assets/bonitoagents.js →
-    # `_setupInputs`) attaches capture-phase click + Enter listeners, reads
+    # `setupInputs`) attaches capture-phase click + Enter listeners, reads
     # the textarea on submit, posts a `{type: 'send', text, attachments}`
     # event over `comm`, and clears the textarea locally. The stop button
     # posts `{type: 'cancel'}`. On the Julia side, those land as
@@ -7305,7 +7305,7 @@ function chat_input_area(session::Session, model::ChatModel)
     # exists on a phone, so the feature was desktop-only by accident. A file
     # input is the one affordance a mobile browser turns into the native
     # camera/gallery sheet — hence `accept="image/*"` (what the pipeline
-    # supports: `_attachAddBlob` reads a data URL for the thumbnail strip).
+    # supports: `attachAddBlob` reads a data URL for the thumbnail strip).
     #
     # The input is hidden and driven by the button, because a raw file input
     # can't be styled to match and reads as a form control in a chat composer.
@@ -7328,7 +7328,7 @@ function chat_input_area(session::Session, model::ChatModel)
     # interpolated observables are live proxies. Toggle ON stashes the user's
     # in-progress draft on the node and shows the current reminders (the
     # composer IS the reminders editor while armed); toggle OFF restores the
-    # draft. While armed the composer mirrors the shared reminders: `_submit`
+    # draft. While armed the composer mirrors the shared reminders: `submit`
     # clears the field optimistically, and the server's reminders write echoes
     # the locked text back (which also syncs concurrent tabs).
     yolo_mode_js = js"""
@@ -8329,7 +8329,7 @@ function Bonito.jsrender(session::Session, m::ChatModel)
         # Idle indicator — visible when the busy dots are NOT (CSS
         # adjacent-sibling rule on `.bt-busy`, so it MUST stay the dots'
         # immediate next sibling) AND the chat has agent replies on display
-        # (`bt-waiting-on`, toggled by `_updateWaiting` in bonitoagents.js).
+        # (`bt-waiting-on`, toggled by `updateWaiting` in bonitoagents.js).
         # The slot under the last message thus says what the agent is
         # doing: dots/reasoning mid-turn, waiting between turns — and
         # nothing at all in a chat that hasn't been asked anything yet.
@@ -8388,7 +8388,7 @@ function Bonito.jsrender(session::Session, m::ChatModel)
         # load overlay (`chat_waiting_view`, sidebar.jl) covers this pane
         # from the moment the user clicks until the chat module reports the
         # geometry settled (`bt-chat-settling` / `bt-chat-settled` events
-        # from `_startSettle` in bonitoagents.js) — one continuous loading
+        # from `startSettle` in bonitoagents.js) — one continuous loading
         # surface instead of the old bring-up pane → bare gap → per-chat
         # curtain relay.
         class="bt-app"))

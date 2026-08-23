@@ -130,7 +130,7 @@
                 """)
             # Jump to scrollTop = 0 and dispatch a synthetic 'scroll' event: in
             # Electron's offscreen renderer a programmatic `scrollTop = N`
-            # changes the value WITHOUT firing 'scroll', so the chat's _onScroll
+            # changes the value WITHOUT firing 'scroll', so the chat's onScroll
             # (and its msgs.request range fetch) would never see the jump.
             # First disengage follow-mode + cancel any pending chase: a prior subtest
             # parks at the bottom, and under OSR's real 60fps that chase rAF would

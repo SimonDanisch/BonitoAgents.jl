@@ -63,8 +63,8 @@
     # map/DOM contradiction production cannot reach. Returns the number of
     # inflated entries.
     # Returns the inflated count PLUS what the churn's own `updateDOM` decided,
-    # sampled right after `refresh()`: `_anchorDebugG` is written by every
-    # `_captureAnchor`, so a value that still reads `st: 0` proves the capture
+    # sampled right after `refresh()`: `anchorDebugGeneric` is written by every
+    # `captureAnchor`, so a value that still reads `st: 0` proves the capture
     # never ran for this churn (initialLoad / a live sticky key-anchor both skip
     # it) — which is a different bug from "captured and restored wrongly", and
     # the failure message could not tell them apart.
@@ -91,7 +91,7 @@
         # Churn heights in the top spacer (below the rendered window) LARGER than
         # their estimate — the same shape as a background prefetch re-measuring
         # unrendered rows taller. When the map-based visibleRange() shifts off the
-        # DOM's real top-visible node the anchor gets EVICTED, and _restoreAnchor
+        # DOM's real top-visible node the anchor gets EVICTED, and restoreAnchor
         # then used a cumHeight() virtual position that omitted the container
         # padding + gap-after-spacer, landing ~a row short — so the follow-up
         # refresh re-anchored the NEIGHBOUR and the view jumped ~1 row (stuck).
@@ -147,7 +147,7 @@
 
     @testset "evicted-anchor restore lands the node at its offset (#32)" begin
         # Deterministic (no load/timing) guard for the coordinate bug: force the
-        # EVICT branch of _restoreAnchor and require the anchored node to end up
+        # EVICT branch of restoreAnchor and require the anchored node to end up
         # exactly at the requested offset once the queued refresh re-materialises
         # it. Pre-fix, the virtual restore used cumHeight() WITHOUT PAD_TOP +
         # ITEM_GAP, so scrollTop landed ~a row short (node ~26px off) → the
@@ -192,7 +192,7 @@
     @testset "hidden panes stop backfilling the transcript" begin
         # Prior testsets' fetch cascades (forced refresh + refetch above) can
         # still be in flight under load — their msgs.request would be counted
-        # against _startPrefetch (the intermittent `116 == 0`). Wait for
+        # against startPrefetch (the intermittent `116 == 0`). Wait for
         # REQUEST QUIESCENCE (no msgs.request for 800ms) before hooking.
         quiesced = TK.eval_js(s, """(() => new Promise(resolve => {
             const ch = $CH;

@@ -1091,7 +1091,7 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)"),
     # Collapse chevron. The collapsed state is the `bt-todo-collapsed` class
     # on the PERSISTENT `.bt-taskbar` element (not the slot — slots are 1 Hz
-    # KeyedList re-renders that would wipe any state; see _setupLiveTicker in
+    # KeyedList re-renders that would wipe any state; see setupLiveTicker in
     # bonitoagents.js, which also persists the choice in localStorage and
     # defaults phones to collapsed).
     CSS(".bt-taskbar-todo-toggle",
@@ -1928,7 +1928,7 @@ const ChatStyles = Bonito.Styles(
         "border-radius" => "var(--bt-radius-sm)",
         "padding" => "8px 10px",
         # Streaming writes the live stdout tail as a raw text node straight into
-        # `.bt-console` (see bonitoagents.js `_evalOutputConsole`), so it needs
+        # `.bt-console` (see bonitoagents.js `evalOutputConsole`), so it needs
         # its own `pre-wrap` — otherwise newlines collapse and the tail renders
         # as one wrapped line, unlike the completed `.terminal-output` <pre>.
         "white-space" => "pre-wrap", "word-break" => "break-word",
@@ -2091,13 +2091,13 @@ const ChatStyles = Bonito.Styles(
         "color" => "inherit"),
 
     # Overscroll tail — empty space below the last message the user can
-    # scroll into (sized to ~30% of the pane by `_sizeTail`). All "bottom"
+    # scroll into (sized to ~30% of the pane by `sizeTail`). All "bottom"
     # math (atBottom / scrollToBottom / pins) targets the CONTENT bottom,
     # treating the tail as beyond-the-end.
     CSS(".bt-messages-tail",
         "flex-shrink" => "0", "overflow-anchor" => "none"),
 
-    # Off-screen measuring host (`_measureNodes`): prefetched message nodes
+    # Off-screen measuring host (`measureNodes`): prefetched message nodes
     # are laid out here — same width as the messages content box — to get
     # real heights before they're ever rendered. Hidden but NOT display:none
     # (children must lay out); zero own height so it never affects the page.
@@ -2117,7 +2117,7 @@ const ChatStyles = Bonito.Styles(
 
     # (The per-chat mount curtain used to live here — the dashboard's load
     # overlay now covers the pane until settle; see `chat_waiting_view` in
-    # sidebar.jl and `_startSettle` in bonitoagents.js.)
+    # sidebar.jl and `startSettle` in bonitoagents.js.)
 
     # ── Busy indicator ───────────────────────────────────────────────────────
     # Lives inside `.bt-messages` (between the bottom spacer and the
@@ -2158,7 +2158,7 @@ const ChatStyles = Bonito.Styles(
     # the adjacent-sibling rule — busy_start/busy_end flips and the
     # server-rendered remount class drive both elements in lockstep) AND
     # the chat has agent replies on display: `bt-waiting-on` is toggled by
-    # `_updateWaiting` in bonitoagents.js — set once an agent message exists
+    # `updateWaiting` in bonitoagents.js — set once an agent message exists
     # and the Agent filter shows them. An empty chat (nothing asked yet) or
     # a filtered-out agent stream gets no dangling "waiting" line. Same
     # placement rules as `.bt-busy` above (inside `.bt-messages`).
@@ -2344,7 +2344,7 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-surface)"),
     # Slash-command autocomplete: floats ABOVE the composer while the input
     # holds a lone "/partial" token (built/driven in bonitoagents.js
-    # _setupInputs; fed by available_commands_update via the 'commands' comm
+    # setupInputs; fed by available_commands_update via the 'commands' comm
     # event + the connect-time init snapshot).
     CSS(".bt-cmd-ac",
         "position" => "absolute", "bottom" => "100%",
