@@ -103,7 +103,7 @@
             timeout = 15) == true
         @test TK.wait_for(s, "$(label): ESC handler wired",
             "(() => { const m = document.querySelector('$(P).bt-messages'); " *
-            "return !!m && !!m.__bt_chat && typeof m.__bt_chat._onEscapeKey === 'function'; })()";
+            "return !!m && !!m.__bt_chat && typeof m.__bt_chat.onEscapeKey === 'function'; })()";
             timeout = 15) == true
 
         # Count agent bubbles already visible so we can refer to "the new one"

@@ -112,7 +112,7 @@ export class Collapsable {
                 // so the resize is animated by Monaco itself instead of CSS
                 // clip.
                 this.body.style.display = '';
-                this._applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
+                this.applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
                 // Plain lazy bodies AND eval compact bodies hide on collapse;
                 // for the latter the node stays mounted (editMode skips the
@@ -152,7 +152,7 @@ export class Collapsable {
     // `[data-compact-body] .bt-tool-header[data-expanded] ~ .bt-tool-body`
     // (see styles.jl), so it holds for EVERY mount path (eager mount,
     // terminal re-render, history reload) with no lifecycle hook.
-    _applyEditHeight(h) {
+    applyEditHeight(h) {
         const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
         divs.forEach(div => {
             const monaco = div.__btMonacoDiff;
@@ -202,17 +202,17 @@ class BonitoChat {
         this.EST_HEIGHT    = 80;    // adapted to the measured average, see _measureNodes
         this.OVERSCAN      = 8;
         this.initialLoad   = false;
-        this._bootstrapped = false; // first msgs.count seen (guards initialLoad re-arm)
-        this._measSum      = 0;     // running mean of measured heights → EST_HEIGHT
-        this._measCount    = 0;
-        this._spacerTopH   = -1;    // last written spacer px (skip no-op style writes)
-        this._spacerBotH   = -1;
-        this._requestedAt  = new Map(); // idx → time of in-flight msgs.request
+        this.bootstrapped = false; // first msgs.count seen (guards initialLoad re-arm)
+        this.measuredHeightSum      = 0;     // running mean of measured heights → EST_HEIGHT
+        this.measuredHeightCount    = 0;
+        this.spacerTopHeight   = -1;    // last written spacer px (skip no-op style writes)
+        this.spacerBottomHeight   = -1;
+        this.requestedAt  = new Map(); // idx → time of in-flight msgs.request
         // Bumped on msgs.reload (the server SPLICED history — all indices
         // shifted). Every msgs.request carries it and the server echoes it
         // back on msgs.range; a reply from before the reload is dropped in
         // onRange instead of caching old-world nodes at new-world indices.
-        this._epoch        = 0;
+        this.epoch        = 0;
         this.STREAM_APPLY_MS = 100; // min interval between streaming innerHTML applies
 
         // ONE shared ResizeObserver for every node in the render window.
@@ -227,7 +227,7 @@ class BonitoChat {
         // start landed inside the viewport — visible bubbles were evicted
         // ("bubbles hide before they leave the screen") and every eviction
         // shrank scrollHeight mid-scroll (stutter).
-        this._ro = new ResizeObserver((entries) => {
+        this.messageHeightObserver = new ResizeObserver((entries) => {
             if (this.destroyed) return;
             let changed = false;
             for (const e of entries) {
@@ -247,7 +247,7 @@ class BonitoChat {
             // ambush the next scroll tick. EXCEPT mid-scrollbar-drag:
             // corrections then wait for release — re-spacing under a held
             // thumb is exactly the flicker.
-            if (changed && !this._scrollbarDrag) this._queueRefresh();
+            if (changed && !this.scrollbarDrag) this.queueRefresh();
         });
 
         // ── Live-app keep-alive LRU ──────────────────────────────────────
@@ -306,7 +306,7 @@ class BonitoChat {
         // handlers re-derive pill visibility constantly (every composer
         // autosize fires one), so show/hide only touch the DOM on an
         // actual flip — see _showNewMessagePill/_hideNewMessagePill.
-        this._pillShown = false;
+        this.pillShown = false;
         // "At bottom" is intentionally tight here (20px) — the loose
         // 200px threshold the old code used was a workaround for
         // chunked-text-during-burst race conditions. With explicit
@@ -320,7 +320,7 @@ class BonitoChat {
         // programmatic scrollTop write that may not fire a scroll event
         // (offscreen renderers): scrollToBottom, the re-pin in updateVisible,
         // onShown's restore, the lens reset, and the pan/momentum writes.
-        this._prevScrollTop = container.scrollTop;
+        this.prevScrollTop = container.scrollTop;
 
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
@@ -368,7 +368,7 @@ class BonitoChat {
         // Overscroll tail: empty space below the last message the user can
         // scroll into (~30% of the pane; sized in the container RO).
         this.tailEl       = container.querySelector('.bt-messages-tail');
-        this._sizeTail();
+        this.sizeTail();
         // Off-screen measuring host: prefetched nodes get REAL heights here
         // before they're ever rendered, so the virtual geometry is exact
         // everywhere and scrollbar drags see a stable scrollHeight (see
@@ -380,7 +380,7 @@ class BonitoChat {
         // Start the settle watch immediately: its hard cap must dismiss the
         // load overlay (sidebar.jl chat_waiting_view) even if the comm
         // bootstrap stalls.
-        this._startSettle();
+        this.startSettle();
 
         // Single subscription. `comm` is a Bonito Observable bridged via
         // WS; every message Julia sets via `model.comm[] = {...}` arrives here.
@@ -401,9 +401,9 @@ class BonitoChat {
             this.applyCount(cur.n);
         } else if (cur && cur.type === 'msgs.range') {
             // Re-mount of a chat that already has messages cached.
-            this._startSettle();
+            this.startSettle();
             this.onRange(cur);
-            this._startPrefetch();
+            this.startPrefetch();
         }
         comm.notify({type: 'init'});
 
@@ -434,18 +434,18 @@ class BonitoChat {
         // intervening frame took. Consumed on use; wall-clock can't
         // expire it because a blocked main thread can't deliver an
         // unrelated scroll event in between anyway.
-        this._lastUserInputT = 0;
-        this._pendingUserScroll = false;
+        this.lastUserInputT = 0;
+        this.pendingUserScroll = false;
         const markUserInput = () => {
-            this._lastUserInputT = performance.now();
-            this._pendingUserScroll = true;
-            this._cancelPendingScroll();
+            this.lastUserInputT = performance.now();
+            this.pendingUserScroll = true;
+            this.cancelPendingScroll();
         };
         container.addEventListener('wheel',      markUserInput, { passive: true });
         container.addEventListener('touchstart', markUserInput, { passive: true });
         container.addEventListener('touchmove',  markUserInput, { passive: true });
         container.addEventListener('keydown',    markUserInput, { passive: true });
-        this._markUserInput = markUserInput;
+        this.markUserInput = markUserInput;
 
         // File-path links: ONE delegated listener for every `.bt-path-link`
         // in the chat (tool titles, diff headers, search hits, linkified
@@ -471,18 +471,18 @@ class BonitoChat {
         // treats it as a layout shift and yanks the thumb back to the
         // bottom ("scrollbar feels stuck"). mouseup lands on window — the
         // pointer often leaves the container before release.
-        this._scrollbarDrag = false;
-        this._onContainerMouseDown = () => {
-            this._scrollbarDrag = true;
+        this.scrollbarDrag = false;
+        this.onContainerMouseDown = () => {
+            this.scrollbarDrag = true;
             markUserInput();
         };
-        this._onWindowMouseUp      = () => {
+        this.onWindowMouseUp      = () => {
             // Window-level listener: a pane whose subtree was unmounted above
             // the direct parent (MutationObserver in `connect` can't see
             // that) self-destroys lazily here.
-            if (!this.container.isConnected) { this._lazyDestroy(); return; }
-            if (!this._scrollbarDrag) return;
-            this._scrollbarDrag = false;
+            if (!this.container.isConnected) { this.lazyDestroy(); return; }
+            if (!this.scrollbarDrag) return;
+            this.scrollbarDrag = false;
             markUserInput();   // the release tick still counts as user input
             // Auto-expands deferred during the drag (image bodies inflate
             // scrollHeight — poison for a held thumb): mount them now. Only
@@ -495,10 +495,10 @@ class BonitoChat {
                     node.collapsable?.setExpanded(true);
                 }
             }
-            this._queueRefresh();   // re-true spacers to the corrected heights
+            this.queueRefresh();   // re-true spacers to the corrected heights
         };
-        container.addEventListener('mousedown', this._onContainerMouseDown, { passive: true });
-        window.addEventListener('mouseup', this._onWindowMouseUp, { passive: true });
+        container.addEventListener('mousedown', this.onContainerMouseDown, { passive: true });
+        window.addEventListener('mouseup', this.onWindowMouseUp, { passive: true });
 
         // ── Grab-to-pan with fling momentum + rubberband ──────────────
         // Click and drag anywhere in the messages area pans the viewport
@@ -521,13 +521,13 @@ class BonitoChat {
         const PAN_SPRING_DAMPING  = 0.72; // overscroll spring-back decay / frame
         const PAN_FLING_THRESHOLD = 0.10; // px/ms; below this no fling on release
 
-        this._overscroll  = 0;
-        this._panState    = null;
-        this._momentumRaf = null;
-        this._springRaf   = null;
+        this.overscroll  = 0;
+        this.panState    = null;
+        this.momentumRaf = null;
+        this.springRaf   = null;
 
         const setOverscroll = (v) => {
-            this._overscroll = v;
+            this.overscroll = v;
             this.container.style.setProperty('--bt-overscroll', v + 'px');
             // The rubberband translateY is applied to EVERY rendered child;
             // a non-`none` transform on each child turns one composited scroll
@@ -537,34 +537,34 @@ class BonitoChat {
             // and normal scrolling composites natively.
             this.container.classList.toggle('bt-overscrolling', v !== 0);
         };
-        this._setOverscroll = setOverscroll;   // so onHidden can clear it
+        this.setOverscroll = setOverscroll;   // so onHidden can clear it
 
-        this._cancelMomentum = () => {
-            if (this._momentumRaf !== null) {
-                cancelAnimationFrame(this._momentumRaf);
-                this._momentumRaf = null;
+        this.cancelMomentum = () => {
+            if (this.momentumRaf !== null) {
+                cancelAnimationFrame(this.momentumRaf);
+                this.momentumRaf = null;
             }
-            if (this._springRaf !== null) {
-                cancelAnimationFrame(this._springRaf);
-                this._springRaf = null;
+            if (this.springRaf !== null) {
+                cancelAnimationFrame(this.springRaf);
+                this.springRaf = null;
             }
         };
 
         const springStep = () => {
-            this._springRaf = null;
+            this.springRaf = null;
             if (this.destroyed) return;
-            if (Math.abs(this._overscroll) < 0.5) { setOverscroll(0); return; }
-            setOverscroll(this._overscroll * PAN_SPRING_DAMPING);
-            this._springRaf = requestAnimationFrame(springStep);
+            if (Math.abs(this.overscroll) < 0.5) { setOverscroll(0); return; }
+            setOverscroll(this.overscroll * PAN_SPRING_DAMPING);
+            this.springRaf = requestAnimationFrame(springStep);
         };
 
         const startSpring = () => {
-            if (this._springRaf !== null || this._overscroll === 0) return;
-            this._springRaf = requestAnimationFrame(springStep);
+            if (this.springRaf !== null || this.overscroll === 0) return;
+            this.springRaf = requestAnimationFrame(springStep);
         };
 
         const momentumStep = (vel) => {
-            this._momentumRaf = null;
+            this.momentumRaf = null;
             if (this.destroyed) return;
             // vel is px/ms in the direction of pointer travel.
             // dy > 0 means pointer moved down ⇒ content goes down ⇒
@@ -576,11 +576,11 @@ class BonitoChat {
             let newTop = prevTop - delta;
             let hitEdge = false;
             if (newTop < 0) {
-                setOverscroll(this._overscroll + (-newTop) * PAN_BOUNCE_RESIST);
+                setOverscroll(this.overscroll + (-newTop) * PAN_BOUNCE_RESIST);
                 this.container.scrollTop = 0;
                 hitEdge = true;
             } else if (newTop > maxScroll) {
-                setOverscroll(this._overscroll - (newTop - maxScroll) * PAN_BOUNCE_RESIST);
+                setOverscroll(this.overscroll - (newTop - maxScroll) * PAN_BOUNCE_RESIST);
                 this.container.scrollTop = maxScroll;
                 hitEdge = true;
             } else {
@@ -591,31 +591,31 @@ class BonitoChat {
             // event for programmatic scrollTop writes, and when the event
             // DOES fire it sees a zero delta against the synced
             // _prevScrollTop and skips (never classified twice).
-            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
-            this._prevScrollTop = this.container.scrollTop;
+            if (this.container.scrollTop !== prevTop) this.applyUserScroll(prevTop);
+            this.prevScrollTop = this.container.scrollTop;
             // Keep the user-input timestamp fresh so the scroll handler
             // continues classifying these programmatic scrollTop writes
             // as user-driven (= the fling the user threw). Without this
             // the 400 ms recency window lapses mid-fling and a stray
             // layout shift re-engages chase, snapping to bottom in the
             // middle of the user's read.
-            this._lastUserInputT = performance.now();
+            this.lastUserInputT = performance.now();
             // Edge-hit: absorb the remaining velocity into the bounce
             // and let the spring carry the rest. Otherwise decay.
             vel = hitEdge ? 0 : vel * PAN_FRICTION;
             if (Math.abs(vel) < PAN_MIN_VELOCITY) { startSpring(); return; }
-            this._momentumRaf = requestAnimationFrame(() => momentumStep(vel));
+            this.momentumRaf = requestAnimationFrame(() => momentumStep(vel));
         };
 
         const onPanDown = (e) => {
             if (e.pointerType === 'touch') return;
             if (e.button !== 0) return;
-            if (this._scrollbarDrag) return;
+            if (this.scrollbarDrag) return;
             // Don't engage on form controls / buttons / links — let their
             // native semantics own the gesture. Closest is cheap.
             if (e.target.closest('input, textarea, button, a, select, [contenteditable]')) return;
-            this._cancelMomentum();
-            this._panState = {
+            this.cancelMomentum();
+            this.panState = {
                 pointerId: e.pointerId,
                 startY:    e.clientY,
                 lastY:     e.clientY,
@@ -626,7 +626,7 @@ class BonitoChat {
         };
 
         const onPanMove = (e) => {
-            const p = this._panState;
+            const p = this.panState;
             if (!p || e.pointerId !== p.pointerId) return;
             if (!p.engaged) {
                 if (Math.abs(e.clientY - p.startY) < PAN_THRESHOLD) return;
@@ -634,7 +634,7 @@ class BonitoChat {
                 // window: yield. Pan only fires when the gesture was
                 // intended as a pan.
                 const sel = window.getSelection();
-                if (sel && sel.toString().length > 0) { this._panState = null; return; }
+                if (sel && sel.toString().length > 0) { this.panState = null; return; }
                 p.engaged = true;
                 p.lastY = e.clientY;
                 p.lastT = performance.now();
@@ -643,8 +643,8 @@ class BonitoChat {
                 // Pan acts like a wheel: cancels pending chase + marks
                 // user input so the scroll handler treats subsequent
                 // scrollTop writes as user-driven.
-                this._lastUserInputT = performance.now();
-                this._cancelPendingScroll();
+                this.lastUserInputT = performance.now();
+                this.cancelPendingScroll();
             }
             e.preventDefault();
             const now = performance.now();
@@ -654,13 +654,13 @@ class BonitoChat {
             const prevTop = this.container.scrollTop;
             const newTop = prevTop - stepDy;
             if (newTop < 0) {
-                setOverscroll(this._overscroll + (-newTop) * PAN_RESIST);
+                setOverscroll(this.overscroll + (-newTop) * PAN_RESIST);
                 this.container.scrollTop = 0;
             } else if (newTop > maxScroll) {
-                setOverscroll(this._overscroll - (newTop - maxScroll) * PAN_RESIST);
+                setOverscroll(this.overscroll - (newTop - maxScroll) * PAN_RESIST);
                 this.container.scrollTop = maxScroll;
             } else {
-                if (this._overscroll !== 0) setOverscroll(0);
+                if (this.overscroll !== 0) setOverscroll(0);
                 this.container.scrollTop = newTop;
             }
             // A drag step is the user's own gesture — classify it at the
@@ -668,8 +668,8 @@ class BonitoChat {
             // scroll event; onscreen: the trailing event is a zero-delta
             // no-op). A downward re-engage never yanks mid-drag: the chase
             // rAF re-arms while the input timestamp stays fresh.
-            if (this.container.scrollTop !== prevTop) this._applyUserScroll(prevTop);
-            this._prevScrollTop = this.container.scrollTop;
+            if (this.container.scrollTop !== prevTop) this.applyUserScroll(prevTop);
+            this.prevScrollTop = this.container.scrollTop;
             if (stepDt > 0) {
                 // Exponentially-smoothed velocity (px/ms): noise-resistant
                 // and recency-biased so the release-instant velocity
@@ -679,21 +679,21 @@ class BonitoChat {
             }
             p.lastY = e.clientY;
             p.lastT = now;
-            this._lastUserInputT = now;
+            this.lastUserInputT = now;
         };
 
         const onPanUp = (e) => {
-            const p = this._panState;
+            const p = this.panState;
             if (!p || e.pointerId !== p.pointerId) return;
             const engaged = p.engaged;
             const vel     = p.velocity;
-            this._panState = null;
+            this.panState = null;
             if (!engaged) return;
             try { this.container.releasePointerCapture(e.pointerId); } catch (_) {}
             this.container.classList.remove('bt-messages-grabbing');
             if (Math.abs(vel) > PAN_FLING_THRESHOLD) {
-                this._momentumRaf = requestAnimationFrame(() => momentumStep(vel));
-            } else if (this._overscroll !== 0) {
+                this.momentumRaf = requestAnimationFrame(() => momentumStep(vel));
+            } else if (this.overscroll !== 0) {
                 startSpring();
             }
         };
@@ -702,11 +702,11 @@ class BonitoChat {
         container.addEventListener('pointermove',   onPanMove);
         container.addEventListener('pointerup',     onPanUp);
         container.addEventListener('pointercancel', onPanUp);
-        this._onPanDown = onPanDown;
-        this._onPanMove = onPanMove;
-        this._onPanUp   = onPanUp;
+        this.onPanDown = onPanDown;
+        this.onPanMove = onPanMove;
+        this.onPanUp   = onPanUp;
 
-        this._onScroll = () => {
+        this.onScroll = () => {
             // A scroll event on a zero-height container carries no user intent:
             // hiding the pane (display:none on a chat switch) collapses
             // scrollTop to 0 and fires this handler. `atBottom()` is then
@@ -716,38 +716,42 @@ class BonitoChat {
             // next onShown — the user's read position lost. Ignore it: the pane
             // has no viewport, so there is nothing to classify.
             if (this.container.clientHeight === 0) return;
-            const userDriven = this._scrollbarDrag ||
-                this._pendingUserScroll ||
-                (performance.now() - this._lastUserInputT) < 400;
-            this._pendingUserScroll = false;
+            // Last position seen with a real layout box. `_restoreAfterMove`
+            // puts this back when the workspace re-inserts our panel and the
+            // browser silently drops scrollTop to 0.
+            this.lastGoodTop = this.container.scrollTop;
+            const userDriven = this.scrollbarDrag ||
+                this.pendingUserScroll ||
+                (performance.now() - this.lastUserInputT) < 400;
+            this.pendingUserScroll = false;
             const atBot      = this.atBottom();
             // Direction comes from the delta since the last processed
             // position. A zero-delta event carries no movement — nothing to
             // classify. That also makes the async scroll event trailing a
             // pan/momentum scrollTop write (already classified at the write,
             // which synced _prevScrollTop) a no-op instead of a double count.
-            const prevTop = this._prevScrollTop;
-            this._prevScrollTop = this.container.scrollTop;
+            const prevTop = this.prevScrollTop;
+            this.prevScrollTop = this.container.scrollTop;
             if (userDriven) {
                 // User-driven movement → the follow-mode transition lives in
                 // _applyUserScroll (razor-thin disengage; generous,
                 // downward-only re-engage at the pill's boundary).
                 if (this.container.scrollTop !== prevTop) {
-                    this._applyUserScroll(prevTop);
+                    this.applyUserScroll(prevTop);
                 }
             } else if (this.followMode && !atBot) {
                 // Layout shift moved us off the bottom while in
                 // follow mode (viewport resize / attachment-bar
                 // pop-in). Re-anchor.
-                this._queueScrollToBottom();
+                this.queueScrollToBottom();
             }
             // The jump-to-bottom pill tracks the read position directly: shown
             // once the last message is completely out of view (plain), glowing
             // only when unread. atBot still owns the unread-clear.
-            this._updateScrollAffordance(atBot);
+            this.updateScrollAffordance(atBot);
             this.refresh();
         };
-        container.addEventListener('scroll', this._onScroll, { passive: true });
+        container.addEventListener('scroll', this.onScroll, { passive: true });
 
         // Re-scroll whenever the messages container changes size
         // while in follow mode. Covers: mobile soft-keyboard
@@ -760,110 +764,112 @@ class BonitoChat {
         // scrollHeight — not the container's box — and the container
         // observation alone would miss it. Observing them keeps the
         // chase pinned to the bottom across every frame of the grow.
-        this._containerRO = new ResizeObserver(() => {
+        this.viewportObserver = new ResizeObserver(() => {
             if (this.destroyed) return;
             // A zero-height (hidden) container has nothing to chase — and the
             // re-show / restore is owned by onShown(), so don't fight it here.
             if (this.container.clientHeight === 0) return;
-            this._sizeTail();
-            if (this.followMode) this._queueScrollToBottom();
+            this.sizeTail();
+            if (this.followMode) this.queueScrollToBottom();
         });
-        this._containerRO.observe(this.container);
-        if (this.busyEl)     this._containerRO.observe(this.busyEl);
-        if (this.waitingEl)  this._containerRO.observe(this.waitingEl);
-        if (this.thinkingEl) this._containerRO.observe(this.thinkingEl);
+        this.viewportObserver.observe(this.container);
+        this.setupMoveObserver();
+        if (this.busyEl)     this.viewportObserver.observe(this.busyEl);
+        if (this.waitingEl)  this.viewportObserver.observe(this.waitingEl);
+        if (this.thinkingEl) this.viewportObserver.observe(this.thinkingEl);
 
         if (window.visualViewport) {
-            this._onVPResize = () => this.onViewportResize();
-            window.visualViewport.addEventListener('resize', this._onVPResize);
+            this.onVisualViewportResize = () => this.onViewportResize();
+            window.visualViewport.addEventListener('resize', this.onVisualViewportResize);
         }
 
         // Image attachments (paste / drag-drop). Wired AFTER the input area
         // is in the DOM, on a microtask so .bt-app's children are queryable.
         Promise.resolve().then(() => {
-            this._setupInputs();
-            this._setupLiveTicker();
-            this._setupLens();
+            this.setupInputs();
+            this.setupLiveTicker();
+            this.setupLens();
         });
     }
 
     destroy() {
         this.destroyed = true;
-        if (this._elapsedTimer) {
-            clearInterval(this._elapsedTimer);
-            this._elapsedTimer = null;
+        if (this.elapsedTimer) {
+            clearInterval(this.elapsedTimer);
+            this.elapsedTimer = null;
         }
-        if (this._onScroll) {
-            this.container.removeEventListener('scroll', this._onScroll);
+        if (this.onScroll) {
+            this.container.removeEventListener('scroll', this.onScroll);
         }
-        if (this._markUserInput) {
-            this.container.removeEventListener('wheel',    this._markUserInput);
-            this.container.removeEventListener('touchstart', this._markUserInput);
-            this.container.removeEventListener('touchmove',  this._markUserInput);
-            this.container.removeEventListener('keydown',  this._markUserInput);
+        if (this.markUserInput) {
+            this.container.removeEventListener('wheel',    this.markUserInput);
+            this.container.removeEventListener('touchstart', this.markUserInput);
+            this.container.removeEventListener('touchmove',  this.markUserInput);
+            this.container.removeEventListener('keydown',  this.markUserInput);
         }
-        if (this._onContainerMouseDown) {
-            this.container.removeEventListener('mousedown', this._onContainerMouseDown);
+        if (this.onContainerMouseDown) {
+            this.container.removeEventListener('mousedown', this.onContainerMouseDown);
         }
-        if (this._onWindowMouseUp) {
-            window.removeEventListener('mouseup', this._onWindowMouseUp);
+        if (this.onWindowMouseUp) {
+            window.removeEventListener('mouseup', this.onWindowMouseUp);
         }
-        if (this._onPanDown) {
-            this.container.removeEventListener('pointerdown',   this._onPanDown);
-            this.container.removeEventListener('pointermove',   this._onPanMove);
-            this.container.removeEventListener('pointerup',     this._onPanUp);
-            this.container.removeEventListener('pointercancel', this._onPanUp);
+        if (this.onPanDown) {
+            this.container.removeEventListener('pointerdown',   this.onPanDown);
+            this.container.removeEventListener('pointermove',   this.onPanMove);
+            this.container.removeEventListener('pointerup',     this.onPanUp);
+            this.container.removeEventListener('pointercancel', this.onPanUp);
         }
-        if (this._cancelMomentum) this._cancelMomentum();
-        if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
-            cancelAnimationFrame(this._scrollRafId);
+        if (this.cancelMomentum) this.cancelMomentum();
+        if (this.scrollRafId !== null && this.scrollRafId !== undefined) {
+            cancelAnimationFrame(this.scrollRafId);
         }
-        if (this._onVPResize && window.visualViewport) {
-            window.visualViewport.removeEventListener('resize', this._onVPResize);
+        if (this.onVisualViewportResize && window.visualViewport) {
+            window.visualViewport.removeEventListener('resize', this.onVisualViewportResize);
         }
-        if (this._containerRO) {
-            this._containerRO.disconnect();
+        if (this.viewportObserver) {
+            this.viewportObserver.disconnect();
         }
-        if (this._ro) this._ro.disconnect();
+        if (this.messageHeightObserver) this.messageHeightObserver.disconnect();
+        if (this.moveObserver) this.moveObserver.disconnect();
         this.observed.clear();
-        if (this._onPaste && this.textInput) {
-            this.textInput.removeEventListener('paste', this._onPaste);
+        if (this.onPaste && this.textInput) {
+            this.textInput.removeEventListener('paste', this.onPaste);
         }
-        if (this._onTextInputKeyCapture && this.textInput) {
-            this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
+        if (this.onTextInputKeyCapture && this.textInput) {
+            this.textInput.removeEventListener('keydown', this.onTextInputKeyCapture, true);
         }
         if (this.textInput) {
-            this._onCmdInput && this.textInput.removeEventListener('input', this._onCmdInput);
-            this._onCmdBlur  && this.textInput.removeEventListener('blur',  this._onCmdBlur);
+            this.onCmdInput && this.textInput.removeEventListener('input', this.onCmdInput);
+            this.onCmdBlur  && this.textInput.removeEventListener('blur',  this.onCmdBlur);
         }
         if (this.cmdAc) { this.cmdAc.remove(); this.cmdAc = null; }
-        if (this._onAppClickCapture && this.app) {
-            this.app.removeEventListener('click', this._onAppClickCapture, true);
+        if (this.onAppClickCapture && this.app) {
+            this.app.removeEventListener('click', this.onAppClickCapture, true);
         }
-        if (this._onEscapeKey) {
-            document.removeEventListener('keydown', this._onEscapeKey, true);
+        if (this.onEscapeKey) {
+            document.removeEventListener('keydown', this.onEscapeKey, true);
         }
         if (this.app) {
-            this._onDragOver  && this.app.removeEventListener('dragover',  this._onDragOver);
-            this._onDragLeave && this.app.removeEventListener('dragleave', this._onDragLeave);
-            this._onDrop      && this.app.removeEventListener('drop',      this._onDrop);
+            this.onDragOver  && this.app.removeEventListener('dragover',  this.onDragOver);
+            this.onDragLeave && this.app.removeEventListener('dragleave', this.onDragLeave);
+            this.onDrop      && this.app.removeEventListener('drop',      this.onDrop);
         }
-        clearTimeout(this._attachErrorTimer);
-        clearTimeout(this._prefetchTimer);
+        clearTimeout(this.attachErrorTimer);
+        clearTimeout(this.prefetchTimer);
         // Torn down mid-settle: clear the in-progress flag so a successor
         // overlay doesn't read a stale "settling" state off the pane (the
         // overlay's own timeout failsafe covers the never-settled case).
-        if (!this._settleDone && this._paneEl) delete this._paneEl.dataset.btSettling;
+        if (!this.settleDone && this.paneEl) delete this.paneEl.dataset.btSettling;
         if (this.measureEl) { this.measureEl.remove(); this.measureEl = null; }
-        if (this._tickerId) {
-            clearInterval(this._tickerId);
-            this._tickerId = null;
+        if (this.tickerId) {
+            clearInterval(this.tickerId);
+            this.tickerId = null;
         }
-        if (this.taskbarEl && this._onTaskbarClick) {
-            this.taskbarEl.removeEventListener('click', this._onTaskbarClick);
+        if (this.taskbarEl && this.onTaskbarClick) {
+            this.taskbarEl.removeEventListener('click', this.onTaskbarClick);
         }
-        if (this._onLensDocClick) {
-            document.removeEventListener('click', this._onLensDocClick);
+        if (this.onLensDocClick) {
+            document.removeEventListener('click', this.onLensDocClick);
         }
     }
 
@@ -873,7 +879,7 @@ class BonitoChat {
     // past). Document/window-level handlers call this when they notice
     // `container.isConnected === false`, so leaked instances clean up on the
     // next global event instead of reacting forever.
-    _lazyDestroy() {
+    lazyDestroy() {
         if (this.destroyed) return;
         try { this.destroy(); } catch (_) { /* already half-gone */ }
         CHAT_INSTANCES.delete(this);
@@ -904,11 +910,11 @@ class BonitoChat {
                 // (it's observed alongside the container) re-scrolls on
                 // each frame, but only if followMode is on — which it
                 // should be when a turn starts.
-                if (this.followMode) this._queueScrollToBottom();
+                if (this.followMode) this.queueScrollToBottom();
                 return;
             case 'busy_end':
                 this.busyEl?.classList.remove('bt-busy-active');
-                if (this.followMode) this._queueScrollToBottom();
+                if (this.followMode) this.queueScrollToBottom();
                 return;
             case 'agent_final':  return this.onAgentFinal(msg);
             case 'thinking':     return this.onThinking(msg);
@@ -927,7 +933,7 @@ class BonitoChat {
             case 'user_requeue': return this.requeueUser(msg);
             case 'summary_final':return this.onSummaryFinal(msg);
             case 'attach_error':
-                return this._showAttachError(msg.error || 'Attachment failed');
+                return this.showAttachError(msg.error || 'Attachment failed');
             // (formerly `send_ack` — JS now clears the input widget
             // unconditionally on submit, so no server ack is needed.)
             case 'user':
@@ -954,18 +960,18 @@ class BonitoChat {
         this.rendered.clear();
         this.nodeById.clear();
         this.observed.clear();
-        this._requestedAt.clear();
-        this._cancelPendingScroll();
+        this.requestedAt.clear();
+        this.cancelPendingScroll();
         // Indices shifted: invalidate every in-flight range reply (onRange
         // drops mismatching epochs) and restart the history backfill against
         // the new indices.
-        this._epoch++;
-        this._prefetchStarted = false;
-        this._prefetchCursor  = null;
-        this._prefetchPending = null;
-        clearTimeout(this._prefetchTimer);
+        this.epoch++;
+        this.prefetchStarted = false;
+        this.prefetchCursor  = null;
+        this.prefetchPending = null;
+        clearTimeout(this.prefetchTimer);
         this.totalCount    = 0;      // applyCount below re-sets it
-        this._bootstrapped = false;  // re-arm the initial bottom-pin cascade
+        this.bootstrapped = false;  // re-arm the initial bottom-pin cascade
         this.followMode    = true;
         this.unreadCount   = 0;
         this.applyCount(n);
@@ -975,8 +981,8 @@ class BonitoChat {
         if (n <= 0) {
             // Empty chat: nothing to settle — dismiss the load overlay
             // right away.
-            this._startSettle();
-            this._settle();
+            this.startSettle();
+            this.settle();
             return;
         }
         this.totalCount  = n;
@@ -986,13 +992,13 @@ class BonitoChat {
         // msgs.range — including ranges OTHER tabs requested — run the
         // initial scroll cascade: follow mode force-enabled and the pane
         // yanked to the bottom while the user was reading scrollback.
-        if (!this._bootstrapped) {
-            this._bootstrapped = true;
+        if (!this.bootstrapped) {
+            this.bootstrapped = true;
             this.initialLoad = true;
         }
-        this._startSettle();
+        this.startSettle();
         this.refresh();
-        this._startPrefetch();
+        this.startPrefetch();
     }
 
     // ── Settle watch (drives the load overlay) ────────────────────────────
@@ -1013,24 +1019,24 @@ class BonitoChat {
     // the quiet counter via their height changes, so image-heavy chats
     // simply hold the overlay a little longer. Hard cap so a broken image
     // can never strand it.
-    _startSettle() {
-        if (this._settleWatch || this._settleDone) return;
-        this._settleWatch  = true;
-        this._settleT0     = performance.now();
-        this._settleLastH  = -1;
-        this._settleStable = 0;
-        this._paneEl = this.container.closest('.bt-chatpane');
-        if (this._paneEl) {
-            delete this._paneEl.dataset.btSettled;
-            this._paneEl.dataset.btSettling = '1';
+    startSettle() {
+        if (this.settleWatch || this.settleDone) return;
+        this.settleWatch  = true;
+        this.settleStartedAt     = performance.now();
+        this.settleLastHeight  = -1;
+        this.settleStable = 0;
+        this.paneEl = this.container.closest('.bt-chatpane');
+        if (this.paneEl) {
+            delete this.paneEl.dataset.btSettled;
+            this.paneEl.dataset.btSettling = '1';
         }
-        this._announceSettle('bt-chat-settling');
+        this.announceSettle('bt-chat-settling');
         const watch = () => {
-            if (this.destroyed || this._settleDone) return;
+            if (this.destroyed || this.settleDone) return;
             const h = this.container.scrollHeight;
-            if (h === this._settleLastH) this._settleStable++;
-            else { this._settleStable = 0; this._settleLastH = h; }
-            const elapsed = performance.now() - this._settleT0;
+            if (h === this.settleLastHeight) this.settleStable++;
+            else { this.settleStable = 0; this.settleLastHeight = h; }
+            const elapsed = performance.now() - this.settleStartedAt;
             // Quiet geometry alone isn't enough: a tool body still being
             // fetched (native bt_show images come from the worker) shows a
             // "loading…" placeholder with STABLE height, and a mounted
@@ -1046,19 +1052,19 @@ class BonitoChat {
                     .startsWith('video/'));
             const pendingImg  = [...this.container.querySelectorAll('img')]
                 .some(img => !img.complete);
-            const settled = this._settleStable >= 10 &&
+            const settled = this.settleStable >= 10 &&
                             elapsed > 400 && !this.initialLoad &&
                             !pendingBody && !pendingImg;
-            if (settled || elapsed > 5000) this._settle();
+            if (settled || elapsed > 5000) this.settle();
             else requestAnimationFrame(watch);
         };
         requestAnimationFrame(watch);
     }
 
-    _settle() {
-        if (this._settleDone) return;
-        this._settleDone  = true;
-        this._settleWatch = false;
+    settle() {
+        if (this.settleDone) return;
+        this.settleDone  = true;
+        this.settleWatch = false;
         // Land exactly at the bottom of the SETTLED layout before the
         // overlay reveals it — but ONLY if follow mode is still on.
         // followMode starts true on construction, so it's false here only
@@ -1067,15 +1073,15 @@ class BonitoChat {
         // pane fully interactive). Forcing it back on would yank them to
         // the bottom mid-read.
         if (this.followMode) this.scrollToBottom();
-        if (this._paneEl) {
-            delete this._paneEl.dataset.btSettling;
-            this._paneEl.dataset.btSettled = '1';
+        if (this.paneEl) {
+            delete this.paneEl.dataset.btSettling;
+            this.paneEl.dataset.btSettled = '1';
         }
-        this._announceSettle('bt-chat-settled');
+        this.announceSettle('bt-chat-settled');
     }
 
-    _announceSettle(name) {
-        const pid = this._paneEl?.dataset.panePid || '';
+    announceSettle(name) {
+        const pid = this.paneEl?.dataset.panePid || '';
         window.dispatchEvent(new CustomEvent(name, { detail: pid }));
     }
 
@@ -1086,33 +1092,33 @@ class BonitoChat {
     // paced on the previous response — user-driven fetches and streaming
     // always win the wire. Cached-only during scrollbar drags by design
     // (onRange skips DOM work mid-drag), so blanks fill in on release.
-    _startPrefetch() {
-        if (this._prefetchStarted) return;
-        this._prefetchStarted = true;
-        this._prefetchTimer = setTimeout(() => this._prefetchTick(), 600);
+    startPrefetch() {
+        if (this.prefetchStarted) return;
+        this.prefetchStarted = true;
+        this.prefetchTimer = setTimeout(() => this.prefetchTick(), 600);
     }
 
-    _prefetchTick() {
+    prefetchTick() {
         if (this.destroyed) return;
-        if (this._prefetchPaused) return;   // hidden pane — onShown resumes
+        if (this.prefetchPaused) return;   // hidden pane — onShown resumes
         // Highest missing index at or below the cursor.
         let e = -1;
-        for (let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
+        for (let i = Math.min(this.prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
             if (!this.cache.has(i)) { e = i; break; }
         }
         if (e < 0) return;                       // fully cached — done
         let s = e;
         while (s > 0 && !this.cache.has(s - 1) && (e - s) < 63) s--;
-        this._prefetchCursor = s - 1;
+        this.prefetchCursor = s - 1;
         // Marks the in-flight chunk so onRange can treat its arrival as
         // SILENT (cache-only): prefetch must not re-window/scroll per chunk
         // — that's a visible flicker storm right after mount.
-        this._prefetchPending = [s, e];
-        this.comm.notify({type: 'msgs.request', range: [s, e], epoch: this._epoch});
+        this.prefetchPending = [s, e];
+        this.comm.notify({type: 'msgs.request', range: [s, e], epoch: this.epoch});
         // onRange reschedules the next tick when the response lands; this
         // timer is only the safety net for a lost/empty response.
-        clearTimeout(this._prefetchTimer);
-        this._prefetchTimer = setTimeout(() => this._prefetchTick(), 2000);
+        clearTimeout(this.prefetchTimer);
+        this.prefetchTimer = setTimeout(() => this.prefetchTick(), 2000);
     }
 
     visibleRange() {
@@ -1196,7 +1202,7 @@ class BonitoChat {
         // churn makes the thumb flicker. A drag navigates CACHED content
         // only (uncached regions show as spacer); the release handler's
         // refresh fetches whatever the thumb landed on.
-        if (!this._scrollbarDrag) {
+        if (!this.scrollbarDrag) {
             // Dedup in-flight requests: refresh() runs on EVERY scroll event,
             // so without this each tick re-sent the same range until the
             // response landed — dozens of identical server renders (each
@@ -1206,15 +1212,15 @@ class BonitoChat {
             const missing = [];
             for (let i = s; i <= e; i++) {
                 if (this.cache.has(i)) continue;
-                const t = this._requestedAt.get(i);
+                const t = this.requestedAt.get(i);
                 if (t !== undefined && (now - t) < 2000) continue;
                 missing.push(i);
             }
             if (missing.length > 0) {
-                for (const i of missing) this._requestedAt.set(i, now);
+                for (const i of missing) this.requestedAt.set(i, now);
                 this.comm.notify({type: 'msgs.request',
                                   range: [missing[0], missing[missing.length - 1]],
-                                  epoch: this._epoch});
+                                  epoch: this.epoch});
             }
         }
         this.updateDOM(s, e);
@@ -1224,15 +1230,15 @@ class BonitoChat {
         // upward wheel/trackpad gesture starting inside AT_BOTTOM_PX used to
         // coincide with a respacing here and get yanked straight back down
         // ("wheel did nothing" at the bottom edge).
-        const userDriving = this._scrollbarDrag || this._pendingUserScroll ||
-            (performance.now() - this._lastUserInputT) < 400;
+        const userDriving = this.scrollbarDrag || this.pendingUserScroll ||
+            (performance.now() - this.lastUserInputT) < 400;
         if (wasAtBottom && !userDriving &&
             this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
             // Programmatic write, possibly event-less (offscreen): keep the
             // direction baseline fresh so the next user scroll classifies
             // against the real position (see _prevScrollTop).
-            this._prevScrollTop = this.container.scrollTop;
+            this.prevScrollTop = this.container.scrollTop;
         }
     }
 
@@ -1242,12 +1248,12 @@ class BonitoChat {
         // wrong messages at the wrong positions. Drop it (the dedup expiry
         // re-requests anything still missing). Servers that don't echo the
         // epoch (older builds) send undefined → accepted, old behavior.
-        if (epoch !== undefined && epoch !== null && epoch !== this._epoch) return;
+        if (epoch !== undefined && epoch !== null && epoch !== this.epoch) return;
         const messages = msgs ?? [];          // tolerate the legacy `messages` field
         const fresh = [];
         messages.forEach((data, i) => {
             const idx = start + i;
-            this._requestedAt.delete(idx);   // no longer in flight
+            this.requestedAt.delete(idx);   // no longer in flight
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
@@ -1260,25 +1266,25 @@ class BonitoChat {
             // without bound). Off-screen heights come from `_measureNodes`.
             fresh.push([idx, node]);
         });
-        this._measureNodes(fresh);
+        this.measureNodes(fresh);
         // Any arriving range advances the background prefetch (pacing: one
         // chunk in flight at a time, ~30ms apart). Runs through drags too —
         // caching is the drag-safe part.
-        if (this._prefetchStarted && !this._prefetchPaused) {
-            clearTimeout(this._prefetchTimer);
-            this._prefetchTimer = setTimeout(() => this._prefetchTick(), 30);
+        if (this.prefetchStarted && !this.prefetchPaused) {
+            clearTimeout(this.prefetchTimer);
+            this.prefetchTimer = setTimeout(() => this.prefetchTick(), 30);
         }
         // Prefetch chunks are SILENT: cache-only, no scroll, and a DOM
         // re-window only when the chunk actually overlaps the visible
         // window. Per-chunk updateDOM + scroll-to-bottom was a visible
         // flicker storm (scrollbar resizing, content shifting) right after
         // mount while ~15 chunks streamed in.
-        const pf = this._prefetchPending;
+        const pf = this.prefetchPending;
         if (pf && start === pf[0]) {
-            this._prefetchPending = null;
+            this.prefetchPending = null;
             const [vs, ve] = this.visibleRange();
             const end = start + messages.length - 1;
-            if (end >= vs && start <= ve && !this._scrollbarDrag) {
+            if (end >= vs && start <= ve && !this.scrollbarDrag) {
                 this.updateDOM(vs, ve);
             }
             return;
@@ -1286,7 +1292,7 @@ class BonitoChat {
         // Ranges still in flight when a scrollbar drag started: cache the
         // nodes (above) but don't touch the DOM/geometry until release —
         // mid-drag insertion is the thumb flicker.
-        if (this._scrollbarDrag) return;
+        if (this.scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
             // Initial mount: scroll to bottom and lock follow mode on.
@@ -1307,7 +1313,7 @@ class BonitoChat {
                 this.initialLoad = false;
             }, 300);
         } else if (this.followMode) {
-            this._queueScrollToBottom();
+            this.queueScrollToBottom();
         }
     }
 
@@ -1317,7 +1323,7 @@ class BonitoChat {
     // frames before a chunk arrives — scrollbar geometry stays truthful,
     // which is what keeps direct thumb drags smooth (no drift to correct,
     // no freeze needed). Nodes already in the live DOM are skipped.
-    _measureNodes(pairs) {
+    measureNodes(pairs) {
         if (!this.measureEl || pairs.length === 0) return;
         const cs = getComputedStyle(this.container);
         const w = this.container.clientWidth -
@@ -1331,8 +1337,8 @@ class BonitoChat {
             const h = node.offsetHeight;
             if (h > 0) {
                 this.heights.set(idx, h);
-                this._measSum += h;
-                this._measCount++;
+                this.measuredHeightSum += h;
+                this.measuredHeightCount++;
             }
         }
         for (const [, node] of toMeasure) {
@@ -1341,9 +1347,9 @@ class BonitoChat {
         // Adapt the estimate to this chat's real average so the pre-measure
         // spacer geometry (and the pixel overscan derived from EST_HEIGHT)
         // tracks tall-message chats instead of the fixed 80px guess.
-        if (this._measCount >= 20) {
+        if (this.measuredHeightCount >= 20) {
             this.EST_HEIGHT = Math.min(400, Math.max(24,
-                this._measSum / this._measCount));
+                this.measuredHeightSum / this.measuredHeightCount));
         }
     }
 
@@ -1353,17 +1359,17 @@ class BonitoChat {
     observe(idx, node) {
         node.__btIdx = idx;
         this.observed.add(idx);
-        this._ro.observe(node);
+        this.messageHeightObserver.observe(node);
     }
 
     // rAF-batched refresh: many ResizeObserver measurements land in the
     // same frame (initial range render, streaming reflows) — coalesce them
     // into one re-window + respace.
-    _queueRefresh() {
-        if (this._refreshQueued || this.destroyed) return;
-        this._refreshQueued = true;
+    queueRefresh() {
+        if (this.refreshQueued || this.destroyed) return;
+        this.refreshQueued = true;
         requestAnimationFrame(() => {
-            this._refreshQueued = false;
+            this.refreshQueued = false;
             if (!this.destroyed) this.refresh();
         });
     }
@@ -1378,7 +1384,7 @@ class BonitoChat {
     // The top-visible rendered node + its offset from scrollTop. `excludeKey`
     // skips rows of a filter type that's about to be hidden — they won't survive
     // the toggle, so anchoring on one would lose the read position (setKeyHidden).
-    _captureAnchor(excludeKey = null) {
+    captureAnchor(excludeKey = null) {
         const st = this.container.scrollTop;
         // Same 4px bottom-overhang tolerance as the key anchor and the
         // top-marker probes: a row with a couple of pixels hanging into the
@@ -1389,17 +1395,17 @@ class BonitoChat {
             if (!n || !n.isConnected || n.style.display === 'none') continue;
             if (excludeKey && n.dataset.filterKey === excludeKey) continue;
             if (n.offsetTop + n.offsetHeight > st + 4) {
-                this._anchorDebugG = { st, idx: i, off: n.offsetTop - st };
+                this.anchorDebugGeneric = { st, idx: i, off: n.offsetTop - st };
                 return { idx: i, off: n.offsetTop - st };
             }
         }
-        this._anchorDebugG = { st, idx: -1, off: 0 };
+        this.anchorDebugGeneric = { st, idx: -1, off: 0 };
         return null;
     }
 
     // Re-pin the anchor after DOM/spacer mutations. No-op when nothing above
     // the viewport changed (|delta| ≤ 1px), so plain scroll ticks never write.
-    _restoreAnchor(a) {
+    restoreAnchor(a) {
         if (!a) return;
         const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
         let want;
@@ -1418,13 +1424,13 @@ class BonitoChat {
             // so the queued refresh's _captureAnchor picked the NEIGHBOURING row
             // and the view jumped ~1 row — a stuck drift on above-viewport churn.
             want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
-            this._queueRefresh();
+            this.queueRefresh();
         }
         if (Math.abs(this.container.scrollTop - want) > 1) {
             this.container.scrollTop = want;
             // Programmatic, possibly event-less write: keep the direction
             // baseline fresh (see _prevScrollTop).
-            this._prevScrollTop = this.container.scrollTop;
+            this.prevScrollTop = this.container.scrollTop;
         }
     }
 
@@ -1444,7 +1450,7 @@ class BonitoChat {
     // (indexAt/cumHeight — immune to holes), and (b) kept STICKY: `updateDOM`
     // re-pins IT for the settle window instead of re-capturing, until it
     // expires or the user scrolls.
-    _captureKeyAnchor(excludeKey) {
+    captureKeyAnchor(excludeKey) {
         const st = this.container.scrollTop;
         // The row to hold is the FIRST surviving row at/below the viewport top
         // in VIRTUAL order — anchoring any row further down cannot preserve
@@ -1484,7 +1490,7 @@ class BonitoChat {
         }
         // Stash the decision for post-mortems (the filter_scroll e2e dumps it
         // on failure): a tiny overwritten object, no rolling log.
-        this._anchorDebug = { st, vi, di, doff,
+        this.anchorDebug = { st, vi, di, doff,
                               pickedDom: di >= 0 && di <= vi };
         if (di >= 0 && di <= vi) {
             return { idx: di, off: doff, dom: true };
@@ -1497,7 +1503,7 @@ class BonitoChat {
     // anchor restores against the row's REAL offset whenever it is rendered
     // (exact); the virtual fallback covers an evicted/unmaterialized anchor
     // (effHeight already reflects the toggled hiddenTypes).
-    _restoreKeyAnchor(a) {
+    restoreKeyAnchor(a) {
         if (!a) return;
         let want;
         const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
@@ -1513,17 +1519,17 @@ class BonitoChat {
         want = Math.max(0, want);
         if (Math.abs(this.container.scrollTop - want) > 1) {
             this.container.scrollTop = want;
-            this._prevScrollTop = this.container.scrollTop;
+            this.prevScrollTop = this.container.scrollTop;
         }
     }
 
     // The live sticky anchor, or null. Expires by time, and immediately on any
     // user scroll input AFTER the toggle (the user owns the position again).
-    _activeKeyAnchor() {
-        const a = this._keyAnchor;
+    activeKeyAnchor() {
+        const a = this.keyAnchor;
         if (!a) return null;
-        if (performance.now() > a.until || this._lastUserInputT > a.setAt) {
-            this._keyAnchor = null;
+        if (performance.now() > a.until || this.lastUserInputT > a.setAt) {
+            this.keyAnchor = null;
             return null;
         }
         return a;
@@ -1536,8 +1542,8 @@ class BonitoChat {
         // While a key-toggle sticky anchor is live, use IT instead of a fresh
         // DOM capture — re-capturing mid-settle would faithfully preserve the
         // drift the toggle reflow just caused (see _captureKeyAnchor).
-        const sticky = this._activeKeyAnchor();
-        const anchor = (this.initialLoad || sticky) ? null : this._captureAnchor();
+        const sticky = this.activeKeyAnchor();
+        const anchor = (this.initialLoad || sticky) ? null : this.captureAnchor();
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
                 const node = this.cache.get(idx);
@@ -1558,7 +1564,7 @@ class BonitoChat {
                     // stays bounded to the rendered window. A detached node
                     // doesn't resize anyway; on re-entry the insert branch
                     // re-observes it.
-                    if (this.observed.delete(idx) && node) this._ro.unobserve(node);
+                    if (this.observed.delete(idx) && node) this.messageHeightObserver.unobserve(node);
                     node?.remove();
                     this.rendered.delete(idx);
                     this.parked.delete(idx);
@@ -1592,16 +1598,16 @@ class BonitoChat {
         // when the window didn't move.
         const topH = this.cumHeight(0, s);
         const botH = this.cumHeight(e + 1, this.totalCount);
-        if (topH !== this._spacerTopH) {
+        if (topH !== this.spacerTopHeight) {
             this.spacerTop.style.height = topH + 'px';
-            this._spacerTopH = topH;
+            this.spacerTopHeight = topH;
         }
-        if (botH !== this._spacerBotH) {
+        if (botH !== this.spacerBottomHeight) {
             this.spacerBottom.style.height = botH + 'px';
-            this._spacerBotH = botH;
+            this.spacerBottomHeight = botH;
         }
-        if (sticky) this._restoreKeyAnchor(sticky);
-        else this._restoreAnchor(anchor);
+        if (sticky) this.restoreKeyAnchor(sticky);
+        else this.restoreAnchor(anchor);
         // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
         // (pin total at drag-start, absorb deltas in the spacers) turned
         // estimate-vs-real drift into PHANTOM BLANK at the end of the
@@ -1704,13 +1710,13 @@ class BonitoChat {
         // scrollbar drag: bodies mounting mid-drag inflate scrollHeight and
         // the thumb's mapping stretches out from under the pointer ("bar
         // gets stuck before the bottom") — the release sweep handles them.
-        if (node.dataset && node.dataset.btAutoExpand && !this._scrollbarDrag) {
+        if (node.dataset && node.dataset.btAutoExpand && !this.scrollbarDrag) {
             delete node.dataset.btAutoExpand;
             node.collapsable?.setExpanded(true);
         }
         // Deferred eager-mount for edit tools (Monaco body without flipping
         // the Collapsable to expanded). Same scrollbar-drag guard as above.
-        if (node.dataset && node.dataset.btAutoMount && !this._scrollbarDrag) {
+        if (node.dataset && node.dataset.btAutoMount && !this.scrollbarDrag) {
             delete node.dataset.btAutoMount;
             if (node.collapsable && !node.collapsable.loaded) {
                 node.collapsable.loaded = true;
@@ -1763,7 +1769,7 @@ class BonitoChat {
             // the DOM, only the scroll lags).
             this.scrollToBottom();
         } else {
-            this._registerUnread();
+            this.registerUnread();
         }
     }
 
@@ -1786,7 +1792,7 @@ class BonitoChat {
         // apply through the throttle below instead of re-parsing and
         // re-laying-out the whole (growing) bubble at chunk rate.
         if (msg.html !== undefined) {
-            this._applyStreamHtml(node, msg.html);
+            this.applyStreamHtml(node, msg.html);
         } else if (msg.text !== undefined) {
             // Legacy text-delta path (kept for the streaming-stress mocks
             // that still feed plain text). Append to the streaming span.
@@ -1797,13 +1803,13 @@ class BonitoChat {
         // we only scroll AFTER the layout pass that includes the new
         // text (avoids the stale-scrollHeight race).
         if (this.followMode) {
-            this._queueScrollToBottom();
+            this.queueScrollToBottom();
         } else {
             // Streaming bubble is being extended while user is reading
             // scrollback. _registerUnread is idempotent for repeated
             // chunks of the same bubble — the pill stays visible once
             // shown.
-            this._registerUnread();
+            this.registerUnread();
         }
     }
 
@@ -1814,9 +1820,9 @@ class BonitoChat {
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
             if (this.followMode) {
-                this._queueScrollToBottom();
+                this.queueScrollToBottom();
             } else {
-                this._registerUnread();
+                this.registerUnread();
             }
         }
     }
@@ -1827,7 +1833,7 @@ class BonitoChat {
     // trailing timer, so the final chunk always lands even if the stream
     // stops mid-window. Per-chunk replacement re-parsed + re-laid-out the
     // entire message at chunk rate — a real stutter source on long replies.
-    _applyStreamHtml(node, html) {
+    applyStreamHtml(node, html) {
         node.__btStreamHtml = html;
         if (node.__btStreamTimer != null) return;   // window open: coalesce
         const flush = () => {
@@ -1844,7 +1850,7 @@ class BonitoChat {
 
     // Final html supersedes any throttled stream payload still pending — a
     // trailing flush after this would resurrect the older streaming state.
-    _clearPendingStream(node) {
+    clearPendingStream(node) {
         node.__btStreamHtml = null;
         if (node.__btStreamTimer != null) {
             clearTimeout(node.__btStreamTimer);
@@ -1860,7 +1866,7 @@ class BonitoChat {
             // otherwise fire AFTER this and resurrect stale streamed text into
             // an already-final bubble. For an empty final we also blank the
             // node so the bubble reflects the authoritative (empty) message.
-            this._clearPendingStream(node);
+            this.clearPendingStream(node);
             node.innerHTML = msg.html || '';
             linkifyPaths(node);
             decorateCodeBlocks(node);
@@ -1882,7 +1888,7 @@ class BonitoChat {
             tgt = nodes[nodes.length - 1];
         }
         if (tgt) {
-            this._clearPendingStream(tgt);
+            this.clearPendingStream(tgt);
             tgt.innerHTML = msg.html || '';
             linkifyPaths(tgt);
             decorateCodeBlocks(tgt);
@@ -1917,7 +1923,7 @@ class BonitoChat {
         if (this.thinkingCountEl)
             this.thinkingCountEl.textContent =
                 (active && msg.count) ? `${msg.count} token chunks` : '';
-        if (active && this.followMode) this._queueScrollToBottom();
+        if (active && this.followMode) this.queueScrollToBottom();
     }
 
     // ── Permission / question cards ──────────────────────────────────────
@@ -1962,7 +1968,7 @@ class BonitoChat {
         // Under the last message: before the busy indicator (which follows
         // the bottom spacer).
         this.container.insertBefore(card, this.busyEl || null);
-        if (this.followMode) this._queueScrollToBottom();
+        if (this.followMode) this.queueScrollToBottom();
     }
 
     onPermissionDone(msg) {
@@ -2102,7 +2108,7 @@ class BonitoChat {
         card.appendChild(actions);
 
         this.container.insertBefore(card, this.busyEl || null);
-        if (this.followMode) this._queueScrollToBottom();
+        if (this.followMode) this.queueScrollToBottom();
     }
 
     // Julia called `restart_chat_session!` — the ACP subprocess was killed
@@ -2131,7 +2137,7 @@ class BonitoChat {
         this.thinkingEl?.classList.remove('bt-thinking-active');
         this.busyEl?.classList.remove('bt-busy-active');
         this.busyEl?.classList.remove('bt-busy-suppressed');
-        this._cancelPendingScroll();
+        this.cancelPendingScroll();
         for (const node of this.nodeById.values()) {
             node.classList?.remove('bt-stream-active');
         }
@@ -2141,7 +2147,7 @@ class BonitoChat {
     // Collapsable the live stdout stream writes into), or null before the
     // body has mounted. Matched by the section's "Output" label so a Code /
     // error console can't be picked by mistake.
-    _evalOutputConsole(node) {
+    evalOutputConsole(node) {
         const secs = node.querySelectorAll('.bt-tool-body .bt-subsection');
         for (const d of secs) {
             const label = d.querySelector('.bt-subsection-label');
@@ -2162,7 +2168,7 @@ class BonitoChat {
             // shared elapsed ticker with it).
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
-            if (live) this._ensureElapsedTicker();
+            if (live) this.ensureElapsedTicker();
             // Compact-body evals mount their body DURING the run (the live
             // stream pane inside the Output section) and editMode never
             // re-fetches on expand, so the completed content would stay
@@ -2228,8 +2234,8 @@ class BonitoChat {
         // (idempotent; user can still collapse). Detached nodes defer the
         // expand to insertion (see insertSorted).
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
-        if (this._wantsNative(node)) {
-            this._applyNative(node);
+        if (this.wantsNative(node)) {
+            this.applyNative(node);
         } else if (msg.expand && node.collapsable) {
             if (node.collapsable.editMode) {
                 // Edit tools: msg.expand from the server means "the first
@@ -2333,7 +2339,7 @@ class BonitoChat {
         // Fallback: if the update raced the body mount, park a plain pane
         // under the header (the mount, which carries the same text, drops it).
         if (msg.stream_tail != null && stillLive && headerEl) {
-            const con = this._evalOutputConsole(node);
+            const con = this.evalOutputConsole(node);
             if (con) {
                 for (const stray of node.querySelectorAll('.bt-eval-stream')) stray.remove();
                 con.textContent = msg.stream_tail;
@@ -2378,10 +2384,10 @@ class BonitoChat {
     onTaskActivity(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node || !msg.entry) return;
-        this._upsertTaskFeedEntry(this._ensureTaskFeed(node), msg.entry, msg.total);
+        this.upsertTaskFeedEntry(this.ensureTaskFeed(node), msg.entry, msg.total);
     }
 
-    _ensureTaskFeed(node) {
+    ensureTaskFeed(node) {
         let feed = node.querySelector('.bt-task-feed');
         if (feed) return feed;
         feed = document.createElement('div');
@@ -2410,7 +2416,7 @@ class BonitoChat {
         return feed;
     }
 
-    _upsertTaskFeedEntry(feed, e, total) {
+    upsertTaskFeedEntry(feed, e, total) {
         const list = feed.querySelector('.bt-task-feed-list');
         let row = e.eid != null ?
             list.querySelector(`[data-eid="${CSS.escape(String(e.eid))}"]`) : null;
@@ -2451,7 +2457,7 @@ class BonitoChat {
         const key = filterKey(msg);
         if (!key || this.seenTypes.has(key)) return;
         this.seenTypes.add(key);
-        if (key === 'agent') this._updateWaiting();
+        if (key === 'agent') this.updateWaiting();
     }
 
     // ── Native media display (bt_show results) ───────────────────────────
@@ -2464,14 +2470,14 @@ class BonitoChat {
 
     // Does the current display-option state want this node native? Keys on
     // the wire show_mime; mimes outside image/video are never native.
-    _wantsNative(node) {
+    wantsNative(node) {
         const mime = node.dataset.showMime || '';
         if (mime.startsWith('image/')) return this.nativeImages;
         if (mime.startsWith('video/')) return this.nativeVideos;
         return false;
     }
 
-    _applyNative(node) {
+    applyNative(node) {
         node.classList.add('bt-tool-native');
         if (node.isConnected) {
             node.collapsable?.setExpanded(true);
@@ -2483,7 +2489,7 @@ class BonitoChat {
         }
     }
 
-    _removeNative(node) {
+    removeNative(node) {
         node.classList.remove('bt-tool-native');
         delete node.dataset.btAutoExpand;
         node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
@@ -2491,12 +2497,12 @@ class BonitoChat {
 
     // Flip one media class ('image/' or 'video/') and re-depict every cached
     // node of that class; the other class is untouched.
-    _setNativeMedia(prefix, on) {
+    setNativeMedia(prefix, on) {
         if (prefix === 'image/') this.nativeImages = on;
         else                     this.nativeVideos = on;
         for (const node of this.cache.values()) {
             if (!(node.dataset.showMime || '').startsWith(prefix)) continue;
-            on ? this._applyNative(node) : this._removeNative(node);
+            on ? this.applyNative(node) : this.removeNative(node);
         }
         this.refresh();
     }
@@ -2514,7 +2520,7 @@ class BonitoChat {
         // different message. So capture the top-visible SURVIVING row now (before
         // the reflow, excluding the type being toggled) and re-pin it after
         // refresh has trued up the spacers/window.
-        const anchor = this.followMode ? null : this._captureKeyAnchor(key);
+        const anchor = this.followMode ? null : this.captureKeyAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache) {
             // applyVisibility, not a raw display write: un-hiding a key must
@@ -2523,19 +2529,19 @@ class BonitoChat {
         }
         // Hiding the agent stream also hides the idle "waiting" line that
         // would otherwise dangle under messages that aren't there.
-        if (key === 'agent') this._updateWaiting();
+        if (key === 'agent') this.updateWaiting();
         if (anchor) {
             // Sticky through the async settle (range fetches, re-measures) that
             // follows the reflow — updateDOM keeps re-pinning THIS anchor
             // instead of re-capturing the already-drifted top (see
             // _captureKeyAnchor). Set BEFORE refresh so the refresh's own
             // updateDOM already honors it.
-            this._keyAnchor = { ...anchor, setAt: performance.now(),
+            this.keyAnchor = { ...anchor, setAt: performance.now(),
                                 until: performance.now() + 1500 };
         }
         this.refresh();
-        if (this.followMode) this._queueScrollToBottom();
-        else if (anchor) this._restoreKeyAnchor(anchor);
+        if (this.followMode) this.queueScrollToBottom();
+        else if (anchor) this.restoreKeyAnchor(anchor);
     }
 
     // The idle "waiting for your next instruction" line only makes sense
@@ -2543,7 +2549,7 @@ class BonitoChat {
     // yet) and while the Agent filter hides the messages it would sit
     // under. The CSS show-rule requires `bt-waiting-on` on top of the
     // not-busy sibling condition, so busy/idle switching stays pure CSS.
-    _updateWaiting() {
+    updateWaiting() {
         if (!this.waitingEl) return;
         const on = this.seenTypes.has('agent') && !this.hiddenTypes.has('agent');
         this.waitingEl.classList.toggle('bt-waiting-on', on);
@@ -2650,7 +2656,7 @@ class BonitoChat {
                                   msg.finished_at == null;
                 if (liveTool) {
                     div.classList.add('bt-tool-live');
-                    this._ensureElapsedTicker();
+                    this.ensureElapsedTicker();
                 }
                 const id = msg.id;
                 // Click-header host; the body is re-rendered (Monaco etc.) on
@@ -2678,9 +2684,9 @@ class BonitoChat {
                 // Subagent Task: rebuild the live activity feed from the
                 // header's snapshot (live growth rides task_activity events).
                 if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
-                    const feed = this._ensureTaskFeed(div);
+                    const feed = this.ensureTaskFeed(div);
                     for (const e of msg.task_feed)
-                        this._upsertTaskFeedEntry(feed, e, msg.task_feed_total);
+                        this.upsertTaskFeedEntry(feed, e, msg.task_feed_total);
                 }
                 // Detach (bonito_app only): pop the embed into the floating
                 // window. Lives on the ⤢ header button — the conventional "open
@@ -2715,7 +2721,7 @@ class BonitoChat {
                 // The show's mime (bt_show results) — the native-media
                 // toggles key on it.
                 if (msg.show_mime) div.dataset.showMime = msg.show_mime;
-                if (this._wantsNative(div)) {
+                if (this.wantsNative(div)) {
                     // Native display: chrome off + body auto-mounted on
                     // first insertion.
                     div.classList.add('bt-tool-native');
@@ -2929,7 +2935,7 @@ class BonitoChat {
         if (msg.summary) node.dataset.planSummary = msg.summary;
     }
 
-    _setupLiveTicker() {
+    setupLiveTicker() {
         // The taskbar itself is a Julia-rendered Bonito component (see
         // taskbar.jl) — state-first, untouched by virtual scrolling. The
         // chat module only contributes click-to-scroll: a slot click jumps
@@ -2949,7 +2955,7 @@ class BonitoChat {
                        ?? window.innerWidth;
             this.taskbarEl.classList.toggle('bt-todo-collapsed',
                 storedTodo != null ? storedTodo === '1' : paneW < 660);
-            this._onTaskbarClick = (ev) => {
+            this.onTaskbarClick = (ev) => {
                 if (ev.target.closest('.bt-taskbar-todo-toggle')) {
                     const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
                     localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
@@ -2973,7 +2979,7 @@ class BonitoChat {
                 jump();
                 requestAnimationFrame(() => requestAnimationFrame(jump));
             };
-            this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+            this.taskbarEl.addEventListener('click', this.onTaskbarClick);
         }
         // The in-chat elapsed ticker lives in `_ensureElapsedTicker` below —
         // started on demand when a live pill appears, self-stopping when the
@@ -2990,9 +2996,9 @@ class BonitoChat {
     // value is recomputed from `toolStarted` each tick, so the 1s cadence
     // is purely cosmetic (background throttling clamps intervals to 1Hz —
     // exactly this rate).
-    _ensureElapsedTicker() {
-        if (this._elapsedTimer) return;
-        this._elapsedTimer = setInterval(() => {
+    ensureElapsedTicker() {
+        if (this.elapsedTimer) return;
+        this.elapsedTimer = setInterval(() => {
             let any = false;
             for (const node of this.nodeById.values()) {
                 if (!node.classList || !node.classList.contains('bt-tool-live')) continue;
@@ -3000,8 +3006,8 @@ class BonitoChat {
                 if (node.isConnected) _writeToolElapsed(node);
             }
             if (!any) {
-                clearInterval(this._elapsedTimer);
-                this._elapsedTimer = null;
+                clearInterval(this.elapsedTimer);
+                this.elapsedTimer = null;
             }
         }, 1000);
     }
@@ -3016,7 +3022,7 @@ class BonitoChat {
     // autocomplete switches from KEYS to ACTIONS (expand/collapse) + OPERATORS
     // (＋ include / − exclude), each starting the next clause. The serialized
     // query (pills + the in-progress tail) is what runs server-side.
-    _setupLens() {
+    setupLens() {
         const host = (this.app || this.container.closest('.bt-app') ||
                       this.container.parentElement).querySelector('.bt-lens-bar');
         if (!host) return;
@@ -3045,43 +3051,43 @@ class BonitoChat {
         const clear = host.querySelector('.bt-lens-clear');
         this.lensClearBtn = clear;
 
-        const apply = () => { this._lensCommitTail(); this._hideLensAutocomplete();
-                              this.runLens(this._lensSerialize()); };
+        const apply = () => { this.lensCommitTail(); this.hideLensAutocomplete();
+                              this.runLens(this.lensSerialize()); };
         go.addEventListener('click', apply);
         save.addEventListener('click', () => {
-            this._lensCommitTail();
-            const q = this._lensSerialize();
+            this.lensCommitTail();
+            const q = this.lensSerialize();
             if (q) this.comm.notify({ type: 'lens.save', q });
         });
-        clear.addEventListener('click', () => this._lensClearAll());
+        clear.addEventListener('click', () => this.lensClearAll());
         this.lensInput.addEventListener('input', () => {
-            this._lensAutoCommitOnOperator();
-            this._updateLensAutocomplete();
+            this.lensAutoCommitOnOperator();
+            this.updateLensAutocomplete();
         });
         this.lensInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') { e.preventDefault();
-                if (!this._acceptLensAutocomplete()) apply(); }
-            else if (e.key === 'Escape') this._hideLensAutocomplete();
+                if (!this.acceptLensAutocomplete()) apply(); }
+            else if (e.key === 'Escape') this.hideLensAutocomplete();
             else if (e.key === 'ArrowDown' || e.key === 'ArrowUp')
-                this._moveLensAutocomplete(e.key === 'ArrowDown' ? 1 : -1, e);
+                this.moveLensAutocomplete(e.key === 'ArrowDown' ? 1 : -1, e);
             else if (e.key === 'Backspace' && this.lensInput.value === '' &&
-                     this.lensClauses.length) { e.preventDefault(); this._lensPopPill(); }
+                     this.lensClauses.length) { e.preventDefault(); this.lensPopPill(); }
         });
         // Click-away closes the autocomplete. (Document-level: lazy
         // self-destroy backstop, same as the ESC handler.)
-        this._onLensDocClick = (e) => {
-            if (!this.container.isConnected) { this._lazyDestroy(); return; }
-            if (!host.contains(e.target)) this._hideLensAutocomplete();
+        this.onLensDocClick = (e) => {
+            if (!this.container.isConnected) { this.lazyDestroy(); return; }
+            if (!host.contains(e.target)) this.hideLensAutocomplete();
         };
-        document.addEventListener('click', this._onLensDocClick);
-        this._renderLensPills();
-        this._renderSavedLenses();
+        document.addEventListener('click', this.onLensDocClick);
+        this.renderLensPills();
+        this.renderSavedLenses();
     }
 
     // ── Clause model: parse / serialize / split ───────────────────────────
     // Light client-side parse of one clause's text, for the pill label + to
     // know whether a structured key is present (mirrors lens.jl parse_clause).
-    _lensClauseParts(text) {
+    lensClauseParts(text) {
         text = (text || '').trim();
         let sign = '+';
         if (text.startsWith('!') || text.startsWith('-')) { sign = '-'; text = text.slice(1).trim(); }
@@ -3103,7 +3109,7 @@ class BonitoChat {
     // Serialize committed clauses to a query string (sign carried by the join
     // operator; first exclude clause keeps a leading `!`). Parsed back verbatim
     // by lens.jl split_lens_clauses.
-    _lensSerialize() {
+    lensSerialize() {
         return this.lensClauses.map((c, i) => i === 0
             ? (c.sign === '-' ? '!' + c.text.replace(/^[!-]\s*/, '') : c.text)
             : (c.sign === '-' ? '- ' + c.text.replace(/^[!-]\s*/, '') : '+ ' + c.text)
@@ -3111,7 +3117,7 @@ class BonitoChat {
     }
 
     // Split a saved query back into clauses (mirrors lens.jl split_lens_clauses).
-    _lensSplit(str) {
+    lensSplit(str) {
         const segs = []; let buf = '', inq = false, sign = '+';
         for (let i = 0; i < str.length; i++) {
             const c = str[i];
@@ -3128,17 +3134,17 @@ class BonitoChat {
     }
 
     // ── Pill commit / edit / remove ───────────────────────────────────────
-    _lensCommitTail() {
+    lensCommitTail() {
         const t = this.lensInput.value.trim();
         if (t) this.lensClauses.push({ sign: this.lensPendingSign, text: t });
         this.lensInput.value = '';
         this.lensPendingSign = '+';
-        this._renderLensPills();
+        this.renderLensPills();
     }
 
     // Auto-commit when the user types a top-level ` + ` / ` - ` (quote-balanced):
     // the operator finalizes the current clause and opens the next.
-    _lensAutoCommitOnOperator() {
+    lensAutoCommitOnOperator() {
         const v = this.lensInput.value;
         const m = v.match(/^(.*\S)\s+([+-])\s$/);
         if (!m) return;
@@ -3146,57 +3152,57 @@ class BonitoChat {
         this.lensClauses.push({ sign: this.lensPendingSign, text: m[1].trim() });
         this.lensPendingSign = m[2] === '-' ? '-' : '+';
         this.lensInput.value = '';
-        this._renderLensPills();
+        this.renderLensPills();
     }
 
-    _lensClearAll() {
+    lensClearAll() {
         this.lensClauses = []; this.lensPendingSign = '+';
         this.lensInput.value = '';
-        this._renderLensPills();
-        this._hideLensAutocomplete();
+        this.renderLensPills();
+        this.hideLensAutocomplete();
         this.runLens('');
     }
 
-    _lensRemovePill(i) {
+    lensRemovePill(i) {
         this.lensClauses.splice(i, 1);
-        this._renderLensPills();
-        this.runLens(this._lensSerialize());
+        this.renderLensPills();
+        this.runLens(this.lensSerialize());
     }
 
-    _lensEditPill(i) {
-        this._lensCommitTail();                 // don't lose the in-progress tail
+    lensEditPill(i) {
+        this.lensCommitTail();                 // don't lose the in-progress tail
         const c = this.lensClauses.splice(i, 1)[0];
         this.lensInput.value = c.text;
         this.lensPendingSign = c.sign;
-        this._renderLensPills();
+        this.renderLensPills();
         this.lensInput.focus();
         const n = this.lensInput.value.length; this.lensInput.setSelectionRange(n, n);
-        this._updateLensAutocomplete();
+        this.updateLensAutocomplete();
     }
 
-    _lensPopPill() {
+    lensPopPill() {
         const c = this.lensClauses.pop();
         if (!c) return;
         this.lensInput.value = c.text;
         this.lensPendingSign = c.sign;
-        this._renderLensPills();
+        this.renderLensPills();
         const n = this.lensInput.value.length; this.lensInput.setSelectionRange(n, n);
-        this._updateLensAutocomplete();
+        this.updateLensAutocomplete();
     }
 
-    _lensLoadQuery(q) {
-        this.lensClauses = this._lensSplit(q);
+    lensLoadQuery(q) {
+        this.lensClauses = this.lensSplit(q);
         this.lensPendingSign = '+';
         this.lensInput.value = '';
-        this._renderLensPills();
+        this.renderLensPills();
         this.runLens(q);
     }
 
-    _renderLensPills() {
+    renderLensPills() {
         if (!this.lensPills) return;
         this.lensPills.innerHTML = '';
         this.lensClauses.forEach((c, i) => {
-            const p = this._lensClauseParts(c.text);
+            const p = this.lensClauseParts(c.text);
             const sign = (c.sign === '-' || p.sign === '-') ? '-' : '+';
             const pill = document.createElement('span');
             pill.className = 'bt-lens-pill' + (sign === '-' ? ' bt-lens-pill-ex' : '');
@@ -3207,10 +3213,10 @@ class BonitoChat {
             html += `<span class="bt-lens-pill-x" title="Remove">✕</span>`;
             pill.innerHTML = html;
             pill.querySelector('.bt-lens-pill-x').addEventListener('mousedown', (e) => {
-                e.preventDefault(); e.stopPropagation(); this._lensRemovePill(i); });
+                e.preventDefault(); e.stopPropagation(); this.lensRemovePill(i); });
             pill.addEventListener('mousedown', (e) => {
                 if (e.target.classList.contains('bt-lens-pill-x')) return;
-                e.preventDefault(); this._lensEditPill(i); });
+                e.preventDefault(); this.lensEditPill(i); });
             this.lensPills.appendChild(pill);
         });
         this.lensBarEl?.classList.toggle('bt-lens-pending-ex', this.lensPendingSign === '-');
@@ -3218,7 +3224,7 @@ class BonitoChat {
 
     // ── Autocomplete (contextual: keys, then actions + operators) ─────────
     // Suggest keys for the token currently being typed after the last `/`.
-    _currentLensToken() {
+    currentLensToken() {
         const v = this.lensInput.value;
         const caret = this.lensInput.selectionStart ?? v.length;
         const head = v.slice(0, caret);
@@ -3229,31 +3235,31 @@ class BonitoChat {
         return { start: slash + 1, end: caret, frag };
     }
 
-    _updateLensAutocomplete() {
-        const tok = this._currentLensToken();
+    updateLensAutocomplete() {
+        const tok = this.currentLensToken();
         if (tok) {                                   // KEY suggestions
             const f = tok.frag.toLowerCase();
             const matches = this.lensVocab.filter(k => _subseqMatch(f, k)).slice(0, 8);
-            if (!matches.length) return this._hideLensAutocomplete();
-            this._renderLensAC(matches.map(k => ({ kind: 'key', val: k, label: '/' + k })), true);
+            if (!matches.length) return this.hideLensAutocomplete();
+            this.renderLensAC(matches.map(k => ({ kind: 'key', val: k, label: '/' + k })), true);
             return;
         }
         // Past the key (or composing free text) → ACTIONS + OPERATORS.
         if (this.lensInput.value.trim() !== '') {
-            const p = this._lensClauseParts(this.lensInput.value);
+            const p = this.lensClauseParts(this.lensInput.value);
             const items = [];
             if (p.key) for (const a of ['expand', 'collapse'])
                 if (p.action !== a) items.push({ kind: 'action', val: a, label: a, hint: `${a} matches` });
             items.push({ kind: 'op', val: '+', label: '＋ add',     hint: 'include another clause' });
             items.push({ kind: 'op', val: '-', label: '− exclude',  hint: 'hide the next clause' });
-            this._renderLensAC(items, false);        // no pre-select → Enter applies the lens
+            this.renderLensAC(items, false);        // no pre-select → Enter applies the lens
             return;
         }
-        this._hideLensAutocomplete();
+        this.hideLensAutocomplete();
     }
 
-    _renderLensAC(items, selectFirst) {
-        if (!items.length) return this._hideLensAutocomplete();
+    renderLensAC(items, selectFirst) {
+        if (!items.length) return this.hideLensAutocomplete();
         this.lensAC.innerHTML = items.map((it, i) =>
             `<div class="bt-lens-ac-item${selectFirst && i === 0 ? ' bt-ac-sel' : ''}" ` +
             `data-kind="${it.kind}" data-val="${escapeAttr(it.val)}">` +
@@ -3263,11 +3269,11 @@ class BonitoChat {
         this.lensAC.hidden = false;
         for (const el of this.lensAC.querySelectorAll('.bt-lens-ac-item')) {
             el.addEventListener('mousedown', (e) => { e.preventDefault();
-                this._applyLensAC(el.dataset.kind, el.dataset.val); });
+                this.applyLensAC(el.dataset.kind, el.dataset.val); });
         }
     }
-    _hideLensAutocomplete() { if (this.lensAC) { this.lensAC.hidden = true; this.lensAC.innerHTML = ''; } }
-    _moveLensAutocomplete(dir, e) {
+    hideLensAutocomplete() { if (this.lensAC) { this.lensAC.hidden = true; this.lensAC.innerHTML = ''; } }
+    moveLensAutocomplete(dir, e) {
         if (this.lensAC.hidden) return;
         e.preventDefault();
         const items = [...this.lensAC.querySelectorAll('.bt-lens-ac-item')];
@@ -3277,43 +3283,43 @@ class BonitoChat {
         i = (i + dir + items.length) % items.length;
         items[i].classList.add('bt-ac-sel');
     }
-    _acceptLensAutocomplete() {
+    acceptLensAutocomplete() {
         if (this.lensAC.hidden) return false;
         const sel = this.lensAC.querySelector('.bt-ac-sel');
         if (!sel) return false;
-        this._applyLensAC(sel.dataset.kind, sel.dataset.val);
+        this.applyLensAC(sel.dataset.kind, sel.dataset.val);
         return true;
     }
-    _applyLensAC(kind, val) {
-        if (kind === 'key') return this._fillLensKey(val);
-        if (kind === 'action') return this._lensAppendToken(val);
+    applyLensAC(kind, val) {
+        if (kind === 'key') return this.fillLensKey(val);
+        if (kind === 'action') return this.lensAppendToken(val);
         if (kind === 'op') {                          // commit clause, open the next
-            this._lensCommitTail();
+            this.lensCommitTail();
             this.lensPendingSign = val === '-' ? '-' : '+';
-            this._renderLensPills();
-            this._hideLensAutocomplete();
+            this.renderLensPills();
+            this.hideLensAutocomplete();
             this.lensInput.focus();
         }
     }
-    _lensAppendToken(tok) {
+    lensAppendToken(tok) {
         let v = this.lensInput.value;
         if (v && !v.endsWith(' ')) v += ' ';
         this.lensInput.value = v + tok + ' ';
-        this._hideLensAutocomplete();
+        this.hideLensAutocomplete();
         this.lensInput.focus();
-        this._updateLensAutocomplete();
+        this.updateLensAutocomplete();
     }
-    _fillLensKey(key) {
-        const tok = this._currentLensToken();
+    fillLensKey(key) {
+        const tok = this.currentLensToken();
         const v = this.lensInput.value;
         if (!tok) return;
         const before = v.slice(0, tok.start), after = v.slice(tok.end);
         this.lensInput.value = before + key + (after.startsWith(' ') ? '' : ' ') + after;
         const caret = (before + key + ' ').length;
         this.lensInput.setSelectionRange(caret, caret);
-        this._hideLensAutocomplete();
+        this.hideLensAutocomplete();
         this.lensInput.focus();
-        this._updateLensAutocomplete();
+        this.updateLensAutocomplete();
     }
 
     // ── Run / receive / apply ─────────────────────────────────────────────
@@ -3330,7 +3336,7 @@ class BonitoChat {
         // view before refresh's anchor runs) — hold the read position like
         // setKeyHidden. Activating scrolls to the first match below, so no anchor.
         const holdAnchor = (this.lensActive && !msg.active && !this.followMode)
-            ? this._captureAnchor() : null;
+            ? this.captureAnchor() : null;
         if (!msg.active) {
             this.lensActive = false; this.lensVisible = null; this.lensActions = null;
         } else {
@@ -3358,16 +3364,16 @@ class BonitoChat {
         }
         // Jump to the top of the filtered view so the first match is visible.
         // (scrollTop write syncs _prevScrollTop: programmatic, possibly event-less.)
-        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this._prevScrollTop = 0; this.refresh(); }
-        else if (holdAnchor) this._restoreAnchor(holdAnchor);   // clearing: hold the read position
+        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this.prevScrollTop = 0; this.refresh(); }
+        else if (holdAnchor) this.restoreAnchor(holdAnchor);   // clearing: hold the read position
     }
 
     onLensSaved(msg) {
         this.savedLenses = msg.lenses || [];
-        this._renderSavedLenses();
+        this.renderSavedLenses();
     }
 
-    _renderSavedLenses() {
+    renderSavedLenses() {
         if (!this.lensChips) return;
         this.lensChips.innerHTML = '';
         for (const l of this.savedLenses) {
@@ -3378,7 +3384,7 @@ class BonitoChat {
             chip.innerHTML = `<span class="bt-lens-chip-label"></span><span class="bt-lens-chip-x" title="Remove">✕</span>`;
             chip.querySelector('.bt-lens-chip-label').textContent = l.title;
             chip.querySelector('.bt-lens-chip-label').addEventListener('click', () => {
-                this._lensLoadQuery(l.query);    // populate pills + apply
+                this.lensLoadQuery(l.query);    // populate pills + apply
             });
             chip.querySelector('.bt-lens-chip-x').addEventListener('click', (e) => {
                 e.stopPropagation(); this.comm.notify({ type: 'lens.delete', q: l.query });
@@ -3403,7 +3409,7 @@ class BonitoChat {
     // via the pan handler — see the panning block in the constructor —
     // so the tail no longer carries the "give me room to overscroll"
     // job.)
-    _sizeTail() {
+    sizeTail() {
         if (!this.tailEl) return;
         this.tailEl.style.height = '50px';
     }
@@ -3444,18 +3450,18 @@ class BonitoChat {
     // Reading scrollHeight synchronously after a textContent write
     // returns a stale value mid-layout; deferring to rAF guarantees
     // we measure post-layout.
-    _queueScrollToBottom() {
+    queueScrollToBottom() {
         // A held scrollbar is ABSOLUTE authority over scrollTop: no chase,
         // no re-anchor, no reveal-scroll may fire mid-drag (container
         // resizes from toolbar growth, streaming chunks, and range
         // arrivals all funnel through here — any of them would snap the
         // thumb out of the user's hand).
-        if (this._scrollbarDrag) return;
-        if (this._scrollQueued || this.destroyed) return;
-        this._scrollQueued = true;
-        this._scrollRafId = requestAnimationFrame(() => {
-            this._scrollQueued = false;
-            this._scrollRafId = null;
+        if (this.scrollbarDrag) return;
+        if (this.scrollQueued || this.destroyed) return;
+        this.scrollQueued = true;
+        this.scrollRafId = requestAnimationFrame(() => {
+            this.scrollQueued = false;
+            this.scrollRafId = null;
             if (this.destroyed) return;
             // A chunk that lands AFTER `markUserInput` cancelled the
             // previous rAF, but BEFORE the user's scroll event flips
@@ -3471,16 +3477,79 @@ class BonitoChat {
             // cancels through _cancelPendingScroll) — the chase must still
             // land, e.g. after a downward re-engage mid-gesture. Re-arm
             // until the input window lapses instead of dropping.
-            if ((performance.now() - this._lastUserInputT) < 100) {
-                if (this.followMode) this._queueScrollToBottom();
+            if ((performance.now() - this.lastUserInputT) < 100) {
+                if (this.followMode) this.queueScrollToBottom();
                 return;
             }
             this.scrollToBottom();
         });
     }
 
+    // Survive the container being MOVED in the DOM.
+    //
+    // The workspace (BonitoWidgets) rebuilds its panel tree on every render: it
+    // parks each `.bw-ws-panel` into `.bw-ws-parking`, then re-places it into
+    // its group — TWICE per chat switch, in the ~10ms after `onShown` has
+    // already restored the scroll correctly. Detaching an element resets its
+    // scrollTop to 0 in the BROWSER, and that is invisible to everything here:
+    //
+    //   • no JS writes scrollTop, so trapping the property catches nothing;
+    //   • park and re-place happen in ONE synchronous task, so the container's
+    //     end-of-frame size never changes and `_containerRO` never fires;
+    //   • BonitoWidgets' own snapshotScroll skips elements reading
+    //     `scrollTop === 0` — i.e. exactly the pane that was hidden when its
+    //     snapshot was taken, so it is never restored either.
+    //
+    // Reported as a blank chat after switching: scrollTop 0 against a
+    // scrollHeight of 107629, with a 58574px top spacer above the render
+    // window. A live trace confirmed the geometry never moved (estimate,
+    // spacers, scrollHeight, rendered range all constant) — only the position
+    // was destroyed, and only by the re-insert.
+    //
+    // Guarded in `panel_move_scroll_test.jl`, which performs the same
+    // park/re-place directly rather than relying on chat length or timing.
+    setupMoveObserver() {
+        const root = this.container.closest('.bw-ws') || document.body;
+        this.moveObserver = new MutationObserver((records) => {
+            if (this.destroyed || !this.container.isConnected) return;
+            for (const r of records) {
+                // Everything that happens INSIDE the container — every message
+                // append, every virtual-scroll re-window — is not a move of us
+                // and is discarded here, before any other work. Only structural
+                // changes at or above our own level can relocate us.
+                if (this.container.contains(r.target)) continue;
+                for (const n of r.addedNodes) {
+                    if (n !== this.container &&
+                        !(n.nodeType === 1 && n.contains(this.container))) continue;
+                    this.restoreAfterMove();
+                    return;
+                }
+            }
+        });
+        this.moveObserver.observe(root, { childList: true, subtree: true });
+    }
+
+    // Undo a re-insert that zeroed us. ONLY that: a node can be moved WITHOUT
+    // losing its scroll (an ordinary re-render of a wrapper), and re-pinning on
+    // those fights every legitimate position holder — the lens/filter anchor
+    // holds and the jitter guards all regress. A genuine reset is ours to undo;
+    // nothing else is.
+    restoreAfterMove() {
+        if (this.container.clientHeight === 0) return;   // no box yet; onShown owns it
+        if (this.container.scrollTop > 1) return;        // scroll survived the move
+        if (this.followMode) {
+            if (!this.atBottom()) this.scrollToBottom();
+            return;
+        }
+        const want = this.lastGoodTop;
+        if (want != null && want > 1) {
+            this.container.scrollTop = want;
+            this.prevScrollTop = this.container.scrollTop;
+        }
+    }
+
     scrollToBottom() {
-        if (this._scrollbarDrag) return;   // the drag owns scrollTop
+        if (this.scrollbarDrag) return;   // the drag owns scrollTop
         // Belt + suspenders: set scrollTop AND scrollIntoView on the LAST
         // child (the overscroll tail — plain content, see _sizeTail).
         // scrollTop alone uses the container's reported scrollHeight which
@@ -3496,7 +3565,7 @@ class BonitoChat {
         // (see the offscreen note below): a chase leaving a stale, SMALLER
         // _prevScrollTop would make the next upward peek read as "moving
         // down" and wrongly re-engage.
-        this._prevScrollTop = this.container.scrollTop;
+        this.prevScrollTop = this.container.scrollTop;
         // Don't rely on the `scroll` event to drive the post-scroll range
         // fetch — Electron's offscreen renderer (and a few other headless
         // browser configs) doesn't fire scroll events for programmatic
@@ -3523,20 +3592,20 @@ class BonitoChat {
         // on return, so the user's read position is lost — it snaps to the top
         // (upward fling decays toward scrollTop 0) or the bottom. Cancelling here
         // makes the saved scrollTop authoritative across the hide/show.
-        if (this._cancelMomentum) this._cancelMomentum();
-        this._cancelPendingScroll();
-        if (this._setOverscroll) this._setOverscroll(0);
-        this._savedScrollTop  = this.container.scrollTop;
-        this._savedFollowMode = this.followMode;
+        if (this.cancelMomentum) this.cancelMomentum();
+        this.cancelPendingScroll();
+        if (this.setOverscroll) this.setOverscroll(0);
+        this.savedScrollTop  = this.container.scrollTop;
+        this.savedFollowMode = this.followMode;
         // CONTENT anchor besides the pixel position: heights re-measured
         // while hidden (or the backfill running meanwhile) change what a raw
         // scrollTop points at — restoring to the anchored MESSAGE is what
         // "keep my read position" actually means.
-        this._savedAnchor = this._captureAnchor();
+        this.savedAnchor = this.captureAnchor();
         // Hidden panes stop backfilling: every prefetch chunk is a server-side
         // render broadcast to every tab — deferred until the user returns.
-        this._prefetchPaused = true;
-        clearTimeout(this._prefetchTimer);
+        this.prefetchPaused = true;
+        clearTimeout(this.prefetchTimer);
     }
 
     // Called by the chat-pane visibility toggle whenever this pane goes
@@ -3557,16 +3626,16 @@ class BonitoChat {
     // The cascade replicates "click again later", just automatically.
     onShown() {
         const followNow  = !!this.followMode;
-        const followThen = !!this._savedFollowMode;
+        const followThen = !!this.savedFollowMode;
         const wantBottom = followNow || followThen;
-        const savedTop   = this._savedScrollTop;
-        const anchor     = this._savedAnchor;
+        const savedTop   = this.savedScrollTop;
+        const anchor     = this.savedAnchor;
 
         // Resume the paused history backfill (see onHidden).
-        this._prefetchPaused = false;
-        if (this._prefetchStarted) {
-            clearTimeout(this._prefetchTimer);
-            this._prefetchTimer = setTimeout(() => this._prefetchTick(), 600);
+        this.prefetchPaused = false;
+        if (this.prefetchStarted) {
+            clearTimeout(this.prefetchTimer);
+            this.prefetchTimer = setTimeout(() => this.prefetchTick(), 600);
         }
 
         const apply = () => {
@@ -3587,7 +3656,7 @@ class BonitoChat {
             }
             // Programmatic, possibly event-less write: sync the direction
             // baseline (see _prevScrollTop).
-            this._prevScrollTop = this.container.scrollTop;
+            this.prevScrollTop = this.container.scrollTop;
         };
         apply();
         requestAnimationFrame(apply);
@@ -3607,7 +3676,7 @@ class BonitoChat {
     // the bytes under `<cwd>/.bt-attachments/<ts>.<ext>`, pushes to the
     // worker mirror (via `send_file_to_worker!`), and forwards them to
     // claude as multimodal content blocks.
-    _setupInputs() {
+    setupInputs() {
         if (this.destroyed) return;
         // The chat shell root. `closest` — the messages container sits
         // inside a positioning wrapper (.bt-messages-wrap), so a bare
@@ -3637,78 +3706,78 @@ class BonitoChat {
         this.inputArea.insertBefore(this.attachBar, this.inputArea.firstChild);
 
         this.attachments = new Map();
-        this._attachIdCounter = 0;
+        this.attachIdCounter = 0;
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
 
         // Paste — clipboardData.items carries File entries for images.
-        this._onPaste = (e) => {
+        this.onPaste = (e) => {
             const items = e.clipboardData?.items;
             if (!items) return;
             for (const it of items) {
                 if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
                     const blob = it.getAsFile();
-                    if (blob) this._attachAddBlob(blob, blob.type || it.type,
+                    if (blob) this.attachAddBlob(blob, blob.type || it.type,
                                                   blob.name || `pasted-${Date.now()}.png`);
                 }
             }
         };
-        this.textInput.addEventListener('paste', this._onPaste);
+        this.textInput.addEventListener('paste', this.onPaste);
 
         // Drag-drop — listen on the whole .bt-app so a drop anywhere in
         // the chat counts. dragover MUST preventDefault to enable drop.
-        this._onDragOver = (e) => {
-            if (!this._dragHasImage(e)) return;
+        this.onDragOver = (e) => {
+            if (!this.dragHasImage(e)) return;
             e.preventDefault();
             this.app.classList.add('bt-drag-over');
         };
-        this._onDragLeave = (e) => {
+        this.onDragLeave = (e) => {
             // Only clear when leaving the .bt-app envelope itself, not
             // when crossing between nested children (relatedTarget inside app).
             if (e.relatedTarget && this.app.contains(e.relatedTarget)) return;
             this.app.classList.remove('bt-drag-over');
         };
-        this._onDrop = (e) => {
+        this.onDrop = (e) => {
             e.preventDefault();
             this.app.classList.remove('bt-drag-over');
             const files = e.dataTransfer?.files;
             if (!files) return;
             for (const f of files) {
                 if (f.type && f.type.startsWith('image/')) {
-                    this._attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
+                    this.attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
                 }
             }
         };
-        this.app.addEventListener('dragover',  this._onDragOver);
-        this.app.addEventListener('dragleave', this._onDragLeave);
-        this.app.addEventListener('drop',      this._onDrop);
+        this.app.addEventListener('dragover',  this.onDragOver);
+        this.app.addEventListener('dragleave', this.onDragLeave);
+        this.app.addEventListener('drop',      this.onDrop);
 
         // Single delegated click handler on the chat root. Capture phase
         // so we run before any inner element that might (in the future)
         // also wire a click handler. `target.closest` survives DOM swaps
         // and works regardless of when the buttons are added.
-        this._onAppClickCapture = (e) => {
+        this.onAppClickCapture = (e) => {
             if (this.destroyed) return;
             if (e.target.closest('.bt-send-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
-                this._submit();
+                this.submit();
             } else if (e.target.closest('.bt-stop-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
-                this._cancel();
+                this.cancel();
             }
         };
-        this.app.addEventListener('click', this._onAppClickCapture, true);
+        this.app.addEventListener('click', this.onAppClickCapture, true);
 
         // Enter-to-send on the textarea (Shift+Enter newline as usual).
-        this._onTextInputKeyCapture = (e) => {
-            if (this._cmdAcHandleKey(e)) return;   // autocomplete owns the key
+        this.onTextInputKeyCapture = (e) => {
+            if (this.cmdAcHandleKey(e)) return;   // autocomplete owns the key
             if (e.key !== 'Enter' || e.shiftKey) return;
             e.preventDefault();
             e.stopImmediatePropagation();
-            this._submit();
+            this.submit();
         };
-        this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+        this.textInput.addEventListener('keydown', this.onTextInputKeyCapture, true);
 
         // ── Slash-command autocomplete ────────────────────────────────────
         // `this.slashCommands` ({name, description, hint}) = the agent's
@@ -3721,13 +3790,13 @@ class BonitoChat {
         this.cmdAc = document.createElement('div');
         this.cmdAc.className = 'bt-cmd-ac';
         this.inputArea.appendChild(this.cmdAc);
-        this._cmdAcItems = [];
-        this._cmdAcSel = 0;
+        this.cmdAcItems = [];
+        this.cmdAcSel = 0;
         const acClose = () => {
-            this._cmdAcItems = [];
+            this.cmdAcItems = [];
             this.cmdAc.classList.remove('bt-cmd-ac-open');
         };
-        this._cmdAcClose = acClose;
+        this.cmdAcClose = acClose;
         const acAccept = (cmd) => {
             this.textInput.value = '/' + cmd.name + ' ';
             this.textInput.focus();
@@ -3735,10 +3804,10 @@ class BonitoChat {
         };
         const acRender = () => {
             this.cmdAc.innerHTML = '';
-            this._cmdAcItems.forEach((cmd, i) => {
+            this.cmdAcItems.forEach((cmd, i) => {
                 const row = document.createElement('div');
                 row.className = 'bt-cmd-ac-item' +
-                    (i === this._cmdAcSel ? ' bt-cmd-ac-sel' : '');
+                    (i === this.cmdAcSel ? ' bt-cmd-ac-sel' : '');
                 const name = document.createElement('span');
                 name.className = 'bt-cmd-ac-name';
                 name.textContent = '/' + cmd.name;
@@ -3763,17 +3832,17 @@ class BonitoChat {
                 });
                 this.cmdAc.appendChild(row);
             });
-            this.cmdAc.classList.toggle('bt-cmd-ac-open', this._cmdAcItems.length > 0);
+            this.cmdAc.classList.toggle('bt-cmd-ac-open', this.cmdAcItems.length > 0);
         };
-        this._cmdAcHandleKey = (e) => {
-            if (!this._cmdAcItems.length) return false;
+        this.cmdAcHandleKey = (e) => {
+            if (!this.cmdAcItems.length) return false;
             if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                 const d = e.key === 'ArrowDown' ? 1 : -1;
-                this._cmdAcSel = (this._cmdAcSel + d + this._cmdAcItems.length)
-                               % this._cmdAcItems.length;
+                this.cmdAcSel = (this.cmdAcSel + d + this.cmdAcItems.length)
+                               % this.cmdAcItems.length;
                 acRender();
             } else if (e.key === 'Enter' || e.key === 'Tab') {
-                acAccept(this._cmdAcItems[this._cmdAcSel]);
+                acAccept(this.cmdAcItems[this.cmdAcSel]);
             } else if (e.key === 'Escape') {
                 acClose();
             } else {
@@ -3783,7 +3852,7 @@ class BonitoChat {
             e.stopImmediatePropagation();
             return true;
         };
-        this._onCmdInput = () => {
+        this.onCmdInput = () => {
             const m = (this.textInput.value || '').match(/^\/([\w:-]*)$/);
             const cmds = this.slashCommands || [];
             if (!m || !cmds.length) { acClose(); return; }
@@ -3791,19 +3860,19 @@ class BonitoChat {
             const starts = cmds.filter(c => c.name.toLowerCase().startsWith(q));
             const incl   = cmds.filter(c => !c.name.toLowerCase().startsWith(q) &&
                                             c.name.toLowerCase().includes(q));
-            this._cmdAcItems = starts.concat(incl).slice(0, 8);
-            this._cmdAcSel = 0;
+            this.cmdAcItems = starts.concat(incl).slice(0, 8);
+            this.cmdAcSel = 0;
             acRender();
         };
-        this._onCmdBlur = () => acClose();
-        this.textInput.addEventListener('input', this._onCmdInput);
-        this.textInput.addEventListener('blur', this._onCmdBlur);
+        this.onCmdBlur = () => acClose();
+        this.textInput.addEventListener('input', this.onCmdInput);
+        this.textInput.addEventListener('blur', this.onCmdBlur);
 
         // ESC anywhere → cancel. Listener on `document` so the user's
         // current focus (textarea, scroll position, anywhere) can't
         // suppress it. The Monaco tool-body editor owns ESC for its own
         // semantics — skip when the user is editing inside one.
-        this._onEscapeKey = (e) => {
+        this.onEscapeKey = (e) => {
             if (e.key !== 'Escape' || e.repeat) return;
             // Document-level listener + kept-alive panes (display:none but
             // connected) = EVERY chat instance hears this. Only the VISIBLE
@@ -3812,22 +3881,22 @@ class BonitoChat {
             // ancestor) is display:none. A container that left the document
             // entirely means the `connect` MutationObserver missed an
             // ancestor-level unmount: self-destroy.
-            if (!this.container.isConnected) { this._lazyDestroy(); return; }
+            if (!this.container.isConnected) { this.lazyDestroy(); return; }
             if (this.container.offsetParent === null) return;
             // The slash-command popup owns ESC while open (this document-level
             // capture fires BEFORE the textarea's own capture handler, so the
             // popup must be dismissed here or ESC would cancel the turn).
-            if (this._cmdAcItems && this._cmdAcItems.length) {
+            if (this.cmdAcItems && this.cmdAcItems.length) {
                 e.preventDefault();
-                this._cmdAcClose();
+                this.cmdAcClose();
                 return;
             }
             const t = e.target;
             if (t && t.closest && t.closest('.monaco-editor')) return;
             e.preventDefault();
-            this._cancel();
+            this.cancel();
         };
-        document.addEventListener('keydown', this._onEscapeKey, true);
+        document.addEventListener('keydown', this.onEscapeKey, true);
     }
 
     // Fire a cancel notification. Used by both the stop button click
@@ -3835,11 +3904,11 @@ class BonitoChat {
     // entry points can't drift in what they send.
     // Carries the sequence number of the turn the user is LOOKING AT
     // (`turn_begin`), so a stale click can never cancel a later turn.
-    _cancel() {
+    cancel() {
         this.comm.notify({type: 'cancel', seq: this.turnSeq ?? -1});
     }
 
-    _dragHasImage(e) {
+    dragHasImage(e) {
         const dt = e.dataTransfer;
         if (!dt) return false;
         if (dt.types) {
@@ -3851,14 +3920,14 @@ class BonitoChat {
         return false;
     }
 
-    _attachAddBlob(blob, mime, filename) {
+    attachAddBlob(blob, mime, filename) {
         if (blob.size > this.ATTACH_MAX_BYTES) {
-            this._showAttachError(
+            this.showAttachError(
                 `Image too large (${(blob.size / 1024 / 1024).toFixed(1)} MB, ` +
                 `max ${this.ATTACH_MAX_BYTES / 1024 / 1024} MB)`);
             return;
         }
-        const id = `att-${++this._attachIdCounter}`;
+        const id = `att-${++this.attachIdCounter}`;
         const reader = new FileReader();
         reader.onload = () => {
             if (this.destroyed) return;
@@ -3866,23 +3935,23 @@ class BonitoChat {
                 blob, mime, filename,
                 dataUrl: reader.result,
             });
-            this._renderAttachments();
+            this.renderAttachments();
         };
-        reader.onerror = () => this._showAttachError('Failed to read image');
+        reader.onerror = () => this.showAttachError('Failed to read image');
         reader.readAsDataURL(blob);
     }
 
-    _attachRemove(id) {
+    attachRemove(id) {
         this.attachments.delete(id);
-        this._renderAttachments();
+        this.renderAttachments();
     }
 
-    _attachClear() {
+    attachClear() {
         this.attachments.clear();
-        this._renderAttachments();
+        this.renderAttachments();
     }
 
-    _renderAttachments() {
+    renderAttachments() {
         if (!this.attachBar) return;
         // Preserve any transient error chip across re-renders.
         const err = this.attachBar.querySelector('.bt-attach-error');
@@ -3908,7 +3977,7 @@ class BonitoChat {
                 rm.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    this._attachRemove(id);
+                    this.attachRemove(id);
                 });
                 wrap.appendChild(rm);
                 this.attachBar.appendChild(wrap);
@@ -3917,7 +3986,7 @@ class BonitoChat {
         if (err) this.attachBar.appendChild(err);
     }
 
-    _showAttachError(message) {
+    showAttachError(message) {
         if (!this.attachBar) return;
         let chip = this.attachBar.querySelector('.bt-attach-error');
         if (!chip) {
@@ -3927,8 +3996,8 @@ class BonitoChat {
             this.attachBar.classList.add('bt-attachments-active');
         }
         chip.textContent = message;
-        clearTimeout(this._attachErrorTimer);
-        this._attachErrorTimer = setTimeout(() => {
+        clearTimeout(this.attachErrorTimer);
+        this.attachErrorTimer = setTimeout(() => {
             chip.remove();
             if (this.attachments.size === 0) {
                 this.attachBar.classList.remove('bt-attachments-active');
@@ -3964,7 +4033,7 @@ class BonitoChat {
         // their next message while bytes are in flight would be hostile.
         this.textInput.value = '';
         this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
-        this._attachClear();
+        this.attachClear();
     }
 
     onViewportResize() {
@@ -3979,7 +4048,7 @@ class BonitoChat {
         const vv  = window.visualViewport;
         const app = this.app || this.container.closest('.bt-app');
         if (app) app.style.height = vv.height + 'px';
-        if (this.followMode) this._queueScrollToBottom();
+        if (this.followMode) this.queueScrollToBottom();
     }
 
     // ── Follow mode + unread pill ────────────────────────────────────────
@@ -4000,12 +4069,12 @@ class BonitoChat {
     // Disengage runs first, so a continuous downward scroll THROUGH the zone
     // doesn't flip-flop with event parity: every in-zone downward event
     // lands on "following".
-    _applyUserScroll(prevTop) {
+    applyUserScroll(prevTop) {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
         const atBot = this.atBottom();
         if (this.followMode && !atBot) {
             this.setFollowMode(false);
-            this._cancelPendingScroll();
+            this.cancelPendingScroll();
         }
         if (this.followMode) return;
         if (atBot) {
@@ -4014,7 +4083,7 @@ class BonitoChat {
             // still in flight and re-arms itself (see _queueScrollToBottom),
             // so it lands right after the input window lapses — and a
             // disengage meanwhile cancels it as always.
-            this._queueScrollToBottom();
+            this.queueScrollToBottom();
         } else {
             // Off-bottom without re-engaging: any pending chase yields to
             // the user's position. Re-engagement requires actually reaching
@@ -4022,7 +4091,7 @@ class BonitoChat {
             // — the old "within one viewport of bottom" shortcut was too
             // aggressive on mobile, snapping the view while the user was
             // still reading the previous sentence.
-            this._cancelPendingScroll();
+            this.cancelPendingScroll();
         }
     }
 
@@ -4037,15 +4106,15 @@ class BonitoChat {
         this.followMode = on;
         if (on) {
             this.unreadCount = 0;
-            this._hideNewMessagePill();
+            this.hideNewMessagePill();
         }
     }
 
-    _cancelPendingScroll() {
-        if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
-            cancelAnimationFrame(this._scrollRafId);
-            this._scrollRafId = null;
-            this._scrollQueued = false;
+    cancelPendingScroll() {
+        if (this.scrollRafId !== null && this.scrollRafId !== undefined) {
+            cancelAnimationFrame(this.scrollRafId);
+            this.scrollRafId = null;
+            this.scrollQueued = false;
         }
     }
 
@@ -4055,12 +4124,12 @@ class BonitoChat {
     // flip the pill ON (never off); while the freshly appended message is
     // still partially visible there's no pill — just keep the glow/label
     // fresh in case it's already showing.
-    _registerUnread() {
+    registerUnread() {
         this.unreadCount++;
         if (this.lastMessageFullyOutOfView()) {
-            this._showNewMessagePill();
+            this.showNewMessagePill();
         } else {
-            this._refreshPillContent();
+            this.refreshPillContent();
         }
     }
 
@@ -4073,51 +4142,51 @@ class BonitoChat {
     // here: clearing unread. In the in-between state — last message partially
     // visible but not at the bottom — the pill hides, but unread is NOT
     // cleared: the user hasn't actually reached the bottom.
-    _updateScrollAffordance(atBot) {
+    updateScrollAffordance(atBot) {
         if (atBot) {
             this.unreadCount = 0;
-            this._hideNewMessagePill();
+            this.hideNewMessagePill();
         } else if (this.lastMessageFullyOutOfView()) {
-            this._showNewMessagePill();
+            this.showNewMessagePill();
         } else {
-            this._hideNewMessagePill();
+            this.hideNewMessagePill();
         }
     }
 
-    _showNewMessagePill() {
-        if (!this._pillEl) this._createNewMessagePill();
-        if (!this._pillEl) return;
+    showNewMessagePill() {
+        if (!this.pillEl) this.createNewMessagePill();
+        if (!this.pillEl) return;
         // Touch classList only on an actual hidden→shown flip (the scroll
         // handler re-derives visibility on every event) — but ALWAYS refresh
         // the glow/label: unread can arrive while the pill is already up.
-        if (!this._pillShown) {
-            this._pillShown = true;
-            this._pillEl.classList.add('bt-new-msg-pill-visible');
+        if (!this.pillShown) {
+            this.pillShown = true;
+            this.pillEl.classList.add('bt-new-msg-pill-visible');
         }
-        this._refreshPillContent();
+        this.refreshPillContent();
     }
 
-    _hideNewMessagePill() {
-        if (!this._pillShown) return;
-        this._pillShown = false;
-        if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
+    hideNewMessagePill() {
+        if (!this.pillShown) return;
+        this.pillShown = false;
+        if (this.pillEl) this.pillEl.classList.remove('bt-new-msg-pill-visible');
     }
 
     // Glow + "New messages" only while there's unread content; otherwise the
     // plain "Move to bottom" form (same popup, no glow).
-    _refreshPillContent() {
-        if (!this._pillEl) return;
+    refreshPillContent() {
+        if (!this.pillEl) return;
         const hasUnread = this.unreadCount > 0;
-        this._pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
-        if (this._pillLabelEl) {
-            this._pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
+        this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        if (this.pillLabelEl) {
+            this.pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
         }
     }
 
     // Pill lives inside .bt-app, absolutely positioned above the input
     // area. We append it once and toggle its visibility class. Click →
     // re-engage follow mode and scroll to the bottom.
-    _createNewMessagePill() {
+    createNewMessagePill() {
         const app = this.container?.closest('.bt-app') ||
                     this.container?.parentElement;
         if (!app) return;
@@ -4138,8 +4207,8 @@ class BonitoChat {
             this.scrollToBottom();
         });
         app.appendChild(pill);
-        this._pillEl = pill;
-        this._pillLabelEl = label;
+        this.pillEl = pill;
+        this.pillLabelEl = label;
     }
 }
 
@@ -4339,10 +4408,12 @@ window.btMSearchSelect = function btMSearchSelect(itemEl, pickObs, cfgId, value)
 // node is fine, the content shows when the node is re-inserted. Without it,
 // a reply racing an eviction was silently dropped and the body stayed on
 // "loading…".
+// Module scope, not `window`. This module is instantiated once per page, so
+// module scope already IS the singleton a global was standing in for. It used
+// to be mirrored to `window.__btChats` for debugging, but nothing read it:
+// every test and console probe reaches a chat the honest way, through the DOM
+// node that owns it (`document.querySelector('.bt-messages').__bt_chat`).
 const CHAT_INSTANCES = new Set();
-// Debug/test introspection: e.g. `[...window.__btChats][0].APP_KEEPALIVE` /
-// `.parked.size`. Read-only convenience; not used by product code.
-if (typeof window !== 'undefined') window.__btChats = CHAT_INSTANCES;
 
 // Find the tool-body slot for `id` — in the live DOM, or on a cached node a
 // virtual-scroll window currently holds detached. A module export (Julia's
