@@ -301,6 +301,59 @@ end
                                         path_env = "/usr/bin:/home/u/.local/bin")
 end
 
+# Which julia the unit execs. The unit used to bake `Sys.BINDIR`, which under
+# juliaup is a VERSION-specific directory the next `juliaup update` deletes —
+# systemd then restart-loops on a missing binary until someone re-runs the
+# installer, with the worker absent throughout (41 failed EXECs in 2.5 minutes,
+# observed).
+@testset "service julia command" begin
+    channel = BW.julia_channel()
+    # A CHANNEL, not a patch version: juliaup registers `1.12`, so `+1.12.7` is
+    # rejected with "not installed" while `+1.12` follows the channel forward.
+    @test occursin(r"^\d+\.\d+$", channel)
+    @test channel == "$(VERSION.major).$(VERSION.minor)"
+
+    # The probe is the whole safety of this: writing an ExecStart we never ran is
+    # the mistake being undone here, and a wrong one stays invisible until the
+    # next restart.
+    @test BW.launcher_resolves_here("/nonexistent/julia-xyz", channel) === false
+    # Exists and is executable, but is not a launcher — exits 0 and prints the
+    # wrong thing, so the BINDIR comparison is what rejects it, not the status.
+    Sys.isunix() && @test BW.launcher_resolves_here("/bin/echo", channel) === false
+    # The version-pinned binary we are RUNNING is not a launcher either: a plain
+    # julia reads `+1.12` as a script name and exits non-zero. Important, or the
+    # fallback would dress the old pinned path up as a fixed one.
+    @test BW.launcher_resolves_here(BW.julia_bin(), channel) === false
+    # A launcher asked for a channel that isn't registered must not pass.
+    for exe in BW.juliaup_launcher_candidates()
+        isfile(exe) && @test BW.launcher_resolves_here(exe, "0.1") === false
+    end
+
+    cmd = BW.service_julia_cmd()
+    @test !isempty(cmd)
+    if cmd == BW.julia_bin()
+        # No launcher on this machine (a plain install). That is the documented
+        # fallback and it does not have the problem either — nothing deletes a
+        # plain install's bindir out from under it.
+        @test isfile(cmd)
+    else
+        # A launcher was found AND probed. It must be pinned to the channel,
+        # otherwise `juliaup default <other>` silently moves the worker onto a
+        # different Julia — the failure mode a bare launcher trades for.
+        @test endswith(cmd, " +" * channel)
+        exe = first(split(cmd, ' '))
+        @test isfile(exe)
+        # And it must NOT be the version-specific path, which is the whole point.
+        @test exe != BW.julia_bin()
+        @test !occursin(string(VERSION), exe)
+    end
+
+    # Whatever it resolved to, it is what the unit execs.
+    @test occursin("ExecStart=$(cmd) --project=@bonito-agents",
+                   BW.render_service_unit(; projects_root = "/tmp", memory_max = "80%",
+                                            path_env = "/usr/bin"))
+end
+
 @testset "run-mode decision" begin
     # Explicit answers.
     @test BW.decide_run_mode("1", false) == :service

@@ -214,7 +214,84 @@ end
 # baked in because systemd --user services do NOT inherit the interactive
 # shell's PATH — without it the worker can't find `claude-agent-acp`/`node`/`git`
 # at runtime. We capture the install-time PATH, which has them resolved.
-function render_service_unit(; julia::AbstractString = julia_bin(),
+# The Julia channel this process belongs to, e.g. "1.12". A CHANNEL and not the
+# patch version: juliaup registers `1.12`, not `1.12.7`, so `+1.12.7` is rejected
+# with "not installed" while `+1.12` follows the channel forward.
+julia_channel() = "$(VERSION.major).$(VERSION.minor)"
+
+# Stable launcher candidates, in the order we trust them. juliaup's own install
+# puts one at `~/.juliaup/bin/julia`; a distro package may instead put
+# `julialauncher` behind plain `julia` on PATH (openSUSE does). Neither path
+# moves when a version is added or removed.
+function juliaup_launcher_candidates()
+    exe  = Sys.iswindows() ? "julia.exe" : "julia"
+    outs = String[joinpath(homedir(), ".juliaup", "bin", exe)]
+    onpath = Sys.which("julia")
+    onpath === nothing || push!(outs, String(onpath))
+    return outs
+end
+
+# Does `exe +channel` actually land on the Julia we are running from?
+#
+# Probed rather than assumed, because everything about this is guesswork
+# otherwise: `exe` may not be a launcher at all (a plain julia treats `+1.12` as
+# a script name and exits non-zero, which is the answer we want), the channel may
+# not be registered, or the launcher may be for a different depot. Writing an
+# ExecStart we have not run is precisely the mistake this whole function exists
+# to undo — it stays invisible until the next restart.
+function launcher_resolves_here(exe::AbstractString, channel::AbstractString)
+    isfile(exe) || return false
+    out = IOBuffer()
+    ok = try
+        success(pipeline(`$exe +$channel --startup-file=no -e 'print(Sys.BINDIR)'`;
+                         stdout = out, stderr = devnull))
+    catch e
+        # ENOENT/EACCES on something that looked like a file a moment ago, or is
+        # not executable. An ordinary "no, not this candidate" — anything else is
+        # a real bug and belongs on the surface.
+        e isa Base.IOError || rethrow()
+        return false
+    end
+    return ok && strip(String(take!(out))) == Sys.BINDIR::String
+end
+
+"""
+    service_julia_cmd() -> String
+
+The ExecStart command prefix: the `julia` the unit should run, plus any argument
+that pins it there.
+
+NOT `julia_bin()` on its own. That is `Sys.BINDIR`, and under juliaup BINDIR is a
+VERSION-specific directory which the next `juliaup update` DELETES. The unit then
+execs a julia that no longer exists and systemd restart-loops on it forever —
+measured here as 41 failed EXECs in the 2.5 minutes before someone happened to
+re-run the installer, with the worker simply absent throughout. Re-running the
+installer is the only cure, because the unit is rewritten there.
+
+So prefer juliaup's launcher, which lives at a stable path, and pin the CHANNEL
+on it. That combination is what gets both properties at once:
+
+  * `juliaup update` within the channel keeps working — the launcher re-resolves
+    to the new patch release, and nothing has to be rewritten;
+  * `juliaup default <other>` does NOT quietly move the worker onto a different
+    Julia, which a bare launcher (or `/usr/bin/env julia`) would.
+
+Only removing the channel outright breaks it, and that is a deliberate act rather
+than a side effect of routine maintenance.
+
+Falls back to `julia_bin()` when no launcher checks out — a plain install has no
+launcher and does not have the problem either, since nothing deletes its bindir
+out from under it.
+"""
+function service_julia_cmd()
+    channel = julia_channel()
+    for exe in juliaup_launcher_candidates()
+        launcher_resolves_here(exe, channel) && return "$(exe) +$(channel)"
+    end
+    return julia_bin()
+end
+
+function render_service_unit(; julia::AbstractString = service_julia_cmd(),
                                project::AbstractString = "@bonito-agents",
                                projects_root::AbstractString = pwd(),
                                memory_max::AbstractString = "85%",
