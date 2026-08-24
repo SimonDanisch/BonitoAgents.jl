@@ -66,6 +66,32 @@ alive(pid) = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0)) == 0
             end
         end
 
+        @testset "no test sweeps the REAL worker id" begin
+            # The guard for the bug above, because the failure is invisible from
+            # inside the suite: `reap_stray_agents!()` returns a count and the
+            # assertions pass — the damage is to a live session in another
+            # process, and it surfaces minutes later as "the worker went
+            # offline".
+            #
+            # Scanned rather than argued about: any future test that reaches for
+            # the no-argument sweep gets caught here instead of on someone's
+            # running chat. Production may call it (`start()` does, after the
+            # pidfile claim proves no other incarnation is alive) — this is only
+            # about the test suite.
+            offenders = String[]
+            for f in readdir(@__DIR__; join = true)
+                endswith(f, ".jl") || continue
+                for (i, line) in enumerate(eachline(f))
+                    startswith(lstrip(line), "#") && continue
+                    occursin(r"reap_stray_agents!\(\)", line) &&
+                        push!(offenders, "$(basename(f)):$i: $(strip(line))")
+                end
+            end
+            @test isempty(offenders)
+            isempty(offenders) ||
+                @info "use reap_agents_owned_by(<synthetic id>) instead" offenders
+        end
+
         @testset "kill_process_group! tolerates an already-dead proc" begin
             proc = open(detach(Cmd(`true`)), "r+")
             sleep(0.3)
@@ -74,12 +100,34 @@ alive(pid) = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0)) == 0
         end
 
         if isdir("/proc")
-            @testset "startup reaps what carries OUR mark, and only that" begin
-                mine   = BW.load_or_generate_worker_id()
+            @testset "the sweep reaps what carries a given mark, and only that" begin
+                # A SYNTHETIC owner id, and `reap_agents_owned_by` rather than
+                # `reap_stray_agents!`.
+                #
+                # `reap_stray_agents!()` is `reap_agents_owned_by(load_or_generate_worker_id())`
+                # — the id of the worker installed on THIS machine, read from its
+                # real scratch space. Calling it here does exactly what its own
+                # docstring warns against ("only call this once the worker owning
+                # `worker_id` is gone"): the operator's worker is running, and
+                # every agent it has spawned carries that mark. So the test
+                # SIGKILLed the live chat session, its MCP servers and their Julia
+                # eval workers — every time the suite ran. It reads as "the worker
+                # keeps going offline", which is a long way from "a test killed
+                # it".
+                #
+                # Nothing is lost by using an explicit id: the sweep is the same
+                # function either way, and what is worth asserting — that it
+                # matches on the mark, that it is prefix-safe, that it leaves
+                # another owner alone — is independent of where the id came from.
+                # The same convention the pidfile testset already follows for the
+                # same reason.
+                mine   = "test-owner-" * BW.generate_worker_id()
                 marked = open(detach(Cmd(`sleep 300`;
                     env = merge(Dict(ENV), Dict(BW.AGENT_OWNER_ENV => mine)))), "r+")
                 # Another worker's agent, alive right now: same shape, different
-                # owner. Reaping it would take down someone else's session.
+                # owner. Reaping it would take down someone else's session. The
+                # id is ours plus a suffix, which is the prefix case the NUL
+                # terminator in the mark exists for.
                 other  = open(detach(Cmd(`sleep 300`;
                     env = merge(Dict(ENV), Dict(BW.AGENT_OWNER_ENV => mine * "-not-me")))), "r+")
                 # Pids captured UP FRONT: `getpid(::Process)` throws ESRCH once
@@ -91,8 +139,12 @@ alive(pid) = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0)) == 0
                     @test alive(mpid)
                     @test alive(opid)
 
-                    n = BW.reap_stray_agents!()
-                    @test n >= 1
+                    n = BW.reap_agents_owned_by(mine)
+                    # EXACTLY one: a synthetic id matches the one process we
+                    # planted and nothing else on the machine. `>= 1` was the
+                    # honest bound while this swept the real id — it had to
+                    # tolerate whatever live agents it was about to kill.
+                    @test n == 1
                     @test timedwait(() -> !alive(mpid), 5.0) === :ok
                     sleep(0.5)
                     @test alive(opid)              # NOT ours, NOT touched
