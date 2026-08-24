@@ -987,20 +987,8 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     # reachable. The server cannot reliably guess its own outward URL (see
     # `Bonito.online_url` behavior under `proxy_url="."`), so it stays out of
     # the URL-naming business.
-    # Provider-specific env (e.g. Claude's CLAUDE_* vars) comes from the descriptor;
-    # the worker layers live ENV under it and the server-url on top. Live ENV stays
-    # the base so the agent inherits PATH etc.; `provider.env` and the per-session
-    # overrides win.
-    env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
-                provider.env,
-                Dict("BONITOAGENTS_SERVER_URL"  => server_url,
-                     # Our OWN mark on the agent and everything it spawns. Read
-                     # back by `reap_stray_agents!` at startup to tell an agent
-                     # left behind by a PREVIOUS incarnation of this worker from
-                     # one belonging to a worker that is alive right now — the
-                     # id is stable across restarts, the pid is not.
-                     AGENT_OWNER_ENV => load_or_generate_worker_id()),
-                env_overrides)
+    env = provider_env(provider,
+                       merge(Dict("BONITOAGENTS_SERVER_URL" => server_url), env_overrides))
 
     # `provider.args` carries any required subcommand (e.g. `["acp"]` for
     # mimo/opencode/kimi, whose ACP server lives under that subcommand).
@@ -1096,9 +1084,28 @@ function handle_close_session(cmd)
 end
 
 # The env var every agent (and everything it spawns) is stamped with, naming the
-# worker that owns it. See the spawn in `start_agent_session` and
-# `reap_stray_agents!`.
+# worker that owns it. See `provider_env` and `reap_stray_agents!`.
 const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
+
+# The environment for EVERY provider process we spawn — the chat session and the
+# `session/list` scan alike. Live ENV is the base so the agent inherits PATH etc.;
+# the descriptor's provider-specific vars (Claude's `CLAUDE_*`, …) win over it,
+# and `extra` (server url, per-session overrides) wins over those.
+#
+# `AGENT_OWNER_ENV` is the part that must not be skipped. It is our own mark on
+# the process and everything it spawns, and `reap_agents_owned_by` reads it back
+# to tell a leftover of a PREVIOUS incarnation of this worker from a process
+# belonging to a worker that is alive right now (the id is stable across
+# restarts, the pid is not). A process spawned WITHOUT the mark is one that
+# nothing can ever clean up: the scan spawn used to skip this, and its strays —
+# a Julia agent still precompiling outlives the SIGTERM that ends the scan — were
+# invisible to both halves of the reaper, at ~500 MB each.
+function provider_env(provider, extra::AbstractDict = Dict{String,String}())
+    return merge(Dict(string(k) => string(v) for (k, v) in ENV),
+                 provider.env,
+                 Dict(AGENT_OWNER_ENV => load_or_generate_worker_id()),
+                 extra)
+end
 
 """
     kill_process_group!(proc)
@@ -2301,8 +2308,16 @@ function acp_epoch(s)
 end
 
 # Drive one provider's `session/list` over stdio and normalize the result.
+#
+# This spawns a REAL provider process, so it is spawned and reaped exactly like a
+# chat session: stamped via `provider_env`, `detach`ed so it leads its own group,
+# and torn down with `kill_proc!`. It used to be a bare `open(Cmd(...))` reaped
+# with a bare SIGTERM, and both halves of that leaked — a `julia -m MockACP`
+# still precompiling outlives SIGTERM, and with no ownership mark and no group of
+# its own the survivor was invisible to `reap_agents_owned_by` AND to the group
+# kill. Measured at 7 orphans (~500 MB each) over one e2e run.
 function acp_list_sessions(prov; timeout::Real = 20.0)
-    proc = open(Cmd(`$(prov.bin) $(prov.args)`), "r+")
+    proc = open(detach(Cmd(`$(prov.bin) $(prov.args)`; env = provider_env(prov))), "r+")
     rows = Dict{String,Any}[]
     try
         replies = Dict{Int,Any}()
@@ -2374,7 +2389,7 @@ function acp_list_sessions(prov; timeout::Real = 20.0)
             id += 1
         end
     finally
-        try kill(proc) catch e; e isa InterruptException && rethrow() end
+        kill_proc!(proc)
     end
     return rows
 end

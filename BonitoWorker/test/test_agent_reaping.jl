@@ -19,7 +19,16 @@ using Test
 using BonitoWorker
 const BW = BonitoWorker
 
+using AgentProviders
+
 alive(pid) = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0)) == 0
+
+# A REAL provider descriptor pointed at a script instead of an agent. The spawn
+# paths read `bin`/`args`/`env`/`elicitation`, and taking them off the actual
+# type means a field that moves breaks this test instead of sliding past a
+# look-alike struct that duck-types just as well.
+probe_provider(bin, args; env = Dict{String,String}()) =
+    AgentProviders.MockAgent(bin, args, env, Dict{String,Any}())
 
 @testset "agent process reaping" begin
     if !Sys.isunix()
@@ -155,6 +164,48 @@ alive(pid) = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0)) == 0
                         try; close(p); catch; end
                     end
                 end
+            end
+        end
+
+        # A session SCAN spawns a real provider process too, and it was the one
+        # spawn that skipped all of the above.
+        @testset "the session scan spawns and reaps like a session" begin
+            @testset "every provider spawn carries our mark" begin
+                prov = probe_provider("true", String[]; env = Dict("PROVIDER_ONLY" => "1"))
+                env  = BW.provider_env(prov)
+                # The mark is what makes a stray findable at all.
+                @test env[BW.AGENT_OWNER_ENV] == BW.load_or_generate_worker_id()
+                @test env["PROVIDER_ONLY"] == "1"
+                @test haskey(env, "PATH")            # live ENV is the base
+                # ...and a caller's overrides win over both.
+                @test BW.provider_env(prov, Dict("PROVIDER_ONLY" => "2"))["PROVIDER_ONLY"] == "2"
+            end
+
+            @testset "a scan leaves nothing behind, even ignoring SIGTERM" begin
+                # The real leak: `julia -m MockACP` still precompiling does not
+                # die on the SIGTERM that ends the scan. Spawned bare and reaped
+                # with a bare SIGTERM, the survivor had neither our mark nor a
+                # group of its own, so BOTH halves of the reaper were blind to it
+                # — 7 orphans over one e2e run, ~500 MB each.
+                pidfile = tempname()
+                prov = probe_provider("bash", ["-c", """
+                    trap '' TERM
+                    sleep 300 &
+                    echo "\$\$ \$(ps -o pgid= -p \$\$ | tr -d ' ') \$!" > $(pidfile)
+                    wait
+                """])
+                # Never answers `initialize`, so the scan gives up on the timeout
+                # and takes the teardown path — which is the path under test.
+                @test BW.acp_list_sessions(prov; timeout = 1.0) == Dict{String,Any}[]
+
+                @test isfile(pidfile)
+                pid, pgid, child = parse.(Int, split(read(pidfile, String)))
+                # `detach` took: its own group is what lets one signal reach the
+                # child too.
+                @test pgid == pid
+                @test timedwait(() -> !alive(pid), 5.0) === :ok
+                @test timedwait(() -> !alive(child), 5.0) === :ok
+                rm(pidfile; force = true)
             end
         end
     end
