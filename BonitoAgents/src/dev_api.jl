@@ -251,6 +251,10 @@ function project_report(p::ProjectInfo)
         "backup_status"     => String(p.backup_status),
         "last_sync_at"      => jsonable(p.last_sync_at),
         "resume_session_id" => jsonable(p.resume_session_id),
+        # Reported next to the resume id because the pair is what you check when
+        # a reopened chat comes up on the wrong backend: the id belongs to this
+        # agent and to no other.
+        "provider"          => jsonable(p.provider),
         "auto_prompt"       => p.auto_prompt === nothing ? nothing : first(p.auto_prompt, 200),
         "dismissed"         => p.dismissed,
         "locked_by"         => jsonable(p.locked_by),

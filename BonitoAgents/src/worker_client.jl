@@ -1308,14 +1308,14 @@ same state is a no-op the second time.
 function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
     wid = String(worker_id)
     fixed = 0
-    # Titles were derived from prompts on disk and `ProjectInfo` does not record
-    # which provider wrote them, so we assume Claude — the only provider that
-    # injects wrappers today. Explicit rather than defaulted so the assumption
-    # is greppable when that stops holding.
-    provider = find_provider("ClaudeCode")
     lock(state.lock) do
         for (pid, p) in state.projects[]
             p.worker_id == wid || continue
+            # The wrappers to peel are the ones of the agent that WROTE the
+            # title, so ask the project. A project that predates the field says
+            # nothing and resolves to the default — which is Claude, the
+            # assumption this used to hardcode for every project alike.
+            provider = project_provider(p)
             title_is_broken(provider, p.title) || continue
             # Prefer the original prompt — re-running the filter against the
             # raw first user message recovers any prose the old truncation

@@ -91,6 +91,15 @@ mutable struct ProjectInfo
     # the conversation history back to where claude left off; nothing → fresh
     # session/new. Persisted so server restarts still resume.
     resume_session_id::Union{String,Nothing}
+    # Which agent this thread belongs to (`provider_name`: "ClaudeCode",
+    # "KimiCode", …), or nothing for "whatever the default is". Stored because
+    # a thread is not portable between agents: `resume_session_id` above is the
+    # id of a session THAT agent created, and asking a different one to
+    # `session/load` it fails with a session it never made. The name is what
+    # already travels to the worker on every `open_session` (agents.jl), and the
+    # worker resolves it against what it has installed — so this is a
+    # preference, not a promise: `project_provider` falls back if it's gone.
+    provider::Union{String,Nothing}
     # If set, the chat fires this prompt as the first user message the next
     # time it brings up an ACP session — used by the "From GitHub" template
     # to seed "fix this issue" / "review this PR" without the operator having
@@ -129,8 +138,18 @@ end
 
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing, nothing, nothing, nothing,
-                false, Dict{String,String}(), false, ProjectFileIndex())
+                nothing,                 # locked_by
+                nothing,                 # locked_at
+                :unsynced,               # backup_status
+                nothing,                 # last_sync_at
+                nothing,                 # resume_session_id
+                nothing,                 # provider
+                nothing,                 # auto_prompt
+                nothing,                 # title
+                false,                   # dismissed
+                Dict{String,String}(),   # desired_config
+                false,                   # dev_mode
+                ProjectFileIndex())      # file_index
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
 # call shape working for tests / fixtures that build a WorkerInfo by hand.
@@ -842,6 +861,7 @@ function save_projects!(s::ServerState)
                      "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
                      "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
                      "resume_session_id" => p.resume_session_id,
+                     "provider"      => p.provider,
                      "auto_prompt"   => p.auto_prompt,
                      "title"         => p.title,
                      "dismissed"     => p.dismissed,
@@ -872,6 +892,11 @@ function load_projects!(s::ServerState)
             sid = get(d, "resume_session_id", nothing)
             p.resume_session_id = (sid === nothing || isempty(String(sid))) ?
                                        nothing : String(sid)
+            # Absent ⇒ nothing ⇒ the default provider, which is what every
+            # project did before this field existed.
+            pv = get(d, "provider", nothing)
+            p.provider = (pv === nothing || isempty(String(pv))) ?
+                                       nothing : String(pv)
             ap = get(d, "auto_prompt", nothing)
             p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
                                        nothing : String(ap)

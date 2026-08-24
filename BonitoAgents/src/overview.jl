@@ -46,10 +46,11 @@ function overview_user_snippet(provider::AgentProvider, text::AbstractString)
     return meaningful_title(provider, base)
 end
 
-# These messages come off disk (chat.md), and `ProjectInfo` does not record
-# which provider wrote them, so we assume Claude — the only provider that
-# injects wrappers today. Passed explicitly rather than defaulted inside
-# `meaningful_title` so this assumption is greppable when that stops holding.
+# These messages come off disk (chat.md), so the wrapper rules that have to be
+# peeled off them are the ones of the agent that WROTE them — Claude injects
+# `<system-reminder>` and friends, the others don't. Callers that have the
+# project pass `project_provider(p)`; the default stands for a caller that
+# doesn't, and matches what every project did before the provider was recorded.
 function overview_snippets(msgs::Vector{ChatMsg};
                            limit::Int = OVERVIEW_SNIPPETS,
                            provider::AgentProvider = find_provider("ClaudeCode"))
@@ -136,7 +137,7 @@ function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
             p.id,
             project_display_title(p),
             length(msgs),
-            overview_snippets(msgs),
+            overview_snippets(msgs; provider = project_provider(p)),
             overview_image(state, p, msgs, chat_dir),
             mt,
             chat_status(state, p)))

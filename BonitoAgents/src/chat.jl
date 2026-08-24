@@ -7235,9 +7235,36 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
     old = s.agent::WorkerAgent
     old.provider = new_provider
     old.resume_session_id = nothing
+    # Remember it: the next bring-up (a reload, a server restart, the model
+    # being evicted) reads this back through `project_provider`. Written next to
+    # the `resume_session_id` clear above because the two travel together — the
+    # id we just dropped belonged to the OLD agent.
+    record_project_provider!(model, new_provider)
 
     # Restart the session with the new provider
     restart_chat_session!(model)
+    return nothing
+end
+
+# Persist which agent a project's thread now belongs to. Same shape as
+# `record_bound_session!`: no-op without a project, write + save + notify only
+# on a real change, so a re-select of the current agent doesn't churn the file.
+function record_project_provider!(model::ChatModel, provider::BinAgent)
+    pid = model.project_id
+    isempty(pid) && return nothing
+    haskey(model.state.projects[], pid) || return nothing
+    p = model.state.projects[][pid]
+    name = provider_name(provider)
+    p.provider == name && return nothing
+    p.provider = name
+    # A failed write must not fail the switch — the agent has already changed in
+    # memory and the chat is live; only the record across restarts is lost.
+    try
+        lock(model.state.lock) do; save_projects!(model.state); end
+    catch e
+        @warn "record_project_provider!: persist failed" exception = e
+    end
+    safe_notify!(model.state.projects)
     return nothing
 end
 

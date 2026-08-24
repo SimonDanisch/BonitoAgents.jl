@@ -416,9 +416,20 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     # The agent carries everything start! needs — including the
     # `resume_session_id` so the worker bring-up path uses session/load
     # instead of session/new for imported claude sessions.
+    # The agent this thread was last used with. Paired with `resume_session_id`
+    # on purpose: that id only means anything to the agent that issued it.
+    prov = project_provider(p)
+    # Substituting the agent is worth saying HERE and only here — the chat is
+    # about to run on a different backend than the thread belongs to, and its
+    # resume id belongs to the one we couldn't find.
+    p.provider === nothing || provider_name(prov) == p.provider ||
+        @warn "project's agent is not available here; opening with the default" project =
+            p.name wanted = p.provider opening_with = provider_name(prov)
+
     agent = WorkerAgent(state, w.worker_id, p.worker_path;
                         mcp               = mcp,
-                        resume_session_id = p.resume_session_id)
+                        resume_session_id = p.resume_session_id,
+                        provider          = prov)
 
     # Ensure server_path exists so BonitoBook (which reads files from cwd to
     # render the chat notebook + tools) doesn't crash on a never-synced

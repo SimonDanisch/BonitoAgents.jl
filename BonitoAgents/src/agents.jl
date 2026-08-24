@@ -59,6 +59,36 @@ end
 # real claude-agent-acp binary works). Production leaves it unset.
 default_provider() = find_provider(get(ENV, "BT_DEFAULT_PROVIDER", "ClaudeCode"))
 
+"""
+    project_provider(p::ProjectInfo) -> BinAgent
+
+The agent a project opens with: the one it was last used with (`p.provider`),
+or the default when it has never been switched.
+
+A thread belongs to the agent that made it — `p.resume_session_id` is that
+agent's session id, and `session/load`ing it against another one asks for a
+session that agent never created. So the choice is remembered per project
+rather than reset to Claude on every restart.
+
+Falls back instead of throwing when the stored name is unknown here: the agent
+may have been uninstalled, or the project copied to another worker. A chat that
+opens with the default beats one that refuses to open, and the header's picker
+shows what it actually got.
+
+Silent on purpose — most callers (title repair, overview snippets) only want an
+agent's text-cleaning rules and a fallback costs them nothing. The one caller
+for which the substitution is a real event, the bring-up in `dashboard.jl`, says
+so itself. The list searched is the SERVER's: a worker may have agents this
+process doesn't, because the hello frame doesn't report what it has installed.
+"""
+function project_provider(p::ProjectInfo)
+    p.provider === nothing && return default_provider()
+    for prov in current_providers()
+        provider_name(prov) == p.provider && return prov
+    end
+    return default_provider()
+end
+
 WorkerAgent(state::ServerState, worker_id::AbstractString, worker_path::AbstractString;
             mcp = ACP.MCPServer[],
             resume_session_id::Union{String,Nothing} = nothing,
