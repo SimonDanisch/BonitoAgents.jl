@@ -595,6 +595,12 @@ function remove_worker!(state::ServerState, worker_id::AbstractString;
             delete!(state.chat_models, p.id)
             if remove_projects
                 delete!(state.projects[], p.id)
+                # Same reason as in `prune_projects_with_missing_paths`: the
+                # review state is keyed by project id and carries pending
+                # comments, so it goes when the project does. NOT on a plain
+                # session stop — that keeps the project, and a review you were
+                # halfway through should survive restarting the agent.
+                delete!(state.review_states, p.id)
                 push!(dropped, p.id)
             end
         end
@@ -1127,6 +1133,10 @@ function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
     lock(state.lock) do
         for id in dead
             haskey(state.projects[], id) && delete!(state.projects[], id)
+            # The review state is keyed by project id and holds pending comments.
+            # Leaving it behind would hand a future project that reuses the id
+            # someone else's half-written review.
+            delete!(state.review_states, id)
         end
         save_projects!(state)
     end

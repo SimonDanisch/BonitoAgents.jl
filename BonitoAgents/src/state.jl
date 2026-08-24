@@ -219,6 +219,18 @@ mutable struct ServerState
     # panel pulls the model from here when a project icon is selected.
     chat_models :: Dict{String,Any}   # id → ChatModel
 
+    # id → ReviewState. The change-review tab's state, kept HERE rather than on
+    # its panel because the panel does not survive a page reload: the workspace
+    # is rebuilt from scratch and `open_review!` constructs a fresh
+    # `ReviewPanel`. Everything the user had put into the old one went with it —
+    # which repository was being reviewed, what it was being diffed against, and
+    # (the one that actually hurts) every review comment collected but not yet
+    # sent. A half-written review should not be one F5 away from gone.
+    #
+    # `Any` like `chat_models` above and for the same reason: review.jl is
+    # included after this file, so the concrete type isn't known here.
+    review_states :: Dict{String,Any}
+
     # Bumped (via `notify_chats!`) whenever `chat_models` gains or loses an
     # entry. `chat_models` is a plain Dict (not an Observable), but the
     # left-hand "active chats" sidebar needs to re-render when a chat opens or
@@ -328,6 +340,7 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,WorkerInfo}()),    # workers
         Observable(Dict{String,ProjectInfo}()),   # projects
         Dict{String,Any}(),                       # chat_models
+        Dict{String,Any}(),                       # review_states
         Observable(0),                            # chat_signal
         Observable(0),                            # turn_signal
         Dict{String,Any}(),                       # worker_control_ws
@@ -372,6 +385,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             map(identity, session, s.workers),
             map(identity, session, s.projects),
             s.chat_models,
+            s.review_states,           # shared: the point is surviving a session
             map(identity, session, s.chat_signal),
             map(identity, session, s.turn_signal),
             s.worker_control_ws,

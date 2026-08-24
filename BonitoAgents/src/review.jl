@@ -215,8 +215,26 @@ const REVIEW_MAX_LINES = 15_000
 # Files bigger than this open collapsed (still in the DOM, just not laid out).
 const REVIEW_AUTO_OPEN_LINES = 400
 
-struct ReviewPanel
-    model     :: ChatModel
+"""
+    ReviewState
+
+Everything the change-review tab remembers about a project, held on `ServerState`
+rather than on the panel.
+
+The panel does NOT survive a page reload: the workspace is rebuilt and
+`open_review!` constructs a fresh `ReviewPanel`. Anything owned by the old panel
+went with it — which repository was being reviewed, what it was being diffed
+against, whether you were in Ask or Feedback mode, and every comment collected
+but not yet sent. The last one is the reason this type exists: losing a
+half-written review to an accidental F5 is not a cost worth paying for a
+simpler struct.
+
+The JS→Julia channels (`submit`, `drop`, `send`, `open_path`, `reload`) live here
+too. They are re-interpolated on each render and only the current session has
+listeners on them, so sharing them across renders costs nothing and keeps
+"the tab's state" in ONE place rather than split by lifetime.
+"""
+struct ReviewState
     base      :: Observable{String}          # "" ⇒ working tree vs HEAD
     mode      :: Observable{String}          # "ask" | "feedback"
     comments  :: Observable{Vector{ReviewComment}}
@@ -242,11 +260,49 @@ struct ReviewPanel
     open_path :: Observable{String}
 end
 
-ReviewPanel(model::ChatModel; base::AbstractString = "", folder::AbstractString = "") =
-    ReviewPanel(model, Observable(String(base)), Observable("ask"),
+ReviewState(; base::AbstractString = "", folder::AbstractString = "") =
+    ReviewState(Observable(String(base)), Observable("ask"),
                 Observable(ReviewComment[]), Observable(0), Observable(""),
                 Observable(String(folder)), Observable(String[]),
                 Observable{Any}(nothing), Observable(0), Observable(0), Observable(""))
+
+"""
+    review_state!(state, project_id; base = "") -> ReviewState
+
+The project's review state, created on first use. One per project for the life of
+the server, which is what makes a reload a re-render rather than a reset.
+
+Under the lock: a reload can race the old session's teardown, and two of these
+would silently split the tab's state in half — the picker reading one, the
+comment tray the other.
+"""
+function review_state!(state::ServerState, project_id::AbstractString;
+                       base::AbstractString = "")
+    id = String(project_id)
+    return lock(state.lock) do
+        existing = get(state.review_states, id, nothing)
+        existing isa ReviewState && return existing
+        st = ReviewState(; base)
+        state.review_states[id] = st
+        return st
+    end
+end
+
+# Drop a project's review state — it is keyed by project id, so leaving it behind
+# would hand a NEW project that reuses the id someone else's pending comments.
+forget_review_state!(state::ServerState, project_id::AbstractString) =
+    lock(state.lock) do
+        delete!(state.review_states, String(project_id))
+        return nothing
+    end
+
+struct ReviewPanel
+    model :: ChatModel
+    st    :: ReviewState
+end
+
+ReviewPanel(model::ChatModel; base::AbstractString = "") =
+    ReviewPanel(model, review_state!(model.state, model.project_id; base))
 
 review_tab_id(project_id::AbstractString) = "review:" * String(project_id)
 
@@ -310,6 +366,14 @@ user" and the tab says so.
     already handled and it must stay untouched.
   * The single checkout under it, when there is exactly one. Making someone pick
     from a list of one is a click that can only have one outcome.
+  * The project folder when the scan found NOTHING under it. The scan only looks
+    at or below the project, so an empty result does not mean "no repository" —
+    it most often means the project sits INSIDE a bigger checkout, which is the
+    monorepo case the tab handled long before it could pick at all: the worker
+    resolves the enclosing repo and scopes the diff to this folder. And when
+    there really is no repository anywhere, the worker says so in one clear
+    sentence, which beats an empty state claiming there is nothing to review.
+
   * Otherwise nothing. With several checkouts under a folder that isn't one
     itself, there is no answer here that isn't a guess, and a guess costs more
     than the question: you get a real diff of the wrong repository, which reads
@@ -322,6 +386,7 @@ function pick_review_folder(repos::AbstractVector{<:AbstractString},
         rstrip(normalize_worker_path(r), '/') == p && return String(project)
     end
     length(repos) == 1 && return String(first(repos))
+    isempty(repos) && return String(project)
     return ""
 end
 
@@ -528,6 +593,10 @@ end
 
 function Bonito.jsrender(session::Session, rp::ReviewPanel)
     model = rp.model
+    # The state OUTLIVES this render — it is the project's, not the panel's, so a
+    # reload re-renders the tab instead of resetting it. Everything below reads
+    # and writes `st`; nothing here owns anything worth keeping.
+    st = rp.st
     repo_txt   = Observable("")
     branch_txt = Observable("")
     stat_txt   = Observable("loading…")
@@ -541,26 +610,31 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     # between "it's working" and "it's stuck": with no folder decided yet the tab
     # is scanning the project for checkouts, not reading a diff of one.
     diff_dom = Observable{Any}(DOM.div(
-        isempty(rp.folder[]) ? "looking for git repositories in this project…" :
+        isempty(st.folder[]) ? "looking for git repositories in this project…" :
                                "reading the diff from the worker…";
         class = "bt-rv-empty"))
 
     build_diff() = begin
-        base = rp.base[]
+        base = st.base[]
         wid = review_worker_id(model)
         isempty(wid) && (safe_set!(stat_txt, "");
                          return DOM.div("This chat has no project on a worker to diff.";
                                         class = "bt-rv-empty"))
-        # No folder decided yet: the project isn't a checkout and there is more
-        # than one under it. Say which, rather than showing git's "not a git
+        # No folder decided yet, which `pick_review_folder` only leaves open for
+        # ONE reason: the project isn't a checkout and holds SEVERAL, so any pick
+        # would be a guess. Say how many, rather than showing git's "not a git
         # repository" about a folder that was never going to be one.
-        folder = rp.folder[]
+        #
+        # An empty scan does NOT land here — that resolves to the project folder,
+        # because the scan only looks at or below it and a project inside a bigger
+        # checkout has nothing underneath. `n` is therefore always ≥ 2; it is
+        # interpolated rather than hard-coded so a future rule change can't leave
+        # a sentence here that quietly lies about the count.
+        folder = st.folder[]
         if isempty(folder)
             safe_set!(stat_txt, "")
-            n = length(rp.repos[])
-            return DOM.div(n == 0 ?
-                "No git repository here. This folder isn't a checkout and there is " *
-                "none underneath it." :
+            n = length(st.repos[])
+            return DOM.div(
                 "This folder isn't a git repository, but it holds $(n) of them. " *
                 "Pick one above to review it.";
                 class = "bt-rv-empty")
@@ -640,24 +714,24 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
             find_repos_on_worker(model.state, wid, root)
         catch e
             @warn "review: repository scan failed" project = model.project_id exception = e
-            safe_set!(rp.status, "could not scan for repositories")
+            safe_set!(st.status, "could not scan for repositories")
             # Fall back to "the project folder is the only candidate". If it is a
             # checkout the tab works exactly as before; if it isn't, the empty
             # state says so instead of silently showing nothing.
-            isempty(rp.folder[]) && safe_set!(rp.folder, String(root))
+            isempty(st.folder[]) && safe_set!(st.folder, String(root))
             return
         end
-        safe_set!(rp.repos, found.repos)
+        safe_set!(st.repos, found.repos)
         # The worker decides its own budget and is the only one who knows whether
         # it ran out, so say THAT rather than quoting a number from this side that
         # a differently-versioned worker need not share.
-        found.truncated && safe_set!(rp.status,
+        found.truncated && safe_set!(st.status,
             "scan hit its limit — some checkouts may be missing from the list")
         # Only DECIDE if nothing has been decided. A user who switched folders
         # while the scan was in flight owns the choice.
-        isempty(rp.folder[]) || return
+        isempty(st.folder[]) || return
         picked = pick_review_folder(found.repos, root)
-        isempty(picked) || safe_set!(rp.folder, picked)
+        isempty(picked) || safe_set!(st.folder, picked)
         # `folder` staying "" is a real outcome (several checkouts, none of them
         # the project) — nudge the empty state to redraw now that it can say how
         # many there are.
@@ -666,11 +740,11 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
 
     # ⟳ and a base change both mean "go ask again"; so does pointing the tab at a
     # different folder.
-    on(session, rp.reload) do _; refresh_diff!(); end
-    on(session, rp.base)   do _; refresh_diff!(); end
-    on(session, rp.folder) do _; refresh_diff!(); end
+    on(session, st.reload) do _; refresh_diff!(); end
+    on(session, st.base)   do _; refresh_diff!(); end
+    on(session, st.folder) do _; refresh_diff!(); end
     scan_repos!()
-    isempty(rp.folder[]) || refresh_diff!()
+    isempty(st.folder[]) || refresh_diff!()
     body = diff_dom
 
     # The folder picker. A `<select>` and not a browse tree: the answer is one of
@@ -678,7 +752,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     # interaction. The project folder is always offered even when it isn't a
     # checkout — it is the default the tab used to hard-code, and a project that
     # gets `git init`-ed mid-session should not need a reopen to become reviewable.
-    folder_select = map(session, rp.repos, rp.folder) do repos, folder
+    folder_select = map(session, st.repos, st.folder) do repos, folder
         root = review_worker_path(model)
         # Ordered shallowest-first (the scan is breadth-first) with the project
         # folder pinned to the top, and de-duplicated: the scan returns the
@@ -699,16 +773,29 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
             push!(nodes, DOM.option(label; value = o, title = o,
                                     (o == folder ? (; selected = true) : (;))...))
         end
+        # NO inline `onchange` here, and that is the whole point of this comment.
+        #
+        # This node is produced INSIDE a `map`, so it is rebuilt on every change of
+        # `repos`/`folder` and re-serialised when the panel re-renders for a new
+        # session. An Observable interpolated into a `js"…"` on such a node does
+        # not survive that: after a page reload the handler runs against a `null`
+        # (`Uncaught TypeError: Cannot read properties of null (reading 'notify')`)
+        # and the picker is silently inert — every later pick does nothing, and ⟳
+        # does not bring it back either.
+        #
+        # `base_input` gets away with an inline handler because it is built ONCE,
+        # outside any `map`. This one goes through the delegated `change` listener
+        # in the `onload` block instead, which is wired once with the observables
+        # resolved once — the same reason the mode buttons and ⟳ are delegated.
         DOM.select(nodes...; class = "bt-rv-folder",
             title = "Which folder's repository to review. " *
-                    "Found by scanning the project for checkouts.",
-            onchange = js"event => $(rp.folder).notify(event.target.value)")
+                    "Found by scanning the project for checkouts.")
     end
 
     base_input = DOM.input(; type = "text", class = "bt-rv-base",
-        placeholder = "vs HEAD", value = rp.base,
+        placeholder = "vs HEAD", value = st.base,
         title = "Compare against a branch, tag or commit. Empty = the working tree vs HEAD.",
-        onchange = js"event => $(rp.base).notify(event.target.value.trim())")
+        onchange = js"event => $(st.base).notify(event.target.value.trim())")
 
     # Session-scoped `map`s: their parent→child callbacks are registered on this
     # render's session and torn down with it, so closing the tab doesn't leave
@@ -724,7 +811,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     # count in the label would track the tray while the styling it keys on stayed
     # stuck at empty. Nothing is lost by rebuilding: the click is delegated from
     # the panel root, so no per-node listener dies with the swap.
-    send_btn = map(session, rp.comments) do cs
+    send_btn = map(session, st.comments) do cs
         n = length(cs)
         DOM.button(n == 0 ? "Send" : "Send $(n) comment$(n == 1 ? "" : "s")";
             class = "bt-btn bt-btn-sm bt-rv-send", type = "button",
@@ -732,7 +819,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
             title = "Deliver every collected comment to the agent as one instruction")
     end
 
-    mode_hint = map(session, rp.mode) do m
+    mode_hint = map(session, st.mode) do m
         (m == "ask" ? "Ask — your question goes to the chat immediately." :
                       "Feedback — comments collect here; Send delivers them as one instruction.") *
         "  ·  + comments on a line; shift-click a second + to cover a block."
@@ -741,9 +828,15 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     header = DOM.div(
         DOM.span("⑂"; class = "bt-fv-icon"),
         path_span(repo_txt; class = "bt-file-editor-path bt-rv-repo"),
-        DOM.span(branch_txt; class = "bt-fv-badge"),
+        # The badge carries its own padding and background, so an EMPTY one is
+        # still a visible 15×3px stub — a stray dash next to the icon. Harmless
+        # while it only flickered during a load; the "pick a folder" state holds
+        # it indefinitely, so hide it when there is no branch to name. (The other
+        # header spans collapse to 0×0 on their own; this one doesn't.)
+        DOM.span(branch_txt; class = "bt-fv-badge",
+                 style = map(b -> isempty(b) ? "display:none" : "", session, branch_txt)),
         DOM.span(stat_txt; class = "bt-rv-stat"),
-        DOM.span(rp.status; class = "bt-file-editor-status"),
+        DOM.span(st.status; class = "bt-file-editor-status"),
         DOM.div(
             folder_select,
             base_input,
@@ -760,12 +853,12 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     node = DOM.div(
         header,
         DOM.div(mode_hint; class = "bt-rv-hint"),
-        DOM.div(map(review_pending_tray, session, rp.comments); class = "bt-rv-tray-wrap"),
+        DOM.div(map(review_pending_tray, session, st.comments); class = "bt-rv-tray-wrap"),
         DOM.div(body; class = "bt-rv-body");
-        class = "bt-review", dataMode = rp.mode[])
+        class = "bt-review", dataMode = st.mode[])
 
     # ── Julia-side handlers ─────────────────────────────────────────────────
-    on(session, rp.submit) do payload
+    on(session, st.submit) do payload
         payload isa AbstractDict || return
         text = strip(String(get(payload, "text", "")))
         isempty(text) && return
@@ -776,31 +869,31 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
                           String(get(payload, "side", "new")),
                           String(get(payload, "snippet", "")),
                           String(text))
-        if rp.mode[] == "ask"
+        if st.mode[] == "ask"
             if !model.session_alive[]
-                safe_set!(rp.status, "no live session — start the chat first")
+                safe_set!(st.status, "no live session — start the chat first")
                 return
             end
             try
                 send_message!(model, UserMsg(review_ask_message(c, repo_txt[])))
-                safe_set!(rp.status, "asked in the chat")
+                safe_set!(st.status, "asked in the chat")
             catch e
                 @warn "review: ask failed" exception = (e, catch_backtrace())
-                safe_set!(rp.status, "could not ask: $(first(split(sprint(showerror, e), '\n')))")
+                safe_set!(st.status, "could not ask: $(first(split(sprint(showerror, e), '\n')))")
             end
         else
-            safe_set!(rp.comments, push!(copy(rp.comments[]), c))
-            safe_set!(rp.status, "")
+            safe_set!(st.comments, push!(copy(st.comments[]), c))
+            safe_set!(st.status, "")
         end
     end
 
     # Open a file from the diff, through the same guarded path everything else
     # uses — so a file that has been deleted in the working tree toasts instead
     # of opening an empty tab.
-    on(session, rp.open_path) do rel
+    on(session, st.open_path) do rel
         isempty(rel) && return
         pane = model.plotpane
-        pane === nothing && (safe_set!(rp.status, "no workspace to open into"); return)
+        pane === nothing && (safe_set!(st.status, "no workspace to open into"); return)
         # `rel` is relative to the PROJECT — `project_path` puts it in that frame,
         # stripping the repository→folder part and prepending the project→folder
         # one — and `open_project_file!` resolves a relative path against the
@@ -810,28 +903,28 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         open_project_file!(pane, model.state, model.project_id, model.cwd, String(rel))
     end
 
-    on(session, rp.drop) do i
-        cs = rp.comments[]
+    on(session, st.drop) do i
+        cs = st.comments[]
         (1 <= i <= length(cs)) || return
-        safe_set!(rp.comments, deleteat!(copy(cs), i))
+        safe_set!(st.comments, deleteat!(copy(cs), i))
     end
 
-    on(session, rp.send) do _
-        cs = rp.comments[]
-        isempty(cs) && (safe_set!(rp.status, "no comments to send"); return)
+    on(session, st.send) do _
+        cs = st.comments[]
+        isempty(cs) && (safe_set!(st.status, "no comments to send"); return)
         if !model.session_alive[]
-            safe_set!(rp.status, "no live session — start the chat first")
+            safe_set!(st.status, "no live session — start the chat first")
             return
         end
         try
-            send_message!(model, UserMsg(review_feedback_message(cs, repo_txt[], rp.base[])))
+            send_message!(model, UserMsg(review_feedback_message(cs, repo_txt[], st.base[])))
             # Clear only AFTER the send succeeded: a failure that also ate the
             # comments would lose a whole review pass.
-            safe_set!(rp.comments, ReviewComment[])
-            safe_set!(rp.status, "sent $(length(cs)) comment$(length(cs) == 1 ? "" : "s")")
+            safe_set!(st.comments, ReviewComment[])
+            safe_set!(st.status, "sent $(length(cs)) comment$(length(cs) == 1 ? "" : "s")")
         catch e
             @warn "review: send failed" exception = (e, catch_backtrace())
-            safe_set!(rp.status, "could not send: $(first(split(sprint(showerror, e), '\n')))")
+            safe_set!(st.status, "could not send: $(first(split(sprint(showerror, e), '\n')))")
         end
     end
 
@@ -840,12 +933,13 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     # server only hears about a finished comment. That keeps typing responsive
     # and means a flaky link can't eat half-written feedback.
     Bonito.onload(session, node, js"""(root) => {
-        const submit = $(rp.submit);
-        const drop   = $(rp.drop);
-        const send   = $(rp.send);
-        const reload = $(rp.reload);
-        const openPath = $(rp.open_path);
-        const modeObs = $(rp.mode);
+        const submit = $(st.submit);
+        const drop   = $(st.drop);
+        const send   = $(st.send);
+        const reload = $(st.reload);
+        const openPath = $(st.open_path);
+        const modeObs = $(st.mode);
+        const folderObs = $(st.folder);
         const CONTEXT = 3;   // lines of code quoted on each side of the target
 
         const setMode = (m) => {
@@ -944,6 +1038,15 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
             });
         };
 
+        // The folder picker. Delegated, because the <select> is rebuilt by a
+        // `map` and an observable interpolated onto it goes null across a
+        // re-render — see the note where the element is built. `change` bubbles,
+        // so one listener on the root covers every rebuild of the node.
+        root.addEventListener('change', (e) => {
+            const folder = e.target.closest('.bt-rv-folder');
+            if (folder) folderObs.notify(folder.value);
+        });
+
         root.addEventListener('click', (e) => {
             const mode = e.target.closest('[data-rv-mode]');
             if (mode) { setMode(mode.dataset.rvMode); return; }
@@ -1004,8 +1107,7 @@ Open (or focus + refresh) the change-review tab for `model`'s project in the
 window's workspace. One tab per chat: re-opening reuses it so a half-written
 batch of feedback survives clicking around.
 """
-function open_review!(pane::PlotPane, model::ChatModel; base::AbstractString = "",
-                      folder::AbstractString = "")
+function open_review!(pane::PlotPane, model::ChatModel; base::AbstractString = "")
     ws = pane.workspace[]
     ws === nothing && return nothing
     id = review_tab_id(model.project_id)
@@ -1015,10 +1117,14 @@ function open_review!(pane::PlotPane, model::ChatModel; base::AbstractString = "
         panel = ws.panels[][existing].content
         # Re-reading on focus is the behaviour you want: you come back to this
         # tab after the agent did something, and it should show what it did.
-        panel isa ReviewPanel && safe_set!(panel.reload, panel.reload[] + 1)
+        panel isa ReviewPanel && safe_set!(panel.st.reload, panel.st.reload[] + 1)
         return nothing
     end
-    BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, ReviewPanel(model; base, folder);
+    # A FRESH panel around the project's EXISTING state — which is the whole
+    # point. This is the path a reload takes (the workspace is rebuilt, so no
+    # panel is found), and it now re-renders the folder, the base, the mode and
+    # the pending comments instead of starting over.
+    BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, ReviewPanel(model; base);
         label = "Changes", closable = true))
     return nothing
 end

@@ -177,6 +177,122 @@ function run_suite(server)
             return !!row && row.dataset.file === 'dev/Beta/src/beta.jl';
         })()""") === true
 
+        # ── And it must STILL work after a page reload.
+        #
+        # This is the gap the rest of this file could not see. Every assertion
+        # above passes against a picker whose handler is about to die: the
+        # `<select>` is built inside a `map`, so it is rebuilt on every change and
+        # re-serialised when the panel renders for a new session — and an
+        # Observable interpolated onto such a node comes back `null` on the other
+        # side of a reload. The picker then looks completely normal and does
+        # nothing, for the rest of the session; ⟳ doesn't revive it either.
+        #
+        # It was found by driving the page by hand, not by a test, which is the
+        # argument for this block existing. Asserted on the SYMPTOM (a pick has to
+        # change the diff) rather than on the wiring, so it holds however the
+        # handler is attached.
+        @testset "the picker survives a reload" begin
+            TK.eval_js(server, "location.reload(); true")
+            @test TK.wait_for(server, "page back",
+                "!!document.querySelector('.bt-header-review')"; timeout = 60) == true
+            TK.eval_js(server, "document.querySelector('.bt-header-review').click(); true")
+            @test TK.wait_for(server, "review tab back",
+                "!!document.querySelector('$(RF_REVIEW) .bt-rv-folder')"; timeout = 60) == true
+            # The reload REMEMBERS what was being reviewed. The workspace is
+            # rebuilt and `open_review!` makes a fresh panel either way — what
+            # changed is that the panel now wraps the project's `ReviewState`
+            # instead of owning its own. Without it the tab came back undecided,
+            # and with several checkouts (no auto-pick) that meant a trip through
+            # the picker after every reload — for exactly the layout the feature
+            # is for.
+            @test TK.wait_for(server, "Beta still shown after the reload",
+                """[...document.querySelectorAll('$(RF_REVIEW) .bt-rv-file-path')]
+                    .some(e => e.textContent.includes('beta.jl'))"""; timeout = 60) == true
+            @test TK.eval_js(server, """(() => {
+                const s = document.querySelector('$(RF_REVIEW) .bt-rv-folder');
+                return [...s.options].find(o => o.selected)?.textContent === 'dev/Beta';
+            })()""") === true
+
+            # The actual regression: pick a checkout and the diff must follow.
+            # Before the fix this was a no-op — the picker looked normal and did
+            # nothing for the rest of the session.
+            TK.eval_js(server, """(() => {
+                const s = document.querySelector('$(RF_REVIEW) .bt-rv-folder');
+                s.value = [...s.options].find(o => o.textContent === 'dev/Alpha').value;
+                s.dispatchEvent(new Event('change', {bubbles: true}));
+                return true; })()""")
+            @test TK.wait_for(server, "switching still works after a reload",
+                """(() => { const p = [...document.querySelectorAll('$(RF_REVIEW) .bt-rv-file-path')]
+                        .map(e => e.textContent);
+                    return p.some(t => t.includes('alpha.jl')) &&
+                           !p.some(t => t.includes('beta.jl')); })()"""; timeout = 60) == true
+            # And the paths are still in the project's frame, not the checkout's.
+            @test TK.eval_js(server, """(() => {
+                const row = [...document.querySelectorAll('$(RF_REVIEW) .bt-rv-line')]
+                    .find(r => (r.dataset.file || '').includes('alpha.jl'));
+                return !!row && row.dataset.file === 'dev/Alpha/src/alpha.jl';
+            })()""") === true
+        end
+
+        # The one that actually hurts. A comment written in Feedback mode is
+        # UNSENT work — the whole point of the mode is that they collect until you
+        # deliver them as one instruction — and it used to be one accidental F5
+        # away from gone, with no warning and no way back.
+        @testset "pending comments survive a reload" begin
+            TK.eval_js(server, """(() => {
+                const b = document.querySelector('$(RF_REVIEW) [data-rv-mode="feedback"]');
+                if (b) b.click(); return !!b; })()""")
+            @test TK.wait_for(server, "feedback mode",
+                "document.querySelector('$(RF_REVIEW)').dataset.mode === 'feedback'";
+                timeout = 20) == true
+
+            # Write one through the real affordance: + on a line, type, submit.
+            TK.eval_js(server, """(() => {
+                const p = document.querySelector('$(RF_REVIEW) .bt-rv-line .bt-rv-plus');
+                if (p) p.click(); return !!p; })()""")
+            @test TK.wait_for(server, "comment box open",
+                "!!document.querySelector('$(RF_REVIEW) textarea')"; timeout = 20) == true
+            TK.eval_js(server, """(() => {
+                const t = document.querySelector('$(RF_REVIEW) textarea');
+                t.value = 'UEBERLEBT-DEN-RELOAD';
+                t.dispatchEvent(new Event('input', {bubbles: true}));
+                return true; })()""")
+            TK.eval_js(server, """(() => {
+                const ok = [...document.querySelectorAll('$(RF_REVIEW) button')]
+                    .find(b => /add|comment|ok|save/i.test(b.textContent));
+                if (ok) ok.click(); return !!ok; })()""")
+            @test TK.wait_for(server, "comment collected in the tray",
+                """(document.querySelector('$(RF_REVIEW) .bt-rv-tray')?.innerText || '')
+                    .includes('UEBERLEBT-DEN-RELOAD')"""; timeout = 30) == true
+
+            TK.eval_js(server, "location.reload(); true")
+            @test TK.wait_for(server, "page back",
+                "!!document.querySelector('.bt-header-review')"; timeout = 60) == true
+            TK.eval_js(server, "document.querySelector('.bt-header-review').click(); true")
+            @test TK.wait_for(server, "review tab back",
+                "!!document.querySelector('$(RF_REVIEW) .bt-rv-folder')"; timeout = 60) == true
+
+            # Still there, and still in the mode it was written in.
+            @test TK.wait_for(server, "the comment is still in the tray",
+                """(document.querySelector('$(RF_REVIEW) .bt-rv-tray')?.innerText || '')
+                    .includes('UEBERLEBT-DEN-RELOAD')"""; timeout = 30) == true
+            @test TK.eval_js(server,
+                "document.querySelector('$(RF_REVIEW)').dataset.mode === 'feedback'") === true
+        end
+
+        # An empty branch badge used to render as a visible 15×3px stub — a stray
+        # dash beside the icon, held for as long as the "pick a folder" state was
+        # on screen. It has a background and padding of its own, so unlike the
+        # other header spans it does not collapse on its own.
+        @testset "no stray empty branch badge" begin
+            @test TK.eval_js(server, """(() => {
+                const b = document.querySelector('$(RF_REVIEW) .bt-fv-badge');
+                if (!b) return true;                      // not rendered at all is fine
+                if (b.textContent.trim().length > 0) return true;   // has a branch: shown
+                return b.getBoundingClientRect().width === 0;       // empty: invisible
+            })()""") === true
+        end
+
         @testset "no JS errors" begin
             @test isempty(TK.js_errors(server))
         end

@@ -111,8 +111,13 @@
         # like a real diff of the right one.
         @test K(["$PROJ/dev/Bonito", "$PROJ/dev/Makie"], PROJ) == ""
 
-        # Nothing found ⇒ nothing to open on; the empty state says so.
-        @test K(String[], PROJ) == ""
+        # Nothing found UNDER it ⇒ the project folder itself. The scan only looks
+        # at or below the project, so an empty result usually means the project
+        # sits INSIDE a bigger checkout — the monorepo case, where the worker
+        # resolves the enclosing repo and scopes the diff here. Returning "" for
+        # this broke `e2e:review_scope`: a package inside a monorepo showed
+        # nothing at all.
+        @test K(String[], PROJ) == PROJ
 
         # The project wins even when the scan also returned others — a checkout
         # nested inside a checkout must not displace the one asked about.
