@@ -3042,21 +3042,21 @@ function arrayBufferToBase64(buf) {
     }
     return btoa(binary);
 }
-window.btMSearchFilter = function btMSearchFilter(inputEl) {
+function msearchFilter(inputEl) {
     const q = inputEl.value.toLowerCase();
     const wrap = inputEl.closest('.bt-msearch');
     wrap.querySelectorAll('.bt-msearch-item').forEach((item)=>{
         item.hidden = q.length > 0 && !item.dataset.label.includes(q);
     });
-};
-window.btMSearchOpen = function btMSearchOpen(triggerEl) {
+}
+function msearchOpen(triggerEl) {
     document.querySelectorAll('.bt-msearch-open').forEach((el)=>el.classList.remove('bt-msearch-open'));
     const wrap = triggerEl.closest('.bt-msearch');
     wrap.classList.add('bt-msearch-open');
     const input = wrap.querySelector('.bt-msearch-input');
     if (input) {
         input.value = '';
-        window.btMSearchFilter(input);
+        msearchFilter(input);
     }
     requestAnimationFrame(()=>{
         function onOutside(e) {
@@ -3068,15 +3068,15 @@ window.btMSearchOpen = function btMSearchOpen(triggerEl) {
         document.addEventListener('click', onOutside, true);
         if (input) input.focus();
     });
-};
-window.btMSearchSelect = function btMSearchSelect(itemEl, pickObs, cfgId, value) {
+}
+function msearchSelect(itemEl, pickObs, cfgId, value) {
     pickObs.notify([
         cfgId,
         value
     ]);
     const wrap = itemEl.closest('.bt-msearch');
     if (wrap) wrap.classList.remove('bt-msearch-open');
-};
+}
 const CHAT_INSTANCES = new Set();
 function toolSlot(id) {
     const direct = document.querySelector(`.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
@@ -3112,6 +3112,9 @@ function connect(node, comm, init = {}) {
 }
 export { BonitoChat as BonitoChat };
 export { Collapsable as Collapsable };
+export { msearchFilter as msearchFilter };
+export { msearchOpen as msearchOpen };
+export { msearchSelect as msearchSelect };
 export { toolSlot as toolSlot };
 export { connect as connect };
 

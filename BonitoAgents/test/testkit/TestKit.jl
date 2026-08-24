@@ -449,6 +449,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       scenario::Union{String,Nothing} = nothing,
                       cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
+                      many_choices::Bool = false,
                       kwargs...)
     ensure_display!()
     agent_ref = Ref{Function}(agent)
@@ -507,6 +508,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     end
     cancel_delay_ms === nothing ||
         (agent_env["BT_MOCK_ACP_CANCEL_DELAY_MS"] = string(cancel_delay_ms))
+    # Make the agent advertise a 12-choice `model` config option, so the header
+    # renders the SEARCHABLE picker (`.bt-msearch`) rather than a native select.
+    many_choices && (agent_env["BT_MOCK_ACP_MANY_CHOICES"] = "1")
 
     h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking

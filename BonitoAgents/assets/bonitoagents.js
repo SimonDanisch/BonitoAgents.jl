@@ -4484,23 +4484,32 @@ function arrayBufferToBase64(buf) {
 // Replaces the native <select> when there are many choices (e.g. OpenCode's
 // ~100 models). All filtering is pure DOM — no Julia round-trips per keystroke.
 
-// Exposed on window so inline onclick= handlers (outside ES6 module scope) can call them.
-window.btMSearchFilter = function btMSearchFilter(inputEl) {
+// Module exports, not `window`. The inline `onclick=` handlers Julia writes are
+// outside module scope, which is what the globals were for — but they can reach
+// in the same way everything else here does, through
+// `$(ChatLib).then(lib => lib.msearch…)`. Same pattern as `toolSlot`, and the
+// same reason: a global is a name every other script on the page can see and
+// nothing declares a dependency on.
+//
+// The call sites resolve `event.currentTarget` BEFORE awaiting the module —
+// `currentTarget` is null once dispatch finishes, so reading it inside the
+// `.then()` would hand these functions nothing.
+export function msearchFilter(inputEl) {
     const q = inputEl.value.toLowerCase();
     const wrap = inputEl.closest('.bt-msearch');
     wrap.querySelectorAll('.bt-msearch-item').forEach(item => {
         item.hidden = q.length > 0 && !item.dataset.label.includes(q);
     });
-};
+}
 
-window.btMSearchOpen = function btMSearchOpen(triggerEl) {
+export function msearchOpen(triggerEl) {
     // Close any other open dropdown first.
     document.querySelectorAll('.bt-msearch-open').forEach(el =>
         el.classList.remove('bt-msearch-open'));
     const wrap = triggerEl.closest('.bt-msearch');
     wrap.classList.add('bt-msearch-open');
     const input = wrap.querySelector('.bt-msearch-input');
-    if (input) { input.value = ''; window.btMSearchFilter(input); }
+    if (input) { input.value = ''; msearchFilter(input); }
     // Register close-on-outside-click after one frame so the triggering click
     // doesn't immediately close the dropdown we just opened.
     requestAnimationFrame(() => {
@@ -4514,13 +4523,13 @@ window.btMSearchOpen = function btMSearchOpen(triggerEl) {
         document.addEventListener('click', onOutside, true);
         if (input) input.focus();
     });
-};
+}
 
-window.btMSearchSelect = function btMSearchSelect(itemEl, pickObs, cfgId, value) {
+export function msearchSelect(itemEl, pickObs, cfgId, value) {
     pickObs.notify([cfgId, value]);
     const wrap = itemEl.closest('.bt-msearch');
     if (wrap) wrap.classList.remove('bt-msearch-open');
-};
+}
 
 // ── ES6 module exports ─────────────────────────────────────────────────────
 // `connect(node, comm)` is the public entry point — Julia calls it inline

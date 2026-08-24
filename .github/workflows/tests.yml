@@ -185,6 +185,7 @@ jobs:
           - leak_cycle
           - lens
           - media
+          - model_search
           - multipane
           - new_project
           - outdated_worker

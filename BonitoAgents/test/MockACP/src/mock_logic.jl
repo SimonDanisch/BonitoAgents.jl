@@ -91,6 +91,11 @@ function _configure!()
     global DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
     global IGNORE_CANCEL   = get(ENV, "BT_MOCK_ACP_IGNORE_CANCEL", "") == "1"
     global CANCEL_DELAY_MS = parse(Int, String(get(ENV, "BT_MOCK_ACP_CANCEL_DELAY_MS", "1500")))
+    # Advertise a config option with MORE choices than the client's searchable-
+    # dropdown threshold, so the model picker renders as `.bt-msearch` instead of
+    # a native <select>. Opt-in: every other suite asserts against the plain
+    # pills, and a real agent only reports this many models for some providers.
+    global MANY_CHOICES    = get(ENV, "BT_MOCK_ACP_MANY_CHOICES", "") == "1"
     return nothing
 end
 
@@ -818,6 +823,30 @@ end
 # loop on each `session/prompt`.
 const LAST_PROMPT = Ref{String}("")
 
+# A `model` config option with 12 choices — past the client's
+# MODEL_SEARCH_THRESHOLD (8), which is what makes it render the searchable
+# dropdown. Distinct, greppable labels so a filter test can assert on exactly
+# which rows survive.
+function many_choice_model_option()
+    Dict(
+        "id" => "model", "name" => "Model", "category" => "model",
+        "currentValue" => "alpha-01",
+        "options" => [
+            Dict("value" => "alpha-01", "name" => "Alpha One",   "description" => "first alpha"),
+            Dict("value" => "alpha-02", "name" => "Alpha Two",   "description" => "second alpha"),
+            Dict("value" => "alpha-03", "name" => "Alpha Three", "description" => "third alpha"),
+            Dict("value" => "beta-01",  "name" => "Beta One",    "description" => "first beta"),
+            Dict("value" => "beta-02",  "name" => "Beta Two",    "description" => "second beta"),
+            Dict("value" => "beta-03",  "name" => "Beta Three",  "description" => "third beta"),
+            Dict("value" => "gamma-01", "name" => "Gamma One",   "description" => "first gamma"),
+            Dict("value" => "gamma-02", "name" => "Gamma Two",   "description" => "second gamma"),
+            Dict("value" => "gamma-03", "name" => "Gamma Three", "description" => "third gamma"),
+            Dict("value" => "delta-01", "name" => "Delta One",   "description" => "first delta"),
+            Dict("value" => "delta-02", "name" => "Delta Two",   "description" => "second delta"),
+            Dict("value" => "delta-03", "name" => "Delta Three", "description" => "third delta"),
+        ])
+end
+
 # Dispatcher: read JSON-RPC frames from stdin, route by `method`. Returns
 # when stdin EOFs (parent closed our stdin → time to die).
 function dispatch_loop()
@@ -833,7 +862,9 @@ function dispatch_loop()
             # initialize's result beyond presence.
             resp(id, Dict())
         elseif method == "session/new" && id !== nothing
-            resp(id, Dict("sessionId" => SESSION))
+            resp(id, MANY_CHOICES ?
+                Dict("sessionId" => SESSION, "configOptions" => [many_choice_model_option()]) :
+                Dict("sessionId" => SESSION))
             # Real agents push their slash commands right after session/new
             # (verified on claude-agent-acp and kimi), which is what makes `/`
             # autocomplete work on a chat you haven't typed in yet. Emitting

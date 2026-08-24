@@ -6574,8 +6574,9 @@ pill_category_label(o::AgentClientProtocol.ConfigOption) =
 const MODEL_SEARCH_THRESHOLD = 8  # use searchable dropdown when choices exceed this
 
 # Custom dropdown with a search/filter input — used when a ConfigOption has many
-# choices (e.g. OpenCode reports ~100 models). Pure DOM manipulation via the
-# btMSearch* JS helpers; no Julia round-trips for keystroke filtering.
+# choices (e.g. OpenCode reports ~100 models). Filtering is pure DOM via the
+# ChatLib module's `msearch*` exports — no Julia round-trip per keystroke, and
+# nothing published on `window` (see `toolSlot` for the same pattern).
 function searchable_config_pill(o::AgentClientProtocol.ConfigOption, pick::Observable;
                                 lc::Bool = false)
     cfg_id = o.id
@@ -6589,18 +6590,21 @@ function searchable_config_pill(o::AgentClientProtocol.ConfigOption, pick::Obser
             class = "bt-msearch-item" * (c.value == cur ? " bt-msearch-item-cur" : ""),
             dataLabel = lowercase(lab(c)) * " " * lowercase(c.value),
             title = isnothing(c.description) ? c.name : c.description,
-            onclick = js"event => window.btMSearchSelect(event.currentTarget, $(pick), $(cfg_id), $(c.value))")
+            onclick = js"""event => { const t = event.currentTarget;
+                $(ChatLib).then(lib => lib.msearchSelect(t, $(pick), $(cfg_id), $(c.value))); }""")
         for c in o.choices
     ]
     search_input = DOM.input(;
         type = "text", placeholder = "Search…", class = "bt-msearch-input",
-        oninput = js"event => window.btMSearchFilter(event.target)")
+        oninput = js"""event => { const t = event.target;
+                $(ChatLib).then(lib => lib.msearchFilter(t)); }""")
     trigger = DOM.div(
         DOM.span(pill_category_label(o) * ": "; class = "bt-header-meta-cat"),
         DOM.span(cur_label),
         " ▾";
         class = "bt-header-meta-item bt-header-meta-pick bt-msearch-trigger",
-        onclick = js"event => { event.stopPropagation(); window.btMSearchOpen(event.currentTarget); }",
+        onclick = js"""event => { event.stopPropagation(); const t = event.currentTarget;
+            $(ChatLib).then(lib => lib.msearchOpen(t)); }""",
         title = pill_tooltip(o))
     DOM.div(
         trigger,
