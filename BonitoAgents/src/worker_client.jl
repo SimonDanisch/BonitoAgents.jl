@@ -390,6 +390,8 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "git_diff_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "find_repos_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "worker_state_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "open_session_failed"
