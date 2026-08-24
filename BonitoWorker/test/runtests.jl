@@ -345,6 +345,11 @@ end
     end
 end
 
+# The review tab's repository scan. Pure filesystem work on temp trees — no
+# subprocess, no git binary needed (a `.git` entry is all `find_repos` looks for,
+# which is also all git itself looks for).
+include("test_find_repos.jl")
+
 end  # BonitoWorker
 
 # Stability regressions (M1 clone_repo data-loss guard, M8/M12/M13). Pure unit

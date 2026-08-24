@@ -1425,6 +1425,42 @@ function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
 end
 
 """
+    find_repos_on_worker(state, worker_id, path; max_depth = 4, timeout = 15.0)
+        -> (repos, truncated, unreadable)
+
+The git checkouts at or under `path` **on the worker**, for the review tab's
+folder picker. A project folder is routinely a workspace holding several
+checkouts rather than being one itself, and the server cannot answer this by
+looking at its own filesystem.
+
+`timeout` is short on purpose. This runs while a tab is opening and the answer
+is a convenience — the picker still works from the project folder alone if the
+scan is slow or the worker is busy, so waiting a minute for it would trade the
+thing the user asked for against the thing they can already do.
+"""
+function find_repos_on_worker(state::ServerState, worker_id::AbstractString,
+                              path::AbstractString; max_depth::Int = 4,
+                              timeout::Real = 15.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("find_repos on '$worker_id'", "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict(
+            "type" => "find_repos", "request_id" => rid,
+            "path" => String(path), "max_depth" => max_depth))
+        take_pending!(state, ch, rid, timeout, "find_repos on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("find_repos on '$worker_id': unexpected response shape")
+    haskey(resp, "error") && error(String(resp["error"]))
+    repos = String[String(p) for p in get(resp, "repos", [])]
+    return (repos      = repos,
+            truncated  = get(resp, "truncated", false) === true,
+            unreadable = Int(get(resp, "unreadable", 0)))
+end
+
+"""
     fetch_file_from_worker(state, worker_name, src_path, dst_path;
                             handoff_timeout = 15.0, on_progress = nothing)
 

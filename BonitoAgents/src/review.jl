@@ -222,6 +222,14 @@ struct ReviewPanel
     comments  :: Observable{Vector{ReviewComment}}
     reload    :: Observable{Int}
     status    :: Observable{String}
+    # WHICH folder is being reviewed, as an absolute worker path. "" until the
+    # repository scan has decided (see `pick_review_folder`) — a project folder
+    # that is not itself a checkout has nothing to show until the user picks one.
+    folder    :: Observable{String}
+    # The checkouts found at or under the project, absolute worker paths, filled
+    # in by the scan — which lands AFTER the first render, so the picker has to
+    # rebuild on it.
+    repos     :: Observable{Vector{String}}
     # JS → Julia: a submitted comment box,
     # `{file, line, end_line, side, snippet, text}`.
     submit    :: Observable{Any}
@@ -229,19 +237,21 @@ struct ReviewPanel
     drop      :: Observable{Int}
     # JS → Julia: pulse to send the batch.
     send      :: Observable{Int}
-    # JS → Julia: open this repo-relative path as a file tab. Reading a diff and
-    # wanting the whole file is the most common next move there is.
+    # JS → Julia: open this PROJECT-relative path as a file tab. Reading a diff
+    # and wanting the whole file is the most common next move there is.
     open_path :: Observable{String}
 end
 
-ReviewPanel(model::ChatModel; base::AbstractString = "") =
+ReviewPanel(model::ChatModel; base::AbstractString = "", folder::AbstractString = "") =
     ReviewPanel(model, Observable(String(base)), Observable("ask"),
                 Observable(ReviewComment[]), Observable(0), Observable(""),
+                Observable(String(folder)), Observable(String[]),
                 Observable{Any}(nothing), Observable(0), Observable(0), Observable(""))
 
 review_tab_id(project_id::AbstractString) = "review:" * String(project_id)
 
-# The worker path whose repository we review: the project's own directory.
+# The project's own directory on the worker — where the repository scan starts
+# and the frame every path the tab hands out is relative to.
 function review_worker_path(model::ChatModel)
     proj = get(model.state.projects[], model.project_id, nothing)
     proj === nothing && return model.cwd
@@ -251,6 +261,68 @@ end
 function review_worker_id(model::ChatModel)
     proj = get(model.state.projects[], model.project_id, nothing)
     return proj === nothing ? "" : proj.worker_id
+end
+
+"""
+    folder_rel_to_project(folder, project) -> String
+
+`folder`'s position under `project`, as a prefix to prepend to a path relative to
+`folder` (so `""` when they are the same folder, `"dev/Foo/"` otherwise).
+
+String surgery, not `relpath`: these are WORKER paths and the worker may run a
+different OS, so the server's own separator has no business deciding what
+"relative" means here. The picker only ever offers folders the scan found *under*
+the project, so a prefix match is the whole of the question.
+
+A folder that is NOT under the project (nothing in the UI produces one, but a
+saved panel could outlive a project being moved) returns `""` — the paths then
+stay relative to the reviewed folder, which is wrong-but-inert, rather than
+carrying a `../..` prefix that `open_project_file!` would resolve into a
+different tree.
+"""
+function folder_rel_to_project(folder::AbstractString, project::AbstractString)
+    f = rstrip(normalize_worker_path(folder), '/')
+    p = rstrip(normalize_worker_path(project), '/')
+    (isempty(f) || isempty(p) || f == p) && return ""
+    startswith(f, p * "/") || return ""
+    return chopprefix(f, p * "/") * "/"
+end
+
+"""
+    review_folder_label(folder, project) -> String
+
+How a folder is named in the picker: its path under the project, or `"."` for the
+project folder itself. Relative, because the absolute path is the same twelve
+characters of prefix on every entry and the difference is the point.
+"""
+function review_folder_label(folder::AbstractString, project::AbstractString)
+    rel = folder_rel_to_project(folder, project)
+    return isempty(rel) ? "." : rstrip(rel, '/')
+end
+
+"""
+    pick_review_folder(repos, project) -> String
+
+Which folder the tab opens on, given what the scan found. `""` means "ask the
+user" and the tab says so.
+
+  * The project folder itself, when it is a checkout. This is the case the tab
+    already handled and it must stay untouched.
+  * The single checkout under it, when there is exactly one. Making someone pick
+    from a list of one is a click that can only have one outcome.
+  * Otherwise nothing. With several checkouts under a folder that isn't one
+    itself, there is no answer here that isn't a guess, and a guess costs more
+    than the question: you get a real diff of the wrong repository, which reads
+    exactly like a real diff of the right one.
+"""
+function pick_review_folder(repos::AbstractVector{<:AbstractString},
+                            project::AbstractString)
+    p = rstrip(normalize_worker_path(project), '/')
+    for r in repos
+        rstrip(normalize_worker_path(r), '/') == p && return String(project)
+    end
+    length(repos) == 1 && return String(first(repos))
+    return ""
 end
 
 # ── message composition ─────────────────────────────────────────────────────
@@ -375,9 +447,40 @@ end
 display_path(path::AbstractString, prefix::AbstractString) =
     isempty(prefix) ? path : chopprefix(path, prefix)
 
-function review_file_section(f::DiffFile, prefix::AbstractString = "")
+"""
+    project_path(git_path, strip, add) -> String
+
+Turn a path as git printed it — relative to the REPOSITORY root — into one
+relative to the PROJECT, which is the only frame the rest of the app speaks.
+
+Two hops, because the reviewed folder and the project are no longer the same
+thing once you can point the tab at a checkout inside the project:
+
+  * `strip` removes the repository→folder part, giving a path relative to the
+    REVIEWED FOLDER (this is what the diff was scoped to);
+  * `add` prepends the project→folder part, giving a path relative to the
+    PROJECT.
+
+Both are empty in the common case (the project IS the reviewed folder and IS the
+repository root), so this is the identity there.
+
+It has to land on the project because that is where everything downstream is
+standing: the agent's working directory is the project folder, and
+`open_project_file!` resolves a relative path against it. A path relative to the
+reviewed folder sent to either of those points at a file that isn't there.
+"""
+project_path(git_path::AbstractString, strip::AbstractString, add::AbstractString) =
+    add * display_path(git_path, strip)
+
+function review_file_section(f::DiffFile, prefix::AbstractString = "",
+                             add::AbstractString = "")
     nlines = sum(h -> length(h.lines), f.hunks; init = 0)
-    shown_path = display_path(f.path, prefix)
+    # What the row SHOWS is relative to the reviewed folder — the folder is named
+    # in the header, so repeating it on every row is the noise the prefix
+    # stripping exists to remove. What the row CARRIES is relative to the project,
+    # because that is what the ⤢ handler and the agent are given.
+    shown_path  = display_path(f.path, prefix)
+    target_path = project_path(f.path, prefix, add)
     head = DOM.summary(
         DOM.span(diff_status_label(f); class = "bt-rv-file-status", dataStatus = string(f.status)),
         # `title` keeps the root-relative path, so hovering still tells you where
@@ -390,7 +493,7 @@ function review_file_section(f::DiffFile, prefix::AbstractString = "")
         # Open the WHOLE file in its own tab. A separate button rather than a
         # clickable path, so it doesn't fight the <details> disclosure toggle.
         DOM.button("⤢"; class = "bt-rv-open", type = "button",
-                   title = "Open this file", dataOpen = shown_path))
+                   title = "Open this file", dataOpen = target_path))
     body = if f.binary
         DOM.div("binary file — no textual diff"; class = "bt-rv-binary")
     elseif isempty(f.hunks)
@@ -398,7 +501,7 @@ function review_file_section(f::DiffFile, prefix::AbstractString = "")
     else
         DOM.div((DOM.div(
                     DOM.div(h.header; class = "bt-rv-hunk-head"),
-                    (review_line_row(shown_path, l) for l in h.lines)...;
+                    (review_line_row(target_path, l) for l in h.lines)...;
                     class = "bt-rv-hunk") for h in f.hunks)...;
                 class = "bt-rv-hunks")
     end
@@ -434,8 +537,13 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     # computing it inside a `map` would park the session's task for that long —
     # freezing every other Observable in the tab. Instead the tab opens
     # immediately on a placeholder and swaps in the diff when it lands.
-    diff_dom = Observable{Any}(DOM.div("reading the diff from the worker…";
-                                       class = "bt-rv-empty"))
+    # Two different waits, and saying which one you are in is the difference
+    # between "it's working" and "it's stuck": with no folder decided yet the tab
+    # is scanning the project for checkouts, not reading a diff of one.
+    diff_dom = Observable{Any}(DOM.div(
+        isempty(rp.folder[]) ? "looking for git repositories in this project…" :
+                               "reading the diff from the worker…";
+        class = "bt-rv-empty"))
 
     build_diff() = begin
         base = rp.base[]
@@ -443,8 +551,22 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         isempty(wid) && (safe_set!(stat_txt, "");
                          return DOM.div("This chat has no project on a worker to diff.";
                                         class = "bt-rv-empty"))
+        # No folder decided yet: the project isn't a checkout and there is more
+        # than one under it. Say which, rather than showing git's "not a git
+        # repository" about a folder that was never going to be one.
+        folder = rp.folder[]
+        if isempty(folder)
+            safe_set!(stat_txt, "")
+            n = length(rp.repos[])
+            return DOM.div(n == 0 ?
+                "No git repository here. This folder isn't a checkout and there is " *
+                "none underneath it." :
+                "This folder isn't a git repository, but it holds $(n) of them. " *
+                "Pick one above to review it.";
+                class = "bt-rv-empty")
+        end
         res = try
-            git_diff_on_worker(model.state, wid, review_worker_path(model); base = base)
+            git_diff_on_worker(model.state, wid, folder; base = base)
         catch e
             @warn "review: git diff failed" project = model.project_id exception = e
             safe_set!(stat_txt, "")
@@ -453,9 +575,9 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
                 DOM.div(first(split(sprint(showerror, e), '\n')); class = "bt-fv-error-detail");
                 class = "bt-tool-error bt-rv-error")
         end
-        # Name what is actually on screen. The diff is scoped to the project's
+        # Name what is actually on screen. The diff is scoped to the reviewed
         # folder, so showing a bare repo root next to it would claim more than the
-        # tab is showing whenever the project sits inside a bigger checkout.
+        # tab is showing whenever that folder sits inside a bigger checkout.
         safe_set!(repo_txt, isempty(res.scope) ? res.repo :
                             rstrip(res.repo, '/') * "/" * res.scope)
         safe_set!(branch_txt, isempty(res.branch) ? res.head : res.branch)
@@ -485,18 +607,103 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
                            "(diff past $(REVIEW_MAX_LINES) lines)" : ""))
         # Rows drop the scope prefix they all share; the header carries it instead.
         prefix = isempty(res.scope) ? "" : rstrip(res.scope, '/') * "/"
-        return DOM.div((review_file_section(f, prefix) for f in shown)...; class = "bt-rv-files")
+        # …and gain the reviewed folder's own position under the project, so what
+        # they CARRY stays in the project's frame even when what they SHOW is
+        # relative to a checkout several levels down. Empty when the tab is
+        # reviewing the project folder itself, which is the case that already
+        # worked and must keep behaving identically.
+        add = folder_rel_to_project(folder, review_worker_path(model))
+        return DOM.div((review_file_section(f, prefix, add) for f in shown)...;
+                       class = "bt-rv-files")
     end
 
     refresh_diff!() = Base.errormonitor(@async begin
         safe_set!(stat_txt, "reading…")
         safe_set!(diff_dom, build_diff())
     end)
-    # ⟳ and a base change both mean "go ask again".
+
+    # Find the checkouts under the project, so the picker has something to offer.
+    #
+    # Async and non-fatal, like the diff: the tab has to open now, and a scan that
+    # is slow or a worker that is busy must not hold it there. A failed scan
+    # leaves the picker with just the project folder, which is exactly what the
+    # tab had before this existed — degraded, not broken.
+    #
+    # It runs BEFORE the first diff when the folder is still undecided, because
+    # the scan is what decides it. When a folder was already passed in (a reopened
+    # tab), the diff starts immediately and the scan only fills the picker.
+    scan_repos!() = Base.errormonitor(@async begin
+        wid = review_worker_id(model)
+        isempty(wid) && return
+        root = review_worker_path(model)
+        found = try
+            find_repos_on_worker(model.state, wid, root)
+        catch e
+            @warn "review: repository scan failed" project = model.project_id exception = e
+            safe_set!(rp.status, "could not scan for repositories")
+            # Fall back to "the project folder is the only candidate". If it is a
+            # checkout the tab works exactly as before; if it isn't, the empty
+            # state says so instead of silently showing nothing.
+            isempty(rp.folder[]) && safe_set!(rp.folder, String(root))
+            return
+        end
+        safe_set!(rp.repos, found.repos)
+        # The worker decides its own budget and is the only one who knows whether
+        # it ran out, so say THAT rather than quoting a number from this side that
+        # a differently-versioned worker need not share.
+        found.truncated && safe_set!(rp.status,
+            "scan hit its limit — some checkouts may be missing from the list")
+        # Only DECIDE if nothing has been decided. A user who switched folders
+        # while the scan was in flight owns the choice.
+        isempty(rp.folder[]) || return
+        picked = pick_review_folder(found.repos, root)
+        isempty(picked) || safe_set!(rp.folder, picked)
+        # `folder` staying "" is a real outcome (several checkouts, none of them
+        # the project) — nudge the empty state to redraw now that it can say how
+        # many there are.
+        isempty(picked) && refresh_diff!()
+    end)
+
+    # ⟳ and a base change both mean "go ask again"; so does pointing the tab at a
+    # different folder.
     on(session, rp.reload) do _; refresh_diff!(); end
     on(session, rp.base)   do _; refresh_diff!(); end
-    refresh_diff!()
+    on(session, rp.folder) do _; refresh_diff!(); end
+    scan_repos!()
+    isempty(rp.folder[]) || refresh_diff!()
     body = diff_dom
+
+    # The folder picker. A `<select>` and not a browse tree: the answer is one of
+    # a handful of known checkouts, and picking from a list is the whole
+    # interaction. The project folder is always offered even when it isn't a
+    # checkout — it is the default the tab used to hard-code, and a project that
+    # gets `git init`-ed mid-session should not need a reopen to become reviewable.
+    folder_select = map(session, rp.repos, rp.folder) do repos, folder
+        root = review_worker_path(model)
+        # Ordered shallowest-first (the scan is breadth-first) with the project
+        # folder pinned to the top, and de-duplicated: the scan returns the
+        # project itself when it is a checkout.
+        opts = String[root]
+        for r in repos
+            rstrip(normalize_worker_path(r), '/') ==
+                rstrip(normalize_worker_path(root), '/') || push!(opts, String(r))
+        end
+        nodes = Any[]
+        # A placeholder only while nothing is chosen — an empty `<select>` value
+        # otherwise reads as "no folder" and the first real option would be
+        # selected on screen while `folder` says something else.
+        isempty(folder) && push!(nodes,
+            DOM.option("choose a folder…"; value = "", selected = true, disabled = true))
+        for o in opts
+            label = review_folder_label(o, root)
+            push!(nodes, DOM.option(label; value = o, title = o,
+                                    (o == folder ? (; selected = true) : (;))...))
+        end
+        DOM.select(nodes...; class = "bt-rv-folder",
+            title = "Which folder's repository to review. " *
+                    "Found by scanning the project for checkouts.",
+            onchange = js"event => $(rp.folder).notify(event.target.value)")
+    end
 
     base_input = DOM.input(; type = "text", class = "bt-rv-base",
         placeholder = "vs HEAD", value = rp.base,
@@ -538,6 +745,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         DOM.span(stat_txt; class = "bt-rv-stat"),
         DOM.span(rp.status; class = "bt-file-editor-status"),
         DOM.div(
+            folder_select,
             base_input,
             DOM.div(
                 DOM.button("Ask"; class = "bt-fv-seg", type = "button", dataRvMode = "ask"),
@@ -593,11 +801,12 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         isempty(rel) && return
         pane = model.plotpane
         pane === nothing && (safe_set!(rp.status, "no workspace to open into"); return)
-        # `rel` is relative to the PROJECT (the rows strip the scope prefix — see
-        # `display_path`), and `open_project_file!` resolves a relative path
-        # against the project's worker path. So it goes straight through. It used
-        # to be joined with the repo root instead, which broke the moment the
-        # header started naming the scope: `<repo>/pkg` + `pkg/member.jl`.
+        # `rel` is relative to the PROJECT — `project_path` puts it in that frame,
+        # stripping the repository→folder part and prepending the project→folder
+        # one — and `open_project_file!` resolves a relative path against the
+        # project's worker path. So it goes straight through. It used to be joined
+        # with the repo root instead, which broke the moment the header started
+        # naming the scope: `<repo>/pkg` + `pkg/member.jl`.
         open_project_file!(pane, model.state, model.project_id, model.cwd, String(rel))
     end
 
@@ -795,7 +1004,8 @@ Open (or focus + refresh) the change-review tab for `model`'s project in the
 window's workspace. One tab per chat: re-opening reuses it so a half-written
 batch of feedback survives clicking around.
 """
-function open_review!(pane::PlotPane, model::ChatModel; base::AbstractString = "")
+function open_review!(pane::PlotPane, model::ChatModel; base::AbstractString = "",
+                      folder::AbstractString = "")
     ws = pane.workspace[]
     ws === nothing && return nothing
     id = review_tab_id(model.project_id)
@@ -808,7 +1018,7 @@ function open_review!(pane::PlotPane, model::ChatModel; base::AbstractString = "
         panel isa ReviewPanel && safe_set!(panel.reload, panel.reload[] + 1)
         return nothing
     end
-    BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, ReviewPanel(model; base);
+    BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, ReviewPanel(model; base, folder);
         label = "Changes", closable = true))
     return nothing
 end

@@ -144,12 +144,15 @@ jobs:
         suite:
           - app_reload
           - app_scroll
+          - attach_mobile
           - auto_prompt
           - background_tab
           - bonito_upgrade
           - bt_eval
           - bt_eval_types
+          - bt_wait
           - cancel_escalation
+          - cancel_misbehaving
           - chat_attach
           - chat_cancel
           - chat_close_rename
@@ -164,6 +167,7 @@ jobs:
           - cross_worker
           - cross_worker_sync_ui
           - dashboard_layout
+          - debug_chat
           - edit_diff
           - errors
           - eval_embed_park
@@ -171,6 +175,7 @@ jobs:
           - file_open
           - file_open_fresh
           - file_tree
+          - file_view
           - filter_scroll
           - folder_threads
           - follow_pill
@@ -190,6 +195,9 @@ jobs:
           - resume_discover
           - resume_eager_bind
           - resume_no_jserrors
+          - review
+          - review_folder
+          - review_scope
           - scroll_anchor
           - scroll_chase
           - scroll_persist
@@ -201,6 +209,7 @@ jobs:
           - subagent_feed
           - subagent_poll
           - todo_taskbar
+          - todo_worker_death
           - tool_rendering
           - two_tab
           - usage_commands

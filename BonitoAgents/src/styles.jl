@@ -1506,6 +1506,16 @@ const ChatStyles = Bonito.Styles(
         "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)",
         "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
         "font-family" => "ui-monospace, monospace"),
+    # Which folder's repository is on screen. Sized to fit `dev/SomePackage`
+    # without growing the header — the full path is in the option's `title`.
+    # `color` explicitly, like every other control here: a select that paints its
+    # own background and leaves the text to the UA gets `fieldtext`, which follows
+    # the OS scheme. See the `html:root { color-scheme: light }` note above.
+    CSS(".bt-rv-folder",
+        "max-width" => "180px", "font-size" => "11px", "padding" => "3px 6px",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+        "font-family" => "ui-monospace, monospace"),
     CSS(".bt-rv-hint",
         "font-size" => "11px", "color" => "var(--bt-text-faint)",
         "padding" => "4px 12px", "flex-shrink" => "0",
