@@ -144,9 +144,9 @@ end
         # the arriving prompt itself cleared, so it took the STREAMING branch
         # and looped forever — the chat was busy because the agent genuinely
         # never stopped talking. Fixed in MockACP with a sticky `INTERRUPTED`
-        # latch; the diagnostic below is what named it (turn slot held,
+        # latch; the diagnostic below is what named it (busy flag held,
         # activity = Prompted, active_prompts = 1 ⇒ a prompt on the wire that
-        # never settled, not a lost turn slot on our side).
+        # never settled, not a stranded busy flag on our side).
         #
         # The probe is scoped to the VISIBLE pane for the same reason `stop!`
         # above is: a bare `document.querySelector('.bt-busy')` can resolve to a
@@ -160,8 +160,8 @@ end
         catch e
             e isa InterruptException && rethrow()
             # `busy` is a derivation of exactly two things, and the spinner alone
-            # cannot say which one is stuck: OUR turn slot (`turn_in_flight`, held
-            # by a `drain_turn!` that never finished) or the CONNECTION's view
+            # cannot say which one is stuck: OUR busy flag (`turn_in_flight`, held
+            # by a `finish_turn!` that never finished) or the CONNECTION's view
             # (`Cancelling` persists while any prompt is active — see
             # `settle(::Cancelling, …)`). Naming the half is the whole
             # difference between a client bug and a protocol bug.

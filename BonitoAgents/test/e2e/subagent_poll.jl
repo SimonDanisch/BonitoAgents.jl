@@ -5,7 +5,7 @@
 # is the launch-ack lie; the fd-close is worthless (the transcript is written
 # append-per-line, so the fd reads "closed" between every write while the subagent
 # is still alive). Only the `end_turn` marker in the content is the real signal.
-# Proves the poller + real worker clear the slot at end_turn, and NOT before.
+# Proves the poller + real worker clear busy at end_turn, and NOT before.
 #
 # Regression (the launch race): the `outputFile` PATH lands on the wire before the
 # file is on disk. A MISSING file, and a still-streaming file with no `end_turn`,
@@ -75,7 +75,7 @@ function run_suite(server)
         @test BA.taskbar_activity(task, time()) == "finished — waiting for the agent"
         @test BA.tool_finished_at(task) === nothing     # ... and not finalized yet
 
-        # (D) A boundary retires it — `retire_reporting!`, which `begin_turn!`
+        # (D) A boundary retires it — `retire_reporting!`, which `begin_turn`
         # runs on every new turn and `leave_unprompted!` runs when an episode
         # ends. It is deliberately NOT edge-only: this task finished with the
         # agent having nothing to say about it, so no auto-wake episode ever

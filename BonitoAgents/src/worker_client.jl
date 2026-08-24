@@ -474,7 +474,7 @@ function teardown_worker_control!(state::ServerState, worker_id::AbstractString,
         haskey(state.workers[], worker_id) && (state.workers[][worker_id].online[] = false)
         for m in kept
             # Tear down the DEAD ACP session (frees the worker-side agent
-            # subprocess), but KEEP the model: begin_turn! rebinds a fresh
+            # subprocess), but KEEP the model: begin_turn rebinds a fresh
             # session on the next message after reconnect.
             try; stop!(m.agent); catch e
                 @warn "stopping agent on worker disconnect" project_id = m.project_id exception = e

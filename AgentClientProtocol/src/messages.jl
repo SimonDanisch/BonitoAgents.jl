@@ -381,7 +381,7 @@ TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "", nothing)
 # Seal the trailing TEXT message at a boundary — and NOTHING else.
 #
 # A boundary is not the end of the stream. A tool call routinely spans one: an
-# eval runs for minutes while you send another message, and `begin_turn!` puts a
+# eval runs for minutes while you send another message, and `begin_turn` puts a
 # marker on the stream before it prompts. `close` force-fails every live tool
 # and empties `st.tools`, so past that point every `tool_call_update` for the
 # running eval finds no tool and is dropped — its card freezes at `in_progress`

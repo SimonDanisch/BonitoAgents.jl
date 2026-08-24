@@ -2,7 +2,7 @@
 #
 # While Yolo is ON, after each turn ends the app auto-nudges the agent to keep
 # working (`YOLO_CONTINUE_PROMPT`) until the agent emits the done sentinel. The self-
-# driving loop is: a turn's finalize (`drain_turn!`) enqueues the next continue
+# driving loop is: a turn's finalize (`finish_turn!`) enqueues the next continue
 # prompt via `send_message!`, whose own finalize repeats the check — no separate
 # loop task. A bare `no` bails (no re-prompt).
 #

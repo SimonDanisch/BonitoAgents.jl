@@ -53,7 +53,7 @@
             # stop on `session/cancel`, so the turn stays busy.
             BA.send_message!(model, BA.UserMsg(model, "stream a long story"))
             # Wait for the PROMPT to be on the wire, not merely for `busy`. Those
-            # are no longer the same instant: the turn slot is claimed before the
+            # are no longer the same instant: the busy flag is set before the
             # lazy ACP bind, so `busy` goes true while `client(agent)` is still
             # nothing — deliberately, since the user has pressed send and the
             # spinner should not read "waiting for your next instruction" through
@@ -84,10 +84,10 @@
             # escalate hint and the ConnectionClosed showerror, so we only assert
             # SOMETHING was surfaced, not its exact text.)
             # Budget sized off the code's OWN bounded wait, not a guess: busy
-            # clears in `drain_turn!`'s finally, which first calls
+            # clears in `finish_turn!`'s finally, which first calls
             # `wait_rendered!` — capped at `RENDER_BARRIER_SECONDS` (10 s) — and
             # here the renderer is parked on the wedged agent's flood, so that
-            # cap is genuinely spent before the turn slot is released. A 15 s
+            # cap is genuinely spent before the busy flag clears. A 15 s
             # deadline sat right on top of 10 s + teardown and failed ~1 run in 3
             # in isolation. Raising it weakens nothing: busy must still clear,
             # just not faster than the barrier the product documents.

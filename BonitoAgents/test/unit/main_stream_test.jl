@@ -568,7 +568,7 @@ end
     close(model)
 end
 
-# `begin_turn!` waits on this barrier before it does ANYTHING else, and the chat
+# `begin_turn` waits on this barrier before it does ANYTHING else, and the chat
 # has ONE serial `run_chat!` consumer. So an unbounded wait here is not a slow
 # turn — it is a chat that can never start another turn: every message queues
 # behind it, the spinner never clears, and stop cannot reach an agent that isn't
@@ -597,7 +597,7 @@ end
 # The wedge, and why it is now unrepresentable.
 #
 # An auto-wake episode used to claim liveness with a latch of its own, whose only
-# exits were an end marker the agent may never send and `begin_turn!` — and
+# exits were an end marker the agent may never send and `begin_turn` — and
 # `busy_active` is exactly what makes the composer queue instead of send. So the
 # one way out ran through the thing that was broken. Stop was the last control
 # left, and it dropped the queued sends unconditionally: it deleted the message
@@ -654,7 +654,7 @@ end
     @test ACP.cancel!(cli) == true
     @test ACP.session_activity(cli.conn) isa ACP.Cancelling
 
-    # begin_turn! must not hand the prompt over yet.
+    # begin_turn must not hand the prompt over yet.
     held = @async BT.await_cancel_settled!(model)
     sleep(0.5)
     @test !istaskdone(held)

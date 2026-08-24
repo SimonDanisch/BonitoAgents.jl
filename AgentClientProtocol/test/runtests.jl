@@ -319,7 +319,7 @@ end
     # A boundary must not kill a tool that is still running. `close(TurnState)`
     # force-fails every live tool, which is right at STREAM END and wrong at a
     # boundary — and boundaries land mid-stream all the time (the dispatcher
-    # stamps one at every response, `begin_turn!` injects one before it
+    # stamps one at every response, `begin_turn` injects one before it
     # prompts). A long `bt_julia_eval` spanning one lost its entry in
     # `st.tools`, so every later update for it was dropped: the card sat at
     # `in_progress` with an empty CODE and OUTPUT while the eval kept running.
