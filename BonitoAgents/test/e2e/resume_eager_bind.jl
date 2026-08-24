@@ -59,6 +59,24 @@ function run_suite(server)
             m !== nothing && m.agent.client !== nothing
         end
     end
+
+    @testset "a stored id the agent rejects opens a fresh session" begin
+        # Rotated, pruned, or written by an agent this project no longer uses.
+        # Without the fallback, `session/load` throws out of the bring-up and
+        # the chat is dead — the failure mode that made recording non-Claude
+        # session ids unsafe. (The mock errors on any id containing "stale".)
+        pstale = BA.create_project_from_worker!(state, wid, mktempdir();
+            name = "staleChat", resume_session_id = "mock-stale-id",
+            start_session = true)
+        @test poll_until(timeout = 30) do
+            m = get(state.chat_models, pstale.id, nothing)
+            m !== nothing && m.agent.client !== nothing
+        end
+        m = state.chat_models[pstale.id]
+        # Fresh session, and the dead id is dropped rather than retried forever.
+        @test m.agent.resume_session_id === nothing
+        @test m.agent.client.session_id != "mock-stale-id"
+    end
     return server
 end
 

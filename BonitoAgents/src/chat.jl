@@ -5831,7 +5831,7 @@ function start_chat_client!(model::ChatModel)
         reconcile_replay!(model, replay_msgs)
     end
     update_session_id!(model.chat_session, new_session_id)
-    # Bind the claude session id onto the project. A fresh `session/new` chat
+    # Bind the agent's session id onto the project. A fresh `session/new` chat
     # gets its real session id only HERE (the agent assigned it); without writing
     # it back, `ProjectInfo.resume_session_id` stayed `nothing` forever, so:
     #   * the SAME open chat appeared in BOTH the homebar (under its title) AND
@@ -6080,21 +6080,17 @@ function backfill_project_title!(model::ChatModel, prompt::AbstractString)
     return nothing
 end
 
-# Persist the agent-assigned claude session id onto the project so the thread
-# becomes resumable + dedupable (see the call site in `start_chat_client!`).
+# Persist the agent-assigned session id onto the project so the thread becomes
+# resumable + dedupable (see the call site in `start_chat_client!`). Which agent
+# issued it is persisted alongside, by `record_project_provider!`.
 # Idempotent: a no-op when the id is unchanged (a restart/resume re-binds the
 # same id) or empty, and when the project entry is gone. Notifies `projects` on
 # a real change so the folder→threads browser hides the now-tracked session.
 function record_bound_session!(model::ChatModel, session_id::AbstractString)
     pid = model.project_id
     (isempty(pid) || isempty(session_id)) && return
-    # Only persist a session id for providers that support claude-style
-    # `session/load` re-attach (ClaudeCode, and the mock which mimics it).
-    # Recording e.g. a MiMo session id would make the next bring-up `session/load`
-    # a session that provider never created — the exact error `switch_provider!`
-    # clears the id to avoid. Claude sessions are also the only ones the worker's
-    # discover scan surfaces, so this is exactly the set thread dedup/resume needs.
-    resumable_session(agent_kind(model.agent)) || return
+    # Only persist an id the agent can actually load back, per its own handshake.
+    loads_sessions(model.agent) || return
     haskey(model.state.projects[], pid) || return
     p = model.state.projects[][pid]
     p.resume_session_id == session_id && return

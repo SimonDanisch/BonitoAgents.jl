@@ -1949,6 +1949,8 @@ by `last_used` descending. Each entry has:
                         `running = false`.
 - `pid`               — set only when `running === true`; the OS PID of the
                         live Claude CLI process. `nothing` otherwise.
+- `provider`          — which agent owns the session, as a wire name
+                        ("KimiCode"). Absent on rows from the Claude file scan.
 - `first_prompt`      — short preview of the first user-message text in the
                         jsonl (whitespace-collapsed, truncated to
                         PREVIEW_MAX_CHARS). `nothing` if the jsonl contains no
@@ -2373,7 +2375,8 @@ function acp_list_sessions(prov; timeout::Real = 20.0)
                     "session_id"        => String(get(s, "sessionId", "")),
                     "last_used"         => acp_epoch(get(s, "updatedAt", "")),
                     "kind"              => "session",
-                    "agent_type"        => kind,
+                    "agent_type"        => nothing,      # not a subagent
+                    "provider"          => kind,
                     "parent_session_id" => nothing,
                     "running"           => false,   # not reported by session/list
                     "pid"               => nothing,

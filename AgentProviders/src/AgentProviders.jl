@@ -14,7 +14,7 @@ module AgentProviders
 
 export AgentProvider, BinAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent, MockAgent2
-export provider_name, label, icon, resumable_session
+export provider_name, label, icon
 export current_providers, find_provider, refresh_providers!
 export strip_injected_context, meaningful_prompt, reports_autonomous_origin
 
@@ -156,26 +156,6 @@ icon(::OpenCodeAgent)   = "bt-provider-opencode"
 icon(::KimiAgent)       = "bt-provider-kimi"
 icon(::MockAgent)       = "bt-provider-mock"
 icon(::MockAgent2)      = "bt-provider-mock"
-
-# Whether a chat should PERSIST this provider's session id for resume across
-# server restarts. True only for providers that support claude-style
-# `session/load` re-attach: ClaudeCode does, and the mock mimics it (it answers
-# `session/load`). MiMo/OpenCode don't, so persisting their id would make the
-# next bring-up `session/load` a session that provider never created.
-#
-# Kimi is the interesting case: it DOES advertise `loadSession` and answers
-# `session/load` for an id it created, but it still belongs in the `false` camp,
-# because the persistence layer stores the session id WITHOUT the provider that
-# minted it (`ProjectInfo.resume_session_id`, no provider field) and every
-# bring-up constructs its `WorkerAgent` with `default_provider()`. A persisted
-# kimi id would therefore come back up under ClaudeCode and `session/load` an id
-# claude never created — the dead-chat failure `switch_provider!` clears the id
-# to avoid. Flipping this to `true` REQUIRES persisting the provider per project
-# first.
-resumable_session(::AgentProvider)  = false
-resumable_session(::ClaudeCodeAgent) = true
-resumable_session(::MockAgent)       = true
-resumable_session(::MockAgent2)      = true
 
 # ── The one provider list ────────────────────────────────────────────────────
 # Memoised singletons; the ENV is read exactly once, on first call. The mock is

@@ -19,7 +19,7 @@
 
 import AgentProviders: AgentProvider, BinAgent,
                        ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent,
-                       provider_name, label, icon, resumable_session,
+                       provider_name, label, icon,
                        current_providers, find_provider
 
 # Replay defaults to empty — only resuming agents (a WorkerAgent with a
@@ -52,6 +52,9 @@ mutable struct WorkerAgent <: AgentProvider
     # bind it, spawning an orphaned subprocess nothing reaps. A reopen always
     # builds a FRESH WorkerAgent, so latching this closed is correct.
     closed             :: Bool
+    # From the agent's own `initialize` handshake: can it session/load? Gates
+    # whether we persist its session id.
+    loads_sessions     :: Bool
 end
 
 # Default provider is ClaudeCode, overridable via `BT_DEFAULT_PROVIDER` — set by
@@ -63,23 +66,9 @@ default_provider() = find_provider(get(ENV, "BT_DEFAULT_PROVIDER", "ClaudeCode")
     project_provider(p::ProjectInfo) -> BinAgent
 
 The agent a project opens with: the one it was last used with (`p.provider`),
-or the default when it has never been switched.
-
-A thread belongs to the agent that made it — `p.resume_session_id` is that
-agent's session id, and `session/load`ing it against another one asks for a
-session that agent never created. So the choice is remembered per project
-rather than reset to Claude on every restart.
-
-Falls back instead of throwing when the stored name is unknown here: the agent
-may have been uninstalled, or the project copied to another worker. A chat that
-opens with the default beats one that refuses to open, and the header's picker
-shows what it actually got.
-
-Silent on purpose — most callers (title repair, overview snippets) only want an
-agent's text-cleaning rules and a fallback costs them nothing. The one caller
-for which the substitution is a real event, the bring-up in `dashboard.jl`, says
-so itself. The list searched is the SERVER's: a worker may have agents this
-process doesn't, because the hello frame doesn't report what it has installed.
+or the default when it has never been switched or when the stored name isn't
+installed here. Silent about the fallback — the bring-up in `dashboard.jl`
+reports it, the cosmetic callers (title repair, overview snippets) don't care.
 """
 function project_provider(p::ProjectInfo)
     p.provider === nothing && return default_provider()
@@ -96,7 +85,8 @@ WorkerAgent(state::ServerState, worker_id::AbstractString, worker_path::Abstract
             handler::ACP.Handler = ACP.DiscardHandler()) =
     WorkerAgent(state, String(worker_id), String(worker_path),
                 collect(ACP.MCPServer, mcp), resume_session_id, provider, handler,
-                Ref{Any}(nothing), nothing, ACP.Message[], ReentrantLock(), false)
+                Ref{Any}(nothing), nothing, ACP.Message[], ReentrantLock(), false,
+                false)   # loads_sessions: set by the handshake in start!
 
 # The agent the worker sees as its cwd is the worker-side path.
 agent_cwd(a::WorkerAgent) = a.worker_path
@@ -106,6 +96,10 @@ Base.isopen(a::WorkerAgent) = a.client !== nothing
 provider_name(a::WorkerAgent) = provider_name(a.provider)
 label(a::WorkerAgent)         = label(a.provider)
 icon(a::WorkerAgent)          = icon(a.provider)
+
+# Never bound → never handshook → we don't know, so don't persist an id.
+loads_sessions(::AgentProvider) = false
+loads_sessions(a::WorkerAgent)  = a.loads_sessions
 
 # Share the agent's `ws` Ref so a single socket is the one truth on teardown.
 # Typed on `WorkerAgent` so it does NOT collide with `ACP.WorkerTransport`'s
@@ -158,30 +152,48 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
                            "open_session on '$(a.worker_id)'")
 
     conn = ACP.Connection(transport, a.handler; on_frame)
-    ACP.send_request(conn, "initialize", Dict(
+    init = ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict(
             "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
             "elicitation" => a.provider.elicitation),
         "clientInfo"         => Dict("name"    => "BonitoAgents.WorkerAgent",
                                      "version" => "0.1.0")))
+    init_caps = get(ACP._result_dict(init), "agentCapabilities", nothing)
+    a.loads_sessions = init_caps isa AbstractDict &&
+                       get(init_caps, "loadSession", false) === true
 
     # Resuming → `session/load` (the agent re-streams history as session/update
     # notifications; `replay_history` captures them). Fresh → `session/new`, no
     # replay. The response carries the session-config blocks either way. Only
     # Claude honours the `_meta.systemPrompt.preset` AGENTS.md append.
+    new_session() = ACP.send_request(conn, "session/new",
+        merge(Dict("cwd" => a.worker_path, "mcpServers" => mcp_list), prompt_meta))
+
     session_id, msgs, result = if a.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=a.worker_path resume=a.resume_session_id
-        rmsgs, load_result = ACP.replay_history(conn, merge(Dict(
+        load_params = merge(Dict(
             "sessionId"  => a.resume_session_id,
             "cwd"        => a.worker_path,
             "mcpServers" => mcp_list,
-        ), prompt_meta))
-        a.resume_session_id, rmsgs, load_result
+        ), prompt_meta)
+        # A stored id the agent can't load any more (rotated, pruned, or written
+        # by a different agent) must open a fresh session, not kill the chat.
+        # The project self-heals: `record_bound_session!` writes the fresh id
+        # over the dead one, and the local history rides forward as a prelude.
+        try
+            rmsgs, load_result = ACP.replay_history(conn, load_params)
+            a.resume_session_id, rmsgs, load_result
+        catch e
+            e isa InterruptException && rethrow()
+            @warn "ACP: session/load failed, starting a fresh session" exception=e cwd=a.worker_path resume=a.resume_session_id
+            a.resume_session_id = nothing
+            fresh = new_session()
+            fresh["sessionId"], ACP.Message[], fresh
+        end
     else
-        new_result = ACP.send_request(conn, "session/new",
-            merge(Dict("cwd" => a.worker_path, "mcpServers" => mcp_list), prompt_meta))
-        new_result["sessionId"], ACP.Message[], new_result
+        fresh = new_session()
+        fresh["sessionId"], ACP.Message[], fresh
     end
 
     a.client = ACP.Client(conn, session_id, a.worker_path, ACP._result_dict(result))

@@ -12,6 +12,10 @@ mutable struct SessionRow
     preview     :: String   # truncated first user-message; "" if unavailable
     meta        :: String
     running     :: Bool     # confirmed alive via OS-level pid check
+    # Which agent owns this session, as a wire name ("KimiCode"); "" for rows
+    # from the Claude file scan. Imported onto the project so a resumed thread
+    # comes back up under the agent that minted its id.
+    provider    :: String
     row_key     :: String   # "path|session_id"
     # Display title shown for the row. Defaults to the first-prompt preview, but
     # `resolve_session_title!` overrides it with the renamed `ProjectInfo.title`
@@ -41,12 +45,16 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     session_id = sid_raw === nothing ? "" : String(sid_raw)
     preview_raw = get(r, "first_prompt", nothing)
     preview    = preview_raw isa AbstractString ? String(preview_raw) : ""
+    prov_raw   = get(r, "provider", nothing)
+    provider   = prov_raw isa AbstractString ? String(prov_raw) : ""
     meta = if haskey(r, "last_used")
         ts = get(r, "last_used", 0.0)
         dt = Dates.unix2datetime(ts isa Number ? Float64(ts) : 0.0)
         base = "Last used $(Dates.format(dt, "yyyy-mm-dd HH:MM"))"
         at = get(r, "agent_type", nothing)
-        at === nothing ? base : base * "  ·  subagent: $at"
+        at !== nothing && (base *= "  ·  subagent: $at")
+        isempty(provider) || (base *= "  ·  $(provider)")
+        base
     else
         ""
     end
@@ -55,8 +63,8 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     # falls through silently.
     running = get(r, "running", nothing) === true
     row_key = string(path, '|', session_id)
-    SessionRow(c.worker_id, path, name, session_id, preview, meta, running, row_key,
-               Observable(session_preview_title(preview)), Observable(false))
+    SessionRow(c.worker_id, path, name, session_id, preview, meta, running, provider,
+               row_key, Observable(session_preview_title(preview)), Observable(false))
 end
 
 # Point the row's display title at the renamed project's title when one resumes
@@ -125,6 +133,7 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
             dataBtAction      = "session-pick",
             dataBtSessionPath = js_path(s.path),
             dataBtSessionId   = s.session_id,
+            dataBtProvider    = s.provider,
             dataBtWorkerId    = s.worker_id);
         class = "bt-session-row"))
 end

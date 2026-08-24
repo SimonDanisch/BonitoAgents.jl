@@ -309,10 +309,14 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
                                 nothing : String(sid_raw)
         w_name = String(get(payload, "worker", ""))
+        prov_raw = get(payload, "provider", nothing)
+        provider = (prov_raw === nothing || isempty(String(prov_raw))) ?
+                       nothing : String(prov_raw)
         pick[] = Dict{String,Any}()              # reset so the same row can re-fire
         isempty(w_name) && return
         is_busy_idle(c.busy[]) || return         # drop double-clicks while a start is in flight
-        c.do_import(w_name, path; resume_session_id = resume_session_id)
+        c.do_import(w_name, path; resume_session_id = resume_session_id,
+                    provider = provider)
     end
     # Plain DOM (not Bonito.Button) so the onclick can `preventDefault` the
     # enclosing <details> summary toggle (Rescan should NOT collapse the panel
@@ -496,6 +500,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             $(pick).notify({
                 path:       btn.dataset.btSessionPath || '',
                 session_id: btn.dataset.btSessionId   || '',
+                provider:   btn.dataset.btProvider    || '',
                 worker:     btn.dataset.btWorkerId    || '',
             });
         });

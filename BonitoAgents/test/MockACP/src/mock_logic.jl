@@ -163,6 +163,10 @@ sub_meta(ev::AbstractDict) =
 resp(id, result) =
     emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
 
+resp_error(id, code, message) =
+    emit(Dict("jsonrpc" => "2.0", "id" => id,
+              "error" => Dict("code" => code, "message" => message)))
+
 # Per-prompt sleep helper: zero-cost in normal scenarios, configurable for
 # the "stress timing" tests that want pacing in the stream.
 pause() = CHUNK_MS > 0 && sleep(CHUNK_MS / 1000)
@@ -857,10 +861,10 @@ function dispatch_loop()
         method = String(get(msg, "method", ""))
         id     = get(msg, "id", nothing)
         if method == "initialize" && id !== nothing
-            # Empty caps + agentCapabilities is what the real agent's
-            # session/new reply leans on; the chat layer doesn't read
-            # initialize's result beyond presence.
-            resp(id, Dict())
+            # `loadSession` must match reality (we answer session/load below):
+            # the server reads it to decide whether to persist the session id.
+            resp(id, Dict("protocolVersion" => 1,
+                          "agentCapabilities" => Dict("loadSession" => true)))
         elseif method == "session/new" && id !== nothing
             resp(id, MANY_CHOICES ?
                 Dict("sessionId" => SESSION, "configOptions" => [many_choice_model_option()]) :
@@ -874,6 +878,12 @@ function dispatch_loop()
                 Dict("name" => "clear",   "description" => "Clear the conversation"),
             ]))
         elseif method == "session/load" && id !== nothing
+            # An id a real agent no longer knows (rotated, pruned, another
+            # agent's). Opt-in by id so the other resume tests keep their ack.
+            if occursin("stale", String(get(get(msg, "params", Dict()), "sessionId", "")))
+                resp_error(id, -32602, "Session not found")
+                continue
+            end
             # Dispatcher mode: re-stream the scripted history as session/update
             # frames BEFORE the load response — exactly how real claude-agent-acp
             # replays a resumed session's jsonl. Other scenarios keep the bare

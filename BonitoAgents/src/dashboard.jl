@@ -143,6 +143,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
                                       name::String = project_name_from_path(worker_path),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
+                                      provider::Union{String,Nothing} = nothing,
                                       start_session::Bool = true,
                                       progress = nothing)
     # A worker may run a different OS than the server, so `worker_path` is a
@@ -167,7 +168,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     isempty(worker_path) && error("Worker path is required (pick a folder).")
 
     # Threads: a folder can hold several conversations, identified by
-    # (worker, path, chat_id) where chat_id is the claude session id. Importing
+    # (worker, path, chat_id) where chat_id is the agent's session id. Importing
     # the SAME session id reuses its thread; importing a DIFFERENT session of
     # the same folder creates a sibling thread; a no-session import
     # (resume_session_id === nothing) always starts a fresh thread. This is the
@@ -191,6 +192,10 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     p.resume_session_id = resume_session_id
+    # The session id and the agent that minted it travel together — the discover
+    # scan reports the provider per row, so a resumed kimi thread comes back up
+    # under kimi instead of the default.
+    p.provider = provider
     lock(state.lock) do
         state.projects[][id] = p
     end
@@ -413,11 +418,9 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
                                        args = w.mcp_args,
                                        env  = eval_dialback_env(state, p.id))]
 
-    # The agent carries everything start! needs — including the
-    # `resume_session_id` so the worker bring-up path uses session/load
-    # instead of session/new for imported claude sessions.
-    # The agent this thread was last used with. Paired with `resume_session_id`
-    # on purpose: that id only means anything to the agent that issued it.
+    # The agent carries everything start! needs — the `resume_session_id` (so
+    # bring-up uses session/load) and the agent this thread was last used with.
+    # The two are paired: that id only means anything to the agent that issued it.
     prov = project_provider(p)
     # Substituting the agent is worth saying HERE and only here — the chat is
     # about to run on a different backend than the thread belongs to, and its
@@ -2654,7 +2657,8 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # at sync-time and is handled separately.
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
-                        resume_session_id::Union{Nothing,String} = nothing)
+                        resume_session_id::Union{Nothing,String} = nothing,
+                        provider::Union{Nothing,String} = nothing)
         # In-flight guard (T16): a double-click (or two import affordances firing
         # at once) had no guard here and would run two concurrent imports of the
         # same folder. Bail synchronously if a long-op is already running; the
@@ -2686,6 +2690,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 p = create_project_from_worker!(state, w_name, real;
                     name = pname,
                     resume_session_id = resume_session_id,
+                    provider = provider,
                     start_session = false,
                     progress = (stage, info) -> busy_event!(busy, stage, info))
                 @info "do_import: registered project, flipping view" id=p.id

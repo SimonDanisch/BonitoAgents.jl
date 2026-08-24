@@ -980,7 +980,7 @@ end
     thread_dedup_key(p) -> Tuple{String,String,String}
 
 A *thread's* identity: `(worker_id, worker_path, chat_id)`, where `chat_id`
-is the claude session id (`resume_session_id`) or, for a brand-new thread
+is the agent's session id (`resume_session_id`) or, for a brand-new thread
 that hasn't a session yet, the project's own `id`. A folder
 (`(worker_id, worker_path)`) can host several threads, so this is what we
 de-duplicate on — NOT the folder key, which would wrongly merge sibling
@@ -994,7 +994,7 @@ thread_dedup_key(p::ProjectInfo) =
     thread_tag(p) -> String
 
 A short human tag distinguishing sibling threads of the same folder: the
-claude session id prefix for a resumed thread, or `new <id>` for a fresh one.
+session id prefix for a resumed thread, or `new <id>` for a fresh one.
 Used to disambiguate identical folder names in the active-chats sidebar.
 """
 thread_tag(p::ProjectInfo) =
@@ -1005,7 +1005,7 @@ thread_tag(p::ProjectInfo) =
     find_thread(state, worker_id, worker_path, chat_id) -> Union{ProjectInfo,Nothing}
 
 Look up the thread `(worker_id, worker_path, chat_id)`, matching on the
-claude session id (`resume_session_id`). `chat_id === nothing` means "a
+agent's session id (`resume_session_id`). `chat_id === nothing` means "a
 brand-new thread" and never matches an existing one (so "+ New thread" and a
 no-session import always create a fresh thread, while re-importing the same
 session id reuses its thread and importing a *different* session of the same

@@ -58,15 +58,6 @@
         # Object, NOT `true` — see the header comment.
         @test kimi.elicitation["form"] isa AbstractDict
         @test find_provider("OpenCode").elicitation["form"] isa AbstractDict
-        # Kimi DOES advertise `loadSession`, but its session id must NOT be
-        # persisted: `ProjectInfo` stores `resume_session_id` without the
-        # provider that minted it and every bring-up builds its `WorkerAgent`
-        # with `default_provider()`, so a persisted kimi id would come back up
-        # under ClaudeCode and `session/load` an id claude never created.
-        @test !resumable_session(kimi)
-        @test resumable_session(find_provider("ClaudeCode"))
-        @test !resumable_session(find_provider("MiMoCode"))
-        @test !resumable_session(find_provider("OpenCode"))
 
         # `KIMI_AGENT_ACP` overrides the resolved binary, like every other
         # provider's `*_AGENT_ACP` (used to point a worker at a custom build).
