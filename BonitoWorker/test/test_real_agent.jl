@@ -164,10 +164,20 @@ end
     env["BONITOAGENTS_SERVER_URL"]    = server_url
     env["BONITOAGENTS_PROJECTS_ROOT"] = projects_root
 
+    # The kernel-level backstop, and the only one that holds when our own
+    # teardown doesn't: `connect_and_serve` arms PR_SET_PDEATHSIG with this pid,
+    # so a worker still alive when THIS process exits is reaped by the kernel.
+    # A worker that outlives the suite is ~500 MB, and nothing else reaps it —
+    # it carries a test secret and a temp projects root nobody looks at again.
+    env["BONITOAGENTS_DIE_WITH_PARENT"] = string(getpid())
+
     worker_log  = tempname() * ".log"
     worker_cmd  = Cmd(`$julia_bin --project=$worker_env --startup-file=no $standalone`)
     println("[real-agent] spawning worker subprocess; log -> ", worker_log)
-    worker_proc = run(pipeline(setenv(worker_cmd, env);
+    # `detach` puts the worker in its own process group, like a real install —
+    # which is also what makes the group signal in `kill_proc!` OURS to send
+    # (it refuses to signal the group the test runner itself sits in).
+    worker_proc = run(pipeline(detach(setenv(worker_cmd, env));
                                 stdout = worker_log, stderr = worker_log);
                        wait = false)
     println("[real-agent] worker pid=", getpid(worker_proc))
@@ -238,24 +248,31 @@ end
         end
 
     finally
-        # Closing the HTTP server + killing the worker subprocess can both
-        # block on Windows (server drains active connections; the worker may
-        # be mid-precompile or sleeping on its reconnect retry). Run cleanup
-        # in a bounded @async so the suite can't hang on it — leaking a
-        # subprocess is better than wedging the test runner.
-        cleanup = @async try
-            close(server)
-            kill(worker_proc)
-        catch end
-        timedwait(() -> istaskdone(cleanup), 5.0)
-        try rm(projects_root; recursive = true, force = true) catch end
+        # Worker FIRST, then the server. The other order put the kill behind
+        # `close(server)`, which drains open connections before it returns — and
+        # the connection it was draining was the control WS of the worker we
+        # hadn't killed yet. Anything that made that close slow or throw (it was
+        # wrapped in a bare `catch end`, so a throw was silent) skipped the kill
+        # entirely and left a ~500 MB worker behind.
+        #
+        # `kill_proc!` is the teardown the worker uses on its own agents: SIGTERM,
+        # then SIGKILL for a process too early in its life to have a handler,
+        # then the process group.
+        BW.kill_proc!(worker_proc)
+        @test timedwait(() -> !process_running(worker_proc), 10.0) === :ok
+        # Bounded: HTTP's graceful close can still block on Windows. A socket
+        # leaked by a process that is about to exit is harmless; a wedged runner
+        # is not.
+        closer = @async close(server)
+        timedwait(() -> istaskdone(closer), 5.0)
+        rm(projects_root; recursive = true, force = true)
         # Keep the worker log on failure for postmortem; otherwise delete.
         ts = Test.get_testset()
         keep_log = ts isa Test.DefaultTestSet && ts.anynonpass
         if keep_log
             @info "worker log retained for postmortem" path=worker_log
         else
-            try rm(worker_log; force = true) catch end
+            rm(worker_log; force = true)
         end
     end
 end

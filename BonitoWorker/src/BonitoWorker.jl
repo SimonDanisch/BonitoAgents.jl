@@ -709,7 +709,6 @@ function _bind_lifetime_to_parent!()
 end
 
 function start(; force::Bool = false)
-    _bind_lifetime_to_parent!()
     cfg = config_path()
     isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
                           "(`curl -fsSL <server-url>/install.jl | julia -`)")
@@ -754,6 +753,12 @@ function connect_and_serve(; server_url::String,
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             agent_bin::String     = find_agent_bin(),
                             retry_delay::Real     = 5.0)
+    # Here rather than in `start()`: this is the one function EVERY worker goes
+    # through, and `worker_standalone.jl` (the monorepo dev loop and the
+    # real-agent test) calls it directly — so binding in `start()` only meant the
+    # standalone worker was the one that could outlive its spawner, which is
+    # exactly the one a test spawns and then has to kill by hand.
+    _bind_lifetime_to_parent!()
     # Stamped once, for the debug chat's uptime readout (`worker_state`). Not a
     # `const` computed at load: that bakes the precompiling machine's clock.
     WORKER_STARTED[] == 0.0 && (WORKER_STARTED[] = time())
