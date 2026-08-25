@@ -165,9 +165,13 @@ const ChatStyles = Bonito.Styles(
         CSS(".bt-header .bt-header-actions", "display" => "none"),
         CSS(".bt-header .bt-header-env", "display" => "none"),
         CSS(".bt-header .bt-lens-bar", "display" => "none"),
+        # `nowrap` + `flex-start` undo the wide strip's wrapping: this is a
+        # single vertical stack, and in column direction those two would wrap
+        # into extra COLUMNS / bottom-align the stack.
         CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-actions",
             "display" => "flex", "flex-direction" => "column",
             "align-items" => "stretch", "gap" => "8px",
+            "flex-wrap" => "nowrap", "justify-content" => "flex-start",
             "flex-basis" => "100%", "margin" => "6px 0 0 0"),
         # Stacked controls all span the panel with centered labels — the Sync
         # button's compact `max-width` cap and the provider select's start
@@ -512,9 +516,17 @@ const ChatStyles = Bonito.Styles(
     # `margin-left:auto` pushes it to the right edge; because the model pill and
     # status text live OUTSIDE it (to its left), their width changes are absorbed
     # by the gap and never move these buttons.
+    # Wraps onto further lines rather than spilling. With `flex: 0 0 auto` and
+    # the default `nowrap` the cluster was ONE unshrinkable row item ~1124px
+    # wide, so every pane between the 660px collapse breakpoint and ~1140px ran
+    # it past the header edge — and `html,body {overflow:hidden}` cut it there
+    # with no scrollbar to reach the rest (measured: 440px lost at a 700px pane,
+    # which ate the Restart button).
     CSS(".bt-header-actions",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
-        "margin-left" => "auto", "flex" => "0 0 auto"),
+        "flex-wrap" => "wrap", "justify-content" => "flex-end", "row-gap" => "6px",
+        "margin-left" => "auto", "flex" => "0 1 auto",
+        "min-width" => "0", "max-width" => "100%"),
     # Config pills (model · mode · effort) share the SAME chrome as the
     # provider/sync/restart buttons — a bordered pill on `--bt-surface`, 12px,
     # 4px/10px padding, 6px radius — so the whole header reads as one uniform
