@@ -79,15 +79,15 @@ end
         path = ws.handshake_request.target
         if path == "/worker-ws"
             try
-                hello = JSON.parse(String(WebSockets.receive(ws)))
+                hello = BW.decode_control(WebSockets.receive(ws))
                 put!(hello_ch, Dict{String,Any}(hello))
-                WebSockets.send(ws, JSON.json(Dict("ok" => true)))
+                WebSockets.send(ws, BW.MsgPack.pack(Dict("ok" => true)))
                 # Separate sender + receiver tasks against the same WS:
                 # HTTP.WebSockets allows concurrent send/receive from
                 # different tasks (just not two senders or two receivers).
                 sender = Base.errormonitor(@async try
                     for msg in ctrl_send
-                        WebSockets.send(ws, JSON.json(msg))
+                        WebSockets.send(ws, BW.MsgPack.pack(msg))
                     end
                 catch e
                     e isa WebSockets.WebSocketError && return
