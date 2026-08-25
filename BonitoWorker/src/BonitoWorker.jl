@@ -883,7 +883,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                     # lock, so close(ws) would deadlock behind it. The transport
                     # close wakes all blocked readers/writers; the retry loop then
                     # re-dials over the new interface.
-                    try ws.close_transport!() catch end
+                    close_transport_quietly!(ws)
                     break
                 end
             end)
@@ -969,6 +969,27 @@ const _SESSION_PROCS_LOCK = ReentrantLock()
 # keep running serves nobody, and its lazy re-opened successor (same cwd, fresh
 # proc) would coexist with it. Kill the procs and kill the session transports
 # so relays wedged on half-open sockets (the WLAN→LAN incident) unwind too.
+"""
+    close_transport_quietly!(ws)
+
+Kill a socket's transport, tolerating one that is already gone.
+
+Not `try … catch end`: closing a dead socket is an EXPECTED failure and the only
+one worth ignoring here. A bare catch also swallows `InterruptException`, so a
+Ctrl-C landing during a teardown sweep was absorbed by whichever close happened
+to be running — the process kept going and the user pressed it again.
+"""
+function close_transport_quietly!(ws)
+    ws === nothing && return nothing
+    try
+        ws.close_transport!()
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "BonitoWorker: transport already closed" exception = e
+    end
+    return nothing
+end
+
 function reap_all_sessions!(reason::AbstractString)
     entries = lock(_SESSION_PROCS_LOCK) do
         snap = collect(_SESSION_PROCS)
@@ -979,7 +1000,7 @@ function reap_all_sessions!(reason::AbstractString)
     @info "BonitoWorker: reaping all agent sessions" n=length(entries) reason
     for (cwd, e) in entries
         kill_proc!(e.proc)
-        e.ws === nothing || try e.ws.close_transport!() catch end
+        close_transport_quietly!(e.ws)
     end
     return nothing
 end
@@ -1131,7 +1152,7 @@ function handle_close_session(cmd)
     kill_proc!(entry.proc)
     # Also kill the dial-back transport: a relay parked on a half-open socket
     # (send holds ws.sendlock) is unreachable by the proc kill alone.
-    entry.ws === nothing || try entry.ws.close_transport!() catch end
+    close_transport_quietly!(entry.ws)
 end
 
 # The env var every agent (and everything it spawns) is stamped with, naming the
@@ -1718,22 +1739,27 @@ function inspect_git_subrepo(abs_dir::AbstractString, root::AbstractString)
     head_time  = 0.0
     dirty_count = 0
     branch     = ""
-    try
-        head_sha = strip(read(Cmd(`git rev-parse HEAD`; dir = abs_dir), String))
-    catch end
-    try
-        # %ct is committer Unix time. Falls back to 0.0 if HEAD is unborn.
-        out = read(Cmd(`git log -1 --format=%ct HEAD`; dir = abs_dir), String)
-        head_time = parse(Float64, strip(out))
-    catch end
-    try
-        # `--porcelain` is line-per-change; count non-empty lines.
-        out = read(Cmd(`git status --porcelain`; dir = abs_dir), String)
-        dirty_count = count(!isempty, split(out, '\n'))
-    catch end
-    try
-        branch = strip(read(Cmd(`git rev-parse --abbrev-ref HEAD`; dir = abs_dir), String))
-    catch end
+    # `git_capture`, not `try … catch end`. These four calls have real expected
+    # failures — an unborn HEAD, a directory that stopped being a repo — and the
+    # bare catch answered ALL of them the same way, including the ones that are
+    # bugs (git missing, a permission error) and the one that is a user:
+    # `InterruptException` was swallowed too, so Ctrl-C during a scan did
+    # nothing. `git_capture` already draws that line correctly for the rest of
+    # this file: a non-zero exit is an ANSWER, anything else propagates.
+    let r = git_capture(abs_dir, `rev-parse HEAD`)
+        r.ok && (head_sha = strip(r.out))
+    end
+    let r = git_capture(abs_dir, `log -1 --format=%ct HEAD`)   # %ct = committer Unix time
+        # Present but unparseable is not the same as absent; `tryparse` keeps the
+        # 0.0 default without inventing a number.
+        r.ok && (head_time = something(tryparse(Float64, strip(r.out)), 0.0))
+    end
+    let r = git_capture(abs_dir, `status --porcelain`)          # line-per-change
+        r.ok && (dirty_count = count(!isempty, split(r.out, '\n')))
+    end
+    let r = git_capture(abs_dir, `rev-parse --abbrev-ref HEAD`)
+        r.ok && (branch = strip(r.out))
+    end
     return Dict(
         "path"        => rel,
         "head_sha"    => head_sha,
