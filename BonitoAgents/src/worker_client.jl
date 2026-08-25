@@ -35,7 +35,63 @@ function send_command(state::ServerState, worker_name::String, payload::Abstract
         get(state.worker_control_ws, worker_name, nothing)
     end
     ws === nothing && error("Worker '$worker_name' is not connected")
-    WebSockets.send(ws, JSON.json(payload))
+    send_control(ws, payload)
+    return nothing
+end
+
+# ── The control-WS wire ─────────────────────────────────────────────────────
+# MsgPack in a BINARY frame; the worker's half of this lives in BonitoWorker and
+# the two must move together. See the long note there for why it is not JSON: a
+# TEXT frame is UTF-8 validated by the receiver, this protocol carries filenames
+# and diff hunks and file previews, and one byte that isn't valid UTF-8 closed
+# the link with 1007 — then again on every reconnect, because the server re-sent
+# the same command. A binary frame is never validated, so a bad byte is data to
+# handle rather than a severed connection.
+#
+# NOT applied to the handoff / transfer sockets: those are separate handshakes
+# with their own peers, and `send_ws_error` below still serves them.
+send_control(ws, payload::AbstractDict) = WebSockets.send(ws, MsgPack.pack(payload))
+
+"""
+    decode_control(frame) -> Dict{String,Any}
+
+Decode one control-WS frame. Binary only — a text frame means the worker still
+speaks the old JSON wire, and saying so beats letting half a migration run.
+"""
+decode_control(frame::AbstractVector{UInt8}) = normalize_wire(MsgPack.unpack(frame))
+decode_control(frame::AbstractString) = error(
+    "BonitoAgents: got a TEXT control frame — this worker still speaks the old " *
+    "JSON wire. Update the worker (re-run the installer against this server).")
+
+"""
+    normalize_wire(x)
+
+Put a decoded MsgPack value back into the shape the handlers expect:
+`Dict{String,Any}` with `Int64` integers.
+
+MsgPack encodes integers in the narrowest type that fits, so `0` arrives as
+`UInt8` and `12345` as `UInt16`, and maps arrive as `Dict{Any,Any}`. Unsigned
+arithmetic WRAPS, which turns a narrowed `size - 1` into 255 somewhere far from
+here, so it is normalised once rather than guarded at every use. `Bool` is
+matched ahead of `Integer` because it is one, and widening would make `true`
+into `1`.
+"""
+normalize_wire(x::Bool)           = x
+normalize_wire(x::Integer)        = Int64(x)
+normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
+normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
+normalize_wire(x)                 = x
+
+# A rejection on the CONTROL WS. Same tolerance as `send_ws_error` — the peer we
+# just refused may already be gone — but on the binary wire, because the worker
+# is waiting on `decode_control` and a text frame there would surface as "your
+# server speaks JSON" instead of the "unauthorized" we are trying to report.
+function send_control_error(ws, payload::AbstractDict)
+    try
+        send_control(ws, payload)
+    catch e
+        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+    end
     return nothing
 end
 
@@ -200,9 +256,9 @@ function handle_worker_control(state::ServerState, ws)
     worker_id = "?"
     try
         hello_raw = WebSockets.receive(ws)
-        hello = JSON.parse(String(hello_raw))
+        hello = decode_control(hello_raw)
         if get(hello, "secret", "") != state.worker_secret
-            send_ws_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
+            send_control_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
             return
         end
         # Worker identity. Newer workers send `worker_id` (stable UUID); old
@@ -223,10 +279,10 @@ function handle_worker_control(state::ServerState, ws)
         # worker can arm its own receive-watchdog (no frame for several
         # intervals ⇒ half-open link ⇒ close + re-dial). Workers predating the
         # field simply ignore it.
-        WebSockets.send(ws, JSON.json(Dict("ok" => true,
-                                            "registered_as" => display_name,
-                                            "worker_id"     => worker_id,
-                                            "heartbeat_interval" => state.heartbeat_interval)))
+        send_control(ws, Dict("ok" => true,
+                              "registered_as" => display_name,
+                              "worker_id"     => worker_id,
+                              "heartbeat_interval" => state.heartbeat_interval))
 
         # Build / refresh the WorkerInfo from the hello frame. Preserve a
         # user-set `initials` override across reconnects (the worker doesn't
@@ -325,7 +381,7 @@ function handle_worker_control(state::ServerState, ws)
             sleep(state.heartbeat_interval)
             hb_alive[] || break
             try
-                WebSockets.send(ws, JSON.json(Dict("type" => "ping")))
+                send_control(ws, Dict("type" => "ping"))
                 last_ping_ok[] = time()
             catch e
                 (e isa WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError) || rethrow()
@@ -362,7 +418,7 @@ function handle_worker_control(state::ServerState, ws)
         try
             for frame in ws
                 try
-                    cmd = JSON.parse(String(frame))
+                    cmd = decode_control(frame)
                     t   = get(cmd, "type", "")
                     rid = String(get(cmd, "request_id", ""))
                     if t == "pong"

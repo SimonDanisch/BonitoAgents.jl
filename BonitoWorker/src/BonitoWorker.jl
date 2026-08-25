@@ -8,6 +8,57 @@ module BonitoWorker
 # Single port to open is on the server (8038), already needed for browsers.
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
+using MsgPack
+
+# ── The control-WS wire ─────────────────────────────────────────────────────
+# MsgPack in a BINARY frame. Not JSON in a text frame, and the difference is not
+# a matter of taste.
+#
+# A WebSocket TEXT frame is UTF-8 validated by the RECEIVER (HTTP.jl,
+# `http_websockets.jl`: `isvalid(String, data) || _queue_close!(…, 1007)`). This
+# protocol carries filenames, paths, diff hunks and file previews — arbitrary
+# bytes from a filesystem that does not promise UTF-8. One such byte closed the
+# control link with 1007; the worker reconnected, the server re-sent the same
+# command, and the link sat in a loop it could not leave. A binary frame is never
+# validated, so the bad byte travels and gets HANDLED instead of severing the
+# connection that would have reported it.
+#
+# There is no JSON fallback on this wire, deliberately. A receiver that accepted
+# both would let half a migration keep working, and the half that didn't would be
+# discovered by a user rather than by a mismatch — so a text frame here is a hard
+# error naming the cause.
+send_control(ws, payload::AbstractDict) = WebSockets.send(ws, MsgPack.pack(payload))
+
+"""
+    decode_control(frame) -> Dict{String,Any}
+
+Decode one control-WS frame. Binary only; a text frame means the peer still
+speaks the old JSON wire and both ends have to move together.
+"""
+decode_control(frame::AbstractVector{UInt8}) = normalize_wire(MsgPack.unpack(frame))
+decode_control(frame::AbstractString) = error(
+    "BonitoWorker: got a TEXT control frame — the server still speaks the old " *
+    "JSON wire. Server and worker must be updated together; re-run the installer " *
+    "against an updated server.")
+
+"""
+    normalize_wire(x)
+
+Put a decoded MsgPack value back into the shape the handlers were written
+against: `Dict{String,Any}` with `Int64` integers.
+
+MsgPack encodes integers in the NARROWEST type that fits, so `0` decodes as
+`UInt8` and `12345` as `UInt16`, and maps decode as `Dict{Any,Any}`. Unsigned
+arithmetic WRAPS — a `size - 1` on a `UInt8(0)` is 255, surfacing far from the
+cause — so the narrowing is normalised away once here rather than guarded at
+every use. `Bool` is matched before `Integer` on purpose: it is one, and
+widening it would turn `true` into `1`.
+"""
+normalize_wire(x::Bool)           = x
+normalize_wire(x::Integer)        = Int64(x)
+normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
+normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
+normalize_wire(x)                 = x
 using Dates: DateTime, datetime2unix, @dateformat_str
 using Scratch: @get_scratch!
 import AgentProviders   # provider descriptors (find_provider) — the SSOT shared with the server
@@ -797,7 +848,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
     control_url = ws_url(server_url, "/worker-ws")
     @info "BonitoWorker: connecting to control WS" control_url worker_id name
     WebSockets.open(control_url) do ws
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"          => "hello",
             "secret"        => secret,
             "worker_id"     => worker_id,
@@ -808,10 +859,10 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             "mcp_path"      => mcp_command,
             "mcp_args"      => mcp_arguments,
             "projects_root" => projects_root,
-        )))
+        ))
 
         ack_raw = WebSockets.receive(ws)
-        ack = JSON.parse(String(ack_raw))
+        ack = decode_control(ack_raw)
         if !get(ack, "ok", false)
             error("server rejected hello: $(get(ack, "error", "unknown"))")
         end
@@ -840,7 +891,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
 
         for frame in ws
             last_rx[] = time()
-            cmd = JSON.parse(String(frame))
+            cmd = decode_control(frame)
             t = get(cmd, "type", "")
             if t == "open_session"
                 @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
@@ -873,7 +924,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             elseif t == "worker_state"
                 @async handle_worker_state(ws, cmd)
             elseif t == "ping"
-                WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
+                send_control(ws, Dict("type" => "pong"))
             else
                 @warn "BonitoWorker: unknown control frame" type=t
             end
@@ -890,11 +941,11 @@ end
 function report_open_session_failed(ws, sid::AbstractString, reason::AbstractString)
     @error "BonitoWorker: open_session failed" sid reason
     try
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"  => "open_session_failed",
             "sid"   => sid,
             "error" => reason,
-        )))
+        ))
     catch e
         @warn "BonitoWorker: could not report open_session failure" sid exception=e
     end
@@ -1270,7 +1321,7 @@ function handle_list_dir(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "list_dir response failed" exception=e
     end
@@ -1306,7 +1357,7 @@ function handle_make_dir(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "make_dir response failed" exception=e
     end
@@ -1352,7 +1403,7 @@ function handle_stat_path(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "stat_path response failed" exception=e
     end
@@ -1407,7 +1458,7 @@ function handle_list_project_files(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "list_project_files response failed" exception=e
     end
@@ -1438,7 +1489,7 @@ function handle_inspect_path(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "inspect_path response failed" exception=e
     end
@@ -1575,7 +1626,7 @@ function handle_kill_file_writers(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "kill_file_writers response failed" exception=e
     end
@@ -1613,7 +1664,7 @@ function handle_tail_file(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "tail_file response failed" exception=e
     end
@@ -1763,7 +1814,7 @@ function handle_clone_repo(ws, cmd::AbstractDict)
 
     response = clone_repo_response(request_id, url, dst_path, pr_raw, git_clone!)
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "clone_repo response failed" exception=e
     end
@@ -2226,11 +2277,11 @@ function handle_scan_sessions(ws, cmd::AbstractDict)
     # …plus every other provider that can list its own sessions over ACP.
     append!(sessions, scan_acp_providers())
     try
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"       => "scan_sessions_result",
             "request_id" => request_id,
             "sessions"   => sessions,
-        )))
+        ))
     catch e
         @warn "BonitoWorker: scan_sessions response failed" exception=e
     end
@@ -2565,7 +2616,7 @@ function handle_git_diff(ws, cmd::AbstractDict)
                                  String(get(cmd, "path", "")),
                                  String(get(cmd, "base", "")))
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "git_diff response failed" exception = e
     end
@@ -2682,7 +2733,7 @@ function handle_find_repos(ws, cmd::AbstractDict)
                                    String(get(cmd, "path", "")),
                                    depth isa Integer ? Int(depth) : FIND_REPOS_MAX_DEPTH)
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "find_repos response failed" exception = e
     end
@@ -2755,7 +2806,7 @@ end
 function handle_worker_state(ws, cmd::AbstractDict)
     response = worker_state_response(String(get(cmd, "request_id", "")))
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "worker_state response failed" exception = e
     end
