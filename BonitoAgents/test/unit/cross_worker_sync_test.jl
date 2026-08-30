@@ -72,7 +72,7 @@ function handle_xsync_inspect(mw::XSyncWorker, cmd::AbstractDict)
         Dict("type" => "inspect_path_response", "request_id" => rid,
              "error" => sprint(showerror, e))
     end
-    WebSockets.send(mw.ws, JSON.json(resp))
+    BA.send_control(mw.ws, resp)
 end
 
 function start_xsync_worker!(name, server_url; root = mktempdir())
@@ -82,18 +82,22 @@ function start_xsync_worker!(name, server_url; root = mktempdir())
         ws_url = replace(server_url, "http://" => "ws://") * "/worker-ws"
         WebSockets.open(ws_url) do ws
             mw.ws = ws
-            WebSockets.send(ws, JSON.json(Dict(
+            BA.send_control(ws, Dict(
                 "secret"        => XS_SECRET,
                 "name"          => name,
                 "hostname"      => "mock-$name",
                 "home"          => "/home/agent",
                 "mcp_path"      => "",
-                "projects_root" => root)))
-            ack = JSON.parse(String(WebSockets.receive(ws)))
+                "projects_root" => root))
+            ack = BA.decode_control(WebSockets.receive(ws))
             put!(ready, get(ack, "ok", false) == true)
             for frame in ws
-                cmd = try JSON.parse(String(frame)) catch _; nothing end
-                cmd === nothing && continue
+                # NOT wrapped in a catch-and-continue. A frame this mock
+                # cannot decode is a PROTOCOL mismatch, and swallowing it turned
+                # the wire switch into a 15-minute hang: the mock skipped every
+                # binary frame in silence while the server waited for a reply
+                # that was never coming. Let it throw and name itself.
+                cmd = BA.decode_control(frame)
                 t = String(get(cmd, "type", ""))
                 if t == "open_transfer"
                     Base.errormonitor(@async handle_xsync_transfer(mw, cmd))

@@ -8,6 +8,57 @@ module BonitoWorker
 # Single port to open is on the server (8038), already needed for browsers.
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
+using MsgPack
+
+# ── The control-WS wire ─────────────────────────────────────────────────────
+# MsgPack in a BINARY frame. Not JSON in a text frame, and the difference is not
+# a matter of taste.
+#
+# A WebSocket TEXT frame is UTF-8 validated by the RECEIVER (HTTP.jl,
+# `http_websockets.jl`: `isvalid(String, data) || _queue_close!(…, 1007)`). This
+# protocol carries filenames, paths, diff hunks and file previews — arbitrary
+# bytes from a filesystem that does not promise UTF-8. One such byte closed the
+# control link with 1007; the worker reconnected, the server re-sent the same
+# command, and the link sat in a loop it could not leave. A binary frame is never
+# validated, so the bad byte travels and gets HANDLED instead of severing the
+# connection that would have reported it.
+#
+# There is no JSON fallback on this wire, deliberately. A receiver that accepted
+# both would let half a migration keep working, and the half that didn't would be
+# discovered by a user rather than by a mismatch — so a text frame here is a hard
+# error naming the cause.
+send_control(ws, payload::AbstractDict) = WebSockets.send(ws, MsgPack.pack(payload))
+
+"""
+    decode_control(frame) -> Dict{String,Any}
+
+Decode one control-WS frame. Binary only; a text frame means the peer still
+speaks the old JSON wire and both ends have to move together.
+"""
+decode_control(frame::AbstractVector{UInt8}) = normalize_wire(MsgPack.unpack(frame))
+decode_control(frame::AbstractString) = error(
+    "BonitoWorker: got a TEXT control frame — the server still speaks the old " *
+    "JSON wire. Server and worker must be updated together; re-run the installer " *
+    "against an updated server.")
+
+"""
+    normalize_wire(x)
+
+Put a decoded MsgPack value back into the shape the handlers were written
+against: `Dict{String,Any}` with `Int64` integers.
+
+MsgPack encodes integers in the NARROWEST type that fits, so `0` decodes as
+`UInt8` and `12345` as `UInt16`, and maps decode as `Dict{Any,Any}`. Unsigned
+arithmetic WRAPS — a `size - 1` on a `UInt8(0)` is 255, surfacing far from the
+cause — so the narrowing is normalised away once here rather than guarded at
+every use. `Bool` is matched before `Integer` on purpose: it is one, and
+widening it would turn `true` into `1`.
+"""
+normalize_wire(x::Bool)           = x
+normalize_wire(x::Integer)        = Int64(x)
+normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
+normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
+normalize_wire(x)                 = x
 using Dates: DateTime, datetime2unix, @dateformat_str
 using Scratch: @get_scratch!
 import AgentProviders   # provider descriptors (find_provider) — the SSOT shared with the server
@@ -797,7 +848,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
     control_url = ws_url(server_url, "/worker-ws")
     @info "BonitoWorker: connecting to control WS" control_url worker_id name
     WebSockets.open(control_url) do ws
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"          => "hello",
             "secret"        => secret,
             "worker_id"     => worker_id,
@@ -808,10 +859,10 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             "mcp_path"      => mcp_command,
             "mcp_args"      => mcp_arguments,
             "projects_root" => projects_root,
-        )))
+        ))
 
         ack_raw = WebSockets.receive(ws)
-        ack = JSON.parse(String(ack_raw))
+        ack = decode_control(ack_raw)
         if !get(ack, "ok", false)
             error("server rejected hello: $(get(ack, "error", "unknown"))")
         end
@@ -832,7 +883,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                     # lock, so close(ws) would deadlock behind it. The transport
                     # close wakes all blocked readers/writers; the retry loop then
                     # re-dials over the new interface.
-                    try ws.close_transport!() catch end
+                    close_transport_quietly!(ws)
                     break
                 end
             end)
@@ -840,7 +891,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
 
         for frame in ws
             last_rx[] = time()
-            cmd = JSON.parse(String(frame))
+            cmd = decode_control(frame)
             t = get(cmd, "type", "")
             if t == "open_session"
                 @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
@@ -873,7 +924,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             elseif t == "worker_state"
                 @async handle_worker_state(ws, cmd)
             elseif t == "ping"
-                WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
+                send_control(ws, Dict("type" => "pong"))
             else
                 @warn "BonitoWorker: unknown control frame" type=t
             end
@@ -890,11 +941,11 @@ end
 function report_open_session_failed(ws, sid::AbstractString, reason::AbstractString)
     @error "BonitoWorker: open_session failed" sid reason
     try
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"  => "open_session_failed",
             "sid"   => sid,
             "error" => reason,
-        )))
+        ))
     catch e
         @warn "BonitoWorker: could not report open_session failure" sid exception=e
     end
@@ -918,6 +969,27 @@ const _SESSION_PROCS_LOCK = ReentrantLock()
 # keep running serves nobody, and its lazy re-opened successor (same cwd, fresh
 # proc) would coexist with it. Kill the procs and kill the session transports
 # so relays wedged on half-open sockets (the WLAN→LAN incident) unwind too.
+"""
+    close_transport_quietly!(ws)
+
+Kill a socket's transport, tolerating one that is already gone.
+
+Not `try … catch end`: closing a dead socket is an EXPECTED failure and the only
+one worth ignoring here. A bare catch also swallows `InterruptException`, so a
+Ctrl-C landing during a teardown sweep was absorbed by whichever close happened
+to be running — the process kept going and the user pressed it again.
+"""
+function close_transport_quietly!(ws)
+    ws === nothing && return nothing
+    try
+        ws.close_transport!()
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "BonitoWorker: transport already closed" exception = e
+    end
+    return nothing
+end
+
 function reap_all_sessions!(reason::AbstractString)
     entries = lock(_SESSION_PROCS_LOCK) do
         snap = collect(_SESSION_PROCS)
@@ -928,7 +1000,7 @@ function reap_all_sessions!(reason::AbstractString)
     @info "BonitoWorker: reaping all agent sessions" n=length(entries) reason
     for (cwd, e) in entries
         kill_proc!(e.proc)
-        e.ws === nothing || try e.ws.close_transport!() catch end
+        close_transport_quietly!(e.ws)
     end
     return nothing
 end
@@ -1080,7 +1152,7 @@ function handle_close_session(cmd)
     kill_proc!(entry.proc)
     # Also kill the dial-back transport: a relay parked on a half-open socket
     # (send holds ws.sendlock) is unreachable by the proc kill alone.
-    entry.ws === nothing || try entry.ws.close_transport!() catch end
+    close_transport_quietly!(entry.ws)
 end
 
 # The env var every agent (and everything it spawns) is stamped with, naming the
@@ -1270,7 +1342,7 @@ function handle_list_dir(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "list_dir response failed" exception=e
     end
@@ -1306,7 +1378,7 @@ function handle_make_dir(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "make_dir response failed" exception=e
     end
@@ -1352,7 +1424,7 @@ function handle_stat_path(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "stat_path response failed" exception=e
     end
@@ -1407,7 +1479,7 @@ function handle_list_project_files(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "list_project_files response failed" exception=e
     end
@@ -1438,7 +1510,7 @@ function handle_inspect_path(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "inspect_path response failed" exception=e
     end
@@ -1575,7 +1647,7 @@ function handle_kill_file_writers(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "kill_file_writers response failed" exception=e
     end
@@ -1613,7 +1685,7 @@ function handle_tail_file(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "tail_file response failed" exception=e
     end
@@ -1667,22 +1739,27 @@ function inspect_git_subrepo(abs_dir::AbstractString, root::AbstractString)
     head_time  = 0.0
     dirty_count = 0
     branch     = ""
-    try
-        head_sha = strip(read(Cmd(`git rev-parse HEAD`; dir = abs_dir), String))
-    catch end
-    try
-        # %ct is committer Unix time. Falls back to 0.0 if HEAD is unborn.
-        out = read(Cmd(`git log -1 --format=%ct HEAD`; dir = abs_dir), String)
-        head_time = parse(Float64, strip(out))
-    catch end
-    try
-        # `--porcelain` is line-per-change; count non-empty lines.
-        out = read(Cmd(`git status --porcelain`; dir = abs_dir), String)
-        dirty_count = count(!isempty, split(out, '\n'))
-    catch end
-    try
-        branch = strip(read(Cmd(`git rev-parse --abbrev-ref HEAD`; dir = abs_dir), String))
-    catch end
+    # `git_capture`, not `try … catch end`. These four calls have real expected
+    # failures — an unborn HEAD, a directory that stopped being a repo — and the
+    # bare catch answered ALL of them the same way, including the ones that are
+    # bugs (git missing, a permission error) and the one that is a user:
+    # `InterruptException` was swallowed too, so Ctrl-C during a scan did
+    # nothing. `git_capture` already draws that line correctly for the rest of
+    # this file: a non-zero exit is an ANSWER, anything else propagates.
+    let r = git_capture(abs_dir, `rev-parse HEAD`)
+        r.ok && (head_sha = strip(r.out))
+    end
+    let r = git_capture(abs_dir, `log -1 --format=%ct HEAD`)   # %ct = committer Unix time
+        # Present but unparseable is not the same as absent; `tryparse` keeps the
+        # 0.0 default without inventing a number.
+        r.ok && (head_time = something(tryparse(Float64, strip(r.out)), 0.0))
+    end
+    let r = git_capture(abs_dir, `status --porcelain`)          # line-per-change
+        r.ok && (dirty_count = count(!isempty, split(r.out, '\n')))
+    end
+    let r = git_capture(abs_dir, `rev-parse --abbrev-ref HEAD`)
+        r.ok && (branch = strip(r.out))
+    end
     return Dict(
         "path"        => rel,
         "head_sha"    => head_sha,
@@ -1763,7 +1840,7 @@ function handle_clone_repo(ws, cmd::AbstractDict)
 
     response = clone_repo_response(request_id, url, dst_path, pr_raw, git_clone!)
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "clone_repo response failed" exception=e
     end
@@ -2226,11 +2303,11 @@ function handle_scan_sessions(ws, cmd::AbstractDict)
     # …plus every other provider that can list its own sessions over ACP.
     append!(sessions, scan_acp_providers())
     try
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"       => "scan_sessions_result",
             "request_id" => request_id,
             "sessions"   => sessions,
-        )))
+        ))
     catch e
         @warn "BonitoWorker: scan_sessions response failed" exception=e
     end
@@ -2565,7 +2642,7 @@ function handle_git_diff(ws, cmd::AbstractDict)
                                  String(get(cmd, "path", "")),
                                  String(get(cmd, "base", "")))
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "git_diff response failed" exception = e
     end
@@ -2682,7 +2759,7 @@ function handle_find_repos(ws, cmd::AbstractDict)
                                    String(get(cmd, "path", "")),
                                    depth isa Integer ? Int(depth) : FIND_REPOS_MAX_DEPTH)
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "find_repos response failed" exception = e
     end
@@ -2755,7 +2832,7 @@ end
 function handle_worker_state(ws, cmd::AbstractDict)
     response = worker_state_response(String(get(cmd, "request_id", "")))
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "worker_state response failed" exception = e
     end

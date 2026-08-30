@@ -12,6 +12,7 @@ using AgentClientProtocol
 using AgentProviders     # provider descriptors + current_providers/find_provider (SSOT, shared w/ worker)
 using HTTP
 using JSON
+using MsgPack
 using Markdown
 using UUIDs
 using Dates
