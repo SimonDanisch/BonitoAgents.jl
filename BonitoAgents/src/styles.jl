@@ -2724,5 +2724,26 @@ const ChatStyles = Bonito.Styles(
             "overflow-x" => "auto",
             "-webkit-overflow-scrolling" => "touch",
             "gap" => "10px",
-            "padding-bottom" => "2px")),
+            "padding-bottom" => "2px"),
+        # Composer: the textarea gets the full first row and the attach +
+        # Yolo/send/stop controls drop to a second row. In the single wrapped
+        # row the flex-shrink:0 button column (~110px) squeezed a 390px phone's
+        # textarea to ~200px — an awkward typing target.
+        CSS(".bt-input-row", "flex-wrap" => "wrap", "row-gap" => "8px"),
+        CSS(".bt-text-input", "flex" => "1 1 100%"),
+        # DOM order is attach, input, controls; wrap puts the 100%-basis input
+        # on its own row but strands attach ABOVE it. order fixes the rows:
+        # input, then attach + Yolo/send/stop together.
+        CSS(".bt-attach-btn", "order" => "1", "flex" => "0 0 auto"),
+        CSS(".bt-input-controls",
+            "order" => "2",
+            "flex" => "1 1 auto",
+            "flex-direction" => "row",
+            "align-items" => "center",
+            "justify-content" => "flex-end",
+            "gap" => "10px"),
+        # The bar's `padding: 3px 0` assumes the desktop column layout
+        # stretches it wide; in a row that collapses to bare "Yolo" text
+        # glued to the Send circle.
+        CSS(".bt-yolo-bar", "padding" => "8px 12px")),
 )

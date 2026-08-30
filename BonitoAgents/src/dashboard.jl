@@ -856,6 +856,17 @@ const DashboardStyles = Bonito.Styles(
         "font-size" => "11px", "font-weight" => "600",
         "letter-spacing" => "0.08em", "text-transform" => "uppercase",
         "color" => "var(--bt-text-muted)", "margin" => "0"),
+    # Action buttons of a section, grouped as one unit on the right instead of
+    # space-between scattering each button across the full row.
+    CSS(".bt-section-actions",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "flex-wrap" => "wrap"),
+    # Sections whose content reads as body text (Defaults, Debug this server):
+    # stack heading above content. In the space-between row the long hint text
+    # collided with the h2 at medium widths ("DEFAULTSApplied to new ...").
+    CSS(".bt-section-stack",
+        "flex-direction" => "column", "align-items" => "flex-start",
+        "gap" => "4px"),
 
     # ── Card ─────────────────────────────────────────────────────────────────
     CSS(".bt-card",
@@ -917,6 +928,9 @@ const DashboardStyles = Bonito.Styles(
         "font" => "inherit",
         "color" => "inherit",
         "min-width" => "0",
+        # Fill the title row: a plain input defaults to ~170px and hard-truncates
+        # long worker names ("simon-dev-") with room to spare.
+        "flex" => "1 1 auto",
         "max-width" => "100%",
         "outline" => "none",
         "cursor" => "text",
@@ -3081,18 +3095,19 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
 
         DOM.div(
             DOM.h2("New project"),
-            new_proj_btn,
-            gh_btn,
-            cp_btn;
+            DOM.div(new_proj_btn, gh_btn, cp_btn;
+                    class = "bt-section-actions"),
             class = "bt-section"),
         form_block,
 
         DOM.div(
             DOM.h2("Defaults"),
-            DOM.div("Applied to new & unconfigured chats; a chat's own picks override.";
-                    class = "bt-defaults-hint"),
-            session_defaults_bar(session, state);
-            class = "bt-section"),
+            DOM.div(
+                DOM.div("Applied to new & unconfigured chats; a chat's own picks override.";
+                        class = "bt-defaults-hint"),
+                session_defaults_bar(session, state);
+                class = "bt-section-body");
+            class = "bt-section bt-section-stack"),
 
         debug_section(session, state, current_view);
 
@@ -3131,12 +3146,14 @@ function debug_section(session::Bonito.Session, state::ServerState,
     end
     return DOM.div(
         DOM.h2("Debug this server"),
-        DOM.div("Opens a chat on $(root) — the source of the server you're " *
-                "looking at — with tools that read its live state: workers, chats, " *
-                "eval bridges, logs and memory. Edits there are edits to this app.";
-                class = "bt-defaults-hint"),
-        btn;
-        class = "bt-section")
+        DOM.div(
+            DOM.div("Opens a chat on $(root) — the source of the server you're " *
+                    "looking at — with tools that read its live state: workers, chats, " *
+                    "eval bridges, logs and memory. Edits there are edits to this app.";
+                    class = "bt-defaults-hint"),
+            btn;
+            class = "bt-section-body");
+        class = "bt-section bt-section-stack")
 end
 
 # ── Cross-worker sync modal ─────────────────────────────────────────────────

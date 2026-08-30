@@ -117,6 +117,18 @@ function run_suite(server)
             s.dispatchEvent(new Event('change', {bubbles: true}));
             return true; })()""")
 
+        # From the moment the pick is processed, the "pick one above" empty state
+        # must never be what's on screen. The refresh swaps the body to a loading
+        # placeholder BEFORE it starts the worker round-trip, because a big repo's
+        # diff can take tens of seconds — leaving the old body up meanwhile reads
+        # exactly like "I picked and nothing happened". Polled tightly across the
+        # whole load window, so a regression back to set-after-build is caught.
+        @test TK.wait_for(server, "the pick-one state clears",
+            """(() => {
+                const e = document.querySelector('$(RF_REVIEW) .bt-rv-empty');
+                return !e || !e.textContent.includes('holds 2 of them');
+            })()"""; timeout = 30) == true
+
         @test TK.wait_for(server, "Alpha's change is listed",
             """[...document.querySelectorAll('$(RF_REVIEW) .bt-rv-file-path')]
                 .some(e => e.textContent.includes('alpha.jl'))"""; timeout = 60) == true

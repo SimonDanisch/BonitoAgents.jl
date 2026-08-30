@@ -693,6 +693,12 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
 
     refresh_diff!() = Base.errormonitor(@async begin
         safe_set!(stat_txt, "reading…")
+        # Swap the body to a loading state NOW. The worker round-trip behind
+        # `build_diff` can take tens of seconds on a big repo; leaving the old
+        # body up meanwhile reads as broken — with the folder picker freshly
+        # set it still says "pick one above" while a diff is already loading.
+        safe_set!(diff_dom, DOM.div("reading the diff from the worker…";
+                                    class = "bt-rv-empty"))
         safe_set!(diff_dom, build_diff())
     end)
 
@@ -969,7 +975,11 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
                 out.push(mark + ' ' + String(n).padStart(5) + ' ' + sign +
                          (r.querySelector('.bt-rv-code')?.textContent ?? ''));
             }
-            return out.join('\\n');
+            // NB: js-strings keep backslashes verbatim (no Julia unescaping), so
+            // this must be '\n' — '\\n' reaches the browser as a LITERAL
+            // backslash-n and every snippet row would be glued together by
+            // visible "\n"s in the message the agent receives.
+            return out.join('\n');
         };
         const lineOf = (row) => parseInt(row.dataset.line, 10) || 0;
 

@@ -174,6 +174,15 @@ function run_suite(server)
                     return document.querySelectorAll('$(REVIEW) .bt-rv-chip').length === 0
                         && b.dataset.empty === '1' && b.textContent.trim() === 'Send';
                 })()"""; timeout = 30) == true
+
+            # The snippet's rows must be joined by REAL newlines. The js-string
+            # that builds the snippet keeps backslashes verbatim, so a `'\\n'`
+            # join reached the browser as an escaped backslash and every row of
+            # the quoted code arrived glued together by literal "\n" characters.
+            @test TK.eval_js(server, """(() => {
+                const bs = String.fromCharCode(92);
+                return !$(AGENT_TEXT).includes(bs + 'n ');
+            })()""") === true
         end
 
         @testset "shift-click covers a BLOCK, and the range reaches the agent" begin
