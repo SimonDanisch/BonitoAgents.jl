@@ -59,6 +59,30 @@ normalize_wire(x::Integer)        = Int64(x)
 normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
 normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
 normalize_wire(x)                 = x
+
+# Split a string into pieces of at most `cap` codeunits, backing each cut to a
+# codepoint boundary so every piece is a VALID UTF-8 string. Used to ship big
+# replies (the git_diff patch) as a series of bounded frames: a multi-MB single
+# `send` holds the socket's send lock long enough to starve the inline pong,
+# and the server's per-frame decode across one giant frame falls behind its
+# heartbeats. Empty input yields ONE empty chunk so a request is always
+# answered by ≥ 1 frame and can never be mistaken for a missing reply.
+function chunk_string(s::AbstractString, cap::Int = GIT_DIFF_CHUNK_BYTES)
+    s = String(s)
+    isempty(s) && return String[""]
+    chunks = String[]
+    i = firstindex(s)
+    nb = ncodeunits(s)
+    while i <= nb
+        j = min(i + cap, nb + 1)
+        while j <= nb && !isvalid(s, j)
+            j = prevind(s, j)   # back the cut to a codepoint boundary
+        end
+        push!(chunks, String(view(codeunits(s), i:(j - 1))))
+        i = j
+    end
+    return chunks
+end
 using Dates: DateTime, datetime2unix, @dateformat_str
 using Scratch: @get_scratch!
 import AgentProviders   # provider descriptors (find_provider) — the SSOT shared with the server
@@ -842,6 +866,26 @@ end
 # close + re-dial recovers.
 
 # Control WS lifecycle
+#
+# Answer a heartbeat ping on its OWN task rather than inline in the read loop.
+# Every handler reply (git_diff chunks, list_project_files…) is a WS send under
+# the socket's send lock; a multi-MB one being written in ANOTHER task would
+# make the inline pong queue behind it and go stale — the server reads that as
+# a dead link and reaps a perfectly healthy worker. Even spawned, the pong can
+# still lose a race against a pathological send, but any single frame here is
+# down to GIT_DIFF_CHUNK_BYTES, so the worst-case wait shrinks to milliseconds.
+function send_pong(ws)
+    try
+        send_control(ws, Dict("type" => "pong"))
+    catch e
+        # A dead/locked link: the reconnect loop is already handling that, and
+        # the watchdog will kill the zombie transport when appropriate. Just log
+        # and drop the pong rather than bubbling an error into the reader.
+        @warn "BonitoWorker: pong send failed (control link dying?)" exception = e
+    end
+    return nothing
+end
+
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                                mcp_arguments, projects_root, agent_bin,
                                agent_env::Dict{String,String} = Dict{String,String}())
@@ -924,7 +968,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             elseif t == "worker_state"
                 @async handle_worker_state(ws, cmd)
             elseif t == "ping"
-                send_control(ws, Dict("type" => "pong"))
+                @async send_pong(ws)
             else
                 @warn "BonitoWorker: unknown control frame" type=t
             end
@@ -2583,6 +2627,21 @@ function untracked_patch(root::AbstractString, rel::AbstractString)
     return String(take!(io))
 end
 
+# Computed diff vs. what the reviewer wants to see — untracked files the agent
+# created are visible only via patches fabricating "new file" hunks, so the
+# agent's work arrives intact.
+#
+#     {type:"git_diff", request_id, path, base}
+#  -> EITHER {type:"git_diff_response", request_id, error:"..."}  (one frame)
+#     OR (chunked — multi-MB patches must not stall heartbeat pongs with one
+#         giant send; each frame ≤ GIT_DIFF_CHUNK_BYTES, metadata rides frame 1)
+#        {type:"git_diff_chunk", request_id, index, total,
+#         repo, branch, head, base, scope,        # only on index == 1
+#         chunk:"…"}                              # every frame
+#     `total == 1` degenerates to today's single-frame shutdown, so callers can
+#     treat "one chunk" and "one response" as the same turn.
+const GIT_DIFF_CHUNK_BYTES = 256 * 1024
+
 function git_diff_response(request_id::AbstractString, path::AbstractString,
                            base::AbstractString)
     try
@@ -2637,15 +2696,46 @@ function git_diff_response(request_id::AbstractString, path::AbstractString,
     end
 end
 
+# Split the reply into ≤ GIT_DIFF_CHUNK_BYTES frames; metadata (repo/branch/
+# head/base/scope) rides frame 1 only, every frame carries `chunk`. The ERROR
+# path keeps the old single `git_diff_response` frame: the server routes it via
+# `deliver_rpc_response!`, which also resolves a chunked registration, so an
+# older server without the `git_diff_chunk` arm still sees every error.
 function handle_git_diff(ws, cmd::AbstractDict)
-    response = git_diff_response(String(get(cmd, "request_id", "")),
+    request_id = String(get(cmd, "request_id", ""))
+    response = git_diff_response(request_id,
                                  String(get(cmd, "path", "")),
                                  String(get(cmd, "base", "")))
-    try
-        send_control(ws, response)
-    catch e
-        @warn "git_diff response failed" exception = e
+    if haskey(response, "error")
+        # One frame, still `git_diff_response` shaped: the server routes it via
+        # `deliver_rpc_response!`, which also resolves a chunked registration.
+        try
+            send_control(ws, response)
+        catch e
+            @warn "git_diff error response failed" exception = e
+        end
+        return
     end
+    chunks = chunk_string(String(response["patch"]))
+    total  = length(chunks)
+    for (idx, chunk) in enumerate(chunks)
+        frame = Dict{String,Any}("type" => "git_diff_chunk",
+                                 "request_id" => request_id,
+                                 "index" => idx, "total" => total,
+                                 "chunk" => chunk)
+        if idx == 1
+            for k in ("repo", "branch", "head", "base", "scope")
+                frame[k] = String(get(response, k, ""))
+            end
+        end
+        try
+            send_control(ws, frame)
+        catch e
+            @warn "git_diff chunk send failed" request_id index=idx total=total exception = e
+            return
+        end
+    end
+    return
 end
 
 # ── finding the repositories under a folder ─────────────────────────────────

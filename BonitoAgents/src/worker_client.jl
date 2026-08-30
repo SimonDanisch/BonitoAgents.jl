@@ -24,6 +24,9 @@ using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol, RemoteSync
 #                              The keys are uuids so collisions across types can't
 #                              happen, and the unified shape is simpler than the
 #                              previous five typed dicts.
+#   state.pending_chunks    — request_id → ChunkAccumulator for replies that span
+#                              MULTIPLE frames (git_diff's patch); `deliver_chunk!`
+#                              reassembles per frame and resolves once complete.
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -169,6 +172,27 @@ function register_rpc!(state::ServerState)
     return (rid, ch)
 end
 
+"""
+    register_chunked_rpc!(state)
+
+Register a pending RPC whose reply arrives as a SERIES of frames, not one.
+Same contract as [`register_rpc!`](@ref) — the caller sends the command with
+`request_id` set to the returned id and waits via `take_pending!` — but the
+reply frames go through [`deliver_chunk!`](@ref), which reassembles them into
+the single value `git_diff_on_worker` exposes. The accumulator lives in
+`state.pending_chunks`; the timeout/cancel paths evict it with the plain
+`pending_rpcs` entry.
+"""
+function register_chunked_rpc!(state::ServerState)
+    rid = string(uuid4())
+    ch  = Channel{Any}(1)
+    lock(state.lock) do
+        state.pending_chunks[rid] = ChunkAccumulator(ch, nothing, 0, IOBuffer(),
+                                                     Dict{String,Any}())
+    end
+    return (rid, ch)
+end
+
 # Drop a pending-RPC registration if it's still present (T10). `take_pending!`
 # already evicts on timeout/success, but if `send_command` (or the command
 # dict-build) throws between `register_rpc!` and `take_pending!`, the entry
@@ -176,7 +200,9 @@ end
 # No-op once the key is gone (the normal success path already removed it).
 function unregister_rpc!(state::ServerState, key::AbstractString)
     lock(state.lock) do
-        haskey(state.pending_rpcs, String(key)) && delete!(state.pending_rpcs, String(key))
+        rid = String(key)
+        haskey(state.pending_rpcs, rid) && delete!(state.pending_rpcs, rid)
+        haskey(state.pending_chunks, rid) && delete!(state.pending_chunks, rid)
     end
     return nothing
 end
@@ -193,10 +219,13 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
     # take returns, so a fast reply doesn't strand anything.
     timer = Timer(timeout) do _
         # Atomic "take if present" so we don't race a concurrent
-        # deliver_rpc_response! popping the same key.
+        # deliver_rpc_response!/deliver_chunk! popping the same key.
         had = lock(state.lock) do
             if haskey(state.pending_rpcs, key)
                 delete!(state.pending_rpcs, key)
+                true
+            elseif haskey(state.pending_chunks, key)
+                delete!(state.pending_chunks, key)
                 true
             else
                 false
@@ -228,9 +257,18 @@ end
 
 # Try to deliver a worker-pushed RPC reply by request_id. No-op if the id is
 # unknown (caller already timed out, or the response races a re-registration).
+# Also serves CHUNKED requests: a worker replying to a chunked request in one
+# legacy-shaped frame (or an error frame) reaches the same channel through the
+# accumulator.
 function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
     ch = lock(state.lock) do
-        haskey(state.pending_rpcs, rid) ? pop!(state.pending_rpcs, rid) : nothing
+        if haskey(state.pending_rpcs, rid)
+            pop!(state.pending_rpcs, rid)
+        elseif haskey(state.pending_chunks, rid)
+            pop!(state.pending_chunks, rid).ch
+        else
+            nothing
+        end
     end
     ch === nothing && return
     # Caller may have given up (closed the channel) between our pop!
@@ -248,6 +286,70 @@ end
 # (e.g. `open_session_failed`) instead of dialing back.
 function deliver_rpc_error!(state::ServerState, rid::AbstractString, message::AbstractString)
     deliver_rpc_response!(state, rid, ErrorException(message))
+    return
+end
+
+"""
+    deliver_chunk!(state, cmd)
+
+Assemble the fragments of a chunked worker reply (`git_diff_chunk`). The
+dispatch arm in the worker control loop feeds every decoded frame here; the
+frame carries `request_id`, `index`/`total` (Int — `normalize_wire` widened
+them), `chunk` (String, binary-safe on the MsgPack wire), and on the FIRST
+frame the reply's metadata (`repo`, `branch`, `head`, `base`, `scope`). Once
+`received == total` the accumulator's channel gets the reassembled payload and
+`git_diff_on_worker`'s `take_pending!` returns it.
+
+Edge cases resolve exactly like the single-frame path:
+  * error chunk                        → whole dict via `deliver_rpc_response!`
+  * `total < 1` announced              → ErrorException
+  * `index > total`                    → ErrorException
+  * unknown/expired request_id         → no-op (caller already timed out)
+"""
+function deliver_chunk!(state::ServerState, cmd::AbstractDict)
+    rid = String(get(cmd, "request_id", ""))
+    isempty(rid) && return
+    if haskey(cmd, "error")
+        # A chunked request can also fail as ONE small frame (e.g. repo path
+        # not inside the working copy); the caller checks for the `error` key.
+        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+        return
+    end
+    chunk = String(get(cmd, "chunk", ""))
+    index = Int(get(cmd, "index", 0))
+    total = Int(get(cmd, "total", 0))
+    r = lock(state.lock) do
+        acc = get(state.pending_chunks, rid, nothing)
+        acc === nothing && return nothing  # timed out / never registered
+        if acc.total === nothing
+            # First frame: the worker ships repo/branch/head/base/scope here.
+            if total < 1
+                delete!(state.pending_chunks, rid)
+                return (acc.ch, ErrorException("git_diff: chunk frame announced total < 1"))
+            end
+            acc.total = total
+            for k in ("repo", "branch", "head", "base", "scope")
+                acc.meta[k] = String(get(cmd, k, ""))
+            end
+        elseif index > acc.total
+            delete!(state.pending_chunks, rid)
+            return (acc.ch, ErrorException("git_diff: chunk index $index exceeds the announced $(acc.total)"))
+        end
+        write(acc.buf, chunk)
+        acc.received += 1
+        acc.received == acc.total || return nothing  # more frames to come
+        # Last frame: reassemble and resolve the RPC with the full reply.
+        acc.meta["patch"] = String(take!(acc.buf))
+        delete!(state.pending_chunks, rid)
+        return (acc.ch, acc.meta)
+    end
+    r === nothing && return
+    ch, value = r
+    try
+        put!(ch, value)
+    catch e
+        e isa InvalidStateException || rethrow()
+    end
     return
 end
 
@@ -446,6 +548,8 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "git_diff_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "git_diff_chunk"
+                        deliver_chunk!(state, cmd)
                     elseif t == "find_repos_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "worker_state_response"
@@ -1462,16 +1566,23 @@ what the change-review tab shows. `base` empty means the working tree against
 otherwise it's the working tree against that ref. Untracked files are included
 as synthetic "new file" sections, so files the agent CREATED are reviewable too.
 
-The patch comes back as raw text and is parsed by [`parse_unified_diff`](@ref)
-here on the server. `timeout` is generous: a first diff of a big repo (cold
-page cache, thousands of files) can take a while.
+The patch comes back as raw text (transport: chunked as `git_diff_chunk`
+frames, so no single control frame ever carries the whole multi-MB patch) and
+is parsed by [`parse_unified_diff`](@ref) here on the server. `timeout` is
+generous: a first diff of a big repo (cold page cache, thousands of files)
+can take a while.
 """
 function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
                             path::AbstractString; base::AbstractString = "",
                             timeout::Real = 60.0)
     haskey(state.worker_control_ws, worker_id) ||
         throw(WorkerUnreachableError("git_diff on '$worker_id'", "worker is not connected"))
-    rid, ch = register_rpc!(state)
+    # Chunked reply, not one-frame: the patch runs to tens of MB on a busy
+    # repo, and a single giant frame stalls BOTH sides (the worker's send holds
+    # the ws send lock while its inline pong queues behind it; the server's
+    # inline decode falls behind its heartbeat). register_chunked_rpc! +
+    # deliver_chunk! reassemble the same value take_pending! returns here.
+    rid, ch = register_chunked_rpc!(state)
     resp = try
         send_command(state, worker_id, Dict(
             "type" => "git_diff", "request_id" => rid,

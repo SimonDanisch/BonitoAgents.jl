@@ -189,6 +189,21 @@ handlers. Five things deserve a paragraph each:
 - `worker_secret` is the auth token every worker presents on its hello
   frame; same secret across all workers, baked into the install script.
 """
+# Accumulator for a MULTI-FRAME (chunked) worker RPC reply, keyed in
+# `pending_chunks` by the same uuid an ordinary `pending_rpcs` entry uses.
+# A multi-MB payload — the git_diff patch — travels as a series of bounded
+# frames so neither side ever packs/sends/unpacks one giant frame. `total` is
+# `nothing` until the FIRST chunk announces how many frames to expect; `meta`
+# collects the reply fields (repo/branch/head/base/scope) that ride on frame 1
+# instead of being repeated per frame; `buf` reassembles the payload in order.
+mutable struct ChunkAccumulator
+    ch       :: Channel{Any}
+    total    :: Union{Int,Nothing}
+    received :: Int
+    buf      :: IOBuffer
+    meta     :: Dict{String,Any}
+end
+
 mutable struct ServerState
     # Convention: every shared-state struct's first field is its lock.
     # Bonito App bodies run on different threads per browser tab and the
@@ -272,6 +287,12 @@ mutable struct ServerState
     # Pending request_id → channel handoffs for every RPC type. Channel{Any}
     # because the answer shape varies (WS for handoff, Dict for rpc result).
     pending_rpcs :: Dict{String,Channel{Any}}
+
+    # Pending request_id → ChunkAccumulator for MULTI-FRAME replies (git_diff).
+    # Same uuid-space as `pending_rpcs`; `deliver_chunk!` grows the accumulator
+    # per frame and resolves the RPC once the announced `total` has arrived,
+    # `take_pending!`/`unregister_rpc!` evict it exactly like a plain RPC.
+    pending_chunks :: Dict{String,ChunkAccumulator}
 
     # Persisted result of "discover Claude Code sessions" per worker:
     # worker_id → Vector of session dicts (session_id, path, first_prompt,
@@ -364,6 +385,7 @@ function ServerState(; state_dir::String,
         Observable(0),                            # turn_signal
         Dict{String,Any}(),                       # worker_control_ws
         Dict{String,Channel{Any}}(),              # pending_rpcs
+        Dict{String,ChunkAccumulator}(),          # pending_chunks
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
         Dict{String,Float64}(),                   # last_scan
         Ref(""),                                  # base_url (set by serve())
@@ -409,6 +431,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             map(identity, session, s.turn_signal),
             s.worker_control_ws,
             s.pending_rpcs,
+            s.pending_chunks,              # shared: one registry per server
             map(identity, session, s.discovered),
             s.last_scan,               # shared: scan freshness is per server
             s.base_url,

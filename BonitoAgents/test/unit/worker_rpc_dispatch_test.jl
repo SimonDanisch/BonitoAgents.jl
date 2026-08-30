@@ -48,4 +48,12 @@
     @test "find_repos_response" in sent
     @test "find_repos_response" in routed
     @test "git_diff_response" in routed
+
+    # The chunked variant of git_diff was added later, when the patch started
+    # crossing the link as multiple frames: the worker emits `git_diff_chunk`
+    # frames (no `_response` suffix!) and the server must ROUTE them to the
+    # reassembler. The regexes above can't see either of these.
+    @test occursin(r"git_diff_chunk", worker_src)
+    @test "git_diff_chunk" in routed
+    @test occursin(r"deliver_chunk!\(state, cmd\)", dispatch)
 end
