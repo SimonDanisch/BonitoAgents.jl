@@ -1172,67 +1172,53 @@ function worker_log_tail(s::TestServer; lines::Int = 40)
 end
 
 """
-    new_chat(s; cwd = mktempdir(), title = basename(cwd)) -> String
+    new_chat(s; cwd = mktempdir(), title = "") -> String
 
-Create a fresh chat the way a user does: from the dashboard, "+ New project",
-type `cwd` into the folder picker, name it, and hit Create. Blocks until the
-chat view is open. Returns the new chat's project id.
+Create a fresh chat the way a user does: on a worker card, "+ Project", type
+`cwd` into the folder picker's single path field, and hit Create. Blocks until
+the chat view is open. Returns the new chat's project id. `title` is accepted
+but unused (the picker names a project after its folder's basename).
 """
 function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
                                    title::AbstractString = "")
-    # `title` is used as the PROJECT NAME, which is also a directory name. The
-    # server's rule is only `valid_project_name` (one path component), so a
-    # space would now go through — but the suite asserts on these names in
-    # selectors and sidebar text, so keep deriving a boring, quotable one.
-    raw  = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
-    name = replace(raw, r"[^A-Za-z0-9_\-]" => "-")
-    leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
+    # `title` is accepted for call-site compatibility but no longer drives the
+    # UI: the per-worker picker has no Name field, so a project is named after
+    # its folder's basename (dashboard.jl `project_name_from_path`, via the
+    # card's Create → `do_import`). The suite keys on the returned project id,
+    # not the sidebar title, so this is safe. `cwd` is the folder the chat is
+    # created from.
     to_dashboard(s)
-    # RE-CLICK "+ New project" until the name field shows. A lone click can be
-    # dropped on a cold/slow first render — Bonito wires the button's onclick
-    # only after it mounts, so the first synthetic click lands before the handler
-    # attaches and the form never opens (the exact race `click_until` fixes for
-    # the ✎ button below; a single `click_text` here left `new_chat` hanging on
-    # a cold isolated run). Generous timeout: the FIRST new_chat against a fresh
-    # server also compiles the whole new-project / folder-picker UI server-side.
-    click_text_until(s, "+ New project",
-        "[...document.querySelectorAll('.bt-np-name')].some(e => e.offsetParent)";
-        timeout = 30)
-    # Flip the breadcrumb to a text field. The ✎ button's onclick (notify
-    # `editing=true`) is wired by Bonito only after the element mounts, so on a
-    # cold/slow runner a single synthetic click can land before the handler
-    # attaches and be lost. `click_until` re-clicks until the input appears.
-    click_until(s, ".bt-addr-icon-btn", "[...document.querySelectorAll('.bt-addr-input')].some($VIS)"; timeout = 30)
-    ok = eval_js(s, """(() => {
-        const inp = [...document.querySelectorAll('.bt-addr-input')].filter($VIS)[0];
-        if (!inp) return false;
-        inp.focus();
-        const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set;
-        set.call(inp, $(json(String(cwd))));
-        inp.dispatchEvent(new Event('input', {bubbles: true}));
-        inp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
-        return true; })()""")
-    ok === true || error("new_chat: folder path field (.bt-addr-input) not found")
-    # Enter commits the path to the picker via an async round-trip. Gate on the
-    # breadcrumb actually showing the target folder before "Choose" reads it —
-    # otherwise Choose captures the old location and Create fails.
-    wait_for(s, "path committed",
-        "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($leaf))";
-        timeout = 30)
-    click_text(s, "Choose")
-    set_input(s, ".bt-np-name", name)
-    # Gate on the form being SUBMITTABLE before clicking Create. Both fields are
-    # filled asynchronously — the name via an `input` event whose notify has to
-    # round-trip to Julia, the worker by the open handler setting `np_worker` to
-    # "" and then to the first worker id (the "" pass makes the <select> render
-    # blank for a beat). Clicking Create in either window submits a form the
-    # server rejects, and the failure then surfaced only as a blind 90 s timeout
-    # on "chat view opened" with nothing saying why.
-    wait_for(s, "new-project form ready (worker + name)",
-        "(() => { const w = document.querySelector('.bt-np-worker-select'); " *
-        "const n = document.querySelector('.bt-np-name'); " *
-        "return !!w && !!w.value && !!n && n.value.length > 0; })()";
-        timeout = 30)
+    # Wait for a worker card to be on screen. Its "+ Project" toggle is the only
+    # create path now (the dashboard's global "+ New project" form is gone).
+    CARD_BTN_JS = """[...document.querySelectorAll('button')].some(b =>
+        b.offsetParent && (b.innerText || '').trim() === '+ Project')"""
+    PICKER_PATH_VISIBLE = "[...document.querySelectorAll('.bt-picker-path')].some($VIS)"
+    wait_for(s, "worker card on screen", CARD_BTN_JS; timeout = 30)
+    # "+ Project" is a TOGGLE (`picker_state` flips between this worker and ""),
+    # so it must NOT go through `click_text_until`: that re-clicks blind on a
+    # fixed interval and flips the form straight back shut. Check first, click a
+    # single time, and only retry if nothing opened — which still covers the
+    # cold-mount race where Bonito wires the handler after the first synthetic
+    # click lands. Generous timeout: the FIRST new_chat against a fresh server
+    # also compiles the whole folder-picker UI server-side.
+    opened = false
+    for _ in 1:5
+        eval_js(s, PICKER_PATH_VISIBLE) === true && (opened = true; break)
+        click_text(s, "+ Project")
+        # Poll for ~6s before re-clicking: a slow first open must not be toggled
+        # shut by a second blind click (the toggle race `open_card_picker!` pins).
+        for _ in 1:30
+            eval_js(s, PICKER_PATH_VISIBLE) === true && (opened = true; break)
+            sleep(0.2)
+        end
+        opened && break
+    end
+    opened || error("new_chat: could not open a worker card's folder picker")
+    # The path field IS the selection — the one editable text field. Set it to
+    # `cwd`; there is no "Choose"/breadcrumb to commit through. A path that
+    # doesn't exist yet is created on the worker at Create time (`ensure_dir`),
+    # so a `mktempdir()` that already exists is the norm.
+    set_input(s, ".bt-picker-path", String(cwd))
     click_text(s, "Create")
     # The chat view renders only after the ACP session binds, which spawns a
     # fresh agent subprocess — cold start can take the better part of a minute,

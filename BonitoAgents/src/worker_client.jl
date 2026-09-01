@@ -530,6 +530,8 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "make_dir_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "ensure_dir_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "stat_path_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "list_project_files_response"
@@ -1039,6 +1041,36 @@ function make_worker_dir(state::ServerState, worker_name::String,
     end
     resp isa AbstractDict || error("make_dir on '$worker_name': unexpected response shape")
     haskey(resp, "error") && error("make_dir on '$worker_name': $(resp["error"])")
+    return String(resp["path"])
+end
+
+"""
+    ensure_worker_dir(state, worker_name, path; timeout = 5.0) -> String
+
+Ask the worker to `mkpath(path)` and return its normalized absolute path.
+Unlike [`make_worker_dir`](@ref) the target is a FULL path that may span
+several segments, and it is created if it doesn't exist (parents included).
+Backs the picker's "type `/newname` to create it" flow. Throws if the path
+exists as a non-directory (the worker refuses).
+"""
+function ensure_worker_dir(state::ServerState, worker_name::String,
+                           path::AbstractString; timeout::Real = 5.0)
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "ensure_dir",
+            "request_id" => rid,
+            "path"       => String(path),
+        ))
+        take_pending!(state, ch, rid, timeout, "ensure_dir on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("ensure_dir on '$worker_name': unexpected response shape")
+    haskey(resp, "error") && error("ensure_dir on '$worker_name': $(resp["error"])")
     return String(resp["path"])
 end
 

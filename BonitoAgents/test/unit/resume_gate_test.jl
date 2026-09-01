@@ -55,10 +55,13 @@
             st = fresh_state()
             card = BT.WorkerCard(st, "w1";
                 error_obs = Observable(""), picker_state = Observable(""),
-                discover_state = Observable(""), busy = Observable(BT.BUSY_IDLE),
+                gh_state = Observable(""), discover_state = Observable(""),
+                busy = Observable(BT.BUSY_IDLE),
                 discover_busy = Observable(false),
                 discover_results = Observable(Dict{String,Any}[]),
-                do_import = (a...; k...) -> nothing, trigger_scan = () -> nothing)
+                do_import = (a...; k...) -> nothing,
+                do_github = (a...; k...) -> nothing,
+                trigger_scan = () -> nothing)
             base = Dict{String,Any}("path" => "/tmp/x", "name" => "x",
                                     "session_id" => "s1", "last_used" => 1.0,
                                     "kind" => "session", "running" => false,

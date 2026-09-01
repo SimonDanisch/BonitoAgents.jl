@@ -13,26 +13,6 @@
         @test !occursin('\\', BT.js_path("C:\\foo\\bar"))
     end
 
-    @testset "breadcrumb_paths" begin
-        @test BT.breadcrumb_paths("/home/sdani/proj") ==
-              ["/", "/home", "/home/sdani", "/home/sdani/proj"]
-        @test BT.breadcrumb_paths("/")        == ["/"]
-        @test BT.breadcrumb_paths("")         == ["/"]
-        @test BT.breadcrumb_paths("/single")  == ["/", "/single"]
-        @test BT.breadcrumb_paths("C:/Users/sdani/Proj") ==
-              ["C:/", "C:/Users", "C:/Users/sdani", "C:/Users/sdani/Proj"]
-        @test BT.breadcrumb_paths("C:/")        == ["C:/"]
-        @test BT.breadcrumb_paths("D:/Single")  == ["D:/", "D:/Single"]
-        @test BT.breadcrumb_paths("c:/Users/sdani") == ["c:/", "c:/Users", "c:/Users/sdani"]
-    end
-
-    @testset "breadcrumb_root_label" begin
-        @test BT.breadcrumb_root_label("/")     == "/"
-        @test BT.breadcrumb_root_label("C:/")   == "C:"
-        @test BT.breadcrumb_root_label("D:/")   == "D:"
-        @test BT.breadcrumb_root_label("c:/")   == "c:"
-    end
-
     @testset "disambiguate_labels" begin
         # No collision: everything stays at its basename.
         @test BT.disambiguate_labels(["/p/src/calc.jl", "/p/README.md"]) ==

@@ -76,6 +76,27 @@ end
             @test !ispath(joinpath(dirname(root), "escape"))
         end
 
+        # Backs the picker's "type /newname to create it" — a FULL path that is
+        # mkpath'd (parents included) rather than a single child of `root`.
+        @testset "ensure_dir creates the full path, refuses files" begin
+            # Multi-segment, nothing exists yet: parents are created too.
+            missing_child = joinpath(root, "a", "b", "newproj")
+            @test !ispath(missing_child)
+            made = BT.ensure_worker_dir(h.state, wid, missing_child)
+            @test isdir(missing_child)
+            # Returns the worker's normalized absolute path.
+            @test made == abspath(missing_child)
+            # Existing folder is idempotent (no error).
+            @test BT.ensure_worker_dir(h.state, wid, missing_child) == abspath(missing_child)
+            # A path that exists as a plain FILE is refused — mkpath would
+            # silently create a sibling and the project would start nowhere real.
+            file_path = joinpath(root, "a", "not-a-dir.txt")
+            write(file_path, "nope")
+            @test_throws Exception BT.ensure_worker_dir(h.state, wid, file_path)
+            # …and it is left untouched.
+            @test isfile(file_path)
+        end
+
         @testset "stat_path: file vs dir vs missing" begin
             src = joinpath(root, "src", "main.jl")
             f = BT.stat_worker_path(h.state, wid, src)

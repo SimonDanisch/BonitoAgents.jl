@@ -947,6 +947,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_list_dir(ws, cmd)
             elseif t == "make_dir"
                 @async handle_make_dir(ws, cmd)
+            elseif t == "ensure_dir"
+                @async handle_ensure_dir(ws, cmd)
             elseif t == "stat_path"
                 @async handle_stat_path(ws, cmd)
             elseif t == "list_project_files"
@@ -1425,6 +1427,38 @@ function handle_make_dir(ws, cmd::AbstractDict)
         send_control(ws, response)
     catch e
         @warn "make_dir response failed" exception=e
+    end
+end
+
+# Ensure a directory exists on the worker, creating it (and any missing
+# parents) if it doesn't. Backs the picker's "type `/newname` to create it"
+# flow: the path field always shows the target, and a non-existent folder is
+# created the moment the user commits a create on it — no separate "+ New
+# folder" step, and multi-segment targets (`a/b/c`) work in one shot.
+#
+#     {type:"ensure_dir", request_id, path}
+#     {type:"ensure_dir_response", request_id, path}   # normalized abspath
+#     {type:"ensure_dir_response", request_id, error}
+function handle_ensure_dir(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    path       = strip(String(get(cmd, "path", "")))
+
+    response = try
+        isempty(path) && error("path is required")
+        # A path that exists but is not a directory (a file) must be refused —
+        # mkpath would silently succeed against it and create a sibling.
+        ispath(path) && !isdir(path) && error("not a directory: $path")
+        mkpath(path)
+        Dict("type" => "ensure_dir_response", "request_id" => request_id,
+             "path" => abspath(path))
+    catch e
+        Dict("type" => "ensure_dir_response", "request_id" => request_id,
+             "error" => sprint(showerror, e))
+    end
+    try
+        send_control(ws, response)
+    catch e
+        @warn "ensure_dir response failed" exception=e
     end
 end
 
