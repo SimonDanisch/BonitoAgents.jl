@@ -54,8 +54,42 @@ import BonitoWorker
 import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
 
+# `Pkg.test` runs the test process with `JULIA_LOAD_PATH="@:<testdir>"` — note
+# the missing `@stdlib`. Every process spawned from here inherits it, including
+# the Malt EVAL workers, which then cannot load a single stdlib: `using Markdown`
+# inside an eval fails with "Package Markdown not found in current path", against
+# a committed evalenv that correctly expects stdlibs to come from `@stdlib`.
+# Production never sees this — nothing exports the variable there (see
+# BonitoAgentsApp's `worker_command`, which passes `--project` on the command
+# line precisely so descendants keep a clean environment) — so clearing it here
+# RESTORES production conditions rather than faking them.
+#
+# Safe for this process: Julia reads the variable into `LOAD_PATH` once at
+# startup and never re-reads it, so our own resolution is untouched and only
+# children change. And TestKit is loaded inside ReTestItems' test workers, never
+# in the parent, so the runner's own worker spawning is unaffected.
+function __init__()
+    delete!(ENV, "JULIA_LOAD_PATH")
+    return nothing
+end
+
+# Re-pointing an MCP dial-back must never abort a bring-up or a teardown — the
+# server it pointed at may already be gone, and half-torn-down state is worse
+# than none. But it must not be SILENT either: a dial-back that failed to reset
+# is precisely how a live bridge leaks from one suite into the next, where it
+# shows up much later as embeds that render and are dead. Warn and continue.
+function reset_dialback_or_warn(reset!::Function, what::AbstractString)
+    try
+        reset!()
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "TestKit: could not reset the $what dial-back" exception = e
+    end
+    return nothing
+end
+
 export TestServer, dev_server, add_worker!,
-       text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update, REPLAY_FN,
+       text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update, kimi_tool, REPLAY_FN,
        post_turn,
        sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn,
@@ -143,6 +177,33 @@ diff_block(path, old, new) = Dict("type" => "diff", "path" => String(path),
 text_block(s::AbstractString) = Dict("type" => "text", "text" => String(s))
 
 """
+    kimi_tool(name; kind, args, content, status, id, human_title) -> Dict
+
+Agent event for a tool call in KIMI's wire dialect instead of claude's — the
+shape captured verbatim from the real `kimi acp` binary (fixtures live in
+`AgentClientProtocol/test/fixtures/kimi_*.jsonl`).
+
+Use it whenever a test needs to prove the chat copes with a NON-claude agent:
+there is no `_meta.claudeCode` envelope, so the tool is identified only by the
+ACP `title` on its opening frame, that title is then replaced by a human
+sentence, and the arguments arrive as streamed partial-JSON `content` before a
+single late `rawInput`. `name` is the real tool name (`"Bash"`, `"Grep"`,
+`"mcp__btworker__bt_julia_eval"`, …) and `args` its argument dict.
+
+Everything else in TestKit emits claude's shape, so a scenario can mix both.
+"""
+kimi_tool(name; kind = "other", args = Dict{String,Any}(), content = Any[],
+          status = "completed", id = nothing, human_title = nothing) = begin
+    d = Dict{String,Any}("type" => "kimi_tool", "name" => String(name),
+                         "kind" => String(kind),
+                         "args" => Dict{String,Any}(args),
+                         "content" => content, "status" => String(status))
+    id          === nothing || (d["id"]          = String(id))
+    human_title === nothing || (d["human_title"] = String(human_title))
+    d
+end
+
+"""
     tool(; kind, title, status, content, tool_name, id, complete, open_status,
            raw_input) -> Dict
 
@@ -181,11 +242,16 @@ way real claude-agent-acp delivers tool input: ACP merges it into the live
 editable-path hint materialise on this in-flight update rather than the empty
 opening header.
 """
-tool_update(id; status = nothing, content = nothing, raw_input = nothing) = begin
+tool_update(id; status = nothing, content = nothing, raw_input = nothing,
+            raw_output = nothing) = begin
     d = Dict{String,Any}("type" => "tool_update", "id" => String(id))
-    status    === nothing || (d["status"]    = String(status))
-    content   === nothing || (d["content"]   = content)
-    raw_input === nothing || (d["raw_input"] = Dict{String,Any}(raw_input))
+    status     === nothing || (d["status"]     = String(status))
+    content    === nothing || (d["content"]    = content)
+    raw_input  === nothing || (d["raw_input"]  = Dict{String,Any}(raw_input))
+    # A terminal update with `raw_output` (and no content) = real claude-agent-acp
+    # for a completed Edit: the diff rode earlier updates; this frame is just the
+    # "… updated successfully …" rawOutput.
+    raw_output === nothing || (d["raw_output"] = String(raw_output))
     d
 end
 
@@ -327,6 +393,12 @@ mutable struct TestServer
     # tests (no GUI) don't pay the Electron cost.
     browser::Ref{Any}                  # ElectronCall.Testing.TestContext | nothing
     closed::Ref{Bool}
+    # Default window size for `open_browser`, from `dev_server`'s
+    # browser_width/browser_height. Held here rather than dropped on the floor:
+    # they used to be accepted and then ignored, so a test asking for a phone
+    # viewport got 1280px and every layout assertion in it passed for the wrong
+    # reason.
+    browser_size::Tuple{Int,Int}
 end
 
 # The dispatcher's TCP server starts BEFORE `dev_server` returns so the
@@ -349,7 +421,7 @@ stays untouched).
 function scrub_mock_env!()
     for k in ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
               "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
-              "BT_MOCK_ACP_IGNORE_CANCEL")
+              "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_CANCEL_DELAY_MS")
         delete!(ENV, k)
     end
     get(ENV, "BT_DEFAULT_PROVIDER", "") in ("MockCode", "MockCode2") &&
@@ -374,7 +446,10 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       browser_width::Int  = 1280,
                       browser_height::Int = 820,
                       ignore_cancel::Bool = false,
+                      scenario::Union{String,Nothing} = nothing,
+                      cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
+                      many_choices::Bool = false,
                       kwargs...)
     ensure_display!()
     agent_ref = Ref{Function}(agent)
@@ -421,6 +496,21 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
+    # Opt-in: run a BUILT-IN MockACP scenario instead of the dispatcher. The
+    # dispatcher is scripted from the test process and is therefore always a
+    # well-behaved agent — it answers when the script says to. The badly-behaved
+    # cancel shapes (`cancel_orphan_tool`, `slow_cancel`, `swallow_next_prompt`)
+    # have to live in the mock itself, because what they model is the agent NOT
+    # doing what the client expects.
+    if scenario !== nothing
+        agent_env["BT_MOCK_ACP_SCENARIO"] = scenario
+        delete!(agent_env, "BT_MOCK_ACP_DISPATCHER")
+    end
+    cancel_delay_ms === nothing ||
+        (agent_env["BT_MOCK_ACP_CANCEL_DELAY_MS"] = string(cancel_delay_ms))
+    # Make the agent advertise a 12-choice `model` config option, so the header
+    # renders the SEARCHABLE picker (`.bt-msearch`) rather than a native select.
+    many_choices && (agent_env["BT_MOCK_ACP_MANY_CHOICES"] = "1")
 
     h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
@@ -430,10 +520,11 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     SERVER_CONTEXT[] = (url = h.url, secret = h.secret, project_id = Ref(""))
     # Clean slate for the MCP control dial-back (armed lazily on the first eval,
     # see invoke_mcp) in case a prior test tore down without close().
-    try BonitoMCP.reset_ctrl_dialback!() catch end
+    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server bring-up)")
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
-                       Ref{Any}(nothing), Ref(false))
+                       Ref{Any}(nothing), Ref(false),
+                       (browser_width, browser_height))
 end
 
 # Dispatcher loop per mock-agent connection. Reads one `{"prompt": "..."}`
@@ -560,8 +651,20 @@ function invoke_mcp(client, ev::AbstractDict)
     println(client, JSON.json(open_ev)); flush(client)
 
     ctx = SERVER_CONTEXT[]
-    runner() = tool == "bt_julia_continue" ?
-        BonitoMCP.julia_continue_handler(args) : BonitoMCP.julia_eval_handler(args)
+    # Dispatch by NAME through the registry, the way a real MCP process does.
+    # This used to hardcode the two eval handlers and fall through to
+    # `julia_eval_handler` for everything else — so `mcp_call("bt_wait")` ran the
+    # eval handler with no `code` and came back "error: empty code" in
+    # milliseconds. The test then measured a turn that was never blocked and had
+    # no way to tell that from a broken tool. Any registered tool is callable now.
+    reg = BonitoMCP.available_tools()
+    hit = findfirst(t -> t.name == tool, reg)
+    runner() = hit === nothing ?
+        Dict{String,Any}("content" => Any[Dict("type" => "text",
+            "text" => "TestKit: no MCP tool named `$tool` (have: " *
+                      join((t.name for t in reg), ", ") * ")")],
+            "isError" => true) :
+        reg[hit].handler(args)
     # Faithful MCP-process behaviour: arm the /mcp-ws control dial-back (idempotent)
     # so the eval's live stdout streams over the REAL wire to the chat's tail, same
     # as production. Env vars (incl. project_id) are set by with_bridge_env, which
@@ -627,8 +730,8 @@ function Base.close(s::TestServer)
     # dev_server re-dials fresh — this replaces the old `refresh_eval_session!`
     # test hack, tying eval-session lifecycle to the dev_server like production
     # ties it to the agent's MCP child.
-    try BonitoMCP.reset_ctrl_dialback!() catch end
-    try BonitoMCP.reset_eval_dialback!() catch end
+    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server teardown)")
+    reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server teardown)")
     ctx = s.browser[]
     ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
@@ -685,7 +788,8 @@ second call closes the prior window and opens a fresh one.
 # the whole e2e suite exercises rAF-paced scroll/animation code, so faithful
 # timing is the correct default. Pass `offscreen = false` to opt a specific test
 # back onto the plain hidden-window path (e.g. to bisect an OSR-only difference).
-function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
+function open_browser(s::TestServer; width::Int = s.browser_size[1],
+                       height::Int = s.browser_size[2],
                        route::AbstractString = "/", offscreen::Bool = true)
     ensure_display!()
     old = s.browser[]
@@ -834,9 +938,11 @@ end
 
 # (Removed `refresh_eval_session!`.) It `restart!`-ed the whole eval worker at
 # each test's START to dodge a stale per-env dial-back — a racy stand-in that
-# also threw away warm compile state. The dial-back is now re-pointed at
-# dev_server CLOSE (`BonitoMCP.reset_eval_dialback!` in `Base.close(::TestServer)`),
-# deterministically and without killing the worker, so tests never need it.
+# also threw away warm compile state. The dial-back is now re-pointed
+# deterministically, without killing the worker, at the two points where the
+# bridge's identity changes: dev_server CLOSE (`Base.close(::TestServer)`, the
+# server changed) and `new_chat` (the PROJECT changed — the server keys bridges
+# by project id). Tests never need to ask for it.
 
 """
     wait_for(s, label, js_predicate; timeout = 8) -> Bool
@@ -1008,57 +1114,126 @@ function to_dashboard(s::TestServer)
 end
 
 """
-    new_chat(s; cwd = mktempdir(), title = basename(cwd)) -> String
+    worker_log_tail(s; lines = 40) -> String
 
-Create a fresh chat the way a user does: from the dashboard, "+ New project",
-type `cwd` into the folder picker, name it, and hit Create. Blocks until the
-chat view is open. Returns the new chat's project id.
+The end of this dev_server's worker log, formatted for appending to an error —
+or `""` when the worker looks healthy or has no log to show.
+
+Why this exists: when the SHARED server's worker dies, every later item fails on
+`new_chat` with the same "scan_sessions … timed out — worker may be offline or
+stuck". One run produced 34 identical copies of it and not one word about the
+cause; the worker's own log was right there on disk and nothing looked at it. The
+server-side throw (`worker_client.jl`) cannot do this — a production worker is on
+another machine and has no log we can read — so it belongs here, where we spawned
+the worker ourselves and know where it writes.
+"""
+function worker_log_tail(s::TestServer; lines::Int = 40)
+    cfg = try
+        s.h.worker_config
+    catch e
+        e isa InterruptException && rethrow()
+        return ""
+    end
+    # HOW it died, first — this is the part that always has an answer. The log
+    # often does not: a worker taken down by SIGKILL loses everything Julia had
+    # buffered, so `worker.log` is empty in exactly the case worth diagnosing.
+    # Exit code and signal survive that, and they separate the three stories the
+    # bare "worker may be offline or stuck" cannot: killed by a signal, exited on
+    # its own with a code, or still running (so it is wedged, not gone).
+    signalled = false
+    state = if s.h.worker_proc === nothing
+        "no worker process handle"
+    elseif process_running(s.h.worker_proc)
+        "RUNNING (so: wedged, not dead)"
+    else
+        p = s.h.worker_proc
+        sig = try p.termsignal catch; 0 end
+        code = try p.exitcode catch; -1 end
+        signalled = sig != 0
+        signalled ? "killed by signal $sig" : "exited with code $code"
+    end
+    # Only where it is true: a RUNNING worker with an empty log has simply not
+    # said anything yet, which is a different (and less alarming) fact.
+    why_empty = signalled ? " (a signalled worker loses its buffered output)" : ""
+
+    path = joinpath(String(cfg), "worker.log")
+    isfile(path) || return "\n\n── worker: $state; no log at $path ──"
+    txt = try
+        read(path, String)
+    catch e
+        e isa InterruptException && rethrow()
+        return "\n\n── worker: $state; log unreadable: $(sprint(showerror, e)) ──"
+    end
+    ls = split(chomp(txt), '\n')
+    isempty(strip(txt)) &&
+        return "\n\n── worker: $state; log at $path is EMPTY$why_empty ──"
+    return "\n\n── worker: $state — last $(min(lines, length(ls))) of $(length(ls)) " *
+           "log lines ──\n" * join(ls[max(1, end - lines + 1):end], "\n")
+end
+
+"""
+    new_chat(s; cwd = mktempdir(), title = "") -> String
+
+Create a fresh chat the way a user does: on a worker card, "+ Project", type
+`cwd` into the folder picker's single path field, and hit Create. Blocks until
+the chat view is open. Returns the new chat's project id. `title` is accepted
+but unused (the picker names a project after its folder's basename).
 """
 function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
                                    title::AbstractString = "")
-    name = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
-    leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
+    # `title` is accepted for call-site compatibility but no longer drives the
+    # UI: the per-worker picker has no Name field, so a project is named after
+    # its folder's basename (dashboard.jl `project_name_from_path`, via the
+    # card's Create → `do_import`). The suite keys on the returned project id,
+    # not the sidebar title, so this is safe. `cwd` is the folder the chat is
+    # created from.
     to_dashboard(s)
-    # RE-CLICK "+ New project" until the name field shows. A lone click can be
-    # dropped on a cold/slow first render — Bonito wires the button's onclick
-    # only after it mounts, so the first synthetic click lands before the handler
-    # attaches and the form never opens (the exact race `click_until` fixes for
-    # the ✎ button below; a single `click_text` here left `new_chat` hanging on
-    # a cold isolated run). Generous timeout: the FIRST new_chat against a fresh
-    # server also compiles the whole new-project / folder-picker UI server-side.
-    click_text_until(s, "+ New project",
-        "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
-        timeout = 30)
-    # Flip the breadcrumb to a text field. The ✎ button's onclick (notify
-    # `editing=true`) is wired by Bonito only after the element mounts, so on a
-    # cold/slow runner a single synthetic click can land before the handler
-    # attaches and be lost. `click_until` re-clicks until the input appears.
-    click_until(s, ".bt-addr-icon-btn", "[...document.querySelectorAll('.bt-addr-input')].some($VIS)"; timeout = 30)
-    ok = eval_js(s, """(() => {
-        const inp = [...document.querySelectorAll('.bt-addr-input')].filter($VIS)[0];
-        if (!inp) return false;
-        inp.focus();
-        const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set;
-        set.call(inp, $(json(String(cwd))));
-        inp.dispatchEvent(new Event('input', {bubbles: true}));
-        inp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
-        return true; })()""")
-    ok === true || error("new_chat: folder path field (.bt-addr-input) not found")
-    # Enter commits the path to the picker via an async round-trip. Gate on the
-    # breadcrumb actually showing the target folder before "Choose" reads it —
-    # otherwise Choose captures the old location and Create fails.
-    wait_for(s, "path committed",
-        "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($leaf))";
-        timeout = 30)
-    click_text(s, "Choose")
-    set_input(s, "input", name; placeholder = "e.g. my-project")
+    # Wait for a worker card to be on screen. Its "+ Project" toggle is the only
+    # create path now (the dashboard's global "+ New project" form is gone).
+    CARD_BTN_JS = """[...document.querySelectorAll('button')].some(b =>
+        b.offsetParent && (b.innerText || '').trim() === '+ Project')"""
+    PICKER_PATH_VISIBLE = "[...document.querySelectorAll('.bt-picker-path')].some($VIS)"
+    wait_for(s, "worker card on screen", CARD_BTN_JS; timeout = 30)
+    # "+ Project" is a TOGGLE (`picker_state` flips between this worker and ""),
+    # so it must NOT go through `click_text_until`: that re-clicks blind on a
+    # fixed interval and flips the form straight back shut. Check first, click a
+    # single time, and only retry if nothing opened — which still covers the
+    # cold-mount race where Bonito wires the handler after the first synthetic
+    # click lands. Generous timeout: the FIRST new_chat against a fresh server
+    # also compiles the whole folder-picker UI server-side.
+    opened = false
+    for _ in 1:5
+        eval_js(s, PICKER_PATH_VISIBLE) === true && (opened = true; break)
+        click_text(s, "+ Project")
+        # Poll for ~6s before re-clicking: a slow first open must not be toggled
+        # shut by a second blind click (the toggle race `open_card_picker!` pins).
+        for _ in 1:30
+            eval_js(s, PICKER_PATH_VISIBLE) === true && (opened = true; break)
+            sleep(0.2)
+        end
+        opened && break
+    end
+    opened || error("new_chat: could not open a worker card's folder picker")
+    # The path field IS the selection — the one editable text field. Set it to
+    # `cwd`; there is no "Choose"/breadcrumb to commit through. A path that
+    # doesn't exist yet is created on the worker at Create time (`ensure_dir`),
+    # so a `mktempdir()` that already exists is the norm.
+    set_input(s, ".bt-picker-path", String(cwd))
     click_text(s, "Create")
     # The chat view renders only after the ACP session binds, which spawns a
-    # fresh mock-agent subprocess — its cold start can take the better part of a
-    # minute, so wait generously here.
-    wait_for(s, "chat view opened",
-             "!!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane')";
-             timeout = 90)
+    # fresh agent subprocess — cold start can take the better part of a minute,
+    # so wait generously. But race it against the form's own error line
+    # (`.bt-error`): a rejected Create never opens a chat, and without this the
+    # run burns the full timeout and reports "chat view opened" instead of the
+    # reason the server gave.
+    ok = wait_for(s, "chat view opened (or form error)",
+        "(() => { if (document.querySelector('.bt-error')) return true; " *
+        "return !!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane'); })()";
+        timeout = 90)
+    err = eval_js(s, "(() => { const e = document.querySelector('.bt-error'); " *
+                     "return e ? (e.innerText||'').trim() : ''; })()")
+    isempty(String(err)) || error("new_chat: the dashboard rejected Create — $(err)" *
+                                  worker_log_tail(s))
     # The ACP session binds asynchronously; until it does, the sidebar hasn't
     # marked the new chat active and a re-render can briefly drop `.bt-text-input`.
     # Gate on the new chat actually being SELECTED (non-empty active pid) AND its
@@ -1072,8 +1247,43 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
              timeout = 90)
     sleep(0.5)
     pid = current_chat_id(s)
+    # `SERVER_CONTEXT` is a single global, set by whichever `dev_server` ran
+    # LAST — but a suite can drive a server that isn't that one. `e2e:bt_eval`
+    # stands up (and closes) eight of its own servers; every later SharedServer
+    # item then hands the eval worker the URL of a server that no longer exists,
+    # and the dial dies with `connect: Connection refused` on `/eval-ws`. The
+    # embed still renders its snapshot, so the symptom is a live app that never
+    # updates — which is what took `e2e:eval_embed_park` down (13 failures) in a
+    # full-suite run while it passed alone. Point the context at the server we
+    # are actually driving, and drop the stale bridge so the next eval re-dials.
     ctx = SERVER_CONTEXT[]
-    ctx === nothing || (ctx.project_id[] = pid)
+    if ctx === nothing || ctx.url != s.h.url
+        SERVER_CONTEXT[] = (url = s.h.url, secret = s.h.secret, project_id = Ref(""))
+        ctx = SERVER_CONTEXT[]
+        reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server changed)")
+    end
+    if ctx !== nothing
+        # Re-point the eval dial-back whenever the PROJECT changes — the same
+        # reason `Base.close(::TestServer)` re-points it when the SERVER changes.
+        #
+        # The server registers one eval bridge per PROJECT
+        # (`state.eval_workers[project_id]`, set when the worker's eval dials
+        # `/eval-ws` carrying that id). The MCP eval-session pool, though, is
+        # keyed by env_path and process-global, and `ensure_eval_dialed!`
+        # short-circuits on `s.dialed_back` — it never dials a second time. So a
+        # second chat that evals in the SAME env inherits the first chat's
+        # already-dialed session, no bridge is ever registered for the new
+        # project, and its live embeds render from their snapshot but have no
+        # browser↔worker route: they look right and are dead.
+        #
+        # In production each chat gets its own MCP process, so each dials once
+        # for its own project. Dropping the bridge here (the worker stays warm,
+        # so no compile cost) reproduces that per-chat dial in one test process.
+        if ctx.project_id[] != pid
+            ctx.project_id[] = pid
+            reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (new chat)")
+        end
+    end
     return pid
 end
 
@@ -1099,7 +1309,7 @@ end
     switch_agent(s, label)
 
 Switch the chat's agent/provider via the header dropdown, e.g. "Mock Agent",
-"Claude Code", "MiMo Code", "OpenCode". The chat must be open.
+"Claude Code", "MiMo Code", "OpenCode", "Kimi Code". The chat must be open.
 """
 function switch_agent(s::TestServer, label::AbstractString)
     l = json(String(label))

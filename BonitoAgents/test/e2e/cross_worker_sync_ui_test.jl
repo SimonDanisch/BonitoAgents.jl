@@ -15,15 +15,15 @@
 #
 # How the same-named-sibling setup is done BLACK-BOX (the legacy test poked
 # `state.projects[]` directly; we can't): both projects are created through the
-# real "+ New project" form. `new_chat` always targets the DEFAULT worker
-# (`first(keys(state.workers))`), and offers no worker selector, so for the
-# SECOND project we replicate the new-project flow inline and additionally drive
-# the form's Worker `<select>` (rendered from `state.workers`, one <option> per
-# worker, value = worker_id) to the OTHER worker before clicking Create. Same
-# `name` + different worker_id ⇒ `same_name_siblings` returns the sibling and
-# the ⇄ control appears. This is fully real: `create_project!` rsyncs the picked
-# folder to the server mirror and pushes it onto each worker, so the live
-# `inspect_project` the modal calls has real content to summarise on both sides.
+# real per-worker-card "+ Project" picker. There is no worker `<select>` anymore
+# — each worker has its OWN card and its OWN picker — so we target a card by the
+# worker NAME it displays (`.bt-card-name`). Same-name siblings require the two
+# FOLDERS to share a basename (the picker names a project after its folder), so
+# each worker gets a folder literally named `PROJNAME`. Same `name` on two
+# different workers ⇒ `same_name_siblings` returns the sibling and the ⇄
+# control appears. This is fully real: `create_project_from_worker!` registers
+# the picked WORKER folder on each worker, so the live `inspect_project` the
+# modal calls has real content to summarise on both sides.
 
 @testitem "e2e:cross_worker_sync_ui" tags = [:e2e] begin
     include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
@@ -43,8 +43,8 @@
     try
         TK.open_browser(server)
 
-        # Both workers must be online before we open the new-project form
-        # (its Worker <select> is built from `state.workers` at form-build time).
+        # Both workers must be online before we open their card pickers (each
+        # card and its "+ Project" form is built from `state.workers`).
         @test TK.wait_for(server, "main worker online",
             "(() => { const m = document.body.innerText.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*workers online/); return m && parseInt(m[1]) >= 1; })()";
             timeout = 20) == true
@@ -53,54 +53,46 @@
             "(() => { const m = document.body.innerText.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*workers online/); return m && parseInt(m[1]) === 2; })()";
             timeout = 30) == true
 
-        # --- helper: create a project named `PROJNAME` on `worker_id`, driving
-        # the real "+ New project" form (path picker + Worker <select> + Create).
-        # Mirrors TestKit.new_chat but adds explicit worker selection so the two
-        # projects deterministically land on DIFFERENT workers. Returns the new
-        # project id (read from the now-active sidebar entry).
-        function create_on_worker(s, worker_id, src_dir)
-            leaf = TK.json(basename(rstrip(src_dir, '/')))
+        # --- helper: open the "+ Project" picker on the card showing worker
+        # `worker_name` (each worker has its own card; `picker_state` toggles,
+        # so click once, check, retry).
+        function open_card_picker_for!(s, worker_name)
+            card_scope = """[...document.querySelectorAll('.bt-worker-cell')]
+                .find(c => { const n = c.querySelector('.bt-card-name');
+                             return n && (n.value || '').trim() === $(TK.json(worker_name)); })"""
+            open_js = "(() => { const c = $card_scope; if (!c) return false; " *
+                "return [...c.querySelectorAll('.bt-picker-path')].some(e => e && e.offsetParent); })()"
+            click_js = """(() => { const c = $card_scope; if (!c) return false;
+                const b = [...c.querySelectorAll('button')]
+                    .find(b => b.offsetParent && (b.innerText || '').trim() === '+ Project');
+                if (!b) return false; b.click(); return true; })()"""
+            for _ in 1:5
+                TK.eval_js(s, open_js) === true && return true
+                TK.eval_js(s, click_js) === true || return false
+                for _ in 1:30                     # ~6s for the notify round-trip
+                    TK.eval_js(s, open_js) === true && return true
+                    sleep(0.2)
+                end
+            end
+            return false
+        end
+
+        # --- helper: create a project named `PROJNAME` (folder basename) on the
+        # worker whose card shows `worker_name`. Drives the real "+ Project"
+        # picker (path field + Create), targeting that specific worker's card.
+        # Returns the new project id (read from the now-active sidebar entry).
+        function create_on_worker(s, worker_name, src_dir)
             TK.to_dashboard(s)
-            TK.click_text(s, "+ New project")
-            TK.wait_for(s, "new-project form",
-                "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
+            TK.wait_for(s, "worker card for $worker_name on screen",
+                """(() => [...document.querySelectorAll('.bt-card-name')]
+                    .some(n => n && (n.value || '').trim() === $(TK.json(worker_name))))()""";
                 timeout = 30)
-            # Select the target worker FIRST. Switching the worker RESETS the
-            # folder picker to that worker's projects_root (the picked folder is
-            # worker-specific — dashboard.jl `on(np_worker)` → reset_to_worker!),
-            # so it MUST come before picking the folder, or the selection is wiped
-            # and Create fails with "Source path is required". The form's select
-            # carries one <option value=worker_id>name</option> per worker.
-            picked = TK.eval_js(s, """(() => {
-                const sel = document.querySelector('.bt-np-worker-select');
-                if (!sel) return false;
-                const opt = [...sel.options].find(o => o.value === $(TK.json(worker_id)));
-                if (!opt) return false;
-                sel.value = opt.value;
-                sel.dispatchEvent(new Event('input', {bubbles: true}));
-                sel.dispatchEvent(new Event('change', {bubbles: true}));
-                return true; })()""")
-            picked === true || error("create_on_worker: no Worker <option> for $worker_id")
-            # Now type the source folder into the (worker-scoped) breadcrumb field.
-            TK.click_until(s, ".bt-addr-icon-btn",
-                "[...document.querySelectorAll('.bt-addr-input')].some(el => el && el.offsetParent !== null)";
-                timeout = 30)
-            ok = TK.eval_js(s, """(() => {
-                const inp = [...document.querySelectorAll('.bt-addr-input')].filter(el => el && el.offsetParent !== null)[0];
-                if (!inp) return false;
-                inp.focus();
-                const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set;
-                set.call(inp, $(TK.json(src_dir)));
-                inp.dispatchEvent(new Event('input', {bubbles: true}));
-                inp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
-                return true; })()""")
-            ok === true || error("create_on_worker: folder field not found")
-            TK.wait_for(s, "path committed",
-                "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($leaf))";
-                timeout = 30)
-            TK.click_text(s, "Choose")
-            # Name the project (same name on both ⇒ siblings).
-            TK.set_input(s, "input", PROJNAME; placeholder = "e.g. my-project")
+            open_card_picker_for!(s, worker_name) ||
+                error("create_on_worker: could not open picker on $worker_name")
+            # The path field IS the selection. `src_dir` already exists (both
+            # sides were populated above); Create resolves it and registers the
+            # project. The basename (`PROJNAME`) is the shared sibling name.
+            TK.set_input(s, ".bt-picker-path", src_dir)
             TK.click_text(s, "Create")
             # Chat view renders after the ACP session binds (mock-agent cold
             # start can take a while) and the new chat becomes the active row.
@@ -114,38 +106,18 @@
             return TK.current_chat_id(s)
         end
 
-        # Resolve worker_ids from the form's Worker <select> (option text =
-        # worker name, value = worker_id). We need the ids to target the
-        # <select> by value when creating each project on a specific worker.
-        src1 = mktempdir(); write(joinpath(src1, "README.md"), "FROM main\n"); write(joinpath(src1, "one.txt"), "1\n")
-        src2 = mktempdir(); write(joinpath(src2, "README.md"), "FROM w-2\n"); write(joinpath(src2, "two.txt"), "2\n")
-
-        TK.to_dashboard(server)
-        TK.click_text(server, "+ New project")
-        # Target the form's worker select by ITS class — "first visible select
-        # with ≥2 options" picked up the dashboard's session-config pills
-        # (also native selects: mode/effort) and read their option labels as
-        # worker names.
-        TK.wait_for(server, "form for id lookup",
-            "(() => { const s = document.querySelector('.bt-np-worker-select'); return !!s && s.offsetParent !== null && s.options.length >= 2; })()";
-            timeout = 30)
-        ids = TK.eval_js(server, """(() => {
-            const sel = document.querySelector('.bt-np-worker-select');
-            if (!sel) return null;
-            const byName = {};
-            for (const o of sel.options) byName[(o.textContent||'').trim()] = o.value;
-            return byName; })()""")
-        @test ids !== nothing
-        main_id = String(ids[MAIN_WORKER])
-        other_id = String(ids[OTHER_WORKER])
-        @test main_id != other_id
-        # Cancel this scouting form open; create_on_worker reopens cleanly.
-        TK.click_text(server, "Cancel")
+        # Same-named sibling FOLDERS on both sides: the picker names a project
+        # after its folder's basename, so `same_name_siblings` only fires when
+        # the basenames match. Distinct content (the modal summarizes reality).
+        src1 = joinpath(mktempdir(), PROJNAME); mkpath(src1)
+        write(joinpath(src1, "README.md"), "FROM main\n"); write(joinpath(src1, "one.txt"), "1\n")
+        src2 = joinpath(mktempdir(), PROJNAME); mkpath(src2)
+        write(joinpath(src2, "README.md"), "FROM w-2\n"); write(joinpath(src2, "two.txt"), "2\n")
 
         @testset "BonitoAgents cross-worker sync UI" begin
-            # Create the same-named project on each worker.
-            pid_main = create_on_worker(server, main_id, src1)
-            pid_other = create_on_worker(server, other_id, src2)
+            # Create the same-named project on each worker (by card name).
+            pid_main = create_on_worker(server, MAIN_WORKER, src1)
+            pid_other = create_on_worker(server, OTHER_WORKER, src2)
             @test pid_main != pid_other
 
             # The ⇄ sibling-sync control is computed ONCE at chat-mount

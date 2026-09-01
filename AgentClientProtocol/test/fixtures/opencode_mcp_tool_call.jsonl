@@ -1,0 +1,3 @@
+{"sessionUpdate":"tool_call","toolCallId":"call_ac17e5939dff4872ac7bfdc1","title":"btworker_bt_julia_eval","kind":"other","status":"pending","locations":[],"rawInput":{}}
+{"sessionUpdate":"tool_call_update","toolCallId":"call_ac17e5939dff4872ac7bfdc1","status":"in_progress","kind":"other","title":"btworker_bt_julia_eval","locations":[],"rawInput":{"code":"1+1","env_path":"/tmp/ocprobe"}}
+{"sessionUpdate":"tool_call_update","toolCallId":"call_ac17e5939dff4872ac7bfdc1","status":"completed","kind":"other","title":"btworker_bt_julia_eval","locations":[],"content":[{"type":"content","content":{"type":"text","text":"2"}}],"rawInput":{"code":"1+1","env_path":"/tmp/ocprobe"},"rawOutput":{"output":"2","metadata":{"truncated":false}}}

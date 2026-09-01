@@ -27,13 +27,15 @@ using ReTestItems, BonitoAgents
 
 # `e2e:bt_eval_types` runs a Malt eval worker on the committed `test/evalenv`
 # project (dev Bonito + DataFrames/Colors/ImageShow/Tables for the render-type
-# cases). That env must be RESOLVED + PRECOMPILED before the worker dials in —
-# otherwise the worker re-resolves the heavy env on first touch and the
-# render/mount times out. The packages are precompiled in the depot, so this is a
-# fast cache hit; do it once here, before the workers fork.
+# cases), and `e2e:bt_eval` uses it plus `test/altenv` (Bonito only, same rev —
+# a second env so the env_path-isolation testset has two to tell apart). Both
+# must be RESOLVED + PRECOMPILED before the worker dials in — otherwise the
+# worker re-resolves on first touch and the render/mount times out. The packages
+# are precompiled in the depot, so this is a fast cache hit; do it once here,
+# before the workers fork.
 let cur = Base.active_project()
     import Pkg
-    for env in ("evalenv",)
+    for env in ("evalenv", "altenv")
         path = joinpath(@__DIR__, env)
         isdir(path) || continue
         try
@@ -41,8 +43,8 @@ let cur = Base.active_project()
             Pkg.instantiate(; io = devnull)
         catch e
             # Best-effort warmup: a failure here only makes that env's e2e items
-            # re-resolve on first touch — it must NOT abort the whole suite (e.g.
-            # `e2e:bt_eval` uses neither env).
+            # re-resolve on first touch — it must NOT abort the whole suite, and
+            # every item that does NOT eval is unaffected either way.
             @warn "test/$env instantiate failed — its e2e items may be slow on first mount" exception = e
         end
     end

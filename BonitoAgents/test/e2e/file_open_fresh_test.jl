@@ -16,7 +16,14 @@
         timeout = 90) == true
 
     # The worker-side project directory (dev worker runs on this machine).
-    wdir = joinpath(s.h.worker_root, "FreshFiles")
+    #
+    # Ask the PROJECT where it lives rather than rebuilding the path from
+    # `worker_root/<name>`. That reconstruction assumes the "New Project" flow,
+    # which does mirror into `projects_root/<name>` — but `TK.new_chat` uses the
+    # open-an-existing-folder flow (`cwd = mktempdir()` by default), where the
+    # worker path IS that folder and `worker_root` stays empty. The assertion
+    # was describing a creation path the test doesn't take.
+    wdir = s.h.state.projects[][pid].worker_path
     @test isdir(wdir)
     probe = joinpath(wdir, "stale_probe.txt")
 

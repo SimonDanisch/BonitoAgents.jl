@@ -12,6 +12,7 @@ using AgentClientProtocol
 using AgentProviders     # provider descriptors + current_providers/find_provider (SSOT, shared w/ worker)
 using HTTP
 using JSON
+using MsgPack
 using Markdown
 using UUIDs
 using Dates
@@ -48,7 +49,10 @@ include("agents.jl")           # WorkerAgent (server-side live agent over the wo
 include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
+include("mesh_view.jl")        # geometry-file parsers (.obj/.stl/.ply/.off/.glb/.gltf) → BTMESH1 blob
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
+include("file_view.jl")        # FileView / FilePanel — the one rich file renderer (bt_show + file tabs)
+include("review.jl")           # change-review tab: git diff + per-line ask / batched feedback
 include("lens.jl")             # lens search: parse + fuzzy filter + saved lenses
 include("remote_app.jl")       # eval-result bridge — live worker Bonito results in the browser
 include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + app detach controller
@@ -61,12 +65,13 @@ include("project_widget.jl")   # ProjectCard widget (stable per project_id, used
 include("file_tree.jl")        # WorkerFileTree — lazy, searchable project file tree (sidebar)
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
+include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
 include("server.jl")           # serve()
 include("dev.jl")              # dev_server() — self-contained dev rig
 
 export serve, dev_server
 export AgentProvider, BinAgent, WorkerAgent
-export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, MockAgent
+export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent
 export start!, stop!, client, switch_provider!
 
 # Bake the real browser-driven paths captured from the e2e suite: literal

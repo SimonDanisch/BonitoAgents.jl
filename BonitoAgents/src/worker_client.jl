@@ -24,6 +24,9 @@ using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol, RemoteSync
 #                              The keys are uuids so collisions across types can't
 #                              happen, and the unified shape is simpler than the
 #                              previous five typed dicts.
+#   state.pending_chunks    — request_id → ChunkAccumulator for replies that span
+#                              MULTIPLE frames (git_diff's patch); `deliver_chunk!`
+#                              reassembles per frame and resolves once complete.
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -35,7 +38,63 @@ function send_command(state::ServerState, worker_name::String, payload::Abstract
         get(state.worker_control_ws, worker_name, nothing)
     end
     ws === nothing && error("Worker '$worker_name' is not connected")
-    WebSockets.send(ws, JSON.json(payload))
+    send_control(ws, payload)
+    return nothing
+end
+
+# ── The control-WS wire ─────────────────────────────────────────────────────
+# MsgPack in a BINARY frame; the worker's half of this lives in BonitoWorker and
+# the two must move together. See the long note there for why it is not JSON: a
+# TEXT frame is UTF-8 validated by the receiver, this protocol carries filenames
+# and diff hunks and file previews, and one byte that isn't valid UTF-8 closed
+# the link with 1007 — then again on every reconnect, because the server re-sent
+# the same command. A binary frame is never validated, so a bad byte is data to
+# handle rather than a severed connection.
+#
+# NOT applied to the handoff / transfer sockets: those are separate handshakes
+# with their own peers, and `send_ws_error` below still serves them.
+send_control(ws, payload::AbstractDict) = WebSockets.send(ws, MsgPack.pack(payload))
+
+"""
+    decode_control(frame) -> Dict{String,Any}
+
+Decode one control-WS frame. Binary only — a text frame means the worker still
+speaks the old JSON wire, and saying so beats letting half a migration run.
+"""
+decode_control(frame::AbstractVector{UInt8}) = normalize_wire(MsgPack.unpack(frame))
+decode_control(frame::AbstractString) = error(
+    "BonitoAgents: got a TEXT control frame — this worker still speaks the old " *
+    "JSON wire. Update the worker (re-run the installer against this server).")
+
+"""
+    normalize_wire(x)
+
+Put a decoded MsgPack value back into the shape the handlers expect:
+`Dict{String,Any}` with `Int64` integers.
+
+MsgPack encodes integers in the narrowest type that fits, so `0` arrives as
+`UInt8` and `12345` as `UInt16`, and maps arrive as `Dict{Any,Any}`. Unsigned
+arithmetic WRAPS, which turns a narrowed `size - 1` into 255 somewhere far from
+here, so it is normalised once rather than guarded at every use. `Bool` is
+matched ahead of `Integer` because it is one, and widening would make `true`
+into `1`.
+"""
+normalize_wire(x::Bool)           = x
+normalize_wire(x::Integer)        = Int64(x)
+normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
+normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
+normalize_wire(x)                 = x
+
+# A rejection on the CONTROL WS. Same tolerance as `send_ws_error` — the peer we
+# just refused may already be gone — but on the binary wire, because the worker
+# is waiting on `decode_control` and a text frame there would surface as "your
+# server speaks JSON" instead of the "unauthorized" we are trying to report.
+function send_control_error(ws, payload::AbstractDict)
+    try
+        send_control(ws, payload)
+    catch e
+        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+    end
     return nothing
 end
 
@@ -113,6 +172,27 @@ function register_rpc!(state::ServerState)
     return (rid, ch)
 end
 
+"""
+    register_chunked_rpc!(state)
+
+Register a pending RPC whose reply arrives as a SERIES of frames, not one.
+Same contract as [`register_rpc!`](@ref) — the caller sends the command with
+`request_id` set to the returned id and waits via `take_pending!` — but the
+reply frames go through [`deliver_chunk!`](@ref), which reassembles them into
+the single value `git_diff_on_worker` exposes. The accumulator lives in
+`state.pending_chunks`; the timeout/cancel paths evict it with the plain
+`pending_rpcs` entry.
+"""
+function register_chunked_rpc!(state::ServerState)
+    rid = string(uuid4())
+    ch  = Channel{Any}(1)
+    lock(state.lock) do
+        state.pending_chunks[rid] = ChunkAccumulator(ch, nothing, 0, IOBuffer(),
+                                                     Dict{String,Any}())
+    end
+    return (rid, ch)
+end
+
 # Drop a pending-RPC registration if it's still present (T10). `take_pending!`
 # already evicts on timeout/success, but if `send_command` (or the command
 # dict-build) throws between `register_rpc!` and `take_pending!`, the entry
@@ -120,7 +200,9 @@ end
 # No-op once the key is gone (the normal success path already removed it).
 function unregister_rpc!(state::ServerState, key::AbstractString)
     lock(state.lock) do
-        haskey(state.pending_rpcs, String(key)) && delete!(state.pending_rpcs, String(key))
+        rid = String(key)
+        haskey(state.pending_rpcs, rid) && delete!(state.pending_rpcs, rid)
+        haskey(state.pending_chunks, rid) && delete!(state.pending_chunks, rid)
     end
     return nothing
 end
@@ -137,10 +219,13 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
     # take returns, so a fast reply doesn't strand anything.
     timer = Timer(timeout) do _
         # Atomic "take if present" so we don't race a concurrent
-        # deliver_rpc_response! popping the same key.
+        # deliver_rpc_response!/deliver_chunk! popping the same key.
         had = lock(state.lock) do
             if haskey(state.pending_rpcs, key)
                 delete!(state.pending_rpcs, key)
+                true
+            elseif haskey(state.pending_chunks, key)
+                delete!(state.pending_chunks, key)
                 true
             else
                 false
@@ -172,9 +257,18 @@ end
 
 # Try to deliver a worker-pushed RPC reply by request_id. No-op if the id is
 # unknown (caller already timed out, or the response races a re-registration).
+# Also serves CHUNKED requests: a worker replying to a chunked request in one
+# legacy-shaped frame (or an error frame) reaches the same channel through the
+# accumulator.
 function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
     ch = lock(state.lock) do
-        haskey(state.pending_rpcs, rid) ? pop!(state.pending_rpcs, rid) : nothing
+        if haskey(state.pending_rpcs, rid)
+            pop!(state.pending_rpcs, rid)
+        elseif haskey(state.pending_chunks, rid)
+            pop!(state.pending_chunks, rid).ch
+        else
+            nothing
+        end
     end
     ch === nothing && return
     # Caller may have given up (closed the channel) between our pop!
@@ -195,14 +289,78 @@ function deliver_rpc_error!(state::ServerState, rid::AbstractString, message::Ab
     return
 end
 
+"""
+    deliver_chunk!(state, cmd)
+
+Assemble the fragments of a chunked worker reply (`git_diff_chunk`). The
+dispatch arm in the worker control loop feeds every decoded frame here; the
+frame carries `request_id`, `index`/`total` (Int — `normalize_wire` widened
+them), `chunk` (String, binary-safe on the MsgPack wire), and on the FIRST
+frame the reply's metadata (`repo`, `branch`, `head`, `base`, `scope`). Once
+`received == total` the accumulator's channel gets the reassembled payload and
+`git_diff_on_worker`'s `take_pending!` returns it.
+
+Edge cases resolve exactly like the single-frame path:
+  * error chunk                        → whole dict via `deliver_rpc_response!`
+  * `total < 1` announced              → ErrorException
+  * `index > total`                    → ErrorException
+  * unknown/expired request_id         → no-op (caller already timed out)
+"""
+function deliver_chunk!(state::ServerState, cmd::AbstractDict)
+    rid = String(get(cmd, "request_id", ""))
+    isempty(rid) && return
+    if haskey(cmd, "error")
+        # A chunked request can also fail as ONE small frame (e.g. repo path
+        # not inside the working copy); the caller checks for the `error` key.
+        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+        return
+    end
+    chunk = String(get(cmd, "chunk", ""))
+    index = Int(get(cmd, "index", 0))
+    total = Int(get(cmd, "total", 0))
+    r = lock(state.lock) do
+        acc = get(state.pending_chunks, rid, nothing)
+        acc === nothing && return nothing  # timed out / never registered
+        if acc.total === nothing
+            # First frame: the worker ships repo/branch/head/base/scope here.
+            if total < 1
+                delete!(state.pending_chunks, rid)
+                return (acc.ch, ErrorException("git_diff: chunk frame announced total < 1"))
+            end
+            acc.total = total
+            for k in ("repo", "branch", "head", "base", "scope")
+                acc.meta[k] = String(get(cmd, k, ""))
+            end
+        elseif index > acc.total
+            delete!(state.pending_chunks, rid)
+            return (acc.ch, ErrorException("git_diff: chunk index $index exceeds the announced $(acc.total)"))
+        end
+        write(acc.buf, chunk)
+        acc.received += 1
+        acc.received == acc.total || return nothing  # more frames to come
+        # Last frame: reassemble and resolve the RPC with the full reply.
+        acc.meta["patch"] = String(take!(acc.buf))
+        delete!(state.pending_chunks, rid)
+        return (acc.ch, acc.meta)
+    end
+    r === nothing && return
+    ch, value = r
+    try
+        put!(ch, value)
+    catch e
+        e isa InvalidStateException || rethrow()
+    end
+    return
+end
+
 # Handler for /worker-ws — runs once per worker, for the worker's lifetime.
 function handle_worker_control(state::ServerState, ws)
     worker_id = "?"
     try
         hello_raw = WebSockets.receive(ws)
-        hello = JSON.parse(String(hello_raw))
+        hello = decode_control(hello_raw)
         if get(hello, "secret", "") != state.worker_secret
-            send_ws_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
+            send_control_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
             return
         end
         # Worker identity. Newer workers send `worker_id` (stable UUID); old
@@ -223,10 +381,10 @@ function handle_worker_control(state::ServerState, ws)
         # worker can arm its own receive-watchdog (no frame for several
         # intervals ⇒ half-open link ⇒ close + re-dial). Workers predating the
         # field simply ignore it.
-        WebSockets.send(ws, JSON.json(Dict("ok" => true,
-                                            "registered_as" => display_name,
-                                            "worker_id"     => worker_id,
-                                            "heartbeat_interval" => state.heartbeat_interval)))
+        send_control(ws, Dict("ok" => true,
+                              "registered_as" => display_name,
+                              "worker_id"     => worker_id,
+                              "heartbeat_interval" => state.heartbeat_interval))
 
         # Build / refresh the WorkerInfo from the hello frame. Preserve a
         # user-set `initials` override across reconnects (the worker doesn't
@@ -325,9 +483,10 @@ function handle_worker_control(state::ServerState, ws)
             sleep(state.heartbeat_interval)
             hb_alive[] || break
             try
-                WebSockets.send(ws, JSON.json(Dict("type" => "ping")))
+                send_control(ws, Dict("type" => "ping"))
                 last_ping_ok[] = time()
-            catch
+            catch e
+                (e isa WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError) || rethrow()
                 break   # socket is gone — the frame loop is already tearing down
             end
         end)
@@ -361,13 +520,17 @@ function handle_worker_control(state::ServerState, ws)
         try
             for frame in ws
                 try
-                    cmd = JSON.parse(String(frame))
+                    cmd = decode_control(frame)
                     t   = get(cmd, "type", "")
                     rid = String(get(cmd, "request_id", ""))
                     if t == "pong"
                         last_pong[] = time()
                         pong_seen[] = true
                     elseif t == "list_dir_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "make_dir_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "ensure_dir_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "stat_path_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
@@ -385,6 +548,14 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "kill_file_writers_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "git_diff_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "git_diff_chunk"
+                        deliver_chunk!(state, cmd)
+                    elseif t == "find_repos_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "worker_state_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "open_session_failed"
                         # M9/M13: worker couldn't spawn/dial the ACP session; fail the
                         # pending open_session (keyed by `sid`) now instead of waiting
@@ -392,6 +563,15 @@ function handle_worker_control(state::ServerState, ws)
                         sid = String(get(cmd, "sid", ""))
                         deliver_rpc_error!(state, sid,
                             String(get(cmd, "error", "worker failed to open ACP session")))
+                    else
+                        # This dispatch is an allow-list, so a NEW worker RPC whose
+                        # reply type isn't added above lands here — and its caller
+                        # would otherwise just sit out its full timeout with no
+                        # clue why. Say it out loud instead. (A newer worker
+                        # talking to an older server hits this too, which is
+                        # exactly the same thing worth knowing.)
+                        @warn "Worker control: unhandled reply type — the caller will time out" *
+                              " (add an arm for it in handle_worker_control)" type=t worker_id=worker_id maxlog=5
                     end
                 catch e
                     @warn "Worker control frame error" exception=e
@@ -456,7 +636,7 @@ function teardown_worker_control!(state::ServerState, worker_id::AbstractString,
         haskey(state.workers[], worker_id) && (state.workers[][worker_id].online[] = false)
         for m in kept
             # Tear down the DEAD ACP session (frees the worker-side agent
-            # subprocess), but KEEP the model: begin_turn! rebinds a fresh
+            # subprocess), but KEEP the model: begin_turn rebinds a fresh
             # session on the next message after reconnect.
             try; stop!(m.agent); catch e
                 @warn "stopping agent on worker disconnect" project_id = m.project_id exception = e
@@ -577,6 +757,12 @@ function remove_worker!(state::ServerState, worker_id::AbstractString;
             delete!(state.chat_models, p.id)
             if remove_projects
                 delete!(state.projects[], p.id)
+                # Same reason as in `prune_projects_with_missing_paths`: the
+                # review state is keyed by project id and carries pending
+                # comments, so it goes when the project does. NOT on a plain
+                # session stop — that keeps the project, and a review you were
+                # halfway through should survive restarting the agent.
+                delete!(state.review_states, p.id)
                 push!(dropped, p.id)
             end
         end
@@ -829,11 +1015,73 @@ function list_worker_dir(state::ServerState, worker_name::String, path::Abstract
 end
 
 """
+    make_worker_dir(state, worker_name, parent, name; timeout = 5.0) -> String
+
+Create `parent/name` on the worker and return its absolute path. Backs the
+folder picker's "New folder", so a project can be started somewhere that doesn't
+exist yet. The worker rejects anything but a single path segment.
+"""
+function make_worker_dir(state::ServerState, worker_name::String,
+                          parent::AbstractString, name::AbstractString;
+                          timeout::Real = 5.0)
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "make_dir",
+            "request_id" => rid,
+            "parent"     => String(parent),
+            "name"       => String(name),
+        ))
+        take_pending!(state, ch, rid, timeout, "make_dir on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("make_dir on '$worker_name': unexpected response shape")
+    haskey(resp, "error") && error("make_dir on '$worker_name': $(resp["error"])")
+    return String(resp["path"])
+end
+
+"""
+    ensure_worker_dir(state, worker_name, path; timeout = 5.0) -> String
+
+Ask the worker to `mkpath(path)` and return its normalized absolute path.
+Unlike [`make_worker_dir`](@ref) the target is a FULL path that may span
+several segments, and it is created if it doesn't exist (parents included).
+Backs the picker's "type `/newname` to create it" flow. Throws if the path
+exists as a non-directory (the worker refuses).
+"""
+function ensure_worker_dir(state::ServerState, worker_name::String,
+                           path::AbstractString; timeout::Real = 5.0)
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "ensure_dir",
+            "request_id" => rid,
+            "path"       => String(path),
+        ))
+        take_pending!(state, ch, rid, timeout, "ensure_dir on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("ensure_dir on '$worker_name': unexpected response shape")
+    haskey(resp, "error") && error("ensure_dir on '$worker_name': $(resp["error"])")
+    return String(resp["path"])
+end
+
+"""
     stat_worker_path(state, worker_name, path; timeout=5.0)
-        -> (exists, isfile, isdir, size, path)
+        -> (exists, isfile, isdir, size, mtime, path)
 
 Stat a single `path` on the worker (the editor open-guard asks before fetching).
-Throws if the worker is disconnected or the RPC errors.
+`(size, mtime)` is the file's version stamp — [`fetch_show_file`](@ref) uses it
+as the freshness key for the server mirror. Throws if the worker is disconnected
+or the RPC errors.
 """
 function stat_worker_path(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
@@ -857,6 +1105,11 @@ function stat_worker_path(state::ServerState, worker_name::String, path::Abstrac
             isfile = Bool(get(resp, "isfile", false)),
             isdir  = Bool(get(resp, "isdir", false)),
             size   = Int(get(resp, "size", 0)),
+            # A worker predating the mtime field reports 0.0 — that pins the
+            # fingerprint to `size` alone, which is weaker but never WRONG
+            # (a same-size rewrite just isn't detected), and the file-editor's
+            # `refresh = true` path bypasses the fingerprint entirely.
+            mtime  = Float64(get(resp, "mtime", 0.0)),
             path   = String(get(resp, "path", path)))
 end
 
@@ -1072,6 +1325,10 @@ function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
     lock(state.lock) do
         for id in dead
             haskey(state.projects[], id) && delete!(state.projects[], id)
+            # The review state is keyed by project id and holds pending comments.
+            # Leaving it behind would hand a future project that reuses the id
+            # someone else's half-written review.
+            delete!(state.review_states, id)
         end
         save_projects!(state)
     end
@@ -1202,6 +1459,7 @@ function scan_and_store!(state::ServerState, worker_id::AbstractString)
     norm = Dict{String,Any}[Dict{String,Any}(r) for r in raw]
     lock(state.lock) do
         state.discovered[][wid] = norm
+        state.last_scan[wid] = time()
         save_discovered!(state)
     end
     safe_notify!(state.discovered)
@@ -1219,10 +1477,10 @@ end
 # different cleaned string (wrapper + prose where the wrapper part leaked
 # through the older regex). Clean titles round-trip to themselves and the
 # sweep ignores them.
-title_is_broken(t::Nothing) = false
-function title_is_broken(t::AbstractString)
+title_is_broken(::AgentProvider, ::Nothing) = false
+function title_is_broken(provider::AgentProvider, t::AbstractString)
     s = String(t)
-    cleaned = meaningful_title(s)
+    cleaned = meaningful_title(provider, s)
     return cleaned === nothing || String(cleaned) != s
 end
 
@@ -1245,17 +1503,22 @@ function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
     lock(state.lock) do
         for (pid, p) in state.projects[]
             p.worker_id == wid || continue
-            title_is_broken(p.title) || continue
+            # The wrappers to peel are the ones of the agent that WROTE the
+            # title, so ask the project. A project that predates the field says
+            # nothing and resolves to the default — which is Claude, the
+            # assumption this used to hardcode for every project alike.
+            provider = project_provider(p)
+            title_is_broken(provider, p.title) || continue
             # Prefer the original prompt — re-running the filter against the
             # raw first user message recovers any prose the old truncation
             # dropped on the floor.
             chat_dir = chat_storage_dir(state, pid, p.server_path)
             raw = first_user_prompt(chat_dir)
-            new_title = raw === nothing ? nothing : meaningful_title(raw)
+            new_title = raw === nothing ? nothing : meaningful_title(provider, raw)
             # Fall back to cleaning the saved title in place — strictly an
             # improvement over the leaked form even when chat.md isn't
             # available (cwd moved, project imported, …).
-            new_title === nothing && (new_title = meaningful_title(String(p.title)))
+            new_title === nothing && (new_title = meaningful_title(provider, String(p.title)))
             p.title = new_title === nothing ? nothing : String(new_title)
             fixed += 1
         end
@@ -1299,6 +1562,113 @@ function clone_repo_on_worker(state::ServerState, worker_name::String,
     haskey(resp, "error") &&
         error("clone_repo '$url' on '$worker_name': $(resp["error"])")
     return String(resp["dst_path"])
+end
+
+"""
+    worker_state(state, worker_id; timeout = 15.0) -> Dict
+
+Ask a worker to describe ITSELF: pid, uptime, memory, the agent binary it
+resolves, and its live agent sessions (with whether each agent process is still
+running and whether its ACP socket is up). The other half of the debug chat's
+picture — the server knows what it *asked* the worker to do, this is what the
+worker actually has.
+"""
+function worker_state(state::ServerState, worker_id::AbstractString; timeout::Real = 15.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("worker_state on '$worker_id'", "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict("type" => "worker_state", "request_id" => rid))
+        take_pending!(state, ch, rid, timeout, "worker_state on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("worker_state on '$worker_id': unexpected response shape")
+    haskey(resp, "error") && error(String(resp["error"]))
+    return Dict{String,Any}(resp)
+end
+
+"""
+    git_diff_on_worker(state, worker_id, path; base = "", timeout = 60.0)
+        -> (repo, branch, head, base, patch)
+
+Ask the worker for one unified diff of the git repository containing `path` —
+what the change-review tab shows. `base` empty means the working tree against
+`HEAD` (everything uncommitted, which is what an agent's turn produces);
+otherwise it's the working tree against that ref. Untracked files are included
+as synthetic "new file" sections, so files the agent CREATED are reviewable too.
+
+The patch comes back as raw text (transport: chunked as `git_diff_chunk`
+frames, so no single control frame ever carries the whole multi-MB patch) and
+is parsed by [`parse_unified_diff`](@ref) here on the server. `timeout` is
+generous: a first diff of a big repo (cold page cache, thousands of files)
+can take a while.
+"""
+function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
+                            path::AbstractString; base::AbstractString = "",
+                            timeout::Real = 60.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("git_diff on '$worker_id'", "worker is not connected"))
+    # Chunked reply, not one-frame: the patch runs to tens of MB on a busy
+    # repo, and a single giant frame stalls BOTH sides (the worker's send holds
+    # the ws send lock while its inline pong queues behind it; the server's
+    # inline decode falls behind its heartbeat). register_chunked_rpc! +
+    # deliver_chunk! reassemble the same value take_pending! returns here.
+    rid, ch = register_chunked_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict(
+            "type" => "git_diff", "request_id" => rid,
+            "path" => String(path), "base" => String(base)))
+        take_pending!(state, ch, rid, timeout, "git_diff on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("git_diff on '$worker_id': unexpected response shape")
+    haskey(resp, "error") && error(String(resp["error"]))
+    return (repo   = String(get(resp, "repo", "")),
+            branch = String(get(resp, "branch", "")),
+            head   = String(get(resp, "head", "")),
+            base   = String(get(resp, "base", "")),
+            # "" when the project IS the repo root; otherwise the sub-path the
+            # diff was limited to.
+            scope  = String(get(resp, "scope", "")),
+            patch  = String(get(resp, "patch", "")))
+end
+
+"""
+    find_repos_on_worker(state, worker_id, path; max_depth = 4, timeout = 15.0)
+        -> (repos, truncated, unreadable)
+
+The git checkouts at or under `path` **on the worker**, for the review tab's
+folder picker. A project folder is routinely a workspace holding several
+checkouts rather than being one itself, and the server cannot answer this by
+looking at its own filesystem.
+
+`timeout` is short on purpose. This runs while a tab is opening and the answer
+is a convenience — the picker still works from the project folder alone if the
+scan is slow or the worker is busy, so waiting a minute for it would trade the
+thing the user asked for against the thing they can already do.
+"""
+function find_repos_on_worker(state::ServerState, worker_id::AbstractString,
+                              path::AbstractString; max_depth::Int = 4,
+                              timeout::Real = 15.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("find_repos on '$worker_id'", "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict(
+            "type" => "find_repos", "request_id" => rid,
+            "path" => String(path), "max_depth" => max_depth))
+        take_pending!(state, ch, rid, timeout, "find_repos on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("find_repos on '$worker_id': unexpected response shape")
+    haskey(resp, "error") && error(String(resp["error"]))
+    repos = String[String(p) for p in get(resp, "repos", [])]
+    return (repos      = repos,
+            truncated  = get(resp, "truncated", false) === true,
+            unreadable = Int(get(resp, "unreadable", 0)))
 end
 
 """

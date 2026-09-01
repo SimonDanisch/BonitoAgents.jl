@@ -38,7 +38,7 @@ subscription.
 ```
 
 Agents are pluggable [ACP](https://agentclientprotocol.com) providers:
-Claude Code by default, with MiMo and OpenCode adapters included
+Claude Code by default, with MiMo, OpenCode and Kimi Code adapters included
 ([`AgentProviders/`](AgentProviders/)).
 
 ## Features
@@ -46,13 +46,19 @@ Claude Code by default, with MiMo and OpenCode adapters included
 - Chats stream in live, with Monaco diff viewers for edits, terminal output
   for shell commands, inline images, and the agent's todo list pinned while
   it works.
-- A file tree and Monaco editor per project. Files open fresh from the
-  worker and save back to it. Panels (chats, editors, app embeds) arrange
-  into tabs, splits and floating windows.
+- A file tree per project, and a viewer that opens ANY file as a tab —
+  images, video and audio streamed from the worker, rendered markdown,
+  CSVs as sortable tables, notebooks with their outputs, 3D geometry,
+  PDF/HTML, source in Monaco, opaque bytes as a hex dump. Text-backed files
+  edit in place and save back to the worker. Panels (chats, files, app
+  embeds) arrange into tabs, splits and floating windows.
+- A change-review tab: the project's git diff with a comment on any line or
+  block, either asked into the chat immediately or batched into one
+  instruction for the agent to work through.
 - Agents get MCP tools backed by a persistent Julia session per project:
-  `julia_eval` with warm state and disciplined output, `bt_show` for media,
-  and `bt_show_app` to embed a running Bonito app whose interactions round
-  trip to Julia on the worker.
+  `julia_eval` with warm state and disciplined output, `bt_show` to render
+  any worker-side file into the chat, and `bt_show_app` to embed a running
+  Bonito app whose interactions round trip to Julia on the worker.
 - Chats persist on disk, browser reconnects resume where you left off, and
   existing Claude Code sessions on a worker can be imported with their
   history.

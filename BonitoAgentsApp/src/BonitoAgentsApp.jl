@@ -62,30 +62,18 @@ across launches:
 `port = nothing` picks a free ephemeral port. Returns an [`AppHandle`](@ref);
 `close(handle)` kills the worker process, then stops the server.
 """
-# In an AppBundler bundle, AppEnv configures the package environment by
-# mutating THIS process's LOAD_PATH/DEPOT_PATH arrays only. Child julia
-# processes (the BonitoMCP session the worker spawns per chat) run with
-# --startup-file=no and would start with default paths — unable to find any
-# bundled package. Exporting the resolved paths makes children inherit them;
-# in a plain dev run this is a no-op-ish reaffirmation of the same paths.
-function export_julia_env!()
-    sep = Sys.iswindows() ? ';' : ':'
-    # `Base.load_path()` — the RESOLVED absolute project paths — not the raw
-    # `LOAD_PATH` tokens. A child that inherits `JULIA_LOAD_PATH="@:@v#.#:@stdlib"`
-    # but sets no `--project` resolves `@` to *its own* (empty) active project and
-    # can't find our packages — exactly what broke the spawned worker
-    # (`-m BonitoAgentsApp worker` → "Package BonitoAgentsApp not found"). The
-    # expanded paths resolve identically in any child.
-    ENV["JULIA_LOAD_PATH"]  = join(Base.load_path(), sep)
-    ENV["JULIA_DEPOT_PATH"] = join(DEPOT_PATH, sep)
-    return
-end
-
 # Command that re-execs THIS process as `bonitoagents worker`. `Base.julia_cmd()`
 # carries the same interpreter + sysimage (`-J`), so in a bundle the worker reuses
-# the app's baked-in precompilation instead of compiling from scratch; LOAD_PATH/
-# DEPOT_PATH are exported into ENV by `export_julia_env!` and inherited by the
-# child, so `-m BonitoAgentsApp` resolves to the same code. One binary, two roles.
+# the app's baked-in precompilation instead of compiling from scratch.
+#
+# The child needs ONE thing to resolve `-m BonitoAgentsApp`: our project. It gets
+# it as `--project`, on its own command line, because `Base.julia_cmd()` does not
+# carry one. This used to be done by exporting `JULIA_LOAD_PATH`/`JULIA_DEPOT_PATH`
+# into the process env — which every descendant then inherited, including the Malt
+# eval workers that are supposed to resolve against the USER'S project. BonitoMCP
+# grew a `worker_env()` whose only job was to undo that, and a test to pin the
+# undoing. A flag on one command replaces all of it: we never touch the ambient
+# environment, so nothing downstream has to repair it.
 function worker_command(; server_url, secret, worker_id, projects_root, data_dir)
     jl = Base.julia_cmd()
     # Opt-in tracing for the precompile harness: when BONITOAGENTS_TRACE_DIR is
@@ -96,7 +84,8 @@ function worker_command(; server_url, secret, worker_id, projects_root, data_dir
     tracedir = get(ENV, "BONITOAGENTS_TRACE_DIR", "")
     trace = isempty(tracedir) ? `` :
             `--trace-compile=$(joinpath(tracedir, "worker-$(worker_id).jl"))`
-    return `$jl $trace --startup-file=no -m BonitoAgentsApp worker
+    return `$jl $trace --startup-file=no --project=$(Base.active_project())
+            -m BonitoAgentsApp worker
             --server-url=$server_url --secret=$secret --worker-id=$worker_id
             --projects-root=$projects_root --data-dir=$data_dir`
 end
@@ -122,7 +111,6 @@ function stop_worker_proc!(proc::Base.Process; grace_s::Real = 1.5)
 end
 
 function start_app(; port::Union{Int,Nothing} = nothing)
-    export_julia_env!()
     root        = data_root()
     state_dir   = mkpath(joinpath(root, "state"))
     working_dir = mkpath(joinpath(root, "working"))
@@ -316,7 +304,6 @@ function run_server(args)
     working_dir = get(opts, "working-dir", mkpath(joinpath(root, "working")))
     secret = get(opts, "secret", "")
     isempty(secret) && (secret = BonitoAgents.persisted_worker_secret(state_dir))
-    export_julia_env!()
     BonitoAgents.serve(;
         host          = get(opts, "host", "0.0.0.0"),
         port          = parse(Int, get(opts, "port", "8038")),
@@ -344,7 +331,6 @@ function run_worker(args)
     ENV["BONITOAGENTS_CONFIG_DIR"] = mkpath(joinpath(root, "worker-config"))
     worker_id = get(opts, "worker-id", "")
     isempty(worker_id) && (worker_id = BonitoWorker.load_or_generate_worker_id())
-    export_julia_env!()
     BonitoWorker.connect_and_serve(;
         server_url    = opts["server-url"],
         secret        = opts["secret"],

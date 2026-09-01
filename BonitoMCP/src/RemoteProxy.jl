@@ -87,10 +87,44 @@ Bonito.proxy_asset_add(d::BridgeDriver, key, mime, total, cached) =
 Bonito.proxy_asset_remove(d::BridgeDriver, key) =
     send_control(d, Dict("op" => "asset_remove", "key" => key))
 
-# ── The bridge: one long-lived proxied root session over the dial-back driver ─
+# A DATA frame for a per-page proxied root carries that root's prefix so the host
+# can demux it to the right browser tab: `[TAG_DATA][UInt8 len][prefix][payload]`.
+# CTRL/asset frames stay bare (shared across pages). A prefix is a uuid (≤255), so
+# one length byte suffices. Rides the same pending/flush path as `send_frame`.
+function send_frame_prefixed(d::BridgeDriver, prefix::AbstractString, payload::AbstractVector{UInt8})
+    pfx = codeunits(String(prefix))
+    env = Vector{UInt8}(undef, length(pfx) + 1 + length(payload))
+    @inbounds env[1] = UInt8(length(pfx))
+    copyto!(env, 2, pfx, firstindex(pfx), length(pfx))
+    copyto!(env, 2 + length(pfx), payload, firstindex(payload), length(payload))
+    send_frame(d, TAG_DATA, env)
+    return nothing
+end
+
+# Per-page proxied root driver: tags DATA with its page prefix so the host routes
+# it to the owning tab; asset verbs DELEGATE to the shared `BridgeDriver` (assets
+# are content-addressed and served once for all pages → cross-page asset dedup,
+# while object caches stay per page-root). The registry root uses one too (its
+# frames envelope with the registry prefix and the host simply has no tab bound
+# to it), so EVERY DATA frame is enveloped — no ambiguous bare-vs-tagged parse.
+struct PageDriver
+    bridge::BridgeDriver
+    prefix::String
+end
+Bonito.proxy_send(pd::PageDriver, bytes) = send_frame_prefixed(pd.bridge, pd.prefix, bytes)
+Bonito.proxy_asset_add(pd::PageDriver, key, mime, total, cached) =
+    Bonito.proxy_asset_add(pd.bridge, key, mime, total, cached)
+Bonito.proxy_asset_remove(pd::PageDriver, key) = Bonito.proxy_asset_remove(pd.bridge, key)
+
+# ── The bridge: a worker-global value registry + one proxied root per browser ─
+# page, all multiplexed over the one dial-back driver. `parent` holds the parked
+# value holders (page-invisible, never rendered); `page_roots` are the real
+# per-tab render roots (own object cache = §0 per-page scope), keyed by prefix.
 mutable struct RemoteBridge
     parent::Bonito.Session
     driver::BridgeDriver
+    page_roots::Dict{String, Bonito.Session}
+    plock::ReentrantLock
 end
 
 const BRIDGE = Ref{Union{Nothing, RemoteBridge}}(nothing)
@@ -113,7 +147,7 @@ event down the dial-back socket.
 function RemoteBridge(; compression::Bool = false)
     prefix = string(Bonito.uuid4())
     driver = BridgeDriver()
-    conn   = Bonito.ProxyConnection(prefix, driver)
+    conn   = Bonito.ProxyConnection(prefix, PageDriver(driver, prefix))
     parent = Bonito.Session(conn; id = prefix,
                             asset_server = Bonito.ProxyAssetServer(driver),
                             compression_enabled = compression)
@@ -121,7 +155,42 @@ function RemoteBridge(; compression::Bool = false)
     # writes reach the browser through the host relay — mark it ready so
     # `close`ing a subsession can emit `free_session` through the bridge.
     isready(parent.connection_ready) || put!(parent.connection_ready, true)
-    return RemoteBridge(parent, driver)
+    return RemoteBridge(parent, driver, Dict{String, Bonito.Session}(), ReentrantLock())
+end
+
+# One proxied root per browser page. A real ROOT (no parent) so Bonito auto-spawns
+# its inbox reader — browser→worker dispatch is free. Its `asset_server` is the
+# bridge's SHARED one (cross-page asset dedup); its object cache is its own
+# (per-page dedup). Frames envelope with `prefix` via `PageDriver`.
+function open_page_root!(b::RemoteBridge; compression::Bool = false)
+    prefix = string(Bonito.uuid4())
+    conn = Bonito.ProxyConnection(prefix, PageDriver(b.driver, prefix))
+    pr = Bonito.Session(conn; id = prefix,
+                        asset_server = b.parent.asset_server,
+                        compression_enabled = compression)
+    isready(pr.connection_ready) || put!(pr.connection_ready, true)
+    lock(b.plock) do
+        b.page_roots[prefix] = pr
+    end
+    return prefix
+end
+
+function close_page_root!(b::RemoteBridge, prefix::AbstractString)
+    pr = lock(b.plock) do
+        pop!(b.page_roots, String(prefix), nothing)
+    end
+    pr === nothing || close(pr)
+    return nothing
+end
+
+# The page-root for `prefix`, or the registry `parent` if the frame targets it
+# (its holders are never mounted, so this is only a defensive fallback).
+function page_root_for(b::RemoteBridge, prefix::AbstractString)
+    p = String(prefix)
+    p == b.parent.id && return b.parent
+    lock(b.plock) do
+        get(b.page_roots, p, nothing)
+    end
 end
 
 """
@@ -135,8 +204,11 @@ function ensure_bridge!(; compression::Bool = false)
     if BRIDGE[] === nothing
         BRIDGE[] = RemoteBridge(; compression)
         # Log every (re)build with the prefix — a rebuild starts a fresh proxied
-        # parent session, which is otherwise invisible.
-        @info "RemoteProxy: BRIDGE built" prefix = BRIDGE[].parent.id
+        # parent session, which is otherwise invisible. `@debug`, NOT `@info`:
+        # this runs inside the EVAL WORKER, whose stdout/stderr IS the
+        # `bt_julia_eval` tool result, so anything above debug level surfaces in
+        # the agent's output as noise attached to unrelated user code.
+        @debug "RemoteProxy: BRIDGE built" prefix = BRIDGE[].parent.id
     end
     return BRIDGE[].parent.id
 end
@@ -187,7 +259,7 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
         backoff = connected ? min_backoff : min(backoff * 2, max_backoff)
         sleep(backoff)
     end
-    @info "RemoteProxy: dial loop exiting (BRIDGE cleared)"
+    @debug "RemoteProxy: dial loop exiting (BRIDGE cleared)"   # eval-worker stdout ⇒ agent output
     return
 end
 
@@ -226,7 +298,9 @@ function stop_dial!(; timeout::Float64 = 10.0)
         try
             ws = b.driver.ws[]
             ws === nothing || close(ws)        # unblock serve_bridge if connected
-        catch
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "stop_dial!: closing dial-back ws failed (already gone?)" exception = e
         end
     end
     t = DIAL_TASK[]
@@ -263,7 +337,7 @@ function serve_bridge(ws)
                 write_frame(ws, buf)
             end
             empty!(d.pending)
-            @info "RemoteProxy: flushed buffered frames on dial-back connect" frames = n
+            @debug "RemoteProxy: flushed buffered frames on dial-back connect" frames = n
         end
     end
     try
@@ -272,11 +346,20 @@ function serve_bridge(ws)
                    Vector{UInt8}(codeunits(String(msg)))
             isempty(data) && continue
             tag = @inbounds data[1]
-            payload = Vector{UInt8}(@view data[2:end])
             if tag == TAG_DATA
-                # Inbound Bonito frame → stock inbox dispatch (kept in order).
-                isopen(b.parent.inbox) && put!(b.parent.inbox, payload)
+                # Enveloped `[len][prefix][frame]` → the owning page-root's inbox,
+                # whose auto-spawned reader runs `process_message` in order.
+                plen = Int(@inbounds data[2])
+                prefix = String(@view data[3:2+plen])
+                frame  = Vector{UInt8}(@view data[3+plen:end])
+                pr = page_root_for(b, prefix)
+                if pr === nothing
+                    @warn "RemoteProxy: inbound frame for unknown page-root (tab closed?)" prefix
+                elseif isopen(pr.inbox)
+                    put!(pr.inbox, frame)
+                end
             elseif tag == TAG_CTRL
+                payload = Vector{UInt8}(@view data[2:end])
                 # Control can render (slow) or read assets — run it OFF the receive
                 # loop so it never starves inbound frames; guard so one bad control
                 # frame can't kill the bridge.
@@ -318,7 +401,7 @@ end
 function remote_ref(@nospecialize(value))
     parent = get_parent_session()
     holder = Bonito.Session(parent)
-    holder.current_app[] = Bonito.App(display_value(bound_for_render(value)))
+    holder.current_app[] = display_app(value)
     return holder.id
 end
 
@@ -345,17 +428,39 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             url = Bonito.url(b.parent.asset_server, Bonito.Asset(path_str))
             mt  = isfile(path_str) ? round(Int, mtime(path_str)) : 0
             send_control(d, Dict("op" => "reply", "id" => id, "val" => url * "?v=" * string(mt)))
+        elseif op == "open_root"
+            # A browser tab's first embed → mint its per-page proxied root; the
+            # host binds this prefix to that tab's connection and routes by it.
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => open_page_root!(b)))
+        elseif op == "close_root"
+            close_page_root!(b, String(msg["root"]))
         elseif op == "close"
-            s = Bonito.get_session(b.parent, String(msg["sub"]))
+            # A render-sub lives under its page-root (id is "pageprefix/uuid").
+            sid = String(msg["sub"])
+            pr = page_root_for(b, first(split(sid, '/')))
+            s = pr === nothing ? nothing : Bonito.get_session(pr, sid)
             s === nothing || close(s)
+        elseif op == "evict"
+            # Free a parked eval RESULT: close its holder (a sub of the registry),
+            # dropping `current_app` — the value, its observables, and a plot's
+            # scene/GPU data — so a heavy page of apps can reclaim worker memory on
+            # demand. A later re-mount of this id fails fast → the embed shows freed.
+            h = Bonito.get_session(b.parent, String(msg["sub"]))
+            h === nothing || close(h)
         elseif op == "mount"
+            # The VALUE holder lives in the registry (`parent`); it is RENDERED as
+            # a fresh sub of the requesting tab's PAGE-ROOT (per-page cache), never
+            # of the holder — so each tab gets its own §0-compliant copy.
             holder = Bonito.get_session(b.parent, String(msg["sub"]))
             holder === nothing &&
                 error("result session $(msg["sub"]) not found (worker restarted or result evicted)")
             app = holder.current_app[]
             app === nothing && error("result session $(msg["sub"]) holds no app")
+            pr = page_root_for(b, String(msg["root"]))
+            pr === nothing &&
+                error("page root $(msg["root"]) not found (tab closed or worker reconnected)")
             Bonito.force_subsession!(true)
-            sub = Bonito.update_session_dom!(holder, String(msg["node"]), app)
+            sub = Bonito.update_session_dom!(pr, String(msg["node"]), app)
             send_control(d, Dict("op" => "reply", "id" => id, "val" => sub.id))
         end
     catch e
@@ -366,7 +471,9 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             try
                 send_control(d, Dict("op" => "reply", "id" => id,
                                      "err" => sprint(showerror, e)))
-            catch
+            catch reply_e
+                reply_e isa InterruptException && rethrow()
+                @debug "handle_control: sending error reply to host failed" exception = reply_e
             end
         end
         rethrow()
@@ -409,21 +516,86 @@ function bound_for_render(s::AbstractString)
 end
 bound_for_render(@nospecialize x) = x
 
-# A returned String renders through Bonito's plain-text child path
-# (`jsrender(::Session, ::String)` returns the string as-is), which never hits
-# the `render_mime` ANSI handling — so a result string carrying ANSI codes
-# (e.g. from `sprint` with color) would show raw escapes while the SAME text on
-# stdout renders as a colored terminal block. Route ANSI strings through
-# `RichText` so both paths display alike.
+# `jsrender(::Session, ::String)` hands the string straight back. That is legal
+# as a node's CHILD but not as an App's ROOT: `session_dom` has methods for `App`
+# and `Node` only, so a bare-text result raised a MethodError there — which
+# Bonito catches and turns into an error page. The SNAPSHOT render (`show_html`)
+# wraps the text and looked right, so the chat displayed the value and then
+# REPLACED it with a stacktrace the moment the live bridge re-rendered it
+# (`update_session_dom!` → `render_subsession` → `session_dom`).
+#
+# Returning a Node is the fix, and `RichText` is the right one: it is already
+# where ANSI strings go, so a result string renders alike with or without escape
+# codes (previously they took different paths and only one of them worked), and
+# its `white-space: pre-wrap` keeps a multi-line result's line breaks. `Symbol`
+# reaches the same raw-text path; `nothing` is handled inside Bonito.
 display_value(@nospecialize x) = x
-display_value(s::AbstractString) =
-    Bonito.has_ansi_codes(String(s)) ? Bonito.RichText(String(s)) : s
+display_value(s::AbstractString) = Bonito.RichText(String(s))
+display_value(s::Symbol) = Bonito.RichText(repr(s))
 # Callables would be swallowed by `App`'s handler constructor (`App(sqrt)`
 # reads as "sqrt IS the app" and rejects its signature) — show them as the
 # REPL would instead. Matches `App`'s handler dispatch surface exactly
 # (functions AND types are callable).
 display_value(f::Union{Function, Type}) =
     Bonito.RichText(sprint(show, MIME"text/plain"(), f; context = :color => true))
+
+# The display App for an eval RESULT value — shared by the live embed
+# (`remote_ref` parks it) and the agent-facing summary (`summary_html` renders
+# it). `App(value)` IS the whole renderer (per-type `jsrender`); callables/ANSI
+# strings are normalized by `display_value`, huge strings bounded up front.
+# A value that IS ALREADY an `App` is used directly — never re-wrapped as
+# `App(App(...))`. The double wrap routes the inner App's render error through
+# Bonito's `handle_render_error` (swallowed into error-HTML) BEFORE
+# `summary_html`'s catch could turn it into a `CapturedException`, so the render
+# error would never reach the agent as an error.
+display_app(app::Bonito.App) = app
+display_app(@nospecialize value) = Bonito.App(display_value(bound_for_render(value)))
+
+# ── Agent-facing summary: the returned App's DOM as compact, assetless HTML ───
+# The agent gets the REAL rendered DOM — not a live embed (that's the browser
+# mount) and not a bare note. We render the App body on a throwaway NoConnection
+# session, which does two things at once:
+#   * the `App() do … end` body RUNS here, inside the eval's captured stdout — a
+#     render-time error (bad Makie attribute, …) is caught and RETURNED as a
+#     `CapturedException`, so the caller surfaces it like any eval error instead
+#     of it failing silently at mount.
+#   * `print` of the jsrendered node is just the DOM tree; it skips the init
+#     bundle (that lives in `session_dom(...; init=true)`, which we never call).
+# `StubAssetServer` is the one lever that keeps the HTML small: `url` returns a
+# short marker instead of `NoServer`'s base64 `data:` URL, so images/assets never
+# inline their bytes into the agent's context.
+struct StubAssetServer <: Bonito.AbstractAssetServer end
+Base.similar(s::StubAssetServer) = s
+Bonito.url(::StubAssetServer, a::Bonito.BinaryAsset) = "[binary:$(a.mime):$(length(a.data))B]"
+Bonito.url(::StubAssetServer, a::Bonito.Asset) =
+    isempty(a.online_path) ? "[asset:$(Bonito.mediatype(a))]" : a.online_path
+# es6 modules interpolated in inline `js""` scripts reference the import key and
+# never inline (mirrors `NoServer`; `render_asset`/`session_dom` aren't hit on
+# this path, so the other asset-server verbs aren't needed).
+function Bonito.import_in_js(io::IO, session::Bonito.Session, ::StubAssetServer, asset::Bonito.Asset)
+    push!(session.imports, asset)
+    print(io, "BONITO_IMPORTS['$(Bonito.unique_key(asset))']")
+end
+
+# Returns the compact HTML `String` on success, or the `CapturedException` a
+# render-time failure threw (a VALUE — the caller decides how to surface it). The
+# inner try/catch RETURNS the error, it never swallows it; the try/finally is
+# session cleanup only.
+function summary_html(@nospecialize value)
+    s = Bonito.Session(Bonito.NoConnection(); asset_server = StubAssetServer())
+    try
+        dom = try
+            app = display_app(value)
+            d = Base.invokelatest(app.handler, s, Bonito.HTTP.Request())
+            Base.invokelatest(Bonito.jsrender, s, d)
+        catch e
+            return CapturedException(e, Base.catch_backtrace())
+        end
+        return sprint(print, dom)
+    finally
+        close(s)
+    end
+end
 
 function render_eval_html(value)
     parent = get_parent_session()

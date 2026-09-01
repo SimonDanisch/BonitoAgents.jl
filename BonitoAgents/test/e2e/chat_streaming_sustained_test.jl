@@ -120,7 +120,7 @@
         TK.eval_js(s, """
             (() => { const n = document.querySelector('.bt-messages');
                 const ch = n.__bt_chat;
-                if (ch) { ch.setFollowMode(false); if (ch._cancelPendingScroll) ch._cancelPendingScroll(); }
+                if (ch) { ch.setFollowMode(false); if (ch.cancelPendingScroll) ch.cancelPendingScroll(); }
                 n.scrollTop = 0; n.dispatchEvent(new Event('scroll'));
                 return true; })()""")
 

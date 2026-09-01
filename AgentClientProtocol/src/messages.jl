@@ -7,8 +7,6 @@
 # message and drains that bubble's stream with `append!`. The wire-parse types
 # (`AgentMessageChunk`, `ToolCallNotif`, …) never escape this file.
 
-abstract type Message end
-
 const ToolContent = Union{TextContent, DiffContent, ImageContent}
 
 mutable struct AgentMessage <: Message
@@ -111,7 +109,31 @@ end
 
 struct Plan <: Message
     entries::Vector{PlanEntry}
+    # False = this plan's stream is over; it will never be updated again.
+    #
+    # The protocol has no "plan ended" frame: the agent resends the whole entry
+    # list, and each ENTRY carries pending/in_progress/completed. That is enough
+    # for a plan the agent finishes (every entry completed) but says nothing
+    # about one it ABANDONS — the turn is cancelled, the agent dies, the worker
+    # goes away — and an abandoned plan's entries simply stay where they were.
+    # A consumer with only the entries to go on cannot tell "still working on
+    # 0/4" from "stopped, having done 0/4", so it shows it as live forever
+    # (observed: todo pills counting past 35 hours).
+    #
+    # This is the STREAM's answer, and `close_turn!` is the single place it is
+    # given — the same one that force-fails live tools, on the same events. It is
+    # not the only way a plan ends (an agent that works its entries to terminal
+    # ends it by status, and an episode that simply STOPS is visible to a
+    # consumer as `session_activity` — neither needs a frame). It is the one that
+    # covers a stream dying under a live plan, which nothing else can see.
+    #
+    # The entries are left EXACTLY as the agent last reported them: sealing is a
+    # property of the plan, not a status we forge onto its entries. Tools get
+    # `failed` here because the protocol HAS that status for a tool; plan entries
+    # have no equivalent, and inventing one would misreport what the agent said.
+    live::Bool
 end
+Plan(entries::Vector{PlanEntry}) = Plan(entries, true)
 
 # Session-config changes mid-turn. Metadata, not content: they don't open a
 # bubble and don't close the currently-streaming message.
@@ -173,6 +195,22 @@ end
 drain_message!(m::Plan) = m
 drain_message!(m::ConfigUpdate) = m
 drain_message!(m::ModeUpdate) = m
+drain_message!(m::StreamFlush) = m
+
+# Same question as `is_agent_work(::SessionUpdate)`, asked of a coalesced
+# message: is this the agent DOING something, or telling us about the session?
+#
+# A renderer reads it to decide whether an AUTO-WAKE EPISODE has begun — the
+# agent talking with no prompt open. Session metadata (config/mode/usage/
+# commands) arrives on bind and at turn boundaries, so counting it would open an
+# episode on a chat that has done nothing.
+is_agent_work(::Message)        = true
+is_agent_work(::ConfigUpdate)   = false
+is_agent_work(::ModeUpdate)     = false
+is_agent_work(::UsageUpdate)    = false
+is_agent_work(::CommandsUpdate) = false
+is_agent_work(::StreamFlush)    = false
+
 
 # ── Wire → typed dispatch ────────────────────────────────────────────────────
 # One place maps Claude Code's tool name to a concrete `ToolCall` subtype.
@@ -295,12 +333,12 @@ GenericTool(id::AbstractString, kind::AbstractString, title::AbstractString,
                 "", Dict{String,Any}())
 
 # ── Subagent activity ────────────────────────────────────────────────────────
-# One subagent event, distilled from a `SubagentUpdate` for the turn's
-# `on_subagent` sink. NOT a `Message`: it is delivered out-of-band (a direct
-# sink call from the parse loop), never through the turn's message channel —
-# the sequential message consumer can be parked inside a long-running tool's
-# snapshot drain, which would starve a channel-delivered feed of exactly the
-# live updates it exists to show.
+# One subagent event, distilled from a `SubagentUpdate` for the subagent that
+# owns it. NOT a `Message`: it never travels the main thread's message channel —
+# that consumer can be parked inside a long-running tool's snapshot drain (often
+# the very Task tool the subagent belongs to), which would starve the feed of
+# exactly the live updates it exists to show. Built straight from the addressed
+# update by the owner's consumer; see `subagent_activity`.
 struct SubagentActivity
     parent_id::String    # the parent Task's tool_use id
     kind::Symbol         # :text | :thought | :tool
@@ -309,27 +347,30 @@ struct SubagentActivity
     status::String       # subagent tool status; "" for text/thought
 end
 
-# ── Per-turn parser ─────────────────────────────────────────────────────────
-# State local to a single prompt loop: the text message currently being
+# ── Stream parser ───────────────────────────────────────────────────────────
+# The coalescing state of ONE update stream: the text message currently being
 # streamed (if any) plus the set of tools still awaiting completion.
+#
+# A `TurnState` outlives any single turn — the main thread's stream is
+# continuous, and `close` is a BOUNDARY on it (end of prompt, start of the
+# next), not the end of its life. So `close` leaves the state clean and
+# reusable rather than spent.
 mutable struct TurnState
     current_message::Union{Message,Nothing}
     tools::Dict{String,ToolCall}
     # Everything the current text message has received so far — used by
     # `text!` to drop claude-agent-acp's handoff duplicate (see there).
     acc::String
-    # Out-of-band sink for subagent-tagged updates (`SubagentUpdate`), called
-    # with each `SubagentActivity` from the parse loop. `nothing` (the
-    # default) drops them — they must NEVER fall through into the main
-    # message stream. Must be fast and non-throwing; it runs on the turn's
-    # coalescer task.
-    on_subagent::Union{Function,Nothing}
+    # The last plan the agent sent, or `nothing` once it has been sealed. Held
+    # for the same reason `tools` is: it is a LIVE thing the stream can end in
+    # the middle of, and whatever ends the stream has to finish it. The agent
+    # always resends the whole list, so last-one-wins is the whole state.
+    plan::Union{Vector{PlanEntry},Nothing}
 end
 TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "", nothing)
-TurnState(on_subagent::Union{Function,Nothing}) =
-    TurnState(nothing, Dict{String,ToolCall}(), "", on_subagent)
 
-# Closing the turn finishes the trailing message and any still-open tools.
+# Closing the stream at a boundary finishes the trailing message and any
+# still-open tools, and leaves the state ready for what comes next.
 #
 # Any tool still in `st.tools` is one the agent NEVER reported terminal for —
 # the turn ended (cancel, EOF, peer hang-up) before its `tool_call_update` with
@@ -337,9 +378,33 @@ TurnState(on_subagent::Union{Function,Nothing}) =
 # snapshot through its `updates` channel BEFORE closing, so downstream consumers
 # (BonitoAgents's `process_update!`) see a terminal status and finalize naturally —
 # instead of draining a channel that just-closed with the status frozen mid-flight.
-function Base.close(st::TurnState)
+# Seal the trailing TEXT message at a boundary — and NOTHING else.
+#
+# A boundary is not the end of the stream. A tool call routinely spans one: an
+# eval runs for minutes while you send another message, and `begin_turn` puts a
+# marker on the stream before it prompts. `close` force-fails every live tool
+# and empties `st.tools`, so past that point every `tool_call_update` for the
+# running eval finds no tool and is dropped — its card freezes at `in_progress`
+# with an empty CODE and OUTPUT while the eval is still going.
+#
+# Tools the agent genuinely abandons are not lost by leaving them here: the chat
+# layer closes each bubble in its drain `finally`,
+# and it deliberately runs only for the LAST turn precisely so a handoff doesn't
+# force-fail its successor's live tools.
+function seal_message!(st::TurnState)
     st.current_message === nothing || close(st.current_message)
     st.current_message = nothing
+    st.acc = ""            # the handoff-duplicate window ends with the message
+    return nothing
+end
+
+# Finish EVERYTHING the stream can end in the middle of. Takes `out` (rather
+# than being a `close(st)` you can call anywhere) on purpose: sealing the plan
+# needs the main stream, and a one-argument version would be a second door that
+# a future caller could walk through while forgetting the plan — which is how
+# plans came to outlive their episodes in the first place.
+function close_turn!(out::Channel, st::TurnState)
+    seal_message!(st)
     for tc in values(st.tools)
         if !is_terminal(tc.status)
             tc.status = "failed"
@@ -348,6 +413,15 @@ function Base.close(st::TurnState)
         close(tc)
     end
     empty!(st.tools)
+    if st.plan !== nothing
+        entries = st.plan
+        st.plan = nothing
+        # Bounded channel, so this CAN block if the consumer stopped draining —
+        # the same exposure every `put!(out, …)` in the parse loop already has,
+        # and reaching here means the loop was draining until a moment ago. Not
+        # risk-free, but the alternative (dropping the seal) is the bug.
+        isopen(out) && put!(out, Plan(entries, false))
+    end
     return nothing
 end
 
@@ -425,6 +499,55 @@ function merge_late_input!(tc::TaskCall, ri::AbstractDict)
     return nothing
 end
 
+# Do we already know this call's arguments? Each variant answers for the field
+# it would actually show, so the streamed-input recovery below stays dormant the
+# moment real arguments exist — which for claude-agent-acp is immediately, since
+# it always sends them in `rawInput`.
+input_known(::ToolCall)         = true
+input_known(tc::GenericTool)    = !isempty(tc.raw_input)
+input_known(tc::MCPCall)        = !isempty(tc.raw_input)
+input_known(tc::BashCall)       = !isempty(tc.command)
+input_known(tc::TaskCall)       = !isempty(tc.prompt)
+input_known(tc::TodoWriteCall)  = !isempty(tc.entries)
+
+"""
+    streamed_input_text(tc, u) -> String or nothing
+
+The text of a `tool_call_update` that is the agent STREAMING this call's
+arguments rather than reporting output, or `nothing` when the frame is ordinary
+content.
+
+Deliberately narrow, so an agent that reports output normally is never
+misread: it fires only when the frame carries no `rawInput` of its own, the
+call still has NO arguments at all, the frame is non-terminal, and its content
+is exactly one text block that opens a JSON object. claude-agent-acp always
+puts arguments in `rawInput`, so `input_known` is already true by the time any
+content arrives and this path stays dormant for it.
+"""
+function streamed_input_text(tc::ToolCall, u::ToolCallUpdateNotif)
+    u.raw_input === nothing || return nothing
+    input_known(tc) && return nothing
+    is_terminal(something(u.status, tc.status)) && return nothing
+    length(u.content) == 1 || return nothing
+    c = u.content[1]
+    c isa TextContent || return nothing
+    t = lstrip(c.text)
+    return startswith(t, "{") ? String(t) : nothing
+end
+
+# The streamed argument text is a complete JSON object only on the LAST
+# non-terminal frame; every earlier prefix is a parse error, which is the
+# expected steady state here and not something to report.
+function parse_json_object(s::AbstractString)
+    v = try
+        JSON.parse(s)
+    catch e
+        e isa InterruptException && rethrow()
+        return nothing
+    end
+    return v isa AbstractDict ? Dict{String,Any}(String(k) => x for (k, x) in v) : nothing
+end
+
 function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never touches the text bubble
     tc = get(st.tools, u.tool_call_id, nothing)
     tc === nothing && return nothing
@@ -432,7 +555,21 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
     u.title  !== nothing && (tc.title  = u.title)
     u.raw_input === nothing || merge_late_input!(tc, u.raw_input)
     u.tool_name === nothing || !(tc isa GenericTool) || (tc.name = u.tool_name)
-    isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+    # Agents that never send `rawInput` stream the tool's ARGUMENTS as content
+    # text instead (verified against kimi 0.29.2: 14 non-terminal frames going
+    # `{"code":"` → `{"code":"1` → … → the complete argument object, then one
+    # terminal frame whose content is the real result). Taking those at face
+    # value renders half-typed argument JSON as the tool's OUTPUT and leaves the
+    # arguments unknown — an eval card with a flickering Output pane and an
+    # empty Code box. Route them to the input instead, and don't let them
+    # overwrite content. See `streamed_input_text`.
+    args_text = streamed_input_text(tc, u)
+    if args_text === nothing
+        isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+    else
+        parsed = parse_json_object(args_text)
+        parsed === nothing || merge_late_input!(tc, parsed)
+    end
     # Async subagent: the `async_launched` update carries the transcript
     # `outputFile` in `_meta.claudeCode.toolResponse` — the only deterministic
     # completion signal (the tool_call itself is `completed` at launch). Capture
@@ -449,6 +586,9 @@ end
 
 function parse_update!(out, st, u::PlanUpdate)
     st.current_message === nothing || (close(st.current_message); st.current_message = nothing)
+    # Remember it, so whatever ends the stream can seal it. The agent resends
+    # the whole list every time, so the newest one is the state.
+    st.plan = u.entries
     put!(out, Plan(u.entries))
     return nothing
 end
@@ -463,19 +603,15 @@ parse_update!(out, st, u::UsageUpdateNotif) =
 parse_update!(out, st, u::AvailableCommandsUpdateNotif) =
     (put!(out, CommandsUpdate(u.commands)); nothing)
 
-# Subagent-tagged updates: NEVER coalesced into the main stream (no
-# current_message touch, no st.tools entry, nothing put! on `out`) — that
-# interleaving is exactly the bug this arm exists to prevent. Distill the
-# update into a `SubagentActivity` and hand it to the turn's sink; without a
-# sink (or for update kinds that carry no feed signal — plans, config, user
-# echoes) the update is dropped.
+# Subagent-tagged updates never reach a main-thread coalescer: the dispatcher
+# addresses them to their owner before any stream logic runs. This arm exists
+# for the one path that still feeds raw updates through a parser directly — a
+# `session/load` replay, whose captured stream can contain subagent-tagged
+# frames from the recorded history. They are not the live conversation and have
+# no owner to belong to (the replay predates every message), so drop them here
+# rather than let them interleave into the resumed transcript.
 function parse_update!(out, st, u::SubagentUpdate)
-    act = subagent_activity(u.parent_tool_use_id, u.update)
-    if act === nothing || st.on_subagent === nothing
-        @debug "ACP: dropping subagent update (no sink / no feed signal)" parent_tool_use_id = u.parent_tool_use_id typeof(u.update)
-        return nothing
-    end
-    st.on_subagent(act)
+    @debug "ACP: dropping replayed subagent update" parent_tool_use_id = u.parent_tool_use_id typeof(u.update)
     return nothing
 end
 

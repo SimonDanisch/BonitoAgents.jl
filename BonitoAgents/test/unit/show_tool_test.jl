@@ -20,12 +20,22 @@ using Bonito
 const BT = BonitoAgents
 
 # Classify what `render_show_file` produced without needing a live session.
+# Ordered most-specific first: a notebook contains a rendered markdown cell, so
+# the notebook wrapper has to be recognised before the markdown class.
 function show_kind(node)
     nameof(typeof(node)) === :MonacoEditor && return :text
     s = sprint(show, node)
+    occursin("bt-fv-notebook", s) && return :notebook
+    occursin("bt-mesh-view", s)   && return :mesh
+    occursin("bt-fv-table", s)    && return :table
+    occursin("bt-fv-markdown", s) && return :markdown
+    occursin("bt-fv-hex", s)      && return :binary
+    occursin("bt-fv-frame", s)    && return :frame
     occursin("<img", s)   && return :image
     occursin("<video", s) && return :video
+    occursin("<audio", s) && return :audio
     occursin("bt-tool-empty", s) && return :caption
+    occursin("bt-tool-error", s) && return :error
     return :unknown
 end
 
@@ -84,18 +94,102 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test_throws Exception BT.fetch_show_file(st_missing)
     end
 
+    # `file_kind` is the single decision point every renderer dispatches on —
+    # pure, so it's worth pinning exactly. The interesting cases are the ones
+    # that used to be lumped together as "not text": .ogg is AUDIO (not a video
+    # container), .ico and .svg are images, .pdf beats the binary-extension list,
+    # and anything unrecognised (including extensionless) stays TEXT rather than
+    # being refused.
+    @testset "file_kind dispatch" begin
+        k(p) = nameof(typeof(BT.file_kind(p)))
+        @test k("a.png") == :ImageFile
+        @test k("a.SVG") == :ImageFile        # case-insensitive
+        @test k("a.ico") == :ImageFile
+        @test k("a.mp4") == :VideoFile
+        @test k("a.ogv") == :VideoFile
+        @test k("a.ogg") == :AudioFile
+        @test k("a.flac") == :AudioFile
+        @test k("README.md") == :MarkdownFile
+        @test k("data.csv") == :TableFile
+        @test k("data.tsv") == :TableFile
+        @test k("nb.ipynb") == :NotebookFile
+        @test k("m.obj") == :MeshFile
+        @test k("m.glb") == :MeshFile
+        @test k("doc.pdf") == :PDFFile
+        @test k("page.html") == :HTMLFile
+        @test k("a.jl") == :TextFile
+        @test k("Makefile") == :TextFile      # extensionless still opens
+        @test k("weird.qqq") == :TextFile     # unknown extension still opens
+        @test k("bundle.zip") == :BinaryFile
+
+        # `editor_openable` is exactly "the Monaco editor can hold this".
+        @test BT.editor_openable("a.jl")
+        @test BT.editor_openable("Makefile")
+        @test !BT.editor_openable("a.png")
+        @test !BT.editor_openable("bundle.zip")
+
+        # Only kinds with a rendered view AND a text you'd want to fix offer the
+        # Preview/Source toggle.
+        @test BT.has_source_view(BT.MarkdownFile(), "a.md")
+        @test BT.has_source_view(BT.ImageFile(), "a.svg")
+        @test !BT.has_source_view(BT.ImageFile(), "a.png")
+        @test !BT.has_source_view(BT.VideoFile(), "a.mp4")
+    end
+
     @testset "render_show_file element selection" begin
         state = newstate()
         cwd = mktempdir()
         write(joinpath(cwd, "a.png"), UInt8[0x89,0x50,0x4e,0x47])
         write(joinpath(cwd, "v.mp4"), rand(UInt8, 32))
+        write(joinpath(cwd, "a.mp3"), rand(UInt8, 32))
         write(joinpath(cwd, "n.txt"), "hello")
-        write(joinpath(cwd, "x.bin"), rand(UInt8, 8))
+        write(joinpath(cwd, "x.bin"), UInt8[0,1,2,3,4,5,6,7])
+        write(joinpath(cwd, "r.md"),  "# Title\n\nbody text\n")
+        write(joinpath(cwd, "t.csv"), "name,value\nfoo,1\nbar,2.5\n")
+        write(joinpath(cwd, "m.obj"), "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+        write(joinpath(cwd, "p.html"), "<h1>hi</h1>")
+        write(joinpath(cwd, "nb.ipynb"),
+              """{"cells":[{"cell_type":"markdown","source":["# NB\\n"]},""" *
+              """{"cell_type":"code","source":["1+1\\n"],"outputs":[]}],""" *
+              """"metadata":{"kernelspec":{"language":"julia"}}}""")
+        # A `.txt` that is actually binary: the extension says text, the NUL
+        # sniff overrules it and we hex-dump instead of feeding Monaco garbage.
+        write(joinpath(cwd, "lying.txt"), UInt8[0x41, 0x00, 0x42, 0x43])
+
         kind(p) = show_kind(BT.render_show_file(BT.ShowTool(state, "", cwd, p)))
-        @test kind("a.png") == :image
-        @test kind("v.mp4") == :video
-        @test kind("n.txt") == :text
-        @test kind("x.bin") == :caption
+        @test kind("a.png")     == :image
+        @test kind("v.mp4")     == :video
+        @test kind("a.mp3")     == :audio
+        @test kind("n.txt")     == :text
+        @test kind("x.bin")     == :binary
+        @test kind("r.md")      == :markdown
+        @test kind("t.csv")     == :table
+        @test kind("m.obj")     == :mesh
+        @test kind("p.html")    == :frame
+        @test kind("nb.ipynb")  == :notebook
+        @test kind("lying.txt") == :binary
+    end
+
+    @testset "hex dump" begin
+        txt = BT.hexdump_text(Vector{UInt8}(codeunits("Hi!\x00\x01")))
+        @test occursin("00000000", txt)
+        @test occursin("48 69 21 00 01", txt)
+        @test occursin("|Hi!..|", txt)         # non-printables collapse to '.'
+        # Only the head is dumped, and the caller is told so (hexdump_node).
+        long = BT.hexdump_text(zeros(UInt8, 10_000); limit = 32)
+        @test count(==('\n'), long) == 2       # 32 bytes = 2 lines of 16
+    end
+
+    @testset "delimited parsing (csv / tsv)" begin
+        pd = BT.parse_delimited
+        @test pd("a,b\n1,2", ',') == [["a","b"], ["1","2"]]
+        @test pd("a,b\n1,2\n", ',') == [["a","b"], ["1","2"]]     # trailing newline
+        @test pd("a\tb\n1\t2", '\t') == [["a","b"], ["1","2"]]
+        # Quoted fields: the delimiter inside quotes is DATA, and "" is a quote.
+        @test pd("a,b\n\"x,y\",2", ',') == [["a","b"], ["x,y","2"]]
+        @test pd("a\n\"he said \"\"hi\"\"\"", ',') == [["a"], ["he said \"hi\""]]
+        # CRLF is stripped, not turned into a stray field.
+        @test pd("a,b\r\n1,2\r\n", ',') == [["a","b"], ["1","2"]]
     end
 
     @testset "Bonito HTTP Range support" begin

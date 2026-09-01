@@ -6,8 +6,16 @@
 # server restart takes (no live ChatModel involved).
 @testitem "unit:overview" tags = [:unit] begin
     import BonitoAgents
+    import AgentProviders
     const BT = BonitoAgents
     using Test
+
+    # Wrapper stripping is dispatched per provider (AgentProviders), and these
+    # are Claude's wrappers. Bound once here so the cases below read as before.
+    overview_user_snippet(t) =
+        BT.overview_user_snippet(AgentProviders.ClaudeCodeAgent(), t)
+    overview_snippets(msgs; kw...) =
+        BT.overview_snippets(msgs; provider = AgentProviders.ClaudeCodeAgent(), kw...)
 
     newstate() = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
                                 worker_secret = "x")
@@ -28,30 +36,30 @@
     end
 
     @testset "overview_user_snippet strips system noise" begin
-        @test BT.overview_user_snippet("plain prompt") == "plain prompt"
-        @test BT.overview_user_snippet(
+        @test overview_user_snippet("plain prompt") == "plain prompt"
+        @test overview_user_snippet(
             "<system-reminder>ctx</system-reminder>real question") == "real question"
-        @test BT.overview_user_snippet("[Request interrupted by user]") === nothing
-        @test BT.overview_user_snippet(
+        @test overview_user_snippet("[Request interrupted by user]") === nothing
+        @test overview_user_snippet(
             "do the thing [Request interrupted by user for tool use]") == "do the thing"
         # Attachment suffix never leaks into the snippet.
-        @test BT.overview_user_snippet(
+        @test overview_user_snippet(
             "see image\n\n[attached files in this message]\n  - .bt-attachments/a.png") ==
             "see image"
         # Pure system commentary → no snippet.
-        @test BT.overview_user_snippet("<ide_opened_file>The user opened x.jl") === nothing
+        @test overview_user_snippet("<ide_opened_file>The user opened x.jl") === nothing
     end
 
     @testset "overview_snippets: last N meaningful prompts, oldest first" begin
         msgs = BT.ChatMsg[
             BT.UserMsg("one"), BT.UserMsg("two"), BT.UserMsg("three"), BT.UserMsg("four"),
         ]
-        @test BT.overview_snippets(msgs; limit = 3) == ["two", "three", "four"]
+        @test overview_snippets(msgs; limit = 3) == ["two", "three", "four"]
         # Auto-continue nudges and system-only messages don't count.
         auto = BT.UserMsg("yolo auto-continue"); auto.auto = true
         msgs2 = BT.ChatMsg[BT.UserMsg("real"), auto,
                            BT.UserMsg("<system-reminder>x</system-reminder>")]
-        @test BT.overview_snippets(msgs2; limit = 3) == ["real"]
+        @test overview_snippets(msgs2; limit = 3) == ["real"]
     end
 
     @testset "recent_chat_cards: mtime order, limit, counts, persistence path" begin

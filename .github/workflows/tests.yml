@@ -142,24 +142,84 @@ jobs:
       fail-fast: false
       matrix:
         suite:
-          - workflows
-          - chat_features
-          - chat_close_rename
           - app_reload
-          - eval_embed_park
-          - leak_cycle
-          - scroll_persist
-          - streaming_flood
-          - errors
-          - lens
-          - file_open
-          - file_tree
-          - dashboard_layout
-          - tool_rendering
-          - todo_taskbar
-          - worker_lifecycle
+          - app_scroll
+          - attach_mobile
+          - auto_prompt
+          - background_tab
+          - bonito_upgrade
+          - bt_eval
+          - bt_eval_types
+          - bt_wait
+          - cancel_escalation
+          - cancel_misbehaving
+          - chat_attach
+          - chat_cancel
+          - chat_close_rename
+          - chat_controls
+          - chat_features
+          - chat_finalize_guard
+          - chat_remount
+          - chat_show
+          - chat_show_extras
+          - chat_streaming_sustained
+          - copy_project
           - cross_worker
+          - cross_worker_sync_ui
+          - dashboard_layout
+          - debug_chat
+          - edit_diff
+          - errors
+          - eval_embed_park
+          - file_download
+          - file_open
+          - file_open_fresh
+          - file_tree
+          - file_view
+          - filter_scroll
+          - folder_threads
+          - follow_pill
+          - header_collapse
+          - kimi_wire
+          - layout_fixes
+          - leak_cycle
+          - lens
+          - media
+          - model_search
+          - multipane
+          - new_project
           - outdated_worker
+          - overview
+          - panel_move_scroll
+          - queued_messages
+          - render_error
+          - resume_discover
+          - resume_eager_bind
+          - resume_no_jserrors
+          - review
+          - review_folder
+          - review_scope
+          - scroll_anchor
+          - scroll_chase
+          - scroll_persist
+          - session_changes
+          - session_sync
+          - smoke
+          - streamed_tool_input
+          - streaming_flood
+          - subagent_feed
+          - subagent_poll
+          - todo_taskbar
+          - todo_worker_death
+          - tool_rendering
+          - two_tab
+          - usage_commands
+          - virtual_scroll
+          - worker_lifecycle
+          - worker_move
+          - worker_zombie
+          - workflows
+          - yolo_mode
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -188,12 +248,29 @@ jobs:
       - name: 'E2E — ${{ matrix.suite }}'
         # Run the suite's `@testitem` through runtests.jl (it owns the
         # SharedServer setup + ReTestItems harness); the bare `e2e/<suite>.jl`
-        # is just the TestKit logic and isn't standalone-runnable. The arg is a
-        # name filter → `e2e:<suite>`. ONE worker = one dev_server (no fan-out),
-        # hardcoded in runtests.jl — no env knob.
+        # is just the TestKit logic and isn't standalone-runnable. ONE worker =
+        # one dev_server (no fan-out), hardcoded in runtests.jl — no env knob.
+        #
+        # The filter is `Regex(join(ARGS,"|"))` matched against testitem names,
+        # so it is FULLY ANCHORED — `^e2e:<suite>$`, one suite per job.
+        #
+        # Anchoring to the e2e namespace alone is not enough. A bare `file_tree`
+        # also matches `unit:file_tree`, which starts its OWN dev_server + worker
+        # subprocess inside this job's process — two servers and two workers at
+        # once, and the e2e tree then reads an empty/foreign project (reproduced
+        # locally: `e2e:file_tree` passes 19/19 alone and 10/19 under the bare
+        # filter). `lens` and `cross_worker` pulled in unit items the same way.
+        #
+        # The trailing `$` matters just as much, because four suites are prefix-
+        # contained in a sibling: bt_eval/bt_eval_types, chat_show/chat_show_extras,
+        # file_open/file_open_fresh, cross_worker/cross_worker_sync_ui. Unanchored,
+        # those jobs run BOTH — the sibling never gets its own runner or its own
+        # 420s, and `e2e:bt_eval` alone already takes ~3m30s, so the pair would
+        # simply time out. Every suite is its own matrix entry now, so each one
+        # needs to match exactly itself.
         run: |
           timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
-            julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '${{ matrix.suite }}'
+            julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '^e2e:${{ matrix.suite }}$'
 
   # ── Single required check for branch protection ───────────────────────────
   all-green:

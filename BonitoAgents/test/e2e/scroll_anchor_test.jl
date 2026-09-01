@@ -62,9 +62,15 @@
     # equal to its DOM pixels, so inflating rendered rows would fabricate a
     # map/DOM contradiction production cannot reach. Returns the number of
     # inflated entries.
+    # Returns the inflated count PLUS what the churn's own `updateDOM` decided,
+    # sampled right after `refresh()`: `anchorDebugGeneric` is written by every
+    # `captureAnchor`, so a value that still reads `st: 0` proves the capture
+    # never ran for this churn (initialLoad / a live sticky key-anchor both skip
+    # it) — which is a different bug from "captured and restored wrongly", and
+    # the failure message could not tell them apart.
     INFLATE = """(() => {
         const ch = $CH;
-        if (ch.rendered.size === 0) return 0;
+        if (ch.rendered.size === 0) return {inflated: 0};
         const winStart = Math.min(...ch.rendered);
         let inflated = 0;
         for (let i = 0; i < winStart; i++) {
@@ -73,14 +79,19 @@
             inflated++;
         }
         ch.refresh();
-        return inflated;
+        return {inflated,
+                dbg:         JSON.stringify(ch.anchorDebugGeneric ?? null),
+                initialLoad: !!ch.initialLoad,
+                sticky:      !!ch.keyAnchor,
+                winStart,
+                scrollTop:   Math.round(ch.container.scrollTop)};
     })()"""
 
     @testset "height churn above the viewport must not move the view" begin
         # Churn heights in the top spacer (below the rendered window) LARGER than
         # their estimate — the same shape as a background prefetch re-measuring
         # unrendered rows taller. When the map-based visibleRange() shifts off the
-        # DOM's real top-visible node the anchor gets EVICTED, and _restoreAnchor
+        # DOM's real top-visible node the anchor gets EVICTED, and restoreAnchor
         # then used a cumHeight() virtual position that omitted the container
         # padding + gap-after-spacer, landing ~a row short — so the follow-up
         # refresh re-anchored the NEIGHBOUR and the view jumped ~1 row (stuck).
@@ -107,8 +118,9 @@
             return { probe, inflated };
         })()""")
         before = r["probe"]
+        churn  = r["inflated"]           # the INFLATE probe's own report
         @test before !== nothing
-        @test Int(r["inflated"]) > 3     # the churn genuinely hit rows above
+        @test Int(churn["inflated"]) > 3     # the churn genuinely hit rows above
         # Poll until the top marker STABILISES (the compensation is a synchronous
         # bump plus a few async correction passes; all settle well under 1s even
         # under load), then assert the view didn't move. No fixed-sleep gamble —
@@ -127,15 +139,15 @@
         @test after !== nothing
         ok = after !== nothing && after["text"] == before["text"] &&
              abs(Int(after["off"]) - Int(before["off"])) <= 3
-        ok || @info "scroll_anchor churn FAILED" before after anchor =
-            TK.eval_js(s, "JSON.stringify(($CH)._anchorDebugG ?? null)")
+        ok || @info "scroll_anchor churn FAILED" before after churn anchor_now =
+            TK.eval_js(s, "JSON.stringify(($CH).anchorDebugGeneric ?? null)")
         @test after["text"] == before["text"]
         @test abs(Int(after["off"]) - Int(before["off"])) <= 3
     end
 
     @testset "evicted-anchor restore lands the node at its offset (#32)" begin
         # Deterministic (no load/timing) guard for the coordinate bug: force the
-        # EVICT branch of _restoreAnchor and require the anchored node to end up
+        # EVICT branch of restoreAnchor and require the anchored node to end up
         # exactly at the requested offset once the queued refresh re-materialises
         # it. Pre-fix, the virtual restore used cumHeight() WITHOUT PAD_TOP +
         # ITEM_GAP, so scrollTop landed ~a row short (node ~26px off) → the
@@ -146,7 +158,7 @@
         TK.eval_js(s, """(() => {
             const ch = $CH;
             ch.rendered.delete($idx);          // simulate the re-window eviction
-            ch._restoreAnchor({idx: $idx, off: -20});
+            ch.restoreAnchor({idx: $idx, off: -20});
             return true; })()""")
         @test TK.wait_for(s, "evicted anchor restored to off=-20",
             """(() => {
@@ -166,7 +178,7 @@
             const idx = 3;
             ch.cache.get(idx)?.remove();
             ch.cache.delete(idx); ch.rendered.delete(idx);
-            const stale = (ch._epoch ?? 0) - 1;
+            const stale = (ch.epoch ?? 0) - 1;
             ch.onRange({start: idx, msgs: [{type: 'user', text: 'STALE-EPOCH-GHOST'}], epoch: stale});
             return ch.cache.has(idx) &&
                    (ch.cache.get(idx).innerText || '').includes('STALE-EPOCH-GHOST');
@@ -180,7 +192,7 @@
     @testset "hidden panes stop backfilling the transcript" begin
         # Prior testsets' fetch cascades (forced refresh + refetch above) can
         # still be in flight under load — their msgs.request would be counted
-        # against _startPrefetch (the intermittent `116 == 0`). Wait for
+        # against startPrefetch (the intermittent `116 == 0`). Wait for
         # REQUEST QUIESCENCE (no msgs.request for 800ms) before hooking.
         quiesced = TK.eval_js(s, """(() => new Promise(resolve => {
             const ch = $CH;
@@ -215,7 +227,7 @@
             const ch = $CH;
             window.__saBf = ch;
             for (const k of [...ch.cache.keys()]) if (k % 2 === 0) { ch.cache.get(k)?.remove(); ch.cache.delete(k); ch.rendered.delete(k); }
-            ch._prefetchStarted = false; ch._prefetchCursor = null;
+            ch.prefetchStarted = false; ch.prefetchCursor = null;
             return true;
         })()""")
         TK.to_dashboard(s)
@@ -225,7 +237,7 @@
             let n = 0;
             const orig = ch.comm.notify.bind(ch.comm);
             ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') n++; return orig(m); };
-            ch._startPrefetch();
+            ch.startPrefetch();
             setTimeout(() => { ch.comm.notify = orig; resolve(n); }, 1500);
         }))()""")
         @test Int(n_requests) == 0

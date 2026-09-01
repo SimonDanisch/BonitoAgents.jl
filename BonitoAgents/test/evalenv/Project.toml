@@ -11,6 +11,12 @@
 #
 # Instantiated once as a warmup in runtests.jl (the packages are precompiled in
 # the depot, so it's a cache hit). NEVER generate this env at runtime in a test.
+#
+# "reachable from @stdlib" above is only true because `TestKit.__init__` clears
+# `JULIA_LOAD_PATH`: `Pkg.test` sets it to "@:<testdir>" — no `@stdlib` — and the
+# Malt eval worker inherits it, at which point `using Markdown` here fails with
+# "Package Markdown not found in current path". Don't paper over that by adding
+# stdlibs to [deps]; this env is meant to look exactly like a user's project.
 name = "evalenv"
 uuid = "e7a1d000-0000-4000-8000-000000000002"
 version = "0.0.1"

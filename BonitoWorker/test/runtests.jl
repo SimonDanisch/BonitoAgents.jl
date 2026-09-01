@@ -5,6 +5,7 @@
 
 using Test
 using BonitoWorker
+import AgentProviders
 const BW = BonitoWorker
 
 # A WebSocket stand-in that drops sends — handle_* helpers write their JSON
@@ -152,6 +153,14 @@ end
     # and an unknown leading tag is stripped just like a known one.
     @test BW.meaningful_prompt("<local-command-caveat>x</local-command-caveat><ide_opened_file>y</ide_opened_file>do the thing") == "do the thing"
 
+    # Regression: this copy of the stripper used to bail at the first space in
+    # the opener, so an attributed or self-closing wrapper leaked into the
+    # preview whole. The server's copy had been fixed and this one had not —
+    # which is why both now share AgentProviders.meaningful_prompt.
+    @test BW.meaningful_prompt("<ide_selection file=\"a.jl\">lines 1-2</ide_selection>fix the parser bug") == "fix the parser bug"
+    @test BW.meaningful_prompt("<command-args foo=\"x\"/>\nthe rest") == "the rest"
+    @test BW.meaningful_prompt("<system-reminder kind=\"foo\">no closer here") === nothing
+
     # first_user_text: returns nothing for non-user / injected records, prose
     # (clean_preview-collapsed) for real ones.
     mkrec(content) = Dict("type"=>"user", "message"=>Dict("role"=>"user","content"=>content))
@@ -187,6 +196,46 @@ end
 # spawn_worker refuse when a live worker already holds the slot. We test the
 # path-injectable predicates against a temp file so the real scratch pidfile is
 # never touched (which would block the user's actual worker).
+# ── ACP session discovery ────────────────────────────────────────────────────
+# Discovery used to be Claude-only (a walk of ~/.claude/projects). Agents that
+# implement ACP's `session/list` can be asked directly — kimi and opencode both
+# advertise it. These guard the parts that don't need an agent installed.
+@testset "acp session discovery" begin
+    # ISO-8601 → epoch, matching the mtime the file scan reports.
+    @test BW.acp_epoch("2026-07-29T10:04:35.131Z") ==
+          BW.datetime2unix(BW.DateTime(2026, 7, 29, 10, 4, 35))
+    # A session with no/garbage timestamp sorts last instead of throwing.
+    @test BW.acp_epoch("") == 0.0
+    @test BW.acp_epoch(nothing) == 0.0
+    @test BW.acp_epoch("not-a-date") == 0.0
+    # Newer sorts after older, so the UI's descending sort works.
+    @test BW.acp_epoch("2026-07-29T10:04:35Z") > BW.acp_epoch("2026-07-27T13:02:47Z")
+
+    # session/list returns the RAW first prompt, so a session started by a
+    # provider switch is titled with the whole replayed transcript. The user's
+    # real text follows the prelude's divider.
+    @test BW.acp_title("hi what model are you using?") == "hi what model are you using?"
+    @test BW.acp_title("Below is a transcript…\n\nMy new message:\n\nwhat model?") == "what model?"
+    @test BW.acp_title("") == ""
+    @test BW.acp_title(nothing) == ""
+    # Divider with nothing after it has no user prose to show.
+    @test BW.acp_title("Below is a transcript…\n\nMy new message:\n\n") == ""
+    # Agents truncate the title (kimi ~200 chars), so the divider is often cut
+    # off entirely — drop it rather than title the row with our own prelude.
+    @test BW.acp_title("Below is a transcript of our previous conversation on this " *
+                       "project. I'm continuing where we left off --- PREVIOUS CONVER") == ""
+
+    # A provider whose binary isn't installed is skipped, not an error — a
+    # machine with only Claude must still scan cleanly.
+    withenv("KIMI_AGENT_ACP" => "/nonexistent/kimi",
+            "MIMO_AGENT_ACP" => "/nonexistent/mimo",
+            "OPENCODE_AGENT_ACP" => "/nonexistent/opencode") do
+        AgentProviders.refresh_providers!()
+        @test BW.scan_acp_providers() == Dict{String,Any}[]
+    end
+    AgentProviders.refresh_providers!()
+end
+
 @testset "pidfile singleton guard" begin
     mktempdir() do dir
         pf = joinpath(dir, "sub", "worker.pid")   # nested → also tests mkpath
@@ -203,13 +252,13 @@ end
 
         # Stale file pointing at a dead pid → slot free (overwritable).
         write(pf, "999999")
-        @test BW.process_running(999999) === false
+        @test BW.pid_running(999999) === false
         @test BW.running_worker_pid(pf) === nothing
 
         # A live OTHER pid → blocked. pid 1 (init/launchd) is always alive and
-        # never us; on Unix kill(1,0) → EPERM which process_running maps to true.
+        # never us; on Unix kill(1,0) → EPERM which pid_running maps to true.
         write(pf, "1")
-        @test BW.process_running(1) === true
+        @test BW.pid_running(1) === true
         @test BW.running_worker_pid(pf) == 1
 
         # Garbage content → nothing (never throws).
@@ -250,6 +299,59 @@ end
                                         projects_root = "/home/u/projs",
                                         memory_max = "80%",
                                         path_env = "/usr/bin:/home/u/.local/bin")
+end
+
+# Which julia the unit execs. The unit used to bake `Sys.BINDIR`, which under
+# juliaup is a VERSION-specific directory the next `juliaup update` deletes —
+# systemd then restart-loops on a missing binary until someone re-runs the
+# installer, with the worker absent throughout (41 failed EXECs in 2.5 minutes,
+# observed).
+@testset "service julia command" begin
+    channel = BW.julia_channel()
+    # A CHANNEL, not a patch version: juliaup registers `1.12`, so `+1.12.7` is
+    # rejected with "not installed" while `+1.12` follows the channel forward.
+    @test occursin(r"^\d+\.\d+$", channel)
+    @test channel == "$(VERSION.major).$(VERSION.minor)"
+
+    # The probe is the whole safety of this: writing an ExecStart we never ran is
+    # the mistake being undone here, and a wrong one stays invisible until the
+    # next restart.
+    @test BW.launcher_resolves_here("/nonexistent/julia-xyz", channel) === false
+    # Exists and is executable, but is not a launcher — exits 0 and prints the
+    # wrong thing, so the BINDIR comparison is what rejects it, not the status.
+    Sys.isunix() && @test BW.launcher_resolves_here("/bin/echo", channel) === false
+    # The version-pinned binary we are RUNNING is not a launcher either: a plain
+    # julia reads `+1.12` as a script name and exits non-zero. Important, or the
+    # fallback would dress the old pinned path up as a fixed one.
+    @test BW.launcher_resolves_here(BW.julia_bin(), channel) === false
+    # A launcher asked for a channel that isn't registered must not pass.
+    for exe in BW.juliaup_launcher_candidates()
+        isfile(exe) && @test BW.launcher_resolves_here(exe, "0.1") === false
+    end
+
+    cmd = BW.service_julia_cmd()
+    @test !isempty(cmd)
+    if cmd == BW.julia_bin()
+        # No launcher on this machine (a plain install). That is the documented
+        # fallback and it does not have the problem either — nothing deletes a
+        # plain install's bindir out from under it.
+        @test isfile(cmd)
+    else
+        # A launcher was found AND probed. It must be pinned to the channel,
+        # otherwise `juliaup default <other>` silently moves the worker onto a
+        # different Julia — the failure mode a bare launcher trades for.
+        @test endswith(cmd, " +" * channel)
+        exe = first(split(cmd, ' '))
+        @test isfile(exe)
+        # And it must NOT be the version-specific path, which is the whole point.
+        @test exe != BW.julia_bin()
+        @test !occursin(string(VERSION), exe)
+    end
+
+    # Whatever it resolved to, it is what the unit execs.
+    @test occursin("ExecStart=$(cmd) --project=@bonito-agents",
+                   BW.render_service_unit(; projects_root = "/tmp", memory_max = "80%",
+                                            path_env = "/usr/bin"))
 end
 
 @testset "run-mode decision" begin
@@ -296,13 +398,23 @@ end
     end
 end
 
+# The review tab's repository scan. Pure filesystem work on temp trees — no
+# subprocess, no git binary needed (a `.git` entry is all `find_repos` looks for,
+# which is also all git itself looks for).
+include("test_find_repos.jl")
+
 end  # BonitoWorker
 
 # Stability regressions (M1 clone_repo data-loss guard, M8/M12/M13). Pure unit
 # tests — no subprocess, no network.
 include("test_stability.jl")
 
+# Agent subprocess reaping (process group + startup stray sweep). Spawns
+# short-lived `sleep`/`bash` children only — no agent, no network.
+include("test_agent_reaping.jl")
+
 # Real-agent integration test — separate file because it boots a subprocess
 # and stands up an HTTP+WS server. Skipped automatically when
 # claude-agent-acp isn't on PATH (so unit-only environments stay green).
 include("test_real_agent.jl")
+

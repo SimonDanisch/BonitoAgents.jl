@@ -2,6 +2,7 @@ using AgentClientProtocol
 using Test
 import HTTP
 import Sockets
+import JSON
 
 const ACP = AgentClientProtocol
 
@@ -160,28 +161,44 @@ end
         relay_close!(m)
     end
 
-    # ── A8: concurrent turns route updates oldest-first + handoff on response ──
+    # ── Concurrent prompts share ONE main stream ─────────────────────────────
     # claude-agent-acp supports a second `session/prompt` while one runs
-    # (steering). Updates route to the OLDEST unresolved prompt; a prompt's
-    # response closes ITS stream and updates flow to the next. The mock streams
-    # one chunk for turn 1, resolves turn 1, streams one chunk for turn 2,
-    # resolves turn 2 — all over the real wire.
-    @testset "concurrent turns route updates oldest-first, handoff on response" begin
+    # (steering): it injects the new message into the live turn and, when the SDK
+    # replays it, resolves the FIRST prompt and hands the stream to the second.
+    #
+    # There is nothing to route. Both prompts are spans over the session's main
+    # thread, so everything the agent says arrives in wire order on one stream
+    # and each response settles its own span. The mock streams a chunk for turn
+    # 1, resolves turn 1, streams a chunk for turn 2, resolves turn 2 — over the
+    # real wire — and we assert BOTH chunks land, in order, on the one stream.
+    @testset "concurrent prompts share one main stream; each response settles" begin
         m = spawn_mock("concurrent_turns"); conn = m.conn
         try
-            do_setup(conn)
-            u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
-            u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+            s1 = ACP.prompt_request(conn, Dict())
+            s2 = ACP.prompt_request(conn, Dict())
 
-            # Drain both streams concurrently: each closes when ITS response lands.
-            t1 = @async drain_text(u1)
-            t2 = @async drain_text(u2)
-            @test timedwait(() -> istaskdone(t1) && istaskdone(t2), 10.0) === :ok
-            @test fetch(t1) == ["for-turn-1"]            # u1 closed by id1's response
-            @test fetch(t2) == ["for-turn-2"]            # turn 1 gone → routed to 2
-            @test take!(r1)["stopReason"] == "end_turn"
-            @test take!(r2)["stopReason"] == "end_turn"
-            @test isempty(conn.active_turns)
+            @test ACP.wait_turn!(s1)["stopReason"] == "end_turn"
+            @test ACP.wait_turn!(s2)["stopReason"] == "end_turn"
+            @test isempty(conn.active_prompts)
+
+            # Both turns' text is on the ONE stream, in wire order — and as TWO
+            # bubbles, because each span's end marker (stamped by the dispatcher
+            # at its response frame) sealed the one before it. A single merged
+            # bubble here would mean the boundary was drawn late.
+            stop = ACP.flush_main!(client)          # our own marker: drain up to here
+            texts = String[]
+            drainer = @async for msg in client.messages
+                if msg isa ACP.StreamFlush
+                    ACP.signal_rendered!(msg)
+                    msg === stop && break
+                elseif msg isa ACP.AgentMessage
+                    push!(texts, msg.text * join(collect(msg.updates)))
+                end
+            end
+            @test timedwait(() -> istaskdone(drainer), 10.0) === :ok
+            @test texts == ["for-turn-1", "for-turn-2"]
         finally
             close(conn)
         end
@@ -189,19 +206,20 @@ end
         relay_close!(m)
     end
 
-    @testset "teardown closes every in-flight turn" begin
+    @testset "teardown fails every in-flight prompt" begin
         # The mock opens (reads) both prompts but never resolves them; teardown
-        # must close both update streams and fail both responses.
+        # must fail both responses and drop both spans.
         m = spawn_mock("two_turns_hang"); conn = m.conn
         try
             do_setup(conn)
-            u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
-            u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
+            s1 = ACP.prompt_request(conn, Dict())
+            s2 = ACP.prompt_request(conn, Dict())
             sleep(0.1)
+            @test length(conn.active_prompts) == 2
             close(conn)
-            @test timedwait(() -> !isopen(u1) && !isopen(u2), 5.0) === :ok
-            @test take!(r1) isa ACP.ConnectionClosed
-            @test take!(r2) isa ACP.ConnectionClosed
+            @test take!(s1.response) isa ACP.ConnectionClosed
+            @test take!(s2.response) isa ACP.ConnectionClosed
+            @test isempty(conn.active_prompts)
         finally
             close(conn)
         end
@@ -231,18 +249,24 @@ end
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
         relay_close!(m)
 
-        # deliver_update! robustness unit-checks (no transport involved — these
-        # construct bare channels to assert the two non-flood invariants against
-        # the now-closed `conn`, which only reads `conn.cancelling`):
-        #   * a cancel in flight must NOT block on a full channel, so the single
-        #     dispatcher stays free to reach the turn's `cancelled` response;
+        # deliver_update! robustness unit-checks (no transport involved — bare
+        # channels against the now-closed `conn`):
+        #   * a full channel BACKPRESSURES and loses nothing, cancel or not. It
+        #     used to bail while a cancel was in flight so the dispatcher could
+        #     reach the `cancelled` response without waiting for a slow browser;
+        #     the skipped frames were discarded unparsed, which is how a stop
+        #     could make the agent's output disappear for good.
         #   * a closed channel is a no-op, not an error.
         mk(i) = ACP.UnknownUpdate("u$i", Dict{String,Any}())
         full = Channel{ACP.SessionUpdate}(2)
         put!(full, mk(1)); put!(full, mk(2))          # full, no consumer
-        @atomic conn.cancelling = true
-        cancel_task = @async ACP.deliver_update!(conn, full, mk(3))
-        @test timedwait(() -> istaskdone(cancel_task), 2.0) === :ok
+        blocked = @async ACP.deliver_update!(conn, full, mk(3))
+        sleep(0.3)
+        @test !istaskdone(blocked)                    # waits, does not discard
+        @test Base.n_avail(full) == 2
+        take!(full)                                   # make room
+        @test timedwait(() -> istaskdone(blocked), 2.0) === :ok
+        @test Base.n_avail(full) == 2                 # ...and mk(3) went in
 
         closed = Channel{ACP.SessionUpdate}(1); close(closed)
         @test ACP.deliver_update!(conn, closed, mk(1)) === nothing
@@ -251,21 +275,21 @@ end
     # ── A7: tool-call snapshots — drop-oldest / latest-wins / never wedge ─────
     # BEHAVIORAL rewrite (no white-box `Base.n_avail`): the mock opens ONE tool
     # then floods N `tool_call_update`s mutating that SAME tool, ending with a
-    # terminal `completed`. The real `prompt!` consumer coalesces these onto one
-    # ToolCall whose per-message `updates` is the drop-oldest snapshot channel.
-    # A deliberately SLOW consumer must (a) never wedge, and (b) still observe the
-    # LATEST snapshot (status == "completed") — latest-wins, no block, no deadlock.
+    # terminal `completed`. The session's main-stream coalescer folds these onto
+    # one ToolCall whose per-message `updates` is the drop-oldest snapshot
+    # channel. A deliberately SLOW consumer must (a) never wedge, and (b) still
+    # observe the LATEST snapshot (status == "completed") — latest-wins, no
+    # block, no deadlock.
     @testset "A7 tool snapshots: drop-oldest, latest-wins, never wedge" begin
         handler = ACP.FSRequestHandler(pwd())
         m = spawn_mock("flood_snapshots"; n = 2000, handler); conn = m.conn
         try
             sid = do_setup(conn)
             client = ACP.Client(conn, sid, pwd())
-            messages = ACP.prompt!(client, "go")
 
             final_status = Ref{String}("")
             tools_seen   = Ref(0)
-            cons = @async for msg in messages
+            cons = @async for msg in client.messages
                 if msg isa ACP.ToolCall
                     tools_seen[] += 1
                     last_status = msg.status
@@ -274,16 +298,107 @@ end
                         sleep(0.0005)        # slow consumer → producer must drop-oldest
                     end
                     final_status[] = last_status
+                elseif msg isa ACP.StreamFlush
+                    ACP.signal_rendered!(msg)
                 end
             end
-            @test timedwait(() -> istaskdone(cons), 30.0) === :ok   # never wedged
-            @test tools_seen[] == 1
-            @test final_status[] == "completed"                     # latest-wins
+            ACP.wait_turn!(ACP.prompt!(client, "go"))
+            # The span's own end marker seals the turn; the slow consumer then
+            # has to finish draining the tool before it reaches that marker.
+            @test timedwait(() -> final_status[] == "completed", 30.0) === :ok
+            @test tools_seen[] == 1                                 # never wedged
+            close(client.updates)
+            @test timedwait(() -> istaskdone(cons), 10.0) === :ok
         finally
             close(conn)
         end
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
         relay_close!(m)
+    end
+
+    # A boundary must not kill a tool that is still running. `close(TurnState)`
+    # force-fails every live tool, which is right at STREAM END and wrong at a
+    # boundary — and boundaries land mid-stream all the time (the dispatcher
+    # stamps one at every response, `begin_turn` injects one before it
+    # prompts). A long `bt_julia_eval` spanning one lost its entry in
+    # `st.tools`, so every later update for it was dropped: the card sat at
+    # `in_progress` with an empty CODE and OUTPUT while the eval kept running.
+    @testset "a live tool survives a stream boundary" begin
+        st  = ACP.TurnState()
+        out = Channel{ACP.Message}(64)
+        mk(d) = ACP.parse_session_update(Dict{String,Any}(d))
+
+        ACP.parse_update!(out, st, mk(Dict(
+            "sessionUpdate" => "tool_call", "toolCallId" => "eval-1",
+            "kind" => "other", "title" => "bt_julia_eval", "status" => "in_progress",
+            "rawInput" => Dict("code" => "1+1"))))
+        tool = first(values(st.tools))
+        ACP.parse_update!(out, st, mk(Dict("sessionUpdate" => "agent_message_chunk",
+            "content" => Dict("type" => "text", "text" => "working"))))
+
+        ACP.seal_message!(st)                       # what a boundary does
+        @test st.current_message === nothing        # the bubble IS sealed
+        @test haskey(st.tools, "eval-1")            # the tool is NOT
+
+        # so its completion, which arrives after the boundary, still lands
+        ACP.parse_update!(out, st, mk(Dict(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "eval-1",
+            "status" => "completed",
+            "content" => [Dict("type" => "content",
+                               "content" => Dict("type" => "text", "text" => "2"))])))
+        @test tool.status == "completed"
+        @test any(c -> c isa ACP.TextContent && c.text == "2", tool.content)
+
+        # At true stream end an abandoned tool is still force-failed, so a tool
+        # the agent never resolved cannot leave the UI pulsing forever.
+        st2 = ACP.TurnState()
+        ACP.parse_update!(out, st2, mk(Dict(
+            "sessionUpdate" => "tool_call", "toolCallId" => "x",
+            "kind" => "other", "title" => "t", "status" => "in_progress")))
+        abandoned = first(values(st2.tools))
+        ACP.close_turn!(out, st2)
+        @test abandoned.status == "failed"
+        @test isempty(st2.tools)
+    end
+
+    # A CANCELLED span must release its live tools; a normal handoff must not.
+    #
+    # A tool's `updates` channel is closed on its terminal frame, and the chat's
+    # consumer BLOCKS draining that channel. So a tool that never reports
+    # terminal parks the consumer forever: the agent keeps producing, nothing
+    # renders, and the messages only appear when a reload replays history.
+    # Reported exactly that — "stop took forever, my message did nothing, then I
+    # restarted and got 10 messages at once".
+    #
+    # `close(TurnState)` used to run at EVERY boundary, which released the tool
+    # but also force-failed a `bt_julia_eval` that was legitimately still running
+    # across the next prompt. The distinction is whether the span was abandoned.
+    @testset "a cancelled span releases its tools; a handoff does not" begin
+        mk(d) = ACP.parse_session_update(Dict{String,Any}(d))
+        live_tool(st, out, id) = ACP.parse_update!(out, st, mk(Dict(
+            "sessionUpdate" => "tool_call", "toolCallId" => id,
+            "kind" => "other", "title" => "still running", "status" => "in_progress")))
+
+        # Handoff: the tool survives, its stream stays open for later updates.
+        st1  = ACP.TurnState(); out1 = Channel{ACP.Message}(64)
+        live_tool(st1, out1, "eval-1")
+        tool1 = first(values(st1.tools))
+        ACP.seal_message!(st1)                       # what a plain boundary does
+        @test haskey(st1.tools, "eval-1")
+        @test isopen(tool1.updates)                  # ...and still streaming
+
+        # Cancelled span: the tool is released, so nothing can block on it.
+        st2  = ACP.TurnState(); out2 = Channel{ACP.Message}(64)
+        live_tool(st2, out2, "eval-2")
+        tool2 = first(values(st2.tools))
+        ACP.close_turn!(out2, st2)                   # what an ABANDONED boundary does
+        @test tool2.status == "failed"
+        @test !isopen(tool2.updates)                 # the consumer is freed
+        @test isempty(st2.tools)
+
+        # And the flag rides the boundary marker itself.
+        @test ACP.StreamFlush().abandoned == false
+        @test ACP.StreamFlush(true).abandoned == true
     end
 
     # ── A4: a stray blank frame does NOT tear the connection down ────────────
@@ -299,6 +414,111 @@ end
             close(conn)
         end
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
+    end
+
+    # ── A plan ALWAYS ends, exactly like a span and a tool ───────────────────
+    # The protocol has no "plan ended" frame. An agent that abandons a plan just
+    # stops sending updates, so entries sit at whatever they reached — and a
+    # consumer that only sees entries shows it as live forever (real symptom:
+    # todo pills counting past 35 hours). `close_turn!` is the single place that
+    # settles it, on the same events that settle a span.
+    @testset "close_turn! seals a live plan; a boundary does not" begin
+        out = Channel{ACP.Message}(16)
+        st  = ACP.TurnState()
+        ACP.parse_update!(out, st,
+            ACP.PlanUpdate([ACP.PlanEntry("write the thing", "medium", "in_progress")]))
+
+        live = take!(out)
+        @test live isa ACP.Plan
+        @test live.live
+
+        # A BOUNDARY is not the end of the stream: a plan spans one exactly like a
+        # long-running tool, so sealing here would kill a plan still being worked.
+        ACP.seal_message!(st)
+        @test st.plan !== nothing
+        @test !isready(out)
+
+        ACP.close_turn!(out, st)
+        sealed = take!(out)
+        @test sealed isa ACP.Plan
+        @test sealed.live == false
+        # Entries are reported as the agent last left them — we do not forge a
+        # status the agent never sent.
+        @test [e.status for e in sealed.entries] == ["in_progress"]
+        @test [e.content for e in sealed.entries] == ["write the thing"]
+
+        # Idempotent: nothing left to seal, so nothing is emitted.
+        ACP.close_turn!(out, st)
+        @test !isready(out)
+    end
+
+    @testset "close_turn! with no plan emits nothing" begin
+        out = Channel{ACP.Message}(4)
+        st  = ACP.TurnState()
+        ACP.close_turn!(out, st)
+        @test !isready(out)
+    end
+
+    # The case that was actually broken in production: the WORKER goes away. No
+    # frame announces it — the socket just dies. Over a REAL severed WebSocket,
+    # the consumer must still see the plan settle.
+    @testset "a severed connection seals the live plan" begin
+        m = spawn_mock("plan_then_idle"); conn = m.conn
+        try
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+
+            plans = ACP.Plan[]
+            cons = @async for msg in client.messages
+                msg isa ACP.Plan && push!(plans, msg)
+            end
+            # The plan arrives INSIDE a turn (the mock waits for the prompt), so
+            # there is a consumer for it — and the prompt is deliberately never
+            # resolved: the agent is still "working" when the socket dies.
+            ACP.prompt_request(conn, Dict())
+
+            @test timedwait(() -> !isempty(plans), 5.0) === :ok
+            @test plans[1].live                      # live while the agent is there
+
+            kill_peer!(m)                            # the worker vanishes
+            @test timedwait(() -> istaskdone(cons), 10.0) === :ok
+            @test length(plans) >= 2
+            @test plans[end].live == false           # ... and settles on its own
+            @test [e.status for e in plans[end].entries] == ["in_progress"]
+        finally
+            close(conn)
+        end
+        relay_close!(m)
+    end
+
+    # The invariant the plan seal rests on, asserted on its own: a severed
+    # connection ENDS the session's main stream. It did not use to. The stream
+    # was reachable from the connection only through a callback, so teardown —
+    # which finishes every other in-flight thing — had no way to finish this one:
+    # the coalescer sat in `for u in main_stream` forever, `client.messages`
+    # never closed, and the consumer task never returned. Nobody had called
+    # `close(client)`, and with the worker already gone nobody was going to.
+    @testset "a severed connection ends the main stream" begin
+        m = spawn_mock("plan_then_idle"); conn = m.conn
+        try
+            sid = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+            cons = @async (for _ in client.messages; end; :ended)
+            ACP.prompt_request(conn, Dict())
+
+            kill_peer!(m)
+            @test timedwait(() -> istaskdone(cons), 10.0) === :ok
+            @test fetch(cons) === :ended               # the consumer RETURNED
+            @test !isopen(client.messages)
+            @test !isopen(client.updates)
+            # And a flush asked for after the stream is gone reports that, rather
+            # than handing back a marker nobody is left to signal — which is the
+            # other half of "tasks that run forever".
+            @test ACP.flush_main!(client) === nothing
+        finally
+            close(conn)
+        end
         relay_close!(m)
     end
 
@@ -360,8 +580,57 @@ end
         try
             sid = do_setup(conn)
             client = ACP.Client(conn, sid, pwd())
-            ACP.cancel!(client)
-            @test !(@atomic conn.cancelling)      # not latched → next turn renders
+            @test ACP.cancel!(client) == false            # nothing to cancel
+            @test ACP.session_activity(conn) isa ACP.Idle # ...and it stays idle
+        finally
+            close(conn)
+        end
+        @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
+    end
+
+    # A cancel never mutes the session, whatever it was cancelling.
+    #
+    # There used to be a `cancelling` flag that made the dispatcher DROP
+    # main-thread updates, so it could skip a cancelled prompt's backlog and
+    # reach that prompt's `cancelled` response. It was cleared only by that
+    # response — so cancelling UN-PROMPTED work (an auto-wake episode, a
+    # background subagent), which has no response of ours coming, latched it
+    # forever and every later frame was discarded unparsed. The agent kept
+    # working and streaming while the client binned all of it; the chat looked
+    # dead until a reload, whose `session/load` replayed the backlog at once.
+    @testset "a cancel never mutes the session" begin
+        m = spawn_mock("setup_then_idle"); conn = m.conn
+        try
+            sid    = do_setup(conn)
+            client = ACP.Client(conn, sid, pwd())
+
+            # No prompt of ours is open; the agent is working on its own.
+            @atomic conn.last_work_at = time()
+            @atomic conn.activity = ACP.Unprompted()
+            @test ACP.session_live(client) == true
+            @test ACP.cancel!(client) == true            # the cancel DOES go out
+            # No prompt to settle, so it does not sit in `Cancelling`; and the
+            # cancel consumes the work recency it acted on, so it lands on
+            # `Idle` rather than re-reporting itself live for the quiet window.
+            @test ACP.session_activity(conn) isa ACP.Idle
+
+            put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("still working")))
+            @test timedwait(() -> Base.n_avail(client.messages) >= 1, 5.0) === :ok
+            msg = take!(client.messages)
+            @test msg isa ACP.AgentMessage && msg.text == "still working"
+
+            # With a prompt of ours open, the cancel is a STATE, and the frames
+            # behind it still arrive — that is the whole change. Asserted on the
+            # DELIVERED TEXT: consecutive chunks coalesce onto the open bubble,
+            # so the message count would not grow even when nothing is dropped.
+            span = ACP.PromptSpan(9992)
+            lock(() -> push!(conn.active_prompts, span), conn.lock)
+            @test ACP.cancel!(client) == true
+            @test ACP.session_activity(conn) isa ACP.Cancelling
+            put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("backlog")))
+            @test timedwait(() -> isready(msg.updates), 5.0) === :ok
+            @test take!(msg.updates) == "backlog"
         finally
             close(conn)
         end
@@ -421,52 +690,107 @@ end
         @test u.update.tool_name == "Grep"
     end
 
-    @testset "parse_update! diverts subagent updates to the sink" begin
-        sub(pid, u) = ACP.SubagentUpdate(pid, u)
-        txt(s)  = ACP.AgentMessageChunk(ACP.TextContent(s))
-        tcall(id, title, status) = ACP.parse_session_update(Dict{String,Any}(
-            "sessionUpdate" => "tool_call", "toolCallId" => id,
-            "kind" => "search", "title" => title, "status" => status))
+    # A subagent's updates never enter the main thread's stream: the dispatcher
+    # reads `parentToolUseId` FIRST and hands the update to its owner. Driven
+    # through `dispatch_message`, which is where that decision lives.
+    @testset "subagent updates are addressed to their owner, not the main stream" begin
+        # A real Connection over the real WS relay; the mock is quiet after
+        # setup, so every frame below is one we hand the dispatcher directly.
+        # `session/update` never touches the wire — this exercises the addressing
+        # decision itself, which is what the test is about.
+        m = spawn_mock("two_turns_hang"); conn = m.conn
+        do_setup(conn)
+        sleep(0.2)                                 # let setup's own updates settle
+        # The main stream is a channel (that is what lets teardown END it), so
+        # stand in for the Client's coalescer with a plain one. `main()` drains
+        # whatever the dispatcher has put there so far and accumulates it, which
+        # keeps every assertion below synchronous with the dispatch above it.
+        stream  = Channel{Any}(64)
+        drained = ACP.SessionUpdate[]
+        main()  = append!(drained, (take!(stream) for _ in 1:Base.n_avail(stream)))
+        owned   = Tuple{String,ACP.SessionUpdate}[]
+        conn.main_stream     = stream
+        conn.on_owner_update = (owner, u) -> push!(owned, (owner, u))
 
-        # With a sink: every tagged update becomes a SubagentActivity, the
-        # main stream (out + current_message + tools) stays untouched.
-        acts = ACP.SubagentActivity[]
-        st  = ACP.TurnState(act -> push!(acts, act))
-        out = Channel{ACP.Message}(32)
-        ACP.parse_update!(out, st, txt("main "))              # opens the main bubble
-        ACP.parse_update!(out, st, sub("task-1", txt("sub prose")))
-        ACP.parse_update!(out, st, sub("task-1", tcall("sub-t1", "Grep foo", "in_progress")))
-        ACP.parse_update!(out, st, sub("task-1", ACP.parse_session_update(Dict{String,Any}(
+        tagged(inner) = Dict{String,Any}("jsonrpc" => "2.0", "method" => "session/update",
+            "params" => Dict{String,Any}("update" => merge(inner, Dict{String,Any}(
+                "_meta" => Dict("claudeCode" => Dict("parentToolUseId" => "task-1"))))))
+        plain(inner) = Dict{String,Any}("jsonrpc" => "2.0", "method" => "session/update",
+            "params" => Dict{String,Any}("update" => inner))
+        chunk(t) = Dict{String,Any}("sessionUpdate" => "agent_message_chunk",
+            "content" => Dict("type" => "text", "text" => t))
+        tcall(id, title, status) = Dict{String,Any}("sessionUpdate" => "tool_call",
+            "toolCallId" => id, "kind" => "search", "title" => title, "status" => status)
+
+        ACP.dispatch_message(conn, plain(chunk("main ")))
+        ACP.dispatch_message(conn, tagged(chunk("sub prose")))
+        ACP.dispatch_message(conn, tagged(tcall("sub-t1", "Grep foo", "in_progress")))
+        ACP.dispatch_message(conn, tagged(Dict{String,Any}(
             "sessionUpdate" => "tool_call_update",
-            "toolCallId" => "sub-t1", "status" => "completed"))))
-        ACP.parse_update!(out, st, txt("still main"))
-        close(st); close(out)
+            "toolCallId" => "sub-t1", "status" => "completed")))
+        ACP.dispatch_message(conn, plain(chunk("still main")))
 
-        msgs = collect(out)
-        @test length(msgs) == 1                               # ONE main bubble, nothing else
-        @test msgs[1] isa ACP.AgentMessage
-        @test msgs[1].text * join(collect(msgs[1].updates)) == "main still main"
-        @test isempty(st.tools)                               # sub tool never tracked
+        # The main thread saw only its own two chunks — no subagent prose, no
+        # subagent tool. Interleaving those is the failure this addressing removes.
+        @test length(main()) == 2
+        @test all(u -> u isa ACP.AgentMessageChunk, main())
+        @test [ACP.text_of(u) for u in main()] == ["main ", "still main"]
 
-        @test length(acts) == 3
-        @test all(a -> a.parent_id == "task-1", acts)
+        # The subagent got its whole stream, tagged with its own id.
+        @test length(owned) == 3
+        @test all(((o, _),) -> o == "task-1", owned)
+
+        # ... and distils into feed activity, which is what its owner renders.
+        acts = [ACP.subagent_activity(o, u) for (o, u) in owned]
         @test acts[1].kind === :text && acts[1].label == "sub prose"
         @test acts[2].kind === :tool && acts[2].tool_id == "sub-t1" &&
               acts[2].label == "Grep foo" && acts[2].status == "in_progress"
         @test acts[3].kind === :tool && acts[3].status == "completed"
 
-        # Without a sink (default TurnState): tagged updates are DROPPED —
-        # never interleaved into the main transcript, never tracked as tools.
-        st2  = ACP.TurnState()
-        out2 = Channel{ACP.Message}(32)
-        ACP.parse_update!(out2, st2, txt("main"))
-        ACP.parse_update!(out2, st2, sub("task-1", txt(" INTRUDER")))
-        ACP.parse_update!(out2, st2, sub("task-1", tcall("sub-t2", "Read bar", "pending")))
-        close(st2); close(out2)
-        msgs2 = collect(out2)
-        @test length(msgs2) == 1
-        @test msgs2[1].text * join(collect(msgs2[1].updates)) == "main"
-        @test isempty(st2.tools)
+        # An UNTAGGED frame for a tool a subagent already claimed is still that
+        # subagent's. claude-agent-acp does not tag every frame — captured live,
+        # a subagent bash goes tagged → UNTAGGED (the toolResponse frame) →
+        # tagged — and addressing on the tag alone hands the middle one to the
+        # main thread, whose coalescer has never heard of the tool id and drops
+        # it. The id is recoverable, so it is recovered.
+        ACP.dispatch_message(conn, tagged(tcall("sub-t2", "Bash sleep", "pending")))
+        ACP.dispatch_message(conn, plain(Dict{String,Any}(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "sub-t2",
+            "_meta" => Dict("claudeCode" => Dict("toolName" => "Bash",
+                "toolResponse" => Dict("stdout" => "hi"))))))
+        @test length(main()) == 2                      # NOT the main thread's
+        @test last(owned)[1] == "task-1"               # ... it went to the subagent
+        @test ACP.tool_call_id(last(owned)[2]) == "sub-t2"
+
+        # A tool id we have never seen tagged belongs to the main thread, and
+        # stays there — recovery only ever re-unites frames with an owner the
+        # wire already named.
+        ACP.dispatch_message(conn, plain(Dict{String,Any}(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "main-only",
+            "status" => "completed")))
+        @test length(main()) == 3
+        @test length(owned) == 5
+
+        # The association is forgotten once the tool is terminal, so a long
+        # session cannot accumulate them.
+        ACP.dispatch_message(conn, plain(Dict{String,Any}(
+            "sessionUpdate" => "tool_call_update", "toolCallId" => "sub-t2",
+            "status" => "completed")))
+        @test last(owned)[1] == "task-1"               # the terminal frame still lands
+        @test !haskey(conn.tool_owners, "sub-t2")      # ... and then it is dropped
+
+        # A cancel in flight silences NEITHER stream. The main thread's frames
+        # are output the agent already produced, and the subagent was never
+        # cancelled at all — it is addressed by `parentToolUseId` and reaches
+        # its owner without consulting session state.
+        @atomic conn.activity = ACP.Cancelling()
+        ACP.dispatch_message(conn, plain(chunk("still rendered")))
+        ACP.dispatch_message(conn, tagged(chunk("still mine")))
+        @test length(main())  == 4
+        @test length(owned) == 7
+        close(conn)
+        @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
     end
 
     # ── Regression: a long resumed history with an un-terminated tool must not
@@ -491,3 +815,163 @@ end
         relay_close!(m)
     end
 end
+
+# ── Non-claude agents: MCP tool identity + arguments ─────────────────────────
+# Replays the REAL frames `kimi acp` 0.29.2 emitted while driving the real
+# btworker MCP server (captured verbatim into test/fixtures). A non-claude agent
+# ships no `_meta.claudeCode` envelope and no `rawInput` at all: it names the
+# tool in the ACP `title` and streams the ARGUMENTS as growing content text.
+# Parsed naively that yields a nameless `GenericTool` whose "output" is
+# half-typed argument JSON — the same tool rendering completely differently
+# depending on which agent ran it, with an empty code preview.
+@testset "MCP tool call from a non-claude agent (real kimi wire)" begin
+    frames = [JSON.parse(l) for l in
+              readlines(joinpath(@__DIR__, "fixtures", "kimi_mcp_tool_call.jsonl"))]
+    @test !isempty(frames)
+    # The fixture must stay a genuine non-claude capture, or it stops guarding
+    # anything: NO `_meta` envelope anywhere, so the tool is identifiable only
+    # through its title. `rawInput` shows up on exactly one late frame (the one
+    # that completes the argument stream), so it cannot name the tool either —
+    # every earlier frame has to be routed on the title alone.
+    @test !any(f -> haskey(f, "_meta"), frames)
+    @test count(f -> haskey(f, "rawInput"), frames) == 1
+    @test !haskey(frames[1], "rawInput")
+
+    out = Channel{Any}(256)
+    st  = ACP.TurnState()
+    for f in frames
+        ACP.parse_update!(out, st, ACP.parse_session_update(f))
+    end
+    ACP.close_turn!(out, st); close(out)
+    tools = [x for x in collect(out) if x isa ACP.ToolCall]
+    @test length(tools) == 1
+    tc = tools[1]
+
+    # Identity recovered from the title → the typed MCP path, not GenericTool.
+    @test tc isa ACP.MCPCall
+    @test tc.server == "btworker"
+    @test tc.tool_name == "bt_julia_eval"
+    # Arguments recovered from the streamed content → a filled code preview.
+    @test tc.raw_input["code"] == "1+1"
+    @test tc.raw_input["env_path"] == "/tmp/kimiprobe"
+    # …and the streamed argument JSON never leaks into the content the UI shows
+    # as output: only the tool's real result survives.
+    @test tc.status == "completed"
+    @test [c.text for c in tc.content if c isa ACP.TextContent] == ["2"]
+end
+
+# Native (non-MCP) tools from the same agent. Kimi labels them with Claude's own
+# names — `Read`, `Bash`, `Agent` — but only on the OPENING frame: a later frame
+# replaces the title with a sentence ("Running: echo …"). Without reading that
+# opening title a shell call has no command to show and a delegation has no Task
+# card, which is what "it used something else instead of subagents" looks like.
+@testset "native tool calls from a non-claude agent (real kimi wire)" begin
+    frames = [JSON.parse(l) for l in
+              readlines(joinpath(@__DIR__, "fixtures", "kimi_native_tools.jsonl"))]
+    @test !any(f -> haskey(f, "_meta"), frames)      # still a genuine non-claude capture
+
+    out = Channel{Any}(1024)
+    st  = ACP.TurnState()
+    for f in frames
+        ACP.parse_update!(out, st, ACP.parse_session_update(f))
+    end
+    ACP.close_turn!(out, st); close(out)
+    tools = [x for x in collect(out) if x isa ACP.ToolCall]
+    @test length(tools) == 3
+    rd, sh, ag = tools
+
+    @test rd isa ACP.GenericTool && rd.name == "Read" && rd.kind == "read"
+    @test rd.raw_input["path"] == "hello.txt"
+
+    # The shell call is the one that was landing as a nameless generic pill.
+    @test sh isa ACP.BashCall
+    @test sh.command == "echo NATIVEPROBE"
+    @test !sh.run_in_background
+
+    # Delegation: a real Task call, with the sub-prompt it dispatched.
+    @test ag isa ACP.TaskCall
+    @test ag.description == "Count lines in hello.txt"
+    @test occursin("hello.txt", ag.prompt)
+
+    # None of the half-typed argument JSON that streams through `content` may
+    # survive as the tool's output.
+    for t in tools
+        for c in t.content
+            c isa ACP.TextContent || continue
+            @test !startswith(lstrip(c.text), "{\"")
+        end
+    end
+    @test occursin("NATIVEPROBE", sh.content[end].text)
+end
+
+# The claude path must be entirely unaffected by the two fallbacks above: it
+# names tools through `_meta` and sends `rawInput`, so a content frame stays
+# content even when it happens to look like a JSON object.
+@testset "claude-shaped MCP frames keep _meta/rawInput semantics" begin
+    id = "toolu_1"
+    call = Dict("sessionUpdate" => "tool_call", "toolCallId" => id,
+                "title" => "Run julia code",
+                "kind" => "other", "status" => "pending", "content" => [],
+                "_meta" => Dict("claudeCode" => Dict("toolName" => "mcp__btworker__bt_julia_eval")),
+                "rawInput" => Dict("code" => "2+2", "env_path" => "/tmp/x"))
+    # A JSON-object-shaped OUTPUT chunk mid-flight must still be treated as
+    # content — the arguments are already known, so the recovery stays dormant.
+    mid  = Dict("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+                "status" => "in_progress",
+                "content" => [Dict("type" => "content",
+                                   "content" => Dict("type" => "text",
+                                                     "text" => "{\"partial\":true}"))])
+    fin  = Dict("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+                "status" => "completed",
+                "content" => [Dict("type" => "content",
+                                   "content" => Dict("type" => "text", "text" => "4"))])
+    out = Channel{Any}(64)
+    st  = ACP.TurnState()
+    for f in (call, mid, fin)
+        ACP.parse_update!(out, st, ACP.parse_session_update(f))
+    end
+    ACP.close_turn!(out, st); close(out)
+    tc = only([x for x in collect(out) if x isa ACP.ToolCall])
+    @test tc isa ACP.MCPCall
+    @test tc.tool_name == "bt_julia_eval"
+    @test tc.raw_input["code"] == "2+2"        # from rawInput, not from content
+    @test tc.content[end].text == "4"
+end
+
+# The title fallback is narrow on purpose: only the canonical MCP form counts,
+# so a human-readable title can never be mistaken for a tool name.
+@testset "title fallback accepts only mcp__server__tool" begin
+    @test ACP.is_mcp_tool_name("mcp__btworker__bt_julia_eval")
+    @test !ACP.is_mcp_tool_name("Run julia code")
+    @test !ACP.is_mcp_tool_name("mcp__btworker__")      # empty tool
+    @test !ACP.is_mcp_tool_name("mcp____bt_julia_eval") # empty server
+    @test !ACP.is_mcp_tool_name("mcp__btworker")        # no separator
+    @test !ACP.is_mcp_tool_name("")
+end
+
+# A tool NAME is one token; every human title kimi emitted has a space in it.
+@testset "bare-name titles are told apart from human titles" begin
+    for name in ("Read", "Bash", "Agent", "TodoWrite", "mcp__btworker__bt_julia_eval")
+        @test ACP.looks_like_tool_name(name)
+    end
+    for title in ("Reading hello.txt", "Running: echo NATIVEPROBE",
+                  "Launching explore agent: Count lines", "", " ")
+        @test !ACP.looks_like_tool_name(title)
+    end
+
+    # …and a mutated title on a LATER frame must not overwrite the name the
+    # opening frame established, or a completed Bash would lose its identity.
+    open_frame = Dict("sessionUpdate" => "tool_call", "toolCallId" => "t1",
+                      "title" => "Bash", "kind" => "execute", "status" => "pending",
+                      "content" => [])
+    later      = Dict("sessionUpdate" => "tool_call_update", "toolCallId" => "t1",
+                      "title" => "Running: echo hi", "status" => "in_progress",
+                      "content" => [])
+    @test ACP.parse_session_update(open_frame).tool_name == "Bash"
+    @test ACP.parse_session_update(later).tool_name === nothing
+end
+
+# Cancelling work the agent streams outside any request (the counterpart to
+# "A8 cancel is a no-op when idle" above: idle must stay a no-op, but
+# unregistered-and-working must not).
+include(joinpath(@__DIR__, "orphan_cancel_test.jl"))

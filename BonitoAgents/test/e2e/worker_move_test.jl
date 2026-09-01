@@ -120,7 +120,7 @@
             # Mirror the legacy test: the user edits files on A's fs in their own
             # editor (server doesn't know yet); the move must pre-pull these.
             proj_dir_a = p.worker_path
-            @test startswith(proj_dir_a, worker_a.projects_root)
+            @test rstrip(proj_dir_a, '/') == rstrip(cwd, '/')
             write(joinpath(proj_dir_a, "README.md"),  "version 2: edited on A out of band\n")
             write(joinpath(proj_dir_a, "newfile.txt"), "added on A\n")
 

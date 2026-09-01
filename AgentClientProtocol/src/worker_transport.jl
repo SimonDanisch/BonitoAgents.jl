@@ -45,7 +45,7 @@ function send(t::WorkerTransport, line::AbstractString)
         # wait forever for a reply the agent never got, hanging the turn until (if
         # ever) the reader loop independently notices the read half died. Surface
         # it instead: a torn-down write IS a dead session. `ConnectionClosed`
-        # propagates through `send_raw` → `prompt_updates`/`send_notification` up to
+        # propagates through `send_raw` → `prompt_request`/`send_notification` up to
         # the chat's `is_session_dead_error` path (which treats `ConnectionClosed`
         # as dead), so the session is marked offline / torn down promptly rather
         # than wedging.

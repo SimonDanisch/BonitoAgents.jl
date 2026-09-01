@@ -207,7 +207,12 @@ function parse_session_meta(path::String, cwd::String)::Union{ChatSession,Nothin
         data = node.t.data
         sid  = get(data, "session_id", "")
         ts   = get(data, "created", string(now(UTC)))
-        created = try DateTime(ts) catch; now(UTC) end
+        created = try
+            DateTime(ts)
+        catch e
+            e isa InterruptException && rethrow()
+            now(UTC)
+        end
         return ChatSession(sid, cwd, created, path)
     end
     return nothing

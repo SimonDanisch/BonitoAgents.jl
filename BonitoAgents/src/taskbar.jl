@@ -174,7 +174,7 @@ function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::Taskba
         # KeyedList key when entries change, and the chevron's behaviour is
         # delegated JS on the persistent `.bt-taskbar` parent (the collapsed
         # state is a class THERE — any state on the slot itself would be
-        # wiped by the 1 Hz re-render; see `_setupLiveTicker`).
+        # wiped by the 1 Hz re-render; see `setupLiveTicker`).
         ndone = count(e -> e[2] == "completed", ents)
         push!(head, DOM.span(string(ndone, "/", length(ents));
                              class = "bt-taskbar-todo-count"))

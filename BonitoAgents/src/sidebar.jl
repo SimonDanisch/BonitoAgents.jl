@@ -38,6 +38,13 @@ function project_color(id::AbstractString)
     return "hsl($(hue), 60%, 48%)"
 end
 
+# Several chats commonly live in ONE folder, and telling them apart by identicon
+# alone is hard past a handful. Keying the hue on the folder makes same-folder
+# chats read as a family (the pattern still differs per chat). Falls back to the
+# id when a project has no path yet, so the colour is never blank.
+folder_hue_key(p::ProjectInfo) =
+    isempty(p.worker_path) ? p.id : rstrip(normalize_worker_path(p.worker_path), '/')
+
 """
     identicon_svg(id) → String
 
@@ -50,9 +57,9 @@ initials remain legible on. Single-quoted attributes so the result embeds
 directly into a CSS `url("data:image/svg+xml;utf8,…")` (the same trick the
 model-picker arrow uses in styles.jl).
 """
-function identicon_svg(id::AbstractString)
-    h   = hash(id)
-    hue = abs(h % 360)
+function identicon_svg(id::AbstractString, hue_key::AbstractString = id)
+    h   = hash(id)                      # pattern: unique per chat
+    hue = abs(hash(hue_key) % 360)      # colour: shared by chats in one folder
     cells = IOBuffer()
     for row in 0:4, col in 0:2
         ((h >> (row * 3 + col)) & 1) == 1 || continue
@@ -79,7 +86,7 @@ function project_icon(p::ProjectInfo, worker_tag::AbstractString = "";
     DOM.div(label;
         class = "bt-proj-icon",
         style = string("background-image:url(\"data:image/svg+xml;utf8,",
-                       identicon_svg(p.id), "\");",
+                       identicon_svg(p.id, folder_hue_key(p)), "\");",
                        "background-size:cover;",
                        "width:$(size_px)px;height:$(size_px)px;",
                        "line-height:$(size_px)px;font-size:$(round(Int, size_px*0.42))px"),
@@ -101,8 +108,9 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
     # Status LED (green pulse / yellow / red) nestled as a presence badge on the
     # icon's bottom-right corner (anchored to the icon, so it stays put whether
     # the rail is expanded or collapsed to icons). `data-status` lets the CSS
-    # pick the colour + animation; the 1Hz `recompute_status_dom!` JS updates the
-    # attr in place. Home entry has no LED (status === nothing).
+    # pick the colour + animation; the `status_obs` JS handler further down
+    # updates the attr in place whenever a status signal fires (no polling, no
+    # body re-render). Home entry has no LED (status === nothing).
     icon_node = if status === nothing
         icon
     else
@@ -279,13 +287,20 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     #   red         — worker offline / missing
     # Re-renders on structural change (`chat_signal` for chat add/remove,
     # `state.projects` for project add/remove, `state.workers` for worker
-    # online/offline transitions). The LED color is recomputed every second
-    # by `recompute_status_dom!` on the OUTER aside (below) so a busy_active
-    # flip mid-turn doesn't require a body re-render.
+    # online/offline transitions) — deliberately NOT on `turn_signal`. The LED
+    # colour follows a turn instead through `status_obs` on the OUTER aside
+    # (below), which rewrites the `data-status` attr in place, so a busy_active
+    # flip mid-turn never rebuilds this body (an open file tree would collapse).
+    # Per-project file trees, kept ACROSS sidebar re-renders. Building a fresh
+    # one each render handed the replacement `active = false` and dropped the
+    # JS-toggled `.bt-tree-open` class with the old node, so an open tree
+    # collapsed and never reloaded. Session-scoped, pruned to the open projects.
+    trees = Dict{String,WorkerFileTree}()
     body = map(state.chat_signal, state.projects, state.workers) do _, projects, workers
         active_pid = current_view[]
         open_projs = open_chat_projects(state, projects)
         sort!(open_projs; by = p -> lowercase(p.name))
+        filter!(kv -> any(p -> p.id == kv.first, open_projs), trees)
 
         entries = Any[sidebar_entry("Home", home_icon, "", "Dashboard";
                                     active = active_pid == "")]
@@ -320,9 +335,14 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             # opens the tree INSIDE the pill (so it visibly belongs to the chat)
             # and, on first open, flips `tree.active` for the lazy worker scan.
             # stopPropagation keeps the click off the row's navigate handler.
-            tree = WorkerFileTree(state, p.id, pane)
-            hint = DOM.div("▾ files";
-                class = "bt-side-tree-hint", title = "Show project files",
+            # A fresh component per render, sharing the project's persistent
+            # state (see the re-wrap constructor).
+            tree = WorkerFileTree(get!(() -> WorkerFileTree(state, p.id, pane),
+                                       trees, p.id))
+            tree_open = tree.active[]
+            hint = DOM.div(tree_open ? "▴ hide files" : "▾ files";
+                class = "bt-side-tree-hint",
+                title = tree_open ? "Hide project files" : "Show project files",
                 onclick = js"""event => {
                     event.stopPropagation();
                     const chat = event.currentTarget.closest('.bt-side-chat');
@@ -342,7 +362,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                       # it stays put when the tree expands below it.
                       DOM.div(item, hint; class = "bt-side-chat-row"),
                       DOM.div(tree; class = "bt-side-tree-wrap");
-                      class = "bt-side-chat"))
+                      class = tree_open ? "bt-side-chat bt-tree-open" : "bt-side-chat"))
         end
         isempty(open_projs) && push!(entries,
             DOM.div("No open chats yet — open one from the dashboard.";
@@ -444,11 +464,14 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # never touches Observable refcounts in the body subsession, so the
     # GLOBAL_OBJECT_CACHE notes at the top still hold.
     #
-    # Triggers: any state change that can flip a chat's status fires
-    # `chat_signal` server-side. `chat_models` additions/removals already
-    # call `notify_chats!`; the `ChatModel` constructor anchors an
-    # `on(busy_active) → notify_chats!` so a prompt going in-flight (or
+    # Triggers: any state change that can flip a chat's status fires one of the
+    # two server-side signals. `chat_models` additions/removals call
+    # `notify_chats!`; the `ChatModel` constructor anchors an
+    # `on(busy_active) → notify_turn!` so a prompt going in-flight (or
     # finishing) fans straight through to the sidebar without any polling.
+    # The LED subscribes to BOTH — `turn_signal` deliberately does not re-render
+    # the body (that is the whole reason it exists; see its field doc), and this
+    # attribute-only update is exactly the kind of consumer it is for.
     status_obs = Observable(Dict{String,String}())
     function recompute_status!()
         # Snapshot (pid, project) pairs under the lock (T17) so we don't iterate
@@ -468,6 +491,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     end
     recompute_status!()
     on(session, state.chat_signal) do _; recompute_status!(); end
+    on(session, state.turn_signal) do _; recompute_status!(); end
     on(session, state.workers)     do _; recompute_status!(); end
     on(session, state.projects)    do _; recompute_status!(); end
 
@@ -505,6 +529,13 @@ const SidebarStyles = Bonito.Styles(
         # main-panel logo's line instead of sitting ~20px below it. The
         # collapse rail below adds the rest of the offset.
         "padding" => "4px 0 10px"),
+    # A fixed 200px rail truncates chat titles to a few words on a big monitor,
+    # where the space is free. Widen in two steps; the collapsed rail and the
+    # narrow-screen rules below still win (they come later in the sheet).
+    CSS("@media (min-width: 1600px)",
+        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "260px")),
+    CSS("@media (min-width: 2000px)",
+        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "320px")),
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
     # Header rail: holds the VSCode-style sidebar toggle. Right-aligned when
@@ -1035,7 +1066,7 @@ end
 #   "Loading the chat…"         this card, pane DOM shipping + mounting
 #   "Rendering messages…"       chat module mounted, settle watch running
 #
-# The chat module drives the hand-offs: `_startSettle` (bonitoagents.js)
+# The chat module drives the hand-offs: `startSettle` (bonitoagents.js)
 # dispatches `bt-chat-settling` / `bt-chat-settled` window events carrying
 # the pane pid, and mirrors them as `data-bt-settling` / `data-bt-settled`
 # flags on the `.bt-chatpane` so a card that mounts AFTER an event fired
@@ -1370,7 +1401,12 @@ function unified_app(state::ServerState)
             stage,
             # Window-level toast layer (position:fixed) — flashes "can't open …"
             # from the editor open-guard. One per window, bound to pane.toast.
-            plotpane_toast_layer(session, pane);
+            plotpane_toast_layer(session, pane),
+            # Window-level file-viewer driver: gives every rendered file body its
+            # behaviour (image dimensions, table sort, 3D mount) no matter how it
+            # was delivered — a chat bubble's bt_show preview, a workspace panel,
+            # or a node the workspace moved between them. See `file_view_driver`.
+            file_view_driver(session);
             class = "bt-shell")
         # Wire the bt_show_app detach controller once the shell is in the DOM:
         # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all

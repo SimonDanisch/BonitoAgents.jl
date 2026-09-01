@@ -32,6 +32,8 @@ end
 
 abstract type SessionUpdate end
 
+
+
 struct AgentMessageChunk <: SessionUpdate
     content::ContentBlock
 end
@@ -85,6 +87,8 @@ struct ToolCallUpdateNotif <: SessionUpdate
     raw::AbstractDict
 end
 
+
+
 struct UnknownUpdate <: SessionUpdate
     session_update::String
     raw::AbstractDict
@@ -110,6 +114,178 @@ The parent Task tool_use id a subagent-originated update is tagged with
 """
 parent_tool_use_id(::SessionUpdate) = nothing
 parent_tool_use_id(u::SubagentUpdate) = u.parent_tool_use_id
+
+"""
+    tool_call_id(u::SessionUpdate) -> Union{String,Nothing}
+
+The tool call an update is about, or `nothing` for updates that aren't about a
+tool. Used to recover an owner the wire omitted: claude-agent-acp does NOT tag
+every frame of a subagent's tool — captured live, one tool arrives
+`tool_call`(tagged) → `tool_call_update`(UNTAGGED, carrying the toolResponse) →
+`tool_call_update`(tagged). The untagged frame is still that subagent's, and its
+`toolCallId` says so.
+"""
+tool_call_id(::SessionUpdate) = nothing
+tool_call_id(u::ToolCallNotif) = u.tool_call_id
+tool_call_id(u::ToolCallUpdateNotif) = u.tool_call_id
+tool_call_id(u::SubagentUpdate) = tool_call_id(u.update)
+
+# Whether an update reports its tool as finished, so a remembered owner can be
+# forgotten once its last frame has been delivered.
+tool_is_terminal(::SessionUpdate) = false
+tool_is_terminal(u::ToolCallNotif) = u.status in ("completed", "failed")
+tool_is_terminal(u::ToolCallUpdateNotif) = u.status in ("completed", "failed")
+tool_is_terminal(u::SubagentUpdate) = tool_is_terminal(u.update)
+
+"""
+    is_agent_work(u::SessionUpdate) -> Bool
+
+Whether `u` is the agent DOING something, as opposed to telling us about the
+session. Content the user watches appear — prose, thoughts, tool calls, plans —
+is work; `available_commands` / `current_mode` / `session_info` / `usage` are
+metadata that arrives on bind and at turn boundaries.
+
+The distinction matters because these updates also arrive with NO prompt open
+(see `Unprompted`), and treating every one of them as "the agent is busy" makes a
+chat that has done nothing look busy: a fresh session emits
+`available_commands_update` right after `session/new`.
+
+`SubagentUpdate` is work, but reaches this only in tests — on the wire it is
+addressed to its owner before liveness is ever consulted.
+"""
+is_agent_work(::SessionUpdate) = false
+is_agent_work(::AgentMessageChunk) = true
+is_agent_work(::AgentThoughtChunk) = true
+is_agent_work(::PlanUpdate) = true
+is_agent_work(::ToolCallNotif) = true
+is_agent_work(::ToolCallUpdateNotif) = true
+is_agent_work(::SubagentUpdate) = true
+
+# ── Autonomous cycles ────────────────────────────────────────────────────────
+# claude-agent-acp tags the `usage_update` it sends at a CYCLE'S RESULT with
+# `_meta["_claude/origin"].kind`, and that tag is the only end-of-episode signal
+# on the wire. When the agent auto-wakes after backgrounded work finishes, it
+# streams prose and tools with no prompt open — an episode with an obvious start
+# and, without this, no observable end at all.
+#
+# The set is the adapter's own `AUTONOMOUS_RESULT_ORIGINS` (acp-agent.js): work
+# the model did on its own. The user's turn is tagged `human`, and
+# `auto-continuation` continues the user's turn, so neither counts. Verified in
+# both captured wires — the auto-wake's last frame is a `usage_update` with
+# `kind = "task-notification"`.
+const AUTONOMOUS_ORIGINS = ("task-notification", "peer", "coordinator",
+                            "observer", "observer-activity")
+
+"""
+    is_autonomous_origin(kind) -> Bool
+
+Whether an origin tag marks the result of a cycle the model ran on its own.
+`nothing` (an untagged frame) is not a result at all, so it is not one.
+"""
+is_autonomous_origin(::Nothing) = false
+is_autonomous_origin(kind::AbstractString) = kind in AUTONOMOUS_ORIGINS
+
+# ── What the session is doing ────────────────────────────────────────────────
+# ONE value, replacing the pile of independent booleans this used to be
+# (`unprompted_work`, `cancelling`, and — a layer up — `busy_active` and
+# `autowake`). Each of those was a latch whose SET and CLEAR lived on different
+# code paths, and each had at least one path where the clear never ran:
+#
+#   * `cancelling` was cleared by a cancelled prompt's response, so cancelling
+#     UN-prompted work latched it forever and the session went silent until the
+#     user reloaded.
+#   * `busy_active`/`autowake` were cleared by a `usage_update` the agent tags
+#     with an autonomous origin — which claude-agent-acp emits conditionally and
+#     can simply omit — so the spinner ran over an idle agent, and because the
+#     composer queues while busy, the chat became unusable.
+#
+# The rule this type enforces: EVERY state has an exit that does not depend on
+# the agent volunteering anything.
+abstract type SessionActivity end
+
+"Nothing of ours is open and the agent is not streaming."
+struct Idle <: SessionActivity end
+
+"At least one `session/prompt` of ours is open. Ends at its response."
+struct Prompted <: SessionActivity end
+
+"""
+The agent is working with no prompt of ours open — it auto-woke after
+backgrounded work finished, or a background subagent is reporting.
+
+This is the one state the wire gives no end marker for: an auto-wake episode is
+prose and tools that simply stop. `AUTONOMOUS_ORIGINS` tags the usual last frame
+but is not guaranteed, so it is treated as a hint, never as the only way out —
+`quiet_since` bounds the state instead (see `settle`).
+"""
+struct Unprompted <: SessionActivity end
+
+"A cancel is on the wire and we are waiting for the turn to wind down."
+struct Cancelling <: SessionActivity end
+
+"""
+Whether the agent has work in flight that a cancel could reach.
+
+`Idle` is the only state where stop has nothing to do — and that is exactly the
+moment a UI should treat its own spinner as stale rather than act on it.
+"""
+is_working(::SessionActivity) = true
+is_working(::Idle) = false
+
+# ── The message stream ───────────────────────────────────────────────────────
+# Whole, ordered messages coalesced from the raw `session/update` soup. The
+# concrete kinds live in messages.jl; the abstract type is here because
+# `Connection` needs the boundary marker below.
+abstract type Message end
+
+# A boundary on a stream, not content. Travels the stream like a message so it
+# arrives in wire order: the coalescer seals its state when it reaches one (the
+# trailing text bubble ends, tools the agent never resolved are force-failed),
+# then forwards it, and the consumer signals `done` once everything ahead of the
+# boundary is rendered.
+#
+# That is what makes "the turn is over" a checkable fact on a CONTINUOUS stream.
+# The main thread does not stop existing between prompts — the agent auto-wakes
+# and keeps talking on it — so end-of-turn cannot be "the channel closed". It is
+# a marker, and waiting on one is the render barrier end-of-turn cleanup needs.
+#
+# `done` is a LATCH, not a mailbox: the consumer CLOSES it, and every waiter —
+# one, none, or the same caller twice — is released. A one-shot `put!`/`take!`
+# looks equivalent and is not: the second `take!` blocks forever on an empty
+# channel. That is exactly what an error path does, since it wants the barrier
+# both before it renders the error and again in its cleanup.
+#
+# `bind(done, task)` composes with this: if the renderer dies, the channel closes
+# and the waiter is released the same way.
+struct StreamFlush <: Message
+    done::Channel{Nothing}
+    # Whether the span this boundary ends was ABANDONED — i.e. it resolved
+    # `cancelled`, so any tool of its that never reported terminal never will.
+    #
+    # The coalescer needs the distinction because a tool's `updates` channel is
+    # closed on its terminal frame, and the CONSUMER blocks draining that
+    # channel. A handed-off turn's live tool must survive (a `bt_julia_eval`
+    # still running when the next prompt goes out); a CANCELLED turn's live tool
+    # must be released, or the consumer waits on a channel nothing will ever
+    # close and the whole chat stops rendering — messages pile up unseen until a
+    # reload replays them.
+    abandoned::Bool
+end
+StreamFlush(abandoned::Bool = false) = StreamFlush(Channel{Nothing}(1), abandoned)
+
+# Release everyone waiting on this boundary. Idempotent.
+signal_rendered!(m::StreamFlush) = (isopen(m.done) && close(m.done); nothing)
+
+# Block until `m` has been rendered (or the renderer is gone). Idempotent, and
+# safe to call from several tasks.
+function wait_rendered(m::StreamFlush)
+    try
+        take!(m.done)
+    catch e
+        e isa InvalidStateException || rethrow()   # closed = signalled
+    end
+    return nothing
+end
 
 # ── Session config options ────────────────────────────────────────────────────
 # ACP "Session Config Options": the session-setup response MAY carry a list of
@@ -275,6 +451,44 @@ function parse_tool_content_item(d::AbstractDict)
     end
 end
 
+# kimi's acp-adapter JSON-stringifies any non-string tool RESULT into a single
+# text block (`toolResultToAcpContent`), so a ReadMediaFile result reaches the
+# wire as ONE TextContent holding the JSON of
+#     [text("<image path=…>"), image_url(data-uri), text("</image>")]
+# — which the UI renders as a giant base64 blob. The SAME part array rides
+# verbatim in `rawOutput`, so re-materialize real content blocks from it: text
+# parts stay text (minus kimi's <image …>/</video> scaffolding, whose path is
+# already in `locations`), and `image_url`/`video_url` data URIs become
+# ImageContent, the shape the renderer's media branch understands. Returns
+# `nothing` when rawOutput isn't such an array — every other agent, kimi's own
+# string results, an unrecognized part, or a non-data-URI media URL — leaving
+# `content` untouched rather than partially rewritten.
+const MEDIA_DATA_URI_RE = r"^data:([^;,]+);base64,(.*)$"s
+
+function media_parts_content(rout)
+    rout isa AbstractVector || return nothing
+    ismedia(p) = p isa AbstractDict &&
+                 get(p, "type", "") in ("image_url", "video_url")
+    any(ismedia, rout) || return nothing
+    content = []
+    for p in rout
+        if p isa AbstractDict && get(p, "type", "") == "text"
+            t = get(p, "text", "")
+            occursin(r"^</?(?:image|video)(?:\s+path=\"[^\"]*\")?>$", t) && continue
+            push!(content, TextContent(t))
+        elseif ismedia(p)
+            u = get(p, "imageUrl", get(p, "videoUrl", Dict()))
+            u = u isa AbstractDict ? get(u, "url", "") : ""
+            m = match(MEDIA_DATA_URI_RE, u)
+            m === nothing && return nothing
+            push!(content, ImageContent(String(m.captures[2]), String(m.captures[1])))
+        else
+            return nothing
+        end
+    end
+    return content
+end
+
 function parse_location(d::AbstractDict)
     # `line` is spec'd as a scalar, but some agents send a non-scalar (a range
     # `[start,end]`, or a malformed value). Coerce anything that isn't an integer
@@ -289,7 +503,23 @@ end
 # tool name + the raw argument dict via the `_meta.claudeCode` envelope. The
 # envelope is optional on the spec, so absence is fine — `parse_tool_call`
 # falls back to `GenericTool` when `tool_name` is empty.
-function parse_claude_meta(params::AbstractDict)
+#
+# Other agents don't ship that envelope, but they still identify MCP tools:
+# they put the canonical `mcp__<server>__<tool>` name in the ACP `title`.
+# Verified against kimi 0.29.2 driving the real btworker server — its
+# `tool_call` frame is
+#     {"toolCallId":"0:tool_…","title":"mcp__btworker__bt_julia_eval",
+#      "kind":"other","status":"pending","content":[…]}
+# with NO `_meta` and NO `rawInput` anywhere in the turn. Without the fallback
+# below `tool_name` stays empty, every such call lands in `GenericTool`, and
+# BonitoAgents renders a bare generic card instead of the typed eval card —
+# the same tool looking completely different depending on which agent ran it.
+#
+# The fallback is deliberately narrow: only a title in the `mcp__a__b` form is
+# taken as a name, which is the exact shape `build_tool_call` already parses
+# and not something a human-readable title collides with. A title that isn't in
+# that form leaves `tool_name` empty and behaves exactly as before.
+function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
     meta = get(params, "_meta", nothing)
     name = ""
     if meta isa AbstractDict
@@ -299,11 +529,42 @@ function parse_claude_meta(params::AbstractDict)
             v isa AbstractString && (name = String(v))
         end
     end
+    if isempty(name)
+        t = get(params, "title", nothing)
+        if t isa AbstractString &&
+           (is_mcp_tool_name(t) || (title_names && looks_like_tool_name(t)))
+            name = String(t)
+        end
+    end
     rinput = get(params, "rawInput", nothing)
     rinput_d = rinput isa AbstractDict ?
                  Dict{String,Any}(String(k) => v for (k, v) in rinput) :
                  Dict{String,Any}()
     return (name, rinput_d)
+end
+
+# A bare tool NAME rather than a human-readable title. Kimi labels its native
+# tools with Claude's own names — `Read`, `Bash`, `Agent` — on the opening
+# `tool_call`, which is the only thing that identifies e.g. a shell call as a
+# shell call once `_meta` is absent. It then REPLACES the title on a later frame
+# with a sentence ("Reading hello.txt", "Running: echo …", "Launching explore
+# agent: …"), so the name is only trustworthy on that opening frame — hence the
+# `title_names` opt-in, set for `tool_call` and NOT for `tool_call_update`.
+#
+# Whitespace is the discriminator: every real tool name is a single token, and
+# every human title kimi produced contains a space. A non-matching title just
+# leaves the name empty, exactly as before.
+looks_like_tool_name(s::AbstractString) =
+    !isempty(s) && ncodeunits(s) <= 64 && !occursin(r"\s", s)
+
+# `mcp__<server>__<tool>` with both parts non-empty — the MCP naming convention
+# every ACP agent uses for tools it got from an MCP server.
+function is_mcp_tool_name(s::AbstractString)
+    startswith(s, "mcp__") || return false
+    rest = SubString(s, 6)
+    sep = findfirst("__", String(rest))
+    sep === nothing && return false
+    return first(sep) > 1 && last(sep) < lastindex(rest)
 end
 
 # Defensive extraction of the subagent tag: the `_meta` envelope is optional
@@ -341,7 +602,10 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
     elseif kind == "tool_call"
         content = [parse_tool_content_item(c) for c in get(params, "content", [])]
         locs = [parse_location(l) for l in get(params, "locations", [])]
-        name, rinput = parse_claude_meta(params)
+        # Opening frame: the title may still be the bare tool name (see
+        # `looks_like_tool_name`), which is the only handle a non-claude agent
+        # gives us on WHICH tool this is.
+        name, rinput = parse_claude_meta(params; title_names = true)
         return ToolCallNotif(
             get(params, "toolCallId", ""),
             get(params, "title", ""),
@@ -362,6 +626,14 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
             rout = get(params, "rawOutput", nothing)
             rout isa AbstractString && !isempty(rout) &&
                 (content = [TextContent(String(rout))])
+        end
+        # Media results (kimi's ReadMediaFile) arrive only as a JSON-stringified
+        # blob in `content`; the structured part array is in `rawOutput` — see
+        # `media_parts_content`. Terminal frames only, same no-race rationale as
+        # the rawOutput-string normalization above.
+        if get(params, "status", nothing) in ("completed", "failed")
+            media = media_parts_content(get(params, "rawOutput", nothing))
+            media !== nothing && (content = media)
         end
         locs = [parse_location(l) for l in get(params, "locations", [])]
         name, rinput = parse_claude_meta(params)

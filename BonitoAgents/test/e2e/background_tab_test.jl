@@ -4,7 +4,7 @@
 # Chrome + Electron pause `requestAnimationFrame` in a backgrounded tab/window —
 # queued rAF callbacks simply never fire until the tab refocuses. The chat's
 # auto-scroll used to route a new agent message's scroll-to-bottom through
-# `_queueScrollToBottom` (rAF-batched). While the tab was backgrounded the new
+# `queueScrollToBottom` (rAF-batched). While the tab was backgrounded the new
 # bubble went into `__bt_chat.cache` but NEVER into the DOM, because the rAF that
 # was supposed to scroll to bottom + re-`updateDOM` with the post-scroll visible
 # range never fired. When the user finally re-focused, the queued rAF fired and
@@ -67,7 +67,7 @@
     # ── Background the tab: pause rAF + flip document.hidden ──────────────────
     # Stub requestAnimationFrame so callbacks are QUEUED but never fire — exactly
     # what Chromium/Electron do to a backgrounded tab. `cancelAnimationFrame` is
-    # kept honest so the chat's own `_cancelPendingScroll` still works. We stash
+    # kept honest so the chat's own `cancelPendingScroll` still works. We stash
     # the real fns + the parked callbacks so we can "refocus" (restore + flush)
     # later and prove nothing was lost or double-fired.
     TK.eval_js(s, raw"""(() => {
