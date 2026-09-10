@@ -706,6 +706,75 @@ function run_dispatcher_prompt(prompt_id)
                 "toolCallId" => tid,
                 "status" => String(get(ev, "status", "completed")),
                 "content" => pack_tool_content(get(ev, "content", Any[]))))
+        elseif et == "codex_tool"
+            # A tool call in CODEX's wire dialect. Captured verbatim from
+            # @agentclientprotocol/codex-acp 1.11.0 (see
+            # AgentClientProtocol/test/fixtures/codex_*.jsonl); it breaks in a
+            # different place than kimi:
+            #
+            #   • It names NO tool anywhere — no `_meta.claudeCode`, and its
+            #     titles are display strings (a shell call is titled with the
+            #     command line itself, spaces and all).
+            #   • An MCP call is WRAPPED: `rawInput` is
+            #     {server, tool, arguments} and the title is `mcp.<server>.<tool>`.
+            #   • The RESULT never appears as content — an MCP call reports
+            #     `rawOutput.result` (the MCP CallToolResult) or
+            #     `rawOutput.error`, a shell call `rawOutput.formatted_output`,
+            #     and a shell call's opening content is a bare `terminal`
+            #     pointer we never subscribe to.
+            tid    = String(get(ev, "id", "cxtool-$(next_tool_id)")); next_tool_id += 1
+            args   = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
+            status = String(get(ev, "status", "completed"))
+            server = get(ev, "server", nothing)
+            if server !== nothing
+                # MCP call: the envelope rides BOTH frames, and the terminal
+                # frame carries no `_meta` at all.
+                tool  = String(ev["tool"])
+                envelope = Dict{String,Any}("server" => String(server),
+                                            "tool" => tool, "arguments" => args)
+                upd("tool_call", Dict{String,Any}(
+                    "toolCallId" => tid, "kind" => "execute",
+                    "title" => "mcp.$(server).$(tool)", "status" => "in_progress",
+                    "rawInput" => envelope,
+                    "_meta" => Dict{String,Any}("is_mcp_tool_call" => true)))
+                pause()
+                # Success AND tool-reported failure both come back as a normal
+                # `CallToolResult` under `result` — a bt_julia_eval that raised
+                # is still a COMPLETED call whose content is the stacktrace
+                # (verified: codex_mcp_tool_error.jsonl). `error` is reserved
+                # for a failure at the MCP layer itself.
+                err = get(ev, "error", nothing)
+                rout = err === nothing ?
+                    Dict{String,Any}("result" => Dict{String,Any}(
+                                         "content" => [Dict{String,Any}("type" => "text",
+                                                                        "text" => String(t))
+                                                       for t in get(ev, "output", String[])],
+                                         "structuredContent" => nothing,
+                                         "_meta" => Dict{String,Any}("elapsed_s" => 0.26,
+                                                                     "status" => "completed")),
+                                     "error" => nothing) :
+                    Dict{String,Any}("result" => nothing,
+                                     "error" => Dict{String,Any}("message" => String(err)))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => status,
+                    "rawInput" => envelope, "rawOutput" => rout))
+            else
+                # Shell call: title IS the command, output only in rawOutput.
+                cmd = String(ev["command"])
+                upd("tool_call", Dict{String,Any}(
+                    "toolCallId" => tid, "kind" => "execute",
+                    "title" => cmd, "status" => "in_progress",
+                    "content" => [Dict{String,Any}("type" => "terminal",
+                                                   "terminalId" => tid)],
+                    "rawInput" => Dict{String,Any}("command" => cmd,
+                                                   "cwd" => String(get(ev, "cwd", pwd())))))
+                pause()
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => status,
+                    "rawOutput" => Dict{String,Any}(
+                        "formatted_output" => String(get(ev, "output", "")),
+                        "exit_code" => Int(get(ev, "exit_code", 0)))))
+            end
         elseif et == "tool"
             # Generic tool call of any kind (edit/search/execute/other). Opens
             # the bubble, then (unless complete=false) ships content + a final

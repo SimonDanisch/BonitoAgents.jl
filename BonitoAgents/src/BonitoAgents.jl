@@ -71,7 +71,7 @@ include("dev.jl")              # dev_server() — self-contained dev rig
 
 export serve, dev_server
 export AgentProvider, BinAgent, WorkerAgent
-export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent
+export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, CodexAgent, MockAgent
 export start!, stop!, client, switch_provider!
 
 # Bake the real browser-driven paths captured from the e2e suite: literal

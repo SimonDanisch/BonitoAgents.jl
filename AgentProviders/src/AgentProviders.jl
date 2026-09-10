@@ -13,7 +13,7 @@ module AgentProviders
 # memoised. `find_provider(name)` maps the wire name back to its singleton.
 
 export AgentProvider, BinAgent
-export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, MockAgent, MockAgent2
+export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, CodexAgent, MockAgent, MockAgent2
 export provider_name, label, icon
 export current_providers, find_provider, refresh_providers!
 export strip_injected_context, meaningful_prompt, reports_autonomous_origin
@@ -45,6 +45,16 @@ function kimi_bin()
     e = get(ENV, "KIMI_AGENT_ACP", ""); isempty(e) || return e
     b = Sys.which("kimi"); b !== nothing && return b
     p = joinpath(homedir(), ".kimi-code", "bin", "kimi"); isfile(p) ? p : "kimi"
+end
+# The `codex` CLI speaks its own app-server protocol, NOT ACP (no `acp`
+# subcommand, and no ACP method names anywhere in the binary — checked against
+# codex-cli 0.154.0). ACP comes from a separate adapter,
+# `@agentclientprotocol/codex-acp`, which spawns Codex itself and translates —
+# the same shape as claude-agent-acp, so the resolver is the same two steps
+# (npm puts it on PATH; no well-known install dir to fall back to).
+function codex_bin()
+    e = get(ENV, "CODEX_AGENT_ACP", ""); isempty(e) || return e
+    b = Sys.which("codex-acp"); b === nothing ? "codex-acp" : b
 end
 # The mock runs as a Julia application: `julia --project=<env> -m MockACP`. The
 # test harness sets `BT_MOCK_PROJECT` to the env where MockACP is resolvable (the
@@ -94,6 +104,35 @@ end
 KimiAgent() = KimiAgent(kimi_bin(), ["acp"], Dict{String,String}(),
     Dict{String,Any}("form" => Dict{String,Any}()))
 
+struct CodexAgent <: BinAgent
+    bin::String; args::Vector{String}; env::Dict{String,String}; elicitation::Dict{String,Any}
+end
+# `codex-acp` IS the ACP server — no subcommand, like claude-agent-acp.
+#
+# `CODEX_CONFIG` (a JSON object codex-acp merges into the Codex session config)
+# is NOT optional tuning here. Codex classifies an MCP server that hasn't
+# finished starting as "pending optional" and silently drops it from the tool
+# catalogue for that step:
+#
+#     codex_mcp::connection_manager::tool_catalog:
+#       mcp.runtime.resolve_for_step: omitting pending optional MCP server
+#       server_name=btworker
+#
+# btworker is a Julia process (`using BonitoMCP` ≈ 2 s warm, far longer on a
+# cold depot), so with the stock grace it loses that race often — and the
+# failure is invisible from outside: `tools/list` succeeds, the server shows up
+# under `/mcp`, and the model just answers "I can't access the requested
+# btworker tool". The trace above is the only tell, and it stops appearing once
+# the grace is set.
+#
+# This does NOT make every turn call the tool: the model still sometimes
+# answers without using an available tool. That case looks different — a bare
+# answer, no claim of unavailability, and no `omitting …` trace — so the two
+# are distinguishable when this comes up again.
+CodexAgent() = CodexAgent(codex_bin(), String[],
+    Dict("CODEX_CONFIG" => "{\"mcp_optional_startup_grace_ms\":30000}"),
+    Dict{String,Any}("form" => Dict{String,Any}()))
+
 # NOTE — `elicitation["form"]` is an OBJECT for every provider above, never
 # `true`, and that is not cosmetic. The ACP schema declares
 # `zElicitationFormCapabilities = z.object({…})` and reads it through
@@ -140,6 +179,7 @@ provider_name(::ClaudeCodeAgent) = "ClaudeCode"
 provider_name(::MiMoAgent)       = "MiMoCode"
 provider_name(::OpenCodeAgent)   = "OpenCode"
 provider_name(::KimiAgent)       = "KimiCode"
+provider_name(::CodexAgent)      = "Codex"
 provider_name(::MockAgent)       = "MockCode"
 provider_name(::MockAgent2)      = "MockCode2"
 
@@ -147,6 +187,7 @@ label(::ClaudeCodeAgent) = "Claude Code"
 label(::MiMoAgent)       = "MiMo Code"
 label(::OpenCodeAgent)   = "OpenCode"
 label(::KimiAgent)       = "Kimi Code"
+label(::CodexAgent)      = "Codex"
 label(::MockAgent)       = "Mock Agent"
 label(::MockAgent2)      = "Mock Agent 2"
 
@@ -154,6 +195,7 @@ icon(::ClaudeCodeAgent) = "bt-provider-claude"
 icon(::MiMoAgent)       = "bt-provider-mimo"
 icon(::OpenCodeAgent)   = "bt-provider-opencode"
 icon(::KimiAgent)       = "bt-provider-kimi"
+icon(::CodexAgent)      = "bt-provider-codex"
 icon(::MockAgent)       = "bt-provider-mock"
 icon(::MockAgent2)      = "bt-provider-mock"
 
@@ -179,7 +221,8 @@ const _PROVIDERS_LOCK = ReentrantLock()
 # is offered only when `BT_ENABLE_MOCK_AGENT` is set — so the result depends on
 # ENV at the moment of the call, which is exactly why the memo below must not be
 # populated before the spawner has finished configuring that ENV.
-_build_providers() = (ps = AgentProvider[ClaudeCodeAgent(), MiMoAgent(), OpenCodeAgent(), KimiAgent()];
+_build_providers() = (ps = AgentProvider[ClaudeCodeAgent(), MiMoAgent(), OpenCodeAgent(),
+                                          KimiAgent(), CodexAgent()];
                       haskey(ENV, "BT_ENABLE_MOCK_AGENT") && append!(ps, (MockAgent(), MockAgent2())); ps)
 
 function current_providers()

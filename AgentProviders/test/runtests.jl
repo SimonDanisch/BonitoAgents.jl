@@ -60,6 +60,7 @@ end
     @test meaningful_prompt(OpenCodeAgent(), html) == html
     @test meaningful_prompt(MiMoAgent(), html) == html
     @test meaningful_prompt(KimiAgent(), html) == html
+    @test meaningful_prompt(CodexAgent(), html) == html
     @test meaningful_prompt(OpenCodeAgent(), "  spaced  ") == "spaced"
     @test meaningful_prompt(OpenCodeAgent(), "   ") === nothing
     # Claude, by contrast, treats that leading block as a wrapper.

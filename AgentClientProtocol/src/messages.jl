@@ -308,7 +308,25 @@ end
 # Fallback when claude-agent-acp didn't fill the meta (`tool_name == ""`):
 # we have no name to dispatch on, so the call lands as `GenericTool` with an
 # empty name. UX will show the ACP `kind` + `title` like before.
+#
+# …with one exception. codex-acp names NO tool — not in `_meta`, not in the
+# title (its shell title IS the command line, spaces and all) — so a shell call
+# from it would render as a nameless generic pill with the command only in the
+# heading and no command line in the card. An `execute` kind carrying a
+# `command` string is unambiguously a shell call whatever produced it, so route
+# it to `BashCall` on that shape. Every agent that DOES name the tool ("Bash")
+# dispatches above and never reaches here.
 function build_tool_call(::Val{Symbol("")}, n::ToolCallNotif)
+    cmd = get(n.raw_input, "command", nothing)
+    if n.kind == "execute" && cmd isa AbstractString && !isempty(cmd)
+        return BashCall(
+            n.tool_call_id, n.kind, n.title, n.status,
+            Vector{ToolContent}(n.content), Channel{ToolCall}(BUF),
+            String(cmd),
+            get(n.raw_input, "run_in_background", false) === true,
+            _opt_str(get(n.raw_input, "description", nothing)),
+        )
+    end
     return GenericTool(
         n.tool_call_id, n.kind, n.title, n.status,
         Vector{ToolContent}(n.content), Channel{ToolCall}(BUF),

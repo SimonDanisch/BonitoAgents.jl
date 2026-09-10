@@ -446,9 +446,33 @@ function parse_tool_content_item(d::AbstractDict)
         return DiffContent(get(d, "path", ""), get(d, "oldText", nothing), get(d, "newText", ""))
     elseif t == "content"
         return parse_content_block(get(d, "content", Dict()))
+    elseif t == "terminal"
+        # `{"type":"terminal","terminalId":…}` is a POINTER, not content: the
+        # client is meant to stream the live output over `terminal/output`,
+        # which we don't implement. Rendering the placeholder text put a literal
+        # "[tool content: terminal]" in the card body for the whole run (codex
+        # opens every shell call this way), and it is not replaced until the
+        # terminal frame — the real output arrives in `rawOutput` instead (see
+        # `tool_output_content`). Dropping it leaves the content empty, which is
+        # exactly what that fallback keys on.
+        return nothing
     else
         return TextContent("[tool content: $t]")
     end
+end
+
+# A frame's `content` list: parsed items, with the ones that carry nothing
+# renderable (see the `terminal` arm) and any non-object entry dropped, rather
+# than throwing and losing the whole frame.
+function parse_tool_content(raw)
+    out = []
+    raw isa AbstractVector || return out
+    for x in raw
+        x isa AbstractDict || continue
+        c = parse_tool_content_item(x)
+        c === nothing || push!(out, c)
+    end
+    return out
 end
 
 # kimi's acp-adapter JSON-stringifies any non-string tool RESULT into a single
@@ -463,6 +487,54 @@ end
 # `nothing` when rawOutput isn't such an array — every other agent, kimi's own
 # string results, an unrecognized part, or a non-data-URI media URL — leaving
 # `content` untouched rather than partially rewritten.
+
+"""
+    tool_output_content(rout) -> Vector or nothing
+
+A tool result that arrived only as `rawOutput`, re-materialized as content
+blocks — or `nothing` when `rawOutput` is not one of the known result shapes,
+leaving the frame's own content untouched.
+
+Three real shapes, all verified on the wire:
+
+  claude-agent-acp  a bare STRING: a FAILED MCP tool's result comes with no
+                    content blocks at all (acp.jsonl — the fused
+                    "```julia\n…\n```\nerror:\n…" text of a bt_julia_eval
+                    DomainError); success frames carry real blocks instead.
+  codex-acp         `{"result":{"content":[…]},"error":null}` for an MCP call —
+                    the MCP `CallToolResult` verbatim, never mirrored into
+                    content — or `{"result":null,"error":{"message":"…"}}` when
+                    the call failed.
+  codex-acp         `{"formatted_output":"NATIVEPROBE\n","exit_code":0}` for a
+                    shell command, whose live output it only ever offers as a
+                    `terminal` pointer we don't subscribe to.
+
+Without this a codex tool card is empty: every result it produces lands here
+and nowhere else.
+"""
+function tool_output_content(rout)
+    rout isa AbstractString && return isempty(rout) ? nothing : [TextContent(String(rout))]
+    rout isa AbstractDict || return nothing
+    # An MCP envelope is identified by either key — `error` alone is what a
+    # failed call sends, and `result` is null there.
+    if haskey(rout, "result") || haskey(rout, "error")
+        err = get(rout, "error", nothing)
+        if err !== nothing
+            err isa AbstractString && return [TextContent(String(err))]
+            msg = err isa AbstractDict ? get(err, "message", nothing) : nothing
+            return [TextContent(msg isa AbstractString ? String(msg) : JSON.json(err))]
+        end
+        res = get(rout, "result", nothing)
+        res isa AbstractDict || return nothing
+        blocks = get(res, "content", nothing)
+        blocks isa AbstractVector || return nothing
+        out = [parse_content_block(b) for b in blocks if b isa AbstractDict]
+        return isempty(out) ? nothing : out
+    end
+    fo = get(rout, "formatted_output", nothing)
+    return fo isa AbstractString && !isempty(fo) ? [TextContent(String(fo))] : nothing
+end
+
 const MEDIA_DATA_URI_RE = r"^data:([^;,]+);base64,(.*)$"s
 
 function media_parts_content(rout)
@@ -540,7 +612,51 @@ function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
     rinput_d = rinput isa AbstractDict ?
                  Dict{String,Any}(String(k) => v for (k, v) in rinput) :
                  Dict{String,Any}()
-    return (name, rinput_d)
+    # codex-acp wraps MCP calls in an envelope instead of naming them the way
+    # every other agent does — unwrap it to the canonical name + arguments.
+    cx = codex_mcp_envelope(rinput_d)
+    cx === nothing && return (name, rinput_d)
+    return cx
+end
+
+"""
+    codex_mcp_envelope(raw_input) -> (name, arguments) or nothing
+
+codex-acp's MCP tool-call envelope, unwrapped to the canonical
+`mcp__<server>__<tool>` name plus the tool's OWN arguments — or `nothing` when
+`raw_input` isn't one.
+
+codex-acp (verified 1.11.0 against the real btworker MCP server, captured into
+test/fixtures/codex_mcp_tool_call.jsonl) is the only agent so far that neither
+names the tool the canonical way nor passes its arguments through:
+
+    {"sessionUpdate":"tool_call","toolCallId":"exec-…","kind":"execute",
+     "title":"mcp.btworker.bt_julia_eval",
+     "rawInput":{"server":"btworker","tool":"bt_julia_eval",
+                 "arguments":{"code":"1+1"}},
+     "_meta":{"is_mcp_tool_call":true}}
+
+Taken at face value that is a nameless `GenericTool` whose "arguments" are
+`server`/`tool`/`arguments` — no eval card, and an empty code preview. The
+dot-separated title can't be split safely (both halves may contain dots), but
+the envelope itself is unambiguous, so the ENVELOPE is what we key on.
+
+The `_meta` flag rides only the OPENING frame — the terminal `tool_call_update`
+repeats the same `rawInput` with no `_meta` at all — so the flag cannot be the
+discriminator or a completed MCP call would re-wrap its own arguments. The
+shape is: exactly the three keys, `server`/`tool` non-empty strings,
+`arguments` an object.
+"""
+function codex_mcp_envelope(raw_input::AbstractDict)
+    length(raw_input) == 3 || return nothing
+    server = get(raw_input, "server", nothing)
+    tool   = get(raw_input, "tool", nothing)
+    args   = get(raw_input, "arguments", nothing)
+    server isa AbstractString && !isempty(server) || return nothing
+    tool   isa AbstractString && !isempty(tool)   || return nothing
+    args isa AbstractDict || return nothing
+    return ("mcp__$(server)__$(tool)",
+            Dict{String,Any}(String(k) => v for (k, v) in args))
 end
 
 # A bare tool NAME rather than a human-readable title. Kimi labels its native
@@ -600,7 +716,7 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
                    for e in get(params, "entries", [])]
         return PlanUpdate(entries)
     elseif kind == "tool_call"
-        content = [parse_tool_content_item(c) for c in get(params, "content", [])]
+        content = parse_tool_content(get(params, "content", []))
         locs = [parse_location(l) for l in get(params, "locations", [])]
         # Opening frame: the title may still be the bare tool name (see
         # `looks_like_tool_name`), which is the only handle a non-claude agent
@@ -614,18 +730,15 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
             content, locs, name, rinput, params
         )
     elseif kind == "tool_call_update"
-        content = [parse_tool_content_item(c) for c in get(params, "content", [])]
-        # claude-agent-acp ships a FAILED MCP tool's result as a bare
-        # `rawOutput` STRING with NO content blocks (verified on acp.jsonl:
-        # the fused "```julia\n…\n```\nerror:\n…" text of a bt_julia_eval
-        # DomainError) — success frames carry real content blocks instead.
-        # Normalize the asymmetry HERE so every downstream consumer (snaps,
-        # persistence, renderers) only ever sees content. Terminal frames
-        # only: a mid-flight rawOutput would race the real content blocks.
+        content = parse_tool_content(get(params, "content", []))
+        # Some agents report a tool's RESULT only in `rawOutput`, with no
+        # content blocks at all. Normalize the asymmetry HERE so every
+        # downstream consumer (snaps, persistence, renderers) only ever sees
+        # content. Terminal frames only: a mid-flight rawOutput would race the
+        # real content blocks. See `tool_output_content` for the shapes.
         if isempty(content) && get(params, "status", nothing) in ("completed", "failed")
-            rout = get(params, "rawOutput", nothing)
-            rout isa AbstractString && !isempty(rout) &&
-                (content = [TextContent(String(rout))])
+            c = tool_output_content(get(params, "rawOutput", nothing))
+            c === nothing || (content = c)
         end
         # Media results (kimi's ReadMediaFile) arrive only as a JSON-stringified
         # blob in `content`; the structured part array is in `rawOutput` — see

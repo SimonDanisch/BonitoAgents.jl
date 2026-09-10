@@ -48,8 +48,25 @@ expose ACP under an `acp` subcommand). Select them per chat from the provider
 dropdown; switching providers mid-project starts the next turn under the new
 agent.
 
-Kimi Code additionally advertises ACP `session/load`, but its sessions are not
-resumed across a server restart yet: a project stores its session id without
+## Codex
+
+[Codex](https://github.com/openai/codex) speaks its own app-server protocol
+rather than ACP, so it plugs in through a separate adapter binary (like Claude
+Code does) that spawns Codex and translates:
+
+```bash
+npm install -g @agentclientprotocol/codex-acp
+codex login   # or set CODEX_API_KEY / OPENAI_API_KEY
+```
+
+The adapter bundles a compatible Codex; set `CODEX_PATH` to point it at a
+different one, or `CODEX_AGENT_ACP` to run a different adapter build. It reports
+its model, reasoning effort and approval mode as session-config pills like any
+other provider, and advertises ACP `session/list`, so **Discover** finds Codex
+sessions on the worker too.
+
+Kimi Code and Codex both advertise ACP `session/load`, but their sessions are
+not resumed across a server restart yet: a project stores its session id without
 the provider that created it, so restoring one under a different provider would
 fail. Only Claude Code resumes today.
 
@@ -60,10 +77,16 @@ whichever agent calls them, even though ACP leaves it up to the agent how to
 identify an MCP tool. Claude Code states the name in a `_meta` extension, Kimi
 puts it in the ACP title as `mcp__btworker__bt_julia_eval`, OpenCode as
 `btworker_bt_julia_eval`, and Kimi streams the arguments as content text rather
-than `rawInput`. All of these are normalised back to `(server, tool)` plus the
-real arguments, so the code preview, output pane and live embeds behave the
-same everywhere. A tool we don't recognise is left untouched and shows the
-generic card.
+than `rawInput`. Codex names no tool at all: it wraps the call as
+`rawInput = {server, tool, arguments}` and returns the result only in
+`rawOutput` — an MCP `CallToolResult` for an MCP tool, `formatted_output` for a
+shell command, whose live output it otherwise offers as a terminal handle. All
+of these are normalised back to `(server, tool)` plus the real arguments and
+content, so the code preview, output pane and live embeds behave the same
+everywhere. A recognised tool is also TITLED by its own name — a
+`bt_julia_eval` card reads `bt_julia_eval` whoever ran it, rather than
+inheriting whatever the agent chose to call it. A tool we don't recognise is
+left untouched and shows the generic card.
 
 ## The mock agent
 

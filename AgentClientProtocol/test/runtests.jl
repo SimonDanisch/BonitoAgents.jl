@@ -904,6 +904,154 @@ end
     @test occursin("NATIVEPROBE", sh.content[end].text)
 end
 
+# ── codex-acp: names no tool, reports every result out-of-band ───────────────
+# Replays the REAL frames `@agentclientprotocol/codex-acp` 1.11.0 emitted while
+# driving the REAL btworker MCP server (BonitoMCP over stdio), captured verbatim
+# into test/fixtures. Codex is the hardest dialect so far and breaks in a
+# different place than kimi: it wraps an MCP call in an envelope (`rawInput` =
+# server/tool/arguments, title `mcp.server.tool`) and returns the result ONLY in
+# `rawOutput`, never as content. Parsed naively that is a nameless `GenericTool`
+# whose "arguments" are `server`/`tool`/`arguments` and whose card body is empty.
+codex_frames(name) = [JSON.parse(l) for l in
+                      readlines(joinpath(@__DIR__, "fixtures", name))]
+
+function codex_tools(name)
+    out = Channel{Any}(256)
+    st  = ACP.TurnState()
+    for f in codex_frames(name)
+        ACP.parse_update!(out, st, ACP.parse_session_update(f))
+    end
+    ACP.close_turn!(out, st); close(out)
+    return [x for x in collect(out) if x isa ACP.ToolCall]
+end
+
+@testset "MCP tool call from codex (real codex-acp wire)" begin
+    frames = codex_frames("codex_mcp_tool_call.jsonl")
+    # The fixture must stay a genuine codex capture or it stops guarding
+    # anything: no `_meta.claudeCode` envelope, the name only ever inside
+    # `rawInput`, and the `is_mcp_tool_call` flag on the OPENING frame ALONE —
+    # which is why the envelope shape, not the flag, is the discriminator.
+    @test !any(f -> haskey(get(f, "_meta", Dict()), "claudeCode"), frames)
+    @test count(f -> get(get(f, "_meta", Dict()), "is_mcp_tool_call", false) === true,
+                frames) == 1
+
+    tools = codex_tools("codex_mcp_tool_call.jsonl")
+    eval_call = only([t for t in tools if t isa ACP.MCPCall])
+
+    # Identity recovered from the envelope → the typed MCP path, not GenericTool.
+    @test eval_call.server == "btworker"
+    @test eval_call.tool_name == "bt_julia_eval"
+    # …and the tool's OWN arguments, not the envelope's three keys.
+    @test eval_call.raw_input["code"] == "1+1"
+    @test eval_call.raw_input["env_path"] == "/tmp/codexprobe"
+    @test !haskey(eval_call.raw_input, "server")
+    @test !haskey(eval_call.raw_input, "tool")
+    @test !haskey(eval_call.raw_input, "arguments")
+    # The result rides `rawOutput.result` (an MCP CallToolResult) and is
+    # mirrored into no content block at all — without the fallback the card is
+    # empty.
+    @test eval_call.status == "completed"
+    @test [c.text for c in eval_call.content if c isa ACP.TextContent] == ["2"]
+
+    # Codex's own auto-review rides alongside as a `think` tool. Its rawInput is
+    # a review event, NOT an MCP envelope, so it must stay a generic call.
+    review = only([t for t in tools if t isa ACP.GenericTool])
+    @test review.kind == "think"
+    @test review.title == "Guardian Review"
+end
+
+# A Julia error is NOT an MCP error, and codex reports it accordingly: the
+# `CallToolResult` comes back normally (so the tool COMPLETES) and the
+# stacktrace is its content. Captured from a real `bt_julia_eval` of
+# `sqrt(-1)`. The distinction matters — keying "did it fail" off the ACP status
+# would call this a success, and reading only `rawOutput.error` would render an
+# empty card for the case users hit most.
+@testset "a Julia error from codex rides the result, not the error" begin
+    tc = only(codex_tools("codex_mcp_tool_error.jsonl"))
+    @test tc isa ACP.MCPCall
+    @test tc.tool_name == "bt_julia_eval"
+    @test tc.raw_input["code"] == "sqrt(-1)"
+    @test tc.status == "completed"
+    body = tc.content[end].text
+    @test occursin("DomainError with -1.0", body)
+    @test occursin("Stacktrace:", body)
+    # BonitoMCP colours its errors; the escapes survive into the card, where
+    # the terminal renderer turns them into styled spans rather than literal
+    # `\e[91m` garbage. Losing them here would mean losing that styling.
+    @test occursin("\e[91m", body)
+end
+
+@testset "native tool calls from codex (real codex-acp wire)" begin
+    tools = codex_tools("codex_native_tools.jsonl")
+    @test length(tools) == 2
+    sh, ed = tools
+
+    # Codex titles a shell call with the command line itself (spaces and all),
+    # so no name fallback can fire — the `execute` + `command` shape is what
+    # makes it a Bash card.
+    @test sh isa ACP.BashCall
+    @test sh.command == "echo NATIVEPROBE"
+    @test !sh.run_in_background
+    # Output arrives as `rawOutput.formatted_output`; the opening frame's
+    # `terminal` pointer must never survive as card text.
+    @test occursin("NATIVEPROBE", sh.content[end].text)
+    @test !any(c -> c isa ACP.TextContent && occursin("tool content: terminal", c.text),
+               sh.content)
+
+    # File edits already speak the spec: kind "edit" with real diff content.
+    @test ed isa ACP.GenericTool && ed.kind == "edit"
+    d = only([c for c in ed.content if c isa ACP.DiffContent])
+    @test d.path == "/tmp/codexprobe/notes.txt"
+    @test d.new_text == "hello world\nsecond line\n"
+end
+
+# The envelope check keys on SHAPE, so it has to be tight enough that a tool
+# whose own arguments happen to be named that way still round-trips.
+@testset "codex MCP envelope is recognised by shape alone" begin
+    ok = ACP.codex_mcp_envelope(Dict{String,Any}(
+        "server" => "btworker", "tool" => "bt_julia_eval",
+        "arguments" => Dict{String,Any}("code" => "1+1")))
+    @test ok == ("mcp__btworker__bt_julia_eval", Dict{String,Any}("code" => "1+1"))
+
+    # Not envelopes: a missing key, an extra key, empty names, or arguments
+    # that aren't an object.
+    @test ACP.codex_mcp_envelope(Dict{String,Any}("server" => "s", "tool" => "t")) === nothing
+    @test ACP.codex_mcp_envelope(Dict{String,Any}(
+        "server" => "s", "tool" => "t", "arguments" => Dict(), "extra" => 1)) === nothing
+    @test ACP.codex_mcp_envelope(Dict{String,Any}(
+        "server" => "", "tool" => "t", "arguments" => Dict())) === nothing
+    @test ACP.codex_mcp_envelope(Dict{String,Any}(
+        "server" => "s", "tool" => "", "arguments" => Dict())) === nothing
+    @test ACP.codex_mcp_envelope(Dict{String,Any}(
+        "server" => "s", "tool" => "t", "arguments" => "1+1")) === nothing
+    @test ACP.codex_mcp_envelope(Dict{String,Any}()) === nothing
+end
+
+# `rawOutput` is a last resort, so anything that isn't a known result shape has
+# to leave the frame's own content alone.
+@testset "rawOutput result shapes" begin
+    @test ACP.tool_output_content("plain text")[1].text == "plain text"
+    @test ACP.tool_output_content("") === nothing
+    @test ACP.tool_output_content(nothing) === nothing
+    @test ACP.tool_output_content(Dict("exit_code" => 0)) === nothing
+    @test ACP.tool_output_content(
+        Dict("formatted_output" => "hi\n", "exit_code" => 0))[1].text == "hi\n"
+    @test ACP.tool_output_content(Dict("formatted_output" => "")) === nothing
+    @test ACP.tool_output_content(
+        Dict("result" => Dict("content" => [Dict("type" => "text", "text" => "2")]),
+             "error" => nothing))[1].text == "2"
+    # The `error` branch is codex-acp's `createMcpRawOutput(result, error)` for a
+    # call that failed at the MCP layer (a transport/protocol error, not a Julia
+    # one — see the testset above for what a Julia error actually looks like).
+    @test ACP.tool_output_content(
+        Dict("result" => nothing, "error" => Dict("message" => "boom")))[1].text == "boom"
+    @test ACP.tool_output_content(Dict("result" => nothing, "error" => "boom"))[1].text == "boom"
+    # A result with no content blocks leaves the card as it was.
+    @test ACP.tool_output_content(Dict("result" => Dict("content" => []), "error" => nothing)) === nothing
+    # …and codex's own review events (neither key) are not results at all.
+    @test ACP.tool_output_content(Dict("review" => Dict("status" => "approved"))) === nothing
+end
+
 # The claude path must be entirely unaffected by the two fallbacks above: it
 # names tools through `_meta` and sends `rawInput`, so a content frame stays
 # content even when it happens to look like a JSON object.

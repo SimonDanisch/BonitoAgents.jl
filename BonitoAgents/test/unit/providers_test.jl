@@ -10,6 +10,7 @@
 # kills the bind before `session/new`. OpenCode wants the same object shape.
 @testitem "unit:providers" tags = [:unit] begin
     using AgentProviders
+    import JSON
 
     saved_mock = get(ENV, "BT_ENABLE_MOCK_AGENT", nothing)
     try
@@ -33,7 +34,7 @@
         ENV["BT_ENABLE_MOCK_AGENT"] = "1"
         @test "MockCode" in provider_name.(refresh_providers!())
 
-        @test issubset(["ClaudeCode", "MiMoCode", "OpenCode", "KimiCode"], names)
+        @test issubset(["ClaudeCode", "MiMoCode", "OpenCode", "KimiCode", "Codex"], names)
 
         # EVERY provider must declare `elicitation.form` as an OBJECT. The ACP
         # schema reads it via `defaultOnError(z.object({…}).nullish(), …)`, so a
@@ -59,16 +60,35 @@
         @test kimi.elicitation["form"] isa AbstractDict
         @test find_provider("OpenCode").elicitation["form"] isa AbstractDict
 
-        # `KIMI_AGENT_ACP` overrides the resolved binary, like every other
-        # provider's `*_AGENT_ACP` (used to point a worker at a custom build).
-        saved_bin = get(ENV, "KIMI_AGENT_ACP", nothing)
-        try
-            ENV["KIMI_AGENT_ACP"] = "/custom/kimi"
-            refresh_providers!()   # the list is memoised; ENV is read on build
-            @test find_provider("KimiCode").bin == "/custom/kimi"
-        finally
-            saved_bin === nothing ? delete!(ENV, "KIMI_AGENT_ACP") :
-                                    (ENV["KIMI_AGENT_ACP"] = saved_bin)
+        # Codex is the other provider whose ACP server is a SEPARATE adapter
+        # binary (`codex-acp`, like claude-agent-acp) rather than a subcommand
+        # of the CLI — the `codex` CLI speaks its own app-server protocol and
+        # has no `acp` subcommand, so an args list here would be a bug.
+        codex = find_provider("Codex")
+        @test codex isa CodexAgent
+        @test label(codex) == "Codex"
+        @test isempty(codex.args)
+        @test codex.elicitation["form"] isa AbstractDict
+        # The MCP startup grace is load-bearing, not tuning: without it codex
+        # drops btworker from the tool catalogue whenever the Julia MCP process
+        # is still starting, and the only symptom is the agent claiming it has
+        # no such tool. Pinned so it can't be dropped as noise.
+        cfg = JSON.parse(codex.env["CODEX_CONFIG"])
+        @test cfg["mcp_optional_startup_grace_ms"] >= 30000
+
+        # `KIMI_AGENT_ACP` / `CODEX_AGENT_ACP` override the resolved binary, like
+        # every other provider's `*_AGENT_ACP` (used to point a worker at a
+        # custom build).
+        for (var, name, path) in (("KIMI_AGENT_ACP", "KimiCode", "/custom/kimi"),
+                                  ("CODEX_AGENT_ACP", "Codex", "/custom/codex-acp"))
+            saved_bin = get(ENV, var, nothing)
+            try
+                ENV[var] = path
+                refresh_providers!()   # the list is memoised; ENV is read on build
+                @test find_provider(name).bin == path
+            finally
+                saved_bin === nothing ? delete!(ENV, var) : (ENV[var] = saved_bin)
+            end
         end
     finally
         saved_mock === nothing ? delete!(ENV, "BT_ENABLE_MOCK_AGENT") :

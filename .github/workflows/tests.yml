@@ -163,6 +163,7 @@ jobs:
           - chat_show
           - chat_show_extras
           - chat_streaming_sustained
+          - codex_wire
           - copy_project
           - cross_worker
           - cross_worker_sync_ui

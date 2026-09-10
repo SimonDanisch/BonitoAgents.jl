@@ -89,7 +89,8 @@ function reset_dialback_or_warn(reset!::Function, what::AbstractString)
 end
 
 export TestServer, dev_server, add_worker!,
-       text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update, kimi_tool, REPLAY_FN,
+       text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update,
+       kimi_tool, codex_mcp_tool, codex_shell, REPLAY_FN,
        post_turn,
        sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn,
@@ -200,6 +201,53 @@ kimi_tool(name; kind = "other", args = Dict{String,Any}(), content = Any[],
                          "content" => content, "status" => String(status))
     id          === nothing || (d["id"]          = String(id))
     human_title === nothing || (d["human_title"] = String(human_title))
+    d
+end
+
+"""
+    codex_mcp_tool(server, tool; args, output, error, status, id) -> Dict
+
+Agent event for an MCP tool call in CODEX's wire dialect — the shape captured
+verbatim from `@agentclientprotocol/codex-acp` (fixtures live in
+`AgentClientProtocol/test/fixtures/codex_*.jsonl`).
+
+Codex neither names the tool the canonical way nor passes its arguments
+through: the call is WRAPPED as `rawInput = {server, tool, arguments}` under the
+title `mcp.<server>.<tool>`, and the result comes back only in
+`rawOutput.result` (the MCP `CallToolResult`), never as content.
+
+`output` is the list of text blocks the tool returned — for a tool that FAILED
+on its own terms (a `bt_julia_eval` that raised) that is the stacktrace, and the
+call still completes, which is what the real wire does. `error` is the separate
+MCP-layer failure (`rawOutput.error`), which does mark the call failed.
+"""
+codex_mcp_tool(server, tool; args = Dict{String,Any}(), output = String[],
+               error = nothing, status = error === nothing ? "completed" : "failed",
+               id = nothing) = begin
+    d = Dict{String,Any}("type" => "codex_tool", "server" => String(server),
+                         "tool" => String(tool), "args" => Dict{String,Any}(args),
+                         "output" => [String(t) for t in output],
+                         "status" => String(status))
+    error === nothing || (d["error"] = String(error))
+    id    === nothing || (d["id"]    = String(id))
+    d
+end
+
+"""
+    codex_shell(command; output, exit_code, status, id, cwd) -> Dict
+
+Agent event for a shell call in CODEX's wire dialect: the tool is titled with
+the command line itself (so no name fallback can fire), the opening content is a
+bare `terminal` pointer we never subscribe to, and the output arrives only as
+`rawOutput.formatted_output`.
+"""
+codex_shell(command; output = "", exit_code = 0, status = "completed",
+            id = nothing, cwd = nothing) = begin
+    d = Dict{String,Any}("type" => "codex_tool", "command" => String(command),
+                         "output" => String(output), "exit_code" => Int(exit_code),
+                         "status" => String(status))
+    id  === nothing || (d["id"]  = String(id))
+    cwd === nothing || (d["cwd"] = String(cwd))
     d
 end
 

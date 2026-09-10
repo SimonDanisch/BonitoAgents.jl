@@ -198,8 +198,8 @@ end
 # never touched (which would block the user's actual worker).
 # ── ACP session discovery ────────────────────────────────────────────────────
 # Discovery used to be Claude-only (a walk of ~/.claude/projects). Agents that
-# implement ACP's `session/list` can be asked directly — kimi and opencode both
-# advertise it. These guard the parts that don't need an agent installed.
+# implement ACP's `session/list` can be asked directly — kimi, opencode and
+# codex all advertise it. These guard the parts that don't need an agent installed.
 @testset "acp session discovery" begin
     # ISO-8601 → epoch, matching the mtime the file scan reports.
     @test BW.acp_epoch("2026-07-29T10:04:35.131Z") ==
@@ -229,7 +229,8 @@ end
     # machine with only Claude must still scan cleanly.
     withenv("KIMI_AGENT_ACP" => "/nonexistent/kimi",
             "MIMO_AGENT_ACP" => "/nonexistent/mimo",
-            "OPENCODE_AGENT_ACP" => "/nonexistent/opencode") do
+            "OPENCODE_AGENT_ACP" => "/nonexistent/opencode",
+            "CODEX_AGENT_ACP" => "/nonexistent/codex-acp") do
         AgentProviders.refresh_providers!()
         @test BW.scan_acp_providers() == Dict{String,Any}[]
     end

@@ -15,16 +15,17 @@
 
     fixtures = joinpath(dirname(dirname(pathof(ACP))), "test", "fixtures")
 
-    # Replay one captured turn through the real parser and return its tool call.
-    function replay_tool(file)
+    # Replay one captured turn through the real parser and return its tool calls.
+    function replay_tools(file)
         out = Channel{Any}(256)
         st  = ACP.TurnState()
         for l in eachline(joinpath(fixtures, file))
             ACP.parse_update!(out, st, ACP.parse_session_update(JSON.parse(l)))
         end
         ACP.close_turn!(out, st); close(out)
-        return only([x for x in collect(out) if x isa ACP.ToolCall])
+        return [x for x in collect(out) if x isa ACP.ToolCall]
     end
+    replay_tool(file) = only(replay_tools(file))
 
     @testset "$agent renders bt_julia_eval as the typed eval card" for (agent, file) in (
             ("kimi",     "kimi_mcp_tool_call.jsonl"),
@@ -39,6 +40,62 @@
         @test !isempty(m.env_path)
         # Only the tool's real result reaches the body; no argument JSON.
         @test [c.text for c in tc.content if c isa ACP.TextContent] == ["2"]
+    end
+
+    # Codex needs its own arm: it is the only agent that ships neither the name
+    # NOR the arguments in a usable form (both are buried in a
+    # server/tool/arguments envelope) and returns the result out-of-band in
+    # `rawOutput`, so all three recoveries have to land for the card to render.
+    # Its own auto-review rides alongside as a separate `think` tool.
+    @testset "codex renders bt_julia_eval as the typed eval card" begin
+        tools = replay_tools("codex_mcp_tool_call.jsonl")
+        tc = only([t for t in tools if t isa ACP.MCPCall])
+        m  = BonitoAgents.replayed_tool_msg(tc)
+        @test m isa BonitoAgents.JuliaEvalToolMsg
+        @test BonitoAgents.tool_key(m) == "bt_julia_eval"
+        @test m.server == "btworker"
+        @test m.code == "1+1"
+        @test m.env_path == "/tmp/codexprobe"
+        # The eval card's own summary is the env it ran in.
+        @test BonitoAgents.eval_env_summary(m) == "env /tmp/codexprobe"
+        @test [c.text for c in tc.content if c isa ACP.TextContent] == ["2"]
+
+        # The review is not an MCP call and must stay a generic card.
+        review = only([t for t in tools if t isa ACP.GenericTool])
+        @test BonitoAgents.replayed_tool_msg(review) isa BonitoAgents.GenericToolMsg
+
+        # A Julia error: codex reports it as a COMPLETED call whose result
+        # content is the stacktrace, so the card must still be the typed eval
+        # card with the failing code in its preview.
+        failed = replay_tool("codex_mcp_tool_error.jsonl")
+        fm = BonitoAgents.replayed_tool_msg(failed)
+        @test fm isa BonitoAgents.JuliaEvalToolMsg
+        @test fm.code == "sqrt(-1)"
+        @test failed.status == "completed"
+        @test occursin("DomainError with -1.0", failed.content[end].text)
+    end
+
+    # Codex's NATIVE tools. It names none of them: a shell call is titled with
+    # the command line itself, so the card depends entirely on the `execute` +
+    # `command` shape, and its output exists only in `rawOutput`.
+    @testset "codex native tools render with their arguments" begin
+        sh, ed = replay_tools("codex_native_tools.jsonl")
+
+        bash = BonitoAgents.replayed_tool_msg(sh)
+        @test bash isa BonitoAgents.BashToolMsg
+        @test bash.command == "echo NATIVEPROBE"
+        @test occursin("NATIVEPROBE", sh.content[end].text)
+        # The opening frame's `terminal` pointer is not renderable content.
+        @test !any(c -> c isa ACP.TextContent && occursin("tool content: terminal", c.text),
+                   sh.content)
+
+        edit = BonitoAgents.replayed_tool_msg(ed)
+        @test edit isa BonitoAgents.EditToolMsg
+        # Codex sends no `rawInput` for an edit — the diff carries the path, and
+        # that is what the ✎ affordance resolves through.
+        d = only([c for c in ed.content if c isa ACP.DiffContent])
+        @test basename(d.path) == "notes.txt"
+        @test BonitoAgents.editable_path_from(Dict{String,Any}(), ed.content) == d.path
     end
 
     # Kimi's NATIVE tools. Two independent things have to line up: the name has
