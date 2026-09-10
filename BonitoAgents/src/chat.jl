@@ -955,8 +955,10 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     # section is MOUNTED ONCE and updated in place — see `eval_body_dom`.
     stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
-    # The terminal result embed, `nothing` until the descriptor lands. Its own
-    # slot for the same reason: the body never re-renders to grow one.
+    # What the terminal result IS, `nothing` until it lands: a DESCRIPTION
+    # (`(kind = :ref | :upgrade | :outdated, …)`, see `eval_result!`), never a
+    # node — the message is shared by every tab and each builds its own
+    # (`eval_result_node`). Its own slot so the body never re-renders to grow one.
     result::Observable{Any}
 end
 JuliaEvalToolMsg(message::Message, server) =
@@ -2304,9 +2306,21 @@ function Bonito.jsrender(session::Session, c::Collapsable)
     kids = Any[DOM.summary(summary_kids...; class="bt-subsection-summary", onclick=cycle), body]
     # Initial end-pin, once the subtree is parsed (inline JSCode children run
     # right after their surrounding DOM — the Bonito idiom for init steps).
+    # Pin to the end once the subtree is parsed (inline JSCode children run right
+    # after their surrounding DOM — the Bonito idiom for init steps), and KEEP it
+    # pinned as the content grows: a running eval's stdout streams into this body
+    # in place, and nothing else re-pins it (the JS `stream_tail` poke that used
+    # to is gone). Only while the user is at the bottom, so scrolling up to read
+    # stays put.
     c.pin_end && push!(kids, js"""(() => {
         const b = $(body);
-        if (b) b.scrollTop = b.scrollHeight;
+        if (!b) return;
+        b.scrollTop = b.scrollHeight;
+        let pinned = true;
+        const atEnd = () => b.scrollTop + b.clientHeight >= b.scrollHeight - 8;
+        b.addEventListener('scroll', () => { pinned = atEnd(); }, { passive: true });
+        new MutationObserver(() => { if (pinned) b.scrollTop = b.scrollHeight; })
+            .observe(b, { childList: true, subtree: true, characterData: true });
     })()""")
     Bonito.jsrender(session, DOM.details(kids...;
         class="bt-subsection",
@@ -2459,10 +2473,38 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     # The Output section: a `pin_end` Collapsable whose body owns the scrollbar
     # and stays pinned to the newest line, streaming AND done — same widget,
     # same chrome, no styling jump on completion.
-    push!(sections, tool_subsection("Output",
-        console_block(session, m.stream_text); pin_end = true))
-    # The result embed's slot, empty until the descriptor lands.
-    push!(sections, DOM.div(map(identity, session, m.result); class = "bt-eval-result"))
+    #
+    # It appears only once there IS output: an eval that prints nothing and
+    # returns a displayed value (an App, a plot) must show the embed and NOTHING
+    # else — no empty box, no result repr leaking into an Output label. So the
+    # slot holds an empty span until the first text arrives and then swaps the
+    # section in, ONCE (`shown`): the console inside is bound to `stream_text`
+    # and grows in place, so this never re-renders a mounted body.
+    out_slot = Observable{Any}(DOM.span())
+    shown = Ref(false)
+    show_output!() = shown[] || (shown[] = true;
+        out_slot[] = tool_subsection("Output",
+            console_block(session, m.stream_text); pin_end = true))
+    isempty(strip(m.stream_text[])) || show_output!()
+    on(session, m.stream_text) do t
+        isempty(strip(t)) || show_output!()
+    end
+    push!(sections, DOM.div(out_slot; class = "bt-eval-output"))
+    # The result embed's slot, empty until the result lands. `m.result` holds a
+    # DESCRIPTION (see `eval_result!`), not a node: the message is shared by
+    # every tab, and one node cannot be mounted in two of them — the second tab
+    # to render would steal it and the first tab's embed went dead (two_tab).
+    # Each session builds its own node here, once, from that description.
+    # `Observable{Any}` + a session-scoped `on` for the same reason `any_bridge`
+    # exists: the slot's value changes type (span → embed), which a
+    # `map(identity, session, …)` child would refuse to convert.
+    result_slot = Observable{Any}(DOM.span())
+    fill_result!(v) = v === nothing || (result_slot[] = eval_result_node(m, v))
+    fill_result!(m.result[])
+    on(session, m.result) do v
+        fill_result!(v)
+    end
+    push!(sections, DOM.div(result_slot; class = "bt-eval-result"))
     return Bonito.jsrender(session, DOM.div(sections...; class = "bt-eval-body"))
 end
 
@@ -2495,20 +2537,40 @@ function eval_result!(m::JuliaEvalCall, content)
     output = join(String[c.text for c in content[begin:stop]
                          if c isa AgentClientProtocol.TextContent &&
                             bonito_upgrade_descriptor(c.text) === nothing], "\n")
-    isempty(strip(output)) || (m.stream_text[] = output)
+    isempty(strip(output)) || set_once!(m.stream_text, output)
     # Deprecation guard: an outdated worker's output is a ```julia code echo with
     # no v3 descriptor. Surface the hint instead of a silently-mangled card (the
     # raw output above is kept, so nothing is hidden).
     if upgrade !== nothing
-        m.result[] = BonitoUpgradeCard(chat, upgrade.current, upgrade.need,
-                                       upgrade.env, upgrade.add)
+        set_once!(m.result, (kind = :upgrade, upgrade = upgrade))
     elseif outdated_worker_content(content)
-        m.result[] = outdated_worker_banner()
+        set_once!(m.result, (kind = :outdated,))
     elseif desc !== nothing
-        m.result[] = wrap_for_detach(tool_id(m),
-            remote_result(chat.state, last.text, chat.project_id))
+        set_once!(m.result, (kind = :ref, payload = last.text))
     end
     return nothing
+end
+
+# Write only a value that isn't already there. `eval_result!` runs from EVERY
+# tab's `jsrender` as well as from the consumer, and an Observable notifies on
+# every `setindex!` regardless of equality — so an unconditional write meant a
+# second tab opening the chat rebuilt the FIRST tab's result embed from scratch,
+# resetting a live app's state (a counter clicked to 11 went back to 0).
+set_once!(obs::Observable, v) = obs[] == v ? nothing : (obs[] = v; nothing)
+
+# The node for one session's copy of an eval result description (`m.result`).
+# Built per session, never stored on the shared message: a mounted node belongs
+# to the tab that mounted it.
+function eval_result_node(m::JuliaEvalCall, v)
+    chat = tool_chat(m)
+    chat === nothing && return DOM.span()
+    v.kind === :outdated && return outdated_worker_banner()
+    if v.kind === :upgrade
+        u = v.upgrade
+        return BonitoUpgradeCard(chat, u.current, u.need, u.env, u.add)
+    end
+    return wrap_for_detach(tool_id(m),
+        remote_result(chat.state, v.payload, chat.project_id))
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
