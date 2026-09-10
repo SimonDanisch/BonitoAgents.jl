@@ -1068,9 +1068,38 @@ agent_tool_label(tc::AgentClientProtocol.GenericTool) =
 
 # Uniform MCP construction: the known types don't store the tool name (the TYPE
 # is the identity); only the unknown-tool fallback keeps it as data.
-build_mcp_msg(T::Type{<:MCPToolMsg}, message::Message, server, tool_name) = T(message, String(server))
-build_mcp_msg(::Type{GenericMCPToolMsg}, message::Message, server, tool_name) =
-    GenericMCPToolMsg(message, String(server), String(tool_name))
+#
+# The TITLE is overwritten with the tool's own name on the way through, because
+# the agent's label for the same tool is not stable and not ours: claude writes
+# a human sentence, kimi `mcp__btworker__bt_julia_eval`, opencode
+# `btworker_bt_julia_eval`, codex `mcp.btworker.bt_julia_eval`. That made one
+# tool read as four different things depending on the backend — with the server
+# already shown as its own badge, the label was pure noise. Once we have
+# resolved a call to a tool we KNOW, its identity is ours to state, so a
+# `bt_julia_eval` card says `bt_julia_eval` whoever ran it. Tools we don't
+# resolve keep the agent's title (see `pretty_tool_title`).
+function build_mcp_msg(T::Type{<:MCPToolMsg}, message::Message, server, tool_name)
+    message.title = String(tool_name)
+    return T(message, String(server))
+end
+function build_mcp_msg(::Type{GenericMCPToolMsg}, message::Message, server, tool_name)
+    message.title = String(tool_name)
+    return GenericMCPToolMsg(message, String(server), String(tool_name))
+end
+
+"""
+    snap_title(b, wire_title) -> String
+
+The title a tool header should show after `wire_title` arrived on a snap.
+
+Agents RENAME a call mid-flight (kimi swaps the tool name for a sentence,
+codex leaves its dotted wire name), so taking the wire title at face value
+would undo the identity `build_mcp_msg` just established on the very next
+frame. A resolved MCP tool keeps its own name; everything else follows the
+agent.
+"""
+snap_title(::ToolMsg, wire_title::AbstractString) = String(wire_title)
+snap_title(b::MCPToolMsg, ::AbstractString)       = tool_key(b)
 
 # ── Shared-header accessors ─────────────────────────────────────────────────
 # Every ToolMsg variant COMPOSES the shared bubble state as `m.message`; these
@@ -3922,7 +3951,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
         for snap in m.updates
             prev_status = h.status
             h.status = snap.status
-            h.title = snap.title
+            h.title = snap_title(b, snap.title)
             # Stamp `finished_at` on terminal-transition so the live timer freezes.
             prev_status in ("completed", "failed") || !(h.status in ("completed", "failed")) ||
                 (h.finished_at = time())
@@ -7086,7 +7115,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # the control sits next to what it changes.)
 
     # ── Provider switcher ──────────────────────────────────────────────────
-    # Dropdown to switch between Claude Code, MiMo Code, OpenCode and Kimi Code
+    # Dropdown to switch between Claude Code, MiMo Code, OpenCode, Kimi Code and Codex
     # per chat.
     # Changing the provider restarts the session with the new backend.
     # Wiring follows the restart button above: the DOM event notifies a plain
