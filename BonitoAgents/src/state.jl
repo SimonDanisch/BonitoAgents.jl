@@ -132,6 +132,13 @@ mutable struct ProjectInfo
     # be re-derivable from the path: pointing an ordinary chat at the checkout
     # should not silently hand it the server's controls.
     dev_mode::Bool
+    # May this chat's agent run Julia (and copy folders) on OTHER workers via
+    # `bt_julia_eval(worker = …)` / `bt_sync_folder`? Off by default; the switch
+    # sits in the chat header next to the permissions pill, and the server
+    # enforces it at relay time (remote_eval.jl), so no restart is involved.
+    # Persisted: a granted capability must survive a server restart, and must
+    # never be derived from anything else.
+    remote_eval::Bool
     # Searchable file index (worker-derived, runtime-only). See ProjectFileIndex.
     file_index::ProjectFileIndex
 end
@@ -149,6 +156,7 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
                 false,                   # dismissed
                 Dict{String,String}(),   # desired_config
                 false,                   # dev_mode
+                false,                   # remote_eval
                 ProjectFileIndex())      # file_index
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
@@ -319,6 +327,11 @@ mutable struct ServerState
     # same mutex their old globals were already taken under.
     eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (eval-result dial-back)
     mcp_ctrl           :: Dict{String,Any}              # project_id => live MCP control WS
+    # Eval hosts: BonitoMCP processes serving a chat's evals from ANOTHER worker
+    # (remote_eval.jl). "project_id\0worker_id" => that host's live control WS.
+    eval_hosts         :: Dict{String,Any}
+    # Single-flight per host key while one is being spawned + waited for.
+    eval_host_locks    :: Dict{String,ReentrantLock}
     # Live stdout/stderr stream sinks for RUNNING evals: "project_id\0route" =>
     # Channel the MCP pushes chunks into (drained by `eval_stream_loop!`). The MCP
     # forwards worker IO over /mcp-ws (no on-disk log, no polling); the sink exists
@@ -391,6 +404,8 @@ function ServerState(; state_dir::String,
         Ref(""),                                  # base_url (set by serve())
         Dict{String,Any}(),                       # eval_workers
         Dict{String,Any}(),                       # mcp_ctrl
+        Dict{String,Any}(),                       # eval_hosts
+        Dict{String,ReentrantLock}(),             # eval_host_locks
         Dict{String,Channel{String}}(),           # eval_stream_sinks
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
@@ -437,6 +452,8 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.base_url,
             s.eval_workers,            # shared registries — one per server, all
             s.mcp_ctrl,                # sessions cooperate on the same tables
+            s.eval_hosts,
+            s.eval_host_locks,
             s.eval_stream_sinks,
             s.session_inflight,
             s.show_fetch_inflight,
@@ -944,6 +961,7 @@ function save_projects!(s::ServerState)
                      "title"         => p.title,
                      "dismissed"     => p.dismissed,
                      "dev_mode"      => p.dev_mode,
+                     "remote_eval"   => p.remote_eval,
                      "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
         atomic_write_json(projects_file(s), data)
@@ -987,6 +1005,9 @@ function load_projects!(s::ServerState)
             # Absent ⇒ false. An upgrade must not turn existing chats into debug
             # chats, and the flag is the only thing that grants the dev tools.
             p.dev_mode = get(d, "dev_mode", false) === true
+            # Absent ⇒ false: running code on other machines is granted per chat,
+            # never assumed.
+            p.remote_eval = get(d, "remote_eval", false) === true
             dc = get(d, "desired_config", nothing)
             if dc isa AbstractDict
                 for (k, v) in dc

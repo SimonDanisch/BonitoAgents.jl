@@ -55,6 +55,73 @@ function completed_response(blocks, html, is_error::Bool, elapsed::Real)
     )
 end
 
+# ── Running on another worker ───────────────────────────────────────────────
+# `worker = "<name>"` on any eval-family tool sends the call through the
+# BonitoAgents server to an EVAL HOST on that worker (eval_host.jl) — the same
+# BonitoMCP, serving this chat from the other machine. The server owns the rules:
+# the chat's "remote julia" switch (off by default), which worker names exist,
+# spawning the host on first use. This side only forwards the call and hands
+# the host's tool result back verbatim, so the agent sees exactly what a local
+# eval would have shown.
+
+tool_error(msg::AbstractString) =
+    Dict{String,Any}("content" => [Dict("type" => "text", "text" => "error: " * msg)],
+                     "isError" => true)
+
+# The `worker` argument, or nothing when the call is for this worker.
+function remote_worker(args::AbstractDict)
+    w = get(args, "worker", nothing)
+    w isa AbstractString || return nothing
+    s = strip(w)
+    return isempty(s) ? nothing : String(s)
+end
+
+# How long to wait for the server's reply: the eval's own soft checkpoint plus
+# room for the host to be spawned on first use (a julia start + `using BonitoMCP`
+# + the eval worker's own start). A checkpoint-free eval (`timeout = 0`, or a
+# `Pkg.*` call) may legitimately run for a long time.
+const REMOTE_SPAWN_GRACE_S = 180.0
+const REMOTE_UNBOUNDED_S   = 6 * 3600.0
+remote_wait(timeout::Union{Real,Nothing}) =
+    timeout === nothing ? REMOTE_UNBOUNDED_S : Float64(timeout) + REMOTE_SPAWN_GRACE_S
+
+function remote_tool_call(op::AbstractString, worker::AbstractString, args::AbstractDict;
+                          wait::Real)
+    fwd = Dict{String,Any}(String(k) => v for (k, v) in args if String(k) != "worker")
+    env_path = get(fwd, "env_path", nothing)
+    env_key  = env_path isa AbstractString && !isempty(env_path) ? String(env_path) : nothing
+    tracked  = op in ("eval", "continue")
+    tracked && @lock SERVER.inflight_lock push!(SERVER.remote_inflight, (worker, env_key))
+    reply = try
+        call_server("remote_eval"; timeout = wait, worker = worker, op = op, args = fwd)
+    catch e
+        e isa InterruptException && rethrow()
+        return tool_error(sprint(showerror, e))
+    finally
+        tracked && @lock SERVER.inflight_lock delete!(SERVER.remote_inflight, (worker, env_key))
+    end
+    reply isa AbstractDict ||
+        return tool_error("unexpected reply from the server for a remote '$(op)': $(repr(reply))")
+    return Dict{String,Any}(String(k) => v for (k, v) in reply)
+end
+
+# A cancel (`notifications/cancelled`) reaches evals running on other workers
+# through the server. Best-effort and asynchronous: the cancel path must not
+# wait on a round trip per remote eval.
+function interrupt_remote_inflight!()
+    targets = @lock SERVER.inflight_lock collect(SERVER.remote_inflight)
+    for (worker, env_path) in targets
+        Base.errormonitor(@async try
+            call_server("remote_eval"; timeout = 30.0, worker = worker, op = "interrupt",
+                        args = Dict{String,Any}("env_path" => env_path))
+        catch e
+            e isa InterruptException && rethrow()
+            log_info("cancel: remote interrupt on '$(worker)' failed: $(sprint(showerror, e))")
+        end)
+    end
+    return length(targets)
+end
+
 # ── Handlers ────────────────────────────────────────────────────────────────
 function julia_eval_handler(args::AbstractDict)
     code        = String(get(args, "code", ""))
@@ -64,10 +131,12 @@ function julia_eval_handler(args::AbstractDict)
     full_output = Bool(get(args, "full_output", false))
     max_bytes   = Int(get(args, "max_response_bytes", 10_000))
 
-    isempty(strip(code)) && return Dict{String,Any}(
-        "content" => [Dict("type" => "text", "text" => "error: empty code")],
-        "isError" => true,
-    )
+    isempty(strip(code)) && return tool_error("empty code")
+
+    worker = remote_worker(args)
+    worker === nothing ||
+        return remote_tool_call("eval", worker, args;
+                                wait = remote_wait(effective_timeout(code, user_to)))
 
     s = try
         get_or_create!(manager(), env_path; julia_cmd)
@@ -138,6 +207,11 @@ function julia_continue_handler(args::AbstractDict)
     env_path  = get(args, "env_path", nothing)
     user_to   = get(args, "timeout",  nothing)
 
+    worker = remote_worker(args)
+    worker === nothing ||
+        return remote_tool_call("continue", worker, args;
+            wait = remote_wait(user_to === nothing ? DEFAULT_TIMEOUT : (user_to > 0 ? user_to : nothing)))
+
     # Pure lookup — never get_or_create! (which would kill+replace the session
     # holding the in-flight eval; M5). `julia_cmd` is intentionally ignored here.
     s = try
@@ -169,6 +243,10 @@ end
 function julia_interrupt_handler(args::AbstractDict)
     env_path  = get(args, "env_path", nothing)
 
+    worker = remote_worker(args)
+    worker === nothing ||
+        return remote_tool_call("interrupt", worker, args; wait = 90.0)
+
     # Pure lookup — never get_or_create! (M5). Interrupting requires the EXISTING
     # session that owns the in-flight eval, not a freshly created replacement.
     s = try
@@ -195,6 +273,9 @@ end
 
 function julia_restart_handler(args::AbstractDict)
     env_path = get(args, "env_path", nothing)
+    worker = remote_worker(args)
+    worker === nothing ||
+        return remote_tool_call("restart", worker, args; wait = 120.0)
     restart!(manager(), env_path)
     label = env_path === nothing ? "<temp>" : env_path
     return Dict{String,Any}(
@@ -204,7 +285,10 @@ function julia_restart_handler(args::AbstractDict)
     )
 end
 
-function julia_list_sessions_handler(::AbstractDict)
+function julia_list_sessions_handler(args::AbstractDict)
+    worker = remote_worker(args)
+    worker === nothing ||
+        return remote_tool_call("sessions", worker, args; wait = 60.0)
     sessions = list_sessions(manager())
     text = if isempty(sessions)
         "no active sessions"
@@ -222,8 +306,71 @@ function julia_list_sessions_handler(::AbstractDict)
         end
         join(lines, "\n")
     end
+    # Under BonitoAgents, also say which OTHER workers this chat could run on
+    # (and what already runs there). Best-effort: standalone BonitoMCP has no
+    # server to ask, and an eval host that doesn't answer must not fail the
+    # listing of the local sessions.
+    if SERVER.control.ws !== nothing && isempty(host_worker_id())
+        text *= "\n\n" * remote_workers_text()
+    end
     return Dict{String,Any}(
         "content" => [Dict("type" => "text", "text" => text)],
+        "isError" => false,
+    )
+end
+
+function remote_workers_text()
+    reply = try
+        call_server("remote_workers"; timeout = 30.0)
+    catch e
+        e isa InterruptException && rethrow()
+        return "other workers: (could not ask the server: $(sprint(showerror, e)))"
+    end
+    reply isa AbstractDict || return "other workers: (unexpected reply)"
+    enabled = get(reply, "enabled", false) === true
+    workers = get(reply, "workers", Any[])
+    lines = String[enabled ?
+        "other workers (pass `worker = \"<name>\"` to run there; remote julia is ON for this chat):" :
+        "other workers (remote julia is OFF for this chat — the user can switch it on in the chat header, next to the permissions pill):"]
+    isempty(workers) && push!(lines, "  (none online)")
+    for w in workers
+        w isa AbstractDict || continue
+        tag = String[]
+        get(w, "host_live", false) === true && push!(tag, "eval host running")
+        push!(lines, "  - $(get(w, "name", "?")) ($(get(w, "hostname", "?")), projects under $(get(w, "projects_root", "?")))" *
+                     (isempty(tag) ? "" : "  [" * join(tag, ", ") * "]"))
+        for s in get(w, "sessions", Any[])
+            s isa AbstractDict || continue
+            push!(lines, "      session $(get(s, "env_path", "<temp>"))" *
+                         (get(s, "in_flight", false) === true ? "  [EVAL IN FLIGHT]" : ""))
+        end
+    end
+    return join(lines, "\n")
+end
+
+# ── bt_sync_folder ──────────────────────────────────────────────────────────
+# Copy a folder from this worker to another one, through the server (the two
+# workers never talk directly). What makes "run it on the MacBook" practical:
+# the code, its Project.toml/Manifest.toml, and the data have to be there first.
+function sync_folder_handler(args::AbstractDict)
+    src    = String(strip(String(get(args, "src", ""))))
+    worker = remote_worker(args)
+    dst    = get(args, "dst", nothing)
+    isempty(src) && return tool_error("`src` (a folder on this worker) is required")
+    worker === nothing && return tool_error("`worker` (the worker to copy to) is required")
+    dst_s = dst isa AbstractString && !isempty(strip(dst)) ? String(strip(dst)) : src
+    reply = try
+        call_server("sync_folder"; timeout = 6 * 3600.0, worker = worker, src = src, dst = dst_s)
+    catch e
+        e isa InterruptException && rethrow()
+        return tool_error(sprint(showerror, e))
+    end
+    reply isa AbstractDict || return tool_error("unexpected reply from the server: $(repr(reply))")
+    return Dict{String,Any}(
+        "content" => [Dict("type" => "text",
+            "text" => "synced $(get(reply, "files", "?")) files ($(get(reply, "bytes", "?")) bytes) " *
+                      "from $(src) on this worker to $(dst_s) on $(get(reply, "worker", worker))" *
+                      (get(reply, "deleted", 0) == 0 ? "" : "; removed $(reply["deleted"]) stale files there"))],
         "isError" => false,
     )
 end
@@ -286,6 +433,19 @@ Output:
     Large arrays / dicts are summarised.
   - 2-D color arrays render as PNG when PNGFiles is loaded in the env.
   - Backtraces are trimmed to user-relevant frames.
+
+Running on ANOTHER worker (machine):
+  - Pass `worker = "<name>"` to run the code on that worker instead of this one.
+    Sessions there are separate (own `env_path`s, own state); `bt_julia_continue`,
+    `bt_julia_interrupt`, `bt_julia_restart` and `bt_julia_list_sessions` take
+    the same `worker` argument to address them. `bt_julia_list_sessions` (no
+    arguments) lists the workers you can use.
+  - This is OFF by default: the user switches "remote julia" on per chat, in the
+    chat header next to the permissions pill. While it is off, a call with
+    `worker` errors and says so — ask the user rather than retrying.
+  - The other machine has its own filesystem: copy code, its Project.toml /
+    Manifest.toml and data there first with `bt_sync_folder`, and pass an
+    `env_path` that exists THERE.
 """
 
 register!(
@@ -299,11 +459,14 @@ register!(
             "julia_cmd"          => Dict("type"=>"string", "description"=>"Custom Julia invocation, e.g. `julia +1.11` or `julia --check-bounds=yes`. Use rarely."),
             "full_output"        => Dict("type"=>"boolean", "default"=>false, "description"=>"Disable output truncation/summarisation"),
             "max_response_bytes" => Dict("type"=>"integer", "default"=>10_000, "description"=>"Per-block byte cap"),
+            "worker"             => Dict("type"=>"string", "description"=>"Run on this OTHER worker (its display name) instead of the chat's own. Needs the chat's 'remote julia' switch; see bt_julia_list_sessions for the names."),
         ),
         "required" => ["code"],
     ),
     julia_eval_handler,
 )
+
+const WORKER_ARG = Dict("type"=>"string", "description"=>"Address the session on this other worker (display name) instead of the chat's own")
 
 register!(
     "bt_julia_continue",
@@ -317,6 +480,7 @@ register!(
         "properties" => Dict{String,Any}(
             "env_path" => Dict("type"=>"string", "description"=>"Session to continue; omit for temp"),
             "timeout"  => Dict("type"=>"number", "description"=>"Checkpoint timeout in seconds. Default 30; pass 0 to disable."),
+            "worker"   => WORKER_ARG,
         ),
     ),
     julia_continue_handler,
@@ -334,6 +498,7 @@ register!(
         "type" => "object",
         "properties" => Dict{String,Any}(
             "env_path" => Dict("type"=>"string", "description"=>"Session to interrupt; omit for temp"),
+            "worker"   => WORKER_ARG,
         ),
     ),
     julia_interrupt_handler,
@@ -351,6 +516,7 @@ register!(
         "type" => "object",
         "properties" => Dict{String,Any}(
             "env_path" => Dict("type"=>"string", "description"=>"Project to restart; omit for the temp session"),
+            "worker"   => WORKER_ARG,
         ),
     ),
     julia_restart_handler,
@@ -358,7 +524,31 @@ register!(
 
 register!(
     "bt_julia_list_sessions",
-    "List currently active per-`env_path` Julia sessions. Marks any session that has an in-flight eval.",
-    Dict{String,Any}("type" => "object", "properties" => Dict{String,Any}()),
+    "List currently active per-`env_path` Julia sessions (marks any with an in-flight eval), " *
+    "and the OTHER workers this chat could run Julia on with `worker = \"<name>\"`.",
+    Dict{String,Any}("type" => "object", "properties" => Dict{String,Any}(
+        "worker" => Dict("type"=>"string", "description"=>"List the sessions on this other worker instead"))),
     julia_list_sessions_handler,
+)
+
+register!(
+    "bt_sync_folder",
+    """
+    Copy a folder from this worker to ANOTHER worker (through the BonitoAgents
+    server; the two machines never talk directly). Use it before running Julia
+    on that worker with `bt_julia_eval(worker = …)`: a project (its code,
+    Project.toml and Manifest.toml) and the data it needs have to be there.
+    Re-running only transfers what changed; files that vanished at `src` are
+    removed at `dst`. Needs the chat's 'remote julia' switch, like remote evals.
+    """,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "src"    => Dict("type"=>"string", "description"=>"Folder on THIS worker (absolute path)"),
+            "worker" => Dict("type"=>"string", "description"=>"The worker to copy to (display name)"),
+            "dst"    => Dict("type"=>"string", "description"=>"Folder on that worker; default: the same path as `src`"),
+        ),
+        "required" => ["src", "worker"],
+    ),
+    sync_folder_handler,
 )

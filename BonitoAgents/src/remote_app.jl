@@ -543,13 +543,21 @@ mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
         get(state.mcp_ctrl, String(project_id), nothing)
     end
 
+# Two kinds of process dial this route, told apart by the handshake:
+#   "secret project_id"                      — a chat's own MCP server;
+#   "secret project_id eval_host worker_id"  — an EVAL HOST: the same BonitoMCP
+#     serving that chat's evals from ANOTHER worker (remote_eval.jl). Its frames
+#     are the same (live stdout, RPC replies), keyed under `state.eval_hosts`;
+#     its stdout routes carry the worker id so two sessions on the same
+#     env_path on different machines can't collide in one chat.
 function handle_mcp_ctrl_ws(state::ServerState, ws)
     line = try; String(HTTP.WebSockets.receive(ws)); catch e
         @warn "mcp ctrl dial-back rejected: handshake never arrived" exception=e; return
     end
-    parts = split(strip(line), ' '; limit = 2)
-    if length(parts) != 2
-        @warn "mcp ctrl dial-back rejected: malformed handshake (expected 2 fields 'secret project_id')" got_fields=length(parts)
+    parts = split(strip(line), ' ')
+    is_host = length(parts) == 4 && parts[3] == "eval_host"
+    if !(length(parts) == 2 || is_host)
+        @warn "mcp ctrl dial-back rejected: malformed handshake (expected 'secret project_id' or 'secret project_id eval_host worker_id')" got_fields=length(parts)
         return
     end
     if parts[1] != state.worker_secret
@@ -557,10 +565,18 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
         return
     end
     project_id = String(parts[2])
+    host_worker = is_host ? String(parts[4]) : ""
+    registry, key = is_host ? (state.eval_hosts, eval_host_key(project_id, host_worker)) :
+                              (state.mcp_ctrl, project_id)
     lock(state.lock) do
-        state.mcp_ctrl[project_id] = ws
+        registry[key] = ws
     end
-    @info "MCP control channel connected" project_id
+    is_host ? (@info "eval host connected" project_id worker_id = host_worker) :
+              (@info "MCP control channel connected" project_id)
+    # A host's live stdout is keyed under its worker, so the chat's eval card
+    # for `bt_julia_eval(worker = …)` finds it and a local session on the same
+    # env_path does not (see `eval_route_key`).
+    route_prefix = is_host ? host_worker * "\0" : ""
     try
         for msg in ws
             # Per-frame guard — one malformed reply must not drop the channel.
@@ -570,14 +586,16 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
                     # Unsolicited live-stdout push (no request_id): route it to the
                     # matching running eval's tail. High-volume, so handled first.
                     route_eval_chunk!(state, project_id,
-                        String(get(d, "route", "")), String(get(d, "chunk", "")))
-                elseif get(d, "type", "") == "dev_request"
-                    # The other direction: a debug chat's `bt_dev_*` tool asking
-                    # the server about itself (dev_api.jl). Answered on its own
-                    # task — a `memory` call with `deep=true` walks the object
-                    # graph for seconds and must not stall this read loop (which
+                        route_prefix * String(get(d, "route", "")), String(get(d, "chunk", "")))
+                elseif get(d, "type", "") == "dev_request" && !is_host
+                    # The other direction: the chat's MCP asking the server
+                    # something — a debug chat's `bt_dev_*` tool (dev_api.jl), or
+                    # any chat's `bt_julia_eval(worker = …)` (remote_eval.jl).
+                    # Answered on its own task — a `memory` call with `deep=true`
+                    # walks the object graph for seconds, a relayed eval waits for
+                    # its checkpoint — and must not stall this read loop (which
                     # also carries eval stdout and interrupt replies).
-                    @async handle_dev_request(state, ws, d)
+                    @async handle_dev_request(state, ws, d; project_id)
                 else
                     rid = get(d, "request_id", nothing)
                     rid isa AbstractString && !isempty(rid) &&
@@ -594,27 +612,32 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
         # Identity-guarded eviction: a reconnect may have swapped a fresh WS
         # in before this stale handler's finally ran.
         lock(state.lock) do
-            get(state.mcp_ctrl, project_id, nothing) === ws && delete!(state.mcp_ctrl, project_id)
+            get(registry, key, nothing) === ws && delete!(registry, key)
         end
-        @info "MCP control channel closed" project_id
+        is_host ? (@info "eval host channel closed" project_id worker_id = host_worker) :
+                  (@info "MCP control channel closed" project_id)
     end
     return
 end
 
 """
-    handle_dev_request(state, ws, frame)
+    handle_dev_request(state, ws, frame; project_id = "")
 
-Answer a `{type:"dev_request", dev_id, op, args}` frame from a debug chat's MCP
-process (see `dev_api.jl` for the ops). ALWAYS replies — an op that throws comes
-back as `ok:false` with the message, because the tool on the other side is
-waiting on a channel and a dropped reply would hang it until its timeout.
+Answer a `{type:"dev_request", dev_id, op, args}` frame from a chat's MCP
+process (see `dev_api.jl` and `remote_eval.jl` for the ops; `project_id` is the
+chat the channel belongs to, which the remote-eval ops key their permission on).
+ALWAYS replies — an op that throws comes back as `ok:false` with the message,
+because the tool on the other side is waiting on a channel and a dropped reply
+would hang it until its timeout.
 """
-function handle_dev_request(state::ServerState, ws, frame::AbstractDict)
+function handle_dev_request(state::ServerState, ws, frame::AbstractDict;
+                            project_id::AbstractString = "")
     id = get(frame, "dev_id", nothing)
     reply = try
         args = get(frame, "args", Dict{String,Any}())
         result = dev_request(state, String(get(frame, "op", "")),
-                             args isa AbstractDict ? args : Dict{String,Any}())
+                             args isa AbstractDict ? args : Dict{String,Any}(),
+                             String(project_id))
         Dict{String,Any}("op" => "dev_reply", "dev_id" => id, "ok" => true, "result" => result)
     catch e
         e isa InterruptException && rethrow()
@@ -677,16 +700,31 @@ function interrupt_project_eval!(state::ServerState, project_id::AbstractString;
     ws === nothing && error(
         "no MCP control channel for this chat — the agent's MCP server " *
         "hasn't dialed back (not started yet, or an old worker install)")
+    n = interrupt_over_channel!(state, ws, env_path, timeout, "interrupt_eval")
+    # The chat's evals on OTHER workers (remote_eval.jl) are stopped the same
+    # way, through their hosts' channels.
+    for (wid, hws) in eval_hosts_of(state, project_id)
+        try
+            n += interrupt_over_channel!(state, hws, env_path, timeout, "interrupt_eval on host $(wid)")
+        catch e
+            e isa InterruptException && rethrow()
+            @warn "interrupt on an eval host failed" project_id worker_id = wid exception = e
+        end
+    end
+    return n
+end
+
+function interrupt_over_channel!(state::ServerState, ws, env_path, timeout::Real, what::AbstractString)
     rid, ch = register_rpc!(state)
     resp = try
         payload = Dict{String,Any}("op" => "interrupt_eval", "request_id" => rid)
         env_path === nothing || (payload["env_path"] = String(env_path))
         HTTP.WebSockets.send(ws, JSON.json(payload))
-        take_pending!(state, ch, rid, timeout, "interrupt_eval")
+        take_pending!(state, ch, rid, timeout, what)
     finally
         unregister_rpc!(state, rid)   # T10: no leak on send failure
     end
-    resp isa AbstractDict || error("interrupt_eval: unexpected response shape")
+    resp isa AbstractDict || error("$(what): unexpected response shape")
     return Int(get(resp, "interrupted", 0))
 end
 

@@ -161,12 +161,19 @@ function ctrl_dial_loop(wsurl::AbstractString, handshake::AbstractString;
     end
 end
 
+# How long a call waits for a channel that is armed but not connected yet: the
+# dial is started at process boot and lands in milliseconds, but the agent's
+# first tool call can beat it (and a reconnect after a server restart takes a
+# backoff). Not waiting made the FIRST `bt_julia_eval(worker = …)` of a chat
+# fail with "no control channel" instead of doing the work.
+const CTRL_CONNECT_WAIT_S = 15.0
+
 """
     call_server(op; timeout = 30.0, kw...) -> Any
 
 Ask the BonitoAgents server something over the control channel and wait for the
-answer. Backs the dev tools, which are the only thing that talks in this
-direction; every other MCP process never calls it.
+answer. Backs the dev tools and the remote-eval relay (tools/eval.jl); an MCP
+process with no BonitoAgents behind it never calls it.
 
 Throws when there is no server attached (standalone BonitoMCP), when the call
 times out, or when the server reports an error — all three are things the tool
@@ -174,9 +181,15 @@ should tell the agent about verbatim rather than paper over.
 """
 function call_server(op::AbstractString; timeout::Real = 30.0, kw...)
     ctrl = SERVER.control
-    ctrl.ws === nothing &&
-        error("no control channel to the BonitoAgents server (is this MCP server " *
-              "running standalone, or has the server gone away?)")
+    if ctrl.ws === nothing
+        # Never armed ⇒ there is no server to reach and no point waiting.
+        ctrl.task === nothing &&
+            error("no control channel to the BonitoAgents server (is this MCP server " *
+                  "running standalone, or has the server gone away?)")
+        Base.timedwait(() -> ctrl.ws !== nothing, CTRL_CONNECT_WAIT_S; pollint = 0.05) === :ok ||
+            error("the control channel to the BonitoAgents server did not connect within " *
+                  "$(CTRL_CONNECT_WAIT_S)s (server unreachable or restarting)")
+    end
     id = Threads.atomic_add!(ctrl.next_id, 1)
     ch = Channel{Any}(1)
     lock(ctrl.pending_lock) do; ctrl.pending[id] = ch; end
@@ -219,6 +232,10 @@ function handle_ctrl_frame!(ws, msg::AbstractDict)
             "type" => "interrupt_result", "request_id" => rid, "interrupted" => n)))
     elseif op == "ping"
         WebSockets.send(ws, JSON.json(Dict("type" => "pong", "request_id" => rid)))
+    elseif op in HOST_OPS
+        # A relayed tool call: this process is an eval host for another worker's
+        # chat (eval_host.jl). Off-loop inside.
+        handle_host_op!(ws, msg)
     else
         log_info("ctrl: unknown op '$op'")
     end

@@ -162,8 +162,8 @@ mcp_call(tool::AbstractString; id = nothing, args...) = begin
     end
     d
 end
-bt_eval(code; env_path = nothing, id = nothing, timeout = nothing) =
-    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout)
+bt_eval(code; env_path = nothing, id = nothing, timeout = nothing, worker = nothing) =
+    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout, worker)
 # bt_julia_continue reattaches to the in-flight eval after a soft-timeout
 # checkpoint — its call carries NO code argument, exactly like real claude.
 bt_continue(; env_path = nothing, timeout = nothing, id = nothing) =
@@ -702,6 +702,7 @@ function invoke_mcp(client, ev::AbstractDict)
         "code" => String(get(ev, "code", "")),
         "env_path" => get(ev, "env_path", nothing))
     haskey(ev, "timeout") && (open_ev["timeout"] = ev["timeout"])
+    haskey(ev, "worker")  && (open_ev["worker"]  = ev["worker"])
     println(client, JSON.json(open_ev)); flush(client)
 
     ctx = SERVER_CONTEXT[]

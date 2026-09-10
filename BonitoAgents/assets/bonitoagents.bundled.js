@@ -1515,6 +1515,14 @@ class BonitoChat {
             const timer = headerEl.querySelector('.bt-tool-timer');
             headerEl.insertBefore(badge, timer || null);
         }
+        if (msg.worker && headerEl && !headerEl.querySelector('.bt-tool-worker')) {
+            const wb = document.createElement('span');
+            wb.className = 'bt-tool-worker';
+            wb.title = 'This runs on another worker';
+            wb.textContent = `⇢ ${String(msg.worker)}`;
+            const title = headerEl.querySelector('.bt-tool-title');
+            headerEl.insertBefore(wb, title ? title.nextSibling : null);
+        }
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
             sb.type = 'button';
@@ -1866,6 +1874,7 @@ class BonitoChat {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
         const server = msg.server ? `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
         const timeoutBadge = msg.timeout_s ? `<span class="bt-tool-timeout" title="Soft eval timeout — the call checkpoints with partial output at this cadence">⏱ ${escapeHTML(String(msg.timeout_s))}</span>` : '';
+        const workerBadge = msg.worker ? `<span class="bt-tool-worker" title="This runs on another worker">⇢ ${escapeHTML(String(msg.worker))}</span>` : '';
         const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini" type="button"
                      title="Stop"></button>` : '';
         const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
@@ -1878,6 +1887,7 @@ class BonitoChat {
                 <span class="bt-tool-kind">${msg.icon || '⚙'}</span>
                 ${server}
                 <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
+                ${workerBadge}
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 ${timeoutBadge}
                 <span class="bt-tool-timer"></span>
@@ -2929,7 +2939,7 @@ function decorateCodeBlocks(rootEl) {
                 try {
                     document.execCommand('copy');
                     done();
-                } finally {
+                } finally{
                     ta.remove();
                 }
             };

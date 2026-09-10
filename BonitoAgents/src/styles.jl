@@ -1305,6 +1305,15 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-faint)",
         "flex-shrink" => "0",
         "white-space" => "nowrap"),
+    # "On another worker" badge (`bt_julia_eval(worker = …)`): filled accent
+    # pill right after the tool name — code running on a different machine is
+    # the one thing about an eval card the user must see without reading it.
+    CSS(".bt-tool-worker",
+        "display" => "inline-flex", "align-items" => "center",
+        "background" => "var(--bt-accent)", "color" => "#fff",
+        "font-size" => "11px", "font-weight" => "600", "letter-spacing" => "0.02em",
+        "padding" => "1px 8px", "border-radius" => "999px",
+        "flex-shrink" => "0", "white-space" => "nowrap"),
     # Per-pill stop (shares .bt-stop-mini for the look). Hidden until the
     # pill is live — stopping a finished tool is meaningless.
     CSS(".bt-tool-stop",

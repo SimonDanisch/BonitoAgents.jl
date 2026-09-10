@@ -103,7 +103,9 @@ Left: the session dot, the chat's title (click to rename) and the folder it
 runs in on its worker. Right: one segmented **session group** with the context
 meter (tokens used of the window, percent, cost so far; it turns amber past
 three quarters and red past nine tenths), the model, permissions and effort
-pickers, and the agent provider. Next to it **Review** opens the change-review
+pickers, the *remote julia* switch (may this chat's agent run Julia and copy
+folders on other workers; off by default, see the tools page), and the agent
+provider. Next to it **Review** opens the change-review
 tab, and the **⋯ menu** holds everything else: *Continue on* another worker,
 *Compact*, *Restart session*, *Debug BonitoAgents* and the *Dev mode* switch.
 Long-running actions report in the muted status line left of the controls;

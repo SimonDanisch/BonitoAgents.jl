@@ -66,6 +66,7 @@ include("file_tree.jl")        # WorkerFileTree — lazy, searchable project fil
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
+include("remote_eval.jl")      # bt_julia_eval(worker = …): eval hosts on other workers, the per-chat switch
 include("server.jl")           # serve()
 include("dev.jl")              # dev_server() — self-contained dev rig
 

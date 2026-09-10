@@ -11,6 +11,7 @@ using Test
     include("test_eval_cancel.jl")
     include("test_process_reaping.jl")
     include("test_wait.jl")
+    include("test_eval_host.jl")
     # ⚠ LAST on purpose: this one needs `Bonito`, which is not in the test
     # target, so it errors and takes the rest of the file with it. That was
     # invisible while `Pkg.test` could not resolve `Test` at all and the suite

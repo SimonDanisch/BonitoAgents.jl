@@ -13,7 +13,11 @@ mutable struct MCPServer
     manager::SessionManager                     # eval sessions, keyed by env_path
     control::ControlChannel                     # /mcp-ws dial-back: interrupt + stdout stream
     inflight::Dict{Any,Union{String,Nothing}}   # in-flight JSON-RPC id → env_path (cancel routing)
-    inflight_lock::ReentrantLock                # guards `inflight`
+    # Evals this chat has running on OTHER workers (tools/eval.jl remote branch):
+    # (worker, env_path) while the relayed call is in flight, so a cancel can
+    # reach them through the server (`interrupt_remote_inflight!`).
+    remote_inflight::Set{Tuple{String,Union{String,Nothing}}}
+    inflight_lock::ReentrantLock                # guards `inflight` and `remote_inflight`
     out_lock::ReentrantLock                     # serialises one-line-per-frame stdout writes
 end
 
@@ -21,6 +25,7 @@ const SERVER = MCPServer(
     SessionManager(),
     ControlChannel(nothing, false, nothing),
     Dict{Any,Union{String,Nothing}}(),
+    Set{Tuple{String,Union{String,Nothing}}}(),
     ReentrantLock(),
     ReentrantLock(),
 )

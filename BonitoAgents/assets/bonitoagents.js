@@ -2338,6 +2338,15 @@ class BonitoChat {
             const timer = headerEl.querySelector('.bt-tool-timer');
             headerEl.insertBefore(badge, timer || null);
         }
+        // Running on ANOTHER worker: the badge sits right after the tool name.
+        if (msg.worker && headerEl && !headerEl.querySelector('.bt-tool-worker')) {
+            const wb = document.createElement('span');
+            wb.className = 'bt-tool-worker';
+            wb.title = 'This runs on another worker';
+            wb.textContent = `⇢ ${String(msg.worker)}`;
+            const title = headerEl.querySelector('.bt-tool-title');
+            headerEl.insertBefore(wb, title ? title.nextSibling : null);
+        }
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
             sb.type = 'button';
@@ -2879,6 +2888,11 @@ class BonitoChat {
         //     the pill is live).
         const timeoutBadge = msg.timeout_s ?
             `<span class="bt-tool-timeout" title="Soft eval timeout — the call checkpoints with partial output at this cadence">⏱ ${escapeHTML(String(msg.timeout_s))}</span>` : '';
+        //   • `worker` — the OTHER worker the eval runs on (bt_julia_eval
+        //     worker=…): a filled badge right after the tool name, so code
+        //     running on a different machine is visible without reading the card.
+        const workerBadge = msg.worker ?
+            `<span class="bt-tool-worker" title="This runs on another worker">⇢ ${escapeHTML(String(msg.worker))}</span>` : '';
         const stopBtn = msg.stoppable ?
             `<button class="bt-tool-stop bt-stop-mini" type="button"
                      title="Stop"></button>` : '';
@@ -2916,6 +2930,7 @@ class BonitoChat {
                 <span class="bt-tool-kind">${msg.icon || '⚙'}</span>
                 ${server}
                 <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
+                ${workerBadge}
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 ${timeoutBadge}
                 <span class="bt-tool-timer"></span>

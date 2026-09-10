@@ -945,6 +945,10 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     code::String                  # the code being executed (live preview + Code section)
     env_path::String              # project env; "" ⇒ ephemeral temp session
     timeout::Union{Float64,Nothing}   # soft checkpoint cadence; nothing ⇒ default
+    # The OTHER worker this runs on (`bt_julia_eval(worker = …)`, remote_eval.jl);
+    # "" ⇒ the chat's own. Shown prominently on the card: code running on another
+    # machine is something the user must be able to see at a glance.
+    worker::String
     # The Output section's text, for the card's whole life: the rolling stdout
     # window while the eval runs (`eval_stream_loop!` drains the MCP's forwarded
     # stream), then the complete output on completion. An Observable so the
@@ -956,7 +960,7 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     result::Observable{Any}
 end
 JuliaEvalToolMsg(message::Message, server) =
-    JuliaEvalToolMsg(message, server, "", "", nothing,
+    JuliaEvalToolMsg(message, server, "", "", nothing, "",
                      Observable(""), nothing, Observable{Any}(nothing))
 
 mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
@@ -965,29 +969,32 @@ mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     code::String                  # continue carries none — stays "" (shared render path)
     env_path::String
     timeout::Union{Float64,Nothing}
+    worker::String
     stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
     result::Observable{Any}
 end
 JuliaContinueToolMsg(message::Message, server) =
-    JuliaContinueToolMsg(message, server, "", "", nothing,
+    JuliaContinueToolMsg(message, server, "", "", nothing, "",
                          Observable(""), nothing, Observable{Any}(nothing))
 
 mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
     message::Message
     server::String
     env_path::String              # which session it SIGINTs; "" ⇒ the active one
+    worker::String                # on which worker; "" ⇒ the chat's own
 end
 JuliaInterruptToolMsg(message::Message, server) =
-    JuliaInterruptToolMsg(message, server, "")
+    JuliaInterruptToolMsg(message, server, "", "")
 
 mutable struct JuliaRestartToolMsg <: MCPToolMsg     # bt_julia_restart
     message::Message
     server::String
     env_path::String
+    worker::String
 end
 JuliaRestartToolMsg(message::Message, server) =
-    JuliaRestartToolMsg(message, server, "")
+    JuliaRestartToolMsg(message, server, "", "")
 
 mutable struct JuliaListSessionsToolMsg <: MCPToolMsg # bt_julia_list_sessions
     message::Message
@@ -1011,11 +1018,15 @@ function apply_input!(m::JuliaEvalCall, raw::AbstractDict)
     e isa AbstractString && !isempty(e) && (m.env_path = String(e))
     t = get(raw, "timeout", nothing)
     t isa Real && (m.timeout = Float64(t))
+    w = get(raw, "worker", nothing)
+    w isa AbstractString && !isempty(strip(w)) && (m.worker = String(strip(w)))
     return nothing
 end
 function apply_input!(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}, raw::AbstractDict)
     e = get(raw, "env_path", nothing)
     e isa AbstractString && !isempty(e) && (m.env_path = String(e))
+    w = get(raw, "worker", nothing)
+    w isa AbstractString && !isempty(strip(w)) && (m.worker = String(strip(w)))
     return nothing
 end
 
@@ -1797,6 +1808,8 @@ function eval_extras!(d::Dict, m::JuliaEvalCall)
     isempty(m.code) || (d["code"] = m.code)       # `continue` has none — that's fine
     d["timeout_s"] = eval_timeout_label(m)
     d["stoppable"] = true                         # a JuliaEvalCall holds an eval in flight
+    # Running on ANOTHER worker: the card wears its name as a badge.
+    isempty(m.worker) || (d["worker"] = m.worker)
     # The client builds the eval card's Collapsable in compact-body mode (the
     # edit-tool mechanism): the body stays mounted, collapse is a HEIGHT cap
     # (~4 code lines) — so the "preview" is the real Monaco Code editor.
@@ -1809,7 +1822,8 @@ end
 # their action otherwise. Default: none. `env_path` streams in like every arg.
 executed_preview(::MCPToolMsg) = nothing
 mcp_env(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}) =
-    isempty(m.env_path) ? "the active session" : m.env_path
+    (isempty(m.env_path) ? "the active session" : m.env_path) *
+    (isempty(m.worker) ? "" : " on " * m.worker)
 executed_preview(m::JuliaInterruptToolMsg)   = "interrupt (SIGINT) " * mcp_env(m)
 executed_preview(m::JuliaRestartToolMsg)     = "restart (fresh process) " * mcp_env(m)
 executed_preview(::JuliaListSessionsToolMsg) = "list active Julia sessions"
@@ -3925,7 +3939,8 @@ end
 # it isn't known at construction — once `update_from_snap!` merged the args, the
 # next summary derivation shows the env.
 eval_env_summary(m::JuliaEvalCall) =
-    "env " * (isempty(m.env_path) ? "<temp>" : m.env_path)
+    "env " * (isempty(m.env_path) ? "<temp>" : m.env_path) *
+    (isempty(m.worker) ? "" : " · on " * m.worker)
 
 snap_summary(::ToolMsg, snap)         = content_summary(builtin_msg_type(snap.kind, tool_call_name(snap)), snap.content)
 # A search's most useful line is the query, not just how many hits it got — and
@@ -4355,6 +4370,24 @@ strip_ansi_codes(s::AbstractString) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
 eval_route_key(m::JuliaEvalCall) =
     isempty(m.env_path) ? BonitoMCP.TEMP_KEY : abspath(m.env_path)
 
+# An eval on ANOTHER worker streams through that worker's eval host, whose
+# chunks the server keys under the worker id (`handle_mcp_ctrl_ws`), so a local
+# session on the same env_path can't be confused with it. The tool names the
+# worker as the user does (display name, or id); resolve it the same way the
+# server does.
+function eval_route_key(state::ServerState, m::JuliaEvalCall)
+    base = eval_route_key(m)
+    isempty(m.worker) && return base
+    wid = m.worker
+    for w in values(state.workers[])
+        if w.worker_id == m.worker || w.name == m.worker || lowercase(w.name) == lowercase(m.worker)
+            wid = w.worker_id
+            break
+        end
+    end
+    return wid * "\0" * base
+end
+
 function start_eval_stream!(m::JuliaEvalCall)
     chat = tool_chat(m)
     chat === nothing && return nothing
@@ -4365,7 +4398,7 @@ end
 
 function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
     state = chat.state
-    key = eval_sink_key(chat.project_id, eval_route_key(m))
+    key = eval_sink_key(chat.project_id, eval_route_key(state, m))
     ch = Channel{String}(Inf)
     lock(state.lock) do
         # A stale sink from a prior eval on the same route can only linger if its
@@ -7336,6 +7369,41 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         end
     end
 
+    # ── Remote Julia switch ──────────────────────────────────────────────────
+    # May this chat's agent run Julia on OTHER workers (`bt_julia_eval(worker =
+    # …)`, `bt_sync_folder`)? Off by default. It sits next to the permissions
+    # pill because it is one: a capability the user grants per chat. The server
+    # enforces it at relay time (remote_eval.jl), so flipping it needs no restart;
+    # switching it off shuts the chat's eval hosts down. The select is rebuilt
+    # from `state.projects`, the source of truth, like the config pills.
+    remote_pick = Observable("")
+    remote_pill = map(session, state.projects) do projects
+        q = isempty(project_id) ? nothing : get(projects, project_id, nothing)
+        q === nothing && return DOM.span(; class = "bt-hidden")
+        opt(label, on) = on ? DOM.option(label; value = label, selected = true) :
+                              DOM.option(label; value = label)
+        DOM.div(
+            DOM.span("remote julia: "; class = "bt-header-meta-cat"),
+            DOM.select(opt("off", !q.remote_eval), opt("on", q.remote_eval);
+                class = "bt-header-meta-select bt-header-remote-select",
+                onchange = js"event => $(remote_pick).notify(event.target.value)");
+            class = "bt-header-meta-item bt-header-meta-pick bt-header-remote",
+            title = "Let this chat's agent run Julia and copy folders on OTHER workers " *
+                    "(bt_julia_eval with worker=…, bt_sync_folder). Off by default; " *
+                    "the server enforces it, and switching it off stops the evals there.")
+    end
+    on(session, remote_pick) do v
+        isempty(v) && return
+        remote_pick[] = ""
+        isempty(project_id) && return
+        try
+            set_remote_eval!(state, project_id, v == "on")
+        catch e
+            @warn "remote julia switch failed" project_id exception = (e, catch_backtrace())
+            problem("Could not change the remote julia switch: " * first(split(sprint(showerror, e), '\n')))
+        end
+    end
+
     # ── Narrow-pane collapse toggle ──────────────────────────────────────────
     # Pure-CSS checkbox pattern (label wraps its own input — no id/for pair, so
     # several chat panes never collide). Invisible on wide panes; a container
@@ -7367,7 +7435,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             DOM.span(header_status; class="bt-header-status"),
             more_toggle,
             DOM.div(
-                DOM.div(usage_node, meta_line, provider_select; class = "bt-header-session"),
+                DOM.div(usage_node, meta_line, remote_pill, provider_select;
+                        class = "bt-header-session"),
                 review_button,
                 menu;
                 class="bt-header-actions"),

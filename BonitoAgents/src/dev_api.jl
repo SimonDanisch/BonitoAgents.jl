@@ -149,7 +149,11 @@ jsonable(x) = string(x)
 # `Val`, for two reasons: an unknown op gets an error that lists the real ones
 # instead of a bare "no method", and an arbitrary string from the wire can't mint
 # an unbounded number of `Val{Symbol}` types in this process.
-const DEV_OPS          = (:inspect, :logs, :memory, :control)
+# `remote_eval` / `remote_workers` / `sync_folder` are not dev tools: every
+# chat's MCP may ask them (remote_eval.jl). They share this channel and this
+# allow-list because it is the one request/reply path an MCP process has.
+const DEV_OPS          = (:inspect, :logs, :memory, :control,
+                          :remote_eval, :remote_workers, :sync_folder)
 const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
                           :rescan_worker, :move_project, :set_title)
@@ -159,14 +163,22 @@ known_or_throw(name::Symbol, known, what) =
     error("unknown $what '$(name)' — expected one of " * join(known, ", "))
 
 """
-    dev_request(state, op, args) -> Any
+    dev_request(state, op, args, caller = "") -> Any
 
-Run one dev-tool operation and return a JSON-encodable result. Unknown ops throw
-(the MCP side turns that into a tool error naming the op), so a typo can't come
-back as an empty success.
+Run one operation asked over an MCP control channel and return a JSON-encodable
+result. `caller` is the project id of the chat whose MCP asked — set by the
+channel, never by the request, so an op that grants something per chat
+(`remote_eval`) keys on the real caller. Unknown ops throw (the MCP side turns
+that into a tool error naming the op), so a typo can't come back as an empty
+success.
 """
-dev_request(state::ServerState, op::AbstractString, args::AbstractDict) =
-    dev_op(state, Val(known_or_throw(Symbol(op), DEV_OPS, "dev op")), args)
+dev_request(state::ServerState, op::AbstractString, args::AbstractDict,
+            caller::AbstractString = "") =
+    dev_op(state, Val(known_or_throw(Symbol(op), DEV_OPS, "dev op")), args, String(caller))
+
+# The dev ops don't care who asked; the remote-eval ops (remote_eval.jl) do and
+# define the 4-argument method themselves.
+dev_op(state::ServerState, v::Val, args::AbstractDict, ::String) = dev_op(state, v, args)
 
 # ── inspect ─────────────────────────────────────────────────────────────────
 

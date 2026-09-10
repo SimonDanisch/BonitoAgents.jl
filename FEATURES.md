@@ -25,8 +25,14 @@ enumerates.
   memory), so the agent resumes on the new machine with its memory intact. A
   provider whose record can't be moved starts fresh there; the chat's history
   stays visible either way.
-- librsync-based directory sync underneath (project import, the moves above);
-  single-file transfers over a dedicated channel.
+- **Run Julia on another worker**: `bt_julia_eval(worker = "MacBook")` runs on
+  that machine through a BonitoMCP eval host the server spawns there for the
+  chat; the eval card wears the worker's name, stdout streams in, plots render
+  live. Off by default, per chat: a *remote julia* pill in the chat header next
+  to the permissions pill, enforced by the server. `bt_sync_folder` copies
+  code and data across first.
+- librsync-based directory sync underneath (project import, the moves above,
+  folder sync between workers); single-file transfers over a dedicated channel.
 
 ## Projects & sessions
 

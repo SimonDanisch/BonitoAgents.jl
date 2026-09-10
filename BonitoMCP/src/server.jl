@@ -139,6 +139,9 @@ function handle_cancelled!(req::AbstractDict)
         interrupt_in_flight!(nothing) :
         interrupt_in_flight!(target_env; scope_temp = target_env === nothing)
     log_info("notifications/cancelled (requestId=$rid) → interrupted $n in-flight eval(s)")
+    # Evals this chat runs on OTHER workers are stopped through the server (the
+    # relayed call is still waiting on its reply; this is what ends it early).
+    interrupt_remote_inflight!()
     return nothing
 end
 

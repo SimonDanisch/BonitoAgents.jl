@@ -625,6 +625,7 @@ function run_dispatcher_prompt(prompt_id)
             get(ev, "env_path", nothing) === nothing ||
                 (raw_input["env_path"] = String(ev["env_path"]))
             haskey(ev, "timeout") && (raw_input["timeout"] = ev["timeout"])
+            haskey(ev, "worker")  && (raw_input["worker"]  = String(ev["worker"]))
             toolname = String(get(ev, "tool", "mcp__btworker__bt_julia_eval"))
             meta = Dict("claudeCode" => Dict("toolName" => toolname))
             upd("tool_call", Dict{String,Any}(

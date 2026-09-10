@@ -1033,6 +1033,10 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_worker_state(ws, cmd; mcp_command, mcp_arguments)
             elseif t == "debug_checkout"
                 @async handle_debug_checkout(ws, cmd)
+            elseif t == "open_eval_host"
+                @async handle_open_eval_host(ws, cmd; server_url, worker_id, mcp_command, mcp_arguments)
+            elseif t == "close_eval_host"
+                @async handle_close_eval_host(ws, cmd)
             elseif t == "stage_session"
                 @async handle_stage_session(ws, cmd)
             elseif t == "install_session"
@@ -1107,6 +1111,7 @@ function close_transport_quietly!(ws)
 end
 
 function reap_all_sessions!(reason::AbstractString)
+    reap_all_eval_hosts!(reason)
     entries = lock(_SESSION_PROCS_LOCK) do
         snap = collect(_SESSION_PROCS)
         empty!(_SESSION_PROCS)
@@ -1269,6 +1274,108 @@ function handle_close_session(cmd)
     # Also kill the dial-back transport: a relay parked on a half-open socket
     # (send holds ws.sendlock) is unreachable by the proc kill alone.
     close_transport_quietly!(entry.ws)
+end
+
+# ── Eval hosts: Julia for ANOTHER worker's chat, run here ────────────────────
+# "Run this on the MacBook" from a chat whose agent lives on the desktop: the
+# server asks THIS worker to spawn a BonitoMCP eval host for that chat
+# (`BonitoMCP.run_eval_host`), which dials the server's /mcp-ws and serves the
+# relayed evals with the same session manager the chat's own MCP uses. One host
+# per chat per worker; the process is the same julia + project the MCP itself is
+# launched with (`mcp_command`/`mcp_arguments`, only the entry point differs),
+# so it runs on the pinned julia and sees the same packages.
+#
+#     {type:"open_eval_host", request_id, project_id, env:{…}}
+#  -> {type:"open_eval_host_response", request_id, ok:true, pid, existed}
+#     {type:"close_eval_host", request_id, project_id}
+#  -> {type:"close_eval_host_response", request_id, ok:true, killed}
+#
+# The host's lifetime is the chat's: the server closes it when the chat's
+# session ends or remote Julia is switched off, and a host that loses the server
+# exits on its own (BonitoMCP.HOST_ORPHAN_S). Reaped with the agent sessions on
+# link loss, and, like an agent, stamped with `AGENT_OWNER_ENV` so a stray from a
+# previous incarnation of this worker is found and killed at the next start.
+const _EVAL_HOSTS = Dict{String,Any}()          # project_id => Process
+const _EVAL_HOSTS_LOCK = ReentrantLock()
+
+# The MCP's argv with its `-e` entry point swapped for the eval host's.
+function eval_host_arguments(mcp_arguments::Vector{String})
+    i = findlast(==("-e"), mcp_arguments)
+    (i === nothing || i == length(mcp_arguments)) &&
+        error("the MCP launch arguments carry no `-e` entry point to derive the eval host from: $(mcp_arguments)")
+    args = copy(mcp_arguments)
+    args[i + 1] = "using BonitoMCP; BonitoMCP.run_eval_host()"
+    return args
+end
+
+function open_eval_host!(project_id::AbstractString, env::AbstractDict;
+                         server_url::AbstractString, worker_id::AbstractString,
+                         mcp_command::AbstractString, mcp_arguments::Vector{String})
+    isempty(project_id) && error("open_eval_host: project_id is empty")
+    isempty(mcp_command) && error("open_eval_host: this worker has no MCP launch command")
+    lock(_EVAL_HOSTS_LOCK) do
+        existing = get(_EVAL_HOSTS, project_id, nothing)
+        if existing !== nothing && process_running(existing)
+            return (pid = Int(getpid(existing)), existed = true)
+        end
+        host_env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
+                         Dict{String,String}(String(k) => String(v) for (k, v) in env),
+                         Dict("BONITOAGENTS_SERVER_URL" => String(server_url),
+                              "BONITOAGENTS_EVAL_HOST_WORKER" => String(worker_id),
+                              AGENT_OWNER_ENV => String(worker_id)))
+        args = eval_host_arguments(mcp_arguments)
+        # `detach`: the host leads its own process group, so killing it reaches
+        # the eval workers it spawned — same as an agent (see handle_open_session).
+        proc = open(detach(Cmd(`$mcp_command $args`; env = host_env)), "r")
+        _EVAL_HOSTS[project_id] = proc
+        @info "BonitoWorker: eval host started" project_id pid = getpid(proc)
+        return (pid = Int(getpid(proc)), existed = false)
+    end
+end
+
+function close_eval_host!(project_id::AbstractString)
+    proc = lock(_EVAL_HOSTS_LOCK) do
+        pop!(_EVAL_HOSTS, project_id, nothing)
+    end
+    proc === nothing && return false
+    @info "BonitoWorker: eval host closed" project_id
+    kill_proc!(proc)
+    return true
+end
+
+function reap_all_eval_hosts!(reason::AbstractString)
+    procs = lock(_EVAL_HOSTS_LOCK) do
+        snap = collect(values(_EVAL_HOSTS))
+        empty!(_EVAL_HOSTS)
+        snap
+    end
+    isempty(procs) && return nothing
+    @info "BonitoWorker: reaping eval hosts" n = length(procs) reason
+    foreach(kill_proc!, procs)
+    return nothing
+end
+
+function handle_open_eval_host(ws, cmd::AbstractDict; server_url, worker_id,
+                               mcp_command, mcp_arguments)
+    reply = Dict{String,Any}("type" => "open_eval_host_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        env = get(cmd, "env", Dict{String,Any}())
+        r = open_eval_host!(String(get(cmd, "project_id", "")),
+                            env isa AbstractDict ? env : Dict{String,Any}();
+                            server_url = String(server_url), worker_id = String(worker_id),
+                            mcp_command = String(mcp_command), mcp_arguments)
+        Dict{String,Any}("ok" => true, "pid" => r.pid, "existed" => r.existed)
+    end
+end
+
+function handle_close_eval_host(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "close_eval_host_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        Dict{String,Any}("ok" => true,
+                         "killed" => close_eval_host!(String(get(cmd, "project_id", ""))))
+    end
 end
 
 # The env var every agent (and everything it spawns) is stamped with, naming the

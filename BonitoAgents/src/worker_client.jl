@@ -564,6 +564,10 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "discard_staging_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "open_eval_host_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "close_eval_host_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "open_session_failed"
                         # M9/M13: worker couldn't spawn/dial the ACP session; fail the
                         # pending open_session (keyed by `sid`) now instead of waiting
@@ -652,8 +656,14 @@ function teardown_worker_control!(state::ServerState, worker_id::AbstractString,
             shared(m).session_alive[] = false
         end
         # The worker host is gone → its eval workers (and their bridges) are gone.
+        # So are its chats' agent sessions, and with them the eval hosts those
+        # chats had running on OTHER workers: nobody is left to talk to them, and
+        # a host outlives its chat only to hold a Julia process open (its own
+        # orphan timer never fires — the SERVER is still up, it is the chat that
+        # died). Same reasoning as `stop_session!`.
         for pid in affected
             teardown_eval_bridge!(state, pid)
+            close_eval_hosts!(state, pid)
         end
         safe_notify!(state.workers)
         # NOT notify_chats!: the chats are kept, so the active-chats list is
@@ -1624,6 +1634,35 @@ function discard_staging_on_worker(state::ServerState, worker_id::AbstractString
     worker_rpc(state, worker_id, "discard_staging",
                Dict{String,Any}("staging" => String(staging)); timeout)
     return nothing
+end
+
+"""
+    open_eval_host_on_worker(state, worker_id; project_id, env) -> (pid, existed)
+
+Ask the worker to spawn (or confirm) the BonitoMCP eval host serving
+`project_id`'s chat from that machine, with `env` (the server's secret and the
+project id) in the process environment. The host dials `/mcp-ws` on its own;
+`ensure_eval_host!` (remote_eval.jl) waits for that.
+"""
+function open_eval_host_on_worker(state::ServerState, worker_id::AbstractString;
+                                  project_id::AbstractString, env::AbstractDict,
+                                  timeout::Real = 60.0)
+    resp = worker_rpc(state, worker_id, "open_eval_host", Dict{String,Any}(
+        "project_id" => String(project_id),
+        "env" => Dict{String,String}(String(k) => String(v) for (k, v) in env)); timeout)
+    return (pid = Int(get(resp, "pid", 0)), existed = get(resp, "existed", false) === true)
+end
+
+"""
+    close_eval_host_on_worker(state, worker_id; project_id) -> Bool
+
+Kill the eval host the worker runs for `project_id`. `false` when there was none.
+"""
+function close_eval_host_on_worker(state::ServerState, worker_id::AbstractString;
+                                   project_id::AbstractString, timeout::Real = 30.0)
+    resp = worker_rpc(state, worker_id, "close_eval_host",
+                      Dict{String,Any}("project_id" => String(project_id)); timeout)
+    return get(resp, "killed", false) === true
 end
 
 """

@@ -26,7 +26,13 @@ Base.show(::IO, ::Unprintable) = error("this show method always throws")
 # failure the lists were introduced to prevent. Cheap to assert, easy to drift.
 @testset "every advertised op is actually implemented" begin
     for op in BT.DEV_OPS
-        @test hasmethod(BT.dev_op, Tuple{BT.ServerState, Val{op}, Dict{String,Any}})
+        # Either the plain form, or the caller-aware one (remote_eval.jl) — and
+        # for the latter a method for THIS op, not the generic fallback that
+        # forwards every `Val` to the plain form.
+        specific4 = let m = which(BT.dev_op, Tuple{BT.ServerState, Val{op}, Dict{String,Any}, String})
+            m.sig.parameters[3] === Val{op}
+        end
+        @test hasmethod(BT.dev_op, Tuple{BT.ServerState, Val{op}, Dict{String,Any}}) || specific4
     end
     for op in BT.DEV_CONTROL_OPS
         @test hasmethod(BT.dev_control, Tuple{BT.ServerState, Val{op}, Dict{String,Any}})

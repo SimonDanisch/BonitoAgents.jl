@@ -534,6 +534,8 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     # the eval bridge's worker session is gone — tear the bridge down explicitly
     # (a WS drop alone no longer does; its lifetime is the worker session).
     teardown_eval_bridge!(state, p.id)
+    # Its evals on OTHER workers end with it: those hosts serve this session only.
+    close_eval_hosts!(state, p.id)
     return nothing
 end
 
