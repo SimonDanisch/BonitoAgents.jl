@@ -2205,20 +2205,6 @@ class BonitoChat {
         }
     }
 
-    // The `.bt-console` of an eval body's Output section (the pin_end
-    // Collapsable the live stdout stream writes into), or null before the
-    // body has mounted. Matched by the section's "Output" label so a Code /
-    // error console can't be picked by mistake.
-    evalOutputConsole(node) {
-        const secs = node.querySelectorAll('.bt-tool-body .bt-subsection');
-        for (const d of secs) {
-            const label = d.querySelector('.bt-subsection-label');
-            if (label && (label.textContent || '').trim() === 'Output')
-                return d.querySelector('.bt-console');
-        }
-        return null;
-    }
-
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -2231,18 +2217,12 @@ class BonitoChat {
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
             if (live) this.ensureElapsedTicker();
-            // Compact-body evals mount their body DURING the run (the live
-            // stream pane inside the Output section) and editMode never
-            // re-fetches on expand, so the completed content would stay
-            // stale forever. Re-render once at terminal status — the fresh
-            // body carries the COMPLETE output text (same bytes the stream
-            // showed, atomic with the result) and the result embed.
-            if (!live) {
-                if (node.dataset.compactBody === '1' && node.collapsable &&
-                    node.collapsable.loaded && node.isConnected) {
-                    this.comm.notify({ type: 'tool.render', id: msg.id });
-                }
-            }
+            // NOTE: no re-render at terminal status. An eval body is mounted
+            // ONCE and its Output text + result embed are Observables the
+            // server fills on completion (`eval_result!`). Re-rendering here
+            // used to detach the Code section's Monaco container while its
+            // async `create` was still resolving — an unhandled "Cannot read
+            // properties of null (reading 'parentNode')".
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -2392,32 +2372,10 @@ class BonitoChat {
                     headerEl.querySelector('.bt-tool-fullwidth') || null);
             }
         }
-        // Live stdout of a RUNNING eval, fed by `stream_tail` updates (the
-        // server tails the eval session's log). The stream IS the body's
-        // Output section — a `pin_end` Collapsable whose `.bt-console` shows
-        // the text; write into it and pin its scroller (the .bt-subsection-
-        // body) to the newest line. Same widget the terminal re-render swaps
-        // the complete text into, so there's no styling jump on completion.
-        // Fallback: if the update raced the body mount, park a plain pane
-        // under the header (the mount, which carries the same text, drops it).
-        if (msg.stream_tail != null && stillLive && headerEl) {
-            const con = this.evalOutputConsole(node);
-            if (con) {
-                for (const stray of node.querySelectorAll('.bt-eval-stream')) stray.remove();
-                con.textContent = msg.stream_tail;
-                const scroller = con.closest('.bt-subsection-body');
-                if (scroller) scroller.scrollTop = scroller.scrollHeight;
-            } else {
-                let sp = node.querySelector('.bt-eval-stream');
-                if (!sp) {
-                    sp = document.createElement('pre');
-                    sp.className = 'bt-eval-stream';
-                    headerEl.insertAdjacentElement('afterend', sp);
-                }
-                sp.textContent = msg.stream_tail;
-                sp.scrollTop = sp.scrollHeight;
-            }
-        }
+        // NOTE: live stdout is NOT pushed from here any more. The Output
+        // section binds to the card's `stream_text` Observable, so the server
+        // writing it updates the console in place — no wire message, no DOM
+        // poke, and the same widget streaming and done.
         // The file path usually arrives with a later update (the initial
         // header has no arguments/content yet) — turn the title into a
         // path link on demand.

@@ -945,14 +945,19 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     code::String                  # the code being executed (live preview + Code section)
     env_path::String              # project env; "" ⇒ ephemeral temp session
     timeout::Union{Float64,Nothing}   # soft checkpoint cadence; nothing ⇒ default
-    # Live stdout tail while the eval runs (`eval_stream_loop!` drains the MCP's
-    # forwarded stream): rolling text window + the drain task (nothing until the
-    # eval turns pending/in_progress).
-    stream_text::String
+    # The Output section's text, for the card's whole life: the rolling stdout
+    # window while the eval runs (`eval_stream_loop!` drains the MCP's forwarded
+    # stream), then the complete output on completion. An Observable so the
+    # section is MOUNTED ONCE and updated in place — see `eval_body_dom`.
+    stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
+    # The terminal result embed, `nothing` until the descriptor lands. Its own
+    # slot for the same reason: the body never re-renders to grow one.
+    result::Observable{Any}
 end
 JuliaEvalToolMsg(message::Message, server) =
-    JuliaEvalToolMsg(message, server, "", "", nothing, "", nothing)
+    JuliaEvalToolMsg(message, server, "", "", nothing,
+                     Observable(""), nothing, Observable{Any}(nothing))
 
 mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     message::Message
@@ -960,11 +965,13 @@ mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     code::String                  # continue carries none — stays "" (shared render path)
     env_path::String
     timeout::Union{Float64,Nothing}
-    stream_text::String
+    stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
+    result::Observable{Any}
 end
 JuliaContinueToolMsg(message::Message, server) =
-    JuliaContinueToolMsg(message, server, "", "", nothing, "", nothing)
+    JuliaContinueToolMsg(message, server, "", "", nothing,
+                         Observable(""), nothing, Observable{Any}(nothing))
 
 mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
     message::Message
@@ -2194,6 +2201,12 @@ end
 # instead of literal `\e[31m` garbage, and the `terminal-output` class gives
 # monospace `pre-wrap`. Wrapped in `.bt-console` so the chat can size it.
 console_block(body::AbstractString) = DOM.div(Bonito.RichText(body); class="bt-console")
+# Live variant: the text is an Observable, so the console is mounted once and
+# updated in place for the eval's whole life. `map(identity, session, obs)` is
+# the session-scoped bridge — the parent→child callback rides
+# `session.deregister_callbacks`, so a closed tab doesn't leave one behind.
+console_block(session::Session, body::Observable{String}) =
+    DOM.div(map(Bonito.RichText, map(identity, session, body)); class="bt-console")
 
 # Render a single GENERIC tool-content text block (third-party tools whose
 # text has no typed contract). This is text PRESENTATION, not protocol
@@ -2411,43 +2424,67 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     # value, `errored: true` marks it). Every other text block IS the
     # terminal output, verbatim. Zero content sniffing. A checkpoint /
     # `nothing` result simply has no descriptor.
-    desc = nothing
-    if tool_status(m) == "completed" && !isempty(content)
-        last = content[end]
-        desc = last isa AgentClientProtocol.TextContent ?
-            result_descriptor(last.text) : nothing
-    end
-    # The Output section is the SAME widget streaming or done: a `pin_end`
-    # Collapsable in summary state — its body owns the scrollbar and stays
-    # pinned to the newest line. While running, the worker's captured stdout
-    # lands in `m.stream_text` (grown by `stream_tail` updates, which also
-    # re-pin the body); the terminal re-render swaps in the complete text
-    # from the content block — same bytes, same chrome, no styling jump.
-    if tool_status(m) in ("pending", "in_progress")
-        push!(sections, tool_subsection("Output",
-            console_block(m.stream_text); pin_end = true))
-    else
-        stop   = desc === nothing ? lastindex(content) : lastindex(content) - 1
-        # Bonito-version-mismatch marker (if any): the env is too old to display
-        # the value live. Render the one-click upgrade card and DON'T print the
-        # marker's raw json as output.
-        upgrade = bonito_upgrade_content(content)
-        output = join(String[c.text for c in content[begin:stop]
-                             if c isa AgentClientProtocol.TextContent &&
-                                bonito_upgrade_descriptor(c.text) === nothing], "\n")
-        # Deprecation guard: an outdated worker's output is a ```julia code echo
-        # with no v3 descriptor. Surface an upgrade hint above the raw output
-        # (kept, so nothing is hidden) instead of a silently-mangled card.
-        outdated_worker_content(content) &&
-            pushfirst!(sections, outdated_worker_banner())
-        isempty(strip(output)) || push!(sections,
-            tool_subsection("Output", console_block(output); pin_end = true))
-        upgrade === nothing || pushfirst!(sections,
-            BonitoUpgradeCard(chat, upgrade.current, upgrade.need, upgrade.env, upgrade.add))
-    end
-    desc === nothing || push!(sections,
-        wrap_for_detach(tool_id(m), remote_result(chat.state, content[end].text, chat.project_id)))
+    # Everything that CHANGES over the eval's life is an Observable, so the body
+    # is built exactly once and updated in place. It used to be rebuilt at
+    # terminal status to swap the live tail for the complete text and grow the
+    # result embed — and that second render detached the Code section's Monaco
+    # container while its async `create` was still resolving, which surfaced as
+    # an unhandled "Cannot read properties of null (reading 'parentNode')".
+    # `eval_result!` fills both observables when the call completes.
+    eval_result!(m, content)
+    # The Output section: a `pin_end` Collapsable whose body owns the scrollbar
+    # and stays pinned to the newest line, streaming AND done — same widget,
+    # same chrome, no styling jump on completion.
+    push!(sections, tool_subsection("Output",
+        console_block(session, m.stream_text); pin_end = true))
+    # The result embed's slot, empty until the descriptor lands.
+    push!(sections, DOM.div(map(identity, session, m.result); class = "bt-eval-result"))
     return Bonito.jsrender(session, DOM.div(sections...; class = "bt-eval-body"))
+end
+
+"""
+    eval_result!(m, content) -> nothing
+
+Fill the eval's Output text and result slot from a COMPLETED call's content.
+No-op while the eval is still running (the live stdout tail owns `stream_text`
+until then) and for content that carries nothing terminal.
+
+Wire contract v3: content is `[output_text?, descriptor?]` — the descriptor
+(exact decode of our own json, see `result_descriptor`) is the LAST block of a
+completed call whenever a result ref exists (values AND errors — the worker
+parks a thrown `CapturedException` like any value, `errored: true` marks it).
+Every other text block IS the terminal output, verbatim. Zero content sniffing.
+A checkpoint / `nothing` result simply has no descriptor.
+"""
+function eval_result!(m::JuliaEvalCall, content)
+    chat = tool_chat(m)
+    chat === nothing && return nothing
+    tool_status(m) in ("completed", "failed") || return nothing
+    isempty(content) && return nothing
+    last = content[end]
+    desc = last isa AgentClientProtocol.TextContent ? result_descriptor(last.text) : nothing
+    stop = desc === nothing ? lastindex(content) : lastindex(content) - 1
+    # Bonito-version-mismatch marker (if any): the env is too old to display the
+    # value live. The upgrade card replaces the value, and the marker's raw json
+    # must NOT be printed as output.
+    upgrade = bonito_upgrade_content(content)
+    output = join(String[c.text for c in content[begin:stop]
+                         if c isa AgentClientProtocol.TextContent &&
+                            bonito_upgrade_descriptor(c.text) === nothing], "\n")
+    isempty(strip(output)) || (m.stream_text[] = output)
+    # Deprecation guard: an outdated worker's output is a ```julia code echo with
+    # no v3 descriptor. Surface the hint instead of a silently-mangled card (the
+    # raw output above is kept, so nothing is hidden).
+    if upgrade !== nothing
+        m.result[] = BonitoUpgradeCard(chat, upgrade.current, upgrade.need,
+                                       upgrade.env, upgrade.add)
+    elseif outdated_worker_content(content)
+        m.result[] = outdated_worker_banner()
+    elseif desc !== nothing
+        m.result[] = wrap_for_detach(tool_id(m),
+            remote_result(chat.state, last.text, chat.project_id))
+    end
+    return nothing
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
@@ -4126,6 +4163,14 @@ function update_from_snap!(b::MCPToolMsg, snap)
     snap isa AgentClientProtocol.MCPCall && apply_input!(b, snap.raw_input)
     return nothing
 end
+# …and for an eval, the completed content fills the Output text + result slot.
+# The body is mounted during the run, so this is what makes the terminal state
+# appear — there is no second render to carry it (see `eval_body_dom`).
+function update_from_snap!(b::JuliaEvalCall, snap)
+    snap isa AgentClientProtocol.MCPCall && apply_input!(b, snap.raw_input)
+    eval_result!(b, snap.content)
+    return nothing
+end
 function update_from_snap!(b::BuiltinToolMsg, snap)
     snap isa AgentClientProtocol.GenericTool && apply_input!(b, snap.raw_input)
     return nothing
@@ -4278,20 +4323,14 @@ bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
 # ── Live stdout tail for a RUNNING bt_julia_eval ─────────────────────────────
 # The MCP forwards the eval worker's stdout/stderr live over /mcp-ws (no on-disk
 # log, no polling — see BonitoMCP.stream_forward_loop!). Each chunk lands in a
-# per-eval sink channel (registered here, drained below) and we ship the last
-# lines to the client as `stream_tail` updates — a ~4-line auto-scrolled pane
-# under the header. A fresh JuliaEvalCall starts with empty `stream_text`, so it
-# only ever shows output that arrives while THIS eval runs.
+# per-eval sink channel (registered here, drained below) and we write it into the
+# card's `stream_text` Observable, which the Output section is bound to. A fresh
+# JuliaEvalCall starts with an empty one, so it only ever shows output that
+# arrives while THIS eval runs.
 const EVAL_STREAM_KEEP_CHARS = 8_000
-const EVAL_STREAM_TAIL_LINES = 12
 const EVAL_STREAM_IDLE_S     = 0.1   # sink-drain cadence when no chunk is waiting
 
 strip_ansi_codes(s::AbstractString) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
-
-function last_lines(s::AbstractString, n::Int)
-    ls = split(s, '\n'; keepempty = true)
-    return join(ls[max(1, end - n + 1):end], '\n')
-end
 
 # Route key for a running eval's stream sink — matched against BonitoMCP.stream_route
 # on the MCP side. Temp sessions (no env_path) collapse onto TEMP_KEY; project
@@ -4329,11 +4368,10 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
                 while isready(ch)
                     write(buf, take!(ch))
                 end
-                m.stream_text = last(m.stream_text * strip_ansi_codes(String(take!(buf))),
-                                     EVAL_STREAM_KEEP_CHARS)
-                chat_emit(chat, Dict{String,Any}(
-                    "type" => "tool_update", "id" => tool_id(m),
-                    "stream_tail" => last_lines(m.stream_text, EVAL_STREAM_TAIL_LINES)))
+                # Straight into the Observable the Output section is bound to —
+                # no `stream_tail` wire message, no DOM poke from JS.
+                m.stream_text[] = last(m.stream_text[] * strip_ansi_codes(String(take!(buf))),
+                                       EVAL_STREAM_KEEP_CHARS)
             else
                 sleep(EVAL_STREAM_IDLE_S)
             end

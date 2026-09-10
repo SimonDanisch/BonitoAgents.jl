@@ -1415,14 +1415,6 @@ class BonitoChat {
             node.classList?.remove('bt-stream-active');
         }
     }
-    evalOutputConsole(node) {
-        const secs = node.querySelectorAll('.bt-tool-body .bt-subsection');
-        for (const d of secs){
-            const label = d.querySelector('.bt-subsection-label');
-            if (label && (label.textContent || '').trim() === 'Output') return d.querySelector('.bt-console');
-        }
-        return null;
-    }
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -1435,14 +1427,6 @@ class BonitoChat {
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
             if (live) this.ensureElapsedTicker();
-            if (!live) {
-                if (node.dataset.compactBody === '1' && node.collapsable && node.collapsable.loaded && node.isConnected) {
-                    this.comm.notify({
-                        type: 'tool.render',
-                        id: msg.id
-                    });
-                }
-            }
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -1519,7 +1503,7 @@ class BonitoChat {
             }
         }
         const headerEl = node.querySelector('.bt-tool-header');
-        const stillLive = !node.dataset.toolFinished && ![
+        !node.dataset.toolFinished && ![
             'completed',
             'failed'
         ].includes(node.querySelector('.bt-tool-status')?.textContent || '');
@@ -1561,24 +1545,6 @@ class BonitoChat {
                     });
                 });
                 headerEl.insertBefore(db, headerEl.querySelector('.bt-tool-fullwidth') || null);
-            }
-        }
-        if (msg.stream_tail != null && stillLive && headerEl) {
-            const con = this.evalOutputConsole(node);
-            if (con) {
-                for (const stray of node.querySelectorAll('.bt-eval-stream'))stray.remove();
-                con.textContent = msg.stream_tail;
-                const scroller = con.closest('.bt-subsection-body');
-                if (scroller) scroller.scrollTop = scroller.scrollHeight;
-            } else {
-                let sp = node.querySelector('.bt-eval-stream');
-                if (!sp) {
-                    sp = document.createElement('pre');
-                    sp.className = 'bt-eval-stream';
-                    headerEl.insertAdjacentElement('afterend', sp);
-                }
-                sp.textContent = msg.stream_tail;
-                sp.scrollTop = sp.scrollHeight;
             }
         }
         if (msg.editable && msg.edit_path && headerEl) {

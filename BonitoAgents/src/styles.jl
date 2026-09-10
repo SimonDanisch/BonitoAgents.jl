@@ -1692,25 +1692,6 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-rv-form-cancel",
         "border" => "none", "background" => "transparent", "cursor" => "pointer",
         "color" => "var(--bt-text-muted)", "font-size" => "12px"),
-    # Live stdout tail of a RUNNING bt_julia_eval: a small terminal-style
-    # pane under the header (~4 lines, auto-scrolled to the newest output by
-    # the client). Removed when the eval completes — the body's "Output"
-    # section carries the full (ANSI-colored) output afterwards. The code
-    # "preview" is no longer a separate element: the eval body eager-mounts
-    # compactly (Collapsable compact-body mode), so the real Monaco Code
-    # editor is what shows at ~4 lines.
-    CSS(".bt-eval-stream",
-        "margin" => "0",
-        "border-top" => "1px solid var(--bt-border)",
-        "background" => "#0f172a",
-        "color" => "#e2e8f0",
-        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
-        "font-size" => "12px", "line-height" => "1.5",
-        "padding" => "6px 12px",
-        "max-height" => "78px",           # ≈ 4 lines at 12px/1.5
-        "overflow-y" => "auto",
-        "white-space" => "pre-wrap", "word-break" => "break-word"),
-
     # The command a Bash tool ran — ALWAYS visible (unlike the eval preview there
     # is no Monaco "Code" section afterwards to fall back on), same dark code look,
     # scrolls for long scripts. "What ran" must never be hidden behind a tooltip.
