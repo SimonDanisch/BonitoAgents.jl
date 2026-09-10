@@ -103,12 +103,19 @@ ok "owned by $SERVICE_USER"
 # The per-package Project.toml files (BonitoAgents/Project.toml etc.) are
 # metadata for declaring deps and must NEVER be used as a runtime env.
 step "Julia env (monorepo root)"
-# resolve() first: the per-package Project.tomls evolve (e.g. a new stdlib dep),
-# so the root Manifest can be out of sync — instantiate() alone would then fail
-# to precompile ("package X does not have Y in its dependencies").
+# update() and nothing else: it re-resolves and instantiates on its way, so a
+# root Manifest left out of sync by an evolving per-package Project.toml is
+# fixed by the same call.
+#
+# It has to be update() rather than resolve(): resolve() honours the manifest's
+# PINNED tree-shas, so a git dep (Bonito, BonitoBook, BonitoWidgets) stays on
+# whatever sha was recorded even after its branch moves. Only update() re-pins
+# those against their `rev`'s current HEAD — which is also what picks up a
+# compat bound tightened upstream (Bonito requiring CommonMark 1.0.4 reached
+# existing installs no other way).
 "$JULIA_BIN" "--project=$MONOREPO_DIR" --startup-file=no \
-    -e 'import Pkg; Pkg.resolve(); Pkg.instantiate()'
-ok "resolved + instantiated"
+    -e 'import Pkg; Pkg.update()'
+ok "updated"
 
 # ── Worker secret ─────────────────────────────────────────────────────────────
 # The server persists its secret at $DATA_DIR/state/worker_secret and reuses it

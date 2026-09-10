@@ -114,6 +114,13 @@ const SPECS = [
 # both — `add` for the fresh-install path, `update` to force a refresh on
 # re-install. Without the explicit `update` the installer silently keeps the
 # user on the manifest's frozen sha forever.
+#
+# The update is UNSCOPED on purpose. Passing `SPECS` only re-pins those
+# packages and whatever their resolve drags along, so a registry dep the env
+# already holds stays frozen even when it should move — including when a
+# dependency tightens its compat (Bonito requiring CommonMark 1.0.4 is what
+# surfaced this). An installer's job is to leave the env current, so update
+# the whole thing.
 function _tree_shas()
     deps = Pkg.dependencies()
     Dict(p.name => p.tree_hash for p in values(deps)
@@ -121,7 +128,7 @@ function _tree_shas()
 end
 before = _tree_shas()
 Pkg.add(SPECS)        # idempotent: handles the fresh-install path
-Pkg.update(SPECS)     # forces a re-pin against `rev`'s current HEAD
+Pkg.update()          # whole env: re-pins `rev` HEADs AND moves registry deps
 Pkg.precompile()
 after = _tree_shas()
 
