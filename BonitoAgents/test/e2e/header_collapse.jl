@@ -1,5 +1,5 @@
 # Narrow-pane header collapse: below the ~660px container breakpoint the chat
-# header hides the action cluster (provider select / Sync / Compact / Restart),
+# header hides the action cluster (the session group / Review / the ⋯ menu),
 # the env path line and the lens search bar behind ONE ⋯ toggle. Checking it
 # expands them all IN FLOW as a full-width stack directly under the toggle,
 # and the glyph flips ⋯ → ✕ so the open toggle reads as the close button of
@@ -12,8 +12,8 @@
 #     "collapse them all together, the ⋯ menu should be enough"), everything
 #     else hidden,
 #   * check: ✕ glyph, actions/env/search all visible; the panel is in flow
-#     below the toggle and its controls span the full row (the Sync button's
-#     wide-strip max-width cap must not apply; the provider select centers),
+#     below the toggle and its controls span the full row (the Review button
+#     stretches with it; the provider select centers),
 #   * uncheck: back to the collapsed row,
 #   * the checked state must never leak into the wide layout: widening the
 #     pane with the menu open shows the plain wide header again.
@@ -53,7 +53,7 @@ click_toggle(s) = TK.eval_js(s, """(() => {
     t.click(); return 'clicked'; })()""")
 
 # Expanded-panel geometry: the actions stack sits BELOW the toggle and spans
-# (nearly) the full header row; the Sync button stretches with it and the
+# (nearly) the full header row; the Review button stretches with it and the
 # provider select centers its label.
 panel_geometry_ok(s) = TK.eval_js(s, """(() => {
     const p = $(PANE);
@@ -61,14 +61,14 @@ panel_geometry_ok(s) = TK.eval_js(s, """(() => {
     const acts = p.querySelector('.bt-header-actions');
     const tog  = p.querySelector('.bt-header-more-toggle');
     const row  = p.querySelector('.bt-header-row');
-    const sync = p.querySelector('.bt-header-sync');
+    const rev  = p.querySelector('.bt-header-review');
     const sel  = p.querySelector('.bt-header-provider-select');
-    if (!acts || !tog || !row || !sync) return 'missing-el';
+    if (!acts || !tog || !row || !rev) return 'missing-el';
     const a = acts.getBoundingClientRect(), t = tog.getBoundingClientRect(),
-          r = row.getBoundingClientRect(),  y = sync.getBoundingClientRect();
+          r = row.getBoundingClientRect(),  y = rev.getBoundingClientRect();
     if (a.top < t.bottom - 1) return 'panel-not-below-toggle';
     if (a.width < 0.9 * r.width) return 'panel-not-full-width';
-    if (y.width < 0.9 * a.width) return 'sync-not-stretched';
+    if (y.width < 0.9 * a.width) return 'review-not-stretched';
     if (sel && getComputedStyle(sel).textAlign !== 'center') return 'select-not-centered';
     // No placeholder children: an empty span (the old xsync placeholder) or a
     // rendered-but-empty meta div costs a flex-gap slot and doubles a row gap.
@@ -145,15 +145,16 @@ function resize_settle(s, w, h)
         })()"""; timeout = 5)
 end
 
-# Is the Restart button whole and inside the header?
-restart_intact(s) = TK.eval_js(s, """(() => {
+# Is the last control of the strip (the ⋯ menu trigger) whole and inside the
+# header?
+menu_intact(s) = TK.eval_js(s, """(() => {
     const p = $(PANE);
-    const b = p && p.querySelector('.bt-header-restart');
+    const b = p && p.querySelector('.bt-header-menu .bt-menu-trigger');
     const hdr = p && p.querySelector('.bt-header');
     if (!b || !hdr) return 'missing';
     const r = b.getBoundingClientRect(), h = hdr.getBoundingClientRect();
     if (r.right > h.right + 1) return 'clipped-right';
-    if (r.width < 40) return 'squashed';
+    if (r.width < 24) return 'squashed';
     return 'ok'; })()""")
 
 function run_suite(server)
@@ -171,7 +172,7 @@ function run_suite(server)
             for w in (1400, 1280, 1100, 1000, 900)
                 resize_settle(s, w, 820)
                 @test spill(s) <= 0
-                @test restart_intact(s) == "ok"
+                @test menu_intact(s) == "ok"
             end
         finally
             unseed_header(s)
@@ -206,8 +207,8 @@ function run_suite(server)
             @test glyph(s) == "✕"
             @test visible(s, ".bt-lens-bar")
             @test visible(s, ".bt-header-env")
-            @test visible(s, ".bt-header-sync")
-            @test visible(s, ".bt-header-restart")
+            @test visible(s, ".bt-header-review")
+            @test visible(s, ".bt-header-menu")
             @test panel_geometry_ok(s) == "ok"
 
             # Collapse again: back to the bare row.

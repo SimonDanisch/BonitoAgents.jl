@@ -61,9 +61,13 @@
         ECT.install_cursor(ctx)  # required: initialises window.__fc so move_to/click work
 
         # ── Create a source project on the main worker ────────────────────────
-        src_dir = mktempdir()
+        # The FOLDER is called "SourceProj": a project is named after its
+        # folder's basename (the picker has no Name field), and that name is
+        # what the copy form lists.
+        src_dir = joinpath(mktempdir(), "SourceProj")
+        mkpath(src_dir)
         write(joinpath(src_dir, "README.md"), "source project\n")
-        pid = TK.new_chat(server; cwd = src_dir, title = "SourceProj")
+        pid = TK.new_chat(server; cwd = src_dir)
         @test !isempty(pid)
 
         # ── Add second worker; assert dashboard shows 2/2 online ──────────────
@@ -84,19 +88,19 @@
             TK.eval_js(server, """(() => {
                 const btn = [...document.querySelectorAll('button')]
                     .find(b => b.offsetParent !== null &&
-                               (b.innerText||'').trim() === '→ Copy project');
+                               (b.innerText||'').trim() === 'Copy project…');
                 btn?.scrollIntoView({block: 'center', behavior: 'instant'});
             })()""")
             sleep(0.25)
 
             # Wait until btn_center_js returns non-null, i.e. the button is
             # visible AND within the viewport so elementFromPoint can reach it.
-            @test TK.wait_for(server, "→ Copy project button in viewport",
-                "$(btn_center_js("→ Copy project")) !== null"; timeout = 10) == true
+            @test TK.wait_for(server, "Copy project… button in viewport",
+                "$(btn_center_js("Copy project…")) !== null"; timeout = 10) == true
 
             # Trusted click via fake cursor: move_to → pointerdown/mousedown →
             # pointerup/mouseup/click — fires onclick on the button element.
-            real_click!(ctx, ECT.JS(btn_center_js("→ Copy project")))
+            real_click!(ctx, ECT.JS(btn_center_js("Copy project…")))
 
             @test TK.wait_for(server, "copy form visible",
                 "document.querySelector('.bt-cp-src-worker') !== null"; timeout = 15) == true

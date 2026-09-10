@@ -52,7 +52,10 @@ js_panel_gone = "!document.querySelector('.bw-ws-panel[data-panel-id=\"$P\"]')"
 
 const CARD = ".bt-tool-msg[data-msg-id*=\"$TID\"]"
 click_detach(s)   = TK.eval_js(s, "(()=>{const x=document.querySelector('$CARD .bt-tool-detach'); if(!x)return false; x.click(); return true;})()")
-click_dock(s)     = TK.eval_js(s, "(()=>{const p=document.querySelector('.bw-ws-panel[data-panel-id=\"$P\"]'); const w=p&&p.closest('.bw-ws-float'); const d=w&&w.querySelector('.bw-float-dock'); if(!d)return false; d.click(); return true;})()")
+# The dock button is a POINTER gesture since BonitoWidgets 0.1.2 (press, then
+# release without dragging = "send the panel home"; dragging aims it), so a
+# synthetic `click()` no longer docks. Press on the button, release on window.
+click_dock(s)     = TK.eval_js(s, "(()=>{const p=document.querySelector('.bw-ws-panel[data-panel-id=\"$P\"]'); const w=p&&p.closest('.bw-ws-float'); const d=w&&w.querySelector('.bw-float-dock'); if(!d)return false; const r=d.getBoundingClientRect(); const o={bubbles:true, cancelable:true, button:0, clientX:r.left+r.width/2, clientY:r.top+r.height/2, pointerId:1, pointerType:'mouse', isPrimary:true}; d.dispatchEvent(new PointerEvent('pointerdown', o)); window.dispatchEvent(new PointerEvent('pointerup', o)); return true;})()")
 click_activate(s) = TK.eval_js(s, "(()=>{const t=[...document.querySelectorAll('.bw-tab')].find(x=>x._panelId==='$P'); if(!t)return false; t.click(); return true;})()")
 click_close(s)    = TK.eval_js(s, "(()=>{const t=[...document.querySelectorAll('.bw-tab')].find(x=>x._panelId==='$P'); const c=t&&t.querySelector('.bw-tab-close'); if(!c)return false; c.click(); return true;})()")
 

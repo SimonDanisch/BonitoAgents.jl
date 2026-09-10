@@ -2073,6 +2073,16 @@ function usage_label(u)
     return join(parts, " · ")
 end
 
+# The meter's class follows how full the context window is, so "nearly out of
+# context" shows as colour before anyone reads the number.
+function usage_class(u)
+    (u === nothing || u.size <= 0) && return "bt-header-usage"
+    r = u.used / u.size
+    r >= 0.9  && return "bt-header-usage bt-header-usage-high"
+    r >= 0.75 && return "bt-header-usage bt-header-usage-warn"
+    return "bt-header-usage"
+end
+
 # ── Edit-tool body sizing ────────────────────────────────────────────────────
 # Edit-tool bodies render as a Monaco `DiffEditor` (see `render_diff_block`).
 # To keep multi-edit tool calls from flooding the chat with full-height
@@ -3553,14 +3563,19 @@ markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
     # rendering unstyled.
     #
     # So the guarantee is checked on the OUTPUT rather than inferred from which
-    # exception the parser happened to throw: if the source had words and none
-    # of them survive into the rendered text, show it verbatim instead. Keyed on
-    # words, not on emptiness — `---` legitimately renders to `<hr>` with no
-    # text at all, and must stay a horizontal rule.
+    # exception the parser happened to throw: if the source had words and any
+    # of them fails to survive into the rendered html, show it verbatim instead.
+    # Keyed on words, not on emptiness — `---` legitimately renders to `<hr>`
+    # with no text at all, and must stay a horizontal rule. EVERY word, not
+    # "at least one": a third CommonMark behaviour renders the half-formed
+    # table `| alpha | beta |\n|::|::|\n| 1 | 2 |` as the paragraph `| 1 | 2 |`
+    # — the numbers survive, the header row is gone — and "any word survived"
+    # waved that through. Checked against the html with its tags, not the text
+    # between them: a link's URL lives in `href`, a fence's language in a
+    # `class`, and those words legitimately never appear as text.
     words = [m.match for m in eachmatch(r"[A-Za-z0-9]+", String(text))]
     if !isempty(words)
-        shown = replace(inner, r"<[^>]*>" => " ")
-        any(w -> occursin(w, shown), words) || (inner = verbatim_html(text))
+        all(w -> occursin(w, inner), words) || (inner = verbatim_html(text))
     end
     "<div class=\"markdown-body\">" * inner * "</div>"
 end
@@ -6832,14 +6847,13 @@ function header_meta_line(items, pick::Union{Observable,Nothing} = nothing;
     DOM.div((header_pill(x, pick; lowercase_modes) for x in shown)...; class = "bt-header-meta")
 end
 
-# Compact the per-file sync progress ("Sending 137/999: src/long/path.jl")
-# down to header-pill size; the full message rides on the button tooltip.
-function compact_sync_label(s::AbstractString)
-    (isempty(s) || s == "__click__") && return "Sync"
-    length(s) <= 26 ? String(s) : String(first(s, 25)) * "…"
-end
-
-function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state::Observable)
+# The chat header: status dot, editable title and worker path on the left; on
+# the right the session group (context meter · model · permissions · effort ·
+# provider), the Review button and the ⋯ menu with every other action.
+# Long-running actions report through `header_status` (the muted line left of
+# the controls) and outcomes through toasts — a button's label is never
+# rewritten to carry a result.
+function chat_header(session::Bonito.Session, model::ChatModel)
     state = model.state
     project_id = model.project_id
     cwd = model.cwd
@@ -6927,7 +6941,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # cumulative session cost rides along since claude-agent-acp 0.44).
     # Empty until the first turn — CSS hides the empty pill.
     usage_node = DOM.span(map(usage_label, model.usage);
-        class = "bt-header-usage",
+        class = map(usage_class, model.usage),
         title = "Context window usage · cumulative session cost")
     on(session, config_pick) do pick
         (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
@@ -6938,115 +6952,54 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         persist_desired_config!(model, cfg_id, value)
     end
 
-    sync_status = Observable("")
-    # Keep the button COMPACT: the idle label is "Sync"; while syncing the
-    # label is a truncated progress string and the full message (long
-    # per-file paths) rides on the tooltip.
-    sync_title = map(sync_status) do s
-        isempty(s) || s == "__click__" ?
-            "Pull this project from the worker to the server" : s
-    end
-    sync_button = DOM.button(map(compact_sync_label, sync_status);
-        class="bt-header-sync",
-        title=sync_title,
-        onclick=js"event => $(sync_status).notify('__click__')")
-    on(session, sync_status) do s
-        s == "__click__" || return
-        sync_status[] = ""
-        isempty(project_id) && (sync_status[] = "no project bound"; return)
-        handle_chat_sync_click(state, project_id, sync_status)
-    end
+    # ── Status line + toasts ─────────────────────────────────────────────────
+    # ONE transient status for the long-running header actions (a provider
+    # switch, a move to another worker). It sits in the flexible left area of
+    # the row, so its width changes are absorbed by the gap and never shove the
+    # controls. Outcomes go to the window's toast (`show_toast!` is a no-op
+    # outside the unified shell, where `plotpane` is `nothing`).
+    header_status = Observable("")
+    pane = model.plotpane
+    problem(msg::AbstractString) = show_toast!(pane, msg)
 
-    # Cross-worker sync: only present when this project has a same-named
-    # sibling on another worker. Clicking inspects both sides and opens the
-    # comparison modal (see `render_sync_modal`). Computed at header build
-    # time — re-navigating refreshes it if siblings appear/disappear.
-    sibs = isempty(project_id) ? ProjectInfo[] : same_name_siblings(state, project_id)
-    # `nothing` (not an empty placeholder span): a rendered empty span still
-    # occupies a flex-gap slot in `.bt-header-actions`, doubling the visible
-    # gap between the provider select and Sync in both the wide strip and the
-    # collapsed-header panel.
-    xsync_control = if isempty(sibs)
-        nothing
-    else
-        other = first(sibs)
-        other_label = haskey(state.workers[], other.worker_id) ?
-            state.workers[][other.worker_id].name : other.worker_id
-        xsync_status = Observable("")
-        xsync_button = DOM.button(map(s -> isempty(s) ? "⇄ $other_label" : s, xsync_status);
-            class="bt-header-sync",
-            title="Compare and sync this project with $other_label",
-            onclick=js"event => $(xsync_status).notify('__click__')")
-        on(session, xsync_status) do s
-            s == "__click__" || return
-            # Guard the lookup BEFORE flipping the label to "comparing…" (T18):
-            # an unguarded `state.projects[][project_id]` KeyErrors if the project
-            # was deleted, escaping before the @async whose catch resets the
-            # label — so the button wedged on "comparing…" forever.
-            cur = get(state.projects[], project_id, nothing)
-            if cur === nothing
-                safe_set!(xsync_status, "project gone")
-                return
-            end
-            xsync_status[] = "comparing…"
-            @async begin
-                try
-                    cmp = compare_projects(state, cur, other)
-                    sync_modal_state[] = (current = cur, other = other, comparison = cmp)
-                    safe_set!(xsync_status, "")
-                catch e
-                    @warn "cross-worker compare failed" exception=(e, catch_backtrace())
-                    safe_set!(xsync_status, "compare failed")
-                end
-            end
-        end
-        xsync_button
-    end
-
-    # Header-level restart: the ONE affordance for restarting the ACP session.
-    # Previously a banner showed only on session death + had its own button;
-    # that banner used Bonito.Button inside a conditional `map(…)` output,
-    # which re-rendered the DOM each `session_alive` toggle and on some
-    # cycles left the click handler bound to an orphaned element — "click
-    # does nothing". The permanent header button avoids that entirely:
-    # plain `DOM.button` + Observable click (same pattern as the sync
-    # buttons above), one DOM element for the lifetime of the chat.
-    #
-    # When the session dies, the button gains `bt-header-restart-dead` →
-    # CSS pulses it red and the title flips to the error message, so a
-    # failure is visible without a separate banner. Mid-restart the label
-    # reads "Restarting…" so the click is acknowledged synchronously.
+    # ── Session restart ──────────────────────────────────────────────────────
+    # One Observable, two controls: the menu's Restart item, and the reconnect
+    # chip that appears next to the title when the session has died (the ONE
+    # failure the user must notice without opening anything). Plain `DOM.button`
+    # + Observable click, one DOM element for the lifetime of the chat: a button
+    # rebuilt inside a conditional `map(…)` sometimes left its click bound to an
+    # orphaned element. Mid-restart the chip reads "Restarting…" in a working
+    # state (not the red pulse), so it reads as busy rather than as a failure to
+    # click again; the handler ignores clicks during a restart either way.
     restart_status = Observable("")
-    restart_label  = map(s -> isempty(s) ? "Restart" : s, restart_status)
-    restart_class  = map(model.session_alive, restart_status) do alive, status
-        # While a restart is running show the "working" state — NOT the red dead
-        # pulse — so the button reads as busy, not as a clickable failure. The
-        # handler also ignores clicks during a restart, but dropping the dead look
-        # is what stops a user (or an impatient poll) from trying to click again.
+    reconnect_label = map(model.session_alive, restart_status) do alive, status
+        status == "Restarting…" ? status : (alive ? "" : "Session ended · Reconnect")
+    end
+    reconnect_class = map(model.session_alive, restart_status) do alive, status
         if status == "Restarting…"
-            "bt-header-restart bt-header-restart-busy"
+            "bt-header-reconnect bt-header-restart-busy"
         elseif alive
-            "bt-header-restart"
+            "bt-header-reconnect bt-hidden"
         else
-            "bt-header-restart bt-header-restart-dead"
+            "bt-header-reconnect bt-header-restart-dead"
         end
     end
-    restart_title  = map(model.session_alive, model.last_error) do alive, err
-        alive  && return "Stop and respawn the agent process for this chat"
-        isempty(err) ? "Session ended — click to reconnect" :
-                       "Session ended: $err — click to reconnect"
+    reconnect_title = map(model.session_alive, model.last_error) do alive, err
+        alive && return "Restarting the agent process for this chat"
+        isempty(err) ? "The agent session ended — click to reconnect" :
+                       "The agent session ended: $err — click to reconnect"
     end
-    restart_button = DOM.button(restart_label;
-        class   = restart_class,
-        title   = restart_title,
+    reconnect_chip = DOM.button(reconnect_label;
+        class   = reconnect_class,
+        title   = reconnect_title,
         onclick = js"event => $(restart_status).notify('__click__')")
     on(session, restart_status) do s
         s == "__click__" || return
-        # The dead-state button stays clickable through the seconds-long bring-up,
-        # so a quick second click (or an e2e poller that re-clicks until the dead
+        # The dead chip stays clickable through the seconds-long bring-up, so a
+        # quick second click (or an e2e poller that re-clicks until the dead
         # class clears) would otherwise bump the restart generation and trigger a
-        # redundant second bring-up — which tears down the just-revived session and
-        # drops the next prompt. Ignore a click while a restart is already running.
+        # redundant second bring-up — which tears down the just-revived session
+        # and drops the next prompt. Ignore a click while a restart is running.
         sh = shared(model)
         lock(() -> sh.restart_inflight[], sh.restart_lock) && return
         restart_status[] = "Restarting…"
@@ -7059,94 +7012,265 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
 
-    # ── Compact button ─────────────────────────────────────────────────────
-    # Fires Claude's `/compact` as a turn: the agent summarizes the conversation
-    # so far (freeing up context) and replies with a summary boundary — which the
-    # chat already renders as a centered separator (see `SummaryMsg`). Only
-    # meaningful on a live session; the message rides the normal send path, so a
-    # turn in flight just queues it.
-    compact_status = Observable("")
-    compact_label  = map(s -> isempty(s) ? "Compact" : s, compact_status)
-    compact_button = DOM.button(compact_label;
-        class   = "bt-header-compact",
-        title   = "Summarize the conversation so far to free up context (/compact)",
-        onclick = js"event => $(compact_status).notify('__click__')")
-    on(session, compact_status) do s
-        s == "__click__" || return
-        compact_status[] = ""
-        isempty(project_id) && return
-        if !model.session_alive[]
-            safe_set!(compact_status, "no session")
-            return
-        end
-        try
-            send_message!(model, UserMsg("/compact"))
-        catch e
-            @warn "compact failed" exception = (e, catch_backtrace())
-            safe_set!(compact_status, "compact failed")
-        end
-    end
-
-    # ── Review button ──────────────────────────────────────────────────────
-    # Opens the change-review tab (review.jl): the project's git diff with a
-    # comment affordance on every line. Lives next to Compact because it's the
-    # other "what just happened in this chat" control. Needs the window's
-    # workspace, so it's inert in a chat rendered outside the unified shell.
-    review_status = Observable("")
-    review_button = DOM.button(map(s -> isempty(s) ? "Review" : s, review_status);
-        class   = "bt-header-compact bt-header-review",
+    # ── Review ───────────────────────────────────────────────────────────────
+    # The one action that stays outside the menu: the change-review tab
+    # (review.jl), the project's git diff with a comment affordance on every
+    # line. Needs the window's workspace, so it says so outside the unified shell.
+    review_click = Observable("")
+    review_button = DOM.button("Review";
+        class   = "bt-btn bt-btn-secondary bt-btn-sm bt-header-review",
         title   = "Review this project's uncommitted changes — ask about or comment on any line",
-        onclick = js"event => $(review_status).notify('__click__')")
-    on(session, review_status) do s
+        onclick = js"event => $(review_click).notify('__click__')")
+    on(session, review_click) do s
         s == "__click__" || return
-        review_status[] = ""
-        pane = model.plotpane
-        if pane === nothing
-            safe_set!(review_status, "no workspace")
-            return
-        end
-        isempty(project_id) && (safe_set!(review_status, "no project"); return)
+        review_click[] = ""
+        pane === nothing && (problem("Review needs the app window"); return)
+        isempty(project_id) && (problem("This chat has no project to review"); return)
         try
             open_review!(pane, model)
         catch e
             @warn "opening the review tab failed" project_id exception = (e, catch_backtrace())
-            safe_set!(review_status, "review failed")
+            problem("Could not open the review: " * first(split(sprint(showerror, e), '\n')))
         end
     end
 
-    # ── Debug BonitoAgents ─────────────────────────────────────────────────
-    # Same destination as the dashboard's button, one click from wherever the
-    # user noticed the problem — which is the whole point of having it here.
-    # Only rendered when this install has a source checkout to debug (a bundled
-    # app has none) and when we're in the unified shell (it navigates the window).
-    debug_status = Observable("")
-    debug_button = if bonitoagents_repo_root() === nothing || model.plotpane === nothing
-        nothing
-    else
-        DOM.button(map(s -> isempty(s) ? "Debug" : s, debug_status);
-            class   = "bt-header-compact bt-header-debug",
-            title   = "Open a chat on BonitoAgents' own source, with live introspection " *
-                      "into the server running this window",
-            onclick = js"event => $(debug_status).notify('__click__')")
+    # ── The ⋯ menu ───────────────────────────────────────────────────────────
+    # Every other one-shot action lives here, so the strip only shows what the
+    # user reads all the time. Each item notifies `menu_pick` with its action
+    # name and closes the menu; the trigger toggles `bt-menu-open` and installs a
+    # capture-phase document listener that closes on a click outside. One
+    # listener per open (a re-open replaces it), removed on every close path.
+    menu_pick = Observable("")
+    close_menu_js = """
+        const m = event.currentTarget.closest('.bt-menu');
+        if (m) {
+            m.classList.remove('bt-menu-open');
+            if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
+        }"""
+    menu_item(text, action; class = "", title = "") = DOM.button(text;
+        class = strip("bt-menu-item " * class),
+        title = title,
+        onclick = js"""event => {
+            $(Bonito.JSString(close_menu_js))
+            $(menu_pick).notify($(action));
+        }""")
+
+    # "Continue on <worker>": the whole chat — its files, its history and the
+    # agent's own memory — moves to another machine and picks up there. One item
+    # per OTHER online worker, following the worker list; the group disappears
+    # when there is nowhere else to go. See `start!` for the move itself.
+    continue_pick = Observable("")
+    continue_items = map(session, state.workers) do workers
+        cur = isempty(project_id) ? nothing : get(state.projects[], project_id, nothing)
+        cur === nothing && return DOM.div(; class = "bt-menu-group bt-hidden")
+        others = sort([w for w in values(workers) if isopen(w) && w.worker_id != cur.worker_id];
+                      by = w -> w.name)
+        isempty(others) && return DOM.div(; class = "bt-menu-group bt-hidden")
+        DOM.div(
+            DOM.div("Continue on"; class = "bt-menu-title"),
+            (DOM.button(w.name;
+                class = "bt-menu-item bt-menu-continue",
+                title = "Move this chat, its files and the agent's memory to $(w.name) and carry on there",
+                onclick = js"""event => {
+                    $(Bonito.JSString(close_menu_js))
+                    $(continue_pick).notify($(w.worker_id));
+                }""") for w in others)...,
+            DOM.div(; class = "bt-menu-sep");
+            class = "bt-menu-group")
     end
-    on(session, debug_status) do s
-        s == "__click__" || return
-        debug_status[] = ""
-        pane = model.plotpane
-        pane === nothing && return
+    on(session, continue_pick) do wid
+        isempty(wid) && return
+        continue_pick[] = ""
+        isempty(project_id) && return
+        p = get(state.projects[], project_id, nothing)
+        p === nothing && return
+        w = get(state.workers[], wid, nothing)
+        (w === nothing || !isopen(w)) && (problem("That worker is offline"); return)
+        wid == p.worker_id && return
+        # A turn in flight would be cut off mid-answer by the session stop: the
+        # user stops it (or waits) first, knowingly.
+        sh = shared(model)
+        if lock(() -> sh.turn_in_flight[], sh.lock)
+            problem("Wait for the current turn to finish, or stop it, before continuing on $(w.name)")
+            return
+        end
+        # The move stops this chat's session first, which evicts its ChatModel
+        # and prunes THIS pane (sidebar.jl) — so from that moment on nothing in
+        # this header exists to show progress in. Progress therefore goes to the
+        # window's toast, re-issued per step so it stays up while the move runs;
+        # the header status only carries the first, synchronous acknowledgement.
         Base.errormonitor(@async try
-            p = ensure_debug_project!(state; worker_id = project_now === nothing ? "" :
-                                                        project_now.worker_id)
-            ensure_project_session!(state, p)
-            pane.navigate[] = p.id
+            safe_set!(header_status, "Continuing on $(w.name)…")
+            start!(state, p, wid; progress = (stage, info) ->
+                show_toast!(pane, "Continuing on $(w.name): " * format_progress_string(stage, info)))
+            # The chat pane is rebuilt around the new session (sidebar.jl revives
+            # the current view on the model's re-add); say what the agent knows.
+            show_toast!(pane, p.resume_session_id === nothing ?
+                "Continued on $(w.name). The agent starts fresh there; the messages above stay." :
+                "Continued on $(w.name). The agent kept its memory.")
+            pane === nothing || (pane.navigate[] = p.id)
         catch e
-            @warn "opening the debug chat failed" exception = (e, catch_backtrace())
-            # The failures here are all things the user can act on (no checkout,
-            # no worker with it), so put the reason where they'll see it.
-            safe_set!(debug_status, "debug failed")
-            show_toast!(pane, first(split(sprint(showerror, e), '\n')))
+            @warn "continue on worker failed" project = p.name target = w.name exception = (e, catch_backtrace())
+            problem("Could not continue on $(w.name): " * first(split(sprint(showerror, e), '\n')))
+            # The session was already stopped for the move; bring the chat back
+            # on the worker it is still bound to, so a failed move is not a
+            # closed chat.
+            try
+                ensure_project_session!(state, p)
+                pane === nothing || (pane.navigate[] = p.id)
+            catch e2
+                @warn "could not bring the chat back after a failed move" project = p.name exception = (e2, catch_backtrace())
+            end
         end)
     end
+
+    # Compact: fires Claude's `/compact` as a turn — the agent summarizes the
+    # conversation so far (freeing up context) and replies with a summary
+    # boundary, rendered as a centered separator (`SummaryMsg`). Rides the normal
+    # send path, so a turn in flight just queues it.
+    # Debug BonitoAgents: same destination as the dashboard's button, one click
+    # from wherever the user noticed the problem. Runs on THIS chat's worker,
+    # which provides the checkout (see `ensure_debug_project!`); needs the window.
+    on(session, menu_pick) do action
+        isempty(action) && return
+        menu_pick[] = ""
+        if action == "compact"
+            isempty(project_id) && return
+            model.session_alive[] || (problem("No live session to compact"); return)
+            try
+                send_message!(model, UserMsg("/compact"))
+            catch e
+                @warn "compact failed" exception = (e, catch_backtrace())
+                problem("Compact failed: " * first(split(sprint(showerror, e), '\n')))
+            end
+        elseif action == "restart"
+            restart_status[] = "__click__"
+        elseif action == "debug"
+            pane === nothing && return
+            safe_set!(header_status, "Preparing the BonitoAgents checkout…")
+            Base.errormonitor(@async try
+                p = ensure_debug_project!(state; worker_id = project_now === nothing ? "" :
+                                                            project_now.worker_id)
+                ensure_project_session!(state, p)
+                safe_set!(header_status, "")
+                pane.navigate[] = p.id
+            catch e
+                @warn "opening the debug chat failed" exception = (e, catch_backtrace())
+                safe_set!(header_status, "")
+                # All things the user can act on (no worker connected, the
+                # checkout could not be set up), so say which.
+                problem("Debug chat failed: " * first(split(sprint(showerror, e), '\n')))
+            end)
+        end
+    end
+
+    # ── Dev mode (dangerous) ───────────────────────────────────────────────
+    # Grants THIS chat the `bt_dev_*` introspection tools without moving it onto
+    # the BonitoAgents checkout: the "my Create button timed out, what does the
+    # server log say" case, answered in the chat where it happened rather than by
+    # opening a second one.
+    #
+    # Gated behind a JS `confirm()` for the same reason as the worker card's
+    # remove ✕ — the call must never fire without an explicit OK. It earns that
+    # because `bt_dev_control` is NOT scoped to the calling chat: the agent here
+    # can send messages into, restart or close any chat on this server, and move
+    # chats between machines.
+    #
+    # Flipping the flag alone would do nothing visible: `dev_mode` is read at
+    # session bring-up (see `set_dev_mode!`), so the session is restarted to
+    # respawn the MCP process with the new environment. A chat with no project
+    # has nowhere to persist the flag, so it gets no item. While ON, the menu
+    # trigger itself turns red: that this chat's agent can drive the whole
+    # server should be legible at a glance, not something you discover by opening
+    # the menu.
+    devmode_trigger = Observable("")
+    devmode_on = map(session, state.projects) do projects
+        q = isempty(project_id) ? nothing : get(projects, project_id, nothing)
+        return q !== nothing && q.dev_mode
+    end
+    devmode_class = map(session, devmode_on) do on
+        on ? "bt-menu-item bt-menu-danger bt-header-devmode bt-header-devmode-on" :
+             "bt-menu-item bt-menu-danger bt-header-devmode"
+    end
+    # The ON state shows through the class alone (red, bold, a ": on" suffix
+    # from CSS) — no label Observable. `devmode_on` re-fires on EVERY
+    # `state.projects` notify, and a text update aimed at a pane that has since
+    # been pruned (a move, a close) throws in the browser; a class update on a
+    # gone node does not.
+    devmode_item = isempty(project_id) ? nothing :
+        DOM.button("Dev mode";
+            class = devmode_class,
+            title = "Dangerous: give this chat's agent live introspection into " *
+                    "the server it runs on, and the ability to drive it. " *
+                    "Restarts the session.",
+            # Which way to toggle is read from the item's own class, not from a
+            # value captured at render: `class` tracks `devmode_on`, so this stays
+            # correct after another tab flips the same project.
+            onclick = js"""event => {
+                $(Bonito.JSString(close_menu_js))
+                if (event.currentTarget.classList.contains('bt-header-devmode-on')) {
+                    $(devmode_trigger).notify('off');
+                    return;
+                }
+                if (confirm("Enable dev mode for this chat?\n\nIts agent gets tools that read AND DRIVE this server: it can send messages into, restart or close ANY chat here, and move chats between machines.\n\nThis restarts the chat session."))
+                    $(devmode_trigger).notify('on');
+            }""")
+    on(session, devmode_trigger) do want
+        isempty(want) && return
+        devmode_trigger[] = ""
+        isempty(project_id) && return
+        want_on = want == "on"
+        Base.errormonitor(@async try
+            safe_set!(header_status, want_on ? "Enabling dev mode…" : "Disabling dev mode…")
+            set_dev_mode!(state, project_id, want_on)
+            # The restart IS the switch as far as the agent is concerned.
+            restart_chat_session!(model)
+            safe_set!(header_status, "")
+        catch e
+            @warn "toggling dev mode failed" project_id want_on exception = (e, catch_backtrace())
+            safe_set!(header_status, "")
+            problem("Dev mode could not be " * (want_on ? "enabled" : "disabled"))
+        end)
+    end
+
+    menu_trigger_class = map(session, devmode_on) do on
+        on ? "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger bt-menu-trigger-danger" :
+             "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger"
+    end
+    menu_trigger = DOM.button("⋯";
+        class = menu_trigger_class,
+        title = "More actions",
+        onclick = js"""event => {
+            event.stopPropagation();
+            const m = event.currentTarget.parentElement;
+            if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
+            const open = m.classList.toggle('bt-menu-open');
+            if (open) {
+                m.__close = (ev) => {
+                    if (m.contains(ev.target)) return;
+                    m.classList.remove('bt-menu-open');
+                    document.removeEventListener('click', m.__close, true);
+                    m.__close = null;
+                };
+                document.addEventListener('click', m.__close, true);
+            }
+        }""")
+    menu = DOM.div(
+        menu_trigger,
+        DOM.div(
+            continue_items,
+            menu_item("Compact", "compact";
+                title = "Summarize the conversation so far to free up context (/compact)"),
+            menu_item("Restart session", "restart"; class = "bt-header-restart",
+                title = "Stop and respawn the agent process for this chat"),
+            pane === nothing ? nothing : DOM.div(; class = "bt-menu-sep"),
+            pane === nothing ? nothing :
+                menu_item("Debug BonitoAgents", "debug"; class = "bt-header-debug",
+                    title = "Open a chat on BonitoAgents' own source on this worker, with live " *
+                            "introspection into the server running this window"),
+            devmode_item;
+            class = "bt-menu-list");
+        class = "bt-menu bt-header-menu")
 
     # (The Yolo toggle lives in the composer — see `chat_input_area` — not in
     # the header: it repurposes the message input as the reminders editor, so
@@ -7167,7 +7291,6 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # the same proven pattern as `config_select_pill`. The `selected` kwarg is
     # splatted in only on the current option (Bonito renders `selected=nothing`
     # as a bare, always-on attribute, which would select every option).
-    provider_status = Observable("")
     provider_choice = Observable("")
     # Each menu entry is a provider singleton (a `BinAgent` descriptor). The
     # <option> value is its stable `provider_name` ("ClaudeCode", …); the label is
@@ -7194,7 +7317,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
         current = model.provider[]
         new_provider === current && return
-        provider_status[] = "Switching to $(label(new_provider))…"
+        header_status[] = "Switching to $(label(new_provider))…"
         @async begin
             try
                 switch_provider!(model, new_provider)
@@ -7202,11 +7325,13 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 # errors (sets `last_error`, keeps the chat object alive), so a
                 # failed switch returns normally. Surface it from the resulting
                 # session state instead of relying on an exception.
-                safe_set!(provider_status,
-                    model.session_alive[] ? "" : "switch failed")
+                safe_set!(header_status, "")
+                model.session_alive[] ||
+                    problem("Switching to $(label(new_provider)) failed; the session did not come up")
             catch e
                 @warn "provider switch failed" exception=(e, catch_backtrace())
-                safe_set!(provider_status, "switch failed")
+                safe_set!(header_status, "")
+                problem("Switching to $(label(new_provider)) failed")
             end
         end
     end
@@ -7228,32 +7353,23 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         title = "Search & session controls")
 
     # No back arrow — the unified app's sidebar Home icon is the way home.
-    # One compact control row (title + the session-config "model" picks + the
-    # provider/sync/restart buttons), then the always-on lens search bar.
+    # One control row: title (+ the reconnect chip when the session died), the
+    # transient status, then the right-anchored actions — the session group
+    # (context meter · model · permissions · effort · provider, one segmented
+    # control), Review, and the ⋯ menu. Then the always-on lens search bar.
     DOM.div(
         DOM.div(
             status_dot,
             title_node,
-            # The transient "Switching…" text sits LEFT (in the flexible area),
-            # absorbed by the gap so it never shoves the controls. The agent
-            # controls — model pill · provider · sync · restart — are ONE
-            # right-anchored group (`margin-left:auto` on `.bt-header-actions`),
-            # so the model and provider pickers stay together. The model pill is
-            # the group's leftmost item: when its label changes width (or clears
-            # mid-switch) only its own left edge moves into the gap — the
-            # provider/sync/restart buttons never reflow.
-            DOM.span(provider_status; class="bt-header-status"),
+            reconnect_chip,
+            # Sits LEFT of the actions, in the flexible area: its width changes
+            # are absorbed by the gap, so the controls never reflow.
+            DOM.span(header_status; class="bt-header-status"),
             more_toggle,
             DOM.div(
-                usage_node,
-                meta_line,
-                provider_select,
-                xsync_control,
-                sync_button,
+                DOM.div(usage_node, meta_line, provider_select; class = "bt-header-session"),
                 review_button,
-                compact_button,
-                debug_button,
-                restart_button;
+                menu;
                 class="bt-header-actions"),
             class="bt-header-row"),
         env_line,
@@ -8456,24 +8572,8 @@ function Bonito.jsrender(session::Session, m::ChatModel)
                                            $(init_snapshot)))
     """
 
-    # Cross-worker sync modal state + apply. `nothing` ⇒ hidden; otherwise
-    # `(current, other, comparison)`. `on_apply(src, dst)` runs the
-    # directional overwrite in a Task and closes the modal when done.
-    sync_modal_state = Observable{Union{Nothing,NamedTuple}}(nothing)
-    sync_modal = render_sync_modal(session, model.state, sync_modal_state,
-        (src, dst) -> @async begin
-            try
-                sync_across_workers!(model.state, src, dst)
-            catch e
-                @warn "cross-worker sync failed" src=src.name dst=dst.name exception=e
-            finally
-                sync_modal_state[] = nothing
-            end
-        end)
-
     Bonito.jsrender(session, DOM.div(
-        chat_header(session, model, sync_modal_state),
-        sync_modal,
+        chat_header(session, model),
         # The messages area + the taskbar share a positioning context so the
         # taskbar floats over the MESSAGES, anchored below the (variable-
         # height) header instead of on top of it.

@@ -556,6 +556,14 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "worker_state_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "debug_checkout_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "stage_session_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "install_session_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "discard_staging_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "open_session_failed"
                         # M9/M13: worker couldn't spawn/dial the ACP session; fail the
                         # pending open_session (keyed by `sid`) now instead of waiting
@@ -1338,87 +1346,6 @@ function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
 end
 
 """
-    inspect_path_local(path) -> Dict
-
-Same shape as `inspect_worker_path` but walks a directory on the SERVER
-(used as a fallback when the project's current owner-worker is offline
-— the server mirror is the best info we have in that case). Defers to
-BonitoWorker's helper so the two sides always agree.
-"""
-function inspect_path_local(path::AbstractString)
-    isdir(path) || error("not a directory: $path")
-    return BonitoWorker.inspect_path_summary(String(path))
-end
-
-"""
-    inspect_project(state, p; timeout=30.0) -> (summary::Dict, source::Symbol)
-
-Content summary for a project, preferring its live worker (`:worker`) and
-falling back to the server mirror (`:mirror`) when the worker is offline or
-the live inspect fails. Shape matches `inspect_worker_path`.
-"""
-function inspect_project(state::ServerState, p::ProjectInfo; timeout::Real = 30.0)
-    if haskey(state.worker_control_ws, p.worker_id)
-        try
-            return inspect_worker_path(state, p.worker_id, p.worker_path; timeout = timeout), :worker
-        catch e
-            @warn "inspect_project: live inspect failed, falling back to mirror" project=p.name exception=e
-        end
-    end
-    return inspect_path_local(p.server_path), :mirror
-end
-
-"""
-    compare_projects(state, a, b; timeout=30.0) -> NamedTuple
-
-Symmetric side-by-side summary of two projects for the cross-worker sync
-modal. Returns `(a, a_source, b, b_source)` where each summary is a Dict
-from `inspect_project`.
-"""
-function compare_projects(state::ServerState, a::ProjectInfo, b::ProjectInfo;
-                          timeout::Real = 30.0)
-    a_sum, a_src = inspect_project(state, a; timeout = timeout)
-    b_sum, b_src = inspect_project(state, b; timeout = timeout)
-    return (a = a_sum, a_source = a_src, b = b_sum, b_source = b_src)
-end
-
-"""
-    sync_across_workers!(state, src::ProjectInfo, dst::ProjectInfo; on_progress=nothing)
-
-Directional overwrite: make `dst`'s worker tree match `src`'s content. There
-is no worker↔worker transport, so this is server-mediated — refresh `src`'s
-server mirror from its live worker, then push that mirror onto `dst`'s worker
-path. `dst`'s divergent edits are overwritten (the caller has confirmed the
-direction via the sync modal). Both workers must be online.
-"""
-function sync_across_workers!(state::ServerState, src::ProjectInfo, dst::ProjectInfo;
-                              on_progress = nothing)
-    src.id == dst.id && error("Source and target are the same project")
-    haskey(state.workers[], src.worker_id) ||
-        error("Source worker '$(src.worker_id)' is not connected")
-    haskey(state.workers[], dst.worker_id) ||
-        error("Target worker '$(dst.worker_id)' is not connected")
-
-    # quick_check=false on both legs: this is a user-confirmed directional
-    # overwrite, so files whose size+mtime happen to match must still be
-    # delta-checked — otherwise divergent same-size edits silently survive.
-    notify_progress(on_progress, :phase, (msg = "Pulling '$(src.name)' from source worker…",))
-    sync_dir_from_worker!(state, src.worker_id, src.worker_path, src.server_path;
-                          on_progress = on_progress, quick_check = false)
-    src.backup_status = :synced
-    src.last_sync_at  = now(UTC)
-
-    notify_progress(on_progress, :phase, (msg = "Pushing onto target worker…",))
-    sync_dir_to_worker!(state, dst.worker_id, src.server_path, dst.worker_path;
-                        on_progress = on_progress, quick_check = false)
-    # dst's worker tree now matches src; dst's own server mirror is out of date.
-    dst.backup_status = :stale
-    save_projects!(state)
-    safe_notify!(state.projects)
-    return nothing
-end
-
-"""
     scan_worker_sessions(state, worker_name; timeout=15.0) → Vector{Dict{String,Any}}
 
 Ask the named worker to scan for existing Claude Code sessions (running processes
@@ -1586,6 +1513,117 @@ function worker_state(state::ServerState, worker_id::AbstractString; timeout::Re
     resp isa AbstractDict || error("worker_state on '$worker_id': unexpected response shape")
     haskey(resp, "error") && error(String(resp["error"]))
     return Dict{String,Any}(resp)
+end
+
+"""
+    debug_checkout_on_worker(state, worker_id; repo, rev, packages, timeout = 900.0)
+        -> path
+
+Ask a worker for a BonitoAgents source checkout of its own and return where it
+is — a path on the WORKER. That is the checkout it already runs from (a dev
+install), or else a clone of `repo` at `rev` under its environment's `dev/`
+with `packages` (the monorepo packages the installer put in that environment)
+developed from it: `dev --local`, done for the user, so a worker restart runs
+what gets edited there.
+
+The timeout covers a first clone plus the precompile that follows the develop;
+a repeat call finds the checkout in place and returns in seconds.
+"""
+function debug_checkout_on_worker(state::ServerState, worker_id::AbstractString;
+                                  repo::AbstractString, rev::AbstractString,
+                                  packages::Vector{String}, timeout::Real = 900.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("debug_checkout on '$worker_id'", "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, String(worker_id), Dict{String,Any}(
+            "type"       => "debug_checkout",
+            "request_id" => rid,
+            "repo"       => String(repo),
+            "rev"        => String(rev),
+            "packages"   => packages))
+        take_pending!(state, ch, rid, timeout, "debug_checkout on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("debug_checkout on '$worker_id': unexpected response shape")
+    haskey(resp, "error") && error("debug_checkout on '$worker_id': $(resp["error"])")
+    path = String(resp["path"])
+    @info "debug checkout ready on worker" worker_id path mode = get(resp, "mode", "") created = get(resp, "created", false)
+    return path
+end
+
+# One request/response round trip for the session-state RPCs below: send
+# `{type, request_id, fields...}`, wait for the worker's reply, and turn a reply
+# that carries `error` into a thrown error naming the RPC and the worker.
+function worker_rpc(state::ServerState, worker_id::AbstractString, kind::AbstractString,
+                    fields::AbstractDict; timeout::Real)
+    what = "$(kind) on '$(worker_id)'"
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError(what, "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, String(worker_id),
+                     merge(Dict{String,Any}("type" => kind, "request_id" => rid), fields))
+        take_pending!(state, ch, rid, timeout, what)
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("$(what): unexpected response shape")
+    haskey(resp, "error") && error("$(what): $(resp["error"])")
+    return resp
+end
+
+"""
+    stage_session_on_worker(state, worker_id; provider, cwd, session_id, staging)
+        -> (path, entries, bytes)
+
+Ask the worker to copy the agent's record of `session_id` (run by `provider` in
+`cwd`) into `staging`, a directory under its projects root's
+`TRANSFER_DIRNAME`, ready to be pulled with `sync_dir_from_worker!`. Errors when
+there is no transcript to carry. First leg of "continue this chat on another
+worker" — see `carry_session!`.
+"""
+function stage_session_on_worker(state::ServerState, worker_id::AbstractString;
+                                 provider::AbstractString, cwd::AbstractString,
+                                 session_id::AbstractString, staging::AbstractString,
+                                 timeout::Real = 300.0)
+    resp = worker_rpc(state, worker_id, "stage_session", Dict{String,Any}(
+        "provider" => String(provider), "cwd" => String(cwd),
+        "session_id" => String(session_id), "staging" => String(staging)); timeout)
+    return (path = String(resp["path"]),
+            entries = String[String(e) for e in get(resp, "entries", Any[])],
+            bytes = Int(get(resp, "bytes", 0)))
+end
+
+"""
+    install_session_on_worker(state, worker_id; provider, cwd, old_cwd, session_id, staging)
+        -> path
+
+Ask the worker to move the session record pushed into `staging` into the
+transcript directory for `cwd`, rewriting the working directory it records from
+`old_cwd`. Returns that directory. Last leg of `carry_session!`.
+"""
+function install_session_on_worker(state::ServerState, worker_id::AbstractString;
+                                   provider::AbstractString, cwd::AbstractString,
+                                   old_cwd::AbstractString, session_id::AbstractString,
+                                   staging::AbstractString, timeout::Real = 300.0)
+    resp = worker_rpc(state, worker_id, "install_session", Dict{String,Any}(
+        "provider" => String(provider), "cwd" => String(cwd), "old_cwd" => String(old_cwd),
+        "session_id" => String(session_id), "staging" => String(staging)); timeout)
+    return String(resp["path"])
+end
+
+"""
+    discard_staging_on_worker(state, worker_id; staging)
+
+Remove a staging directory `stage_session_on_worker` left on the worker.
+"""
+function discard_staging_on_worker(state::ServerState, worker_id::AbstractString;
+                                   staging::AbstractString, timeout::Real = 60.0)
+    worker_rpc(state, worker_id, "discard_staging",
+               Dict{String,Any}("staging" => String(staging)); timeout)
+    return nothing
 end
 
 """

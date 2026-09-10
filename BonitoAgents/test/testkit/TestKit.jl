@@ -469,7 +469,8 @@ stays untouched).
 function scrub_mock_env!()
     for k in ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
               "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
-              "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_CANCEL_DELAY_MS")
+              "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_CANCEL_DELAY_MS",
+              "BT_MOCK_ACP_STRICT_LOAD")
         delete!(ENV, k)
     end
     get(ENV, "BT_DEFAULT_PROVIDER", "") in ("MockCode", "MockCode2") &&
@@ -498,6 +499,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
                       many_choices::Bool = false,
+                      strict_load::Bool = false,
                       kwargs...)
     ensure_display!()
     agent_ref = Ref{Function}(agent)
@@ -559,6 +561,10 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # Make the agent advertise a 12-choice `model` config option, so the header
     # renders the SEARCHABLE picker (`.bt-msearch`) rather than a native select.
     many_choices && (agent_env["BT_MOCK_ACP_MANY_CHOICES"] = "1")
+    # Make the mock as strict as Claude Code about WHERE a session lives:
+    # `session/load` fails unless the transcript sits under the encoded cwd it
+    # is loaded in. What "continue this chat on another worker" has to satisfy.
+    strict_load && (agent_env["BT_MOCK_ACP_STRICT_LOAD"] = "1")
 
     h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
@@ -1249,10 +1255,24 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # cold-mount race where Bonito wires the handler after the first synthetic
     # click lands. Generous timeout: the FIRST new_chat against a fresh server
     # also compiles the whole folder-picker UI server-side.
+    # Find AND click in ONE evaluation, rather than via `click_text`. `click_text`
+    # re-queries the DOM after its own visibility check, and the dashboard's
+    # worker cards are a KeyedList that re-renders whenever `state.projects`
+    # notifies — so a button confirmed a moment earlier can be swapped out before
+    # the click lands. That gap is what made `new_chat` throw "no visible button
+    # labelled +Project" when called right after another chat was created (seen
+    # in `e2e:header_collapse`, which does exactly that between testsets).
+    CLICK_CARD_BTN_JS = """(() => {
+        const b = [...document.querySelectorAll('button')].find(b =>
+            b.offsetParent && (b.innerText || '').trim() === '+ Project');
+        if (!b) return false; b.click(); return true; })()"""
     opened = false
     for _ in 1:5
         eval_js(s, PICKER_PATH_VISIBLE) === true && (opened = true; break)
-        click_text(s, "+ Project")
+        if eval_js(s, CLICK_CARD_BTN_JS) !== true
+            sleep(0.5)      # mid-re-render — the next pass re-finds the fresh node
+            continue
+        end
         # Poll for ~6s before re-clicking: a slow first open must not be toggled
         # shut by a second blind click (the toggle race `open_card_picker!` pins).
         for _ in 1:30

@@ -43,11 +43,20 @@ can be scripted in a few lines.
 
 ## Debugging BonitoAgents itself
 
-The dashboard (and every chat header) has a **Debug BonitoAgents** button. It
-opens a chat whose working directory is the checkout this server is running
-from, so the agent can read the source, edit it, and open a PR the ordinary way.
-It's offered only when the install IS a checkout and a connected worker has it —
-there is nothing to debug against otherwise.
+The dashboard has a **Debug BonitoAgents** section with a worker picker, and
+every chat header has a **Debug** button (which uses that chat's worker). Both
+open a chat whose working directory is a BonitoAgents source checkout **on that
+worker**, so the agent can read the source, edit it, and open a PR the ordinary
+way.
+
+The worker provides the checkout. A worker that already runs from one (a dev
+install, the test suite) answers with it. An ordinary install clones the
+repository into its environment — `<env>/dev/BonitoAgents`, at the revision
+this server was installed from — and `Pkg.develop`s the monorepo packages from
+it: `dev --local`, done for you. The first press on such a worker therefore
+takes a few minutes (clone + precompile); afterwards a restart of that worker
+runs what the agent edited, and re-running the installer puts the environment
+back on the pinned revision.
 
 That chat additionally gets `bt_dev_*` MCP tools that read the **live process**,
 which is the part the filesystem can't tell you:
@@ -59,9 +68,12 @@ which is the part the filesystem can't tell you:
 | `bt_dev_memory` | RSS, GC live bytes and every registry that has historically grown without bound, with an optional GC and a deep `summarysize` pass. For a leak: take a reading, exercise the suspect path, read again with `gc = true`, compare what grew. |
 | `bt_dev_control` | drive the server as a user would — open a chat, send a message, restart a session, rescan a worker, move a project to another machine. |
 
-The tools are attached by a per-project `dev_mode` flag that only this button
-sets, so no ordinary chat can see them — not even one whose working directory
-happens to be the checkout.
+The tools are attached by a persisted per-project `dev_mode` flag. The button
+sets it; the **Dev mode** item in a chat's ⋯ menu can grant it to any chat by
+hand (behind a confirm, since the tools drive the whole server; the ⋯ trigger
+turns red while it is on), and a chat that got
+it that way is told the source is not in front of it. Pointing an ordinary chat
+at the checkout grants nothing.
 
 ## The walkthrough videos
 

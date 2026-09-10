@@ -66,8 +66,10 @@ function run_suite(server)
             @test TK.eval_js(server, "document.body.innerText.includes('workers online')") == true
         end
 
-        # One chat for the whole conversation.
-        pid = TK.new_chat(server; title = "Workflows")
+        # One chat for the whole conversation. The FOLDER is called "Workflows":
+        # a project is named after its folder's basename (the picker has no
+        # Name field), and that name is what the sidebar shows.
+        pid = TK.new_chat(server; cwd = mkpath(joinpath(mktempdir(), "Workflows")))
 
         @testset "open a project (new chat via folder picker)" begin
             @test !isempty(pid)
