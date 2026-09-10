@@ -586,21 +586,46 @@ function agents_prompt_appendix(s::ServerState, project_id::AbstractString)
     isempty(project_id) && return base
     p = get(s.projects[], String(project_id), nothing)
     (p === nothing || !p.dev_mode) && return base
-    return base * "\n\n" * DEV_MODE_BRIEFING
+    return base * "\n\n" * dev_mode_briefing(s, p)
 end
 
-# What a "Debug BonitoAgents" chat's agent is told about its own situation. Kept
-# short and concrete: the tools carry their own documentation, so this only has
-# to establish WHERE it is and which of the two things in front of it (the source
+# What a dev-mode chat's agent is told about its own situation. Kept short and
+# concrete: the tools carry their own documentation, so this only has to
+# establish WHERE it is and which of the two things in front of it (the source
 # tree, the live process) answers which kind of question.
-const DEV_MODE_BRIEFING = """
+#
+# There are two openings because dev mode is granted two ways. The "Debug
+# BonitoAgents" button puts the chat ON the source checkout. The header toggle
+# grants it to ANY project, whose cwd is then an unrelated tree — telling that
+# agent "your working directory is the BonitoAgents source" would be a lie, and
+# an agent that believes it goes on to read the wrong files and report on code
+# that isn't running. `dev_mode_briefing` picks by the project's actual path.
+const DEV_MODE_INTRO_SOURCE = """
 # Debugging BonitoAgents itself
 
-This chat's working directory is the **BonitoAgents source checkout** for the
-server you are running inside. Editing a file here edits the code of the live
-application; `git` works normally, so you can branch, commit and open a PR.
+This chat's working directory is the **BonitoAgents source checkout** on the
+worker this chat runs on, at the revision the server you are running inside was
+installed from. The worker's own packages (BonitoWorker, BonitoMCP, …) are
+developed from this checkout, so a restart of that worker runs what you edit
+here. The server runs from its own install; it is this same tree only in a dev
+setup where both share the checkout. `git` works normally, so you can branch,
+commit and open a PR.
+"""
 
-You also have `bt_dev_*` tools that read the **running process**:
+const DEV_MODE_INTRO_ELSEWHERE = """
+# Debugging BonitoAgents from outside its source
+
+Dev mode was switched on for this chat by hand, so you can see what the server
+is doing. Its working directory is an ORDINARY project, **not** the BonitoAgents
+source checkout, so the code that produced the behaviour you are looking at is
+NOT in front of you. Report what the tools show; do not infer the
+implementation from the symptoms, and do not say you checked the source. To read
+or edit BonitoAgents itself, the user wants the "Debug BonitoAgents" button,
+which opens a chat on the checkout.
+"""
+
+const DEV_MODE_TOOLS = """
+You have `bt_dev_*` tools that read the **running process**:
 
 - `bt_dev_inspect` — live workers, projects, chats and eval bridges.
 - `bt_dev_logs` — the server's own `@info`/`@warn`/`@error` ring.
@@ -614,17 +639,47 @@ You also have `bt_dev_*` tools that read the **running process**:
   count the processes on the machine.
 - `bt_dev_control` — drive the server the way a user would (open a chat, send a
   message, restart a session, move a project between machines).
+"""
 
+const DEV_MODE_RULES_SOURCE = """
 Two rules that matter here more than in a normal chat:
 
-1. **The source tree and the running process are different things.** Code you
-   edit does not take effect until the server restarts (Revise picks up most
-   changes in a dev server; a bundled install does not). Say which one you are
-   describing.
+1. **The source tree and the running processes are different things.** Code you
+   edit takes effect on the worker only after it restarts, and on the server
+   only if it runs from this same checkout (a dev server, where Revise picks up
+   most changes); a server installed elsewhere keeps running its own code. Say
+   which one you are describing.
 2. **`bt_dev_control` has real effects on the user's live session** — sending a
    message starts a turn that costs tokens, moving a project writes files on
    another machine. Say what you are about to do before you do it.
 """
+
+const DEV_MODE_RULES_ELSEWHERE = """
+Two rules that matter here more than in a normal chat:
+
+1. **You are reporting, not reading.** The tools show the live process; the code
+   behind it is not in this working directory. Quote what you measured, and name
+   the file you would need to read rather than guessing what it says.
+2. **`bt_dev_control` has real effects on the user's live session** — sending a
+   message starts a turn that costs tokens, moving a project writes files on
+   another machine. It reaches every chat on this server, not just this one. Say
+   what you are about to do before you do it.
+"""
+
+const DEV_MODE_BRIEFING_SOURCE =
+    DEV_MODE_INTRO_SOURCE * "\n" * DEV_MODE_TOOLS * "\n" * DEV_MODE_RULES_SOURCE
+const DEV_MODE_BRIEFING_ELSEWHERE =
+    DEV_MODE_INTRO_ELSEWHERE * "\n" * DEV_MODE_TOOLS * "\n" * DEV_MODE_RULES_ELSEWHERE
+
+"""
+    dev_mode_briefing(state, p) -> String
+
+The dev-mode system-prompt briefing for one project, picked by whether its
+working directory actually IS a BonitoAgents checkout on its worker
+([`is_source_checkout_project`](@ref)).
+"""
+dev_mode_briefing(s::ServerState, p::ProjectInfo) =
+    is_source_checkout_project(s, p) ? DEV_MODE_BRIEFING_SOURCE : DEV_MODE_BRIEFING_ELSEWHERE
 
 """
     derive_initials(name) -> String
@@ -869,7 +924,7 @@ end
 
 # Like `save_workers!`: snapshot + write under `state.lock` (reentrant, so
 # callers already holding it are unaffected). Without this, several savers ran
-# unlocked — `sync_project_to_server!`, `rename_worker!`, `sync_across_workers!`,
+# unlocked — `sync_project_to_server!`, `rename_worker!`, `transfer_project!`,
 # title backfill, etc. — iterating `values(s.projects[])` while locked writers
 # mutated the dict, and two of them could share a temp file and rename a
 # half-written projects.json into place (T2).
@@ -1064,21 +1119,6 @@ compute_server_path(state::ServerState,
                      worker_name::AbstractString,
                      name::AbstractString) =
     joinpath(state.working_dir, "$(String(worker_name))-$(String(name))")
-
-"""
-    same_name_siblings(state, project_id) -> Vector{ProjectInfo}
-
-Projects that share `project_id`'s display `name` but live on a *different*
-worker. Because `compute_server_path` keeps each worker's mirror separate,
-two workers can both carry a "BonitoAgents" project; these are the candidates
-for an explicit cross-worker reconcile (see `sync_across_workers!`).
-"""
-function same_name_siblings(state::ServerState, project_id::AbstractString)
-    haskey(state.projects[], project_id) || return ProjectInfo[]
-    p = state.projects[][project_id]
-    [q for q in values(state.projects[])
-        if q.id != p.id && q.name == p.name && q.worker_id != p.worker_id]
-end
 
 # Collapse projects.json entries that are the SAME THREAD —
 # `(worker_id, worker_path, chat_id)` (see `thread_dedup_key`). A folder can

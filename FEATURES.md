@@ -19,7 +19,13 @@ enumerates.
   a minute; the worker watches for the server's pings, re-dials over the
   current network, and reaps agent sessions the server abandoned. Requests
   against an unreachable worker fail fast with a toast instead of hanging.
-- librsync-based directory sync for project import and moves between workers;
+- **Continue a chat on another worker** (the chat's ⋯ menu): the project's
+  files move through the server, and so does the agent's own record of the
+  conversation (for Claude Code: transcript, subagent transcripts, project
+  memory), so the agent resumes on the new machine with its memory intact. A
+  provider whose record can't be moved starts fresh there; the chat's history
+  stays visible either way.
+- librsync-based directory sync underneath (project import, the moves above);
   single-file transfers over a dedicated channel.
 
 ## Projects & sessions
@@ -158,9 +164,11 @@ enumerates.
 - Black-box e2e suite driving a real dev server through headless Electron
   (DOM in, rendered DOM out; no server introspection; retries forbidden), plus
   fast headless unit items.
-- **Debug BonitoAgents**: a one-click chat (dashboard and every chat header)
-  whose working directory is the server's own source checkout, so the agent can
-  read, edit and open a PR against the running application. It additionally gets
+- **Debug BonitoAgents**: a one-click chat (dashboard worker picker + button, and
+  every chat header) whose working directory is a BonitoAgents source checkout on
+  the chosen worker — the checkout it runs from, or a `dev --local` clone into its
+  environment at the server's revision, so a worker restart runs the edits — and
+  the agent can read, edit and open a PR against the running application. It additionally gets
   `bt_dev_*` tools that read the LIVE process — workers, projects, chats and
   eval bridges, the server's own log ring, memory and per-registry leak
   counters (with an optional GC and deep `summarysize` pass), the worker's

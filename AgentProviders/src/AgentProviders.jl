@@ -157,6 +157,69 @@ icon(::KimiAgent)       = "bt-provider-kimi"
 icon(::MockAgent)       = "bt-provider-mock"
 icon(::MockAgent2)      = "bt-provider-mock"
 
+# ── Where a provider keeps its sessions on disk ──────────────────────────────
+# "Continue this chat on another worker" carries the agent's OWN record of the
+# conversation to the new machine, so it resumes with its memory intact instead
+# of starting fresh. That record is provider-specific. Claude Code keeps one
+# directory per working directory under `~/.claude/projects/`: the
+# `<session id>.jsonl` transcript, a `<session id>/` folder of subagent
+# transcripts, and the project's `memory/`. `session_state_format` maps a
+# provider to the format describing that layout, or `nothing` for a provider
+# whose record we don't know how to move (the chat then continues on the new
+# worker with a fresh agent session; the server-side history stays visible).
+#
+# The mock agent keeps the same layout under `~/.mockacp/`, so the move is
+# testable end to end without a real agent.
+export session_state_format, JsonlTranscripts, transcript_dir, session_state_entries,
+       claude_project_key
+
+"""
+    JsonlTranscripts(root)
+
+Claude Code's session layout: `<home>/<root>/projects/<encoded cwd>/` holding
+`<session id>.jsonl`, `<session id>/` (subagents) and `memory/`.
+"""
+struct JsonlTranscripts
+    root::String
+end
+
+session_state_format(::AgentProvider) = nothing
+session_state_format(::ClaudeCodeAgent) = JsonlTranscripts(".claude")
+session_state_format(::MockAgent)  = JsonlTranscripts(".mockacp")
+session_state_format(::MockAgent2) = JsonlTranscripts(".mockacp")
+
+# Claude Code's encoding of a working directory into a folder name: every
+# character outside `[A-Za-z0-9]` becomes `-`. NOT invertible (`.`, `_` and `/`
+# all collide), which is why the worker's session scanner reads `cwd` out of the
+# transcripts rather than decoding folder names.
+claude_project_key(cwd::AbstractString) = replace(String(cwd), r"[^A-Za-z0-9]" => "-")
+
+"""
+    transcript_dir(format::JsonlTranscripts, home, cwd) -> String
+
+The directory holding the sessions run in `cwd` by the user whose home is `home`.
+"""
+transcript_dir(f::JsonlTranscripts, home::AbstractString, cwd::AbstractString) =
+    joinpath(home, f.root, "projects", claude_project_key(cwd))
+
+"""
+    session_state_entries(format::JsonlTranscripts, session_id) -> Vector
+
+The entries of `transcript_dir` that make up one session, as `(name, required)`.
+The transcript itself is required (no transcript, nothing to carry); subagent
+transcripts and the project memory are carried when present.
+"""
+session_state_entries(::JsonlTranscripts, session_id::AbstractString) = [
+    (name = String(session_id) * ".jsonl", required = true),
+    (name = String(session_id),            required = false),
+    (name = "memory",                      required = false),
+]
+
+# The directory under a worker's projects root where session state is staged
+# while it travels (source: packed for the pull; target: landed by the push,
+# then installed). Shared so the server composes the path the worker checks.
+const TRANSFER_DIRNAME = ".bonitoagents-transfer"
+
 # ── The one provider list ────────────────────────────────────────────────────
 # Memoised singletons; the ENV is read exactly once, on first call. The mock is
 # offered only when `BT_ENABLE_MOCK_AGENT` is set — absent in production, set by

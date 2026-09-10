@@ -82,6 +82,9 @@ IGNORE_CANCEL::Bool     = false
 # How long `slow_cancel` keeps streaming after `session/cancel` before it
 # answers. The real floor is 30 s; tests want it short but non-zero.
 CANCEL_DELAY_MS::Int    = 1500
+# Refuse `session/load` unless the transcript sits under the cwd it is loaded
+# in (see `transcript_path`). Declared here, before `_configure!` assigns it.
+STRICT_LOAD::Bool       = false
 
 function _configure!()
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
@@ -96,6 +99,31 @@ function _configure!()
     # a native <select>. Opt-in: every other suite asserts against the plain
     # pills, and a real agent only reports this many models for some providers.
     global MANY_CHOICES    = get(ENV, "BT_MOCK_ACP_MANY_CHOICES", "") == "1"
+    # Behave like Claude Code about WHERE a session lives: `session/load` only
+    # succeeds when the transcript for that session sits under the encoded cwd
+    # it is asked to load in (see `transcript_path`). Opt-in: the resume suites
+    # bind ids the mock never created, and keep the unconditional ack.
+    global STRICT_LOAD     = get(ENV, "BT_MOCK_ACP_STRICT_LOAD", "") == "1"
+    return nothing
+end
+
+# The mock's "transcript": the same per-cwd layout Claude Code keeps under
+# `~/.claude/projects/<encoded cwd>/<session id>.jsonl`, here under `~/.mockacp`
+# (`AgentProviders.session_state_format(MockAgent())`), so "continue this chat
+# on another worker" — which moves that file and rewrites its recorded cwd — is
+# testable end to end without a real agent. Written on session/new while
+# `STRICT_LOAD` is set.
+transcript_path(cwd::AbstractString, sid::AbstractString) =
+    joinpath(homedir(), ".mockacp", "projects",
+             replace(String(cwd), r"[^A-Za-z0-9]" => "-"), String(sid) * ".jsonl")
+function write_transcript!(cwd::AbstractString)
+    isempty(cwd) && return nothing
+    path = transcript_path(cwd, SESSION)
+    mkpath(dirname(path))
+    open(path, "w") do io
+        println(io, JSON.json(Dict("type" => "user", "cwd" => String(cwd),
+                                   "sessionId" => SESSION, "version" => "mock")))
+    end
     return nothing
 end
 
@@ -866,6 +894,10 @@ function dispatch_loop()
             resp(id, Dict("protocolVersion" => 1,
                           "agentCapabilities" => Dict("loadSession" => true)))
         elseif method == "session/new" && id !== nothing
+            # Only under strict_load: the transcript is what that mode checks,
+            # and writing one for every mock chat would litter `~/.mockacp`
+            # with a folder per temp cwd of every suite.
+            STRICT_LOAD && write_transcript!(String(get(get(msg, "params", Dict()), "cwd", "")))
             resp(id, MANY_CHOICES ?
                 Dict("sessionId" => SESSION, "configOptions" => [many_choice_model_option()]) :
                 Dict("sessionId" => SESSION))
@@ -880,7 +912,11 @@ function dispatch_loop()
         elseif method == "session/load" && id !== nothing
             # An id a real agent no longer knows (rotated, pruned, another
             # agent's). Opt-in by id so the other resume tests keep their ack.
-            if occursin("stale", String(get(get(msg, "params", Dict()), "sessionId", "")))
+            load_params = get(msg, "params", Dict())
+            load_sid = String(get(load_params, "sessionId", ""))
+            load_cwd = String(get(load_params, "cwd", ""))
+            if occursin("stale", load_sid) ||
+               (STRICT_LOAD && !isfile(transcript_path(load_cwd, load_sid)))
                 resp_error(id, -32602, "Session not found")
                 continue
             end

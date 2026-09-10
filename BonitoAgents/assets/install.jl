@@ -93,7 +93,10 @@ end
 # Pkg does NOT consult a dependency package's own `[sources]`, so we add
 # RemoteSync explicitly (url+subdir) — that puts it in the env, and
 # BonitoWorker's `[deps] RemoteSync` then resolves against it by UUID.
-# All three come from the same repo/rev so they resolve as one set.
+# All three come from the same repo/rev so they resolve as one set. The
+# monorepo packages listed here are what the "Debug BonitoAgents" chat later
+# `Pkg.develop`s from a clone on the worker — keep the list in step with
+# `WORKER_REPO_PACKAGES` in BonitoAgents/src/server.jl.
 println("\n==> Installing into shared @bonito-agents env")
 Pkg.activate("bonito-agents"; shared = true)
 const SPECS = [

@@ -252,7 +252,7 @@ it, so it covers the working path; the inactive-close fix is still open.
 | `file_view.jl`        | the rich file viewer: png (image stage + reported pixel size, no editor), md (rendered by default, Source toggle holding the real text, Save writes the WORKER file and the preview follows), csv (sortable table of the right shape), obj (server-side parse → BTMESH1 blob → WebGL viewer reporting the decoded triangle/vertex counts, in singular for one triangle), .bin (hex dump, never Monaco), mp4 (video stage, centred, a 1600px-tall clip FITTED so its controls stay on screen) and a tall png held to the same rule, pdf (the frame is pointed at its file from inside the document — see Headless limitations); every panel header names the WORKER path, and renders it in reading order rather than letting `direction: rtl` move the leading `/` to the end; and the editor re-lays-out when its panel changes width (Monaco's own `automaticLayout` is off — it calls `layout()` from inside its ResizeObserver's delivery cycle, which is what made this suite's no-JS-errors gate fail on "ResizeObserver loop completed with undelivered notifications"; the replacement defers to the next frame, and the test pins that it still follows the panel in BOTH directions) |
 | `review.jl`           | change-review tab: the Review button opens the project's git diff incl. UNTRACKED files (marked added) with both sides' line numbers; Ask sends the question to the chat immediately with its code context; Feedback batches into the tray (counted on the Send button), sends ONE numbered instruction and only then clears; shift-click covers a BLOCK and the range + every line in it reach the agent; chips drop; ⟳ re-reads the tree; ⤢ opens the file itself |
 | `review_scope.jl`     | the review diff is SCOPED to the project's folder: a package inside a bigger checkout lists its own change and its own untracked file, NOT a sibling's; rows drop the shared prefix while `data-file` stays relative to the PROJECT (the agent's cwd — a root-relative path would send it to `pkg/pkg/…`); the header names the folder, not the repository above it. Its own dev_server AND its own single chat: two review panels in one window cannot be told apart by `querySelector` (answers about the first) nor by "which is visible" (an inactive panel still has an `offsetParent`) |
-| `debug_chat.jl`       | "Debug BonitoAgents": the dashboard button opens the chat AND navigates to it, rooted at this server's own checkout; the same button in a chat header goes to the same place; pressing it again reuses the one chat |
+| `debug_chat.jl`       | "Debug BonitoAgents": the dashboard's worker picker lists the connected worker and its button opens the chat AND navigates to it, rooted at the checkout that WORKER provides (the suite's worker runs from the monorepo, so the server's own checkout, and nothing is cloned); the same item in a chat header's ⋯ menu goes to the same place; pressing it again reuses the one chat; the menu's Dev mode item reflects the persisted flag (and the ⋯ trigger turns red while it is on), stays off when the confirm is declined, and restarts the session when accepted |
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |
 | `todo_taskbar.jl`     | live todo as a pinned panel, plan update mutates it in place (done/active), turn end finalizes to one bubble + drops the pin |
@@ -293,9 +293,12 @@ unit test stays — it is headless, not a UI test).
   dialog; also covers the attach button, the `change`-driven picker path and the
   10-image queue cap).
 - `test_chat_cancel.jl` → `chat_cancel_test.jl` / `cancel_escalation_test.jl`.
-- `test_worker_move.jl` → `worker_move_test.jl`; `test_cross_worker_sync_ui.jl` →
-  `cross_worker_sync_ui_test.jl`; the backend reconcile (`same_name_siblings` /
-  `compare_projects` / `sync_across_workers!`) → headless `../unit/cross_worker_sync_test.jl`.
+- `test_worker_move.jl` → `worker_move_test.jl`, now driven through the chat
+  header's ⋯ → *Continue on* item and also pinning that the agent's transcript
+  travels (the mock keeps a Claude-shaped transcript and, under `strict_load`,
+  refuses `session/load` unless it sits under the new cwd). The cross-worker
+  *sync* UI (`⇄`, the compare modal, `sync_across_workers!`) was removed with it:
+  there is one operation for a chat on another machine, the move.
 - `test_remotesync.jl` → headless `../unit/remotesync_test.jl`.
 - `test_chat_stress.jl` → the real-`serve()` render path is exercised by every
   dev_server suite (`smoke_test.jl`, `chat_features.jl`, `workflows.jl`).

@@ -578,132 +578,164 @@ function dev_control(state::ServerState, ::Val{:set_title}, args::AbstractDict)
                             "title" => project_display_title(state.projects[][p.id]))
 end
 
-# Move a project's FILES to another worker. Reuses the same `sync_across_workers!`
-# the UI's ⇄ button runs, so there is one implementation of "copy a project
-# between machines" and this can't drift from it. The destination project is the
-# same-named sibling on `worker_id`; if there isn't one yet we create it, which is
-# what makes this a MOVE rather than a sync between two things that both exist.
+# Continue a chat on another worker. The SAME operation as the chat header's
+# "Continue on <worker>" (`start!`): the project's files and the agent's own
+# record of the conversation move through the server, the project is re-bound to
+# the new worker, and its session is brought up there — so there is one
+# implementation of "move a chat between machines" and this can't drift from it.
 function dev_control(state::ServerState, ::Val{:move_project}, args::AbstractDict)
-    src = dev_project(state, String(get(args, "project_id", "")))
+    p = dev_project(state, String(get(args, "project_id", "")))
     dst_worker = String(get(args, "worker_id", ""))
     haskey(state.workers[], dst_worker) || error("no worker '$dst_worker'")
-    src.worker_id == dst_worker &&
-        error("project '$(src.id)' is already on worker '$dst_worker'")
+    p.worker_id == dst_worker &&
+        error("project '$(p.id)' is already on worker '$dst_worker'")
     w = state.workers[][dst_worker]
-    isopen(w) || error("worker '$dst_worker' is offline — can't copy to it")
-
-    # `worker_join`, not `joinpath`: the root is the DESTINATION WORKER's, which
-    # may be a different OS than this server. A server-side separator here also
-    # makes the `find_project_by_location` lookup below miss the sibling that
-    # already exists (stored paths are normalized), so a re-run would create a
-    # duplicate instead of moving into it. Same rule as `transfer_project!`.
-    dst_worker_path = worker_join(w.projects_root, src.name)
-    dst = find_project_by_location(state, dst_worker, dst_worker_path)
-    created = dst === nothing
-    if created
-        dst = ProjectInfo(string(uuid4())[1:8], src.name, dst_worker,
-                          compute_server_path(state, dst_worker, src.name),
-                          dst_worker_path, now(UTC))
-        dst.title = src.title
-        lock(state.lock) do
-            state.projects[][dst.id] = dst
-            save_projects!(state)
-        end
-        safe_notify!(state.projects)
-    end
-    sync_across_workers!(state, src, dst)
-    return Dict{String,Any}("ok" => true,
-                            "source_project" => src.id, "source_worker" => src.worker_id,
-                            "dest_project" => dst.id, "dest_worker" => dst_worker,
-                            "dest_path" => dst_worker_path,
-                            "created_destination" => created)
+    isopen(w) || error("worker '$dst_worker' is offline — can't continue there")
+    source_worker = p.worker_id
+    start!(state, p, dst_worker)
+    return Dict{String,Any}("ok" => true, "project_id" => p.id,
+                            "source_worker" => source_worker,
+                            "dest_worker" => p.worker_id, "dest_path" => p.worker_path,
+                            # Whether the agent resumes with its memory (the
+                            # transcript travelled) or starts fresh there.
+                            "conversation_carried" => p.resume_session_id !== nothing)
 end
 
 # ── the "Debug BonitoAgents" chat ───────────────────────────────────────────
-# A normal project, pointed at the BonitoAgents source checkout, with `dev_mode`
-# set. `dev_mode` is what attaches the `bt_dev_*` tools (via `eval_dialback_env`)
-# and the briefing in the system prompt (via `agents_prompt_appendix`); the cwd
-# is what lets the agent read, edit and `git` the code. Nothing else is special
-# about it — it uses the same bring-up, the same worker, the same everything.
+# A normal project, pointed at a BonitoAgents source checkout ON THE WORKER it
+# runs on, with `dev_mode` set. `dev_mode` is what attaches the `bt_dev_*` tools
+# (via `eval_dialback_env`) and the briefing in the system prompt (via
+# `agents_prompt_appendix`); the cwd is what lets the agent read, edit and `git`
+# the code. Nothing else is special about it — it uses the same bring-up, the
+# same worker, the same everything.
+#
+# The checkout is the WORKER's, not this server's. The server's own checkout (if
+# it has one) is a path on the server's machine, which a worker cannot see unless
+# the two happen to share a filesystem — so the worker is asked to provide one
+# (`debug_checkout_on_worker`): the checkout it already runs from when it is a
+# dev install, otherwise a clone at `<env>/dev/BonitoAgents` developed into its
+# environment, at the revision this server runs (`current_repo_rev`). That is
+# `dev --local` done for the user, and it means a restart of that worker runs
+# what the agent edited.
 
 """
     bonitoagents_repo_root() -> String | nothing
 
-The git repository containing BonitoAgents' source, or `nothing` when this
-install isn't a checkout (a bundled app, or a package installed from the
-registry). Walks up from `pkgdir` looking for `.git` — which may be a DIRECTORY
-(a normal clone) or a FILE (a worktree or a submodule), so both count.
+The git repository containing THIS server's BonitoAgents source, or `nothing`
+when the install isn't a checkout (a bundled app, or a package installed from
+the registry). Walks up from `pkgdir` to a `.git` — a DIRECTORY (a normal
+clone) or a FILE (a worktree or a submodule) — and only accepts a root that is
+the monorepo (has the sibling packages), so a dotfiles repository in `\$HOME`
+can't claim `~/.julia/packages/…`.
 
-Returning the REPO root rather than the package directory is deliberate: the
-sibling packages (BonitoWorker, BonitoMCP, AgentClientProtocol) live next to it
-in the same repo, and a bug is as likely to be in one of those.
+This is the server's view of itself. The debug chat's working directory comes
+from the WORKER (see the section comment above); the two coincide when server
+and worker run from the same checkout, which is what the test suite does.
 """
 function bonitoagents_repo_root()
     dir = pkgdir(@__MODULE__)
     dir === nothing && return nothing
     cur = abspath(String(dir))
     while true
-        ispath(joinpath(cur, ".git")) && return cur
+        ispath(joinpath(cur, ".git")) && is_monorepo_root(cur) && return cur
         parent = dirname(cur)
         parent == cur && return nothing
         cur = parent
     end
 end
 
+is_monorepo_root(dir::AbstractString) =
+    isfile(joinpath(dir, "BonitoAgents", "Project.toml")) &&
+    isfile(joinpath(dir, "BonitoWorker", "Project.toml"))
+
+"""
+    is_source_checkout_project(state, p) -> Bool
+
+Whether this project's working directory IS a BonitoAgents monorepo checkout on
+its worker — i.e. whether its agent can read the code it is debugging.
+
+True for the project the "Debug BonitoAgents" button opens, false for one that
+got `dev_mode` from the header toggle while sitting on an ordinary tree. Asked
+of the worker (a `stat` of the sibling packages' Project.toml), because a path
+only means something on the machine it is on.
+"""
+function is_source_checkout_project(state::ServerState, p::ProjectInfo)
+    root = rstrip(p.worker_path, '/')
+    isempty(root) && return false
+    for pkg in ("BonitoAgents", "BonitoWorker")
+        stat_worker_path(state, p.worker_id, joinpath(root, pkg, "Project.toml")).isfile ||
+            return false
+    end
+    return true
+end
+
+"""
+    set_dev_mode!(state, project_id, on) -> ProjectInfo
+
+Turn `dev_mode` on or off for one project, persist it, and return the project.
+Throws by name if there is no such project.
+
+Writes only on an actual change, so a toggle can be clicked repeatedly without
+rewriting `projects.json` each time.
+
+The caller is responsible for RESTARTING the chat afterwards. `dev_mode` is read
+at session bring-up and nowhere else: `eval_dialback_env` bakes
+`BONITOAGENTS_DEV_TOOLS` into the MCP process's environment when it is spawned,
+and `agents_prompt_appendix` composes the briefing into the system prompt at
+`open_session`. A live session keeps whatever it started with, so flipping the
+flag without a restart changes what is on disk and nothing the agent can see.
+"""
+function set_dev_mode!(state::ServerState, project_id::AbstractString, on::Bool)
+    p = dev_project(state, project_id)
+    if p.dev_mode != on
+        p.dev_mode = on
+        lock(state.lock) do; save_projects!(state); end
+        safe_notify!(state.projects)
+    end
+    return p
+end
+
 """
     debug_project_worker(state, preferred = "") -> worker_id
 
-Which worker the debug chat should run on. The source checkout has to EXIST
-there, so this is not just "any online worker": it prefers `preferred` (the
-worker of the chat the user clicked from), then any other online worker, and
-reports what it tried when none of them has the checkout.
+Which worker the debug chat runs on: `preferred` (the dashboard picker's choice,
+or the worker of the chat the button was pressed in) when it is connected, else
+the first connected worker by name. Errors — naming the worker — when the
+preferred one is unknown or offline, and when there is none at all: the chat
+has to run somewhere, and quietly picking another machine than the one the user
+chose is worse than saying so.
 """
-function debug_project_worker(state::ServerState, root::AbstractString,
-                              preferred::AbstractString = "")
-    candidates = String[]
-    isempty(preferred) || push!(candidates, String(preferred))
-    for (id, w) in state.workers[]
-        (id in candidates || !isopen(w)) && continue
-        push!(candidates, id)
+function debug_project_worker(state::ServerState, preferred::AbstractString = "")
+    workers = state.workers[]
+    if !isempty(preferred)
+        w = get(workers, String(preferred), nothing)
+        w === nothing && error("no worker '$(preferred)'")
+        isopen(w) || error("worker '$(w.name)' is not connected")
+        return String(preferred)
     end
-    isempty(candidates) && error("no worker is connected — a debug chat needs one to run on")
-    tried = String[]
-    for wid in candidates
-        haskey(state.workers[], wid) || continue
-        info = try
-            stat_worker_path(state, wid, joinpath(root, ".git"))
-        catch e
-            e isa InterruptException && rethrow()
-            push!(tried, "$(wid): $(first(split(sprint(showerror, e), '\n')))")
-            continue
-        end
-        info.exists && return wid
-        push!(tried, "$(wid): no $(root)/.git")
-    end
-    error("none of the connected workers has the BonitoAgents checkout at '$root'.\n" *
-          "Checked: " * join(tried, "; ") * ".\n" *
-          "Clone the repo there (or run the server from a checkout) to debug it.")
+    online = sort([w for w in values(workers) if isopen(w)]; by = w -> w.name)
+    isempty(online) && error("no worker is connected — a debug chat needs one to run on")
+    return first(online).worker_id
 end
 
 """
     ensure_debug_project!(state; worker_id = "") -> ProjectInfo
 
-Find or create the "Debug BonitoAgents" project and return it, ready to open.
-Idempotent: a second call reuses the existing one, so the button can be clicked
-any number of times and the conversation survives.
+Find or create the "Debug BonitoAgents" project on a worker and return it, ready
+to open. Idempotent: a second call reuses the existing one, so the button can be
+clicked any number of times and the conversation survives.
 
-Throws — with a message meant for the user — when this install has no source
-checkout, or when no connected worker has it. That's the honest outcome: without
-the source there's nothing to debug WITH, and inventing a chat that can only
-read the server's memory would be a worse experience than saying so.
+The worker provides the checkout (see the section comment): a first call on an
+ordinary install clones the repository into the worker's environment and
+precompiles, which takes a few minutes — `debug_checkout_on_worker`'s timeout is
+sized for that. Throws — with a message meant for the user — when no worker is
+connected or the worker could not set the checkout up.
 """
 function ensure_debug_project!(state::ServerState; worker_id::AbstractString = "")
-    root = bonitoagents_repo_root()
-    root === nothing && error(
-        "this BonitoAgents install isn't a git checkout, so there's no source to " *
-        "debug against. Run the server from a clone of the repository (or `Pkg.develop` it) " *
-        "and the debug chat becomes available.")
-    wid = debug_project_worker(state, root, worker_id)
+    wid  = debug_project_worker(state, worker_id)
+    root = debug_checkout_on_worker(state, wid; repo = WORKER_REPO_URL,
+                                    rev = current_repo_rev(),
+                                    packages = WORKER_REPO_PACKAGES)
 
     existing = find_project_by_location(state, wid, root)
     if existing !== nothing

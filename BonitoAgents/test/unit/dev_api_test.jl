@@ -10,7 +10,7 @@
 # correctness property, not a preference.
 
 using Test
-import BonitoAgents, BonitoMCP
+import BonitoAgents, BonitoMCP, BonitoWorker
 const BT = BonitoAgents
 
 # A value whose `show` throws — the case that must not be able to take the
@@ -132,6 +132,23 @@ end
                 Dict("section" => "worker", "worker_id" => "no-such-worker"))
         end
 
+        @testset "the MCP launch command is the stable launcher, not a versioned binary" begin
+            # The hello frame carries what claude-agent-acp execs for every
+            # chat's `bt_*` tools. It used to be `Sys.BINDIR`'s julia — a path
+            # `juliaup update` deletes, and the one thing a re-install under a
+            # different default Julia never refreshed while the old worker lived.
+            w = st.workers[][wid]
+            @test isfile(w.mcp_path)
+            launcher = BonitoWorker.julia_launcher()
+            @test w.mcp_path == BonitoWorker.mcp_exe(launcher)
+            @test w.mcp_args == BonitoWorker.mcp_args(launcher)
+            # The worker reports the same pair about itself — what it SAID, so
+            # the two can be compared, not a fresh probe.
+            me = BT.dev_request(st, "inspect", Dict("section" => "worker", "worker_id" => wid))
+            @test me["mcp_command"] == w.mcp_path
+            @test me["mcp_args"] == w.mcp_args
+        end
+
         @testset "every section is JSON-encodable" begin
             # The reports cross a JSON wire to the MCP process, so a live object
             # leaking into one is a runtime failure in the tool, not here.
@@ -202,16 +219,34 @@ end
         end
 
         @testset "the debug project is created once and gated correctly" begin
+            # The WORKER provides the checkout. This suite's worker runs from
+            # the monorepo (a path dep of the test env), so it answers with that
+            # checkout — the tree this server runs from too — and clones nothing.
             root = BT.bonitoagents_repo_root()
             if root === nothing
                 @info "not a git checkout — skipping the debug-project cases"
             else
-                p = BT.ensure_debug_project!(st)
+                p = BT.ensure_debug_project!(st; worker_id = wid)
                 @test p.dev_mode
+                @test p.worker_id == wid
                 @test p.worker_path == root
                 @test p.title == BT.DEBUG_PROJECT_TITLE
-                # Idempotent: clicking the button twice reuses the chat.
+                # Idempotent: clicking the button twice reuses the chat — also
+                # when the worker is left for it to pick (the only one here).
                 @test BT.ensure_debug_project!(st).id == p.id
+                @test BT.ensure_debug_project!(st; worker_id = wid).id == p.id
+                # A worker that isn't there is named, not silently swapped for
+                # another machine: the choice is where the agent edits and what
+                # a restart afterwards loads.
+                err = try
+                    BT.ensure_debug_project!(st; worker_id = "no-such-worker"); ""
+                catch e
+                    sprint(showerror, e)
+                end
+                @test occursin("no-such-worker", err)
+                # The worker reports that checkout as its own.
+                me = BT.dev_request(st, "inspect", Dict("section" => "worker", "worker_id" => wid))
+                @test me["source_checkout"] == root
 
                 # `dev_mode` is the ONLY thing that hands out the tools…
                 @test haskey(BT.eval_dialback_env(st, p.id), "BONITOAGENTS_DEV_TOOLS")
@@ -256,6 +291,67 @@ end
             lp = get(legacy.projects[], "legacy01", nothing)
             @test lp !== nothing            # the entry loaded at all
             @test lp.dev_mode === false     # …and defaulted OFF, not to a throw
+        end
+
+        # These come last on purpose: they leave extra dev_mode projects in `st`,
+        # which the round-trip test above counts.
+        @testset "set_dev_mode! grants and revokes the tools by hand" begin
+            # What the header toggle does. The FLAG is the only gate — a project
+            # that is nowhere near the checkout gets the tools when it's on and
+            # loses them when it's off.
+            hand = BT.ProjectInfo("hand-enabled", "SomeApp", wid,
+                                  mktempdir(), mktempdir(), BT.now(BT.UTC))
+            st.projects[]["hand-enabled"] = hand
+            @test !haskey(BT.eval_dialback_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
+
+            @test BT.set_dev_mode!(st, "hand-enabled", true).dev_mode
+            @test haskey(BT.eval_dialback_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
+
+            @test !BT.set_dev_mode!(st, "hand-enabled", false).dev_mode
+            @test !haskey(BT.eval_dialback_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
+
+            # Idempotent (the toggle can be clicked repeatedly), and it names a
+            # project it can't find rather than quietly doing nothing — a silent
+            # no-op here looks exactly like a broken button.
+            @test !BT.set_dev_mode!(st, "hand-enabled", false).dev_mode
+            @test_throws Exception BT.set_dev_mode!(st, "no-such-project", true)
+        end
+
+        @testset "the briefing matches where the chat actually is" begin
+            # An agent told "your working directory is the BonitoAgents source"
+            # when it isn't will read the wrong files and report on code that
+            # isn't running. The two briefings must not be interchangeable.
+            away = BT.ProjectInfo("briefing-elsewhere", "SomeApp", wid,
+                                  mktempdir(), mktempdir(), BT.now(BT.UTC))
+            st.projects[]["briefing-elsewhere"] = away
+            BT.set_dev_mode!(st, "briefing-elsewhere", true)
+
+            @test !BT.is_source_checkout_project(st, away)
+            txt = BT.agents_prompt_appendix(st, "briefing-elsewhere")
+            @test occursin("from outside its source", txt)
+            @test !occursin("working directory is the **BonitoAgents source checkout**", txt)
+            # It still gets the tool documentation — only the WHERE differs.
+            @test occursin("bt_dev_control", txt)
+
+            root = BT.bonitoagents_repo_root()
+            if root !== nothing
+                p = BT.ensure_debug_project!(st)
+                @test BT.is_source_checkout_project(st, p)
+                src = BT.agents_prompt_appendix(st, p.id)
+                @test occursin("working directory is the **BonitoAgents source checkout**", src)
+                @test !occursin("from outside its source", src)
+                # A trailing slash is a different string but the same directory;
+                # `find_project_by_location` normalizes it, so this must too.
+                p.worker_path = rstrip(root, '/') * "/"
+                @test BT.is_source_checkout_project(st, p)
+                p.worker_path = root
+                # The question is asked of the WORKER (the path only means
+                # something there): a checkout-shaped path that doesn't exist on
+                # it is not a checkout, wherever it may exist on the server.
+                p.worker_path = joinpath(mktempdir(), "BonitoAgents.jl")
+                @test !BT.is_source_checkout_project(st, p)
+                p.worker_path = root
+            end
         end
     finally
         close(h)

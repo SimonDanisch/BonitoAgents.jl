@@ -97,6 +97,19 @@ their bubble into a workspace tab or floating window and stay alive there: the
 same DOM node is moved, so their WebGL context and session are kept rather than
 rebuilt.
 
+## The header
+
+Left: the session dot, the chat's title (click to rename) and the folder it
+runs in on its worker. Right: one segmented **session group** with the context
+meter (tokens used of the window, percent, cost so far; it turns amber past
+three quarters and red past nine tenths), the model, permissions and effort
+pickers, and the agent provider. Next to it **Review** opens the change-review
+tab, and the **⋯ menu** holds everything else: *Continue on* another worker,
+*Compact*, *Restart session*, *Debug BonitoAgents* and the *Dev mode* switch.
+Long-running actions report in the muted status line left of the controls;
+outcomes arrive as a toast. When the agent session dies, a red **Session
+ended · Reconnect** chip appears next to the title.
+
 ## Staying in control
 
 - **Stop** interrupts the current turn; a hung agent escalates (cancel, then
@@ -104,8 +117,10 @@ rebuilt.
 - **Yolo mode** (composer toggle) auto-continues an agent that pauses to ask
   "shall I keep going?". The reminder it injects also tells the agent how to
   bail out deliberately.
-- **Compact** asks the agent to summarize the conversation so far into a fresh
-  context, after which the transcript reconciles cleanly.
+- **Compact** (⋯ menu) asks the agent to summarize the conversation so far into
+  a fresh context, after which the transcript reconciles cleanly.
+- **Continue on** (⋯ menu) moves the chat, its files and the agent's memory to
+  another worker and carries on there; see the workers page.
 - **Background tasks** (long test runs, builds) stay pinned to the taskbar
   with live line counts and a per-task stop button, monitored across turns
   until their writer exits.

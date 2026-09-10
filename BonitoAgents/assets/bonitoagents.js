@@ -4366,11 +4366,25 @@ function decorateCodeBlocks(rootEl) {
             return b;
         };
         const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b) => {
-            if (!navigator.clipboard) return;
-            navigator.clipboard.writeText(codeText()).then(() => {
+            const done = () => {
                 b.textContent = '✓';
                 setTimeout(() => { b.textContent = '⧉'; }, 1200);
-            }).catch(() => {});
+            };
+            const fallback = () => {
+                const ta = document.createElement('textarea');
+                ta.value = codeText();
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                try { document.execCommand('copy'); done(); }
+                finally { ta.remove(); }
+            };
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(codeText()).then(done, fallback);
+            } else {
+                fallback();
+            }
         });
         const dlBtn = mk('bt-code-download', '⤓', 'Download', () => {
             const blob = new Blob([codeText()], { type: 'text/plain' });

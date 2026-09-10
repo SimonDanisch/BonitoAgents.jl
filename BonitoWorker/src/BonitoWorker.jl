@@ -123,10 +123,31 @@ config_path() = joinpath(config_dir(), "config.json")
 # already holds it.
 pidfile_path() = joinpath(config_dir(), "worker.pid")
 
+# The pidfile is two lines: the pid, then the `julia_bin()` the worker runs on.
+# The second line is what lets a re-install tell "the live worker is on the
+# Julia this install uses" from "it is on the one juliaup defaulted to LAST
+# time" — without it a reinstall after `juliaup default 1.12` left a 1.13
+# worker (and its 1.13 BonitoMCP launch command) running forever, because
+# nothing else about the install had changed. Files written before the second
+# line existed still parse (a missing line reads as `nothing`).
+pidfile_lines(path::AbstractString) = split(read(path, String), '\n'; keepempty = false)
+
 # The pid recorded in the pidfile, or `nothing` if absent/empty/garbage.
 function read_pidfile(path::AbstractString = pidfile_path())
     isfile(path) || return nothing
-    return tryparse(Int, strip(read(path, String)))
+    lines = pidfile_lines(path)
+    isempty(lines) && return nothing
+    return tryparse(Int, strip(first(lines)))
+end
+
+# The julia binary the pidfile's worker was started from, or `nothing` for a
+# pidfile that predates the record (or has none).
+function pidfile_julia(path::AbstractString = pidfile_path())
+    isfile(path) || return nothing
+    lines = pidfile_lines(path)
+    length(lines) >= 2 || return nothing
+    julia = strip(lines[2])
+    return isempty(julia) ? nothing : String(julia)
 end
 
 # Pid of a *live, other* worker holding the pidfile, or `nothing` if the slot is
@@ -147,7 +168,7 @@ end
 # detects as dead and overwrites.
 function claim_pidfile!(path::AbstractString = pidfile_path())
     mkpath(dirname(path))
-    write(path, string(getpid()))
+    write(path, string(getpid(), '\n', julia_bin(), '\n'))
     atexit() do
         # Only remove if it's still ours — a successor that took over the slot
         # must keep its own claim.
@@ -243,15 +264,104 @@ end
 # cross-platform: a `.sh`/`.cmd` wrapper would need an OS-specific variant,
 # but `julia` + an argv array runs identically on Linux/macOS/Windows.
 #
-# `julia_bin()` resolves the current interpreter; `Base.active_project()` is
-# whatever env this worker itself runs in (the shared `@bonito-agents` after a
+# `julia_launcher()` resolves WHICH julia — see there; it is deliberately not the
+# version-specific binary this process happens to run from. `Base.active_project()`
+# is whatever env this worker itself runs in (the shared `@bonito-agents` after a
 # normal install, or the monorepo project in dev) — BonitoMCP is co-installed
 # there, so the MCP process resolves it without any extra setup.
 julia_bin() = joinpath(Sys.BINDIR::String, Base.julia_exename())
 
-function mcp_args()
+# The Julia channel this process belongs to, e.g. "1.12". A CHANNEL and not the
+# patch version: juliaup registers `1.12`, not `1.12.7`, so `+1.12.7` is rejected
+# with "not installed" while `+1.12` follows the channel forward.
+julia_channel() = "$(VERSION.major).$(VERSION.minor)"
+
+# Stable launcher candidates, in the order we trust them. juliaup's own install
+# puts one at `~/.juliaup/bin/julia`; a distro package may instead put
+# `julialauncher` behind plain `julia` on PATH (openSUSE does). Neither path
+# moves when a version is added or removed.
+function juliaup_launcher_candidates()
+    exe  = Sys.iswindows() ? "julia.exe" : "julia"
+    outs = String[joinpath(homedir(), ".juliaup", "bin", exe)]
+    onpath = Sys.which("julia")
+    onpath === nothing || push!(outs, String(onpath))
+    return outs
+end
+
+# Does `exe +channel` actually land on the Julia we are running from?
+#
+# Probed rather than assumed, because everything about this is guesswork
+# otherwise: `exe` may not be a launcher at all (a plain julia treats `+1.12` as
+# a script name and exits non-zero, which is the answer we want), the channel may
+# not be registered, or the launcher may be for a different depot. Writing a
+# launch command we have not run is precisely the mistake this whole function
+# exists to undo — it stays invisible until the next restart.
+function launcher_resolves_here(exe::AbstractString, channel::AbstractString)
+    isfile(exe) || return false
+    out = IOBuffer()
+    ok = try
+        success(pipeline(`$exe +$channel --startup-file=no -e 'print(Sys.BINDIR)'`;
+                         stdout = out, stderr = devnull))
+    catch e
+        # ENOENT/EACCES on something that looked like a file a moment ago, or is
+        # not executable. An ordinary "no, not this candidate" — anything else is
+        # a real bug and belongs on the surface.
+        e isa Base.IOError || rethrow()
+        return false
+    end
+    return ok && strip(String(take!(out))) == Sys.BINDIR::String
+end
+
+"""
+    julia_launcher() -> Cmd
+
+The `julia` every process this worker launches on its own behalf runs on: the
+systemd unit's ExecStart, a respawned background worker, and the BonitoMCP
+server claude-agent-acp starts for each chat. The `Cmd` is the executable plus
+whatever argument pins it, so `\$(julia_launcher()) --project=… -e …` composes
+and `.exec` splits into the command + argv the MCP config wants.
+
+NOT `julia_bin()`. That is `Sys.BINDIR`, and under juliaup BINDIR is a
+VERSION-specific directory which the next `juliaup update` DELETES. A unit that
+bakes it execs a julia that no longer exists and systemd restart-loops on it
+forever — measured here as 41 failed EXECs in the 2.5 minutes before someone
+happened to re-run the installer, with the worker simply absent throughout. An
+MCP config that bakes it is the same failure one level down: every new chat's
+`bt_*` tools fail to start until the worker is restarted.
+
+So prefer juliaup's launcher, which lives at a stable path, and pin the CHANNEL
+on it. That combination is what gets both properties at once:
+
+  * `juliaup update` within the channel keeps working — the launcher re-resolves
+    to the new patch release, and nothing has to be rewritten;
+  * `juliaup default <other>` does NOT quietly move the worker onto a different
+    Julia, which a bare launcher (or `/usr/bin/env julia`) would. Moving is what
+    re-running the installer under the new default is for — it restarts the
+    worker on the Julia it ran under (see `spawn_worker` / `install_service!`).
+
+Only removing the channel outright breaks it, and that is a deliberate act rather
+than a side effect of routine maintenance.
+
+Falls back to `julia_bin()` when no launcher checks out — a plain install has no
+launcher and does not have the problem either, since nothing deletes its bindir
+out from under it.
+"""
+function julia_launcher()
+    channel = julia_channel()
+    for exe in juliaup_launcher_candidates()
+        launcher_resolves_here(exe, channel) && return `$exe +$channel`
+    end
+    return `$(julia_bin())`
+end
+
+# The (command, argv) pair claude-agent-acp launches BonitoMCP with. Split from
+# one `julia_launcher()` so the channel pin (`+1.12`) rides in the argv.
+mcp_exe(launcher::Cmd = julia_launcher()) = String(first(launcher.exec))
+
+function mcp_args(launcher::Cmd = julia_launcher())
     project = something(Base.active_project(), "@bonito-agents")
     return String[
+        launcher.exec[2:end]...,
         "--project=$(project)",
         "--startup-file=no",
         "--threads=auto",
@@ -289,82 +399,9 @@ end
 # baked in because systemd --user services do NOT inherit the interactive
 # shell's PATH — without it the worker can't find `claude-agent-acp`/`node`/`git`
 # at runtime. We capture the install-time PATH, which has them resolved.
-# The Julia channel this process belongs to, e.g. "1.12". A CHANNEL and not the
-# patch version: juliaup registers `1.12`, not `1.12.7`, so `+1.12.7` is rejected
-# with "not installed" while `+1.12` follows the channel forward.
-julia_channel() = "$(VERSION.major).$(VERSION.minor)"
-
-# Stable launcher candidates, in the order we trust them. juliaup's own install
-# puts one at `~/.juliaup/bin/julia`; a distro package may instead put
-# `julialauncher` behind plain `julia` on PATH (openSUSE does). Neither path
-# moves when a version is added or removed.
-function juliaup_launcher_candidates()
-    exe  = Sys.iswindows() ? "julia.exe" : "julia"
-    outs = String[joinpath(homedir(), ".juliaup", "bin", exe)]
-    onpath = Sys.which("julia")
-    onpath === nothing || push!(outs, String(onpath))
-    return outs
-end
-
-# Does `exe +channel` actually land on the Julia we are running from?
 #
-# Probed rather than assumed, because everything about this is guesswork
-# otherwise: `exe` may not be a launcher at all (a plain julia treats `+1.12` as
-# a script name and exits non-zero, which is the answer we want), the channel may
-# not be registered, or the launcher may be for a different depot. Writing an
-# ExecStart we have not run is precisely the mistake this whole function exists
-# to undo — it stays invisible until the next restart.
-function launcher_resolves_here(exe::AbstractString, channel::AbstractString)
-    isfile(exe) || return false
-    out = IOBuffer()
-    ok = try
-        success(pipeline(`$exe +$channel --startup-file=no -e 'print(Sys.BINDIR)'`;
-                         stdout = out, stderr = devnull))
-    catch e
-        # ENOENT/EACCES on something that looked like a file a moment ago, or is
-        # not executable. An ordinary "no, not this candidate" — anything else is
-        # a real bug and belongs on the surface.
-        e isa Base.IOError || rethrow()
-        return false
-    end
-    return ok && strip(String(take!(out))) == Sys.BINDIR::String
-end
-
-"""
-    service_julia_cmd() -> String
-
-The ExecStart command prefix: the `julia` the unit should run, plus any argument
-that pins it there.
-
-NOT `julia_bin()` on its own. That is `Sys.BINDIR`, and under juliaup BINDIR is a
-VERSION-specific directory which the next `juliaup update` DELETES. The unit then
-execs a julia that no longer exists and systemd restart-loops on it forever —
-measured here as 41 failed EXECs in the 2.5 minutes before someone happened to
-re-run the installer, with the worker simply absent throughout. Re-running the
-installer is the only cure, because the unit is rewritten there.
-
-So prefer juliaup's launcher, which lives at a stable path, and pin the CHANNEL
-on it. That combination is what gets both properties at once:
-
-  * `juliaup update` within the channel keeps working — the launcher re-resolves
-    to the new patch release, and nothing has to be rewritten;
-  * `juliaup default <other>` does NOT quietly move the worker onto a different
-    Julia, which a bare launcher (or `/usr/bin/env julia`) would.
-
-Only removing the channel outright breaks it, and that is a deliberate act rather
-than a side effect of routine maintenance.
-
-Falls back to `julia_bin()` when no launcher checks out — a plain install has no
-launcher and does not have the problem either, since nothing deletes its bindir
-out from under it.
-"""
-function service_julia_cmd()
-    channel = julia_channel()
-    for exe in juliaup_launcher_candidates()
-        launcher_resolves_here(exe, channel) && return "$(exe) +$(channel)"
-    end
-    return julia_bin()
-end
+# The ExecStart command prefix: `julia_launcher()` as unit text (`exe +channel`).
+service_julia_cmd() = join(julia_launcher().exec, ' ')
 
 function render_service_unit(; julia::AbstractString = service_julia_cmd(),
                                project::AbstractString = "@bonito-agents",
@@ -727,14 +764,18 @@ end
 # `force_restart=true` (set by the installer when the Pkg env actually moved
 # forward) stops the live worker first and then respawns — without this the
 # pidfile keeps a stale process alive after a `git pull`-style update, and the
-# user never sees the new code load. The PID-lock invariant is preserved:
-# `stop_running_worker!` waits for exit before we spawn the replacement.
+# user never sees the new code load. The same happens when the live worker runs
+# on a different Julia than this install does (`replace_reason`). The PID-lock
+# invariant is preserved: `stop_running_worker!` waits for exit before we spawn
+# the replacement.
 function spawn_worker(; force_restart::Bool = false)
     logfile = joinpath(config_dir(), "worker.log")
     other = running_worker_pid()
     if other !== nothing
-        if force_restart
-            @info "BonitoWorker: stopping live worker to load updated code" pid = other
+        reason = replace_reason(; force_restart, recorded_julia = pidfile_julia(),
+                                  current_julia = julia_bin())
+        if reason !== nothing
+            @info "BonitoWorker: stopping live worker: $(reason)" pid = other
             stop_running_worker!()
         else
             # Don't launch a duplicate on top of a healthy live worker — the
@@ -746,10 +787,27 @@ function spawn_worker(; force_restart::Bool = false)
         end
     end
     project = something(Base.active_project(), "@bonito-agents")
-    cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
+    cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
     proc = run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true);
                wait = false)
     return proc, logfile
+end
+
+# Why a live worker has to go before this install spawns its own, or `nothing`
+# to leave it running. Pure, so the decision is testable without a worker.
+#
+# `recorded_julia` is the pidfile's second line — `nothing` for a pidfile written
+# before that line existed. Unknown counts as different: the one-off restart it
+# costs is nothing next to the failure it rules out, which is a worker quietly
+# staying on the Julia juliaup defaulted to LAST time.
+function replace_reason(; force_restart::Bool,
+                          recorded_julia::Union{AbstractString,Nothing},
+                          current_julia::AbstractString)
+    force_restart && return "loading updated code"
+    recorded_julia === nothing &&
+        return "its pidfile does not say which Julia it runs on; this install uses $(current_julia)"
+    recorded_julia == current_julia && return nothing
+    return "it runs on $(recorded_julia); this install uses $(current_julia)"
 end
 
 """
@@ -823,8 +881,12 @@ function connect_and_serve(; server_url::String,
                             secret::String,
                             worker_id::String     = load_or_generate_worker_id(),
                             name::String          = default_worker_name(worker_id),
-                            mcp_command::String   = julia_bin(),
-                            mcp_arguments::Vector{String} = mcp_args(),
+                            # Probed ONCE here (it spawns a julia per candidate),
+                            # then split into the command + argv the hello frame
+                            # carries.
+                            launcher::Cmd         = julia_launcher(),
+                            mcp_command::String   = mcp_exe(launcher),
+                            mcp_arguments::Vector{String} = mcp_args(launcher),
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             agent_bin::String     = find_agent_bin(),
                             retry_delay::Real     = 5.0)
@@ -968,7 +1030,15 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             elseif t == "find_repos"
                 @async handle_find_repos(ws, cmd)
             elseif t == "worker_state"
-                @async handle_worker_state(ws, cmd)
+                @async handle_worker_state(ws, cmd; mcp_command, mcp_arguments)
+            elseif t == "debug_checkout"
+                @async handle_debug_checkout(ws, cmd)
+            elseif t == "stage_session"
+                @async handle_stage_session(ws, cmd)
+            elseif t == "install_session"
+                @async handle_install_session(ws, cmd)
+            elseif t == "discard_staging"
+                @async handle_discard_staging(ws, cmd)
             elseif t == "ping"
                 @async send_pong(ws)
             else
@@ -1921,6 +1991,412 @@ function handle_clone_repo(ws, cmd::AbstractDict)
         send_control(ws, response)
     catch e
         @warn "clone_repo response failed" exception=e
+    end
+end
+
+# ── Debug checkout: the BonitoAgents source, on THIS worker ──────────────────
+# Backs the server's "Debug BonitoAgents" chat. That chat needs the source in
+# front of its agent, on the worker it runs on — and a normal install has none:
+# the packages sit in `~/.julia/packages/...` as plain trees. So the worker
+# provides a checkout of its own, the way a developer would: `dev --local` into
+# the environment the worker runs in, i.e. a clone at `<env>/dev/BonitoAgents`
+# with the monorepo packages developed from it. Restarting the worker then runs
+# whatever the agent edited there, which is what makes the chat a real
+# debugging loop rather than a read-only one. A re-run of the installer
+# (`Pkg.add` against the repo) puts the env back on the pinned revision.
+#
+#     {type:"debug_checkout", request_id, repo, rev, packages}
+#  -> {type:"debug_checkout_response", request_id, path, mode, created}
+#     {type:"debug_checkout_response", request_id, error:"..."}  on failure
+#
+# `mode` is "running" when this worker already runs FROM a checkout (a monorepo
+# dev setup, the test suite) — then that checkout is the answer and nothing is
+# cloned or developed; "developed" otherwise. `created` says whether THIS call
+# made the clone (a repeat call finds it and leaves the user's edits alone).
+
+"""
+    source_checkout_root() -> String | nothing
+
+The git repository this worker's own code is loaded from, or `nothing` when it
+runs from an ordinary install (a package tree under `~/.julia/packages`).
+
+Walks up from `pkgdir(BonitoWorker)` to a `.git` — a directory (clone) or a file
+(worktree / submodule) — and only accepts a root that actually IS the monorepo
+(has `BonitoWorker/Project.toml` and `BonitoAgents/Project.toml`). Without that
+check a dotfiles repository in `\$HOME` would claim `~/.julia/packages/...`.
+"""
+function source_checkout_root()
+    dir = pkgdir(@__MODULE__)
+    dir === nothing && return nothing
+    cur = abspath(String(dir))
+    while true
+        ispath(joinpath(cur, ".git")) && is_monorepo_root(cur) && return cur
+        parent = dirname(cur)
+        parent == cur && return nothing
+        cur = parent
+    end
+end
+
+is_monorepo_root(dir::AbstractString) =
+    isfile(joinpath(dir, "BonitoWorker", "Project.toml")) &&
+    isfile(joinpath(dir, "BonitoAgents", "Project.toml"))
+
+# Where `dev --local` puts the clone for the environment `project` (a
+# Project.toml path): next to it, under `dev/`, named after the repository.
+debug_checkout_dir(project::AbstractString) =
+    joinpath(dirname(abspath(project)), "dev", "BonitoAgents")
+
+# Two clicks racing each other would clone into the same directory twice; the
+# second waits here and then finds the checkout in place.
+const DEBUG_CHECKOUT_LOCK = ReentrantLock()
+
+"""
+    debug_checkout(; repo, rev, packages, project = Base.active_project(),
+                     running_root = source_checkout_root(), logfile)
+        -> (path, mode, created)
+
+Make the BonitoAgents source available on this worker and return where it is.
+`project` is the environment to develop into, `running_root` the checkout this
+process already runs from (if any) and `logfile` where the develop's output
+goes — all parameters so the test suite, which itself runs from a checkout, can
+exercise the clone path against a throwaway environment.
+"""
+function debug_checkout(; repo::AbstractString, rev::AbstractString,
+                          packages::Vector{String},
+                          project::Union{AbstractString,Nothing} = Base.active_project(),
+                          running_root::Union{AbstractString,Nothing} = source_checkout_root(),
+                          logfile::AbstractString = joinpath(config_dir(), "debug_checkout.log"))
+    running_root === nothing || return (path = String(running_root), mode = "running", created = false)
+    project === nothing && error("this worker has no active project to develop the checkout into")
+    isempty(repo) && error("no repository url to clone")
+    isempty(rev) && error("no revision to check out")
+    lock(DEBUG_CHECKOUT_LOCK) do
+        dest = debug_checkout_dir(project)
+        created = false
+        if !ispath(joinpath(dest, ".git"))
+            ispath(dest) && error("$(dest) exists but is not a git checkout; move it away first")
+            mkpath(dirname(dest))
+            created = true
+            try
+                # A full clone, not a shallow one: `rev` is whatever the server
+                # runs — a branch, a tag or a bare sha — and only a full history
+                # is guaranteed to contain a sha. The agent also wants `git log`.
+                git_or_error(`clone $(repo) $(dest)`)
+                git_or_error(`-C $(dest) checkout $(rev)`)
+            catch e
+                # Only a directory WE created is removed, so a retry starts
+                # clean; a pre-existing checkout is never touched.
+                rm(dest; recursive = true, force = true)
+                rethrow(e)
+            end
+        end
+        develop_checkout!(dest, packages, project, logfile)
+        return (path = dest, mode = "developed", created = created)
+    end
+end
+
+# Run one git command; on failure the error carries git's own output, which is
+# the part the user needs ("Repository not found", "could not resolve host",
+# "pathspec 'v9' did not match").
+function git_or_error(args::Cmd)
+    out = IOBuffer()
+    ok = success(pipeline(`git $(args)`; stdout = out, stderr = out))
+    ok && return nothing
+    error("git $(join(args.exec, ' ')) failed:\n$(strip(String(take!(out))))")
+end
+
+# `Pkg.develop` the monorepo packages found under `dest` into `project`, in a
+# subprocess: Pkg in this long-lived process would hold registries and depot
+# state for the rest of the worker's life, and a subprocess also gets the
+# precompile (auto after `develop`) out of our process and into a log. That log
+# is the error message when it fails — the useful line is at its tail.
+function develop_checkout!(dest::AbstractString, packages::Vector{String},
+                           project::AbstractString, logfile::AbstractString)
+    paths = String[]
+    for name in packages
+        p = joinpath(dest, name)
+        if isfile(joinpath(p, "Project.toml"))
+            push!(paths, p)
+        else
+            @warn "BonitoWorker: debug checkout has no package '$(name)'; not developing it" dest
+        end
+    end
+    isempty(paths) && error("none of $(join(packages, ", ")) exist under $(dest)")
+    # The explicit `precompile` is deliberate: the develop's own auto-precompile
+    # is off under `JULIA_PKG_PRECOMPILE_AUTO=0`, and a checkout that is not
+    # precompiled here gets precompiled by the FIRST chat's BonitoMCP spawn
+    # instead — minutes inside claude-agent-acp's MCP start-up timeout.
+    code = "import Pkg; Pkg.develop([Pkg.PackageSpec(path = p) for p in ARGS]); Pkg.precompile()"
+    cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $(code) $(paths)`
+    # `@stdlib` has to be on the load path for `import Pkg`; a parent that pruned
+    # its own load path (`Pkg.test` sets `@:<testdir>`) must not take that away.
+    cmd = addenv(cmd, "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'))
+    mkpath(dirname(logfile))
+    ok = open(logfile, "w") do io
+        success(pipeline(cmd; stdout = io, stderr = io))
+    end
+    ok && return nothing
+    tail = isfile(logfile) ? join(last(readlines(logfile), 30), '\n') : "(no log)"
+    error("Pkg.develop of $(join(basename.(paths), ", ")) into $(project) failed; " *
+          "full log at $(logfile):\n$(tail)")
+end
+
+function debug_checkout_response(request_id::AbstractString, repo::AbstractString,
+                                 rev::AbstractString, packages::Vector{String})
+    try
+        r = debug_checkout(; repo, rev, packages)
+        return Dict("type" => "debug_checkout_response", "request_id" => request_id,
+                    "path" => r.path, "mode" => r.mode, "created" => r.created)
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict("type" => "debug_checkout_response", "request_id" => request_id,
+                    "error" => sprint(showerror, e))
+    end
+end
+
+function handle_debug_checkout(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    repo       = String(get(cmd, "repo", ""))
+    rev        = String(get(cmd, "rev", ""))
+    packages   = Vector{String}(get(cmd, "packages", String[]))
+    response = debug_checkout_response(request_id, repo, rev, packages)
+    try
+        send_control(ws, response)
+    catch e
+        @warn "debug_checkout response failed" exception = e
+    end
+end
+
+# ── Session state: carrying an agent's conversation to another worker ────────
+# Backs "Continue this chat on <worker>". The project's files travel through the
+# server's mirror (RemoteSync); the agent's OWN record of the conversation has to
+# travel too, or the agent on the new machine starts with no memory of the chat.
+# For Claude Code that record is `~/.claude/projects/<encoded cwd>/`: the
+# transcript jsonl, the subagent transcripts and the project memory (see
+# `AgentProviders.session_state_format`). Three RPCs, all driven by the server:
+#
+#     {type:"stage_session", request_id, provider, cwd, session_id, staging}
+#  -> {type:"stage_session_response", request_id, path, entries:[...], bytes}
+#        Copy the session's entries out of the transcript dir into `staging`,
+#        so the server pulls exactly that session and nothing else.
+#     {type:"install_session", request_id, provider, cwd, old_cwd, session_id, staging}
+#  -> {type:"install_session_response", request_id, path, entries:[...]}
+#        Move the staged entries into the transcript dir for `cwd` on THIS
+#        worker. The transcript names its working directory on every line and
+#        the agent files the session under the encoded cwd, so the recorded
+#        `old_cwd` is rewritten to `cwd` on the way in. An entry that already
+#        exists as a directory (the project memory) is merged file by file.
+#     {type:"discard_staging", request_id, staging}
+#  -> {type:"discard_staging_response", request_id}
+#        Remove a staging directory (the source side, after the pull).
+#
+# Every `staging` path must be a directory directly under a
+# `.bonitoagents-transfer` folder (`AgentProviders.TRANSFER_DIRNAME`); the worker
+# refuses anything else, so a bad request can never make it copy into, or
+# delete, an arbitrary folder. Errors ride back in the response.
+
+function check_staging_path(staging::AbstractString)
+    isempty(staging) && error("staging path is empty")
+    path = abspath(staging)
+    basename(dirname(path)) == AgentProviders.TRANSFER_DIRNAME ||
+        error("staging path must be a directory under $(AgentProviders.TRANSFER_DIRNAME): $(staging)")
+    return path
+end
+
+function session_format(provider::AbstractString)
+    fmt = AgentProviders.session_state_format(AgentProviders.find_provider(provider))
+    fmt === nothing && error("provider '$(provider)' keeps no session record this worker can move")
+    return fmt
+end
+
+tree_bytes(path::AbstractString) = isdir(path) ?
+    sum(Int[filesize(joinpath(root, f)) for (root, _, files) in walkdir(path) for f in files]; init = 0) :
+    filesize(path)
+
+"""
+    stage_session(; provider, cwd, session_id, staging, home = homedir())
+        -> (path, entries, bytes)
+
+Copy the on-disk record of `session_id` (run by `provider` in `cwd`) into the
+`staging` directory, which is created fresh. Errors when the transcript itself is
+missing; optional entries (subagent transcripts, project memory) are copied when
+present and listed in `entries`.
+"""
+function stage_session(; provider::AbstractString, cwd::AbstractString,
+                         session_id::AbstractString, staging::AbstractString,
+                         home::AbstractString = homedir())
+    isempty(session_id) && error("session id is empty")
+    fmt  = session_format(provider)
+    dest = check_staging_path(staging)
+    src_dir = AgentProviders.transcript_dir(fmt, home, cwd)
+    # Always a fresh directory: a leftover from an interrupted move must not be
+    # mistaken for this session's files.
+    isdir(dest) && rm(dest; recursive = true)
+    mkpath(dest)
+    entries = String[]
+    bytes = 0
+    for e in AgentProviders.session_state_entries(fmt, session_id)
+        src = joinpath(src_dir, e.name)
+        if !ispath(src)
+            if e.required
+                rm(dest; recursive = true)
+                error("no transcript for session $(session_id) under $(src_dir)")
+            end
+            continue
+        end
+        cp(src, joinpath(dest, e.name))
+        push!(entries, e.name)
+        bytes += tree_bytes(src)
+    end
+    return (path = dest, entries = entries, bytes = bytes)
+end
+
+"""
+    install_session(; provider, cwd, old_cwd, session_id, staging, home = homedir())
+        -> (path, entries)
+
+Move a staged session record (see [`stage_session`](@ref)) into the transcript
+directory for `cwd` on this worker, rewriting the working directory recorded in
+the transcripts from `old_cwd` to `cwd`. The staging directory is removed.
+"""
+function install_session(; provider::AbstractString, cwd::AbstractString,
+                           old_cwd::AbstractString, session_id::AbstractString,
+                           staging::AbstractString, home::AbstractString = homedir())
+    isempty(session_id) && error("session id is empty")
+    fmt = session_format(provider)
+    src = check_staging_path(staging)
+    isdir(src) || error("staging directory does not exist: $(src)")
+    dest_dir = AgentProviders.transcript_dir(fmt, home, cwd)
+    relocate_transcripts!(fmt, src, old_cwd, cwd)
+    mkpath(dest_dir)
+    entries = String[]
+    for e in AgentProviders.session_state_entries(fmt, session_id)
+        from = joinpath(src, e.name)
+        if !ispath(from)
+            e.required && error("the staged session has no $(e.name)")
+            continue
+        end
+        place_entry!(from, joinpath(dest_dir, e.name))
+        push!(entries, e.name)
+    end
+    remove_staging!(src)
+    return (path = dest_dir, entries = entries)
+end
+
+# Remove a staging directory, and the transfer folder itself once it holds
+# nothing else — a move leaves no trace under the projects root.
+function remove_staging!(staging::AbstractString)
+    rm(staging; recursive = true, force = true)
+    parent = dirname(staging)
+    isdir(parent) && isempty(readdir(parent)) && rm(parent)
+    return nothing
+end
+
+# Land one staged entry. A directory that already exists at the destination
+# (the project memory, which every session in that cwd shares) is merged file
+# by file, newer files winning; anything else is moved into place.
+function place_entry!(from::AbstractString, to::AbstractString)
+    if isdir(from) && isdir(to)
+        for (root, _, files) in walkdir(from), f in files
+            target = joinpath(to, relpath(joinpath(root, f), from))
+            mkpath(dirname(target))
+            mv(joinpath(root, f), target; force = true)
+        end
+        rm(from; recursive = true)
+    else
+        mv(from, to; force = true)
+    end
+    return nothing
+end
+
+# The transcript names its working directory on every line (`"cwd":"…"`), and
+# the agent files the session under the encoded cwd — so both have to name the
+# NEW directory or the agent won't find its own history. Streamed line by line
+# so a transcript of hundreds of MB never sits in memory at once. The value is
+# matched in its JSON-encoded form, so a path with characters JSON escapes
+# (Windows backslashes) is rewritten correctly. Returns the number of rewritten
+# lines.
+function relocate_transcripts!(::AgentProviders.JsonlTranscripts, dir::AbstractString,
+                               old_cwd::AbstractString, new_cwd::AbstractString)
+    old_cwd == new_cwd && return 0
+    from = "\"cwd\":" * JSON.json(String(old_cwd))
+    to   = "\"cwd\":" * JSON.json(String(new_cwd))
+    n = 0
+    for (root, _, files) in walkdir(dir), f in files
+        endswith(f, ".jsonl") || continue
+        path = joinpath(root, f)
+        tmp  = path * ".relocating"
+        open(tmp, "w") do out
+            for line in eachline(path; keep = true)
+                occursin(from, line) && (n += 1)
+                write(out, replace(line, from => to))
+            end
+        end
+        mv(tmp, path; force = true)
+    end
+    return n
+end
+
+"""
+    discard_staging(; staging)
+
+Remove a staging directory left on this worker by [`stage_session`](@ref).
+"""
+function discard_staging(; staging::AbstractString)
+    remove_staging!(check_staging_path(staging))
+    return nothing
+end
+
+# Run `f` and send `reply` (already carrying `type` + `request_id`) extended with
+# its result, or with `error` when it throws. The reply's type is spelled out at
+# each call site on purpose: the server's dispatch is an allow-list, and the
+# `unit:worker_rpc_dispatch` test pairs every `"type" => "…_response"` literal in
+# this file with an arm over there.
+function reply_with(f, ws, reply::Dict{String,Any})
+    response = try
+        merge(reply, f())
+    catch e
+        e isa InterruptException && rethrow()
+        merge(reply, Dict{String,Any}("error" => sprint(showerror, e)))
+    end
+    try
+        send_control(ws, response)
+    catch e
+        @warn "BonitoWorker: $(reply["type"]) failed to send" exception = e
+    end
+end
+
+function handle_stage_session(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "stage_session_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        r = stage_session(; provider   = String(get(cmd, "provider", "")),
+                            cwd        = String(get(cmd, "cwd", "")),
+                            session_id = String(get(cmd, "session_id", "")),
+                            staging    = String(get(cmd, "staging", "")))
+        Dict{String,Any}("path" => r.path, "entries" => r.entries, "bytes" => r.bytes)
+    end
+end
+
+function handle_install_session(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "install_session_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        r = install_session(; provider   = String(get(cmd, "provider", "")),
+                              cwd        = String(get(cmd, "cwd", "")),
+                              old_cwd    = String(get(cmd, "old_cwd", "")),
+                              session_id = String(get(cmd, "session_id", "")),
+                              staging    = String(get(cmd, "staging", "")))
+        Dict{String,Any}("path" => r.path, "entries" => r.entries)
+    end
+end
+
+function handle_discard_staging(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "discard_staging_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        discard_staging(; staging = String(get(cmd, "staging", "")))
+        Dict{String,Any}()
     end
 end
 
@@ -2911,7 +3387,9 @@ function worker_rss()
     return (bytes = Sys.maxrss(), kind = "peak")
 end
 
-function worker_state_response(request_id::AbstractString)
+function worker_state_response(request_id::AbstractString;
+                               mcp_command::AbstractString = "",
+                               mcp_arguments::Vector{String} = String[])
     try
         sessions = lock(_SESSION_PROCS_LOCK) do
             [Dict("cwd" => cwd,
@@ -2938,7 +3416,11 @@ function worker_state_response(request_id::AbstractString)
                     "project" => something(Base.active_project(), ""),
                     "worker_package" => something(pkgdir(@__MODULE__), ""),
                     "agent_bin" => something(find_agent_bin(), ""),
-                    "mcp_args" => mcp_args(),
+                    # What the hello frame told the server, not a fresh probe:
+                    # the point of reporting it is to compare the two.
+                    "mcp_command" => String(mcp_command),
+                    "mcp_args" => mcp_arguments,
+                    "source_checkout" => something(source_checkout_root(), ""),
                     "rss_bytes" => rss.bytes,
                     "rss_kind" => rss.kind,
                     "gc_live_bytes" => Base.gc_live_bytes(),
@@ -2953,8 +3435,11 @@ function worker_state_response(request_id::AbstractString)
     end
 end
 
-function handle_worker_state(ws, cmd::AbstractDict)
-    response = worker_state_response(String(get(cmd, "request_id", "")))
+function handle_worker_state(ws, cmd::AbstractDict;
+                             mcp_command::AbstractString = "",
+                             mcp_arguments::Vector{String} = String[])
+    response = worker_state_response(String(get(cmd, "request_id", ""));
+                                     mcp_command, mcp_arguments)
     try
         send_control(ws, response)
     catch e

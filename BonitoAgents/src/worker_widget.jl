@@ -202,15 +202,17 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
     card_body = DOM.div(
-        DOM.div(status_dot_obs, initials_input, name_input, remove_btn;
+        DOM.div(status_dot_obs, initials_input, name_input;
                 class = "bt-card-title"),
         DOM.div(subtitle_obs; class = "bt-card-meta", title = title_attr);
         class = "bt-card-body")
 
-    # Top row of the worker pill: identity + actions. The discover details lives
-    # inside the SAME pill (below this row), so a worker with a collapsed project
-    # list takes the same space as a bare card — no separate pill underneath.
-    card_row = DOM.div(card_body, actions_block; class = "bt-card-row")
+    # Top row of the worker pill: identity, then the actions, then the remove ✕
+    # at the far right (after the buttons, not floating in the middle of the
+    # title row). The discover details lives inside the SAME pill (below this
+    # row), so a worker with a collapsed project list takes the same space as a
+    # bare card — no separate pill underneath.
+    card_row = DOM.div(card_body, actions_block, remove_btn; class = "bt-card-row")
 
     is_picking_obs = map(s -> s == wid, c.picker_state)
     picker_form    = render_remote_picker_form(session, c, wid)

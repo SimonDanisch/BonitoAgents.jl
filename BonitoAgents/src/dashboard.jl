@@ -226,32 +226,6 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     return p
 end
 
-# Triggered by the chat header's "Sync to server" menu item. Looks up the
-# project, runs sync_project_to_server! in a Task, pushes status updates
-# back to the chat's sync_status observable so the menu shows progress
-# without redirecting to the dashboard.
-function handle_chat_sync_click(state::ServerState, project_id::AbstractString,
-                                 sync_status::Observable{String})
-    haskey(state.projects[], project_id) || (safe_set!(sync_status, "unknown project"); return)
-    p = state.projects[][project_id]
-    p.backup_status === :syncing && (safe_set!(sync_status, "already syncing…"); return)
-    safe_set!(sync_status, "starting…")
-    @async begin
-        try
-            sync_project_to_server!(state, p;
-                on_progress = (stage, info) ->
-                    safe_set!(sync_status, format_progress_string(stage, info)))
-            safe_set!(sync_status,
-                "✓ synced $(Dates.format(p.last_sync_at, "HH:MM:SS")) UTC")
-        catch e
-            bt = catch_backtrace()
-            @warn "handle_chat_sync_click failed" project=p.name exception=(e, bt)
-            safe_set!(sync_status, "failed: $(sprint(showerror, e))")
-        end
-    end
-    return
-end
-
 """
     sync_project_to_server!(state, p::ProjectInfo; on_progress=nothing)
 
@@ -618,17 +592,89 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
     sync_dir_to_worker!(state, target_id, p.server_path, target_path;
                          on_progress = progress)
 
-    # Re-bind. resume_session_id cleared because claude's jsonl lives on
-    # the old worker's fs and isn't transportable. Persistent state is
-    # written before we return so a server crash mid-`start!` (between
-    # this point and ensure_project_session!) doesn't leave projects.json
-    # disagreeing with the bytes on disk.
+    # The agent's own record of the conversation travels too, so the session
+    # resumes on the target with its memory intact. When it can't (nothing to
+    # carry, a provider whose record we can't move, the source offline, or a
+    # failed transport) the chat continues with a fresh agent session and the
+    # server-side history stays visible — `resume_session_id` is cleared so the
+    # target's agent isn't asked to load a session it never saw.
+    carried = carry_session!(state, p, target_w, target_path; progress)
+
+    # Re-bind. Persistent state is written before we return so a server crash
+    # mid-`start!` (between this point and ensure_project_session!) doesn't
+    # leave projects.json disagreeing with the bytes on disk.
     p.worker_id          = target_id
     p.worker_path        = target_path
-    p.resume_session_id  = nothing
+    carried || (p.resume_session_id = nothing)
     save_projects!(state)
     safe_notify!(state.projects)
     return p
+end
+
+"""
+    carry_session!(state, p, target_w, target_path; progress = nothing) -> Bool
+
+Move the agent's on-disk record of `p`'s conversation (for Claude Code: the
+transcript, subagent transcripts and project memory) from its current worker to
+`target_w`, so `session/load` on the target resumes with the agent's memory
+intact. Server-mediated like the project files: the source worker stages the
+session under its projects root, the server pulls it, pushes it under the
+target's projects root, and the target installs it into its transcript
+directory for `target_path` (rewriting the recorded working directory).
+
+Returns `true` when the record now sits on the target and `p.resume_session_id`
+can be kept. `false` means the move goes on with a fresh session: no session yet,
+a provider whose record we don't know how to move, the source worker offline,
+or a transport that failed — the failure is logged with its reason, since none
+of them should stop the user from continuing their chat elsewhere.
+"""
+function carry_session!(state::ServerState, p::ProjectInfo, target_w::WorkerInfo,
+                        target_path::AbstractString; progress = nothing)
+    sid = p.resume_session_id
+    sid === nothing && return false
+    provider = project_provider(p)
+    session_state_format(provider) === nothing && return false
+    src_w = get(state.workers[], p.worker_id, nothing)
+    (src_w === nothing || !isopen(src_w)) && return false
+    staging_src = worker_join(src_w.projects_root, AgentProviders.TRANSFER_DIRNAME * "/" * p.id)
+    staging_dst = worker_join(target_w.projects_root, AgentProviders.TRANSFER_DIRNAME * "/" * p.id)
+    server_dir  = joinpath(state.state_dir, "transfers", p.id)
+    pname = provider_name(provider)
+    carried = try
+        notify_progress(progress, :phase,
+            (msg = "Packing the conversation on $(src_w.name)…",))
+        staged = stage_session_on_worker(state, src_w.worker_id; provider = pname,
+                                         cwd = p.worker_path, session_id = sid,
+                                         staging = staging_src)
+        isdir(server_dir) && rm(server_dir; recursive = true)
+        notify_progress(progress, :phase,
+            (msg = "Pulling the conversation from $(src_w.name)…",))
+        sync_dir_from_worker!(state, src_w.worker_id, staging_src, server_dir;
+                              on_progress = progress)
+        notify_progress(progress, :phase,
+            (msg = "Pushing the conversation to $(target_w.name)…",))
+        sync_dir_to_worker!(state, target_w.worker_id, server_dir, staging_dst;
+                            on_progress = progress)
+        installed = install_session_on_worker(state, target_w.worker_id; provider = pname,
+                                              cwd = target_path, old_cwd = p.worker_path,
+                                              session_id = sid, staging = staging_dst)
+        @info "conversation carried to worker" project = p.name target = target_w.name session = sid entries = staged.entries bytes = staged.bytes installed
+        true
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "could not carry the conversation to the new worker; the agent starts fresh there" project = p.name source = src_w.name target = target_w.name exception = (e, catch_backtrace())
+        false
+    end
+    # Leave nothing behind either way: the server's copy, and the source's
+    # staging directory (the target's is consumed by the install).
+    isdir(server_dir) && rm(server_dir; recursive = true, force = true)
+    try
+        discard_staging_on_worker(state, src_w.worker_id; staging = staging_src)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "could not remove the staged conversation on the source worker" source = src_w.name staging = staging_src exception = e
+    end
+    return carried
 end
 
 """
@@ -740,30 +786,10 @@ end
 
 # Dashboard styles — modern surface + spacing system, status dots, smooth transitions
 const DashboardStyles = Bonito.Styles(
-    # ── Tokens ───────────────────────────────────────────────────────────────
-    # `html:root`, not `:root`, and its own rule: the dashboard can be mounted
-    # without ChatStyles, so it can't rely on that sheet's copy — and BonitoWidgets'
-    # `@media (prefers-color-scheme: dark) { :root { color-scheme: dark } }` has the
-    # same specificity as a plain `:root` and lands later. See the long note on the
-    # matching rule in styles.jl.
-    CSS("html:root", "color-scheme" => "light"),
-    CSS(":root",
-        "--bt-bg"            => "#fafaf9",
-        "--bt-surface"       => "#ffffff",
-        "--bt-surface-2"     => "#f8fafc",
-        "--bt-border"        => "rgba(15,23,42,0.08)",
-        "--bt-border-strong" => "rgba(15,23,42,0.14)",
-        "--bt-text"          => "#0f172a",
-        "--bt-text-muted"    => "#64748b",
-        "--bt-text-faint"    => "#94a3b8",
-        "--bt-accent"        => "#3b82f6",
-        "--bt-accent-hover"  => "#2563eb",
-        "--bt-success"       => "#10b981",
-        "--bt-error"         => "#ef4444",
-        "--bt-shadow-sm"     => "0 1px 2px rgba(15,23,42,0.05)",
-        "--bt-shadow-md"     => "0 4px 12px rgba(15,23,42,0.08)",
-        "--bt-radius"        => "8px",
-        "--bt-radius-sm"     => "6px"),
+    # Tokens, reset, buttons and menus come from the shared base (styles.jl):
+    # the dashboard can be mounted without ChatStyles, and must still agree
+    # with it on every one of them.
+    BASE_CSS...,
 
     # ── Shell ────────────────────────────────────────────────────────────────
     # No own max-width: the whole app is bounded by `.bt-shell` (defined in
@@ -792,10 +818,6 @@ const DashboardStyles = Bonito.Styles(
     # `bt-hidden`.
     CSS(".bt-worker-cell",
         "display" => "flex", "flex-direction" => "column", "gap" => "8px"),
-    # Class-toggle helper used by WorkerCard for picker / discover / install
-    # blocks: collapses the element without removing it from the DOM, so
-    # interactive state (folder selection, scan results, focus) survives.
-    CSS(".bt-hidden", "display" => "none !important"),
     # Wrappers around the toggled blocks; semantic class for the test
     # suite to query.
     CSS(".bt-form-wrapper", "display" => "block"),
@@ -861,12 +883,37 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-section-actions",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "flex-wrap" => "wrap"),
-    # Sections whose content reads as body text (Defaults, Debug this server):
-    # stack heading above content. In the space-between row the long hint text
-    # collided with the h2 at medium widths ("DEFAULTSApplied to new ...").
+    # Sections whose content reads as body text: stack heading above content.
+    # In the space-between row the long hint text collided with the h2 at
+    # medium widths ("DEFAULTSApplied to new ...").
     CSS(".bt-section-stack",
         "flex-direction" => "column", "align-items" => "flex-start",
         "gap" => "4px"),
+
+    # ── Settings card ────────────────────────────────────────────────────────
+    # One card, uniform rows (`settings_row`): title + hint left, control right,
+    # hairline between rows. Overrides the card's own padding/gap so the rows
+    # own the spacing.
+    CSS(".bt-settings", "padding" => "0", "gap" => "0"),
+    CSS(".bt-settings-row",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "flex-wrap" => "wrap",
+        "gap" => "var(--bt-space-3) var(--bt-space-4)",
+        "padding" => "14px 16px"),
+    CSS(".bt-settings-row + .bt-settings-row",
+        "border-top" => "1px solid var(--bt-border)"),
+    CSS(".bt-settings-text", "flex" => "1 1 320px", "min-width" => "0"),
+    CSS(".bt-settings-title", "font-weight" => "600", "font-size" => "13px"),
+    CSS(".bt-settings-hint",
+        "color" => "var(--bt-text-muted)", "font-size" => "12px",
+        "margin-top" => "2px", "max-width" => "64ch", "line-height" => "1.45"),
+    CSS(".bt-settings-control",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "flex" => "0 1 auto", "flex-wrap" => "wrap", "justify-content" => "flex-end",
+        "min-width" => "0"),
+    # The defaults bar names itself ("Session defaults"); in a row that already
+    # carries the title, that label is noise.
+    CSS(".bt-settings .bt-defaults-label", "display" => "none"),
 
     # ── Card ─────────────────────────────────────────────────────────────────
     CSS(".bt-card",
@@ -900,10 +947,10 @@ const DashboardStyles = Bonito.Styles(
         "text-overflow" => "ellipsis",
         "white-space" => "nowrap",
         "word-break" => "keep-all"),
-    # Remove-worker affordance: a faint ✕ pinned to the right of the title
-    # row (margin-left:auto), turning red on hover so it reads as destructive.
+    # Remove-worker affordance: a faint ✕ at the far right of the card's top
+    # row, after the action buttons, turning red on hover so it reads as
+    # destructive.
     CSS(".bt-card-remove",
-        "margin-left" => "auto",
         "flex-shrink" => "0",
         "cursor" => "pointer",
         "color" => "var(--bt-text-faint)",
@@ -1033,36 +1080,7 @@ const DashboardStyles = Bonito.Styles(
         "background" => "rgba(59,130,246,0.12)", "color" => "#1d4ed8",
         "gap" => "6px"),
 
-    # ── Buttons ──────────────────────────────────────────────────────────────
-    CSS(".bt-btn",
-        "appearance" => "none", "border" => "none",
-        "padding" => "7px 12px",
-        "border-radius" => "var(--bt-radius-sm)",
-        "background" => "var(--bt-accent)", "color" => "#fff",
-        "font-size" => "13px", "font-weight" => "500",
-        "cursor" => "pointer",
-        # Never break the label across lines — on narrow viewports `.bt-section`
-        # / `.bt-card-actions` would otherwise let "+ New project" wrap to two
-        # lines inside the button.
-        "white-space" => "nowrap",
-        "display" => "inline-flex", "align-items" => "center", "gap" => "6px",
-        "transition" => "background 120ms ease, transform 80ms ease, opacity 120ms ease, color 120ms"),
-    CSS(".bt-btn:hover",  "background" => "var(--bt-accent-hover)"),
-    CSS(".bt-btn:active", "transform" => "translateY(1px)"),
-    CSS(".bt-btn-secondary",
-        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
-        "border" => "1px solid var(--bt-border-strong)"),
-    CSS(".bt-btn-secondary:hover",
-        "background" => "var(--bt-surface-2)"),
-    CSS(".bt-btn-ghost",
-        "background" => "transparent", "color" => "var(--bt-text-muted)",
-        "padding" => "6px 8px"),
-    CSS(".bt-btn-ghost:hover",
-        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text)"),
-    CSS(".bt-btn-loading",
-        "opacity" => "0.7", "cursor" => "wait"),
-    CSS(".bt-btn-sm",
-        "padding" => "3px 9px", "font-size" => "12px"),
+    # (Buttons: `.bt-btn` and its variants live in BASE_CSS, styles.jl.)
 
     # ── Forms ────────────────────────────────────────────────────────────────
     CSS(".bt-form",
@@ -1619,133 +1637,6 @@ const DashboardStyles = Bonito.Styles(
         # Stats strip: tighter gap so the inline pills don't overflow
         CSS(".bt-stats", "gap" => "12px")),
 
-    # ── Collision-resolution modal ───────────────────────────────────────────
-    CSS(".bt-collision-overlay",
-        "position" => "fixed",
-        "top" => "0", "left" => "0", "right" => "0", "bottom" => "0",
-        "background" => "rgba(0,0,0,0.55)",
-        "z-index" => "1000",
-        "display" => "flex",
-        "align-items" => "center",
-        "justify-content" => "center",
-        "padding" => "16px"),
-    CSS(".bt-collision-card",
-        "background" => "var(--bt-bg, #fff)",
-        "color" => "var(--bt-text, #111)",
-        "border-radius" => "12px",
-        "max-width" => "900px", "width" => "100%",
-        "max-height" => "85vh", "overflow-y" => "auto",
-        "padding" => "20px",
-        "box-shadow" => "0 8px 32px rgba(0,0,0,0.25)",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "16px"),
-    CSS(".bt-collision-card h3",
-        "margin" => "0",
-        "font-size" => "18px"),
-    CSS(".bt-collision-card h5",
-        "margin" => "8px 0 4px 0",
-        "font-size" => "12px",
-        "text-transform" => "uppercase",
-        "color" => "var(--bt-text-muted)"),
-    CSS(".bt-collision-sub",
-        "color" => "var(--bt-text-muted)",
-        "font-size" => "13px",
-        "margin-top" => "4px"),
-
-    CSS(".bt-collision-sides",
-        "display" => "grid",
-        "grid-template-columns" => "1fr 1fr",
-        "gap" => "12px"),
-    CSS("@media (max-width: 720px)",
-        CSS(".bt-collision-sides",
-            "grid-template-columns" => "1fr")),
-
-    CSS(".bt-collision-side",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "8px",
-        "padding" => "12px",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "8px",
-        "min-width" => "0"),
-    # Highlight the side that's been touched more recently.
-    CSS(".bt-collision-newer .bt-collision-side",
-        "border-color" => "var(--bt-accent)",
-        "box-shadow" => "0 0 0 2px rgba(59,130,246,0.18)"),
-    CSS(".bt-collision-side-title",
-        "font-weight" => "600",
-        "font-size" => "14px"),
-    CSS(".bt-collision-side-path",
-        "font-family" => "monospace",
-        "font-size" => "11px",
-        "color" => "var(--bt-text-muted)",
-        "white-space" => "nowrap",
-        "overflow" => "hidden",
-        "text-overflow" => "ellipsis"),
-
-    CSS(".bt-collision-stats",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "2px",
-        "font-size" => "13px"),
-    CSS(".bt-collision-label",
-        "color" => "var(--bt-text-muted)"),
-    CSS(".bt-collision-value",
-        "font-weight" => "600"),
-    CSS(".bt-collision-value-faint",
-        "color" => "var(--bt-text-muted)"),
-
-    CSS(".bt-collision-recent, .bt-collision-git",
-        "font-size" => "12px"),
-    CSS(".bt-collision-file-row, .bt-collision-git-row",
-        "display" => "flex",
-        "justify-content" => "space-between",
-        "gap" => "8px",
-        "padding" => "2px 0",
-        "white-space" => "nowrap",
-        "overflow" => "hidden"),
-    CSS(".bt-collision-file-path",
-        "font-family" => "monospace",
-        "overflow" => "hidden",
-        "text-overflow" => "ellipsis",
-        "flex" => "1 1 auto",
-        "min-width" => "0"),
-    CSS(".bt-collision-file-age",
-        "color" => "var(--bt-text-muted)",
-        "flex-shrink" => "0"),
-    CSS(".bt-collision-empty",
-        "color" => "var(--bt-text-muted)",
-        "font-style" => "italic",
-        "font-size" => "12px"),
-
-    CSS(".bt-collision-git-row",
-        "flex-direction" => "column",
-        "gap" => "2px",
-        "padding-bottom" => "6px"),
-    CSS(".bt-collision-git-path",
-        "font-family" => "monospace",
-        "font-size" => "12px"),
-    CSS(".bt-collision-git-ref",
-        "font-family" => "monospace",
-        "color" => "var(--bt-text-muted)",
-        "font-size" => "11px"),
-    CSS(".bt-collision-git-clean",
-        "color" => "#065f46",
-        "font-size" => "11px",
-        "margin-left" => "8px"),
-    CSS(".bt-collision-git-dirty",
-        "color" => "var(--bt-error, #b91c1c)",
-        "font-size" => "11px",
-        "margin-left" => "8px"),
-    CSS(".bt-collision-git-age",
-        "color" => "var(--bt-text-muted)",
-        "font-size" => "11px",
-        "margin-left" => "8px"),
-
-    CSS(".bt-collision-actions",
-        "display" => "flex",
-        "justify-content" => "flex-end",
-        "gap" => "8px",
-        "padding-top" => "8px",
-        "border-top" => "1px solid var(--bt-border)"),
 )
 
 # Normalize a path for use inside the picker / for JS string interpolation.
@@ -2256,7 +2147,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         error_obs[]  = ""
     end
 
-    cp_btn = Bonito.Button("→ Copy project"; style=nothing, class = "bt-btn bt-btn-secondary")
+    cp_btn = Bonito.Button("Copy project…"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, cp_btn.value) do clicked
         clicked || return
         if isempty(state.workers[]) || isempty(state.projects[])
@@ -2428,12 +2319,17 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.label("Source project"),
         map(session, state.projects, cp_src_worker) do projects, wid
             wid_projs = sort([p for p in values(projects) if p.worker_id == wid];
-                             by = p -> p.name)
+                             by = p -> lowercase(project_display_title(p)))
             isempty(wid_projs) ?
                 DOM.div("No projects on this worker";
                         style = Styles("color"=>"var(--bt-text-muted)", "font-size"=>"12px")) :
                 DOM.select(
-                    (DOM.option(p.name; value=p.id,
+                    # Listed by the name the user knows the chat by (its title,
+                    # or the folder when it has none), with the folder alongside
+                    # when the two differ.
+                    (DOM.option(project_display_title(p) == p.name ? p.name :
+                                    "$(project_display_title(p)) ($(p.name))";
+                                value=p.id,
                                 selected=p.id==cp_src_project[]) for p in wid_projs)...;
                     class = "bt-cp-src-project",
                     value = cp_src_project,
@@ -2704,254 +2600,93 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.div(DOM.h2("Agents"); class = "bt-section"),
         agents_block,
 
+        # Everything that is neither a worker nor a chat lives in ONE card of
+        # uniform rows, so the tail of the dashboard reads as one place rather
+        # than a stack of differently shaped sections.
+        DOM.div(DOM.h2("Settings"); class = "bt-section"),
         DOM.div(
-            DOM.h2("Copy project"),
-            # New project & GitHub clone moved to the per-worker cards; the
-            # dashboard keeps Copy because it genuinely crosses workers.
-            DOM.div(cp_btn; class = "bt-section-actions"),
-            class = "bt-section"),
-        form_block,
-
-        DOM.div(
-            DOM.h2("Defaults"),
-            DOM.div(
-                DOM.div("Applied to new & unconfigured chats; a chat's own picks override.";
-                        class = "bt-defaults-hint"),
-                session_defaults_bar(session, state);
-                class = "bt-section-body");
-            class = "bt-section bt-section-stack"),
-
-        debug_section(session, state, current_view);
+            settings_row("Defaults",
+                "Applied to new and unconfigured chats; a chat's own picks override.",
+                session_defaults_bar(session, state)),
+            # New project & GitHub clone live on the per-worker cards; Copy stays
+            # here because it genuinely crosses workers.
+            settings_row("Copy project",
+                "Snapshot a project's files onto another worker as a new project. " *
+                "To carry on a chat elsewhere, use that chat's ⋯ menu → Continue on.",
+                cp_btn),
+            debug_section(session, state, current_view);
+            class = "bt-card bt-settings"),
+        form_block;
 
         class = "bt-dash")
 end
 
+# One row of the Settings card: what it is (and why) on the left, the control
+# on the right. Rows wrap onto two lines when the pane is narrow.
+function settings_row(title::AbstractString, hint::AbstractString, control)
+    DOM.div(
+        DOM.div(DOM.div(title; class = "bt-settings-title"),
+                DOM.div(hint; class = "bt-settings-hint");
+                class = "bt-settings-text"),
+        DOM.div(control; class = "bt-settings-control");
+        class = "bt-settings-row")
+end
+
 # ── "Debug BonitoAgents" ────────────────────────────────────────────────────
-# Opens a chat whose working directory is this server's own source checkout, with
-# the `bt_dev_*` introspection tools attached (dev_api.jl). Lives at the bottom of
-# the dashboard: it's a power tool, not part of the normal flow, but it should be
-# ONE click away when something is wrong.
+# Opens a chat on a BonitoAgents source checkout on a worker the user picks, with
+# the `bt_dev_*` introspection tools attached (dev_api.jl). The last row of the
+# dashboard's Settings card: it's a power tool, not part of the normal flow, but
+# it should be ONE click away when something is wrong.
 #
-# It is only offered when the source is actually a checkout — a bundled install
-# has nothing to debug against, and a button that always failed would be worse
-# than no button.
+# The WORKER provides the checkout — the one it runs from, or a `dev --local`
+# clone into its environment (see `ensure_debug_project!`) — so nothing on the
+# server has to be a checkout, and the section is offered whenever a worker is
+# connected. Which worker matters: it is where the agent runs, edits, and what a
+# restart afterwards loads.
 function debug_section(session::Bonito.Session, state::ServerState,
                        current_view::Union{Observable{String},Nothing})
-    root = bonitoagents_repo_root()
-    (root === nothing || current_view === nothing) && return DOM.div()
+    current_view === nothing && return nothing
+    chosen = Observable("")
     status = Observable("")
+    # The picker follows the worker list: a worker that goes away is dropped and
+    # the choice falls back to the first connected one, so the button never
+    # targets a machine that isn't there.
+    picker = map(session, state.workers) do workers
+        online = sort([w for w in values(workers) if isopen(w)]; by = w -> w.name)
+        ids = [w.worker_id for w in online]
+        chosen[] in ids || (chosen[] = isempty(ids) ? "" : first(ids))
+        isempty(online) &&
+            return DOM.span("no worker connected"; class = "bt-debug-noworker")
+        return DOM.select(
+            (DOM.option(w.name; value = w.worker_id, selected = w.worker_id == chosen[])
+             for w in online)...;
+            class = "bt-debug-worker",
+            title = "The worker the debug chat runs on; its checkout is what the agent edits",
+            onchange = js"event => $(chosen).notify(event.target.value)")
+    end
     btn = DOM.button(map(s -> isempty(s) ? "Debug BonitoAgents" : s, status);
         class = "bt-btn bt-btn-secondary bt-debug-btn",
-        title = "Open a chat on this server's own source ($(root)) with live " *
-                "introspection into the running process",
+        title = "Open a chat on the BonitoAgents source, checked out on the chosen " *
+                "worker, with live introspection into this server",
         onclick = js"event => $(status).notify('__click__')")
     on(session, status) do s
         s == "__click__" || return
-        status[] = "Opening…"
+        wid = chosen[]
+        status[] = "Preparing the checkout… (a first run clones and precompiles)"
         Base.errormonitor(@async try
-            open_debug_chat!(state, current_view)
+            open_debug_chat!(state, current_view; worker_id = wid)
             safe_set!(status, "")
         catch e
-            @warn "opening the debug chat failed" exception = (e, catch_backtrace())
+            @warn "opening the debug chat failed" worker_id = wid exception = (e, catch_backtrace())
             safe_set!(status, first(split(sprint(showerror, e), '\n')))
         end)
     end
-    return DOM.div(
-        DOM.h2("Debug this server"),
-        DOM.div(
-            DOM.div("Opens a chat on $(root) — the source of the server you're " *
-                    "looking at — with tools that read its live state: workers, chats, " *
-                    "eval bridges, logs and memory. Edits there are edits to this app.";
-                    class = "bt-defaults-hint"),
-            btn;
-            class = "bt-section-body");
-        class = "bt-section bt-section-stack")
-end
-
-# ── Cross-worker sync modal ─────────────────────────────────────────────────
-# Surfaced from the chat header when a project has a same-named sibling on
-# another worker (see `same_name_siblings`). `sync_modal_state` is `nothing`
-# (hidden) or `(current, other, comparison)` where comparison comes from
-# `compare_projects`. The user picks a direction; `on_apply(src, dst)` runs the
-# directional overwrite via `sync_across_workers!`. Reuses the `bt-collision-*`
-# CSS that already ships in DashboardStyles.
-# One opened-modal instance. Rendered via `jsrender` so its three button
-# handlers register on the PER-RENDER sub-session (T22), not the long-lived
-# parent — `map(session, sync_modal_state)` frees that sub-session when the
-# modal closes / reopens, so handlers + the retained `comparison` don't pile up.
-struct SyncModalContent
-    state            :: ServerState
-    sync_modal_state :: Observable
-    on_apply         :: Function
-    c                :: Any   # (current, other, comparison) NamedTuple
-end
-
-function render_sync_modal(session::Bonito.Session,
-                            state::ServerState,
-                            sync_modal_state::Observable,
-                            on_apply::Function)
-    # Always return a SyncModalContent (c === nothing renders the hidden
-    # state inside jsrender): the map's output Observable takes the type of
-    # the FIRST result, and the modal always starts hidden — returning a
-    # DOM.div() here would pin the Observable to Node{HTMLSVG} and the
-    # later open (a SyncModalContent) would throw a convert MethodError.
-    map(session, sync_modal_state) do c
-        # Return a renderable: its jsrender runs in this map iteration's
-        # sub-session, so the button handlers it registers are freed when this
-        # value is superseded (modal closed or reopened) — fixing the handler
-        # accumulation (T22).
-        SyncModalContent(state, sync_modal_state, on_apply, c)
-    end
-end
-
-function Bonito.jsrender(session::Bonito.Session, m::SyncModalContent)
-    # Hidden state — no comparison to show.
-    m.c === nothing && return Bonito.jsrender(session, DOM.div())
-    state            = m.state
-    sync_modal_state = m.sync_modal_state
-    on_apply         = m.on_apply
-    c                = m.c
-    worker_label(id) = haskey(state.workers[], id) ? state.workers[][id].name : id
-    cur_label   = worker_label(c.current.worker_id)
-    other_label = worker_label(c.other.worker_id)
-
-    cur_side = sync_side_panel(
-        "$(cur_label) (this chat)", c.current.worker_path,
-        c.comparison.a,
-        c.comparison.a_source === :worker ? "live" : "server mirror")
-    other_side = sync_side_panel(
-        other_label, c.other.worker_path,
-        c.comparison.b,
-        c.comparison.b_source === :worker ? "live" : "server mirror")
-
-    # Highlight whichever side was edited more recently.
-    cur_mt   = Float64(c.comparison.a["latest_mtime"])
-    other_mt = Float64(c.comparison.b["latest_mtime"])
-    newer = cur_mt > other_mt ? :current : (other_mt > cur_mt ? :other : :tie)
-    if newer === :current
-        cur_side = DOM.div(cur_side; class = "bt-collision-newer")
-    elseif newer === :other
-        other_side = DOM.div(other_side; class = "bt-collision-newer")
-    end
-
-    push_btn = Bonito.Button("Use $cur_label → overwrite $other_label";
-        style = nothing, class = "bt-btn bt-btn-primary",
-        title = "Copy $(cur_label)'s files onto $other_label, overwriting it")
-    pull_btn = Bonito.Button("Use $other_label → overwrite $cur_label";
-        style = nothing, class = "bt-btn bt-btn-secondary",
-        title = "Copy $(other_label)'s files onto $cur_label, overwriting it")
-    cancel_btn = Bonito.Button("Cancel"; style = nothing,
-        class = "bt-btn bt-btn-ghost")
-    # Register on THIS render's session (freed when the modal closes/reopens).
-    on(session, push_btn.value) do clicked
-        clicked || return
-        on_apply(c.current, c.other)
-    end
-    on(session, pull_btn.value) do clicked
-        clicked || return
-        on_apply(c.other, c.current)
-    end
-    on(session, cancel_btn.value) do clicked
-        clicked || return
-        sync_modal_state[] = nothing
-    end
-
-    node = DOM.div(
-        DOM.div(
-            DOM.div(
-                DOM.h3("Sync '$(c.current.name)' across workers"),
-                DOM.div("This project exists on both $cur_label and $other_label. " *
-                        "Pick which side's files to keep — the other side is overwritten.";
-                        class = "bt-collision-sub")),
-            DOM.div(cur_side, other_side; class = "bt-collision-sides"),
-            DOM.div(cancel_btn, pull_btn, push_btn;
-                    class = "bt-collision-actions");
-            class = "bt-collision-card");
-        class = "bt-collision-overlay")
-    return Bonito.jsrender(session, node)
-end
-
-# One column of the side-by-side compare. Top line is the headline decision
-# signal (last edit time), then file/byte counts, then a short recent-files
-# list and a per-subrepo git breakdown.
-function sync_side_panel(title::AbstractString,
-                          path::AbstractString,
-                          summary::AbstractDict,
-                          source_label::AbstractString)
-    age_str    = format_relative_age(Float64(summary["latest_mtime"]))
-    n_files    = Int(summary["total_files"])
-    total_kb   = round(Int(summary["total_bytes"]) / 1024; digits = 1)
-    recent     = summary["recent_files"]
-    subrepos   = summary["git_subrepos"]
-
-    recent_rows = if isempty(recent)
-        [DOM.div("(no files)"; class = "bt-collision-empty")]
-    else
-        [DOM.div(
-            DOM.span(String(r["path"]); class = "bt-collision-file-path"),
-            DOM.span(format_relative_age(Float64(r["mtime"]));
-                     class = "bt-collision-file-age");
-            class = "bt-collision-file-row") for r in recent]
-    end
-
-    git_rows = if isempty(subrepos)
-        [DOM.div("no git sub-repos found"; class = "bt-collision-empty")]
-    else
-        [sync_git_row(g) for g in subrepos]
-    end
-
-    DOM.div(
-        DOM.div(title; class = "bt-collision-side-title"),
-        DOM.div(path; class = "bt-collision-side-path", title = String(path)),
-        DOM.div(
-            DOM.div(
-                DOM.span("Last edit: "; class = "bt-collision-label"),
-                DOM.span(age_str; class = "bt-collision-value")),
-            DOM.div(
-                DOM.span("Files: "; class = "bt-collision-label"),
-                DOM.span("$n_files ($(total_kb) KB)"; class = "bt-collision-value")),
-            DOM.div(
-                DOM.span("Source: "; class = "bt-collision-label"),
-                DOM.span(source_label; class = "bt-collision-value-faint"));
-            class = "bt-collision-stats"),
-        DOM.div(
-            DOM.h5("Recent files"),
-            recent_rows...;
-            class = "bt-collision-recent"),
-        DOM.div(
-            DOM.h5("Git sub-repos"),
-            git_rows...;
-            class = "bt-collision-git");
-        class = "bt-collision-side")
-end
-
-function sync_git_row(g::AbstractDict)
-    head = String(get(g, "head_sha", ""))
-    short_sha = isempty(head) ? "(no head)" : (length(head) >= 7 ? head[1:7] : head)
-    dirty = Int(get(g, "dirty_count", 0))
-    branch = String(get(g, "branch", ""))
-    head_time = Float64(get(g, "head_time", 0.0))
-    dirty_str = dirty == 0 ? "clean" : "$dirty dirty"
-    DOM.div(
-        DOM.div(String(g["path"]); class = "bt-collision-git-path"),
-        DOM.div(
-            DOM.span("$branch @ $short_sha"; class = "bt-collision-git-ref"),
-            DOM.span(dirty_str; class = dirty == 0 ?
-                "bt-collision-git-clean" : "bt-collision-git-dirty"),
-            DOM.span(format_relative_age(head_time); class = "bt-collision-git-age"));
-        class = "bt-collision-git-row")
-end
-
-# "5m ago" / "3h ago" / "2d ago" — short, glanceable.
-function format_relative_age(t::Float64)
-    t <= 0 && return "—"
-    Δ = time() - t
-    Δ < 0    && return "in the future"
-    Δ < 60   && return "$(round(Int, Δ))s ago"
-    Δ < 3600 && return "$(round(Int, Δ / 60))m ago"
-    Δ < 86400 && return "$(round(Int, Δ / 3600))h ago"
-    Δ < 86400 * 30 && return "$(round(Int, Δ / 86400))d ago"
-    return "$(round(Int, Δ / (86400 * 30)))mo ago"
+    return settings_row("Debug BonitoAgents",
+        "Opens a chat on the BonitoAgents source, checked out on the worker you pick " *
+        "(dev --local into its environment, at this server's revision), with tools that " *
+        "read this server's live state: workers, chats, eval bridges, logs and memory. " *
+        "Restart that worker to run what was edited there.",
+        DOM.div(picker, btn; class = "bt-debug-row"))
 end
 
 # Thin shim for callers that want a standalone dashboard App (tests, the

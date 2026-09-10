@@ -3,6 +3,13 @@ const ASSETS_DIR    = normpath(joinpath(@__DIR__, "..", "assets"))
 # Monorepo root (sibling of BonitoAgents/) — contains BonitoMCP/, BonitoWorker/, AgentClientProtocol/.
 const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
+# The public repository workers are installed from, and the monorepo packages
+# `install.jl` puts into a worker's `@bonito-agents` environment from it (its
+# `SPECS`; keep the two in step). The "Debug BonitoAgents" chat develops these
+# same packages from a clone of this repo on the worker (`ensure_debug_project!`).
+const WORKER_REPO_URL = "https://github.com/SimonDanisch/BonitoAgents.jl"
+const WORKER_REPO_PACKAGES = ["RemoteSync", "BonitoWorker", "BonitoMCP", "AgentProviders"]
+
 # The worker installer is a cross-platform Julia script (`curl … | julia -`).
 # It Pkg.add's BonitoWorker + BonitoMCP from the public GitHub repo into a
 # shared `@bonito-agents` env — no tar bundle, no per-package source trees, runs
