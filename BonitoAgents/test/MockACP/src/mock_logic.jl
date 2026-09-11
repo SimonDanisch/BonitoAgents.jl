@@ -806,9 +806,10 @@ function run_dispatcher_prompt(prompt_id)
             end
         elseif et == "codex_image"
             # Codex's image VIEW: a `resource_link` naming a file on the worker,
-            # not the bytes (verified against codex-acp 1.11.0
-            # `createImageViewUpdate`). claude/kimi send `ImageContent` instead,
-            # so this is the only dialect that makes the chat fetch the file.
+            # not the bytes. Frame shape copied from the real capture in
+            # AgentClientProtocol/test/fixtures/codex_image_view.jsonl —
+            # claude/kimi send `ImageContent` instead, so this is the only
+            # dialect that makes the chat go and fetch the file.
             tid  = String(get(ev, "id", "cximg-$(next_tool_id)")); next_tool_id += 1
             path = String(ev["path"])
             upd("tool_call", Dict{String,Any}(

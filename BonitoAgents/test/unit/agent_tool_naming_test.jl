@@ -98,6 +98,25 @@
         @test BonitoAgents.editable_path_from(Dict{String,Any}(), ed.content) == d.path
     end
 
+    # Codex's image view. It is the only agent that sends an image as a
+    # REFERENCE to a file on the worker rather than base64 bytes, so all the
+    # card needs has to come off that one block: the path to fetch, a mime so
+    # the client treats it as media, and a summary that names the file (the
+    # symptom of dropping it was a "(empty)" body under "0 bytes").
+    @testset "codex image view carries everything the card needs" begin
+        tc = replay_tool("codex_image_view.jsonl")
+        m  = BonitoAgents.replayed_tool_msg(tc)
+        @test m isa BonitoAgents.ReadToolMsg
+        link = only([c for c in tc.content if c isa ACP.ResourceLink])
+        @test ACP.resource_link_path(link) == "/tmp/codexprobe/probe_shot.png"
+        # From `rawInput.path` — this is what the ✎ affordance opens.
+        @test m.file_path == "/tmp/codexprobe/probe_shot.png"
+        # Recognised as media, which is what puts the card in native-image mode.
+        @test BonitoAgents.tool_media_mime(tc.content) == "image/png"
+        @test BonitoAgents.content_summary(BonitoAgents.ReadToolMsg, tc.content) ==
+              "probe_shot.png"
+    end
+
     # Kimi's NATIVE tools. Two independent things have to line up: the name has
     # to survive (it is only in the opening title), and the argument keys differ
     # from claude's (`path` vs `file_path`), each of which alone leaves the card
