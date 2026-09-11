@@ -2,7 +2,7 @@
 #
 # They ask the RUNNING BonitoAgents server about itself over the control channel
 # this MCP process already holds (`call_server`): live workers and chats, memory
-# and leak counters, the server's own log ring, and a small set of orchestration
+# and leak counters, the server's own logs, and a small set of orchestration
 # ops. The server implements every op in `dev_api.jl`; this file is the schema +
 # the presentation.
 #
@@ -118,38 +118,80 @@ register!("bt_dev_inspect", DEV_INSPECT_DESCRIPTION,
     available = dev_tools_enabled)
 
 const DEV_LOGS_DESCRIPTION = """
-Read the BonitoAgents server's own log ring — the `@info` / `@warn` / `@error`
-records the running process emitted, newest last.
+Read logs from ANY machine in the fleet — the server's in-memory ring, or the log
+FILE that the server and every worker write.
 
-The ring is in memory and bounded, so it holds the recent past, not history.
-Filter it rather than dumping it:
-  • `limit`    — how many records to return (default 100, newest kept).
-  • `level`    — minimum level: "debug", "info", "warn", "error".
-  • `contains` — case-insensitive substring the message or its key/values must
-                 contain (e.g. a project id, "worker", "eval bridge").
+`source` picks which, and it is the important argument:
+  • omitted / "ring" — the SERVER's own `@info`/`@warn`/`@error` ring. In memory,
+    bounded, dies with the process.
+  • "server"         — the server's log file.
+  • a worker's name or id ("MacBook", "Bosgame", …) — that worker's log file,
+    read on that machine.
+  • "all"            — the server plus every connected worker, in one reply.
 
-Each record carries its timestamp, level, module, source location and the
-key/value pairs the log site attached — so a warning about a specific chat can be
-traced back to the exact line that emitted it.
+Reach for the FILE, not the ring, when the ring cannot have the answer — and it
+often cannot. The file is a redirect of the process's stdout and stderr, so it
+holds three things no logger ever sees:
+  • "UNHANDLED TASK ERROR" — `errormonitor` prints it straight to stderr;
+  • the runtime's fatal-signal thread dump, written from C on SIGTERM/SIGSEGV;
+  • anything from BEFORE the last restart, since the ring starts empty at boot —
+    which is exactly the window you want when a process was restarted for hanging.
+
+You are running on ONE worker, and nothing but the server runs on the server
+host. Every other machine's log is reachable only through this tool, so a
+cross-machine question ("the server stopped answering — what did the other
+workers see?") is one call with source="all".
+
+Filters, applied to whichever source you picked:
+  • `limit`    — records/lines (ring default 100, file default 200, cap 2000).
+  • `level`    — ring only: minimum "debug" / "info" / "warn" / "error".
+  • `contains` — substring match, case-insensitive.
+  • `since` / `until` — file only: "2026-09-11 14:40" or "2026-09-11T14:40",
+    and spanning a restart is fine. They match our own timestamped records;
+    untimestamped lines (stack traces, a signal dump) are kept with the record
+    above them, so a trace never gets sliced off the line that raised it. If a
+    log predates the timestamping logger the reply says so rather than coming
+    back empty.
+
+A machine that has no log file yet answers `ok: false` with the reason rather
+than failing the call, so a fan-out over the fleet still returns everyone else.
 """
 
 register!("bt_dev_logs", DEV_LOGS_DESCRIPTION,
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
-            "limit"    => Dict("type" => "integer", "description" => "Max records (default 100)."),
+            "source"   => Dict("type" => "string",
+                               "description" => "\"ring\" (default, the server's in-memory log), " *
+                                                "\"server\" (the server's log file), a worker " *
+                                                "name/id, or \"all\" for every machine."),
+            "limit"    => Dict("type" => "integer",
+                               "description" => "Max records/lines (ring 100, file 200; cap 2000)."),
             "level"    => Dict("type" => "string", "enum" => ["debug", "info", "warn", "error"],
-                               "description" => "Minimum level to include."),
+                               "description" => "Ring only: minimum level to include."),
             "contains" => Dict("type" => "string",
                                "description" => "Case-insensitive substring filter."),
+            "since"    => Dict("type" => "string",
+                               "description" => "Log file only: e.g. \"2026-09-11 14:40\"."),
+            "until"    => Dict("type" => "string",
+                               "description" => "Log file only: upper bound, same format as since."),
         ),
     ),
     function (args::AbstractDict)
-        limit = get(args, "limit", 100)
-        return dev_call("logs";
-                        limit = limit isa Integer ? Int(limit) : tryparse(Int, String(limit)),
-                        level = String(get(args, "level", "info")),
-                        contains = String(get(args, "contains", "")))
+        limit = get(args, "limit", nothing)
+        # Defaulted on the SERVER, not here: the sensible default differs per
+        # source (ring 100, file 200) and the server is what knows which.
+        kw = Dict{Symbol,Any}(
+            :source   => String(get(args, "source", "")),
+            :level    => String(get(args, "level", "info")),
+            :contains => String(get(args, "contains", "")),
+            :since    => String(get(args, "since", "")),
+            :until    => String(get(args, "until", "")))
+        limit === nothing ||
+            (kw[:limit] = limit isa Integer ? Int(limit) : tryparse(Int, String(limit)))
+        # A fan-out shells out on every machine in the fleet; one default-timeout
+        # worth of patience is not enough for six of them.
+        return dev_call("logs"; timeout = 120.0, kw...)
     end;
     available = dev_tools_enabled)
 

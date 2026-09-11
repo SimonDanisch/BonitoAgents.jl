@@ -156,11 +156,13 @@ function run_suite(server)
                 "document.querySelector('$(panel_sel("logo.png")) .bt-file-editor-path').textContent.endsWith('logo.png')") == true
         end
 
-        @testset "a folder still toasts and opens no panel" begin
+        @testset "a folder still refuses and opens no panel" begin
             # The guard's remaining job: things that cannot be opened AT ALL.
+            # The refusal lands in the window's ONE progress card as an error —
+            # which, unlike the toast it replaced, does not expire on a timer.
             TK.eval_js(server, open_file("subdir"))
-            @test TK.wait_for(server, "folder refusal toast",
-                "[...document.querySelectorAll('.bt-toast-text')].some(t => (t.textContent||'').includes('subdir'))";
+            @test TK.wait_for(server, "folder refusal shown in the progress card",
+                "[...document.querySelectorAll('.bt-prog-err .bt-prog-title')].some(t => (t.textContent||'').includes('subdir'))";
                 timeout = 15) == true
             @test TK.eval_js(server,
                 "document.querySelectorAll('$(panel_sel("subdir"))').length") == 0

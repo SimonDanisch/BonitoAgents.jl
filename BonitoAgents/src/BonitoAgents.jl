@@ -42,7 +42,7 @@ bonito_asset(parts::AbstractString...) =
     Bonito.Asset(joinpath(pkgdir(@__MODULE__)::String, "assets", parts...))
 
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
-include("progress.jl")         # notify_progress / format_progress_string — shared by sync + import
+include("progress.jl")         # notify_progress + the window's ONE progress card (BusyState)
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ACP bring-up payload helpers (mcp list, system prompt)
 include("agents.jl")           # WorkerAgent (server-side live agent over the worker WS)

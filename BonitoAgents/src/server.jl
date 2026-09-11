@@ -63,7 +63,8 @@ function serve(; host::String        = "0.0.0.0",
                  state_dir::Union{String,Nothing}   = nothing,
                  working_dir::Union{String,Nothing} = nothing,
                  heartbeat_interval::Real = 15.0,
-                 heartbeat_deadline::Real = 45.0)
+                 heartbeat_deadline::Real = 45.0,
+                 log_file::Union{String,Nothing} = nothing)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
     isvalid(s) = s !== nothing && !isempty(String(s))
@@ -76,6 +77,23 @@ function serve(; host::String        = "0.0.0.0",
     # debug chat's `bt_dev_logs` sees the whole life of the server rather than
     # "everything after the first browser connected". Idempotent + process-wide
     # (the logger is); a second `serve()` in the same process shares the ring.
+    #
+    # The FILE comes first and the ring second: the file is a redirect of fd 1
+    # and 2, so it also catches what never reaches a logger at all — an
+    # `errormonitor` task death, the runtime's fatal-signal thread dump — and it
+    # is the only one of the two that survives the restart you do when a server
+    # hangs.
+    #
+    # OPT-IN, and it defaults OFF on purpose. This REDIRECTS fd 1 and 2, so a
+    # library that did it by default would silently swallow the output of every
+    # caller — a REPL, a script, a test runner (nine unit tests call `serve()`
+    # directly, and the first version of this took their stdout with it). The
+    # SERVER BINARY asks for it; nothing else does. `""` means "the default path
+    # under state_dir".
+    if log_file !== nothing
+        BonitoWorker.start_file_log!(isempty(log_file) ?
+            joinpath(sd, "logs", "server.log") : log_file)
+    end
     install_log_ring!()
     SERVER_STARTED[] == 0.0 && (SERVER_STARTED[] = time())
 

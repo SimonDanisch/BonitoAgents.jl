@@ -310,7 +310,12 @@ function run_server(args)
         public_url    = get(opts, "public-url", ""),
         worker_secret = secret,
         state_dir     = state_dir,
-        working_dir   = working_dir)
+        working_dir   = working_dir,
+        # THIS is the process that should own its stdout: a long-running daemon
+        # whose output nobody is watching. `""` = <state-dir>/logs/server.log,
+        # which is what `bt_dev_logs(source="server")` reads back. `serve()`
+        # itself defaults to no redirect — see the note there.
+        log_file      = get(opts, "log-file", ""))
     block_until_interrupt()
     return 0
 end

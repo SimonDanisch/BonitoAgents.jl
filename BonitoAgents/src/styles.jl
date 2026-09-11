@@ -183,6 +183,108 @@ const BASE_CSS = [
     CSS(".bt-modal-card .bt-form",
         "background" => "transparent", "border" => "0",
         "padding" => "0", "margin-top" => "12px"),
+
+    # ── The one progress card (progress.jl::progress_overlay) ────────────────
+    # Top-centered and fixed, because it must be findable from anywhere and must
+    # not sit where the user is typing (the toast it replaces hovered over the
+    # composer). It is one line tall while work runs and only grows for an
+    # error, which is the one state that is worth reading.
+    CSS(".bt-prog",
+        "position" => "fixed",
+        "top" => "10px", "left" => "50%",
+        "transform" => "translateX(-50%)",
+        "z-index" => "9998",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "var(--bt-space-2)",
+        "min-width" => "min(320px, 92vw)",
+        "max-width" => "min(760px, 92vw)",
+        "padding" => "8px 10px 8px 12px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "var(--bt-radius)",
+        "box-shadow" => "var(--bt-shadow-md)",
+        "font-size" => "var(--bt-text-sm)",
+        "color" => "var(--bt-text)"),
+    CSS(".bt-prog.bt-prog-idle", "display" => "none"),
+    CSS(".bt-prog.bt-prog-run", "border-color" => "var(--bt-accent)"),
+    # An OUTCOME fades itself out, with no timer anywhere in Julia or JS: the
+    # root's className is re-assigned on every state change, so entering :ok
+    # starts this animation and leaving it removes the rule outright.
+    CSS(".bt-prog.bt-prog-ok",
+        "border-color" => "var(--bt-success)",
+        "animation" => "bt-prog-fade 4.5s ease-in forwards"),
+    CSS("@keyframes bt-prog-fade",
+        CSS("0%",   "opacity" => "1"),
+        CSS("80%",  "opacity" => "1"),
+        CSS("100%", "opacity" => "0", "visibility" => "hidden")),
+    CSS(".bt-prog.bt-prog-err", "border-color" => "var(--bt-error)"),
+    CSS(".bt-prog-row",
+        "display" => "flex", "align-items" => "center",
+        "gap" => "var(--bt-space-2)", "min-width" => "0"),
+    CSS(".bt-prog-title",
+        "font-weight" => "600", "flex" => "0 0 auto",
+        "white-space" => "nowrap"),
+    CSS(".bt-prog-pct",
+        "font-variant-numeric" => "tabular-nums",
+        "color" => "var(--bt-text-muted)",
+        "flex" => "0 0 auto"),
+    # The only elastic part: a scrolling file path must never widen the card or
+    # push the buttons out of reach.
+    CSS(".bt-prog-msg",
+        "color" => "var(--bt-text-muted)",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "var(--bt-text-xs)",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap"),
+    # Spinner only while something is actually in flight — a still card with a
+    # spinning dot is how "stuck" and "working" become indistinguishable.
+    CSS(".bt-prog-spin", "display" => "none"),
+    CSS(".bt-prog-run .bt-prog-spin",
+        "display" => "block",
+        "width" => "11px", "height" => "11px", "flex" => "0 0 auto",
+        "border" => "2px solid var(--bt-border-strong)",
+        "border-top-color" => "var(--bt-accent)",
+        "border-radius" => "50%",
+        "animation" => "bt-prog-spin 0.7s linear infinite"),
+    CSS("@keyframes bt-prog-spin",
+        CSS("from", "transform" => "rotate(0deg)"),
+        CSS("to",   "transform" => "rotate(360deg)")),
+    # Determinate bar, only for transfers that know their total.
+    CSS(".bt-prog-bar", "display" => "none"),
+    CSS(".bt-prog-run .bt-prog-bar",
+        "display" => "block",
+        "height" => "3px",
+        "background" => "var(--bt-border)",
+        "border-radius" => "999px",
+        "overflow" => "hidden"),
+    CSS(".bt-prog-fill",
+        "height" => "100%", "width" => "0%",
+        "background" => "var(--bt-accent)",
+        "transition" => "width 0.12s linear"),
+    # The error body: selectable, scrollable, and shown for :err only. `Copy`
+    # is next to it for when selecting in a moving card is not the point.
+    CSS(".bt-prog-detail", "display" => "none"),
+    CSS(".bt-prog-err .bt-prog-detail",
+        "display" => "block",
+        "margin" => "0",
+        "max-height" => "min(40vh, 320px)",
+        "overflow" => "auto",
+        "white-space" => "pre-wrap",
+        "word-break" => "break-word",
+        "user-select" => "text",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "var(--bt-text-xs)",
+        "color" => "var(--bt-text-muted)",
+        "background" => "var(--bt-surface-2)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "padding" => "6px 8px"),
+    # Copy belongs to the error state; dismissing a running transfer would only
+    # hide it (the work keeps going), so ✕ is for the states that have ended.
+    CSS(".bt-prog-copy", "display" => "none"),
+    CSS(".bt-prog-err .bt-prog-copy", "display" => "inline-flex"),
+    CSS(".bt-prog-close", "flex" => "0 0 auto"),
+    CSS(".bt-prog-run .bt-prog-close", "display" => "none"),
 ]
 
 const ChatStyles = Bonito.Styles(
@@ -1075,7 +1177,29 @@ const ChatStyles = Bonito.Styles(
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "8px 12px",
         "cursor" => "pointer",
+        # Backstop. Every elastic child above is allowed to shrink, so this
+        # should never engage — but if a future child forgets to, it clips
+        # inside the card instead of pushing the duration off the screen.
+        "overflow" => "hidden",
         "transition" => "background 80ms"),
+    # Container for the width-dependent rules below. The tool row's room is
+    # decided by the message column, not the viewport: the same phone shows a
+    # roomy row with the sidebar collapsed and a cramped one without.
+    CSS(".bt-messages", "container-type" => "inline-size"),
+    # Phone-width message column: the summary goes entirely (the expanded body
+    # says the same thing, at length) and the full-width toggle with it — that
+    # button only makes sense where there is width to expand INTO. What is left
+    # is what the row is for: which tool, how long, and how it ended.
+    CSS("@container (max-width: 560px)",
+        CSS(".bt-tool-summary", "display" => "none"),
+        # Matching the `[data-expanded="true"]` rule above selector-for-selector
+        # on purpose: a container query adds NO specificity, so a bare
+        # `.bt-tool-fullwidth` here loses to it and the button stays put. "Expand
+        # to full chat width" is a no-op where the chat already IS the width, so
+        # the ~28px it costs the title is better spent on the title.
+        CSS(".bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
+            "display" => "none"),
+        CSS(".bt-tool-title", "min-width" => "0")),
     # The title / summary / server badge carry the actual content the user
     # wants to grab — show a text cursor there so the affordance is obvious.
     CSS(".bt-tool-title, .bt-tool-summary, .bt-tool-server",
@@ -1110,14 +1234,34 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-surface-2)",
         "border-radius" => "999px",
         "padding" => "1px 7px"),
+    # ── What yields when the header runs out of room ─────────────────────────
+    # The order is deliberate, and it is the one thing this row has to get
+    # right on a narrow pane: the TIMER and the STATUS never move (both
+    # `flex-shrink: 0`, and they sit after everything elastic), the summary
+    # collapses first, the title keeps a readable stub.
+    #
+    # It used to be the other way round. `.bt-tool-summary` was `flex-shrink: 0`
+    # with `nowrap`, so it could not yield an inch: the title shrank away to a
+    # single character and then the summary shoved the timer and the status
+    # clean out of the card. Measured on a 392px phone viewport, header 70→382:
+    # a 20-character summary overflowed by 52px and put the status pill at
+    # 335→407; at 80 characters it was at 700→772. That is the "you cannot see
+    # how long a tool ran on mobile" bug — the duration was rendered, just
+    # outside the box.
     CSS(".bt-tool-title",
-        "flex" => "1 1 auto", "min-width" => "0",
+        # A floor, not zero: a title ellipsized to "B" identifies nothing.
+        "flex" => "1 1 auto", "min-width" => "3.5rem",
         "font-family" => "ui-monospace, monospace", "font-size" => "12px",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
     CSS(".bt-tool-summary",
         "color" => "var(--bt-text-muted)", "font-size" => "11.5px",
-        "flex-shrink" => "0",
+        # Shrink factor 100 against the title's 1: flex weights shrinkage by
+        # base size, and the title's base (a long path) dwarfs the summary's, so
+        # an equal factor would take it out of the title first. This makes the
+        # summary give way while the title still reads.
+        "flex" => "0 100 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
 
     # Tool status — slim pill, harmonized with dashboard

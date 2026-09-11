@@ -41,8 +41,8 @@
                 c.__bt_chat.comm.notify({type: 'edit_file', id: '', path: 'zombie_probe.txt'});
                 return true;
             })()""")
-            @test TK.wait_for(z, "fail-closed toast within the stat timeout",
-                "[...document.querySelectorAll('.bt-toast')].some(t => t.innerText.includes('zombie_probe.txt'))";
+            @test TK.wait_for(z, "fail-closed message within the stat timeout",
+                "[...document.querySelectorAll('.bt-prog-err')].some(t => t.innerText.includes('zombie_probe.txt'))";
                 timeout = 9) == true
         end
 

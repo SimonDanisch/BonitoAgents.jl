@@ -158,11 +158,34 @@
             @test TK.eval_js(server, continue_items) == ["worker-b"]
             @test TK.eval_js(server, click_continue("worker-b")) == true
 
+            # ── The move reports into the window's ONE progress card ─────────
+            # The move stops this chat's session, which prunes the pane it was
+            # started from — so its progress cannot live in the header. It goes
+            # to the window-level card, which STAYS UP for the whole move. This
+            # used to be a 3.2 s toast re-flashed once per transferred FILE:
+            # feedback that looked like a popup loop and told the user nothing
+            # about whether the move was progressing.
+            @test TK.eval_js(server, "document.querySelectorAll('.bt-prog').length") == 1
+            @test TK.wait_for(server, "the progress card names the move",
+                """(() => { const c = document.querySelector('.bt-prog');
+                    if (!c || c.classList.contains('bt-prog-idle')) return false;
+                    return /Continu(ing|ed) on worker-b/.test(
+                        c.querySelector('.bt-prog-title')?.textContent || ''); })()""";
+                timeout = 120) == true
+
             # The header shows B's path once the chat is re-bound and rebuilt.
             proj_dir_b_expected = BT.worker_join(worker_b.projects_root, p.name)
             @test TK.wait_for(server, "header shows the chat on B",
                 "$(header_env) === $(TK.json(replace(proj_dir_b_expected, homedir() => "~")))";
                 timeout = 120) == true
+
+            # …and ends in the DONE state saying what the agent kept. Not
+            # "the card disappears": a FAILED move parks it in `.bt-prog-err`,
+            # and an assertion on "gone" would pass for either outcome.
+            @test TK.wait_for(server, "the progress card reports the move done",
+                """(() => { const c = document.querySelector('.bt-prog.bt-prog-ok');
+                    return !!c && (c.querySelector('.bt-prog-title')?.textContent || '')
+                        .includes('Continued on worker-b'); })()"""; timeout = 120) == true
 
             # ── Atomic flip of worker_id / worker_path ───────────────────────
             @test p.worker_id == target_id

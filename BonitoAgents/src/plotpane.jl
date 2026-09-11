@@ -28,10 +28,15 @@ struct PlotPane
     workspace  :: Base.RefValue{Any}
     # `bt_show_app` detach: a tool_id pulse → float (or focus) that embed's panel.
     detach_app  :: Observable{String}
-    # Transient window-level notice. Setting a non-empty string flashes a toast
-    # that auto-dismisses in JS — reachable from the editor open-guard via
-    # `model.plotpane` so a file we can't open says so instead of opening blank.
-    toast       :: Observable{String}
+    # The window's ONE progress/notice channel — a `BusyState` snapshot
+    # (progress.jl) rendered by the single `progress_overlay` card the shell
+    # mounts. Long-running work (a chat's "continue on worker", the dashboard's
+    # syncs, imports and copies) reports into it with
+    # `busy_start!`/`busy_event!`/`busy_done!`/`busy_fail!`; one-line notices go
+    # through `show_toast!` / `show_problem!` below. Reachable from chat code via
+    # `model.plotpane`, which is how a file that won't open says so instead of
+    # opening blank.
+    progress    :: Observable{Any}
     # "Show this project in this window" — a project id pulse that
     # `install_workspace!` forwards to the window's `current_view`. Chat-side
     # code reaches the window through `model.plotpane` and nothing else, so this
@@ -40,40 +45,33 @@ struct PlotPane
     navigate    :: Observable{String}
 end
 
-PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""), Observable(""), Observable(""))
+PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""),
+                      Observable{Any}(BUSY_IDLE), Observable(""))
 
 """
     show_toast!(pane::PlotPane, msg)
 
-Flash a transient notice in the window. No-op when `pane` is `nothing` (chat
-rendered outside the unified shell). Re-sends even if the text is unchanged so
-two identical failures still each blink.
+Report a one-line OUTCOME in the window's progress card ("Continued on Bosgame",
+"Can't open foo.bin"). It shows for a few seconds and fades. No-op when `pane`
+is `nothing` (chat rendered outside the unified shell).
+
+For a FAILURE use [`show_problem!`](@ref) instead: a message the user has to act
+on must not be on a timer.
 """
-function show_toast!(pane::PlotPane, msg::AbstractString)
-    # notify=true forces a fire even when the string equals the current value,
-    # so clicking the same un-openable file twice re-shows the toast.
-    pane.toast[] = ""
-    pane.toast[] = String(msg)
-    return nothing
-end
+show_toast!(pane::PlotPane, msg::AbstractString) = busy_done!(pane.progress, msg)
 show_toast!(::Nothing, ::AbstractString) = nothing
 
-# Window-level toast layer — one transient bubble bound to `pane.toast`. A
-# non-empty value shows it for ~3.2s then fades; the JS owns the timer so the
-# server never has to schedule a clear. Mounted once in the window shell.
-function plotpane_toast_layer(session::Bonito.Session, pane::PlotPane)
-    node = DOM.div(DOM.span(pane.toast; class = "bt-toast-text");
-                   class = "bt-toast", dataShown = "false")
-    Bonito.onjs(session, pane.toast, js"""(msg) => {
-        const el = $(node);
-        if (!el) return;
-        if (!msg) { el.dataset.shown = 'false'; return; }
-        el.dataset.shown = 'true';
-        if (el.__btToastTimer) clearTimeout(el.__btToastTimer);
-        el.__btToastTimer = setTimeout(() => { el.dataset.shown = 'false'; }, 3200);
-    }""")
-    return node
-end
+"""
+    show_problem!(pane::PlotPane, headline, detail = "")
+
+Report a failure in the window's progress card. It STAYS until the user
+dismisses it and its text is selectable and copyable — the whole reason this is
+not a toast. `detail` is the full error (see `error_detail`); the headline says
+which operation failed.
+"""
+show_problem!(pane::PlotPane, headline::AbstractString, detail::AbstractString = "") =
+    busy_fail!(pane.progress, headline, detail)
+show_problem!(::Nothing, ::AbstractString, ::AbstractString = "") = nothing
 
 file_tab_id(path::AbstractString) = "file:" * String(path)
 # Per-embed panel id. One panel per detached `bt_show_app`, keyed by its tool id

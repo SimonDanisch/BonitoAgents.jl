@@ -464,7 +464,7 @@ function handle_eval_ws(state::ServerState, ws)
             end
         end
     catch e
-        e isa HTTP.WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError ||
+        is_peer_gone(e) ||
             @warn "eval dial-back relay loop ended" exception = (e, catch_backtrace())
     finally
         close(outbound)   # stop the writer task
@@ -734,6 +734,13 @@ end
 # on), and BonitoMCP derives the eval-ws path from it. That keeps the two
 # dial-backs (worker-control WS + eval WS) keyed off the same proven URL
 # and avoids the server having to guess its own outward-facing address.
+# The name of the ONE MCP server we inject into every chat (see
+# `bring_up_project_session!`). Named in a const because two places need to agree
+# on it: the one that builds the server, and `refresh_injected_env` — which must
+# re-point OURS and leave any other entry alone rather than handing a stranger
+# `BONITOAGENTS_SECRET`.
+const INJECTED_MCP_NAME = "btworker"
+
 function eval_dialback_env(state::ServerState, project_id::AbstractString)
     env = Dict{String,String}(
         "BONITOAGENTS_SECRET"     => state.worker_secret,
@@ -746,6 +753,32 @@ function eval_dialback_env(state::ServerState, project_id::AbstractString)
     p = get(state.projects[], String(project_id), nothing)
     p !== nothing && p.dev_mode && (env["BONITOAGENTS_DEV_TOOLS"] = "1")
     return env
+end
+
+"""
+    refresh_injected_env(mcp, state, project_id) -> Vector{MCPServer}
+
+`mcp` with OUR injected server's environment re-derived from live state, ready
+to spawn. Everything else about it (command, args) and every other entry is left
+untouched.
+
+Called from `start!(::WorkerAgent)` so the environment an MCP process is spawned
+with always reflects the project as it is NOW, not as it was when the chat's
+`WorkerAgent` was constructed. `MCPServer` is immutable, so this rebuilds the
+one entry rather than mutating it.
+
+An empty `project_id` (no project matched the agent's worker + path) means there
+is nothing to derive from, so the existing environment is kept — overwriting it
+with `eval_dialback_env(state, "")` would blank the project id the MCP needs to
+dial back with.
+"""
+function refresh_injected_env(mcp::AbstractVector{ACP.MCPServer}, state::ServerState,
+                              project_id::AbstractString)
+    (isempty(mcp) || isempty(project_id)) && return mcp
+    env = eval_dialback_env(state, project_id)
+    return ACP.MCPServer[s.name == INJECTED_MCP_NAME ?
+                         ACP.MCPServer(s.name, s.command; args = s.args, env = env) : s
+                         for s in mcp]
 end
 
 # ── Host-side page-root wiring (per stable browser tab root session) ─────────

@@ -188,21 +188,17 @@
                 "$(btn_center_js("Copy")) !== null"; timeout = 10) == true
             real_click!(ctx, ECT.JS(btn_center_js("Copy")))
 
-            # Busy card must become visible (transfer started).
-            @test TK.wait_for(server, "busy card visible",
-                """(() => {
-                    const b = document.querySelector('.bt-busy-card');
-                    return b !== null && !b.classList.contains('bt-busy-hidden');
-                })()"""; timeout = 20) == true
+            # The window's one progress card must come up (transfer started).
+            @test TK.wait_for(server, "progress card running",
+                "document.querySelector('.bt-prog.bt-prog-run') !== null"; timeout = 20) == true
 
             TK.screenshot(server, joinpath(tempdir(), "copy_project_busy.png"))
 
-            # Wait for the busy card to clear (rsync + WS push complete).
+            # …and reach its DONE state (rsync + WS push complete). Not
+            # "disappears": a failure now parks the card in `.bt-prog-err`, and
+            # a test that waited for "gone" would pass on either.
             @test TK.wait_for(server, "transfer completes",
-                """(() => {
-                    const b = document.querySelector('.bt-busy-card');
-                    return b === null || b.classList.contains('bt-busy-hidden');
-                })()"""; timeout = 120) == true
+                "document.querySelector('.bt-prog.bt-prog-ok') !== null"; timeout = 120) == true
 
             TK.screenshot(server, joinpath(tempdir(), "copy_project_done.png"))
         end

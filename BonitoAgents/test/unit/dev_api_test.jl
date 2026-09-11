@@ -138,6 +138,72 @@ end
                 Dict("section" => "worker", "worker_id" => "no-such-worker"))
         end
 
+        @testset "logs reach every machine, not just the one we sit on" begin
+            # A dev-mode chat runs on a WORKER and nothing but the server runs on
+            # the server host, so without this the agent can read exactly one
+            # machine's log: its own. That is how the 2026-09-11 hang went — the
+            # worker log was local, the SERVER's had to be pasted in by hand.
+
+            # The default source is still the in-memory ring, unchanged.
+            ring = BT.dev_request(st, "logs", Dict("limit" => 5))
+            @test haskey(ring, "records") && haskey(ring, "capacity")
+            @test BT.dev_request(st, "logs", Dict("source" => "ring"))["records"] isa AbstractVector
+
+            # A file source answers with the SAME shape whichever machine it is,
+            # so a fan-out is a vector of these and nothing special-cases the
+            # server. `ok` is false for the server under `dev_server` (which
+            # passes `log_file = nothing` so it never steals the runner's
+            # stdout) — a legitimate answer; what must hold is that it ANSWERS.
+            srv = BT.dev_request(st, "logs", Dict("source" => "server", "limit" => 5))
+            @test srv["role"] == "server"
+            @test srv["ok"] isa Bool
+            @test srv["ok"] || !isempty(srv["error"])
+            @test haskey(srv, "host")
+
+            # …and the worker one round-trips the REAL four-sided RPC: server
+            # sends `read_log`, worker handles it, server matches the
+            # `read_log_response` arm. A missing arm here is invisible — it
+            # reads exactly like an offline worker — so this is the assertion
+            # that catches it. The spawned worker DOES write a log file, so this
+            # one comes back `ok`.
+            wname = st.workers[][wid].name
+            for key in (wname, wid)        # addressable by display name AND id
+                j = BT.dev_request(st, "logs", Dict("source" => key, "limit" => 5))
+                @test j["role"] == "worker"
+                @test j["worker_id"] == wid
+                @test j["ok"] isa Bool
+                @test j["ok"] || !isempty(j["error"])
+                # Answered by the WORKER process, not fabricated by the server.
+                @test haskey(j, "host")
+            end
+
+            # "all" = the server plus every connected worker, server first.
+            all = BT.dev_request(st, "logs", Dict("source" => "all", "limit" => 3))
+            srcs = all["sources"]
+            @test length(srcs) == 2
+            @test srcs[1]["role"] == "server"
+            @test srcs[2]["role"] == "worker"
+            @test BonitoAgents.JSON.json(all) isa String
+
+            # `serve()` must NOT redirect its caller's stdout by default. The
+            # log file is a dup2 of fd 1 and 2, so a library that opted in for
+            # you would swallow the output of every embedder — and nine unit
+            # tests call `serve()` directly, so the first version of this took
+            # the RUNNER's stdout and the ring went silent three testitems later.
+            # Only the server binary asks for it.
+            @test BonitoWorker.log_file_path() == ""
+
+            # A typo must name what IS available, not come back as an empty
+            # log — which would read like a quiet machine.
+            err = try
+                BT.dev_request(st, "logs", Dict("source" => "no-such-machine")); ""
+            catch e
+                sprint(showerror, e)
+            end
+            @test occursin("no-such-machine", err)
+            @test occursin(wname, err) && occursin("server", err)
+        end
+
         @testset "the MCP launch command is the stable launcher, not a versioned binary" begin
             # The hello frame carries what claude-agent-acp execs for every
             # chat's `bt_*` tools. It used to be `Sys.BINDIR`'s julia — a path
@@ -269,6 +335,56 @@ end
                 @test !occursin("Debugging BonitoAgents itself",
                                 BT.agents_prompt_appendix(st, "plain-at-root"))
             end
+        end
+
+        @testset "a restart re-derives the MCP env, it does not reuse the old one" begin
+            # The bug this pins: `WorkerAgent` stored the env `eval_dialback_env`
+            # produced at its FIRST bring-up, and a restart re-`start!`s that
+            # same object. So flipping "Dev mode" (which persists the flag and
+            # restarts) composed the briefing into the system prompt — that is
+            # read live at every `start!` — while the `bt_dev_*` tools never
+            # arrived, because the MCP was respawned with the ORIGINAL
+            # environment. No number of restarts could fix it; only closing and
+            # reopening the chat. Both halves must be derived, not one of each.
+            baked = BT.ProjectInfo("baked-env", "proj", "w-none",
+                                   mktempdir(), "/remote/baked", BT.now(BT.UTC))
+            st.projects[]["baked-env"] = baked
+            stale = [BT.AgentClientProtocol.MCPServer(
+                         BT.INJECTED_MCP_NAME, "/usr/bin/julia";
+                         args = ["-e", "using BonitoMCP"],
+                         env  = BT.eval_dialback_env(st, "baked-env"))]
+            @test !haskey(only(stale).env, "BONITOAGENTS_DEV_TOOLS")
+
+            BT.set_dev_mode!(st, "baked-env", true)
+            fresh = BT.refresh_injected_env(stale, st, "baked-env")
+            @test haskey(only(fresh).env, "BONITOAGENTS_DEV_TOOLS")
+            # Only the ENVIRONMENT is re-derived; how to launch it is the
+            # worker's business and must survive untouched.
+            @test only(fresh).command == "/usr/bin/julia"
+            @test only(fresh).args == ["-e", "using BonitoMCP"]
+
+            # Revoking travels the same way, or "Dev mode: off" would leave the
+            # tools attached until the chat was closed.
+            BT.set_dev_mode!(st, "baked-env", false)
+            @test !haskey(only(BT.refresh_injected_env(stale, st, "baked-env")).env,
+                          "BONITOAGENTS_DEV_TOOLS")
+
+            # An MCP server we did NOT inject never gets handed the secret, and
+            # a bring-up that matched no project keeps what it had (deriving from
+            # an empty id would blank the project id the MCP dials back with).
+            BT.set_dev_mode!(st, "baked-env", true)
+            mixed = vcat(stale, [BT.AgentClientProtocol.MCPServer("theirs", "/bin/true")])
+            got = BT.refresh_injected_env(mixed, st, "baked-env")
+            @test isempty(only(s for s in got if s.name == "theirs").env)
+            @test BT.refresh_injected_env(mixed, st, "") === mixed
+
+            # And the flag is READABLE — not being reported is what made "am I
+            # actually in dev mode?" the one question a debug chat could not
+            # answer about itself.
+            rep = BT.dev_request(st, "inspect",
+                                 Dict("section" => "projects", "project_id" => "baked-env"))
+            @test rep isa AbstractVector ? rep[1]["dev_mode"] : rep["dev_mode"]
+            BT.set_dev_mode!(st, "baked-env", false)
         end
 
         @testset "dev_mode survives a save/load round trip" begin

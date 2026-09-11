@@ -124,15 +124,15 @@ function run_suite(server)
                 })()"""; timeout = 36) == true
         end
 
-        @testset "the open-guard toasts on an un-openable file and opens NO panel" begin
+        @testset "the open-guard reports an un-openable file and opens NO panel" begin
             # What's left for the guard: things no viewer can help with. A text
             # file past the editor's size cap is the case a user actually hits.
             before = TK.eval_js(server, "document.querySelectorAll('.bw-ws-panel').length")
             TK.eval_js(server, "$(row_for("huge.txt"))?.click(); true")
-            @test TK.wait_for(server, "guard toast shown",
-                "document.querySelector('.bt-toast')?.dataset.shown === 'true'"; timeout = 30) == true
-            toast_text = TK.eval_js(server, "document.querySelector('.bt-toast .bt-toast-text').textContent")
-            @test occursin("huge.txt", toast_text) && occursin("Can't open", toast_text)
+            @test TK.wait_for(server, "guard message shown in the progress card",
+                "document.querySelector('.bt-prog.bt-prog-err') !== null"; timeout = 30) == true
+            msg = TK.eval_js(server, "document.querySelector('.bt-prog-err .bt-prog-title').textContent")
+            @test occursin("huge.txt", msg) && occursin("Can't open", msg)
             sleep(1.0)
             @test TK.eval_js(server, "document.querySelectorAll('.bw-ws-panel').length") == before
         end

@@ -120,14 +120,23 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     haskey(a.state.worker_control_ws, a.worker_id) ||
         error("Worker '$(a.worker_id)' is not connected")
 
-    mcp_list = mcp_list_payload(a.mcp)
-
-    # Find the project this session belongs to (cosmetic — worker log line).
+    # Find the project this session belongs to. NOT cosmetic: both the MCP
+    # environment and the system-prompt appendix below are derived from it.
     project_id = ""
     for p in values(a.state.projects[])
         p.worker_id == a.worker_id && p.worker_path == a.worker_path &&
             (project_id = p.id; break)
     end
+
+    # Re-derived on every bring-up, NOT taken from what `a.mcp` was built with.
+    # `eval_dialback_env` reads the project's live `dev_mode`, and the appendix
+    # three lines down already reads live state — caching one while deriving the
+    # other is what made the "Dev mode" toggle half-work: it composed the
+    # briefing into the system prompt (live) while the `bt_dev_*` tools never
+    # appeared, because a restart re-`start!`s the SAME agent object and so
+    # respawned the MCP with the environment the chat had at its FIRST bring-up.
+    # No number of restarts could fix that; only closing and reopening the chat.
+    mcp_list = mcp_list_payload(refresh_injected_env(a.mcp, a.state, project_id))
 
     pname = provider_name(a)
     # Only Claude honours the `_meta.systemPrompt.preset` append. The appendix

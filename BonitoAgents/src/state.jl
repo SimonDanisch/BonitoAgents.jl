@@ -645,10 +645,24 @@ const DEV_MODE_TOOLS = """
 You have `bt_dev_*` tools that read the **running process**:
 
 - `bt_dev_inspect` — live workers, projects, chats and eval bridges.
-- `bt_dev_logs` — the server's own `@info`/`@warn`/`@error` ring.
+- `bt_dev_logs` — logs from ANY machine in the fleet. You are running on ONE
+  worker and nothing but the server runs on the server host, so every other
+  machine's log is reachable only through this tool: `source="server"` for the
+  server's log file, `source="<worker name>"` for a worker's, `source="all"`
+  for everyone at once, and the default `"ring"` for the server's in-memory
+  `@info`/`@warn`/`@error` records.
+  Prefer the FILE when the ring cannot hold the answer, which is often. The file
+  is a redirect of the process's stdout and stderr, so it also holds what no
+  logger ever sees: "UNHANDLED TASK ERROR" (printed straight to stderr), the
+  runtime's fatal-signal thread dump, and everything from BEFORE the last
+  restart — the ring starts empty at boot. `since`/`until` take
+  "2026-09-11 14:40" and may span a restart.
 - `bt_dev_memory` — memory and per-registry counters, with an optional GC and a
   deep `summarysize` pass. For a suspected leak: take a reading, exercise the
   suspect path, take another with `gc = true`, compare what grew.
+  It also reports `open_fds` / `fd_limit`: a server that serves no NEW
+  connections while its timers keep ticking (flat CPU, no log output) is what fd
+  exhaustion looks like.
   It sees THIS process only. Leaks that live outside it are invisible here, and
   one is known: agent subprocesses are spawned as plain children, so a worker
   that is killed orphans them and nothing reaps them (measured at ~3 per full
@@ -757,6 +771,32 @@ function safe_set!(obs::Observable, val)
     return nothing
 end
 
+"""
+    is_peer_gone(e) -> Bool
+
+Whether `e` means "the socket is already gone" — this send or close can never
+succeed and there is nothing to report. ONE predicate for every socket teardown
+path in the server, because the per-site whitelists this replaces were each
+written against the transport of their day and silently stopped covering the
+current one.
+
+`Reseau.IOPoll.NetClosingError` is matched BY NAME, not by importing Reseau: it
+is HTTP's transport internals, which this package reaches only through HTTP and
+does not depend on directly.
+
+Not cosmetic. On 2026-09-11 the worker-heartbeat ping task took exactly that
+error — a bare `struct <: Exception`, so `IOError`/`EOFError`/`WebSocketError`
+all missed it — rethrew, and died as an `UNHANDLED TASK ERROR` in the journal.
+Its death froze `last_ping_ok`, which is the timestamp the zombie reaper reads
+to decide whether a worker is still reachable.
+"""
+is_peer_gone(e) =
+    e isa Base.IOError ||
+    e isa EOFError ||
+    e isa HTTP.WebSockets.WebSocketError ||
+    nameof(typeof(e)) === :NetClosingError ||
+    (e isa ArgumentError && occursin("closed", lowercase(e.msg)))
+
 # Errors a stale browser session raises when we push an update to it: a Bonito
 # JSException (hashed asset 404 after redeploy), or a transport-level failure on
 # a half-dead socket. These are the "this one tab is gone" signals — NOT a bug in
@@ -764,10 +804,7 @@ end
 # rethrows (a real error must not be hidden, T6).
 is_stale_session_error(e) =
     e isa Bonito.JSException ||
-    e isa Base.IOError ||
-    e isa HTTP.WebSockets.WebSocketError ||
-    e isa EOFError ||
-    (e isa ArgumentError && occursin("closed", lowercase(e.msg))) ||
+    is_peer_gone(e) ||
     # Bonito's `update_session_dom!` does `error("Updating the session dom for a
     # closed session")` (a plain ErrorException) when a mapped UI observable fires
     # into a browser session that already closed — e.g. during server shutdown.

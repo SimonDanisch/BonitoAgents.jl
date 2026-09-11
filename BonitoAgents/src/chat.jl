@@ -7032,15 +7032,19 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         persist_desired_config!(model, cfg_id, value)
     end
 
-    # ── Status line + toasts ─────────────────────────────────────────────────
-    # ONE transient status for the long-running header actions (a provider
-    # switch, a move to another worker). It sits in the flexible left area of
-    # the row, so its width changes are absorbed by the gap and never shove the
-    # controls. Outcomes go to the window's toast (`show_toast!` is a no-op
-    # outside the unified shell, where `plotpane` is `nothing`).
+    # ── Status line + the window's progress card ─────────────────────────────
+    # ONE transient status for the header's own short actions (a provider
+    # switch). It sits in the flexible left area of the row, so its width
+    # changes are absorbed by the gap and never shove the controls.
+    #
+    # Anything the user has to ACT on goes to the window's progress card
+    # instead: `problem` is a failure, so it stays there until dismissed and can
+    # be selected and copied. Both are no-ops outside the unified shell, where
+    # `plotpane` is `nothing`.
     header_status = Observable("")
     pane = model.plotpane
-    problem(msg::AbstractString) = show_toast!(pane, msg)
+    problem(msg::AbstractString, detail::AbstractString = "") =
+        show_problem!(pane, msg, detail)
 
     # ── Session restart ──────────────────────────────────────────────────────
     # One Observable, two controls: the menu's Restart item, and the reconnect
@@ -7176,22 +7180,31 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         end
         # The move stops this chat's session first, which evicts its ChatModel
         # and prunes THIS pane (sidebar.jl) — so from that moment on nothing in
-        # this header exists to show progress in. Progress therefore goes to the
-        # window's toast, re-issued per step so it stays up while the move runs;
-        # the header status only carries the first, synchronous acknowledgement.
+        # this header exists to show progress in. It all goes to the WINDOW's one
+        # progress card, which outlives the pane: one card that stays up for the
+        # whole move and updates in place (this used to flash a fresh 3.2 s toast
+        # per transferred FILE, which is why a move looked like a popup loop that
+        # never got anywhere).
+        prog = pane === nothing ? nothing : pane.progress
+        if prog !== nothing && is_busy_running(prog[])
+            problem("Something else is already running in this window — wait for it to finish")
+            return
+        end
+        prog === nothing || busy_start!(prog, "Continuing on $(w.name)")
         Base.errormonitor(@async try
             safe_set!(header_status, "Continuing on $(w.name)…")
             start!(state, p, wid; progress = (stage, info) ->
-                show_toast!(pane, "Continuing on $(w.name): " * format_progress_string(stage, info)))
+                prog === nothing || busy_event!(prog, stage, info))
             # The chat pane is rebuilt around the new session (sidebar.jl revives
             # the current view on the model's re-add); say what the agent knows.
-            show_toast!(pane, p.resume_session_id === nothing ?
+            prog === nothing || busy_done!(prog, p.resume_session_id === nothing ?
                 "Continued on $(w.name). The agent starts fresh there; the messages above stay." :
                 "Continued on $(w.name). The agent kept its memory.")
             pane === nothing || (pane.navigate[] = p.id)
         catch e
-            @warn "continue on worker failed" project = p.name target = w.name exception = (e, catch_backtrace())
-            problem("Could not continue on $(w.name): " * first(split(sprint(showerror, e), '\n')))
+            bt = catch_backtrace()
+            @warn "continue on worker failed" project = p.name target = w.name exception = (e, bt)
+            problem("Could not continue on $(w.name)", error_detail(e, bt))
             # The session was already stopped for the move; bring the chat back
             # on the worker it is still bound to, so a failed move is not a
             # closed chat.
@@ -8553,19 +8566,21 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
     # its `height:100%` chain (Monaco collapses to ~1px). `add_panel!` dedupes by
     # id, so racing re-clicks still land one panel.
     Base.errormonitor(@async begin
-        # Pre-fetch guard: a folder / missing / oversize file flashes a toast and
-        # opens NO panel, instead of streaming bytes into an empty view (the
-        # worker stat is the gate — see open_guard_reject_reason).
+        # Pre-fetch guard: a folder / missing / oversize file says so in the
+        # window's progress card and opens NO panel, instead of streaming bytes
+        # into an empty view (the worker stat is the gate — see
+        # open_guard_reject_reason).
         reason = open_guard_reject_reason(state, project_id, path)
         if reason !== nothing
-            show_toast!(pane, reason)
+            show_problem!(pane, reason)
             return
         end
         elem = try
             file_panel_content(state, project_id, server_cwd, path)
         catch e
             @warn "file open failed" path exception = e
-            show_toast!(pane, "Can't open $(basename(String(path))) — $(open_error_brief(e))")
+            show_problem!(pane, "Can't open $(basename(String(path))) — $(open_error_brief(e))",
+                          error_detail(e))
             return
         end
         BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;

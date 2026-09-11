@@ -824,24 +824,6 @@ const UnifiedShellStyles = Bonito.Styles(
         "font-family" => "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
         "color"        => "var(--bt-text)",
         "-webkit-font-smoothing" => "antialiased"),
-    # Window-level toast — a transient notice (e.g. the editor open-guard's
-    # "can't open <file>"). Fixed, centered near the bottom; JS flips
-    # data-shown and clears it after ~3.2s (see plotpane_toast_layer).
-    CSS(".bt-toast",
-        "position" => "fixed",
-        "bottom" => "22px", "left" => "50%",
-        "transform" => "translateX(-50%) translateY(12px)",
-        "max-width" => "min(520px, 86vw)",
-        "background" => "#1f2937", "color" => "#f9fafb",
-        "padding" => "10px 16px", "border-radius" => "8px",
-        "font-size" => "13px", "line-height" => "1.4",
-        "box-shadow" => "0 6px 24px rgba(0,0,0,0.28)",
-        "z-index" => "9999",
-        "opacity" => "0", "pointer-events" => "none",
-        "transition" => "opacity 0.18s ease, transform 0.18s ease"),
-    CSS(".bt-toast[data-shown=\"true\"]",
-        "opacity" => "1",
-        "transform" => "translateX(-50%) translateY(0)"),
     # Everything to the right of the sidebar: the chat/dashboard column plus the
     # plotpane. Fills the viewport minus the sidebar; `.bt-main` centers within
     # whatever horizontal space the plotpane leaves it.
@@ -1200,7 +1182,8 @@ function unified_main(session::Bonito.Session, state::ServerState,
                       pane::Union{Nothing,PlotPane} = nothing)
     # ── Dashboard pane: rendered ONCE, mounted forever ──────────────────────
     dash_pane = DOM.div(
-        dashboard_dom(session, state; current_view = current_view);
+        dashboard_dom(session, state; current_view = current_view,
+                      progress = pane === nothing ? nothing : pane.progress);
         class = "bt-view bt-view-dash")
 
     # ── Chat panes: one per opened chat, DOM-preserved via KeyedList ────────
@@ -1399,9 +1382,12 @@ function unified_app(state::ServerState)
             Bonito.ConnectionIndicator(),
             sidebar,
             stage,
-            # Window-level toast layer (position:fixed) — flashes "can't open …"
-            # from the editor open-guard. One per window, bound to pane.toast.
-            plotpane_toast_layer(session, pane),
+            # The window's ONE progress card (position:fixed, top-centered).
+            # Every long-running operation and every outcome in this window
+            # reports into `pane.progress` and renders HERE — the dashboard no
+            # longer carries its own pill, and nothing flashes a toast over the
+            # composer any more. See progress.jl::progress_overlay.
+            progress_overlay(session, pane.progress),
             # Window-level file-viewer driver: gives every rendered file body its
             # behaviour (image dimensions, table sort, 3D mount) no matter how it
             # was delivered — a chat bubble's bt_show preview, a workspace panel,

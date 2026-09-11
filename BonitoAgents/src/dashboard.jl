@@ -388,7 +388,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     # shadows the one we inject here, and the tools silently vanish. `btworker`
     # is deliberately specific to avoid that — see `mcp__btworker__*` tool names.
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
-        [AgentClientProtocol.MCPServer("btworker", w.mcp_path;
+        [AgentClientProtocol.MCPServer(INJECTED_MCP_NAME, w.mcp_path;
                                        args = w.mcp_args,
                                        env  = eval_dialback_env(state, p.id))]
 
@@ -1475,53 +1475,6 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-open-on-select:hover",
         "background" => "rgba(59,130,246,0.06)"),
 
-    # ── Global busy progress pill ────────────────────────────────────────────
-    # Fixed top-centered, single text line. One UI for every long-running op
-    # (sync, project import, GitHub clone). Hidden via class toggle so the
-    # wrapper stays mounted; child <span>s bind to derived Observable{String}s
-    # which hit Bonito's innerText fast-path — no DOM swap, no flash, even
-    # when librsync fires hundreds of file events per second.
-    CSS(".bt-busy-card",
-        "position" => "fixed",
-        "top" => "12px",
-        "left" => "50%",
-        "transform" => "translateX(-50%)",
-        "max-width" => "min(720px, 92vw)",
-        "background" => "var(--bt-surface)",
-        "border" => "1px solid var(--bt-accent)",
-        "border-radius" => "999px",
-        "padding" => "5px 14px",
-        "box-shadow" => "var(--bt-shadow-md)",
-        "z-index" => "9998",
-        "font-size" => "13px",
-        "line-height" => "1.4",
-        "color" => "var(--bt-text)",
-        "display" => "flex",
-        "align-items" => "center",
-        "gap" => "10px",
-        "white-space" => "nowrap",
-        "overflow" => "hidden"),
-    CSS(".bt-busy-card.bt-busy-hidden",
-        "display" => "none"),
-    CSS(".bt-busy-title",
-        "font-weight" => "600",
-        "color" => "var(--bt-text)",
-        "flex" => "0 0 auto"),
-    CSS(".bt-busy-pct",
-        "font-variant-numeric" => "tabular-nums",
-        "color" => "var(--bt-text-muted)",
-        "min-width" => "32px",
-        "text-align" => "right",
-        "flex" => "0 0 auto"),
-    CSS(".bt-busy-msg",
-        "color" => "var(--bt-text-muted)",
-        "font-family" => "ui-monospace, monospace",
-        "font-size" => "12.5px",
-        "overflow" => "hidden",
-        "text-overflow" => "ellipsis",
-        "flex" => "1 1 auto",
-        "min-width" => "0"),
-
     # ── Inline "loading" state for click-fired DOM buttons ───────────────────
     # Used by the Discover Import button — JS flips this class on click for
     # instant visual feedback (the WS round-trip to surface the busy card
@@ -2002,7 +1955,8 @@ auto-navigate to the new project's chat by setting it; otherwise creation
 just leaves the user on the dashboard.
 """
 function dashboard_dom(session::Bonito.Session, state::ServerState;
-                        current_view::Union{Observable{String},Nothing} = nothing)
+                        current_view::Union{Observable{String},Nothing} = nothing,
+                        progress::Union{Observable,Nothing} = nothing)
     error_obs = Observable("")
 
     # Workers self-register over WS — no manual "Add worker" form.
@@ -2013,10 +1967,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # only. One enum is clearer than two booleans that always have to be kept
     # opposite.
     which_form = Observable(:none)
-    # Single source of truth for the global progress card (sync, project
-    # import, GitHub clone). `BUSY_IDLE` ⇒ card hidden; non-idle snapshot ⇒
-    # card visible with title + progress + recent files. See progress.jl.
-    busy = Observable(BUSY_IDLE)
+    # Where this dashboard's long-running work (sync, project import, GitHub
+    # clone, copy) reports. In the app this is the WINDOW's one progress card
+    # (`pane.progress`, passed in by `unified_main`), so a sync started from the
+    # dashboard stays readable after the user switches to a chat. A standalone
+    # `dashboard_app` has no window, so it owns the observable and mounts its
+    # own `progress_overlay`. Either way there is exactly one card. See
+    # progress.jl.
+    busy = progress === nothing ? Observable{Any}(BUSY_IDLE) : progress
 
     # ── Copy-project form state ────────────────────────────────────────────────
     cp_src_worker  = Observable("")
@@ -2062,13 +2020,15 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 sync_project_to_server!(state, p;
                     on_progress = (stage, info) -> busy_event!(busy, stage, info))
                 safe_set!(error_obs, "")
+                busy_done!(busy, "Synced $(p.name)")
             catch e
+                # The failure REPLACES the progress card rather than clearing it
+                # and writing somewhere else: what failed belongs where the user
+                # was already watching, and it stays there (with its full text,
+                # selectable and copyable) until they dismiss it.
                 bt = catch_backtrace()
                 @warn "sync_project_to_server! failed" project=p.name exception=(e, bt)
-                safe_set!(error_obs,
-                    "Failed to sync $(p.name): $(sprint(showerror, e))")
-            finally
-                busy_clear!(busy)
+                busy_fail!(busy, "Failed to sync $(p.name)", error_detail(e, bt))
             end
         end
     end
@@ -2095,10 +2055,10 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         end
 
         haskey(state.workers[], target) || return
-        is_busy_idle(busy[]) || return   # don't pile up moves
+        refuse_if_busy(busy, error_obs, "Can't open that chat elsewhere yet") && return
         target_w = state.workers[][target]
         # Set the busy guard SYNCHRONOUSLY, before spawning (T16). Doing it
-        # inside the @async let a double-click pass the `is_busy_idle` check
+        # inside the @async let a double-click pass the `is_busy_running` check
         # twice (busy was still idle until the first task ran) and start two
         # concurrent project moves. The other long-ops set it synchronously too.
         busy_start!(busy, "Opening $(p.name) on $(target_w.name)")
@@ -2107,14 +2067,13 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 cb = (stage, info) -> busy_event!(busy, stage, info)
                 start!(state, p, target; progress = cb)
                 safe_set!(error_obs, "")
+                busy_done!(busy, "Opened $(p.name) on $(target_w.name)")
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 bt = catch_backtrace()
                 @warn "open-on-worker failed" project=p.name target=target exception=(e, bt)
-                safe_set!(error_obs,
-                    "Failed to open $(p.name) on $(target_w.name): $(sprint(showerror, e))")
-            finally
-                busy_clear!(busy)
+                busy_fail!(busy, "Failed to open $(p.name) on $(target_w.name)",
+                           error_detail(e, bt))
             end
         end
     end
@@ -2124,7 +2083,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
 
     on(session, cp_submit.value) do clicked
         clicked || return
-        is_busy_idle(busy[]) || return
+        refuse_if_busy(busy, error_obs, "Can't copy right now") && return
         pid = String(cp_src_project[])
         tgt = String(cp_tgt_worker[])
         nm  = String(strip(cp_new_name[]))
@@ -2144,21 +2103,19 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                     progress = (stage, info) -> busy_event!(busy, stage, info))
                 safe_set!(error_obs, "")
                 which_form[] = :none
+                busy_done!(busy, "Copied $(p.name) → $(tgt_w.name)")
                 current_view !== nothing && (current_view[] = new_p.id)
             catch e
                 bt = catch_backtrace()
                 @warn "copy_to! failed" project=p.name target=tgt exception=(e, bt)
-                safe_set!(error_obs,
-                    "Copy failed: $(sprint(showerror, e))")
-            finally
-                busy_clear!(busy)
+                busy_fail!(busy, "Copy failed", error_detail(e, bt))
             end
         end
     end
 
     on(session, cp_cancel.value) do clicked
         clicked || return
-        is_busy_idle(busy[]) || return
+        is_busy_running(busy[]) && return
         which_form[] = :none
         error_obs[]  = ""
     end
@@ -2235,7 +2192,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         # at once) had no guard here and would run two concurrent imports of the
         # same folder. Bail synchronously if a long-op is already running; the
         # synchronous `busy_start!` just below then latches this one.
-        is_busy_idle(busy[]) || return nothing
+        refuse_if_busy(busy, error_obs, "Can't create a chat right now") && return nothing
         # Label for the busy card only — `busy_start!` has to run SYNCHRONOUSLY
         # (it is the double-click latch), and the authoritative name can't be
         # derived until the worker has confirmed the path below.
@@ -2269,13 +2226,13 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 error_obs[]      = ""
                 discover_state[] = ""
                 picker_state[]   = ""
+                busy_done!(busy, "Imported $(p.name)")
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 # Never swallow silently: surface to the UI AND the server log.
-                @warn "do_import failed" worker=w_name path resume=resume_session_id exception=(e, catch_backtrace())
-                error_obs[] = "Failed to import: $(sprint(showerror, e))"
-            finally
-                busy_clear!(busy)
+                bt = catch_backtrace()
+                @warn "do_import failed" worker=w_name path resume=resume_session_id exception=(e, bt)
+                busy_fail!(busy, "Failed to import", error_detail(e, bt))
             end
         end
     end
@@ -2288,7 +2245,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # Per-worker "From GitHub" clone, bridged to the worker card's GitHub form.
     # Only reachable from a worker card so `worker_name` is always concrete.
     function do_github(w_name::String, url::String)
-        is_busy_idle(busy[]) || return nothing
+        refuse_if_busy(busy, error_obs, "Can't clone right now") && return nothing
         busy_start!(busy, "Opening from GitHub")
         @async begin
             try
@@ -2297,12 +2254,12 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                     progress    = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 gh_state[]  = ""
+                busy_done!(busy, "Opened $(p.name) from GitHub")
                 current_view !== nothing && (current_view[] = p.id)
             catch e
-                @warn "do_github failed" worker=w_name url exception=(e, catch_backtrace())
-                error_obs[] = "Failed to open from GitHub: $(sprint(showerror, e))"
-            finally
-                busy_clear!(busy)
+                bt = catch_backtrace()
+                @warn "do_github failed" worker=w_name url exception=(e, bt)
+                busy_fail!(busy, "Failed to open from GitHub", error_detail(e, bt))
             end
         end
         return nothing
@@ -2605,30 +2562,9 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         (isempty(msg) || wf !== :none) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
 
-    # Global busy progress pill — fixed top-centered, single text line.
-    # Wrapper stays mounted; visibility flips via class toggle (instant
-    # attribute update). The three text spans bind to derived
-    # Observable{String}s so they hit Bonito's innerText fast-path — no
-    # wrapper re-render and no DOM swap during the thousands of file
-    # events that a librsync transfer fires.
-    title_obs = map(s -> s.title, busy)
-    pct_obs   = map(busy) do s
-        s.total > 0 ? "$(round(Int, 100 * s.done / max(s.total, 1)))%" : ""
-    end
-    msg_obs   = map(s -> s.msg, busy)
-    visibility_class = map(busy) do s
-        is_busy_idle(s) ? "bt-busy-card bt-busy-hidden" : "bt-busy-card"
-    end
-    busy_card = DOM.div(
-        DOM.span(title_obs; class = "bt-busy-title"),
-        DOM.span(pct_obs;   class = "bt-busy-pct"),
-        DOM.span(msg_obs;   class = "bt-busy-msg");
-        class = visibility_class)
-
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
     DOM.div(
-        busy_card,
         DOM.div(
             DOM.h1(
                 DOM.img(src = logo_svg(), alt = "", class = "bt-logo",
@@ -2751,10 +2687,13 @@ function dashboard_app(state::ServerState)
         # Observable is what drives re-renders for this tab — and tears
         # down via `session.deregister_callbacks` on close.
         view = copy(state, session)
+        # No window shell here, so this mount owns the one progress card.
+        progress = Observable{Any}(BUSY_IDLE)
         DOM.div(
             DashboardStyles,
             Bonito.ConnectionIndicator(),
-            dashboard_dom(session, view))
+            progress_overlay(session, progress),
+            dashboard_dom(session, view; progress = progress))
     end
 end
 

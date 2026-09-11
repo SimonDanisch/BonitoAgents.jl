@@ -48,14 +48,21 @@ end
 
 const LOG_RING = LogRing(ReentrantLock(), LogRecord[], 4000, 0, false)
 
+# Per-value caps. A failure gets a much bigger one than an ordinary key: a
+# stack trace that stops after 400 characters names no frame at all, which is
+# the one thing the record was written to say.
+const LOG_VALUE_MAX     = 400
+const LOG_EXCEPTION_MAX = 3000
+truncate_log(s::AbstractString, n::Int) =
+    length(s) > n ? first(String(s), n) * "…" : String(s)
+
 # A logged key's value as text. `show` on a user value can itself throw (a bad
 # `show` method, a broken iterator); if it does we keep the record and say so in
 # the field, rather than losing the whole log line — a logger that throws inside
 # logging takes the process down with it.
 function log_value_string(v)
     try
-        s = sprint(show, v; context = :limit => true)
-        return length(s) > 400 ? first(s, 400) * "…" : s
+        return truncate_log(sprint(show, v; context = :limit => true), LOG_VALUE_MAX)
     catch e
         e isa InterruptException && rethrow()
         return "<unprintable: $(typeof(e))>"
@@ -65,8 +72,30 @@ end
 # Strings are already their own text. Going through `show` would wrap every log
 # message and every string-valued key in escaped quotes, which is noise in a
 # reader whose whole job is being read.
-log_value_string(v::AbstractString) =
-    length(v) > 400 ? first(String(v), 400) * "…" : String(v)
+log_value_string(v::AbstractString) = truncate_log(v, LOG_VALUE_MAX)
+
+# `exception = (e, catch_backtrace())` is Base logging's convention for attaching
+# a failure, and `show` on that tuple prints the raw instruction pointers: 400
+# characters of `Ptr{Nothing}(0x…)` where "which line threw this" belongs. A
+# `SystemError("write", 104)` logged that way says a socket was reset and NOTHING
+# about which socket — so the exception is rendered, not shown.
+function log_value_string(v::Tuple{Any,Vector{<:Union{Ptr{Nothing},Base.InterpreterIP}}})
+    try
+        return truncate_log(error_detail(v[1], v[2]; frames = 15), LOG_EXCEPTION_MAX)
+    catch e
+        e isa InterruptException && rethrow()
+        return "<unrenderable exception: $(typeof(e))>"
+    end
+end
+
+function log_value_string(e::Exception)
+    try
+        return truncate_log(error_detail(e), LOG_EXCEPTION_MAX)
+    catch e2
+        e2 isa InterruptException && rethrow()
+        return "<unrenderable exception: $(typeof(e2))>"
+    end
+end
 
 function push_log_record!(ring::LogRing, level, message, _module, file, line, kwargs)
     rec = LogRecord(time(), string(level), log_value_string(message),
@@ -270,6 +299,14 @@ function project_report(p::ProjectInfo)
         "provider"          => jsonable(p.provider),
         "auto_prompt"       => p.auto_prompt === nothing ? nothing : first(p.auto_prompt, 200),
         "dismissed"         => p.dismissed,
+        # The two per-chat switches. `dev_mode` in particular is what decides
+        # whether a chat's agent gets these very tools, and it was NOT reported
+        # here — so the one question a debug chat cannot answer about itself was
+        # "am I actually in dev mode?". It is spawn-time state (see
+        # `refresh_injected_env`), which is exactly the kind you need to be able
+        # to read back.
+        "dev_mode"          => p.dev_mode,
+        "remote_eval"       => p.remote_eval,
         "locked_by"         => jsonable(p.locked_by),
         "desired_config"    => jsonable(p.desired_config),
         "file_index"        => Dict{String,Any}("files" => nfiles,
@@ -392,7 +429,85 @@ const LOG_LEVEL_ORDER = Dict("debug" => 0, "info" => 1, "warn" => 2, "error" => 
 # LogLevel) sorts as Info so it isn't silently filtered out.
 log_level_rank(s::AbstractString) = get(LOG_LEVEL_ORDER, lowercase(s), 1)
 
+# ── fleet logs (every machine's log, from a chat that sits on exactly one) ───
+# A dev-mode chat runs on a WORKER and nothing but the server runs on the server
+# host, so natively its agent can read one machine's journal: its own. That is
+# how the 2026-09-11 hang went — the worker journal was local and answered the
+# question, the SERVER's had to be pasted in by hand, and the other four workers
+# were never looked at.
+#
+# The log FILE is not a nicer view of `LOG_RING`; it holds what the ring
+# structurally cannot. `errormonitor` prints `UNHANDLED TASK ERROR` straight to
+# stderr without passing through the logger, so the ring never recorded the one
+# error that mattered; the SIGTERM thread dump is not a log record either; and
+# the ring dies with the process, which is exactly what happens to a server that
+# gets restarted for hanging. We write that file ourselves (BonitoWorker's
+# `start_file_log!` redirects fd 1 and 2) rather than reading journald, which
+# exists on the Linux boxes and nowhere else.
+
+# Which name means "the server's own log" rather than a worker's.
+const SERVER_LOG_SOURCE = "server"
+# Fan out to the server AND every connected worker.
+const ALL_LOG_SOURCES   = "all"
+
+"""
+    resolve_log_worker(state, source) -> worker_id
+
+The worker `source` names, matched against worker id first and then display name
+(case-insensitively), so a human can ask for "MacBook" and a script can pass the
+uuid. Throws naming what IS available — a typo must not come back as an empty
+log, which reads like a quiet machine.
+"""
+function resolve_log_worker(state::ServerState, source::AbstractString)
+    workers = state.workers[]
+    haskey(workers, source) && return source
+    hit = findfirst(w -> lowercase(w.name) == lowercase(source), workers)
+    hit === nothing || return hit
+    known = sort([w.name for w in values(workers)])
+    error("unknown log source '$source' — expected \"$(SERVER_LOG_SOURCE)\", " *
+          "\"$(ALL_LOG_SOURCES)\", or one of: " * join(known, ", "))
+end
+
+# One machine's log, shaped the same whichever machine it is, so a fan-out is a
+# vector of these and the caller never special-cases the server.
+function log_of(state::ServerState, source::AbstractString; lines, since, until, grep)
+    if source == SERVER_LOG_SOURCE
+        r = BonitoWorker.read_log_file(; lines, since, until, grep)
+        return merge(Dict{String,Any}("source" => SERVER_LOG_SOURCE, "role" => "server"), r)
+    end
+    wid = resolve_log_worker(state, source)
+    name = state.workers[][wid].name
+    r = try
+        worker_log(state, wid; lines, since, until, grep)
+    catch e
+        e isa InterruptException && rethrow()
+        # An unreachable worker is a finding about THAT worker, not a failure of
+        # the fan-out — report it in place, like `dev_section(::Val{:worker})`.
+        Dict{String,Any}("ok" => false, "error" => first(split(sprint(showerror, e), '\n')))
+    end
+    delete!(r, "type"); delete!(r, "request_id")
+    return merge(Dict{String,Any}("source" => name, "role" => "worker", "worker_id" => wid), r)
+end
+
 function dev_op(state::ServerState, ::Val{:logs}, args::AbstractDict)
+    source = String(get(args, "source", ""))
+    if !isempty(source) && source != "ring"
+        raw = get(args, "limit", 200)
+        lines = raw isa Integer ? Int(raw) : 200
+        kw = (lines = lines,
+              since = String(get(args, "since", "")),
+              until = String(get(args, "until", "")),
+              grep  = String(get(args, "contains", "")))
+        if source == ALL_LOG_SOURCES
+            # Server first, then workers by name: a cross-machine incident is
+            # read in one pass, and a stable order makes two readings comparable.
+            srcs = vcat([SERVER_LOG_SOURCE],
+                        sort([w.name for w in values(state.workers[]) if isopen(w)]))
+            return Dict{String,Any}(
+                "sources" => [log_of(state, x; kw...) for x in srcs])
+        end
+        return log_of(state, source; kw...)
+    end
     raw_limit = get(args, "limit", 100)
     limit = raw_limit isa Integer ? Int(raw_limit) : 100
     limit = clamp(limit, 1, LOG_RING.capacity)
@@ -517,12 +632,68 @@ function dev_op(state::ServerState, ::Val{:memory}, args::AbstractDict)
         "rss_bytes_before"  => rss_before.bytes,
         "total_allocated"   => gc.allocd + gc.total_allocd,
         "gc_collections"    => gc.pause,
+        # CUMULATIVE since process start, not the last pause — reading it as a
+        # single pause is how a perfectly healthy 0.4%-of-uptime figure turns
+        # into a "7-second stop-the-world" that explains a hang it did not cause.
         "gc_time_ns"        => gc.total_time,
         "threads"           => Threads.nthreads(),
+        "open_fds"          => open_fd_count(),
+        "fd_limit"          => fd_limit(),
         "registries"        => registry_counts(state),
     )
     deep && (result["deep_sizes"] = deep_sizes(state))
     return result
+end
+
+# ── file descriptors ────────────────────────────────────────────────────────
+# A server that stops serving NEW connections while its existing timers keep
+# ticking looks exactly like a hang, and fd exhaustion is the cheapest way to
+# get there: accept() fails, nothing logs, CPU stays flat. The 2026-09-11 hang
+# had that shape (all threads idle, 11m36s CPU over 2.5h, 18 minutes of silence,
+# four workers reconnecting the instant the process was replaced) and this was
+# NOT measurable at the time — which is the reason it is measurable now.
+#
+# Linux only; `nothing` elsewhere, so the report stays honest rather than
+# guessing. `/proc/self/fd` counts the entries including the one the read itself
+# opens, which is close enough for a trend.
+
+"""
+    open_fd_count() -> Union{Int,Nothing}
+
+How many file descriptors this process currently holds, or `nothing` where that
+cannot be read. Compare against [`fd_limit`](@ref); a ratio that climbs across
+two readings minutes apart is a leak, and a ratio near 1.0 is the hang.
+"""
+function open_fd_count()
+    isdir("/proc/self/fd") || return nothing
+    try
+        return length(readdir("/proc/self/fd"))
+    catch e
+        e isa Base.IOError || e isa SystemError || rethrow()
+        return nothing
+    end
+end
+
+"""
+    fd_limit() -> Union{Int,Nothing}
+
+The soft `RLIMIT_NOFILE` for this process. Worth reporting next to the count
+because the systemd unit does not set `LimitNOFILE`, so the ceiling is whatever
+the distribution's default happens to be.
+"""
+function fd_limit()
+    isfile("/proc/self/limits") || return nothing
+    try
+        for line in eachline("/proc/self/limits")
+            startswith(line, "Max open files") || continue
+            soft = split(line)[4]
+            return soft == "unlimited" ? typemax(Int) : parse(Int, soft)
+        end
+        return nothing
+    catch e
+        e isa Base.IOError || e isa SystemError || rethrow()
+        return nothing
+    end
 end
 
 # ── control ─────────────────────────────────────────────────────────────────

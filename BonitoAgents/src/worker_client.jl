@@ -93,7 +93,7 @@ function send_control_error(ws, payload::AbstractDict)
     try
         send_control(ws, payload)
     catch e
-        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+        is_peer_gone(e) || rethrow()
     end
     return nothing
 end
@@ -107,7 +107,7 @@ function send_ws_error(ws, payload::AbstractDict)
     try
         WebSockets.send(ws, JSON.json(payload))
     catch e
-        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+        is_peer_gone(e) || rethrow()
     end
     return nothing
 end
@@ -121,7 +121,7 @@ function close_ws_safe(ws)
     try
         close(ws)
     catch e
-        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+        is_peer_gone(e) || rethrow()
     end
     return nothing
 end
@@ -138,7 +138,7 @@ function force_close_ws!(ws)
     try
         ws.close_transport!()
     catch e
-        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+        is_peer_gone(e) || rethrow()
     end
     return nothing
 end
@@ -486,7 +486,11 @@ function handle_worker_control(state::ServerState, ws)
                 send_control(ws, Dict("type" => "ping"))
                 last_ping_ok[] = time()
             catch e
-                (e isa WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError) || rethrow()
+                # `is_peer_gone`, not a local whitelist: the Reseau transport
+                # throws `NetClosingError`, which matched none of the three
+                # types listed here before and so escaped as an UNHANDLED TASK
+                # ERROR — killing the pinger and freezing `last_ping_ok`.
+                is_peer_gone(e) || rethrow()
                 break   # socket is gone — the frame loop is already tearing down
             end
         end)
@@ -555,6 +559,8 @@ function handle_worker_control(state::ServerState, ws)
                     elseif t == "find_repos_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "worker_state_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "read_log_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "debug_checkout_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
@@ -1522,6 +1528,36 @@ function worker_state(state::ServerState, worker_id::AbstractString; timeout::Re
     end
     resp isa AbstractDict || error("worker_state on '$worker_id': unexpected response shape")
     haskey(resp, "error") && error(String(resp["error"]))
+    return Dict{String,Any}(resp)
+end
+
+"""
+    worker_log(state, worker_id; lines, since, until, grep, timeout = 45.0) -> Dict
+
+That worker's own log file, read ON the worker and returned whole.
+
+Unlike most worker RPCs this does NOT throw when the worker cannot answer the
+question — a worker that never started a log file answers `ok = false` with the
+reason, because the point of this call is a fan-out across a fleet where a
+refusal from one machine must not lose the other five. It still throws when the
+worker is UNREACHABLE, which is a different fact.
+"""
+function worker_log(state::ServerState, worker_id::AbstractString;
+                        lines::Integer = 200, since::AbstractString = "",
+                        until::AbstractString = "", grep::AbstractString = "",
+                        timeout::Real = 45.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        throw(WorkerUnreachableError("worker_log on '$worker_id'", "worker is not connected"))
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict("type" => "read_log", "request_id" => rid,
+                                            "lines" => Int(lines), "since" => String(since),
+                                            "until" => String(until), "grep" => String(grep)))
+        take_pending!(state, ch, rid, timeout, "worker_log on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("worker_log on '$worker_id': unexpected response shape")
     return Dict{String,Any}(resp)
 end
 

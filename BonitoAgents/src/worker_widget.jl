@@ -241,7 +241,11 @@ function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::
 
     on(session, create_btn.value) do clicked
         clicked || return
-        is_busy_idle(c.busy[]) || return
+        # `is_busy_running`, not `is_busy_idle`: the progress card parks on the
+        # LAST outcome (:ok / :err) so the user can read it, and a guard that
+        # demanded :idle would refuse every click after the first operation for
+        # the rest of the window's life.
+        refuse_if_busy(c.busy, c.error_obs, "Can't create a chat right now") && return
         # The path field IS the selection — nothing else to resolve. A path that
         # doesn't exist yet ("type /newname to create it") is created on the
         # WORKER here (mkpath) before import; `do_import` itself stays strict
@@ -260,7 +264,7 @@ function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::
     end
     on(session, cancel_btn.value) do clicked
         clicked || return
-        is_busy_idle(c.busy[]) || return
+        is_busy_running(c.busy[]) && return
         c.picker_state[] = ""
         c.error_obs[]    = ""
     end
@@ -289,7 +293,7 @@ function render_github_form(session::Bonito.Session, c::WorkerCard, wid::String)
 
     on(session, open_btn.value) do clicked
         clicked || return
-        is_busy_idle(c.busy[]) || return
+        refuse_if_busy(c.busy, c.error_obs, "Can't clone right now") && return
         u = String(strip(url[]))
         if isempty(u)
             err[] = "GitHub URL required."
@@ -382,7 +386,9 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
                        nothing : String(prov_raw)
         pick[] = Dict{String,Any}()              # reset so the same row can re-fire
         isempty(w_name) && return
-        is_busy_idle(c.busy[]) || return         # drop double-clicks while a start is in flight
+        # Drop double-clicks while a start is in flight (see create_btn above
+        # for why this asks "running?" and not "idle?").
+        refuse_if_busy(c.busy, c.error_obs, "Can't open that chat right now") && return
         c.do_import(w_name, path; resume_session_id = resume_session_id,
                     provider = provider)
     end

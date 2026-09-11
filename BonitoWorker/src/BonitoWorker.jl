@@ -110,6 +110,11 @@ end
 # display name is just a label — this id is the dict key on the server.
 worker_id_path() = joinpath(config_dir(), "worker_id")
 
+# Where this worker's output goes, named once: `spawn_worker` points the child's
+# stdout/stderr here, `start` claims it as the log the server can read back, and
+# both must agree or the fleet-log tool serves an empty file.
+worker_log_path() = joinpath(config_dir(), "worker.log")
+
 # Install config written by `install!` and read back by `start`.
 config_path() = joinpath(config_dir(), "config.json")
 
@@ -768,8 +773,22 @@ end
 # on a different Julia than this install does (`replace_reason`). The PID-lock
 # invariant is preserved: `stop_running_worker!` waits for exit before we spawn
 # the replacement.
+# Keep one previous generation, like `rotate_log_if_big!` does for the server.
+# Safe only between worker incarnations — see the call site.
+function rotate_spawn_log!(logfile::AbstractString)
+    (isfile(logfile) && filesize(logfile) > LOG_MAX_BYTES) || return nothing
+    try
+        mv(logfile, logfile * ".1"; force = true)
+    catch e
+        # A log we cannot rotate is not a reason to refuse to start a worker.
+        e isa Base.IOError || e isa SystemError || rethrow()
+        @warn "BonitoWorker: could not rotate $logfile" exception = e
+    end
+    return nothing
+end
+
 function spawn_worker(; force_restart::Bool = false)
-    logfile = joinpath(config_dir(), "worker.log")
+    logfile = worker_log_path()
     other = running_worker_pid()
     if other !== nothing
         reason = replace_reason(; force_restart, recorded_julia = pidfile_julia(),
@@ -786,6 +805,12 @@ function spawn_worker(; force_restart::Bool = false)
             return nothing, logfile
         end
     end
+    # The one moment nothing holds a descriptor on the log: the previous worker
+    # has exited and the next has not started. `append = true` below means the
+    # file otherwise grows for the life of the install — bound it HERE rather
+    # than from inside the worker, which cannot rename a file its parent's fd
+    # points at without losing every line written afterwards.
+    rotate_spawn_log!(logfile)
     project = something(Base.active_project(), "@bonito-agents")
     cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
     proc = run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true);
@@ -842,6 +867,14 @@ function _bind_lifetime_to_parent!()
 end
 
 function start(; force::Bool = false)
+    # Before anything can log: the file is a redirect of fd 1 and 2, so starting
+    # it late means the first seconds of a worker's life — which is where a
+    # failed dial or a bad config shows up — go to wherever the service manager
+    # happened to point them, i.e. nowhere we can read from another machine.
+    # NOT a redirect: `spawn_worker` already launched us with stdout/stderr on
+    # this very file. We only claim it as the log `read_log_file` serves, and
+    # install the timestamping logger so the lines can be sliced by time.
+    start_file_log!(worker_log_path(); redirect = false)
     cfg = config_path()
     isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
                           "(`curl -fsSL <server-url>/install.jl | julia -`)")
@@ -950,7 +983,8 @@ end
 
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                                mcp_arguments, projects_root, agent_bin,
-                               agent_env::Dict{String,String} = Dict{String,String}())
+                               agent_env::Dict{String,String} = Dict{String,String}(),
+                               hello_timeout::Real = 30.0)
     control_url = ws_url(server_url, "/worker-ws")
     @info "BonitoWorker: connecting to control WS" control_url worker_id name
     WebSockets.open(control_url) do ws
@@ -967,7 +1001,31 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             "projects_root" => projects_root,
         ))
 
-        ack_raw = WebSockets.receive(ws)
+        # The hello/ack exchange is the ONE window with NO watchdog on either
+        # side. The receive-watchdog below is armed from `heartbeat_interval`,
+        # which arrives IN the ack; the server's own zombie reaper only watches
+        # workers it has already registered. So a server that upgrades the
+        # socket and then never answers leaves this `receive` blocked forever —
+        # measured on 2026-09-11: a worker sat here 14m37s and recovered only
+        # when the server PROCESS died, not because anything noticed.
+        #
+        # Bounded, then killed at the TRANSPORT (not `close(ws)` — same
+        # sendlock-deadlock reasoning as the watchdog below), which makes the
+        # blocked receive throw and hands control back to the retry loop.
+        ack_raw = let ch = Channel{Any}(1)
+            Base.errormonitor(@async put!(ch, try
+                WebSockets.receive(ws)
+            catch e
+                e                       # hand the failure over, don't race two throws
+            end))
+            if timedwait(() -> isready(ch), Float64(hello_timeout)) !== :ok
+                close_transport_quietly!(ws)
+                error("server did not answer the registration hello within " *
+                      "$(hello_timeout)s — it is up but wedged; re-dialling")
+            end
+            v = take!(ch)
+            v isa Exception ? throw(v) : v
+        end
         ack = decode_control(ack_raw)
         if !get(ack, "ok", false)
             error("server rejected hello: $(get(ack, "error", "unknown"))")
@@ -1031,6 +1089,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_find_repos(ws, cmd)
             elseif t == "worker_state"
                 @async handle_worker_state(ws, cmd; mcp_command, mcp_arguments)
+            elseif t == "read_log"
+                @async handle_read_log(ws, cmd)
             elseif t == "debug_checkout"
                 @async handle_debug_checkout(ws, cmd)
             elseif t == "open_eval_host"
@@ -3469,6 +3529,239 @@ function handle_find_repos(ws, cmd::AbstractDict)
         send_control(ws, response)
     catch e
         @warn "find_repos response failed" exception = e
+    end
+end
+
+# ── our own log file (the debug chat's view of ANY machine's log) ────────────
+# A dev-mode chat always runs on a WORKER, and nothing but the server runs on the
+# server host — so an agent debugging an incident can natively read exactly one
+# machine's log: the one it sits on. This is the reader both sides use;
+# BonitoAgents depends on BonitoWorker, so the server calls it directly for its
+# own file and asks each worker over the control WS for theirs.
+#
+# We write the file ourselves rather than reading journald. journald would work
+# on the Linux boxes and nowhere else — half this fleet is macOS and Windows —
+# and reading a system unit's journal also depends on the reading user's groups.
+# A plain file has neither problem, needs no subprocess, and we control rotation.
+#
+# The critical design point, and the reason this is a REDIRECT of fd 1/2 rather
+# than a logger sink: the evidence that matters most never passes through the
+# logger. `errormonitor` prints "UNHANDLED TASK ERROR" straight to stderr, and
+# the runtime's fatal-signal handler writes its thread dump to fd 2 from C. A
+# sink that only saw `@info`/`@warn`/`@error` would have missed BOTH on
+# 2026-09-11. Measured: with the file-backed redirect below, an `@info` record, a
+# bare `println`, an errormonitor failure and a `signal 15` thread dump all land
+# in the file. A PIPE-backed redirect would also capture them but needs a live
+# task to drain it — which is exactly what a dying process does not have — so it
+# would lose the crash dump. File-backed it is.
+
+const LOG_MAX_BYTES  = 32 * 1024 * 1024   # per generation; two are kept
+const LOG_TAIL_BYTES = 4 * 1024 * 1024    # the most we ever read back
+const LOG_MAX_LINES  = 2000               # …and the most we ever return
+const LOG_ROTATE_CHECK_S = 30.0
+
+# Process-global because the thing it describes — fd 1 and fd 2 — is.
+const LOG_FILE   = Ref("")
+const LOG_HANDLE = Ref{Union{IOStream,Nothing}}(nothing)
+
+"""
+    log_file_path() -> String
+
+Where this process is writing its log, or `""` if [`start_file_log!`](@ref) was
+never called (a REPL, a test runner, an embedder that wants its own output).
+"""
+log_file_path() = LOG_FILE[]
+
+# Timestamps on our own records, because a log you cannot line up against
+# another machine's answers nothing. Lines we do NOT format — stack traces, a
+# signal dump, whatever a dependency prints — stay verbatim and are read as
+# continuations of the stamped record above them (see `read_log_file`).
+#
+# Written against `Base.CoreLogging` and `Libc.strftime` rather than the
+# `Logging` stdlib's `ConsoleLogger`: `ConsoleLogger` is not in Base, and this
+# package's dependencies are deliberately few. One record is ONE stamped line
+# plus indented continuations, which is what makes the file greppable and what
+# `read_log_file`'s time filter parses.
+const CoreLogging = Base.CoreLogging
+
+struct TimestampLogger <: CoreLogging.AbstractLogger
+    stream    :: IO
+    min_level :: CoreLogging.LogLevel
+end
+
+CoreLogging.min_enabled_level(l::TimestampLogger) = l.min_level
+CoreLogging.shouldlog(::TimestampLogger, level, _module, group, id) = true
+# A throwing `show` on a logged value must not take the process down from
+# inside logging; report it in place instead.
+CoreLogging.catch_exceptions(::TimestampLogger) = true
+
+function CoreLogging.handle_message(l::TimestampLogger, level, message, _module, group,
+                                    id, file, line; kwargs...)
+    buf = IOBuffer()
+    print(buf, Libc.strftime("%Y-%m-%dT%H:%M:%S", time()), ' ',
+          uppercase(string(level)), ": ", message)
+    for (k, v) in kwargs
+        print(buf, "  ", k, "=", v)
+    end
+    print(buf, "  @ ", _module, ' ', basename(String(something(file, ""))), ':', line)
+    # Indent every continuation so one record stays one visual block and the
+    # stamp regex cannot match mid-record.
+    println(l.stream, replace(String(take!(buf)), '\n' => "\n    "))
+    flush(l.stream)
+    return nothing
+end
+
+"""
+    start_file_log!(path; redirect = true, max_bytes = LOG_MAX_BYTES,
+                    timestamps = true) -> String
+
+Declare `path` to be this process's log — the file [`read_log_file`](@ref) serves
+— and make sure everything this process emits lands in it. Returns the path;
+idempotent, so two `serve()` calls in one process share the file.
+
+`redirect` is the difference between the two callers:
+
+  * `true` (the SERVER) — we point fd 1 and fd 2 at the file ourselves, and we
+    own rotation because we own the descriptors.
+  * `false` (the WORKER) — our PARENT already did it: `spawn_worker` launches us
+    with `stdout`/`stderr` piped to this exact file, which is strictly better
+    than doing it here because it also captures whatever Julia prints before
+    this code runs (precompilation, a load error). Redirecting again would point
+    us at a second file and split the log in half, and rotating would rename the
+    file out from under the parent's descriptor — which follows the inode, so
+    every later line would vanish into an unlinked file.
+
+`timestamps` installs [`TimestampLogger`](@ref) either way, since `since`/`until`
+in `read_log_file` need something to match.
+"""
+function start_file_log!(path::AbstractString; redirect::Bool = true,
+                         max_bytes::Integer = LOG_MAX_BYTES, timestamps::Bool = true)
+    LOG_FILE[] == String(path) && return LOG_FILE[]
+    mkpath(dirname(String(path)))
+    if redirect
+        io = open(String(path), "a")
+        redirect_stdout(io)
+        redirect_stderr(io)
+        LOG_HANDLE[] = io
+    end
+    LOG_FILE[] = String(path)
+    timestamps && CoreLogging.global_logger(TimestampLogger(stderr, CoreLogging.Info))
+    redirect && Base.errormonitor(@async while true
+        sleep(LOG_ROTATE_CHECK_S)
+        rotate_log_if_big!(Int(max_bytes))
+    end)
+    return LOG_FILE[]
+end
+
+# Two generations, `path` and `path.1`, so the disk cost is bounded at
+# 2 × max_bytes no matter how long the process runs. The order matters: point
+# fd 1/2 at the NEW file before closing the old handle, or output written in
+# between is lost rather than merely landing in `.1`.
+function rotate_log_if_big!(max_bytes::Int)
+    path = LOG_FILE[]
+    isempty(path) && return nothing
+    (isfile(path) && filesize(path) > max_bytes) || return nothing
+    old = LOG_HANDLE[]
+    mv(path, path * ".1"; force = true)
+    io = open(path, "a")
+    redirect_stdout(io)
+    redirect_stderr(io)
+    LOG_HANDLE[] = io
+    old === nothing || close(old)
+    return nothing
+end
+
+# Read back at most the last LOG_TAIL_BYTES: the file is bounded but still tens
+# of megabytes, and seeking beats reading it whole.
+function tail_lines(path::AbstractString)
+    sz = filesize(path)
+    from = max(0, sz - LOG_TAIL_BYTES)
+    text = open(path, "r") do io
+        seek(io, from)
+        read(io, String)
+    end
+    ls = split(text, '\n')
+    # A seek lands mid-line; that fragment is not a line.
+    from > 0 && !isempty(ls) && popfirst!(ls)
+    return [String(l) for l in ls if !isempty(l)]
+end
+
+# Our stamps are ISO and fixed-width, so a lexicographic compare IS a time
+# compare, and a shorter bound ("2026-09-11 14:40") compares correctly as a
+# prefix. `T` or space both work on input.
+normalize_stamp(s::AbstractString) = replace(strip(String(s)), ' ' => 'T')
+const STAMP_RE = r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+
+"""
+    read_log_file(; path = log_file_path(), lines = 200, grep = "", since = "", until = "")
+
+This machine's log, newest last. Always returns a Dict — a process that never
+started a log file is an ANSWER, not an exception, because the fan-out across a
+fleet must report that machine rather than fail on it.
+
+Untimestamped lines (stack traces, a signal dump) inherit the timestamp of the
+record above them, so `since`/`until` keep a trace attached to the line that
+raised it instead of slicing it in half.
+"""
+function read_log_file(; path::AbstractString = log_file_path(), lines::Integer = 200,
+                       grep::AbstractString = "", since::AbstractString = "",
+                       until::AbstractString = "")
+    host = gethostname()
+    base = Dict{String,Any}("host" => host, "path" => String(path))
+    isempty(path) && return merge(base, Dict{String,Any}("ok" => false,
+        "error" => "this process is not writing a log file (start_file_log! was never called)"))
+    isfile(path) || return merge(base, Dict{String,Any}("ok" => false,
+        "error" => "no log file at $path on $host"))
+
+    ls = tail_lines(path)
+    note = ""
+    lo, hi = normalize_stamp(since), normalize_stamp(until)
+    if !isempty(lo) || !isempty(hi)
+        cur, saw_stamp = "", false
+        ls = [l for l in ls if begin
+            m = match(STAMP_RE, l)
+            if m !== nothing
+                cur = String(m.captures[1]); saw_stamp = true
+            end
+            (isempty(lo) || cur >= lo) && (isempty(hi) || cur <= hi)
+        end]
+        # A time filter over a log written before the timestamping logger
+        # existed matches nothing. Say so: an empty list is indistinguishable
+        # from a quiet machine, and that is the wrong thing to conclude.
+        saw_stamp || (note = "no line in the window carries a timestamp — this log " *
+                             "predates the timestamping logger, so `since`/`until` " *
+                             "cannot select from it; retry without them")
+    end
+    isempty(grep) || (needle = lowercase(grep);
+                      ls = [l for l in ls if occursin(needle, lowercase(l))])
+    n = clamp(Int(lines), 1, LOG_MAX_LINES)
+    length(ls) > n && (ls = ls[(end - n + 1):end])
+    r = Dict{String,Any}("ok" => true, "lines" => ls, "returned" => length(ls),
+                         "capped_at" => n, "bytes" => filesize(path))
+    isempty(note) || (r["note"] = note)
+    return merge(base, r)
+end
+
+# The control-WS half of the above.
+#     {type:"read_log", request_id, lines, since, until, grep}
+#  -> {type:"read_log_response", request_id, ok, host, path, lines, …}
+function handle_read_log(ws, cmd::AbstractDict)
+    rid = String(get(cmd, "request_id", ""))
+    response = try
+        r = read_log_file(; lines = Int(get(cmd, "lines", 200)),
+                            since = String(get(cmd, "since", "")),
+                            until = String(get(cmd, "until", "")),
+                            grep  = String(get(cmd, "grep", "")))
+        merge(Dict{String,Any}("type" => "read_log_response", "request_id" => rid), r)
+    catch e
+        e isa InterruptException && rethrow()
+        Dict{String,Any}("type" => "read_log_response", "request_id" => rid,
+                         "ok" => false, "error" => sprint(showerror, e))
+    end
+    try
+        send_control(ws, response)
+    catch e
+        @warn "read_log response failed" exception = e
     end
 end
 
