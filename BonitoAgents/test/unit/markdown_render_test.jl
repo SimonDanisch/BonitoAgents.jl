@@ -1,98 +1,100 @@
-@testitem "unit:markdown_render" tags = [:unit] begin
-
 # `markdown_html` renders chat message text through CommonMark on every streamed
-# chunk, so it is routinely handed half-formed markdown. It must NEVER throw —
-# a parser exception there takes down the whole message render (and floods the
-# server log), which is exactly what happened in production.
+# chunk, so it is routinely handed half-formed markdown. The guarantee it owes
+# the user is simple and absolute: RENDERING MUST NOT LOSE TEXT. A message that
+# renders unstyled is a nuisance; a message that renders with sentences missing
+# is a lie.
 #
-# The offender is CommonMark's GFM table rule: a separator row that starts with
-# `|` and is all `|-: ` passes its permissive `valid_table_spec`, but
-# `parse_table_spec` (which needs `|dashes|`) yields an EMPTY column spec, so its
-# `inline_modifier` indexes `spec[0]` → BoundsError. A streamed table hits that
-# on its way to `|---|` (separator arrives as `|`, `|-`, `| |`, …).
+# The thing that breaks it is `CommonMark.TableRule`, which deletes text.
+# `gfm_table` does
 #
-# `markdown_html` catches ONLY that BoundsError and shows the text verbatim. We
-# deliberately do NOT "fix" it by tightening `valid_table_spec`: CommonMark
-# consumes the header paragraph before it bails on an invalid spec, so that would
-# silently DROP the header line. The verbatim fallback keeps all the text; the
-# next streamed chunk re-renders the finished table cleanly.
+#     finalize_literal!(container)     # empties the paragraph
+#     header = container.literal       # takes its text
+#     … only THEN validates the spec
+#
+# so every line of a paragraph before the last `|`-leading line is dropped, with
+# no error — verified against CommonMark 1.0.4:
+#
+#     "x\n| a |\n| b |"  →  <p>| b |</p>
+#
+# `defuse_table_rule` escapes the leading `|` of any line that is not part of a
+# valid table, so the rule never fires on prose. These tests pin the guarantee,
+# not the mechanism: whatever we do, the words have to come out the other side.
+@testitem "unit:markdown_render" tags = [:unit] begin
 
 using Test
 import BonitoAgents
 const BT = BonitoAgents
 
-@testset "markdown_html never throws on half-formed table markdown" begin
-    # Each forms a zero-column CommonMark Table and used to throw
-    # `BoundsError: 0-element Vector{Symbol} at index [0]`.
-    crashers = [
-        "alpha | beta\n|-",                # streamed separator, mid-flight
-        "alpha | beta\n| |",
-        "alpha | beta\n|::|",
-        "| alpha | beta |\n|::|::|\n| 1 | 2 |",
-    ]
-    for s in crashers
-        local html
-        @test (html = BT.markdown_html(s); true)             # no throw
-        @test startswith(html, "<div class=\"markdown-body\">")
-        @test occursin("alpha", html) && occursin("beta", html)  # content preserved
-    end
+# Every word of `src` must survive into the rendered html.
+function keeps(src, words)
+    h = BT.markdown_html(src)
+    all(w -> occursin(w, h), words) || return false
+    # …and our escaping must never leak into what the user sees.
+    return !occursin("\\|", h) && !occursin("\\1", h)
 end
 
-@testset "a render that would erase the message falls back to verbatim" begin
-    # The content-preservation guarantee above cannot rest on WHICH exception
-    # CommonMark throws. Our pinned version raises a BoundsError on a
-    # half-formed table; the newer fork CI resolves to returns successfully with
-    # a zero-column <table> and no cells, so the message rendered BLANK and only
-    # CI saw it. The guard therefore checks the OUTPUT.
-    #
-    # It is keyed on words surviving, not on the output having any text at all —
-    # these render to nothing by design and must keep doing so.
+@testset "CommonMark's table rule must not eat prose" begin
+    # Each of these loses text through a bare CommonMark 1.0.4 parse.
+    @test keeps("x\n| a |\n| b |", ["x", "a", "b"])
+    @test keeps("| a |\n| b |\n| c |", ["a", "b", "c"])
+    @test keeps("| alpha | beta |\n| 1 | 2 |", ["alpha", "beta", "1", "2"])
+    # A table mid-stream, on its way to `|---|` — the common case, since the
+    # message is re-rendered per chunk.
+    @test keeps("alpha | beta\n|-", ["alpha", "beta"])
+    @test keeps("alpha | beta\n| |", ["alpha", "beta"])
+    @test keeps("alpha | beta\n|::|", ["alpha", "beta"])
+    @test keeps("| alpha | beta |\n|::|::|\n| 1 | 2 |", ["alpha", "beta", "1", "2"])
+end
+
+@testset "a real table still renders as a table" begin
+    h = BT.markdown_html("| a | b |\n|---|---|\n| 1 | 2 |")
+    @test occursin("<table", h)
+    for w in ["a", "b", "1", "2"]; @test occursin(w, h); end
+    # Alignment specs are specs too.
+    @test occursin("<table", BT.markdown_html("| a | b |\n|:--|--:|\n| 1 | 2 |"))
+end
+
+@testset "code keeps its pipes, unescaped" begin
+    fenced = BT.markdown_html("```\n| a |\n| b |\n```")
+    @test occursin("<code>", fenced) && occursin("| a |", fenced)
+    indented = BT.markdown_html("    | a | b |")
+    @test occursin("<code>", indented) && occursin("| a | b |", indented)
+end
+
+# Structure is not content. An ordered list's `1.` becomes `<ol><li>` with the
+# digit drawn by a CSS counter, so it is absent from the html by design — the
+# previous guard read that as erased content and dumped whole messages to
+# escaped plain text, which is how a numbered list broke every message carrying
+# one.
+@testset "ordinary markdown renders as markdown" begin
+    for s in ["1. alpha\n2. beta", "1) alpha\n2) beta", "  1. nested\n  2. list"]
+        h = BT.markdown_html(s)
+        @test occursin("<ol", h) && occursin("<li>", h)
+        @test occursin("alpha", h) || occursin("nested", h)
+    end
+    @test occursin("<ul", BT.markdown_html("- alpha\n- beta"))
+    @test occursin("<strong", BT.markdown_html("hello **world**"))
+    @test occursin("<h1", BT.markdown_html("# heading"))
+    @test occursin("<code", BT.markdown_html("`code span`"))
+    @test occursin("<a", BT.markdown_html("see [x](https://example.com)"))
+    # These render to no text at all, by design, and must keep doing so.
     @test occursin("<hr", BT.markdown_html("---"))
     @test occursin("<hr", BT.markdown_html("***"))
-    # ... while anything carrying words keeps them, however it is parsed.
-    for s in ["alpha | beta\n|-", "| alpha | beta |\n|::|::|\n| 1 | 2 |",
-              "# heading", "- item one\n- item two", "`code span`"]
-        h = BT.markdown_html(s)
-        for w in ["alpha", "beta", "heading", "item", "one", "two", "code", "span"]
-            occursin(w, s) && @test occursin(w, h)
-        end
-    end
 end
 
-# The preservation guard is keyed on every word surviving, which quietly made it
-# a rule about MARKUP too: an ordered list's `1.` is rendered as `<ol><li>` with
-# the digit drawn by a CSS counter, so it is absent from the html by design. The
-# guard read that as "the render erased content" and dumped the whole message to
-# escaped plain text — asterisks, backticks and all. It looked agent-dependent
-# because it only bit when the digit appeared nowhere else in the message.
-@testset "structure is not content: numbered lists still render" begin
-    for s in ["1. alpha\n2. beta",            # the minimal case
-              "1) alpha\n2) beta",            # the `)` delimiter
-              "  1. nested\n  2. list",       # indented
-              "1. one\n2. two\n3. three\n4. four"]
-        h = BT.markdown_html(s)
-        @test occursin("<ol", h)
-        @test occursin("<li>", h)
-        # …and the prose still survives, which is what the guard is FOR.
-        for w in ["alpha", "beta", "nested", "list", "one", "two", "three", "four"]
-            occursin(w, s) && @test occursin(w, h)
-        end
+# The defusing is a workaround for an upstream bug; when CommonMark validates
+# the spec before gutting the paragraph, it can go. Until then it must be a
+# no-op for anything that cannot trigger the rule, so it never costs a message
+# that has no leading pipe anything.
+@testset "defuse_table_rule only touches what it must" begin
+    for s in ["hello world", "- a\n- b", "a | b\nc | d", "# x", ""]
+        @test BT.defuse_table_rule(s) === s      # identity, not just equal
     end
-    # A link reference definition is consumed whole and emits nothing, so its
-    # label must not be demanded back either.
-    h = BT.markdown_html("see [1] for details\n\n[1]: https://example.com/x")
-    @test occursin("<a", h) && occursin("example.com", h)
-
-    # The guard must still FIRE on the case it exists for: a half-formed table
-    # whose header row CommonMark swallows falls back to verbatim.
-    bad = BT.markdown_html("| alpha | beta |\n|::|::|\n| 1 | 2 |")
-    @test occursin("alpha", bad) && occursin("beta", bad)
-end
-
-@testset "markdown_html still renders well-formed markdown" begin
-    @test occursin("<strong", BT.markdown_html("hello **world**"))
-    @test occursin("<table", BT.markdown_html("| a | b |\n|---|---|\n| 1 | 2 |"))
-    h = BT.markdown_html("plain text")
-    @test occursin("plain text", h) && !occursin("<table", h)
+    @test BT.defuse_table_rule("x\n| a |") == "x\n\\| a |"
+    # Indentation in front of the pipe is preserved.
+    @test BT.defuse_table_rule("x\n  | a |") == "x\n  \\| a |"
+    # A valid table is left exactly as it was.
+    tbl = "| a | b |\n|---|---|\n| 1 | 2 |"
+    @test BT.defuse_table_rule(tbl) === tbl
 end
 end
