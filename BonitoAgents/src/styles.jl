@@ -150,6 +150,39 @@ const BASE_CSS = [
         "height" => "1px", "background" => "var(--bt-border)", "margin" => "4px 6px"),
     CSS(".bt-menu-danger", "color" => "var(--bt-error)"),
     CSS(".bt-menu-danger:hover", "background" => "rgba(239,68,68,0.10)"),
+
+    # ── Modal: a form that must be answered before anything else ─────────────
+    # For work that opens from a control the user may have scrolled far away
+    # from. An in-page panel appended at the bottom looked like nothing had
+    # happened (the Copy-project form, opened from the Settings card while
+    # scrolled up). Fixed overlay, so it is where the eye is; the card scrolls
+    # internally rather than growing past the viewport.
+    CSS(".bt-modal-overlay",
+        "position" => "fixed", "inset" => "0",
+        "background" => "rgba(15,23,42,0.45)",
+        "z-index" => "1000",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "padding" => "var(--bt-space-4)"),
+    CSS(".bt-modal-card",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "var(--bt-radius)",
+        "box-shadow" => "var(--bt-shadow-md)",
+        "width" => "min(560px, 100%)",
+        "max-height" => "85vh", "overflow-y" => "auto",
+        "display" => "flex", "flex-direction" => "column"),
+    CSS(".bt-modal-head",
+        "display" => "flex", "align-items" => "center", "justify-content" => "space-between",
+        "gap" => "var(--bt-space-3)",
+        "padding" => "14px 16px",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-modal-title", "font-weight" => "600", "font-size" => "14px"),
+    CSS(".bt-modal-body", "padding" => "4px 16px 16px"),
+    # The form inside a modal brings its own layout, not its own chrome — the
+    # card is the surface.
+    CSS(".bt-modal-card .bt-form",
+        "background" => "transparent", "border" => "0",
+        "padding" => "0", "margin-top" => "12px"),
 ]
 
 const ChatStyles = Bonito.Styles(
@@ -739,10 +772,6 @@ const ChatStyles = Bonito.Styles(
     # (the home has room, unlike the single-line chat header).
     CSS(".bt-defaults-bar",
         "flex-wrap" => "wrap"),
-    # One-line explainer under the "Defaults" heading.
-    CSS(".bt-defaults-hint",
-        "font-size" => "12px", "color" => "var(--bt-text-muted)",
-        "margin" => "0 0 8px 0"),
 
     # ── Home "Debug BonitoAgents" control ────────────────────────────────────
     # The worker picker and its button on one row; the picker borrows the

@@ -904,11 +904,15 @@ const DashboardStyles = Bonito.Styles(
         "padding" => "14px 16px"),
     CSS(".bt-settings-row + .bt-settings-row",
         "border-top" => "1px solid var(--bt-border)"),
-    CSS(".bt-settings-text", "flex" => "1 1 320px", "min-width" => "0"),
-    CSS(".bt-settings-title", "font-weight" => "600", "font-size" => "13px"),
-    CSS(".bt-settings-hint",
-        "color" => "var(--bt-text-muted)", "font-size" => "12px",
-        "margin-top" => "2px", "max-width" => "64ch", "line-height" => "1.45"),
+    CSS(".bt-settings-text", "flex" => "0 1 auto", "min-width" => "0"),
+    # Dotted underline: the standing "there is a tooltip here" affordance, the
+    # same one `.bt-path-link` uses for a clickable path.
+    CSS(".bt-settings-title",
+        "font-weight" => "600", "font-size" => "13px",
+        "text-decoration" => "underline dotted",
+        "text-decoration-color" => "var(--bt-text-faint)",
+        "text-underline-offset" => "3px",
+        "cursor" => "help"),
     CSS(".bt-settings-control",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "flex" => "0 1 auto", "flex-wrap" => "wrap", "justify-content" => "flex-end",
@@ -1098,6 +1102,14 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-form label",
         "color" => "var(--bt-text-muted)", "font-size" => "13px",
         "padding-top" => "8px"),
+    # A note that belongs to the field ABOVE it, not to a label: it sits in the
+    # value column, where the input it explains is. Dropped into the grid as a
+    # plain child it landed in the 120px label column instead and wrapped to
+    # four lines.
+    CSS(".bt-form-note",
+        "grid-column" => "2",
+        "font-size" => "11px", "color" => "var(--bt-text-muted)",
+        "margin-top" => "-6px"),
     # An input that paints its own `background` must paint its own `color` too —
     # otherwise the text is the UA's `fieldtext` and follows the OS color scheme
     # while the background stays our light token. `html:root { color-scheme: light }`
@@ -1609,6 +1621,8 @@ const DashboardStyles = Bonito.Styles(
             "gap" => "8px"),
         CSS(".bt-form label",
             "padding-top" => "0", "font-size" => "12px"),
+        # One column here, so the note can't sit in a second one.
+        CSS(".bt-form-note", "grid-column" => "1"),
         # Cards: body + actions stack instead of sitting on one row. The card
         # is column-flex now (project list lives inside it), so wrapping is on
         # the top row (`.bt-card-row`) rather than the card itself.
@@ -2342,9 +2356,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.label("Name on target"),
         text_input(cp_new_name, "e.g. my-project-copy"),
         DOM.div("It becomes a folder on the target worker: no / or \\, no leading dot.";
-                style = Styles("font-size" => "11px",
-                               "color"     => "var(--bt-text-muted)",
-                               "margin-top" => "-4px")),
+                class = "bt-form-note"),
         form_error(),
         DOM.div(cp_cancel, cp_submit; class = "bt-form-actions"),
         class = "bt-form")
@@ -2539,15 +2551,51 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # worker pills and the sidebar. (`ProjectCard`, `sync_request`,
     # `open_request` remain defined for the future move-to-worker redesign.)
 
-    # One slide-in form, one source of truth: which one is open right now.
-    # Only copy-project remains on the dashboard; new-project and GitHub
-    # clone moved onto the per-worker cards (worker_widget.jl).
-    form_block = map(which_form) do which
-        if which === :copy_project
-            DOM.div(cp_form(); class = "bt-slide-in")
-        else
-            DOM.div()
-        end
+    # One form, one source of truth: which one is open right now. Only
+    # copy-project remains on the dashboard; new-project and GitHub clone moved
+    # onto the per-worker cards (worker_widget.jl).
+    #
+    # It opens as a MODAL, not as a panel in the page: the button that opens it
+    # lives in the Settings card at the very bottom, so a user who scrolled up
+    # to pick a project clicked it and saw nothing happen — the form was
+    # appended below the fold. Closes on the ✕, on the backdrop, and on Escape.
+    form_close = Observable("")
+    on(session, form_close) do v
+        isempty(v) && return
+        form_close[] = ""
+        which_form[] = :none
+        error_obs[]  = ""
+    end
+    form_block = map(session, which_form) do which
+        which === :copy_project || return DOM.div()
+        close_btn = DOM.button("✕";
+            class = "bt-btn bt-btn-ghost bt-btn-sm bt-modal-close",
+            title = "Close",
+            onclick = js"event => $(form_close).notify('x')")
+        DOM.div(
+            DOM.div(
+                DOM.div(DOM.span("Copy project"; class = "bt-modal-title"), close_btn;
+                        class = "bt-modal-head"),
+                DOM.div(cp_form(); class = "bt-modal-body");
+                class = "bt-modal-card",
+                # A click inside the card must not reach the backdrop handler.
+                onclick = js"event => event.stopPropagation()"),
+            # Escape closes it too. The listener is on the document (the overlay
+            # never has focus) and retires itself once the overlay is gone — the
+            # node is discarded when `which_form` flips, so there is nothing else
+            # to hang a teardown on.
+            js"""(() => {
+                const esc = (e) => {
+                    if (!document.querySelector('.bt-modal-overlay')) {
+                        document.removeEventListener('keydown', esc, true);
+                        return;
+                    }
+                    if (e.key === 'Escape') { e.stopPropagation(); $(form_close).notify('x'); }
+                };
+                document.addEventListener('keydown', esc, true);
+            })()""";
+            class = "bt-modal-overlay",
+            onclick = js"event => $(form_close).notify('x')")
     end
     # Top-of-page errors, for failures with no form on screen ("Register a
     # worker before creating a project"). While a form IS open its own copy
@@ -2626,12 +2674,14 @@ end
 # One row of the Settings card: what it is (and why) on the left, the control
 # on the right. Rows wrap onto two lines when the pane is narrow.
 function settings_row(title::AbstractString, hint::AbstractString, control)
+    # The explanation rides on the row's tooltip rather than under the title:
+    # these are three or four lines each, and printed in full they turned a card
+    # of three controls into a wall of prose. The dotted title says there is
+    # more to read; hovering the row shows it.
     DOM.div(
-        DOM.div(DOM.div(title; class = "bt-settings-title"),
-                DOM.div(hint; class = "bt-settings-hint");
-                class = "bt-settings-text"),
+        DOM.div(DOM.span(title; class = "bt-settings-title"); class = "bt-settings-text"),
         DOM.div(control; class = "bt-settings-control");
-        class = "bt-settings-row")
+        class = "bt-settings-row", title = hint)
 end
 
 # ── "Debug BonitoAgents" ────────────────────────────────────────────────────
