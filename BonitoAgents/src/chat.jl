@@ -3694,12 +3694,34 @@ markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
     # waved that through. Checked against the html with its tags, not the text
     # between them: a link's URL lives in `href`, a fence's language in a
     # `class`, and those words legitimately never appear as text.
-    words = [m.match for m in eachmatch(r"[A-Za-z0-9]+", String(text))]
+    # …with STRUCTURE excluded from "words". An ordered list's `1.` / `2.` is
+    # markup, not prose: CommonMark emits `<ol><li>` and the browser draws the
+    # number from a CSS counter, so the digit is legitimately absent from the
+    # html. Counting it made EVERY numbered list fall back to verbatim — the
+    # whole message rendered as escaped plain text, asterisks and backticks and
+    # all — unless the digit happened to appear elsewhere in the message, which
+    # is exactly why it looked agent-dependent rather than content-dependent.
+    # Same for a link reference definition's label, which CommonMark consumes
+    # whole and emits nothing for.
+    words = [m.match for m in eachmatch(r"[A-Za-z0-9]+", strip_markup_only(String(text)))]
     if !isempty(words)
         all(w -> occursin(w, inner), words) || (inner = verbatim_html(text))
     end
     "<div class=\"markdown-body\">" * inner * "</div>"
 end
+
+# Markdown whose own syntax carries the only copy of some characters, dropped so
+# the preservation check above never demands them back out of the html:
+#
+#   `1. item`   an ordered-list marker  → `<ol><li>`, digit drawn by CSS
+#   `[1]: url`  a link reference def    → consumed entirely, emits nothing
+#
+# Everything else markdown uses for structure (`-`, `#`, `>`, `|`, `*`) has no
+# word characters in it, so it never entered the word set to begin with.
+const ORDERED_LIST_MARKER = r"(?m)^[ \t]*\d+[.)](?=[ \t])"
+const LINK_REF_DEF        = r"(?m)^[ \t]*\[[^\]]*\]:[ \t]*\S+[ \t]*$"
+strip_markup_only(text::AbstractString) =
+    replace(replace(String(text), LINK_REF_DEF => ""), ORDERED_LIST_MARKER => "")
 
 # The message with no markdown applied: escaped, line breaks kept. What we fall
 # back to whenever the parser can't render it without losing it.

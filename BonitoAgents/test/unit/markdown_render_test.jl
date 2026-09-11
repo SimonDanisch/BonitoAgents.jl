@@ -59,6 +59,36 @@ end
     end
 end
 
+# The preservation guard is keyed on every word surviving, which quietly made it
+# a rule about MARKUP too: an ordered list's `1.` is rendered as `<ol><li>` with
+# the digit drawn by a CSS counter, so it is absent from the html by design. The
+# guard read that as "the render erased content" and dumped the whole message to
+# escaped plain text — asterisks, backticks and all. It looked agent-dependent
+# because it only bit when the digit appeared nowhere else in the message.
+@testset "structure is not content: numbered lists still render" begin
+    for s in ["1. alpha\n2. beta",            # the minimal case
+              "1) alpha\n2) beta",            # the `)` delimiter
+              "  1. nested\n  2. list",       # indented
+              "1. one\n2. two\n3. three\n4. four"]
+        h = BT.markdown_html(s)
+        @test occursin("<ol", h)
+        @test occursin("<li>", h)
+        # …and the prose still survives, which is what the guard is FOR.
+        for w in ["alpha", "beta", "nested", "list", "one", "two", "three", "four"]
+            occursin(w, s) && @test occursin(w, h)
+        end
+    end
+    # A link reference definition is consumed whole and emits nothing, so its
+    # label must not be demanded back either.
+    h = BT.markdown_html("see [1] for details\n\n[1]: https://example.com/x")
+    @test occursin("<a", h) && occursin("example.com", h)
+
+    # The guard must still FIRE on the case it exists for: a half-formed table
+    # whose header row CommonMark swallows falls back to verbatim.
+    bad = BT.markdown_html("| alpha | beta |\n|::|::|\n| 1 | 2 |")
+    @test occursin("alpha", bad) && occursin("beta", bad)
+end
+
 @testset "markdown_html still renders well-formed markdown" begin
     @test occursin("<strong", BT.markdown_html("hello **world**"))
     @test occursin("<table", BT.markdown_html("| a | b |\n|---|---|\n| 1 | 2 |"))
