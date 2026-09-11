@@ -12,7 +12,37 @@ struct ImageContent
     mime_type::String
 end
 
-const ContentBlock = Union{TextContent, ImageContent}
+# A REFERENCE to a file rather than its bytes. codex-acp's image view is the one
+# that sends these: reading a PNG yields
+#     {"type":"resource_link","name":"/abs/x.png","uri":"/abs/x.png"}
+# instead of an `ImageContent` full of base64 (which is what claude and kimi
+# send). The better protocol of the two — the file already lives on the worker
+# and we can stream it — but it is a distinct block and must not be flattened
+# into text: parsed as one it became `TextContent("")`, so the card rendered
+# "(empty)" with a "0 bytes" summary and the image was simply gone.
+#
+# `uri` is whatever the agent put there. codex sends a bare absolute path; the
+# spec also allows a real URI scheme, so consumers check before treating it as
+# a local path (see `resource_link_path`).
+struct ResourceLink
+    name::String
+    uri::String
+end
+
+const ContentBlock = Union{TextContent, ImageContent, ResourceLink}
+
+"""
+    resource_link_path(c::ResourceLink) -> String or nothing
+
+`c`'s target as a local filesystem path — a bare absolute path, or a `file://`
+URI — and `nothing` for anything else (http(s), or a relative/opaque uri we
+can't resolve on the worker).
+"""
+function resource_link_path(c::ResourceLink)
+    startswith(c.uri, "file://") && return c.uri[8:end]
+    occursin(r"^[A-Za-z][A-Za-z0-9+.-]*://", c.uri) && return nothing
+    return startswith(c.uri, "/") ? c.uri : nothing
+end
 
 # ── Tool-call content ─────────────────────────────────────────────────────────
 
@@ -435,6 +465,9 @@ function parse_content_block(d::AbstractDict)::ContentBlock
     t = get(d, "type", "")
     if t == "image"
         return ImageContent(get(d, "data", ""), get(d, "mimeType", "image/png"))
+    elseif t == "resource_link"
+        uri = String(get(d, "uri", ""))
+        return ResourceLink(String(get(d, "name", uri)), uri)
     end
     # default: text
     return TextContent(get(d, "text", ""))

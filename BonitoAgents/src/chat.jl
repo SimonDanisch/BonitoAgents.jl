@@ -1635,6 +1635,11 @@ function content_summary_default(content::AbstractVector)
             return n <= 1 ? "$(b) bytes" : "$(n) lines · $(b) bytes"
         elseif c isa DiffContent
             return basename(c.path)
+        elseif c isa AgentClientProtocol.ResourceLink
+            # Same as a diff's: name the file. Without it a codex image view
+            # summarises to nothing at all, since a link carries no text.
+            path = AgentClientProtocol.resource_link_path(c)
+            return basename(path === nothing ? c.name : path)
         end
     end
     return ""
@@ -2756,6 +2761,12 @@ function tool_media_mime(content)
     ref === nothing || return parse_show_mime(ref)
     for c in content
         c isa ImageContent && return c.mime_type
+        if c isa AgentClientProtocol.ResourceLink
+            path = AgentClientProtocol.resource_link_path(c)
+            path === nothing && continue
+            mime = resource_media_mime(path)
+            mime === nothing || return mime
+        end
     end
     return nothing
 end
@@ -3092,6 +3103,21 @@ end
 # Stream it from the worker when we can resolve a file path + live bridge (so big
 # images don't ride as base64 through chat history); else fall back to the ACP
 # base64 the agent sent. Either way it gets the lightbox via `media_element`.
+"""
+    resource_media_mime(path) -> String or nothing
+
+The displayable-media mime for `path`'s extension, or `nothing` when it names
+no media we render inline. Same extension tables `file_kind` dispatches on.
+"""
+function resource_media_mime(path::AbstractString)
+    ext = lowercase(splitext(String(path))[2])
+    haskey(SHOW_VIDEO_MIME, ext) && return SHOW_VIDEO_MIME[ext]
+    ext in SHOW_IMAGE_EXTS || return nothing
+    ext == ".svg" && return "image/svg+xml"
+    ext == ".ico" && return "image/x-icon"
+    return "image/" * lstrip(ext == ".jpg" ? ".jpeg" : ext, '.')
+end
+
 function read_image_element(state::ServerState, project_id::AbstractString,
                             m::ToolMsg, c::ImageContent)
     fp = m isa Union{EditToolMsg,ReadToolMsg} && !isempty(m.file_path) ?
@@ -3346,6 +3372,20 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
         path === nothing || return ShowTool(state, project_id, String(cwd), path)
     end
 
+    # codex's image view ships a `resource_link` to a file ON THE WORKER instead
+    # of the image bytes (see `ResourceLink`). That is the same job bt_show
+    # does, so route it to the same widget: `ShowTool` mirrors the file over the
+    # control WS, dispatches on `file_kind`, and degrades to a visible error
+    # node if the fetch fails. Media only — a link to a .txt belongs in the text
+    # body, not a preview pane.
+    for c in content
+        c isa AgentClientProtocol.ResourceLink || continue
+        path = AgentClientProtocol.resource_link_path(c)
+        path === nothing && continue
+        resource_media_mime(path) === nothing && continue
+        return ShowTool(state, project_id, String(cwd), path)
+    end
+
     # Per-type body. Dispatched on the message TYPE (EditToolMsg / SearchToolMsg
     # / ReadToolMsg / BashToolMsg / …), never a `kind ==` string test.
     return render_tool_content(state, m, content, project_id)
@@ -3363,6 +3403,11 @@ function render_tool_parts(state::ServerState, m::ToolMsg, content, project_id::
             push!(parts, render_diff_block(c))
         elseif c isa ImageContent
             push!(parts, read_image_element(state, project_id, m, c))
+        elseif c isa AgentClientProtocol.ResourceLink
+            # A link the body-level `ShowTool` hook didn't claim (a remote uri,
+            # or one block among several): its target IS the information, so
+            # name it rather than drop it.
+            push!(parts, render_text_block(isempty(c.name) ? c.uri : c.name))
         end
     end
     isempty(parts) && return DOM.div("(empty)", class="bt-tool-empty")
