@@ -131,6 +131,11 @@ tool_content_to_dict(c::TextContent) = Dict{String,Any}(
 tool_content_to_dict(c::ImageContent) = Dict{String,Any}(
     "type" => "content", "content" => Dict{String,Any}(
         "type" => "image", "data" => c.data, "mimeType" => c.mime_type))
+# Round-trips as the ACP shape it arrived in, so `load_tool_content` parses it
+# straight back on a history reload and the image still renders.
+tool_content_to_dict(c::AgentClientProtocol.ResourceLink) = Dict{String,Any}(
+    "type" => "content", "content" => Dict{String,Any}(
+        "type" => "resource_link", "name" => c.name, "uri" => c.uri))
 
 function persist_tool_content!(chat_dir::AbstractString, tc::AgentClientProtocol.ToolCall)
     isempty(tc.content) && return nothing

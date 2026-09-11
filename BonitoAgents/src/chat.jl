@@ -1635,6 +1635,11 @@ function content_summary_default(content::AbstractVector)
             return n <= 1 ? "$(b) bytes" : "$(n) lines · $(b) bytes"
         elseif c isa DiffContent
             return basename(c.path)
+        elseif c isa AgentClientProtocol.ResourceLink
+            # Same as a diff's: name the file. Without it a codex image view
+            # summarises to nothing at all, since a link carries no text.
+            path = AgentClientProtocol.resource_link_path(c)
+            return basename(path === nothing ? c.name : path)
         end
     end
     return ""
@@ -2756,6 +2761,12 @@ function tool_media_mime(content)
     ref === nothing || return parse_show_mime(ref)
     for c in content
         c isa ImageContent && return c.mime_type
+        if c isa AgentClientProtocol.ResourceLink
+            path = AgentClientProtocol.resource_link_path(c)
+            path === nothing && continue
+            mime = resource_media_mime(path)
+            mime === nothing || return mime
+        end
     end
     return nothing
 end
@@ -3092,6 +3103,21 @@ end
 # Stream it from the worker when we can resolve a file path + live bridge (so big
 # images don't ride as base64 through chat history); else fall back to the ACP
 # base64 the agent sent. Either way it gets the lightbox via `media_element`.
+"""
+    resource_media_mime(path) -> String or nothing
+
+The displayable-media mime for `path`'s extension, or `nothing` when it names
+no media we render inline. Same extension tables `file_kind` dispatches on.
+"""
+function resource_media_mime(path::AbstractString)
+    ext = lowercase(splitext(String(path))[2])
+    haskey(SHOW_VIDEO_MIME, ext) && return SHOW_VIDEO_MIME[ext]
+    ext in SHOW_IMAGE_EXTS || return nothing
+    ext == ".svg" && return "image/svg+xml"
+    ext == ".ico" && return "image/x-icon"
+    return "image/" * lstrip(ext == ".jpg" ? ".jpeg" : ext, '.')
+end
+
 function read_image_element(state::ServerState, project_id::AbstractString,
                             m::ToolMsg, c::ImageContent)
     fp = m isa Union{EditToolMsg,ReadToolMsg} && !isempty(m.file_path) ?
@@ -3346,6 +3372,20 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
         path === nothing || return ShowTool(state, project_id, String(cwd), path)
     end
 
+    # codex's image view ships a `resource_link` to a file ON THE WORKER instead
+    # of the image bytes (see `ResourceLink`). That is the same job bt_show
+    # does, so route it to the same widget: `ShowTool` mirrors the file over the
+    # control WS, dispatches on `file_kind`, and degrades to a visible error
+    # node if the fetch fails. Media only — a link to a .txt belongs in the text
+    # body, not a preview pane.
+    for c in content
+        c isa AgentClientProtocol.ResourceLink || continue
+        path = AgentClientProtocol.resource_link_path(c)
+        path === nothing && continue
+        resource_media_mime(path) === nothing && continue
+        return ShowTool(state, project_id, String(cwd), path)
+    end
+
     # Per-type body. Dispatched on the message TYPE (EditToolMsg / SearchToolMsg
     # / ReadToolMsg / BashToolMsg / …), never a `kind ==` string test.
     return render_tool_content(state, m, content, project_id)
@@ -3363,6 +3403,11 @@ function render_tool_parts(state::ServerState, m::ToolMsg, content, project_id::
             push!(parts, render_diff_block(c))
         elseif c isa ImageContent
             push!(parts, read_image_element(state, project_id, m, c))
+        elseif c isa AgentClientProtocol.ResourceLink
+            # A link the body-level `ShowTool` hook didn't claim (a remote uri,
+            # or one block among several): its target IS the information, so
+            # name it rather than drop it.
+            push!(parts, render_text_block(isempty(c.name) ? c.uri : c.name))
         end
     end
     isempty(parts) && return DOM.div("(empty)", class="bt-tool-empty")
@@ -3607,58 +3652,80 @@ const MARKDOWN_LOCK = ReentrantLock()
 # is GitHub-style and already loaded into the shell) handles tables, code
 # blocks, lists, etc. — we don't have to duplicate the styling.
 markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
-    inner = try
-        sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text))))
-    catch e
-        # We re-render on every streamed chunk, so the parser is routinely handed
-        # half-formed markdown — it must not be able to break message rendering.
-        # The one known failure is CommonMark's GFM table rule: a separator row
-        # that starts with `|` and is all `|-: ` passes its permissive
-        # `valid_table_spec`, but `parse_table_spec` (which needs `|dashes|`)
-        # returns an empty column spec, so `inline_modifier` indexes `spec[0]` →
-        # BoundsError. A streamed table trips exactly that on its way to `|---|`
-        # (`|`, `|-`, `| |`, …). Catch ONLY that and show the text verbatim
-        # (escaped, line breaks kept) — this preserves the content (tightening
-        # `valid_table_spec` instead makes CommonMark drop the header line) and
-        # the next chunk re-renders cleanly. Anything else is an unexpected bug
-        # and must surface, so rethrow. @debug not @warn: it fires per streamed
-        # partial, and warning would just reproduce the log flood it prevents.
-        e isa BoundsError || rethrow()
-        @debug "markdown_html: CommonMark BoundsError; showing text verbatim" exception = (e, catch_backtrace())
-        verbatim_html(text)
-    end
-    # RENDERING MUST NOT ERASE THE MESSAGE.
-    #
-    # The catch above only covers CommonMark THROWING. A parser version that
-    # instead returns successfully with the content dropped slips straight
-    # past it — and that is a real version, not a hypothetical: on the same
-    # half-formed table input where our pinned CommonMark raises the
-    # `BoundsError` described above, the newer fork CI resolves to emits a
-    # zero-column `<table>` with no cells, so `alpha | beta` renders as
-    # nothing at all. A message silently rendering blank is far worse than one
-    # rendering unstyled.
-    #
-    # So the guarantee is checked on the OUTPUT rather than inferred from which
-    # exception the parser happened to throw: if the source had words and any
-    # of them fails to survive into the rendered html, show it verbatim instead.
-    # Keyed on words, not on emptiness — `---` legitimately renders to `<hr>`
-    # with no text at all, and must stay a horizontal rule. EVERY word, not
-    # "at least one": a third CommonMark behaviour renders the half-formed
-    # table `| alpha | beta |\n|::|::|\n| 1 | 2 |` as the paragraph `| 1 | 2 |`
-    # — the numbers survive, the header row is gone — and "any word survived"
-    # waved that through. Checked against the html with its tags, not the text
-    # between them: a link's URL lives in `href`, a fence's language in a
-    # `class`, and those words legitimately never appear as text.
-    words = [m.match for m in eachmatch(r"[A-Za-z0-9]+", String(text))]
-    if !isempty(words)
-        all(w -> occursin(w, inner), words) || (inner = verbatim_html(text))
-    end
+    inner = sprint(io -> CM.html(io, MARKDOWN_PARSER(defuse_table_rule(String(text)))))
     "<div class=\"markdown-body\">" * inner * "</div>"
 end
 
-# The message with no markdown applied: escaped, line breaks kept. What we fall
-# back to whenever the parser can't render it without losing it.
-verbatim_html(text::AbstractString) = replace(esc_html(String(text)), "\n" => "<br>")
+# ── Working around CommonMark's GFM table rule ───────────────────────────────
+# `CommonMark.TableRule` DELETES TEXT. `gfm_table` runs
+#
+#     finalize_literal!(container)          # empties the paragraph
+#     header = container.literal            # takes its text
+#     spec_str = rest_from_nonspace(parser)
+#     if valid_table_spec(spec_str) … if !isempty(spec) … build the table
+#
+# — the paragraph is gutted BEFORE anything is validated, and no path puts it
+# back. So every line of a paragraph before the last line that starts with `|`
+# is silently dropped:
+#
+#     "x\n| a |\n| b |"  →  <p>| b |</p>          (verified, CommonMark 1.0.4)
+#
+# It is not an exotic case. Prose quoting piped shell output hits it, and so
+# does every table being typed, because the message is re-rendered per streamed
+# chunk and passes through `header | row` + `|-` on its way to `|---|`.
+#
+# We defuse it at the SOURCE instead: escape the leading `|` of any line that
+# isn't part of a valid table, so the rule never fires and `\|` renders as a
+# literal pipe. What this replaces was a check that re-scanned the OUTPUT html
+# for every word of the input and swapped in escaped plain text if one was
+# missing — 20× the cost of the render it guarded, on every chunk, and wrong in
+# both directions (`href` "survived" as prose; an ordered list's `1.` did not,
+# so any numbered list turned the whole message into plain text).
+#
+# The real fix is upstream: move `finalize_literal!`/`header` inside the
+# `isempty(spec)` branch. Drop this the release after that lands.
+
+# A spec line CommonMark will actually build columns from — its own regex.
+const TABLE_SPEC_COLUMNS = r"\|([ ]*[: ]?[-]+[ :]?[ ]*)\|"
+# Cheap gate: no line starts with a pipe ⇒ the rule cannot fire ⇒ nothing to do.
+const LINE_LEADING_PIPE  = r"(?m)^[ \t]*\|"
+
+table_spec_line(s::AbstractString) =
+    !isempty(collect(eachmatch(TABLE_SPEC_COLUMNS, String(s); overlap = true)))
+
+function defuse_table_rule(text::AbstractString)
+    occursin(LINE_LEADING_PIPE, text) || return text
+    lines = split(text, '\n'; keepempty = true)
+    n = length(lines)
+    intable = falses(n)      # belongs to a table CommonMark renders correctly
+    infence = falses(n)
+    open_fence = false
+    for (k, l) in enumerate(lines)
+        if startswith(lstrip(l), "```") || startswith(lstrip(l), "~~~")
+            infence[k] = true; open_fence = !open_fence; continue
+        end
+        infence[k] = open_fence
+    end
+    # Mirrors the rule's own `!parser.indented`: an indented line is code, the
+    # rule never fires on it, so it must never be escaped either.
+    indented(l) = startswith(l, "    ") || startswith(l, "\t")
+    i = 1
+    while i <= n
+        if !infence[i] && !indented(lines[i]) && i < n && table_spec_line(strip(lines[i + 1]))
+            intable[i] = intable[i + 1] = true                 # header + spec
+            j = i + 2
+            while j <= n && !infence[j] && occursin('|', lines[j]) && !isempty(strip(lines[j]))
+                intable[j] = true; j += 1                      # body rows
+            end
+            i = j
+        else
+            i += 1
+        end
+    end
+    return join((intable[k] || infence[k] || indented(l) ? l :
+                 replace(l, r"^([ \t]*)\|" => s"\1\\|"; count = 1)
+                 for (k, l) in enumerate(lines)), '\n')
+end
 
 # "new message" event. Streaming-open shape for agent/thought (seeded with the
 # first chunk); plain shape for user/tool/plan. `send!` adds the `n` count.

@@ -20,8 +20,22 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
+# A real PNG on the worker for the image-view case: codex sends only a
+# reference, so the chat has to fetch and render the actual file.
+const IMG_PATH = joinpath(tempdir(), "codexwire_shot.png")
+# Smallest valid PNG (1x1, opaque black) — enough for <img> to decode.
+const PNG_1PX = UInt8[
+    0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,
+    0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x08,0x02,0x00,0x00,0x00,0x90,0x77,0x53,
+    0xde,0x00,0x00,0x00,0x0c,0x49,0x44,0x41,0x54,0x08,0xd7,0x63,0xf8,0xcf,0xc0,0x00,
+    0x00,0x03,0x01,0x01,0x00,0x18,0xdd,0x8d,0xb0,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,
+    0x44,0xae,0x42,0x60,0x82]
+isfile(IMG_PATH) || write(IMG_PATH, PNG_1PX)
+
 # One of each shape codex produces. `id`s are markers the DOM asserts on.
 function codex_wire_agent(prompt::AbstractString)
+    occursin("image", lowercase(prompt)) &&
+        return Any[TK.text("viewing the image:"), TK.codex_image(IMG_PATH; id = "cw-img")]
     occursin("tools", lowercase(prompt)) || return [TK.text("Echo: $(prompt)")]
     return Any[
         TK.text("running codex-shaped tools:"),
@@ -119,6 +133,38 @@ function run_suite(server)
             const t = $(card_text("cw-eval"));
             return t.includes('"server"') || t.includes('"arguments"');
         })()""") == false
+
+        @test isempty(TK.js_errors(server))
+    end
+
+    # Codex is the only agent that sends an image as a REFERENCE (a
+    # `resource_link` to a path on the worker) rather than base64 bytes. Parsed
+    # as an unknown block it collapsed to `TextContent("")`, so the card
+    # rendered "(empty)" with a "0 bytes" summary and the image never appeared.
+    @testset "a codex image view renders the actual image" begin
+        TK.new_chat(server; title = "CodexImage")
+        TK.send_message(server, "show me the image")
+
+        @test TK.wait_for(server, "image card", "!!document.querySelector('$(card("cw-img"))')";
+                          timeout = 120) == true
+        # The summary names the file rather than measuring an empty text block
+        # ("0 bytes" was the old symptom). Read off the ELEMENT: recognising the
+        # mime puts the card in native-media mode, which strips the chrome, so
+        # the header is no longer part of `innerText`.
+        @test TK.wait_for(server, "filename summary",
+            """(() => { const c = document.querySelector('$(card("cw-img"))');
+                return (c.querySelector('.bt-tool-summary')?.textContent || '').trim(); })()""";
+            timeout = 60) == "codexwire_shot.png"
+        # …and the body is the real image, fetched from the worker.
+        @test TK.wait_for(server, "img element",
+            "!!document.querySelector('$(card("cw-img")) img')"; timeout = 120) == true
+        @test TK.wait_for(server, "image actually decoded",
+            "(() => { const i = document.querySelector('$(card("cw-img")) img'); " *
+            "return !!i && i.complete && i.naturalWidth > 0; })()"; timeout = 120) == true
+        # Served from the server's mirror of the worker file, not a data: URI —
+        # codex never sent the bytes, so anything else means we invented them.
+        @test TK.eval_js(server,
+            "(document.querySelector('$(card("cw-img")) img').getAttribute('src')||'').startsWith('/assets/')") == true
 
         @test isempty(TK.js_errors(server))
     end

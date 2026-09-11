@@ -1086,6 +1086,47 @@ end
     @test tc.content[end].text == "4"
 end
 
+# codex's image view is a REFERENCE, not bytes: reading a PNG ships a
+# `resource_link` naming the file on the worker, where claude and kimi ship an
+# `ImageContent` full of base64. Parsed as an unknown block it collapsed into
+# `TextContent("")` — the card rendered "(empty)" with a "0 bytes" summary and
+# the image was gone.
+#
+# Captured verbatim from codex-acp 1.11.0 actually looking at a PNG (it replied
+# "A solid coral-red rectangle", so it really did see the file), not
+# hand-written from the adapter's source — a shape we only *believe* is right
+# is exactly what this fixture set exists to stop.
+@testset "codex image view parses as a resource link, not empty text" begin
+    frames = codex_frames("codex_image_view.jsonl")
+    n = ACP.parse_session_update(only(frames))
+    @test n.kind == "read"
+    @test startswith(n.title, "View Image ")
+    c = only(n.content)
+    @test c isa ACP.ResourceLink
+    @test c.uri == "/tmp/codexprobe/probe_shot.png"
+    @test c.name == c.uri
+    @test ACP.resource_link_path(c) == "/tmp/codexprobe/probe_shot.png"
+    # The path is ALSO in rawInput, which is what gives the card its file_path
+    # (and so the ✎ affordance), and in `locations`.
+    @test n.raw_input["path"] == "/tmp/codexprobe/probe_shot.png"
+    @test only(n.locations).path == "/tmp/codexprobe/probe_shot.png"
+    # It is ONE frame: the view completes on arrival, so nothing later fills
+    # the content in — if this block is dropped the card has nothing at all.
+    @test length(frames) == 1
+    @test only(frames)["status"] == "completed"
+end
+
+# `uri` is whatever the agent put there, and only some of it names a file we can
+# stream off the worker.
+@testset "resource_link_path resolves only local targets" begin
+    local_uri(u) = ACP.resource_link_path(ACP.ResourceLink("n", u))
+    @test local_uri("/abs/x.png") == "/abs/x.png"
+    @test local_uri("file:///abs/x.png") == "/abs/x.png"
+    @test local_uri("https://example.com/x.png") === nothing
+    @test local_uri("relative/x.png") === nothing
+    @test local_uri("") === nothing
+end
+
 # The title fallback is narrow on purpose: only the canonical MCP form counts,
 # so a human-readable title can never be mistaken for a tool name.
 @testset "title fallback accepts only mcp__server__tool" begin

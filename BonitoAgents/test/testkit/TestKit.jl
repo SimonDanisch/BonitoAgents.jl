@@ -90,7 +90,7 @@ end
 
 export TestServer, dev_server, add_worker!,
        text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update,
-       kimi_tool, codex_mcp_tool, codex_shell, REPLAY_FN,
+       kimi_tool, codex_mcp_tool, codex_shell, codex_image, REPLAY_FN,
        post_turn,
        sub_text, sub_tool,
        diff_block, text_block, error_reply, crash, end_turn,
@@ -230,6 +230,21 @@ codex_mcp_tool(server, tool; args = Dict{String,Any}(), output = String[],
                          "status" => String(status))
     error === nothing || (d["error"] = String(error))
     id    === nothing || (d["id"]    = String(id))
+    d
+end
+
+"""
+    codex_image(path; id) -> Dict
+
+Agent event for codex's image VIEW: a `resource_link` naming a file on the
+worker rather than the image bytes. claude and kimi send an `ImageContent`
+full of base64, so this is the only dialect where the chat has to go and fetch
+the file itself — which it does through the same `ShowTool` widget `bt_show`
+uses.
+"""
+codex_image(path; id = nothing) = begin
+    d = Dict{String,Any}("type" => "codex_image", "path" => String(path))
+    id === nothing || (d["id"] = String(id))
     d
 end
 

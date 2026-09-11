@@ -7,7 +7,7 @@
 # message and drains that bubble's stream with `append!`. The wire-parse types
 # (`AgentMessageChunk`, `ToolCallNotif`, …) never escape this file.
 
-const ToolContent = Union{TextContent, DiffContent, ImageContent}
+const ToolContent = Union{TextContent, DiffContent, ImageContent, ResourceLink}
 
 mutable struct AgentMessage <: Message
     text::String                 # seeded with the first chunk

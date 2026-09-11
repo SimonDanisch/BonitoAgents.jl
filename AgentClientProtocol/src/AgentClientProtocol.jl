@@ -21,7 +21,8 @@ export ToolCallNotif, ToolCallUpdateNotif, PlanUpdate, UnknownUpdate
 # Subagent visibility: the tagged wire wrapper + the distilled activity events
 # an owner builds from its addressed updates (see `Connection.on_owner_update`).
 export SubagentUpdate, SubagentActivity, parent_tool_use_id, subagent_activity
-export TextContent, ImageContent, DiffContent, ToolCallLocation, PlanEntry
+export TextContent, ImageContent, DiffContent, ResourceLink, ToolCallLocation, PlanEntry
+export resource_link_path
 export parse_tool_content_item, parse_session_update, parse_location
 # Typed tool-call family — downstream consumers dispatch on these instead of
 # probing strings on the generic ACP `tool.kind`.
