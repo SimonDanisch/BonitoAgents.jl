@@ -6753,48 +6753,70 @@ pill_category_label(o::AgentClientProtocol.ConfigOption) =
 # `lowercase_modes` lower-cases the PERMISSION-MODE labels (claude reports them
 # title-cased — "Default", "Bypass Permissions"); set for the Claude provider so
 # the mode pill reads in the same lower-case style as the underlying values.
-const MODEL_SEARCH_THRESHOLD = 8  # use searchable dropdown when choices exceed this
+const MODEL_SEARCH_THRESHOLD = 8  # add the filter input when choices exceed this
 
-# Custom dropdown with a search/filter input — used when a ConfigOption has many
-# choices (e.g. OpenCode reports ~100 models). Filtering is pure DOM via the
-# ChatLib module's `msearch*` exports — no Julia round-trip per keystroke, and
-# nothing published on `window` (see `toolSlot` for the same pattern).
-function searchable_config_pill(o::AgentClientProtocol.ConfigOption, pick::Observable;
-                                lc::Bool = false)
+# The picker behind every selectable config pill: our own dropdown, not a native
+# `<select>`. A native one cannot be styled where it matters — the OPEN list is
+# drawn by the OS, so a 6-item effort menu appeared as a bare white box with
+# square corners over the chat. This one is ours end to end; a filter input is
+# added only when the list is long enough to need it (OpenCode reports ~100
+# models). Filtering is pure DOM via the ChatLib module's `msearch*` exports — no
+# Julia round-trip per keystroke, and nothing published on `window` (see
+# `toolSlot` for the same pattern).
+# The generic half: one styled dropdown pill. `items` are `(label, value, title,
+# current)` rows and `onpick(value)` supplies each row's click handler, so the
+# same widget serves a session-config option and the provider switcher. The
+# filter input appears only past `MODEL_SEARCH_THRESHOLD` rows; `msearchOpen` /
+# `msearchFilter` both guard on its absence.
+function dropdown_pill(category::AbstractString, current_label::AbstractString,
+                       items, onpick; tooltip::AbstractString = "",
+                       extra_class::AbstractString = "")
+    rows = [
+        DOM.div(it.label;
+            class = "bt-msearch-item" * (it.current ? " bt-msearch-item-cur" : ""),
+            dataLabel = lowercase(it.label) * " " * lowercase(String(it.value)),
+            title = it.title,
+            onclick = onpick(it.value))
+        for it in items
+    ]
+    search_input = length(rows) > MODEL_SEARCH_THRESHOLD ?
+        DOM.input(;
+            type = "text", placeholder = "Search…", class = "bt-msearch-input",
+            oninput = js"""event => { const t = event.target;
+                    $(ChatLib).then(lib => lib.msearchFilter(t)); }""") :
+        nothing
+    trigger = DOM.div(
+        DOM.span(category * ": "; class = "bt-header-meta-cat"),
+        DOM.span(current_label),
+        " ▾";
+        class = strip("bt-header-meta-item bt-header-meta-pick bt-msearch-trigger " * extra_class),
+        onclick = js"""event => { event.stopPropagation(); const t = event.currentTarget;
+            $(ChatLib).then(lib => lib.msearchOpen(t)); }""",
+        title = tooltip)
+    DOM.div(
+        trigger,
+        DOM.div(
+            search_input,
+            DOM.div(rows...; class = "bt-msearch-items");
+            class = "bt-msearch-list");
+        class = "bt-msearch")
+end
+
+function config_pick_pill(o::AgentClientProtocol.ConfigOption, pick::Observable;
+                          lc::Bool = false)
     cfg_id = o.id
     cur    = o.current_value
     lab(c) = let s = AgentClientProtocol.choice_label(o, c); lc ? lowercase(s) : s end
     cur_label = let idx = findfirst(c -> c.value == cur, o.choices)
         idx !== nothing ? lab(o.choices[idx]) : cur
     end
-    items = [
-        DOM.div(lab(c);
-            class = "bt-msearch-item" * (c.value == cur ? " bt-msearch-item-cur" : ""),
-            dataLabel = lowercase(lab(c)) * " " * lowercase(c.value),
-            title = isnothing(c.description) ? c.name : c.description,
-            onclick = js"""event => { const t = event.currentTarget;
-                $(ChatLib).then(lib => lib.msearchSelect(t, $(pick), $(cfg_id), $(c.value))); }""")
-        for c in o.choices
-    ]
-    search_input = DOM.input(;
-        type = "text", placeholder = "Search…", class = "bt-msearch-input",
-        oninput = js"""event => { const t = event.target;
-                $(ChatLib).then(lib => lib.msearchFilter(t)); }""")
-    trigger = DOM.div(
-        DOM.span(pill_category_label(o) * ": "; class = "bt-header-meta-cat"),
-        DOM.span(cur_label),
-        " ▾";
-        class = "bt-header-meta-item bt-header-meta-pick bt-msearch-trigger",
-        onclick = js"""event => { event.stopPropagation(); const t = event.currentTarget;
-            $(ChatLib).then(lib => lib.msearchOpen(t)); }""",
-        title = pill_tooltip(o))
-    DOM.div(
-        trigger,
-        DOM.div(
-            search_input,
-            DOM.div(items...; class = "bt-msearch-items");
-            class = "bt-msearch-list");
-        class = "bt-msearch")
+    items = [(label = lab(c), value = c.value,
+              title = isnothing(c.description) ? c.name : c.description,
+              current = c.value == cur) for c in o.choices]
+    return dropdown_pill(pill_category_label(o), cur_label, items,
+        v -> js"""event => { const t = event.currentTarget;
+                $(ChatLib).then(lib => lib.msearchSelect(t, $(pick), $(cfg_id), $(v))); }""";
+        tooltip = pill_tooltip(o))
 end
 
 function header_pill(o::AgentClientProtocol.ConfigOption,
@@ -6802,9 +6824,7 @@ function header_pill(o::AgentClientProtocol.ConfigOption,
                      lowercase_modes::Bool = false)
     lc = lowercase_modes && o.category == "mode"
     if pick !== nothing && o.category in SELECTABLE_CONFIG && length(o.choices) > 1
-        return length(o.choices) > MODEL_SEARCH_THRESHOLD ?
-            searchable_config_pill(o, pick; lc = lc) :
-            config_select_pill(o, pick; lc = lc)
+        return config_pick_pill(o, pick; lc = lc)
     end
     label = AgentClientProtocol.pill_label(o)
     lc && (label = lowercase(label))
@@ -6816,41 +6836,6 @@ end
 # Fallback so an unknown meta kind degrades to its string form, not an error.
 header_pill(x, pick::Union{Observable,Nothing} = nothing; lowercase_modes::Bool = false) =
     DOM.span(string(x); class = "bt-header-meta-item")
-
-# A native <select> wrapped to look like the meta-item pill. The agent's
-# config_option_update is the SOURCE OF TRUTH for the displayed value — we
-# rebuild the select on every session_meta change, so `selected` is whatever
-# the agent currently reports. `onchange` posts `(configId, value)` into
-# `pick`; the parent handler (registered ONCE in `chat_header`) translates
-# that into a `set_config_option!` RPC.
-function config_select_pill(o::AgentClientProtocol.ConfigOption, pick::Observable;
-                            lc::Bool = false)
-    cfg_id = o.id
-    cur    = o.current_value
-    lab(name) = lc ? lowercase(name) : name   # lower-case the option labels (mode)
-    # Build each option separately so we can conditionally include the
-    # `selected` attribute — Bonito's DOM renders `selected = nothing` as a
-    # bare `selected` (boolean attribute is present, just empty), which then
-    # marks EVERY option as selected. Splatting kwargs lets us omit the key
-    # entirely on the non-current options.
-    function mkopt(c)
-        title = isnothing(c.description) ? c.name : c.description
-        kwargs = c.value == cur ?
-            (; value = c.value, title = title, selected = true) :
-            (; value = c.value, title = title)
-        # Resolved label (e.g. model "default" → "Opus 4.8 …", "(recommended)"
-        # stripped) so the collapsed select shows the real value, not "default".
-        DOM.option(lab(AgentClientProtocol.choice_label(o, c)); kwargs...)
-    end
-    sel = DOM.select((mkopt(c) for c in o.choices)...;
-            class = "bt-header-meta-select",
-            onchange = js"event => $(pick).notify([$(cfg_id), event.target.value])")
-    # Category prefix outside the <select> (a native select can't prefix only the
-    # collapsed value), so the pill reads "permissions: default" / "model: Opus 4.8".
-    DOM.div(DOM.span(pill_category_label(o) * ": "; class = "bt-header-meta-cat"), sel;
-        class = "bt-header-meta-item bt-header-meta-pick",
-        title = pill_tooltip(o))
-end
 
 # ── Home "Defaults" control ──────────────────────────────────────────────────
 # Server-wide default model / permission mode / effort for NEW & unconfigured
@@ -6905,7 +6890,7 @@ function session_defaults_bar(session::Bonito.Session, state::ServerState)
             cur = get(defs, base.id, base.current_value)
             o = AgentClientProtocol.ConfigOption(base.id, base.name, base.description,
                                                  base.category, String(cur), base.choices)
-            config_select_pill(o, pick; lc = o.category == "mode")
+            config_pick_pill(o, pick; lc = o.category == "mode")
         end for base in rows]
         DOM.div(pills...; class = "bt-header-meta bt-defaults-bar")
     end
@@ -7372,36 +7357,38 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # the control sits next to what it changes.)
 
     # ── Provider switcher ──────────────────────────────────────────────────
-    # Dropdown to switch between Claude Code, MiMo Code, OpenCode, Kimi Code and Codex
-    # per chat.
-    # Changing the provider restarts the session with the new backend.
-    # Wiring follows the restart button above: the DOM event notifies a plain
-    # Observable, Julia reacts via `on(session, …)` (a DOM node itself is not
-    # observable — `on(session, ::Node)` has no method).
+    # Switch between Claude Code, MiMo Code, OpenCode, Kimi Code and Codex per
+    # chat; changing it restarts the session with the new backend. Wiring follows
+    # the restart button above: the DOM event notifies a plain Observable, Julia
+    # reacts via `on(session, …)` (a DOM node itself is not observable —
+    # `on(session, ::Node)` has no method).
     #
-    # A reactive `value=` binding does NOT work on a native <select> (it sticks
-    # on the first option — "Claude Code" — regardless of the real provider, so
-    # the header lied about the backend). Instead mark the current provider's
-    # <option selected> and rebuild the select when `model.provider` changes —
-    # the same proven pattern as `config_select_pill`. The `selected` kwarg is
-    # splatted in only on the current option (Bonito renders `selected=nothing`
-    # as a bare, always-on attribute, which would select every option).
-    provider_choice = Observable("")
-    # Each menu entry is a provider singleton (a `BinAgent` descriptor). The
-    # <option> value is its stable `provider_name` ("ClaudeCode", …); the label is
-    # its `label`. `cur` is the current provider held by `model.provider`. The set
+    # The same `dropdown_pill` as the config pills, so the whole session group is
+    # one widget repeated — and no native `<select>`, whose OPEN list the OS
+    # draws and no stylesheet can reach. It also drops the old select's hazard:
+    # a reactive `value=` binding does not work there (it sticks on the first
+    # option, so the header lied about the backend), which forced a rebuild on
+    # every `model.provider` change; this rebuilds for display only.
+    # `msearchSelect` posts `[configId, value]` (its one wire shape, shared with
+    # the config pills), which arrives as a `Vector{Any}` — an `Observable{String}`
+    # would REFUSE that and drop the pick silently, so hold the raw payload and
+    # unpack in the handler. Same reasoning as `config_pick` above.
+    provider_choice = Observable{Any}(["", ""])
+    # Each entry is a provider singleton (a `BinAgent` descriptor): the stable
+    # `provider_name` ("ClaudeCode", …) is the value, `label` the text. The set
     # offered is `current_providers()` — the mock appears only when its env is set.
-    provider_opt(p, cur) = DOM.option(label(p);
-        (p === cur ? (; value = provider_name(p), selected = true) :
-                     (; value = provider_name(p)))...)
     provider_select = map(session, model.provider) do cur
-        DOM.select(
-            (provider_opt(p, cur) for p in current_providers())...;
-            class = "bt-header-provider-select",
-            title = "Switch AI agent backend",
-            onchange = js"event => $(provider_choice).notify(event.target.value)")
+        items = [(label = label(p), value = provider_name(p),
+                  title = "Switch this chat to " * label(p), current = p === cur)
+                 for p in current_providers()]
+        dropdown_pill("agent", label(cur), items,
+            v -> js"""event => { const t = event.currentTarget;
+                    $(ChatLib).then(lib => lib.msearchSelect(t, $(provider_choice), 'provider', $(v))); }""";
+            tooltip = "Switch AI agent backend", extra_class = "bt-header-provider-pick")
     end
-    on(session, provider_choice) do val
+    on(session, provider_choice) do pick
+        (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
+        val = String(pick[2])
         isempty(val) && return
         # Resolve the wire name back to the provider singleton (default Claude).
         new_provider = try
@@ -7436,27 +7423,30 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # …)`, `bt_sync_folder`)? Off by default. It sits next to the permissions
     # pill because it is one: a capability the user grants per chat. The server
     # enforces it at relay time (remote_eval.jl), so flipping it needs no restart;
-    # switching it off shuts the chat's eval hosts down. The select is rebuilt
-    # from `state.projects`, the source of truth, like the config pills.
-    remote_pick = Observable("")
+    # switching it off shuts the chat's eval hosts down. Two states, so it is a
+    # TOGGLE, not a picker: one click flips it, and the pill reads its own state
+    # (accent when on). Rebuilt from `state.projects`, the source of truth.
+    remote_toggle = Observable("")
     remote_pill = map(session, state.projects) do projects
         q = isempty(project_id) ? nothing : get(projects, project_id, nothing)
         q === nothing && return DOM.span(; class = "bt-hidden")
-        opt(label, on) = on ? DOM.option(label; value = label, selected = true) :
-                              DOM.option(label; value = label)
-        DOM.div(
+        on_now = q.remote_eval
+        # Hoisted: a nested string literal inside the `js"…"` macro does not parse.
+        flip_to = on_now ? "off" : "on"
+        DOM.button(
             DOM.span("remote julia: "; class = "bt-header-meta-cat"),
-            DOM.select(opt("off", !q.remote_eval), opt("on", q.remote_eval);
-                class = "bt-header-meta-select bt-header-remote-select",
-                onchange = js"event => $(remote_pick).notify(event.target.value)");
-            class = "bt-header-meta-item bt-header-meta-pick bt-header-remote",
+            DOM.span(on_now ? "on" : "off");
+            class = "bt-header-meta-item bt-header-meta-pick bt-header-remote" *
+                    (on_now ? " bt-header-remote-on" : ""),
             title = "Let this chat's agent run Julia and copy folders on OTHER workers " *
                     "(bt_julia_eval with worker=…, bt_sync_folder). Off by default; " *
-                    "the server enforces it, and switching it off stops the evals there.")
+                    "the server enforces it, and switching it off stops the evals there. " *
+                    "Click to turn it " * flip_to * ".",
+            onclick = js"event => $(remote_toggle).notify($(flip_to))")
     end
-    on(session, remote_pick) do v
+    on(session, remote_toggle) do v
         isempty(v) && return
-        remote_pick[] = ""
+        remote_toggle[] = ""
         isempty(project_id) && return
         try
             set_remote_eval!(state, project_id, v == "on")

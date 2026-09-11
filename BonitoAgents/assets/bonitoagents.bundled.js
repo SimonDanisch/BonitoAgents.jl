@@ -3047,6 +3047,17 @@ function msearchOpen(triggerEl) {
     document.querySelectorAll('.bt-msearch-open').forEach((el)=>el.classList.remove('bt-msearch-open'));
     const wrap = triggerEl.closest('.bt-msearch');
     wrap.classList.add('bt-msearch-open');
+    const list = wrap.querySelector('.bt-msearch-list');
+    if (list) {
+        const t = triggerEl.getBoundingClientRect();
+        list.style.top = '0px';
+        list.style.left = '0px';
+        const l = list.getBoundingClientRect();
+        const below = t.bottom + 4;
+        const top = below + l.height > window.innerHeight - 8 && t.top - 4 - l.height > 8 ? t.top - 4 - l.height : below;
+        list.style.top = `${Math.max(8, top)}px`;
+        list.style.left = `${Math.max(8, Math.min(t.left, window.innerWidth - l.width - 8))}px`;
+    }
     const input = wrap.querySelector('.bt-msearch-input');
     if (input) {
         input.value = '';

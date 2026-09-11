@@ -4495,6 +4495,21 @@ export function msearchOpen(triggerEl) {
         el.classList.remove('bt-msearch-open'));
     const wrap = triggerEl.closest('.bt-msearch');
     wrap.classList.add('bt-msearch-open');
+    // The list is `position: fixed` (the header's session group clips, so an
+    // absolute one would be cut off at its edge) — so place it under the
+    // trigger here, flipping above / nudging left when the viewport runs out.
+    const list = wrap.querySelector('.bt-msearch-list');
+    if (list) {
+        const t = triggerEl.getBoundingClientRect();
+        list.style.top = '0px';
+        list.style.left = '0px';
+        const l = list.getBoundingClientRect();
+        const below = t.bottom + 4;
+        const top = (below + l.height > window.innerHeight - 8 && t.top - 4 - l.height > 8)
+            ? t.top - 4 - l.height : below;
+        list.style.top = `${Math.max(8, top)}px`;
+        list.style.left = `${Math.max(8, Math.min(t.left, window.innerWidth - l.width - 8))}px`;
+    }
     const input = wrap.querySelector('.bt-msearch-input');
     if (input) { input.value = ''; msearchFilter(input); }
     // Register close-on-outside-click after one frame so the triggering click

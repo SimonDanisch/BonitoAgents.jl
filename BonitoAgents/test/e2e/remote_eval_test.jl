@@ -40,9 +40,14 @@
         }
         return (c.querySelector('.bt-tool-body')?.innerText || '').includes($(repr(text))); })()"""
     card_badge(id) = "(() => { const c = $(card(id)); const b = c && c.querySelector('.bt-tool-worker'); return b ? b.textContent : ''; })()"
-    remote_select = "$VP?.querySelector('.bt-header-remote-select')"
-    set_switch(v) = """(() => { const s = $(remote_select); if (!s) return false;
-        s.value = $(repr(v)); s.dispatchEvent(new Event('change', {bubbles: true})); return true; })()"""
+    # The switch is a TOGGLE (two states), so the test clicks it like a user and
+    # reads the state off the pill rather than driving a <select>'s value.
+    remote_pill = "$VP?.querySelector('.bt-header-remote')"
+    remote_state = "($(remote_pill)?.classList.contains('bt-header-remote-on') ? 'on' : 'off')"
+    set_switch(v) = """(() => { const b = $(remote_pill); if (!b) return false;
+        const on = b.classList.contains('bt-header-remote-on');
+        if ((on ? 'on' : 'off') !== $(repr(v))) b.click();
+        return true; })()"""
 
     server = TK.dev_server(agent = _ -> [TK.end_turn()])
     try
@@ -69,7 +74,7 @@
 
             # ── 1. off by default ────────────────────────────────────────────
             @test TK.wait_for(server, "the switch is in the header, off",
-                "$(remote_select)?.value === 'off'"; timeout = 30) == true
+                "$(remote_state) === 'off'"; timeout = 30) == true
             @test p.remote_eval === false
             server.agent_fn[] = _ -> [TK.bt_eval("1 + 1"; worker = "worker-b", id = "re-off"),
                                       TK.end_turn()]
@@ -86,7 +91,7 @@
             while !p.remote_eval && time() - t0 < 10; sleep(0.05); end
             @test p.remote_eval === true
             @test TK.wait_for(server, "the switch reads on",
-                "$(remote_select)?.value === 'on'"; timeout = 10) == true
+                "$(remote_state) === 'on'"; timeout = 10) == true
             server.agent_fn[] = _ -> [TK.bt_eval(
                 "string(\"host=\", get(ENV, \"BONITOAGENTS_EVAL_HOST_WORKER\", \"none\"))";
                 worker = "worker-b", id = "re-on"), TK.end_turn()]

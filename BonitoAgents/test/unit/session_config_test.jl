@@ -75,18 +75,27 @@ end
     @test occursin("whatever", string(BT.header_pill("whatever")))    # unknown kind degrades to its string
 end
 
-@testset "config_select_pill: resolved <option> label + category prefix" begin
+@testset "config_pick_pill: resolved item label + category prefix" begin
+    # Our own dropdown, never a native `<select>`: the OS draws an open select's
+    # list and no stylesheet reaches it, which is what made a six-item effort
+    # menu a bare white box over the chat.
     pick = BT.Bonito.Observable{Any}(["", ""])
-    s = string(BT.config_select_pill(real_model(), pick))
-    @test occursin("<select", s) && occursin("bt-header-meta-pick", s)
+    s = string(BT.config_pick_pill(real_model(), pick))
+    @test !occursin("<select", s)
+    @test occursin("bt-msearch-trigger", s) && occursin("bt-header-meta-pick", s)
     @test occursin("model:", s)
-    @test occursin(">Opus 4.8 with 1M context</option>", s)          # resolved, collapsed label
-    @test !occursin(">Default (recommended)</option>", s)           # "(recommended)" gone from the option text
-    @test occursin(">Sonnet</option>", s)
+    @test occursin(">Opus 4.8 with 1M context<", s)                  # resolved, collapsed label
+    # "(recommended)" is gone from the item's visible TEXT (it still rides in the
+    # row's title attribute, which is the choice's raw name — that's the tooltip).
+    @test !occursin(">Default (recommended)<", s)
+    @test occursin(">Sonnet<", s)
+    # Three choices ⇒ no filter box; it appears only past MODEL_SEARCH_THRESHOLD.
+    @test !occursin("bt-msearch-input", s)
+    @test length(real_model().choices) <= BT.MODEL_SEARCH_THRESHOLD
     # The mode pill in the Defaults bar is lower-cased → "permissions: default".
-    sm = string(BT.config_select_pill(real_mode(), pick; lc = true))
+    sm = string(BT.config_pick_pill(real_mode(), pick; lc = true))
     @test occursin("permissions:", sm)
-    @test occursin(">default</option>", sm)                          # lower-cased label
+    @test occursin(">default<", sm)                                  # lower-cased label
 end
 
 # ── Part B: home "Defaults" + settings persistence ───────────────────────────

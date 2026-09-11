@@ -22,22 +22,30 @@
         TK.open_browser(server)
         TK.new_chat(server; cwd = mktempdir(), title = "ModelSearch")
 
-        # Visible (non-`hidden`) rows in the dropdown — what filtering changes.
-        shown_js = """(() => [...document.querySelectorAll('.bt-msearch-item')]
+        # EVERY selectable config pill is one of these dropdowns now (the native
+        # `<select>` is gone — the OS drew its open list and no stylesheet
+        # reached it), so permissions and effort have `.bt-msearch-item`s too.
+        # Scope to the MODEL pill, the one this suite is about.
+        model_js = """[...document.querySelectorAll('.bt-msearch')]
+            .find(w => (w.querySelector('.bt-msearch-trigger')?.textContent || '').startsWith('model:'))"""
+        # Visible (non-`hidden`) rows in that dropdown — what filtering changes.
+        shown_js = """(() => [...($(model_js))?.querySelectorAll('.bt-msearch-item') ?? []]
             .filter(e => !e.hidden).map(e => e.textContent.trim()))()"""
-        open_js = "!!document.querySelector('.bt-msearch.bt-msearch-open')"
+        open_js = "!!$(model_js)?.classList.contains('bt-msearch-open')"
+        # `.bt-msearch-input` is still unique: only a list past
+        # MODEL_SEARCH_THRESHOLD gets a filter box, and model (12) is the only one.
 
         @testset "many choices render the searchable picker" begin
             @test TK.wait_for(server, "msearch picker present",
-                "!!document.querySelector('.bt-msearch-trigger')"; timeout = 60) == true
+                "!!$(model_js)"; timeout = 60) == true
             # 12 choices, all present before any filtering.
             @test TK.wait_for(server, "all 12 choices rendered",
-                "document.querySelectorAll('.bt-msearch-item').length === 12"; timeout = 30) == true
+                "$(model_js).querySelectorAll('.bt-msearch-item').length === 12"; timeout = 30) == true
             @test TK.eval_js(server, open_js) == false   # closed until clicked
         end
 
         @testset "clicking the trigger opens it" begin
-            TK.click(server, ".bt-msearch-trigger")
+            TK.eval_js(server, "$(model_js).querySelector('.bt-msearch-trigger').click(); true")
             @test TK.wait_for(server, "dropdown open", open_js; timeout = 10) == true
             @test length(TK.eval_js(server, shown_js)) == 12
         end
@@ -62,7 +70,7 @@
             @test TK.wait_for(server, "delta two isolated",
                 "$(shown_js).length === 1"; timeout = 10) == true
             TK.eval_js(server, """(() => {
-                const el = [...document.querySelectorAll('.bt-msearch-item')].find(e => !e.hidden);
+                const el = [...($(model_js)).querySelectorAll('.bt-msearch-item')].find(e => !e.hidden);
                 if (el) el.click(); return !!el; })()""")
             @test TK.wait_for(server, "dropdown closed after pick",
                 "!$(open_js)"; timeout = 10) == true
@@ -70,7 +78,7 @@
             # trigger's label — the part that needs the Observable, and the
             # reason `select` can't be pure DOM.
             @test TK.wait_for(server, "pill shows the picked model",
-                """(document.querySelector('.bt-msearch-trigger')?.textContent || '')
+                """(($(model_js))?.querySelector('.bt-msearch-trigger')?.textContent || '')
                      .includes('Delta Two')"""; timeout = 30) == true
         end
 

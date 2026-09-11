@@ -621,6 +621,12 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-menu-trigger-danger",
         "border-color" => "rgba(239,68,68,0.5)", "color" => "var(--bt-error)"),
     CSS(".bt-header-devmode-on", "font-weight" => "600"),
+    # The remote-julia toggle reads its own state: quiet when off, accent when
+    # this chat's agent may run code on other machines.
+    CSS(".bt-header-actions .bt-header-session .bt-header-remote-on",
+        "color" => "var(--bt-accent)", "font-weight" => "600"),
+    CSS(".bt-header-actions .bt-header-session .bt-header-remote-on .bt-header-meta-cat",
+        "color" => "var(--bt-accent)"),
     CSS(".bt-header-devmode-on::after", "content" => "\": on\""),
     # Transient status of a long-running header action ("Switching to…",
     # "Continuing on MacBook: Sending 12/40…"). Lives in the flexible left
@@ -731,9 +737,13 @@ const ChatStyles = Bonito.Styles(
         "position" => "relative", "display" => "inline-block"),
     CSS(".bt-msearch-trigger",
         "cursor" => "pointer", "user-select" => "none"),
+    # `fixed`, and placed by `msearchOpen` from the trigger's rect: the pill sits
+    # inside the header's segmented session group, which CLIPS (`overflow:hidden`
+    # keeps the group's own left border off the first visible cell). An
+    # absolutely-positioned list would be cut off at the group's edge.
     CSS(".bt-msearch-list",
         "display" => "none",
-        "position" => "absolute", "top" => "calc(100% + 4px)", "left" => "0",
+        "position" => "fixed", "top" => "0", "left" => "0",
         "z-index" => "200",
         "min-width" => "240px", "max-height" => "320px",
         "background" => "var(--bt-surface)",
