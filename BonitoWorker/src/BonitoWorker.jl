@@ -4,11 +4,13 @@ module BonitoWorker
 # spawns claude-agent-acp + a dedicated per-session WS each time the server
 # requests a new session.
 #
-# Worker has NO inbound listener — no firewall hole on the worker side.
+# MCP control uses an authenticated loopback listener, with no firewall hole.
 # Single port to open is on the server (8038), already needed for browsers.
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
 using MsgPack
+import Random
+include("mcp_relay.jl")
 import Pkg
 
 # ── The control-WS wire ─────────────────────────────────────────────────────
@@ -1211,76 +1213,83 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             end)
         end
 
-        for frame in ws
-            last_rx[] = time()
-            cmd = decode_control(frame)
-            t = get(cmd, "type", "")
-            if t == "open_session"
-                pending_update = lock(_AUTO_UPDATE_LOCK) do
-                    _AUTO_UPDATE_PENDING[]
-                end
-                if pending_update
-                    report_open_session_failed(ws, String(get(cmd, "sid", "")),
-                        "worker is installing a server update; it will reconnect shortly")
+        relay = get(ack, "mcp_relay", 0) == 1 ? start_mcp_relay(ws) : nothing
+        try
+            for frame in ws
+                last_rx[] = time()
+                cmd = decode_control(frame)
+                t = get(cmd, "type", "")
+                if t in ("mcp_frame", "mcp_close")
+                    handle_mcp_relay_frame!(relay, cmd)
+                elseif t == "open_session"
+                    pending_update = lock(_AUTO_UPDATE_LOCK) do
+                        _AUTO_UPDATE_PENDING[]
+                    end
+                    if pending_update
+                        report_open_session_failed(ws, String(get(cmd, "sid", "")),
+                            "worker is installing a server update; it will reconnect shortly")
+                    else
+                        @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env, mcp_relay = relay)
+                    end
+                elseif t == "close_session"
+                    @async handle_close_session(cmd)
+                elseif t == "open_transfer"
+                    @async handle_open_transfer(server_url, secret, cmd)
+                elseif t == "list_dir"
+                    @async handle_list_dir(ws, cmd)
+                elseif t == "make_dir"
+                    @async handle_make_dir(ws, cmd)
+                elseif t == "ensure_dir"
+                    @async handle_ensure_dir(ws, cmd)
+                elseif t == "stat_path"
+                    @async handle_stat_path(ws, cmd)
+                elseif t == "read_file_range"
+                    @async handle_read_file_range(ws, cmd)
+                elseif t == "list_project_files"
+                    @async handle_list_project_files(ws, cmd)
+                elseif t == "inspect_path"
+                    @async handle_inspect_path(ws, cmd)
+                elseif t == "tail_file"
+                    @async handle_tail_file(ws, cmd)
+                elseif t == "kill_file_writers"
+                    @async handle_kill_file_writers(ws, cmd)
+                elseif t == "scan_sessions"
+                    @async handle_scan_sessions(ws, cmd)
+                elseif t == "clone_repo"
+                    @async handle_clone_repo(ws, cmd)
+                elseif t == "git_diff"
+                    @async handle_git_diff(ws, cmd)
+                elseif t == "find_repos"
+                    @async handle_find_repos(ws, cmd)
+                elseif t == "worker_state"
+                    @async handle_worker_state(ws, cmd; mcp_command, mcp_arguments)
+                elseif t == "read_log"
+                    @async handle_read_log(ws, cmd)
+                elseif t == "debug_checkout"
+                    @async handle_debug_checkout(ws, cmd)
+                elseif t == "open_eval_host"
+                    @async handle_open_eval_host(ws, cmd; server_url, worker_id, mcp_command, mcp_arguments, mcp_relay = relay)
+                elseif t == "close_eval_host"
+                    @async handle_close_eval_host(ws, cmd; mcp_relay = relay)
+                elseif t == "stage_session"
+                    @async handle_stage_session(ws, cmd)
+                elseif t == "install_session"
+                    @async handle_install_session(ws, cmd)
+                elseif t == "discard_staging"
+                    @async handle_discard_staging(ws, cmd)
+                elseif t == "ping"
+                    @async send_pong(ws)
+                elseif t == "force_update"
+                    update_config === nothing || schedule_auto_update!(update_config,
+                        get(cmd, "update_spec", nothing); force = true)
                 else
-                    @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
+                    @warn "BonitoWorker: unknown control frame" type=t
                 end
-            elseif t == "close_session"
-                @async handle_close_session(cmd)
-            elseif t == "open_transfer"
-                @async handle_open_transfer(server_url, secret, cmd)
-            elseif t == "list_dir"
-                @async handle_list_dir(ws, cmd)
-            elseif t == "make_dir"
-                @async handle_make_dir(ws, cmd)
-            elseif t == "ensure_dir"
-                @async handle_ensure_dir(ws, cmd)
-            elseif t == "stat_path"
-                @async handle_stat_path(ws, cmd)
-            elseif t == "read_file_range"
-                @async handle_read_file_range(ws, cmd)
-            elseif t == "list_project_files"
-                @async handle_list_project_files(ws, cmd)
-            elseif t == "inspect_path"
-                @async handle_inspect_path(ws, cmd)
-            elseif t == "tail_file"
-                @async handle_tail_file(ws, cmd)
-            elseif t == "kill_file_writers"
-                @async handle_kill_file_writers(ws, cmd)
-            elseif t == "scan_sessions"
-                @async handle_scan_sessions(ws, cmd)
-            elseif t == "clone_repo"
-                @async handle_clone_repo(ws, cmd)
-            elseif t == "git_diff"
-                @async handle_git_diff(ws, cmd)
-            elseif t == "find_repos"
-                @async handle_find_repos(ws, cmd)
-            elseif t == "worker_state"
-                @async handle_worker_state(ws, cmd; mcp_command, mcp_arguments)
-            elseif t == "read_log"
-                @async handle_read_log(ws, cmd)
-            elseif t == "debug_checkout"
-                @async handle_debug_checkout(ws, cmd)
-            elseif t == "open_eval_host"
-                @async handle_open_eval_host(ws, cmd; server_url, worker_id, mcp_command, mcp_arguments)
-            elseif t == "close_eval_host"
-                @async handle_close_eval_host(ws, cmd)
-            elseif t == "stage_session"
-                @async handle_stage_session(ws, cmd)
-            elseif t == "install_session"
-                @async handle_install_session(ws, cmd)
-            elseif t == "discard_staging"
-                @async handle_discard_staging(ws, cmd)
-            elseif t == "ping"
-                @async send_pong(ws)
-            elseif t == "force_update"
-                update_config === nothing || schedule_auto_update!(update_config,
-                    get(cmd, "update_spec", nothing); force = true)
-            else
-                @warn "BonitoWorker: unknown control frame" type=t
             end
+        finally
+            hb_alive[] = false
+            relay === nothing || close(relay)
         end
-        hb_alive[] = false
         @info "BonitoWorker: control WS closed by server"
     end
 end
@@ -1359,7 +1368,8 @@ end
 
 function handle_open_session(ws, server_url::String, secret::String, agent_bin::String,
                               cmd::AbstractDict;
-                              agent_env::Dict{String,String} = Dict{String,String}())
+                              agent_env::Dict{String,String} = Dict{String,String}(),
+                              mcp_relay::Union{MCPRelay,Nothing} = nothing)
     sid           = String(get(cmd, "sid", ""))
     cwd           = String(get(cmd, "cwd", pwd()))
     # `cmd.env` is per-session overrides from the open_session command.
@@ -1404,10 +1414,9 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         end
     end
 
-    # `BONITOAGENTS_SERVER_URL` flows from here all the way down to BonitoMCP's
-    # eval-ws dial-back: claude-agent-acp inherits this env, and MCP children
-    # spawned by the agent inherit it too. The worker is the right side to set
-    # it — `server_url` is the URL we ourselves dialed in on, so by construction
+    # Supply the URL to the agent, and explicitly to our MCP entry in the ACP
+    # relay below: some agents filter the environment inherited by MCP children.
+    # The worker sets it because `server_url` is the URL we dialed in on, so it is
     # reachable. The server cannot reliably guess its own outward URL (see
     # `Bonito.online_url` behavior under `proxy_url="."`), so it stays out of
     # the URL-naming business.
@@ -1458,7 +1467,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
                     (_SESSION_PROCS[cwd] = (proc = proc, ws = ws))
             end
 
-            ws_to_proc = @async relay_ws_to_proc(ws, proc)
+            ws_to_proc = @async relay_ws_to_proc(ws, proc; server_url, mcp_relay, owner = sid)
             proc_to_ws = @async relay_proc_to_ws(proc, ws)
             try
                 wait(ws_to_proc)
@@ -1475,6 +1484,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         # errors are reported too; harmless if the session already came up.
         report_open_session_failed(ws, sid, "ACP session error: $(sprint(showerror, e))")
     finally
+        mcp_relay === nothing || revoke_mcp_grants!(mcp_relay, sid)
         # Deregister (only if still us — a fast reopen on the same cwd may have
         # replaced the entry) so a late close_session can't kill a newer session.
         lock(_SESSION_PROCS_LOCK) do
@@ -1541,7 +1551,8 @@ end
 
 function open_eval_host!(project_id::AbstractString, env::AbstractDict;
                          server_url::AbstractString, worker_id::AbstractString,
-                         mcp_command::AbstractString, mcp_arguments::Vector{String})
+                         mcp_command::AbstractString, mcp_arguments::Vector{String},
+                         mcp_relay::Union{MCPRelay,Nothing} = nothing)
     isempty(project_id) && error("open_eval_host: project_id is empty")
     isempty(mcp_command) && error("open_eval_host: this worker has no MCP launch command")
     lock(_EVAL_HOSTS_LOCK) do
@@ -1554,10 +1565,19 @@ function open_eval_host!(project_id::AbstractString, env::AbstractDict;
                          Dict("BONITOAGENTS_SERVER_URL" => String(server_url),
                               "BONITOAGENTS_EVAL_HOST_WORKER" => String(worker_id),
                               AGENT_OWNER_ENV => String(worker_id)))
+        if mcp_relay !== nothing
+            revoke_mcp_grants!(mcp_relay, "host:" * project_id)
+            merge!(host_env, mcp_relay_env(mcp_relay, project_id; host = true, owner = "host:" * project_id))
+        end
         args = eval_host_arguments(mcp_arguments)
         # `detach`: the host leads its own process group, so killing it reaches
         # the eval workers it spawned — same as an agent (see handle_open_session).
-        proc = open(detach(Cmd(`$mcp_command $args`; env = host_env)), "r")
+        proc = try
+            open(detach(Cmd(`$mcp_command $args`; env = host_env)), "r")
+        catch
+            mcp_relay === nothing || revoke_mcp_grants!(mcp_relay, "host:" * project_id)
+            rethrow()
+        end
         _EVAL_HOSTS[project_id] = proc
         @info "BonitoWorker: eval host started" project_id pid = getpid(proc)
         return (pid = Int(getpid(proc)), existed = false)
@@ -1587,7 +1607,7 @@ function reap_all_eval_hosts!(reason::AbstractString)
 end
 
 function handle_open_eval_host(ws, cmd::AbstractDict; server_url, worker_id,
-                               mcp_command, mcp_arguments)
+                               mcp_command, mcp_arguments, mcp_relay = nothing)
     reply = Dict{String,Any}("type" => "open_eval_host_response",
                              "request_id" => String(get(cmd, "request_id", "")))
     reply_with(ws, reply) do
@@ -1595,12 +1615,13 @@ function handle_open_eval_host(ws, cmd::AbstractDict; server_url, worker_id,
         r = open_eval_host!(String(get(cmd, "project_id", "")),
                             env isa AbstractDict ? env : Dict{String,Any}();
                             server_url = String(server_url), worker_id = String(worker_id),
-                            mcp_command = String(mcp_command), mcp_arguments)
+                            mcp_command = String(mcp_command), mcp_arguments, mcp_relay)
         Dict{String,Any}("ok" => true, "pid" => r.pid, "existed" => r.existed)
     end
 end
 
-function handle_close_eval_host(ws, cmd::AbstractDict)
+function handle_close_eval_host(ws, cmd::AbstractDict; mcp_relay = nothing)
+    mcp_relay === nothing || revoke_mcp_grants!(mcp_relay, "host:" * String(get(cmd, "project_id", "")))
     reply = Dict{String,Any}("type" => "close_eval_host_response",
                              "request_id" => String(get(cmd, "request_id", "")))
     reply_with(ws, reply) do
@@ -2833,12 +2854,49 @@ function handle_open_transfer(server_url::String, secret::String,
     end
 end
 
-# Byte-shuttle between WS frame and subprocess stdio
-function relay_ws_to_proc(ws, proc)
+# Complete our MCP launch environment at the worker, which knows the reachable
+# server URL. In particular, Codex does not inherit arbitrary parent env vars.
+# Only touch our injected stdio entry; other MCP servers and ACP traffic retain
+# their original configuration. Apply on both new and resumed sessions.
+function inject_mcp_server_url(line::String, server_url::AbstractString;
+                               mcp_relay = nothing, owner::AbstractString = "")
+    isempty(server_url) && mcp_relay === nothing && return line
+    msg = JSON.parse(line)
+    msg isa AbstractDict || return line
+    get(msg, "method", nothing) in ("session/new", "session/load", "session/fork", "session/resume") || return line
+    params = get(msg, "params", nothing)
+    params isa AbstractDict || return line
+    servers = get(params, "mcpServers", nothing)
+    servers isa AbstractVector || return line
+    changed = false
+    for mcp in servers
+        mcp isa AbstractDict || continue
+        get(mcp, "name", nothing) == "btworker" || continue
+        get(mcp, "type", "stdio") == "stdio" || continue
+        env = get!(mcp, "env", Any[])
+        values = Dict(String(e["name"]) => String(e["value"]) for e in env)
+        # The URL remains available to the separate rich-display bridge. Control
+        # requests use only the local grant; they need no server address/secret.
+        isempty(server_url) || (values["BONITOAGENTS_SERVER_URL"] = String(server_url))
+        if mcp_relay !== nothing
+            project_id = get(values, "BONITOAGENTS_PROJECT_ID", "")
+            isempty(project_id) && error("injected MCP is missing its chat identity")
+            merge!(values, mcp_relay_env(mcp_relay, project_id; owner))
+        end
+        mcp["env"] = [Dict("name" => k, "value" => v) for (k, v) in sort!(collect(values); by = first)]
+        changed = true
+    end
+    return changed ? JSON.json(msg) : line
+end
+
+# Byte-shuttle between WS frame and subprocess stdio, with the worker's URL
+# supplied explicitly in our MCP launch configuration.
+function relay_ws_to_proc(ws, proc; server_url::AbstractString = "",
+                          mcp_relay = nothing, owner::AbstractString = "")
     try
         while !WebSockets.isclosed(ws)
             frame = WebSockets.receive(ws)
-            line  = String(frame)
+            line  = inject_mcp_server_url(String(frame), server_url; mcp_relay, owner)
             endswith(line, '\n') || (line *= "\n")
             write(proc.in, line)
             flush(proc.in)

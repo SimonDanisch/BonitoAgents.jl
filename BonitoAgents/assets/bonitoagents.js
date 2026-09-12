@@ -132,6 +132,10 @@ export class Collapsable {
         const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
         if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
+                // Reserve this mount before notifying. Deferred auto-mount
+                // and completion updates can arrive before the body does;
+                // a second render would replace an initializing editor.
+                this.loaded = true;
                 this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
                 this.onExpand && this.onExpand();
             }

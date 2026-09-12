@@ -609,6 +609,8 @@ function run_dispatcher_prompt(prompt_id)
                 "_meta" => meta))
             upd("tool_call_update", Dict{String,Any}(
                 "toolCallId" => tid, "status" => "completed", "_meta" => meta))
+        elseif et == "worker_mcp_call"
+            emit_real_mcp_call(ev)
         elseif et == "bt_eval_open"
             # The dispatcher announces the eval BEFORE running it (mirrors real
             # claude: the tool opens, the args stream in on an update, and the
@@ -993,6 +995,7 @@ function dispatch_loop()
             resp(id, Dict("protocolVersion" => 1,
                           "agentCapabilities" => Dict("loadSession" => true)))
         elseif method == "session/new" && id !== nothing
+            set_mcp_config!(get(msg, "params", Dict()))
             # Only under strict_load: the transcript is what that mode checks,
             # and writing one for every mock chat would litter `~/.mockacp`
             # with a folder per temp cwd of every suite.
@@ -1009,6 +1012,7 @@ function dispatch_loop()
                 Dict("name" => "clear",   "description" => "Clear the conversation"),
             ]))
         elseif method == "session/load" && id !== nothing
+            set_mcp_config!(get(msg, "params", Dict()))
             # An id a real agent no longer knows (rotated, pruned, another
             # agent's). Opt-in by id so the other resume tests keep their ack.
             load_params = get(msg, "params", Dict())

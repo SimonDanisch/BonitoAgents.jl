@@ -174,6 +174,7 @@ function host_rpc(state::ServerState, ws, op::AbstractString, args::AbstractDict
         take_pending!(state, ch, rid, timeout, "eval host $(op)")
     finally
         unregister_rpc!(state, rid)
+        untrack_mcp_request!(ws, rid)
     end
     resp isa AbstractDict || error("eval host '$(op)': unexpected reply shape")
     haskey(resp, "error") && error("eval host '$(op)': $(resp["error"])")

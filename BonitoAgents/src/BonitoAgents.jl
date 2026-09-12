@@ -54,6 +54,7 @@ include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("file_view.jl")        # FileView / FilePanel — the one rich file renderer (bt_show + file tabs)
 include("review.jl")           # change-review tab: git diff + per-line ask / batched feedback
 include("lens.jl")             # lens search: parse + fuzzy filter + saved lenses
+include("mcp_relay.jl")
 include("remote_app.jl")       # eval-result bridge — live worker Bonito results in the browser
 include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + app detach controller
 include("persistence.jl")

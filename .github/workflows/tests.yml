@@ -194,6 +194,7 @@ jobs:
           - panel_move_scroll
           - queued_messages
           - render_error
+          - remote_eval
           - resume_discover
           - resume_eager_bind
           - resume_no_jserrors

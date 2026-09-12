@@ -310,7 +310,7 @@ function julia_list_sessions_handler(args::AbstractDict)
     # (and what already runs there). Best-effort: standalone BonitoMCP has no
     # server to ask, and an eval host that doesn't answer must not fail the
     # listing of the local sessions.
-    if SERVER.control.ws !== nothing && isempty(host_worker_id())
+    if SERVER.control.task !== nothing && isempty(host_worker_id())
         text *= "\n\n" * remote_workers_text()
     end
     return Dict{String,Any}(

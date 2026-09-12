@@ -61,6 +61,7 @@ class Collapsable {
         const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
         if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
+                this.loaded = true;
                 this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
                 this.onExpand && this.onExpand();
             }

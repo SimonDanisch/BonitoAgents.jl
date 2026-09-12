@@ -161,10 +161,15 @@ function run_suite(server)
         @test TK.wait_for(server, "image actually decoded",
             "(() => { const i = document.querySelector('$(card("cw-img")) img'); " *
             "return !!i && i.complete && i.naturalWidth > 0; })()"; timeout = 120) == true
-        # Served from the server's mirror of the worker file, not a data: URI —
-        # codex never sent the bytes, so anything else means we invented them.
+        # Codex supplied a worker-file reference. Its stable route must point
+        # to that exact path, independently of the original display session.
         @test TK.eval_js(server,
-            "(document.querySelector('$(card("cw-img")) img').getAttribute('src')||'').startsWith('/assets/')") == true
+            """(() => {
+                const image = document.querySelector('$(card("cw-img")) img');
+                const url = new URL(image.src, location.href);
+                return url.pathname.startsWith('/worker-file/') &&
+                       url.searchParams.get('path') === $(repr(IMG_PATH));
+            })()""") == true
 
         @test isempty(TK.js_errors(server))
     end

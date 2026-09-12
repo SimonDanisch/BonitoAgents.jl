@@ -3,8 +3,8 @@
 # chat whose agent sits on the desktop: the chat's own MCP asks the BonitoAgents
 # server (`call_server("remote_eval", …)`, tools/eval.jl), the server spawns one
 # of these on the MacBook's worker for that chat, and relays the eval to it over
-# /mcp-ws — the control channel every MCP process dials, with a handshake that
-# names the worker this host runs on and the chat it serves.
+# the worker daemon's existing connection. A local relay grant binds the host
+# to its chat; older workers use the legacy /mcp-ws handshake instead.
 #
 # Everything below the wire is shared with the stdio server: the same session
 # manager (one Malt worker per env_path), the same tool handlers, the same live
@@ -14,7 +14,7 @@
 # into the chat on the desktop).
 #
 # Wire, on top of ctrl_ws.jl's:
-#   handshake:      "secret project_id eval_host worker_id"
+#   legacy handshake: "secret project_id eval_host worker_id"
 #   server → host:  {"op": "eval"|"continue"|"interrupt"|"restart"|"sessions",
 #                    "request_id", "args": {…the tool's own arguments…}}
 #                   {"op": "shutdown", "request_id"}
@@ -41,6 +41,17 @@ Serve evals for one chat from THIS worker until told to shut down. Reads the sam
 spawned it). Blocks; returns after the shutdown.
 """
 function run_eval_host()
+    if !isempty(get(ENV, "BONITOAGENTS_CONTROL_URL", ""))
+        isempty(host_worker_id()) && error("eval host has no worker identity")
+        start_ctrl_dialback!()
+        try
+            watch_host_orphaned()
+        finally
+            shutdown!(manager())
+            reset_ctrl_dialback!()
+        end
+        return nothing
+    end
     server_url = get(ENV, "BONITOAGENTS_SERVER_URL", "")
     secret     = get(ENV, "BONITOAGENTS_SECRET", "")
     project_id = get(ENV, "BONITOAGENTS_PROJECT_ID", "")

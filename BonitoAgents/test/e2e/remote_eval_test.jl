@@ -19,6 +19,8 @@
     include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
     using .TestKit
     const TK = TestKit
+    real_eval(code; kw...) = TK.bt_eval(code; real_process = true, kw...)
+    real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
     import BonitoAgents as BT
 
     VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
@@ -80,7 +82,7 @@
             @test TK.wait_for(server, "the ⋯ menu offers the switch, off",
                 "$(remote_state) === 'off'"; timeout = 30) == true
             @test p.remote_eval === false
-            server.agent_fn[] = _ -> [TK.bt_eval("1 + 1"; worker = "worker-b", id = "re-off"),
+            server.agent_fn[] = _ -> [real_eval("1 + 1"; worker = "worker-b", id = "re-off"),
                                       TK.end_turn()]
             TK.send_message(server, "try it on worker-b")
             @test TK.wait_for(server, "the card wears the worker badge",
@@ -148,7 +150,7 @@
             @test TK.eval_js(server, "$(remote_item)?.dataset.btProbe") == "stamped"
             @test TK.wait_for(server, "the switch reads on",
                 "$(remote_state) === 'on'"; timeout = 10) == true
-            server.agent_fn[] = _ -> [TK.bt_eval(
+            server.agent_fn[] = _ -> [real_eval(
                 "string(\"host=\", get(ENV, \"BONITOAGENTS_EVAL_HOST_WORKER\", \"none\"))";
                 worker = "worker-b", id = "re-on"), TK.end_turn()]
             TK.send_message(server, "now for real")
@@ -160,23 +162,48 @@
             @test TK.wait_for(server, "the eval ran on worker B",
                 card_shows("re-on", "host=" * worker_b.worker_id); timeout = 420) == true
             @test TK.eval_js(server, card_badge("re-on")) == "⇢ worker-b"
+            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
+            @test all(last(pair) isa BT.WorkerMCPChannel for pair in BT.eval_hosts_of(state, pid))
             @test length(BT.eval_hosts_of(state, pid)) == 1
             @test first(BT.eval_hosts_of(state, pid))[1] == worker_b.worker_id
 
             # ── 3. the listing names B and its live host ─────────────────────
-            server.agent_fn[] = _ -> [TK.mcp_call("bt_julia_list_sessions"; id = "re-list"),
+            server.agent_fn[] = _ -> [real_call("bt_julia_list_sessions"; id = "re-list"),
                                       TK.end_turn()]
             TK.send_message(server, "what do we have")
             @test TK.wait_for(server, "the listing names worker-b's host",
                 card_shows("re-list", "eval host running"); timeout = 60) == true
             @test TK.eval_js(server, card_shows("re-list", "worker-b")) == true
 
+            # Checkpoint and interruption must use the same relayed host and
+            # leave its Julia state usable afterwards.
+            server.agent_fn[] = _ -> [real_eval("relay_value = 41; sleep(60); relay_value";
+                worker = "worker-b", timeout = 0.1, id = "re-running"), TK.end_turn()]
+            TK.send_message(server, "start a long remote eval")
+            @test TK.wait_for(server, "remote eval checkpoint",
+                card_shows("re-running", "still running"); timeout = 60) == true
+            # Eager expansion and the fast checkpoint must share one body
+            # mount, including while the first render is still in flight.
+            renders = BT.shared(state.chat_models[pid]).tool_renders
+            @test [generation[] for (key, (_, generation)) in renders
+                   if occursin("re-running", key)] == [1]
+            server.agent_fn[] = _ -> [real_call("bt_julia_interrupt";
+                worker = "worker-b", id = "re-interrupt"), TK.end_turn()]
+            TK.send_message(server, "interrupt the remote eval")
+            @test TK.wait_for(server, "remote interrupt result",
+                card_shows("re-interrupt", "InterruptException"); timeout = 60) == true
+            server.agent_fn[] = _ -> [real_eval("relay_value + 1";
+                worker = "worker-b", id = "re-after-interrupt"), TK.end_turn()]
+            TK.send_message(server, "reuse the remote session")
+            @test TK.wait_for(server, "remote state survived interruption",
+                card_shows("re-after-interrupt", "42"); timeout = 60) == true
+
             # ── 4. a folder travels A → B ────────────────────────────────────
             src = mkpath(joinpath(mktempdir(), "payload"))
             write(joinpath(src, "hello.txt"), "from A\n")
             mkpath(joinpath(src, "deep")); write(joinpath(src, "deep", "n.txt"), "nested\n")
             dst = BT.worker_join(worker_b.projects_root, "payload-on-b")
-            server.agent_fn[] = _ -> [TK.mcp_call("bt_sync_folder"; id = "re-sync",
+            server.agent_fn[] = _ -> [real_call("bt_sync_folder"; id = "re-sync",
                                                   src = src, worker = "worker-b", dst = dst),
                                       TK.end_turn()]
             TK.send_message(server, "ship the folder")
@@ -184,6 +211,16 @@
                 card_shows("re-sync", "synced"); timeout = 120) == true
             @test read(joinpath(dst, "hello.txt"), String) == "from A\n"
             @test read(joinpath(dst, "deep", "n.txt"), String) == "nested\n"
+
+            old_channel = BT.mcp_ctrl_for(state, pid)
+            BT.restart_chat_session!(state.chat_models[pid])
+            server.agent_fn[] = _ -> [real_eval("6 * 7";
+                worker = "worker-b", id = "re-resumed"), TK.end_turn()]
+            TK.send_message(server, "remote eval after resuming the agent")
+            @test TK.wait_for(server, "resumed agent launches a working MCP",
+                card_shows("re-resumed", "42"); timeout = 120) == true
+            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
+            @test BT.mcp_ctrl_for(state, pid) !== old_channel
 
             # ── 5. off again: the host goes, the refusal is back ─────────────
             @test TK.eval_js(server, open_menu) == true
@@ -195,7 +232,7 @@
             end
             @test p.remote_eval === false
             @test isempty(BT.eval_hosts_of(state, pid))
-            server.agent_fn[] = _ -> [TK.bt_eval("1 + 1"; worker = "worker-b", id = "re-off2"),
+            server.agent_fn[] = _ -> [real_eval("1 + 1"; worker = "worker-b", id = "re-off2"),
                                       TK.end_turn()]
             TK.send_message(server, "and now?")
             @test TK.wait_for(server, "refused again",

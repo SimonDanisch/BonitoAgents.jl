@@ -573,34 +573,12 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
     end
     is_host ? (@info "eval host connected" project_id worker_id = host_worker) :
               (@info "MCP control channel connected" project_id)
-    # A host's live stdout is keyed under its worker, so the chat's eval card
-    # for `bt_julia_eval(worker = …)` finds it and a local session on the same
-    # env_path does not (see `eval_route_key`).
-    route_prefix = is_host ? host_worker * "\0" : ""
     try
         for msg in ws
             # Per-frame guard — one malformed reply must not drop the channel.
             try
                 d = JSON.parse(String(msg))
-                if get(d, "type", "") == "eval_stream_chunk"
-                    # Unsolicited live-stdout push (no request_id): route it to the
-                    # matching running eval's tail. High-volume, so handled first.
-                    route_eval_chunk!(state, project_id,
-                        route_prefix * String(get(d, "route", "")), String(get(d, "chunk", "")))
-                elseif get(d, "type", "") == "dev_request" && !is_host
-                    # The other direction: the chat's MCP asking the server
-                    # something — a debug chat's `bt_dev_*` tool (dev_api.jl), or
-                    # any chat's `bt_julia_eval(worker = …)` (remote_eval.jl).
-                    # Answered on its own task — a `memory` call with `deep=true`
-                    # walks the object graph for seconds, a relayed eval waits for
-                    # its checkpoint — and must not stall this read loop (which
-                    # also carries eval stdout and interrupt replies).
-                    @async handle_dev_request(state, ws, d; project_id)
-                else
-                    rid = get(d, "request_id", nothing)
-                    rid isa AbstractString && !isempty(rid) &&
-                        deliver_rpc_response!(state, String(rid), Dict{String,Any}(d))
-                end
+                handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
             catch e
                 @warn "mcp ctrl frame error" exception = e
             end
@@ -618,6 +596,30 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
                   (@info "MCP control channel closed" project_id)
     end
     return
+end
+
+function handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
+    if get(d, "type", "") == "eval_stream_chunk"
+        # Unsolicited live-stdout push (no request_id): route it to the
+        # matching running eval's tail, prefixed with the host's worker id
+        # so it cannot reach a local eval on the same env_path.
+        route_eval_chunk!(state, project_id,
+            (isempty(host_worker) ? "" : host_worker * "\0") * String(get(d, "route", "")), String(get(d, "chunk", "")))
+    elseif get(d, "type", "") == "dev_request" && isempty(host_worker)
+        # The other direction: the chat's MCP asking the server
+        # something — a debug chat's `bt_dev_*` tool (dev_api.jl), or
+        # any chat's `bt_julia_eval(worker = …)` (remote_eval.jl).
+        # Answered on its own task — a `memory` call with `deep=true`
+        # walks the object graph for seconds, a relayed eval waits for
+        # its checkpoint — and must not stall this read loop (which
+        # also carries eval stdout and interrupt replies).
+        @async handle_dev_request(state, ws, d; project_id)
+    else
+        rid = get(d, "request_id", nothing)
+        rid isa AbstractString && !isempty(rid) &&
+            deliver_rpc_response!(state, String(rid), Dict{String,Any}(d))
+    end
+    return nothing
 end
 
 """
@@ -723,6 +725,7 @@ function interrupt_over_channel!(state::ServerState, ws, env_path, timeout::Real
         take_pending!(state, ch, rid, timeout, what)
     finally
         unregister_rpc!(state, rid)   # T10: no leak on send failure
+        untrack_mcp_request!(ws, rid)
     end
     resp isa AbstractDict || error("$(what): unexpected response shape")
     return Int(get(resp, "interrupted", 0))
@@ -730,9 +733,9 @@ end
 
 # Env the server injects into the BonitoMCP MCP server so its eval worker can
 # dial `/eval-ws` back. The dial-back URL itself is NOT set here — the
-# BonitoWorker daemon supplies `BONITOAGENTS_SERVER_URL` (the URL it dialed in
-# on), and BonitoMCP derives the eval-ws path from it. That keeps the two
-# dial-backs (worker-control WS + eval WS) keyed off the same proven URL
+# BonitoWorker daemon supplies `BONITOAGENTS_SERVER_URL` explicitly in the ACP
+# MCP launch entry (the URL it dialed in on), and BonitoMCP derives the eval-ws
+# path from it. That keeps both dial-backs keyed off the same proven URL
 # and avoids the server having to guess its own outward-facing address.
 # The name of the ONE MCP server we inject into every chat (see
 # `bring_up_project_session!`). Named in a const because two places need to agree

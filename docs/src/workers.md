@@ -78,6 +78,40 @@ happened.
 
 ## Managing workers
 
+### Remote Julia transport
+
+Remote Julia requests, replies, stdout, interrupts, and dev-tool requests use
+the workers' existing authenticated connections to the server. Each chat's MCP
+process connects to a loopback listener on its own worker daemon using a token
+scoped to that chat. A remote eval host uses the same local relay on the target
+worker. The server still enforces the chat's **Remote julia** switch.
+
+The control path is:
+
+```text
+chat MCP → local daemon → server → target daemon → eval host
+           loopback      existing worker connections      loopback
+```
+
+Local relay coordinates are supplied explicitly in ACP's MCP launch environment,
+including when a chat is resumed. MCP control does not need the server URL or
+server secret. Worker disconnects close their local channels and fail pending
+control requests; reconnects establish new channels. Queues for slow local
+clients are bounded so they cannot stall worker heartbeats.
+
+The separate interactive-rendering bridge still carries Bonito app/plot traffic.
+Older workers retain the legacy direct MCP control connection. Update the server
+and workers, then restart existing agent sessions to use the daemon relay.
+
+Tests for this boundary are `unit:mcp_relay` (real MCP subprocess with no server
+coordinates, cancellation, disconnects, routing, and queue bounds) and
+`e2e:remote_eval` (real worker daemons and MCP processes, with a deterministic
+agent that filters inherited environment variables). The latter runs in CI.
+TestKit's default in-process MCP simulator remains useful for UI tests but does
+not cover process launch; use `real_process=true` for that coverage.
+
+### Worker controls
+
 Each worker card on the dashboard shows its status dot, lets you rename it,
 and offers *Rescan* to refresh the discovered-sessions list. The `worker.log`
 lives next to the worker config (a Julia scratchspace by default; the exact

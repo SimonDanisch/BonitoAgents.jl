@@ -1,7 +1,8 @@
 @testitem "unit:mcp_ctrl" tags = [:unit] begin
 
-# MCP control channel (/mcp-ws) — the transport the per-tool eval interrupt
-# rides on — plus the AGENTS.md → system-prompt `_meta` plumbing.
+# Legacy MCP control channel (/mcp-ws), retained for older workers, plus the
+# AGENTS.md → system-prompt `_meta` plumbing. Current worker relay coverage is
+# in mcp_relay_test.jl and e2e/remote_eval_test.jl.
 #
 #   1. Real WS round-trip: a BonitoMCP `start_ctrl_dialback!` (driven by the
 #      same env vars production uses) dials a live BonitoAgents server;

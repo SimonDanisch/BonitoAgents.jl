@@ -356,6 +356,7 @@ end
 # Handler for /worker-ws — runs once per worker, for the worker's lifetime.
 function handle_worker_control(state::ServerState, ws)
     worker_id = "?"
+    mcp_channels = Dict{String,Any}()
     try
         hello_raw = WebSockets.receive(ws)
         hello = decode_control(hello_raw)
@@ -391,6 +392,7 @@ function handle_worker_control(state::ServerState, ws)
                               "registered_as" => display_name,
                               "worker_id"     => worker_id,
                               "heartbeat_interval" => state.heartbeat_interval,
+                              "mcp_relay" => 1,
                               # Optional to old workers, authoritative to new ones:
                               # this is the same spec /install.jl would serve, but
                               # travels over the already authenticated control WS.
@@ -539,7 +541,9 @@ function handle_worker_control(state::ServerState, ws)
                     cmd = decode_control(frame)
                     t   = get(cmd, "type", "")
                     rid = String(get(cmd, "request_id", ""))
-                    if t == "pong"
+                    if t in ("mcp_open", "mcp_frame", "mcp_close")
+                        handle_worker_mcp!(state, worker_id, ws, mcp_channels, cmd)
+                    elseif t == "pong"
                         last_pong[] = time()
                         pong_seen[] = true
                     elseif t == "list_dir_response"
@@ -619,6 +623,8 @@ function handle_worker_control(state::ServerState, ws)
         # `hb_alive` only exists once registration reached the watchdog block —
         # a rejected/failed hello lands here without it.
         @isdefined(hb_alive) && (hb_alive[] = false)
+        foreach(ch -> close_mcp_channel!(ch; notify_worker = false), values(mcp_channels))
+        empty!(mcp_channels)
         teardown_worker_control!(state, worker_id, ws)
     end
 end

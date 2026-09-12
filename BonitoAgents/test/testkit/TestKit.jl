@@ -144,8 +144,10 @@ end
 """
     mcp_call(tool; id = nothing, args...) -> Dict
 
-Agent event that runs the REAL BonitoMCP handler for the bare tool name
-`tool` exactly the way the real chat does it: Malt worker per `env_path`,
+By default, a tool simulator that runs the BonitoMCP handler in the test
+process. This does NOT test agent/MCP launch or environment propagation.
+Pass `real_process=true` to launch MCP from the worker-supplied ACP config.
+The simulator uses: Malt worker per `env_path`,
 real `--project` activation, real captured stdout/value/errors. The
 dispatcher executes it in the test process and pipes the resulting MCP
 content blocks back to the mock as ACP tool_call frames announced under
@@ -154,16 +156,16 @@ ones are dropped; `env_path = nothing` opts into BonitoMCP's ephemeral-temp
 session, same as the default in production). `bt_eval` / `bt_continue` are
 sugar over this.
 """
-mcp_call(tool::AbstractString; id = nothing, args...) = begin
-    d = Dict{String,Any}("type" => "mcp_call", "tool" => String(tool))
+mcp_call(tool::AbstractString; id = nothing, real_process::Bool = false, args...) = begin
+    d = Dict{String,Any}("type" => real_process ? "worker_mcp_call" : "mcp_call", "tool" => String(tool))
     id === nothing || (d["id"] = String(id))
     for (k, v) in pairs(args)
         v === nothing || (d[String(k)] = v)
     end
     d
 end
-bt_eval(code; env_path = nothing, id = nothing, timeout = nothing, worker = nothing) =
-    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout, worker)
+bt_eval(code; env_path = nothing, id = nothing, timeout = nothing, worker = nothing, real_process = false) =
+    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout, worker, real_process)
 # bt_julia_continue reattaches to the in-flight eval after a soft-timeout
 # checkpoint — its call carries NO code argument, exactly like real claude.
 bt_continue(; env_path = nothing, timeout = nothing, id = nothing) =
@@ -1098,8 +1100,14 @@ For routes that aren't direct URLs, prefer the high-level helpers
 """
 function navigate(s::TestServer, route::AbstractString)
     base = "http://127.0.0.1:$(s.h.state.srv.port)"
-    eval_js(s, "location.href = $(json(base * String(route)))")  # errors if no browser
-    sleep(2.0)
+    eval_js(s, "window.__btNavigationPending = true; location.href = $(json(base * String(route)))")
+    wait_for(s, "new document loaded",
+        "window.__btNavigationPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-app')";
+        timeout = 60)
+    # Navigation replaces the document and its selector wrappers. Without
+    # reinstalling these, the next suite can read a hidden chat's message
+    # count instead of the active chat after a reload test.
+    install_pane_scope!(s)
     return s
 end
 

@@ -204,9 +204,13 @@ function run_suite(server)
         # change the diff) rather than on the wiring, so it holds however the
         # handler is attached.
         @testset "the picker survives a reload" begin
-            TK.eval_js(server, "location.reload(); true")
+            # A header exists both in the old document and behind the new
+            # page's loading overlay. Wait until the reloaded chat is usable
+            # before clicking; a programmatic click bypasses that overlay.
+            TK.eval_js(server, "window.__reviewReloadPending = true; location.reload(); true")
             @test TK.wait_for(server, "page back",
-                "!!document.querySelector('.bt-header-review')"; timeout = 60) == true
+                "window.__reviewReloadPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-chatpane[data-bt-settled=\"1\"] .bt-header-review')";
+                timeout = 60) == true
             TK.eval_js(server, "document.querySelector('.bt-header-review').click(); true")
             @test TK.wait_for(server, "review tab back",
                 "!!document.querySelector('$(RF_REVIEW) .bt-rv-folder')"; timeout = 60) == true
@@ -277,9 +281,10 @@ function run_suite(server)
                 """(document.querySelector('$(RF_REVIEW) .bt-rv-tray')?.innerText || '')
                     .includes('UEBERLEBT-DEN-RELOAD')"""; timeout = 30) == true
 
-            TK.eval_js(server, "location.reload(); true")
+            TK.eval_js(server, "window.__reviewReloadPending = true; location.reload(); true")
             @test TK.wait_for(server, "page back",
-                "!!document.querySelector('.bt-header-review')"; timeout = 60) == true
+                "window.__reviewReloadPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-chatpane[data-bt-settled=\"1\"] .bt-header-review')";
+                timeout = 60) == true
             TK.eval_js(server, "document.querySelector('.bt-header-review').click(); true")
             @test TK.wait_for(server, "review tab back",
                 "!!document.querySelector('$(RF_REVIEW) .bt-rv-folder')"; timeout = 60) == true

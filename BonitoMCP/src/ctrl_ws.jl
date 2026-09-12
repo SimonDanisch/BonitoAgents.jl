@@ -1,9 +1,9 @@
-# Control dial-back from THIS process (the stdio MCP server) to the
-# BonitoAgents server — the lever that lets the chat's per-tool ⊗ button
+# Control channel from THIS process (the stdio MCP server) through its local
+# worker daemon — the lever that lets the chat's per-tool ⊗ button
 # interrupt an in-flight bt_julia_eval WITHOUT cancelling the whole agent
 # turn.
 #
-# Why a separate channel: the eval-ws bridge (RemoteProxy) lives in the Malt
+# Why control lives outside user code: the eval-ws bridge (RemoteProxy) lives in the Malt
 # EVAL worker, the same process that runs the user's code — a busy eval can
 # starve its event loop, so it can't be trusted to deliver an interrupt. THIS
 # process never runs user code (evals are remote_eval'd into the Malt
@@ -26,7 +26,12 @@
 # request of ours using that name would be routed into its pending-RPC table and
 # never handled.
 #
-# The dial is configured by the same env the eval-ws dial-back uses
+# Current workers supply CONTROL_URL (loopback only) and a chat-scoped
+# CONTROL_TOKEN explicitly in the ACP launch config. The daemon forwards frames
+# on its existing authenticated worker/server connection. No server URL or
+# server secret is needed by this control path.
+#
+# Compatibility with older workers: the direct server dial uses
 # (BONITOAGENTS_SERVER_URL from the worker daemon, BONITOAGENTS_SECRET /
 # BONITOAGENTS_PROJECT_ID injected by the server into the MCP launch env).
 # Standalone BonitoMCP use (no BonitoAgents) has none of them set → no dial,
@@ -83,6 +88,15 @@ send_eval_stream_chunk(route::AbstractString, chunk::AbstractString) =
                          "route" => String(route), "chunk" => String(chunk)))
 
 function start_ctrl_dialback!()
+    local_url = get(ENV, "BONITOAGENTS_CONTROL_URL", "")
+    if !isempty(local_url)
+        token = get(ENV, "BONITOAGENTS_CONTROL_TOKEN", "")
+        isempty(token) && error("local worker control endpoint has no session token")
+        SERVER.control.task === nothing || return nothing
+        SERVER.control.task = Base.errormonitor(@async ctrl_dial_loop(local_url, token))
+        log_info("control relay armed through the local worker")
+        return nothing
+    end
     server_url = get(ENV, "BONITOAGENTS_SERVER_URL", "")
     secret     = get(ENV, "BONITOAGENTS_SECRET", "")
     project_id = get(ENV, "BONITOAGENTS_PROJECT_ID", "")
@@ -151,6 +165,7 @@ function ctrl_dial_loop(wsurl::AbstractString, handshake::AbstractString;
                 finally
                     # Identity-guarded: a reconnect may already have armed a fresh one.
                     SERVER.control.ws === ws && (SERVER.control.ws = nothing)
+                    fail_control_requests!("worker control connection closed")
                 end
             end
         catch e
@@ -159,6 +174,18 @@ function ctrl_dial_loop(wsurl::AbstractString, handshake::AbstractString;
         backoff = connected ? min_backoff : min(backoff * 2, max_backoff)
         sleep(backoff)
     end
+end
+
+function fail_control_requests!(message::AbstractString)
+    pending = lock(SERVER.control.pending_lock) do
+        channels = collect(values(SERVER.control.pending))
+        empty!(SERVER.control.pending)
+        channels
+    end
+    for ch in pending
+        put!(ch, ErrorException(message))
+    end
+    return nothing
 end
 
 # How long a call waits for a channel that is armed but not connected yet: the
