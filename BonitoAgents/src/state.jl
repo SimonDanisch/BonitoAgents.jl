@@ -36,6 +36,8 @@ mutable struct WorkerInfo
     # reconnects (the WorkerInfo is reused, not rebuilt). Query with `isopen(w)`.
     online::Observable{Bool}
     last_check::DateTime
+    update_state::Symbol               # :current | :available
+    update_message::String
 end
 
 # A worker is "open" while its control WS is connected. Point read; bind to
@@ -171,7 +173,7 @@ WorkerInfo(worker_id, name, url, secret, ssh_target, hostname, home,
                # `:online`/`:offline`/`:unknown`) or a ready Observable/Bool.
                status isa Observable ? status :
                    Observable(status === :online || status === true),
-               last_check)
+               last_check, :current, "")
 
 """
     ServerState
@@ -968,7 +970,7 @@ function load_workers!(s::ServerState)
                            # the 12-arg shim's coercion and silently DROPPED
                            # every persisted worker here once `online` became
                            # an Observable ("skipping malformed worker entry").
-                           Observable(false), now(UTC))
+                           Observable(false), now(UTC), :current, "")
             s.workers[][wid] = w
         catch e
             @warn "skipping malformed worker entry" entry=d exception=e

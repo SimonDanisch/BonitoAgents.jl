@@ -515,9 +515,44 @@ function render_install_script(template::AbstractString,
         "{{SERVER_URL}}"    => public_url,
         "{{WORKER_SECRET}}" => worker_secret,
         "{{REV}}"           => current_repo_rev(),
+        "{{SOURCE_ID}}"     => current_repo_source_id(),
         "{{BONITO_URL}}"    => bonito_url,
         "{{BONITO_REV}}"    => bonito_rev,
     )
+end
+
+# The version identity sent to an installed worker after it authenticates on the
+# control WebSocket. Keep it in terms of source specs, rather than a package
+# version: workers and servers commonly run feature branches where every
+# Project.toml says the same development version.
+function current_worker_update_spec()
+    bonito_url, bonito_rev = current_bonito_install_spec()
+    return Dict(
+        "repo"       => "https://github.com/SimonDanisch/BonitoAgents.jl",
+        "rev"        => current_repo_rev(),
+        "source_id"  => current_repo_source_id(),
+        "bonito_url" => bonito_url,
+        "bonito_rev" => bonito_rev,
+    )
+end
+
+# A branch name cannot tell a worker whether it is on yesterday's `main` or
+# today's. Prefer the server's reachable commit as its update identity and only
+# fall back to the install ref when the deployment is not a usable git checkout.
+function current_repo_source_id()
+    ref = current_repo_rev()
+    pkg = pkgdir(@__MODULE__)
+    pkg === nothing && return ref
+    repo_root = abspath(pkg, "..")
+    ispath(joinpath(repo_root, ".git")) || return ref
+    try
+        sha = strip(read(`git -C $repo_root rev-parse HEAD`, String))
+        return _sha_on_origin(repo_root, sha) ? String(sha) : ref
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "current_repo_source_id: git resolve failed" exception=e
+        return ref
+    end
 end
 
 """

@@ -620,6 +620,26 @@ end
     @test BW.decide_run_mode(nothing, false) == :background
 end
 
+# The worker only self-updates when a real installer opted in AND the server's
+# authenticated install spec differs. Dev/test workers deliberately write no
+# opt-in flag, so opening a local dev_server can never mutate @bonito-agents.
+@testset "automatic update identity" begin
+    current = Dict("repo" => "https://example.test/agents.git", "rev" => "main", "source_id" => "abc123",
+                   "bonito_url" => "https://example.test/bonito.git", "bonito_rev" => "master")
+    newer = copy(current); newer["source_id"] = "def456"
+
+    @test BW.update_spec_from_wire(current) == current
+    @test BW.update_spec_from_wire(Dict("repo" => "x")) === nothing
+    @test BW.update_spec_from_wire(Dict("repo" => "", "rev" => "main", "source_id" => "s",
+                                        "bonito_url" => "u", "bonito_rev" => "r")) === nothing
+
+    installed = Dict{String,Any}("auto_update" => true, "update_spec" => current)
+    @test !BW.update_needed(installed, current)
+    @test BW.update_needed(installed, newer)
+    @test !BW.update_needed(Dict{String,Any}("update_spec" => current), newer)
+    @test !BW.update_needed(Dict{String,Any}("auto_update" => true), newer)
+end
+
 # ── file_writer_pids / kill_file_writers (background-shell stop) ────────────
 # The direct stop for a background bash: the shell holds its `>> output`
 # redirect open until it exits, so the file's writers ARE the shell. Linux
@@ -668,4 +688,3 @@ include("test_agent_reaping.jl")
 # and stands up an HTTP+WS server. Skipped automatically when
 # claude-agent-acp isn't on PATH (so unit-only environments stay green).
 include("test_real_agent.jl")
-

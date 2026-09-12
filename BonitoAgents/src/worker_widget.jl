@@ -69,13 +69,14 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
 
     status_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w === nothing ? :unknown : (isopen(w) ? :online : :offline)
+        w === nothing ? :unknown : (!isopen(w) ? :offline :
+                                    (w.update_state === :available ? :update : :online))
     end
     subtitle_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
         w === nothing ? "(removed)" : worker_subtitle(w)
     end
-    is_online_obs = map(s -> s == :online, status_obs)
+    is_online_obs = map(s -> s == :online || s == :update, status_obs)
     title_attr = let w = get(state.workers[], wid, nothing)
         w === nothing ? "(removed)" :
             "$(w.hostname) · home: $(w.home)"
@@ -171,6 +172,26 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         status_dot(s)
     end
 
+    update_notice = map(state.workers) do workers
+        w = get(workers, wid, nothing)
+        w === nothing || w.update_state !== :available ? nothing :
+            DOM.span(w.update_message; class = "bt-worker-update-note")
+    end
+    update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")
+    on(session, update_btn.value) do clicked
+        clicked || return
+        @async try
+            force_worker_update!(state, wid)
+            c.error_obs[] = "Update requested; it starts after active work finishes."
+        catch e
+            c.error_obs[] = "Could not request update: $(sprint(showerror, e))"
+        end
+    end
+    update_btn_class = map(state.workers) do workers
+        w = get(workers, wid, nothing)
+        w !== nothing && w.update_state === :available ? "" : "bt-hidden"
+    end
+
     # Remove worker. The confirm() lives in JS so we never fire the
     # destructive call without an explicit OK; only then does the trigger
     # Observable flip and the Julia handler run `remove_worker!`.
@@ -198,7 +219,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     online_class  = map(o -> o ? "bt-card-actions"            : "bt-card-actions bt-hidden", is_online_obs)
     offline_class = map(o -> o ? "bt-card-actions bt-hidden"  : "bt-card-actions",            is_online_obs)
     actions_block = DOM.div(
-        DOM.div(new_proj_btn, gh_btn; class = online_class),
+        DOM.div(new_proj_btn, gh_btn, DOM.div(update_btn; class = update_btn_class); class = online_class),
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
     card_body = DOM.div(
@@ -228,7 +249,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # just a thin "▸ projects (N)" toggle row — no separate pill chrome. Fed
     # from state.discovered (no scan needed on first paint); the per-card Rescan
     # button refreshes it.
-    card = DOM.div(card_row, render_discover_panel(session, c, wid); class = "bt-card")
+    card = DOM.div(card_row, update_notice, render_discover_panel(session, c, wid); class = "bt-card")
 
     return Bonito.jsrender(session,
         DOM.div(card, picker_block, gh_block; class = "bt-worker-cell"))

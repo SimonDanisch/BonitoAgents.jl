@@ -9,6 +9,7 @@ module BonitoWorker
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
 using MsgPack
+import Pkg
 
 # ── The control-WS wire ─────────────────────────────────────────────────────
 # MsgPack in a BINARY frame. Not JSON in a text frame, and the difference is not
@@ -670,13 +671,24 @@ end
 function write_config!(; server_url::AbstractString,
                           secret::AbstractString,
                           projects_root::AbstractString = pwd(),
-                          name::AbstractString = default_worker_name(load_or_generate_worker_id()))
+                          name::AbstractString = default_worker_name(load_or_generate_worker_id()),
+                          # The installer records the spec it installed. The server sends
+                          # its current spec in the authenticated hello acknowledgement;
+                          # this is what lets the worker notice a later server upgrade
+                          # without polling a third-party service.
+                          update_spec::Union{AbstractDict,Nothing} = nothing,
+                          # Direct callers are dev/test rigs. The public
+                          # installer opts in below after recording a real spec.
+                          auto_update::Bool = false)
     config = Dict(
         "server_url"    => String(server_url),
         "secret"        => String(secret),
         "name"          => String(name),
         "projects_root" => abspath(projects_root),
+        "auto_update"   => auto_update,
     )
+    update_spec === nothing || (config["update_spec"] = Dict{String,Any}(
+        String(k) => String(v) for (k, v) in update_spec))
     cfg = config_path()
     write(cfg, JSON.json(config))
     @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
@@ -699,13 +711,15 @@ function install!(; server_url::String,
                     secret::String,
                     projects_root::String = pwd(),
                     run_mode::Symbol = :prompt,
+                    update_spec::Union{AbstractDict,Nothing} = nothing,
+                    auto_update::Bool = true,
                     # Did the underlying Pkg env actually move forward (per
                     # `install.jl`'s before/after tree-sha diff)? When `true`,
                     # the running worker / service is restarted so the new
                     # code is actually loaded — otherwise the user only sees
                     # the new package version after a manual kill.
                     code_changed::Bool = true)
-    cfg = write_config!(; server_url, secret, projects_root)
+    cfg = write_config!(; server_url, secret, projects_root, update_spec, auto_update)
 
     mode = run_mode == :prompt ? choose_run_mode() : run_mode
     result = apply_run_mode!(mode; projects_root = abspath(projects_root),
@@ -898,6 +912,7 @@ function start(; force::Bool = false)
         worker_id     = worker_id,
         name          = String(get(config, "name", default_worker_name(worker_id))),
         projects_root = String(get(config, "projects_root", pwd())),
+        update_config = Dict{String,Any}(config),
     )
 end
 
@@ -922,6 +937,9 @@ function connect_and_serve(; server_url::String,
                             mcp_arguments::Vector{String} = mcp_args(launcher),
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             agent_bin::String     = find_agent_bin(),
+                            # `nothing` is the standalone/dev default. Only a real
+                            # installer writes an auto-update-enabled config.
+                            update_config::Union{Dict{String,Any},Nothing} = nothing,
                             retry_delay::Real     = 5.0)
     # Here rather than in `start()`: this is the one function EVERY worker goes
     # through, and `worker_standalone.jl` (the monorepo dev loop and the
@@ -935,7 +953,7 @@ function connect_and_serve(; server_url::String,
     while true
         try
             run_control_session(; server_url, secret, worker_id, name, mcp_command,
-                                  mcp_arguments, projects_root, agent_bin)
+                                  mcp_arguments, projects_root, agent_bin, update_config)
         catch e
             e isa InterruptException && rethrow()
             @error "BonitoWorker: control session crashed; reconnecting" exception=(e, catch_backtrace())
@@ -981,8 +999,145 @@ function send_pong(ws)
     return nothing
 end
 
+# ── Worker self-update ───────────────────────────────────────────────────────
+#
+# The server is the authority for which worker build belongs with its wire
+# protocol. It advertises that build in the authenticated hello acknowledgement;
+# a worker never polls GitHub, nor does it execute a downloaded installer script.
+# The install spec is persisted with the local config so an unchanged server is a
+# cheap string comparison, not a Pkg operation.
+const _AUTO_UPDATE_LOCK = ReentrantLock()
+const _AUTO_UPDATE_TASK = Ref{Union{Task,Nothing}}(nothing)
+const _AUTO_UPDATE_PENDING = Ref(false)
+
+const _UPDATE_SPEC_KEYS = ("repo", "rev", "source_id", "bonito_url", "bonito_rev")
+
+function update_spec_from_wire(x)
+    x isa AbstractDict || return nothing
+    spec = Dict{String,String}()
+    for key in _UPDATE_SPEC_KEYS
+        value = get(x, key, nothing)
+        value isa AbstractString && !isempty(value) || return nothing
+        spec[key] = String(value)
+    end
+    return spec
+end
+
+function configured_update_spec(config::AbstractDict)
+    update_spec_from_wire(get(config, "update_spec", nothing))
+end
+
+auto_update_enabled(config::AbstractDict) = get(config, "auto_update", false) === true
+
+update_needed(config::AbstractDict, target::AbstractDict) =
+    auto_update_enabled(config) && configured_update_spec(config) != target
+
+function worker_idle_for_update()
+    sessions_empty = lock(_SESSION_PROCS_LOCK) do
+        isempty(_SESSION_PROCS)
+    end
+    sessions_empty || return false
+    return lock(_EVAL_HOSTS_LOCK) do
+        isempty(_EVAL_HOSTS)
+    end
+end
+
+function write_update_spec!(config::Dict{String,Any}, target::Dict{String,String})
+    config["update_spec"] = target
+    write(config_path(), JSON.json(config))
+    return nothing
+end
+
+function update_packages!(target::Dict{String,String})
+    # This is intentionally the same package set and resolution policy as the
+    # first-run installer. `add` moves a worker across branches/tags; unscoped
+    # `update` also refreshes transitive registry deps whose compat tightened.
+    Pkg.activate("bonito-agents"; shared = true)
+    specs = [
+        # `source_id` is an immutable reachable commit when the server can
+        # provide one. That makes a worker match the server, rather than racing
+        # ahead to whatever a moving branch points at after the server deployed.
+        Pkg.PackageSpec(name = "RemoteSync", url = target["repo"], subdir = "RemoteSync", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "BonitoWorker", url = target["repo"], subdir = "BonitoWorker", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "BonitoMCP", url = target["repo"], subdir = "BonitoMCP", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "AgentProviders", url = target["repo"], subdir = "AgentProviders", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "Bonito", url = target["bonito_url"], rev = target["bonito_rev"]),
+    ]
+    Pkg.add(specs)
+    Pkg.update()
+    return nothing
+end
+
+function spawn_updated_worker!()
+    project = something(Base.active_project(), "@bonito-agents")
+    cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start(force=true)")`
+    logfile = joinpath(config_dir(), "worker.log")
+    run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true); wait = false)
+    return nothing
+end
+
+function replace_with_updated_worker!()
+    # A systemd-managed worker must be replaced by its unit. Spawning a detached
+    # child here would work once, but leave systemd believing its service exited
+    # cleanly and therefore not start it after the next boot (`Restart=on-failure`).
+    if service_installed() && systemd_user_available()
+        run(`systemctl --user restart $SERVICE_NAME`; wait = false)
+    else
+        spawn_updated_worker!()
+    end
+    return nothing
+end
+
+function run_auto_update!(config::Dict{String,Any}, target::Dict{String,String})
+    # Do not cut an agent or an eval out from underneath a user. Marking the
+    # worker pending also rejects new sessions, so the observed idle state stays
+    # true through the update and replacement.
+    while !worker_idle_for_update()
+        sleep(1)
+    end
+    @info "BonitoWorker: updating to the server's worker build" rev=target["rev"]
+    try
+        update_packages!(target)
+        write_update_spec!(config, target)
+    catch e
+        e isa InterruptException && rethrow()
+        @error "BonitoWorker: automatic update failed; retrying in five minutes" exception=(e, catch_backtrace())
+        lock(_AUTO_UPDATE_LOCK) do
+            _AUTO_UPDATE_PENDING[] = false
+        end
+        # A transient network or registry failure must not turn automatic update
+        # into "wait for the next reconnect". Clear the admission gate first so
+        # the worker remains useful, then make one delayed, coalesced retry.
+        Base.errormonitor(@async begin
+            sleep(300)
+            schedule_auto_update!(config, target)
+        end)
+        return nothing
+    end
+    @info "BonitoWorker: update installed; starting replacement"
+    replace_with_updated_worker!()
+    # The replacement claims the pidfile and reconnects before this process
+    # exits. Background installs need the detached successor explicitly;
+    # systemd installs receive a `systemctl restart` above.
+    exit(0)
+end
+
+function schedule_auto_update!(config::Dict{String,Any}, target_wire; force::Bool = false)
+    target = update_spec_from_wire(target_wire)
+    target === nothing && return nothing       # server predates the feature
+    (force || update_needed(config, target)) || return nothing
+    lock(_AUTO_UPDATE_LOCK) do
+        task = _AUTO_UPDATE_TASK[]
+        task !== nothing && !istaskdone(task) && return nothing
+        _AUTO_UPDATE_PENDING[] = true
+        _AUTO_UPDATE_TASK[] = Base.errormonitor(@async run_auto_update!(config, target))
+    end
+    return nothing
+end
+
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                                mcp_arguments, projects_root, agent_bin,
+                               update_config::Union{Dict{String,Any},Nothing} = nothing,
                                agent_env::Dict{String,String} = Dict{String,String}(),
                                hello_timeout::Real = 30.0)
     control_url = ws_url(server_url, "/worker-ws")
@@ -999,6 +1154,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             "mcp_path"      => mcp_command,
             "mcp_args"      => mcp_arguments,
             "projects_root" => projects_root,
+            "auto_update"   => update_config !== nothing && auto_update_enabled(update_config),
+            "update_spec"   => update_config === nothing ? nothing : configured_update_spec(update_config),
         ))
 
         # The hello/ack exchange is the ONE window with NO watchdog on either
@@ -1031,6 +1188,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             error("server rejected hello: $(get(ack, "error", "unknown"))")
         end
         @info "BonitoWorker: registered with server" name=name
+        update_config === nothing || schedule_auto_update!(update_config, get(ack, "update_spec", nothing))
 
         last_rx  = Ref(time())
         hb_alive = Ref(true)
@@ -1058,7 +1216,15 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             cmd = decode_control(frame)
             t = get(cmd, "type", "")
             if t == "open_session"
-                @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
+                pending_update = lock(_AUTO_UPDATE_LOCK) do
+                    _AUTO_UPDATE_PENDING[]
+                end
+                if pending_update
+                    report_open_session_failed(ws, String(get(cmd, "sid", "")),
+                        "worker is installing a server update; it will reconnect shortly")
+                else
+                    @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
+                end
             elseif t == "close_session"
                 @async handle_close_session(cmd)
             elseif t == "open_transfer"
@@ -1107,6 +1273,9 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_discard_staging(ws, cmd)
             elseif t == "ping"
                 @async send_pong(ws)
+            elseif t == "force_update"
+                update_config === nothing || schedule_auto_update!(update_config,
+                    get(cmd, "update_spec", nothing); force = true)
             else
                 @warn "BonitoWorker: unknown control frame" type=t
             end

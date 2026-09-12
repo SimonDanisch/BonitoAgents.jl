@@ -381,10 +381,20 @@ function handle_worker_control(state::ServerState, ws)
         # worker can arm its own receive-watchdog (no frame for several
         # intervals ⇒ half-open link ⇒ close + re-dial). Workers predating the
         # field simply ignore it.
+        update_spec = current_worker_update_spec()
+        installed_spec = get(hello, "update_spec", nothing)
+        auto_update = get(hello, "auto_update", false) === true
+        update_available = auto_update && installed_spec != update_spec
+        update_message = update_available ?
+            "A worker update is available. It will install when this worker is idle." : ""
         send_control(ws, Dict("ok" => true,
                               "registered_as" => display_name,
                               "worker_id"     => worker_id,
-                              "heartbeat_interval" => state.heartbeat_interval))
+                              "heartbeat_interval" => state.heartbeat_interval,
+                              # Optional to old workers, authoritative to new ones:
+                              # this is the same spec /install.jl would serve, but
+                              # travels over the already authenticated control WS.
+                              "update_spec" => update_spec))
 
         # Build / refresh the WorkerInfo from the hello frame. Preserve a
         # user-set `initials` override across reconnects (the worker doesn't
@@ -411,6 +421,8 @@ function handle_worker_control(state::ServerState, ws)
             String(get(hello, "projects_root", "")),
             online_obs,
             now(UTC),
+            update_available ? :available : :current,
+            update_message,
         )
         # All shared-state writes for this worker's registration go in one
         # critical section so the workers/worker_control_ws/projects tables
@@ -1546,6 +1558,14 @@ function worker_state(state::ServerState, worker_id::AbstractString; timeout::Re
     resp isa AbstractDict || error("worker_state on '$worker_id': unexpected response shape")
     haskey(resp, "error") && error(String(resp["error"]))
     return Dict{String,Any}(resp)
+end
+
+function force_worker_update!(state::ServerState, worker_id::AbstractString)
+    haskey(state.worker_control_ws, String(worker_id)) ||
+        throw(WorkerUnreachableError("force update", "worker is not connected"))
+    send_command(state, String(worker_id), Dict("type" => "force_update",
+                                                 "update_spec" => current_worker_update_spec()))
+    return nothing
 end
 
 """

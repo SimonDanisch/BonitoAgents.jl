@@ -82,7 +82,8 @@ const BASE_CSS = [
         #    active = a turn is in flight (pulses), offline = worker down.
         "--bt-status-online"  => "#16a34a",
         "--bt-status-active"  => "#16a34a",
-        "--bt-status-offline" => "#dc2626"),
+        "--bt-status-offline" => "#dc2626",
+        "--bt-status-update"  => "#f59e0b"),
 
     # ── Reset ────────────────────────────────────────────────────────────────
     # This is a LIGHT app, and it has to SAY so. Without `color-scheme`, a user
@@ -996,6 +997,10 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-dot-online",
         "background" => "var(--bt-status-online)"),
     CSS(".bt-dot-offline", "background" => "var(--bt-status-offline)"),
+    CSS(".bt-dot-update", "background" => "var(--bt-status-update)"),
+    CSS(".bt-worker-update-note",
+        "display" => "block", "margin" => "0 14px 8px", "font-size" => "12px",
+        "color" => "#92400e"),
 
     # (The old `.bt-banner-error` / `.bt-banner-detail` session-ended banner
     # has been removed: the reconnect chip next to the title is the failure
