@@ -89,7 +89,7 @@
     pill_text() = TK.eval_js(s, "(() => { const el = $vis_pill; return el ? (el.textContent || '') : ''; })()")
 
     # Drive the scroll the way the legacy test did: a `wheel` event arms
-    # `_pendingUserScroll`, then setting scrollTop + firing `scroll` makes the
+    # `pendingUserScroll`, then setting scrollTop + firing `scroll` makes the
     # chat's own handler classify it as a user-driven scroll and flip followMode
     # off (it's not at the bottom). This fires the exact DOM events the chat's
     # scroll handler listens on, so it works without the custom pan scroller.

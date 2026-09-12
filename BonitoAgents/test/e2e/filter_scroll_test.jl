@@ -90,7 +90,7 @@
         return probe;
     })()"""
     # On failure, the anchor's own capture decision tells WHICH row it pinned.
-    ANCHOR_DEBUG = "JSON.stringify(($CH)._anchorDebug ?? null)"
+    ANCHOR_DEBUG = "JSON.stringify(($CH).anchorDebug ?? null)"
     # Viewport offset of marker #mk (the reading row), or null if not rendered.
     # The row is pinned at the viewport top by the toggle anchor, so it cannot
     # be virtualized away between the toggle and this probe.

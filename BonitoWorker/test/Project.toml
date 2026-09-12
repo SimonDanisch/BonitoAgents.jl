@@ -1,0 +1,27 @@
+# Dedicated test environment, same pattern as BonitoAgents/test/Project.toml.
+#
+# Without this file `Pkg.test("BonitoWorker")` builds a sandbox from the parent
+# environment and resolves BonitoWorker's own `[sources]` against the ACTIVE
+# project's directory instead of BonitoWorker's — so `../RemoteSync` became
+# `<umbrella>/../RemoteSync` and the run died before a single test with
+# "expected package `RemoteSync` to exist at path /…/RemoteSync". Declaring the
+# test env explicitly makes THESE `[sources]` the ones that decide resolution,
+# and they are written relative to this directory.
+#
+# Scoped to BonitoWorker's real deps plus Test, so it never drags in the
+# umbrella's Makie/Sunny stack.
+[deps]
+BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
+AgentProviders = "c3d4e5f6-7a8b-49c0-b1d2-e3f4a5b6c7d8"
+RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Scratch = "6c6a2e73-6563-6170-7368-637461726353"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+BonitoWorker = {path = ".."}
+AgentProviders = {path = "../../AgentProviders"}
+RemoteSync = {path = "../../RemoteSync"}

@@ -3,6 +3,13 @@ const ASSETS_DIR    = normpath(joinpath(@__DIR__, "..", "assets"))
 # Monorepo root (sibling of BonitoAgents/) — contains BonitoMCP/, BonitoWorker/, AgentClientProtocol/.
 const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
+# The public repository workers are installed from, and the monorepo packages
+# `install.jl` puts into a worker's `@bonito-agents` environment from it (its
+# `SPECS`; keep the two in step). The "Debug BonitoAgents" chat develops these
+# same packages from a clone of this repo on the worker (`ensure_debug_project!`).
+const WORKER_REPO_URL = "https://github.com/SimonDanisch/BonitoAgents.jl"
+const WORKER_REPO_PACKAGES = ["RemoteSync", "BonitoWorker", "BonitoMCP", "AgentProviders"]
+
 # The worker installer is a cross-platform Julia script (`curl … | julia -`).
 # It Pkg.add's BonitoWorker + BonitoMCP from the public GitHub repo into a
 # shared `@bonito-agents` env — no tar bundle, no per-package source trees, runs
@@ -56,7 +63,8 @@ function serve(; host::String        = "0.0.0.0",
                  state_dir::Union{String,Nothing}   = nothing,
                  working_dir::Union{String,Nothing} = nothing,
                  heartbeat_interval::Real = 15.0,
-                 heartbeat_deadline::Real = 45.0)
+                 heartbeat_deadline::Real = 45.0,
+                 log_file::Union{String,Nothing} = nothing)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
     isvalid(s) = s !== nothing && !isempty(String(s))
@@ -64,6 +72,30 @@ function serve(; host::String        = "0.0.0.0",
          joinpath(homedir(), ".local", "share", "bonitoagents-server")
     wd = isvalid(working_dir) ? String(working_dir) :
          joinpath(homedir(), "bonitoagents-server")
+
+    # Start recording our own log output BEFORE anything else can log, so the
+    # debug chat's `bt_dev_logs` sees the whole life of the server rather than
+    # "everything after the first browser connected". Idempotent + process-wide
+    # (the logger is); a second `serve()` in the same process shares the ring.
+    #
+    # The FILE comes first and the ring second: the file is a redirect of fd 1
+    # and 2, so it also catches what never reaches a logger at all — an
+    # `errormonitor` task death, the runtime's fatal-signal thread dump — and it
+    # is the only one of the two that survives the restart you do when a server
+    # hangs.
+    #
+    # OPT-IN, and it defaults OFF on purpose. This REDIRECTS fd 1 and 2, so a
+    # library that did it by default would silently swallow the output of every
+    # caller — a REPL, a script, a test runner (nine unit tests call `serve()`
+    # directly, and the first version of this took their stdout with it). The
+    # SERVER BINARY asks for it; nothing else does. `""` means "the default path
+    # under state_dir".
+    if log_file !== nothing
+        BonitoWorker.start_file_log!(isempty(log_file) ?
+            joinpath(sd, "logs", "server.log") : log_file)
+    end
+    install_log_ring!()
+    SERVER_STARTED[] == 0.0 && (SERVER_STARTED[] = time())
 
     state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret,
                           heartbeat_interval = heartbeat_interval,
@@ -288,6 +320,12 @@ end
 const DOWNLOAD_ROUTE_RE = r"^/download/([A-Za-z0-9_-]+)"
 
 function add_download_routes!(srv::Bonito.Server, state::ServerState)
+    Bonito.route!(srv, r"^/worker-file/([A-Za-z0-9_-]+)(?:$|\?)" => function(context)
+        wid = String(context.match.captures[1])
+        params = HTTP.queryparams(HTTP.URI(context.request.target))
+        worker_file_response(state, context.request, wid,
+            String(get(params, "path", "")), String(get(params, "token", "")))
+    end)
     Bonito.route!(srv, DOWNLOAD_ROUTE_RE => function(context)
         pid    = String(context.match.captures[1])
         params = HTTP.queryparams(HTTP.URI(context.request.target))
@@ -298,6 +336,90 @@ function add_download_routes!(srv::Bonito.Server, state::ServerState)
         params = HTTP.queryparams(HTTP.URI(context.request.target))
         attachment_response(state, pid, String(get(params, "file", "")))
     end)
+end
+
+# These URLs depend only on persisted worker identity, path, and server secret.
+# Signing limits access to files exposed by the UI, including bt_show files
+# outside the project tree. No browser/eval session owns or unregisters them.
+worker_file_token(state::ServerState, worker_id::String, path::String) =
+    bytes2hex(SHA.hmac_sha256(Vector{UInt8}(codeunits(state.worker_secret)),
+        codeunits(JSON.json([worker_id, path]))))
+
+function worker_file_url(state::ServerState, worker_id::String, path::String)
+    token = worker_file_token(state, worker_id, path)
+    return "/worker-file/$(HTTP.escapeuri(worker_id))?path=$(HTTP.escapeuri(path))&token=$token"
+end
+
+# Compatibility for workers predating range reads. Keep a versioned mirror so
+# seeking in a video doesn't copy the whole file again for every Range request.
+function worker_file_copy_response(state::ServerState, request, worker_id::String,
+                                   path::String, info)
+    key = worker_file_token(state, worker_id, path)
+    dst = joinpath(state.state_dir, "worker-files", key, basename(path))
+    dst_lock = lock(state.lock) do
+        get!(ReentrantLock, state.show_fetch_inflight, dst)
+    end
+    return lock(dst_lock) do
+        stamp = (size=info.size, mtime=info.mtime)
+        previous = lock(state.lock) do
+            get(state.show_mirror_stamps, dst, nothing)
+        end
+        if !isfile(dst) || previous != stamp
+            mkpath(dirname(dst))
+            fetch_file_from_worker(state, worker_id, path, dst)
+            after = stat_worker_path(state, worker_id, path)
+            lock(state.lock) do
+                delete!(state.show_mirror_stamps, dst)
+                (size=after.size, mtime=after.mtime) == stamp &&
+                    (state.show_mirror_stamps[dst] = stamp)
+            end
+        end
+        # Mirror mtimes are transfer times. Do not let a browser validate them
+        # at whole-second precision and miss two rapid rewrites of the source.
+        return Bonito.serve_asset(request, nothing, dst,
+                                   string(Bonito.file_mimetype(path)), "no-store")
+    end
+end
+
+function worker_file_response(state::ServerState, request, worker_id::String,
+                              path::String, token::String)
+    isempty(path) && return HTTP.Response(400, "missing path")
+    token == worker_file_token(state, worker_id, path) ||
+        return HTTP.Response(403, "invalid file token")
+    try
+        info = stat_worker_path(state, worker_id, path)
+        info.isfile || return HTTP.Response(404, ["Cache-Control" => "no-store"],
+                                            "file no longer exists on worker")
+        mime = string(Bonito.file_mimetype(path))
+        if !info.range_reads
+            # Workers installed before range reads still work through the existing
+            # transfer protocol. Upgrading them enables seeking without a full copy.
+            return worker_file_copy_response(state, request, worker_id, path, info)
+        end
+        range = Bonito.parse_byte_range(HTTP.header(request, "Range", ""), info.size)
+        if range === nothing && !isempty(HTTP.header(request, "Range", ""))
+            return HTTP.Response(416, ["Content-Range" => "bytes */$(info.size)"])
+        end
+        start, stop = range === nothing ? (0, info.size - 1) : range
+        body = UInt8[]
+        sizehint!(body, stop - start + 1)
+        offset = start
+        while offset <= stop
+            count = min(256 * 1024, stop - offset + 1)
+            bytes = read_worker_file_range(state, worker_id, path, offset, count)
+            length(bytes) == count || error("file changed while reading: $path")
+            append!(body, bytes)
+            offset += count
+        end
+        headers = ["Content-Type" => mime, "Cache-Control" => "no-cache",
+                   "Accept-Ranges" => "bytes", "Content-Length" => string(length(body))]
+        range === nothing || push!(headers, "Content-Range" => "bytes $start-$stop/$(info.size)")
+        return HTTP.Response(range === nothing ? 200 : 206, headers; body)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "worker file: read failed" worker_id path exception = (e, catch_backtrace())
+        return HTTP.Response(502, ["Cache-Control" => "no-store"], "could not read file from worker")
+    end
 end
 
 # /attachment/<pid>?file=<name> — serve a pasted/dropped image from the
@@ -393,9 +515,44 @@ function render_install_script(template::AbstractString,
         "{{SERVER_URL}}"    => public_url,
         "{{WORKER_SECRET}}" => worker_secret,
         "{{REV}}"           => current_repo_rev(),
+        "{{SOURCE_ID}}"     => current_repo_source_id(),
         "{{BONITO_URL}}"    => bonito_url,
         "{{BONITO_REV}}"    => bonito_rev,
     )
+end
+
+# The version identity sent to an installed worker after it authenticates on the
+# control WebSocket. Keep it in terms of source specs, rather than a package
+# version: workers and servers commonly run feature branches where every
+# Project.toml says the same development version.
+function current_worker_update_spec()
+    bonito_url, bonito_rev = current_bonito_install_spec()
+    return Dict(
+        "repo"       => "https://github.com/SimonDanisch/BonitoAgents.jl",
+        "rev"        => current_repo_rev(),
+        "source_id"  => current_repo_source_id(),
+        "bonito_url" => bonito_url,
+        "bonito_rev" => bonito_rev,
+    )
+end
+
+# A branch name cannot tell a worker whether it is on yesterday's `main` or
+# today's. Prefer the server's reachable commit as its update identity and only
+# fall back to the install ref when the deployment is not a usable git checkout.
+function current_repo_source_id()
+    ref = current_repo_rev()
+    pkg = pkgdir(@__MODULE__)
+    pkg === nothing && return ref
+    repo_root = abspath(pkg, "..")
+    ispath(joinpath(repo_root, ".git")) || return ref
+    try
+        sha = strip(read(`git -C $repo_root rev-parse HEAD`, String))
+        return _sha_on_origin(repo_root, sha) ? String(sha) : ref
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "current_repo_source_id: git resolve failed" exception=e
+        return ref
+    end
 end
 
 """
@@ -473,7 +630,8 @@ end
 function _branch_on_origin(path::AbstractString, branch::AbstractString)
     try
         return !isempty(strip(read(`git -C $path ls-remote --heads origin $branch`, String)))
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return false
     end
 end
@@ -484,7 +642,8 @@ end
 function _sha_on_origin(path::AbstractString, sha::AbstractString)
     try
         return !isempty(strip(read(`git -C $path branch -r --contains $sha`, String)))
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return false
     end
 end

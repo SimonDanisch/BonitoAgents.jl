@@ -1,0 +1,248 @@
+# Running Julia on ANOTHER worker, end to end through the real UI:
+#
+#   1. a chat on worker A; worker B joins. `bt_julia_eval(worker = "worker-b")`
+#      is refused while the chat's "remote julia" switch is off — the eval card
+#      still wears the ⇢ worker-b badge (what was asked is visible either way),
+#      and the tool's result tells the agent where the switch is;
+#   2. the switch, an item in the chat's ⋯ menu next to 'Dev mode', is
+#      turned on by the user; the same call now runs on B: the server spawns a
+#      BonitoMCP eval host on worker B for this chat, relays the eval, and the
+#      result names B's worker id (the host's own environment);
+#   3. `bt_julia_list_sessions` lists worker B and its live host;
+#   4. `bt_sync_folder` copies a folder from A to B through the server;
+#   5. switching it off shuts the host down and the refusal is back.
+#
+# Two real worker processes (TestKit's `add_worker!`), the real dev_server, the
+# mock agent only where the agent's decisions would be. ISOLATED: it spawns a
+# second worker, so it gets its own throwaway dev_server + browser.
+@testitem "e2e:remote_eval" tags = [:e2e] begin
+    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+    using .TestKit
+    const TK = TestKit
+    real_eval(code; kw...) = TK.bt_eval(code; real_process = true, kw...)
+    real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
+    import BonitoAgents as BT
+
+    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    card(id) = "$VP?.querySelector('.bt-tool-msg[data-msg-id*=\"$id\"]')"
+    # The tool card for `id` finished (either way) and its body shows `text`.
+    # Bodies render lazily on expand (what a user does to read a result), so a
+    # collapsed finished card is expanded — ONCE, marked on the node: this runs
+    # from a poll, and clicking a second time collapses the card again (and
+    # tears a half-built Monaco editor out of the document under itself).
+    card_shows(id, text) = """(() => {
+        const c = $(card(id)); if (!c) return false;
+        const st = c.querySelector('.bt-tool-status')?.textContent || '';
+        if (!(st === 'completed' || st === 'failed')) return false;
+        const h = c.querySelector('.bt-tool-header');
+        if (h && !c.dataset.probeExpanded) {
+            c.dataset.probeExpanded = '1';
+            if (h.dataset.expanded !== 'true') h.click();
+            return false;
+        }
+        return (c.querySelector('.bt-tool-body')?.innerText || '').includes($(repr(text))); })()"""
+    card_badge(id) = "(() => { const c = $(card(id)); const b = c && c.querySelector('.bt-tool-worker'); return b ? b.textContent : ''; })()"
+    # The switch is a TOGGLE (two states) and it lives in the ⋯ MENU, next to
+    # Dev mode — both are capabilities granted per chat, flipped rarely. So the
+    # test opens the menu first, the way a user reaches it, and reads the state
+    # off the item's own class rather than driving a <select>'s value.
+    remote_item  = "$VP?.querySelector('.bt-header-menu .bt-header-remote')"
+    remote_state = "($(remote_item)?.classList.contains('bt-cap-on') ? 'on' : 'off')"
+    open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bt-menu-trigger'); if(!t) return false; t.click(); return true; })()"
+    menu_open = "$VP?.querySelector('.bt-header-menu')?.classList.contains('bt-menu-open') === true"
+    set_switch(v) = """(() => { const b = $(remote_item); if (!b) return false;
+        const on = b.classList.contains('bt-cap-on');
+        if ((on ? 'on' : 'off') !== $(repr(v))) b.click();
+        return true; })()"""
+
+    server = TK.dev_server(agent = _ -> [TK.end_turn()])
+    try
+        TK.open_browser(server)
+        state = server.h.state
+
+        @testset "remote julia: off by default, on by the header switch" begin
+            # The chat is created while worker A is the only worker (which card
+            # `new_chat` presses "+ Project" on follows the worker list's order).
+            @test TK.wait_for(server, "worker A online",
+                "(() => { const m = document.body.innerText.match(/(\\d+)\\s*\\/\\s*\\d+\\s*workers online/); return m && parseInt(m[1]) >= 1; })()";
+                timeout = 20) == true
+            cwd = mkpath(joinpath(mktempdir(), "remoteproj"))
+            pid = TK.new_chat(server; cwd = cwd)
+            p = state.projects[][pid]
+            worker_b_proc = TK.add_worker!(server; name = "worker-b")
+            t0 = time()
+            while time() - t0 < 30 &&
+                  !any(w -> w.name == "worker-b" && w.online[], values(state.workers[]))
+                sleep(0.1)
+            end
+            worker_b = only(w for w in values(state.workers[]) if w.name == "worker-b")
+            @test worker_b.online[]
+
+            # ── 1. off by default ────────────────────────────────────────────
+            @test TK.wait_for(server, "the ⋯ menu offers the switch, off",
+                "$(remote_state) === 'off'"; timeout = 30) == true
+            @test p.remote_eval === false
+            server.agent_fn[] = _ -> [real_eval("1 + 1"; worker = "worker-b", id = "re-off"),
+                                      TK.end_turn()]
+            TK.send_message(server, "try it on worker-b")
+            @test TK.wait_for(server, "the card wears the worker badge",
+                "$(card_badge("re-off")).includes('worker-b')"; timeout = 60) == true
+            @test TK.wait_for(server, "refused while off, saying where the switch is",
+                card_shows("re-off", "switched OFF"); timeout = 60) == true
+            # The refusal names the chat the SERVER resolved, not just "this
+            # chat". Several chats can be open on one folder, each with its own
+            # switch; without the id, "the header says on but the agent says
+            # off" sends you to the right switch on the wrong chat.
+            @test TK.eval_js(server, card_shows("re-off", pid)) == true
+            @test isempty(state.eval_hosts)
+
+            # ── 2. the user switches it on; the eval runs on B ───────────────
+            # Stamp the item first. `state.projects` notifies on every sync,
+            # save and heartbeat, and the switch used to be a `DOM.button`
+            # REBUILT inside `map(session, state.projects)` — so each notify
+            # replaced the node and the click could end up bound to an orphaned
+            # element, doing nothing in EITHER direction. (The restart button a
+            # few lines above it in chat.jl carries a comment about exactly this
+            # failure.) The fix is one stable element whose `class` is the only
+            # thing an Observable drives, so this asserts identity: the node the
+            # user clicks after N notifies is the node that was wired.
+            # No need to open the menu: the item is in the DOM either way, the
+            # menu only hides it. (Opening it here to stamp, then clicking the
+            # trigger again to close, raced the open below.)
+            @test TK.eval_js(server,
+                "(() => { const b = $(remote_item); if (!b) return false; " *
+                "b.dataset.btProbe = 'stamped'; return true; })()") == true
+
+            @test TK.eval_js(server, open_menu) == true
+            @test TK.wait_for(server, "the ⋯ menu is open", menu_open; timeout = 10) == true
+            @test TK.eval_js(server, set_switch("on")) == true
+            # Picking an item closes the menu — that is the contract every other
+            # item in this list follows, and a switch that left it hanging open
+            # would be the odd one out.
+            @test TK.wait_for(server, "the menu closed on pick",
+                "!($(menu_open))"; timeout = 10) == true
+            t0 = time()
+            while !p.remote_eval && time() - t0 < 10; sleep(0.05); end
+            @test p.remote_eval === true
+
+            # The click carries an INTENT, not a direction. It used to bake
+            # `on`/`off` into the handler at RENDER time, and `state.projects`
+            # notifies on every sync and heartbeat — so a node could carry a
+            # direction computed from a reading that had since changed, and
+            # "turn it on" sent "off". Two BLIND clicks (no reading of the
+            # rendered state at all) must therefore land back where they
+            # started; with a baked direction they could both send the same
+            # absolute value and stick.
+            for _ in 1:2
+                @test TK.eval_js(server, open_menu) == true
+                @test TK.wait_for(server, "menu open for a blind click",
+                    menu_open; timeout = 10) == true
+                @test TK.eval_js(server, "$(remote_item).click(); true") == true
+                sleep(0.4)
+            end
+            t0 = time()
+            while !p.remote_eval && time() - t0 < 10; sleep(0.05); end
+            @test p.remote_eval === true
+            @test TK.wait_for(server, "and the item still reads on",
+                "$(remote_state) === 'on'"; timeout = 10) == true
+            # …and it is the SAME element throughout. A rebuilt node would have
+            # lost the stamp — and with it, the live click binding.
+            @test TK.eval_js(server, "$(remote_item)?.dataset.btProbe") == "stamped"
+            @test TK.wait_for(server, "the switch reads on",
+                "$(remote_state) === 'on'"; timeout = 10) == true
+            server.agent_fn[] = _ -> [real_eval(
+                "string(\"host=\", get(ENV, \"BONITOAGENTS_EVAL_HOST_WORKER\", \"none\"))";
+                worker = "worker-b", id = "re-on"), TK.end_turn()]
+            TK.send_message(server, "now for real")
+            # First use spawns the host on B and waits for it to dial back (a
+            # julia start + `using BonitoMCP`), then starts an eval worker there
+            # and runs the eval. The budget has to clear the SERVER's own bound
+            # for that — `EVAL_HOST_SPAWN_TIMEOUT_S` (180 s) plus the eval — or a
+            # slow machine reads as a product failure.
+            @test TK.wait_for(server, "the eval ran on worker B",
+                card_shows("re-on", "host=" * worker_b.worker_id); timeout = 420) == true
+            @test TK.eval_js(server, card_badge("re-on")) == "⇢ worker-b"
+            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
+            @test all(last(pair) isa BT.WorkerMCPChannel for pair in BT.eval_hosts_of(state, pid))
+            @test length(BT.eval_hosts_of(state, pid)) == 1
+            @test first(BT.eval_hosts_of(state, pid))[1] == worker_b.worker_id
+
+            # ── 3. the listing names B and its live host ─────────────────────
+            server.agent_fn[] = _ -> [real_call("bt_julia_list_sessions"; id = "re-list"),
+                                      TK.end_turn()]
+            TK.send_message(server, "what do we have")
+            @test TK.wait_for(server, "the listing names worker-b's host",
+                card_shows("re-list", "eval host running"); timeout = 60) == true
+            @test TK.eval_js(server, card_shows("re-list", "worker-b")) == true
+
+            # Checkpoint and interruption must use the same relayed host and
+            # leave its Julia state usable afterwards.
+            server.agent_fn[] = _ -> [real_eval("relay_value = 41; sleep(60); relay_value";
+                worker = "worker-b", timeout = 0.1, id = "re-running"), TK.end_turn()]
+            TK.send_message(server, "start a long remote eval")
+            @test TK.wait_for(server, "remote eval checkpoint",
+                card_shows("re-running", "still running"); timeout = 60) == true
+            # Eager expansion and the fast checkpoint must share one body
+            # mount, including while the first render is still in flight.
+            renders = BT.shared(state.chat_models[pid]).tool_renders
+            @test [generation[] for (key, (_, generation)) in renders
+                   if occursin("re-running", key)] == [1]
+            server.agent_fn[] = _ -> [real_call("bt_julia_interrupt";
+                worker = "worker-b", id = "re-interrupt"), TK.end_turn()]
+            TK.send_message(server, "interrupt the remote eval")
+            @test TK.wait_for(server, "remote interrupt result",
+                card_shows("re-interrupt", "InterruptException"); timeout = 60) == true
+            server.agent_fn[] = _ -> [real_eval("relay_value + 1";
+                worker = "worker-b", id = "re-after-interrupt"), TK.end_turn()]
+            TK.send_message(server, "reuse the remote session")
+            @test TK.wait_for(server, "remote state survived interruption",
+                card_shows("re-after-interrupt", "42"); timeout = 60) == true
+
+            # ── 4. a folder travels A → B ────────────────────────────────────
+            src = mkpath(joinpath(mktempdir(), "payload"))
+            write(joinpath(src, "hello.txt"), "from A\n")
+            mkpath(joinpath(src, "deep")); write(joinpath(src, "deep", "n.txt"), "nested\n")
+            dst = BT.worker_join(worker_b.projects_root, "payload-on-b")
+            server.agent_fn[] = _ -> [real_call("bt_sync_folder"; id = "re-sync",
+                                                  src = src, worker = "worker-b", dst = dst),
+                                      TK.end_turn()]
+            TK.send_message(server, "ship the folder")
+            @test TK.wait_for(server, "the folder synced",
+                card_shows("re-sync", "synced"); timeout = 120) == true
+            @test read(joinpath(dst, "hello.txt"), String) == "from A\n"
+            @test read(joinpath(dst, "deep", "n.txt"), String) == "nested\n"
+
+            old_channel = BT.mcp_ctrl_for(state, pid)
+            BT.restart_chat_session!(state.chat_models[pid])
+            server.agent_fn[] = _ -> [real_eval("6 * 7";
+                worker = "worker-b", id = "re-resumed"), TK.end_turn()]
+            TK.send_message(server, "remote eval after resuming the agent")
+            @test TK.wait_for(server, "resumed agent launches a working MCP",
+                card_shows("re-resumed", "42"); timeout = 120) == true
+            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
+            @test BT.mcp_ctrl_for(state, pid) !== old_channel
+
+            # ── 5. off again: the host goes, the refusal is back ─────────────
+            @test TK.eval_js(server, open_menu) == true
+            @test TK.wait_for(server, "the ⋯ menu is open again", menu_open; timeout = 10) == true
+            @test TK.eval_js(server, set_switch("off")) == true
+            t0 = time()
+            while (p.remote_eval || !isempty(BT.eval_hosts_of(state, pid))) && time() - t0 < 30
+                sleep(0.1)
+            end
+            @test p.remote_eval === false
+            @test isempty(BT.eval_hosts_of(state, pid))
+            server.agent_fn[] = _ -> [real_eval("1 + 1"; worker = "worker-b", id = "re-off2"),
+                                      TK.end_turn()]
+            TK.send_message(server, "and now?")
+            @test TK.wait_for(server, "refused again",
+                card_shows("re-off2", "switched OFF"); timeout = 60) == true
+
+            kill(worker_b_proc)
+        end
+
+        @test isempty(TK.js_errors(server))
+    finally
+        close(server)
+    end
+end

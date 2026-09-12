@@ -24,6 +24,7 @@ const REPO   = "https://github.com/SimonDanisch/BonitoAgents.jl"
 # feature branch can `curl … | sh` workers onto the same code without
 # users needing to know its name. See server.jl :: current_repo_rev.
 const REV    = "{{REV}}"
+const SOURCE_ID = "{{SOURCE_ID}}"
 const SERVER = "{{SERVER_URL}}"
 const SECRET = "{{WORKER_SECRET}}"
 # Bonito (the UI / proxy library) is pinned to the SERVER's version so
@@ -36,7 +37,7 @@ const BONITO_REV = "{{BONITO_REV}}"
 # Guard against running the raw template (the `{{ }}` are intact only if this
 # file wasn't fetched through the server's rendering route).
 if startswith(SERVER, "{{") || startswith(SECRET, "{{") ||
-        startswith(REV, "{{") || startswith(BONITO_URL, "{{") ||
+        startswith(REV, "{{") || startswith(SOURCE_ID, "{{") || startswith(BONITO_URL, "{{") ||
         startswith(BONITO_REV, "{{")
     error("install.jl must be fetched from a running BonitoAgents server: " *
           "`curl -fsSL <server-url>/install.jl | julia -`")
@@ -93,7 +94,10 @@ end
 # Pkg does NOT consult a dependency package's own `[sources]`, so we add
 # RemoteSync explicitly (url+subdir) — that puts it in the env, and
 # BonitoWorker's `[deps] RemoteSync` then resolves against it by UUID.
-# All three come from the same repo/rev so they resolve as one set.
+# All three come from the same repo/rev so they resolve as one set. The
+# monorepo packages listed here are what the "Debug BonitoAgents" chat later
+# `Pkg.develop`s from a clone on the worker — keep the list in step with
+# `WORKER_REPO_PACKAGES` in BonitoAgents/src/server.jl.
 println("\n==> Installing into shared @bonito-agents env")
 Pkg.activate("bonito-agents"; shared = true)
 const SPECS = [
@@ -111,6 +115,13 @@ const SPECS = [
 # both — `add` for the fresh-install path, `update` to force a refresh on
 # re-install. Without the explicit `update` the installer silently keeps the
 # user on the manifest's frozen sha forever.
+#
+# The update is UNSCOPED on purpose. Passing `SPECS` only re-pins those
+# packages and whatever their resolve drags along, so a registry dep the env
+# already holds stays frozen even when it should move — including when a
+# dependency tightens its compat (Bonito requiring CommonMark 1.0.4 is what
+# surfaced this). An installer's job is to leave the env current, so update
+# the whole thing.
 function _tree_shas()
     deps = Pkg.dependencies()
     Dict(p.name => p.tree_hash for p in values(deps)
@@ -118,7 +129,7 @@ function _tree_shas()
 end
 before = _tree_shas()
 Pkg.add(SPECS)        # idempotent: handles the fresh-install path
-Pkg.update(SPECS)     # forces a re-pin against `rev`'s current HEAD
+Pkg.update()          # whole env: re-pins `rev` HEADs AND moves registry deps
 Pkg.precompile()
 after = _tree_shas()
 
@@ -140,4 +151,9 @@ import BonitoWorker
 BonitoWorker.install!(; server_url    = SERVER,
                          secret        = SECRET,
                          projects_root = pwd(),
+                         update_spec   = Dict("repo"       => REPO,
+                                              "rev"        => REV,
+                                              "source_id"  => SOURCE_ID,
+                                              "bonito_url" => BONITO_URL,
+                                              "bonito_rev" => BONITO_REV),
                          code_changed  = code_changed)

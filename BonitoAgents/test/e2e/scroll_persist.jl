@@ -90,8 +90,8 @@ function run_suite(server)
             TK.eval_js(server, """(() => {
                 const c = document.querySelector('.bt-messages').__bt_chat;
                 c.setFollowMode(false);
-                if (c._cancelPendingScroll) c._cancelPendingScroll();
-                c._lastUserInputT = performance.now();
+                if (c.cancelPendingScroll) c.cancelPendingScroll();
+                c.lastUserInputT = performance.now();
                 c.container.scrollTop = 200;
                 return true; })()""")
             sleep(0.4)   # let the park's own scroll event settle
@@ -99,7 +99,7 @@ function run_suite(server)
             # Arm the NEXT scroll event (the imminent display:none collapse) as
             # user-driven — deterministic regardless of nav round-trip latency,
             # which is exactly the condition under which the bug bites.
-            TK.eval_js(server, "document.querySelector('.bt-messages').__bt_chat._pendingUserScroll = true")
+            TK.eval_js(server, "document.querySelector('.bt-messages').__bt_chat.pendingUserScroll = true")
             # Switch away (dashboard) and back through the real nav path.
             TK.to_dashboard(server)
             TK.open_chat(server, pid)
@@ -149,15 +149,15 @@ function run_suite(server)
             for y in 312:14:520; pd("pointermove", y); sleep(0.01); end
             pd("pointerup", 520)
             momentum = TK.eval_js(server, """(()=>{const ch=document.querySelector($(repr(sel))).__bt_chat;
-                return ch._momentumRaf!==null || ch._springRaf!==null;})()""")
+                return ch.momentumRaf!==null || ch.springRaf!==null;})()""")
             @test momentum === true                       # the fling engaged the pan momentum
             TK.to_dashboard(server)                        # hide mid-fling → onHidden
             sleep(0.1)
             # The fix: onHidden cancelled both rAFs (none left mutating scrollTop on
             # the hidden pane) and froze a non-top saved position.
             @test TK.eval_js(server, """(() => { const ch=document.querySelector($(repr(sel))).__bt_chat;
-                return ch._momentumRaf===null && ch._springRaf===null; })()""") === true
-            @test TK.eval_js(server, "Math.round(document.querySelector($(repr(sel))).__bt_chat._savedScrollTop)") > 100
+                return ch.momentumRaf===null && ch.springRaf===null; })()""") === true
+            @test TK.eval_js(server, "Math.round(document.querySelector($(repr(sel))).__bt_chat.savedScrollTop)") > 100
             TK.open_chat(server, pid); sleep(0.3)
             TK.eval_js(server, "(() => { const c=document.querySelector($(repr(sel))).__bt_chat; c.setFollowMode(true); c.scrollToBottom(); return true; })()")
             sleep(0.2)

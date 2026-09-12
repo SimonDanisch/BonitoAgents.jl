@@ -10,12 +10,12 @@
 # frames; the chat renders them through its standard `bt_julia_eval`
 # path (the one that produces collapsible Code/Output sub-sections).
 #
-# The "tmp env with the correct package versions" goal lands here too:
-# each test creates its own `mktempdir()` Project and asserts that
-# `bt_eval` ran INSIDE that project, not in the test process's session.
+# The "env with the correct package versions" goal lands here too: the
+# testsets run in the COMMITTED `test/evalenv` / `test/altenv` projects (see
+# EVALENV/ALTENV below) and assert that `bt_eval` ran INSIDE the project it was
+# handed, not in the test process's session.
 
 using Test, JSON
-using Bonito           # test dep — used to locate the RESOLVED v5 Bonito source
 include(joinpath(@__DIR__, "testkit", "TestKit.jl"))
 import .TestKit
 const TK = TestKit
@@ -25,28 +25,26 @@ const SHOT_DIR = joinpath(tempdir(), "bt-eval-e2e")
 mkpath(SHOT_DIR)
 shot(name) = joinpath(SHOT_DIR, name)
 
-# The committed eval test env (dev Bonito via [sources]) — REQUIRED for any
+# The committed eval test envs (dev Bonito via [sources]) — REQUIRED for any
 # testset asserting the LIVE result embed: a fresh empty project resolves a
 # pre-v5 Bonito, the bridge gate skips setup, and contract v3 then has no
 # descriptor — the result is the REPL-style echo in Output instead.
+#
+# Every testset here uses one of these two; nothing builds a project at runtime.
+# `mktempdir` envs cost this suite twice over: they resolved whatever the
+# machine's global `@v#.#` env held (a registered Bonito v4 → no bridge → every
+# embed "(result not live — worker gone and no snapshot)"), and they paid a cold
+# precompile on first touch, which turned the same assertions into timeouts on a
+# cold depot and passes on a warm one. Committed env + warmup (runtests.jl) is
+# the STRICT e2e policy, and it is also just faster: one warm worker per env,
+# reused across every testset here AND `e2e:bt_eval_types`.
+#
+# ALTENV exists solely so the env_path-isolation testset has a SECOND env. Its
+# path must not contain EVALENV's and vice versa — `!occursin(pA, bodyB)` would
+# be a false failure if one were a prefix of the other, which is why it is
+# `altenv` and not `evalenv2`.
 const EVALENV = abspath(joinpath(@__DIR__, "evalenv"))
-
-# Create a tmp project directory with a fresh, empty Project.toml. No
-# package deps → no Pkg.instantiate needed → fast. The `Base.active_project()`
-# probe below proves bt_eval is honoring the env_path.
-function fresh_project(name::AbstractString)
-    d = mktempdir(; prefix = "bt-eval-env-$(name)-")
-    open(joinpath(d, "Project.toml"), "w") do io
-        write(io, """
-        name = "$(name)"
-        uuid = "$(string(Base.UUID(rand(UInt128))))"
-        version = "0.0.1"
-
-        [deps]
-        """)
-    end
-    return d
-end
+const ALTENV  = abspath(joinpath(@__DIR__, "altenv"))
 
 # ── Tool-message DOM probe ─────────────────────────────────────────────────
 # After bt_eval lands, the chat renders a `bt_julia_eval` tool message
@@ -72,8 +70,25 @@ function probe(s)
     })()""")
 end
 
+# Poll a JS predicate WITHOUT throwing on timeout. The eval body mounts live over
+# the bridge (worker round-trip), so reading it after a fixed sleep is a race;
+# but a throwing `wait_for` would swallow the DOM in its timeout message, and the
+# body text is exactly what distinguishes "(result not live …)" from a wrong
+# value. Poll here, assert (and report) at the call site.
+function settle(s, predicate; timeout = 30)
+    t0 = time()
+    while time() - t0 < timeout
+        TK.eval_js(s, predicate) === true && return true
+        sleep(0.25)
+    end
+    return false
+end
+
+body_shows(text) = "(document.querySelector('.bt-tool-msg .bt-tool-body')?.innerText || '')" *
+                   ".includes(" * TK.json(text) * ")"
+
 @testset "bt_eval e2e — runs a simple expression and renders the result" begin
-    project = fresh_project("simple")
+    project = EVALENV   # body asserts the rendered result → needs the bridge
     @info "project env" project
 
     s = TK.dev_server(; agent = msg -> [
@@ -96,7 +111,7 @@ end
 
         # Expand the tool body so the Code/Output collapsibles render.
         TK.click(s, ".bt-tool-msg .bt-tool-header")
-        sleep(1.5)
+        settle(s, body_shows("42"))
 
         snap = probe(s)
         @info "DOM after bt_eval" snap
@@ -294,9 +309,11 @@ end
 
         # (4) The completed Output section is the SAME pin_end console in
         # SUMMARY state — scrollbar, capped to ~4 lines. Clicking its HEADER
-        # cycles the three states: summary → collapsed → full → summary. Each
-        # state has its OWN distinct disclosure marker (▸ collapsed, ▿ summary,
-        # ▾ full) so all three are visually distinguishable.
+        # cycles the three states: summary → full → collapsed → summary. The
+        # first click UNCAPS, because that is what someone looking at a 4-line
+        # window of a longer log wants; hiding it altogether is the second.
+        # Each state has its OWN distinct disclosure marker (▸ collapsed,
+        # ▿ summary, ▾ full) so all three are visually distinguishable.
         marker = () -> TK.eval_js(s,
             "getComputedStyle(($out_sec).querySelector('.bt-subsection-summary'), '::before').content")
         @test TK.wait_for(s, "Output section done: summary state, pinned console",
@@ -306,20 +323,20 @@ end
                           d.hasAttribute('open') && b.offsetHeight <= 110); })()""";
             timeout = 30) == true
         @test occursin("▿", marker())          # summary marker
-        # Cycle 1: summary → collapsed (header click; body hidden).
-        TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
-        @test TK.wait_for(s, "cycled to collapsed",
-            "!(($out_sec).hasAttribute('open'))"; timeout = 5) == true
-        @test occursin("▸", marker())          # collapsed marker (distinct)
-        # Cycle 2: collapsed → full (body back, taller than the summary cap).
+        # Cycle 1: summary → full (body uncapped, taller than the summary cap).
         TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
         @test TK.wait_for(s, "cycled to full (uncapped)",
             """(() => { const d = $out_sec;
                 return !!(d.hasAttribute('open') && d.dataset.state === 'full' &&
                     d.querySelector('.bt-subsection-body').offsetHeight > 110); })()""";
             timeout = 5) == true
-        @test occursin("▾", marker())          # full marker (distinct from the other two)
-        # Cycle 3: full → summary (back to the ~4-line window).
+        @test occursin("▾", marker())          # full marker (distinct)
+        # Cycle 2: full → collapsed (header click; body hidden).
+        TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
+        @test TK.wait_for(s, "cycled to collapsed",
+            "!(($out_sec).hasAttribute('open'))"; timeout = 5) == true
+        @test occursin("▸", marker())          # collapsed marker (distinct from the other two)
+        # Cycle 3: collapsed → summary (back to the ~4-line window).
         TK.eval_js(s, "($out_sec).querySelector('.bt-subsection-summary').click(); true")
         @test TK.wait_for(s, "cycled back to summary",
             """(() => { const d = $out_sec;
@@ -436,15 +453,15 @@ end
 end
 
 @testset "bt_eval e2e — env_path isolation: two projects, separate sessions" begin
-    # Two independent tmp projects. Run `Base.active_project()` in each
-    # via bt_eval. The output for each must point at its OWN tmp project,
-    # proving the env_path is honored end-to-end (not "all eval runs in
-    # the test process's project"). This is the regression the user asked
-    # for under "tmp env with correct package versions" — env_path
-    # leaking would make e.g. `pkgversion(Bonito)` return the
-    # development version when the user expected the registered one.
-    pA = fresh_project("envA")
-    pB = fresh_project("envB")
+    # Two independent projects. Run `Base.active_project()` in each via
+    # bt_eval. The output for each must point at its OWN project, proving the
+    # env_path is honored end-to-end (not "all eval runs in the test process's
+    # project"). This is the regression the user asked for under "tmp env with
+    # correct package versions" — env_path leaking would make e.g.
+    # `pkgversion(Bonito)` return the development version when the user
+    # expected the registered one.
+    pA = EVALENV
+    pB = ALTENV
 
     s = TK.dev_server(; agent = msg -> begin
         # Choose env based on the user's message. The test sends two
@@ -472,7 +489,8 @@ end
                     timeout = 60)
         sleep(0.5)
         TK.click(s, ".bt-tool-msg[data-msg-id*=\"teA\"] .bt-tool-header")
-        sleep(1.5)
+        settle(s, "(document.querySelector('.bt-tool-msg[data-msg-id*=\"teA\"] .bt-tool-body')?.innerText || '')" *
+                  ".includes(" * TK.json(pA) * ")")
 
         bodyA = TK.eval_js(s, """document.querySelector('.bt-tool-msg[data-msg-id*="teA"] .bt-tool-body')?.innerText || ''""")
         @info "envA body" bodyA
@@ -487,7 +505,8 @@ end
                     timeout = 60)
         sleep(0.5)
         TK.click(s, ".bt-tool-msg[data-msg-id*=\"teB\"] .bt-tool-header")
-        sleep(1.5)
+        settle(s, "(document.querySelector('.bt-tool-msg[data-msg-id*=\"teB\"] .bt-tool-body')?.innerText || '')" *
+                  ".includes(" * TK.json(pB) * ")")
 
         bodyB = TK.eval_js(s, """document.querySelector('.bt-tool-msg[data-msg-id*="teB"] .bt-tool-body')?.innerText || ''""")
         @info "envB body" bodyB
@@ -501,33 +520,8 @@ end
     end
 end
 
-# A tmp project that pins the dev Bonito so the eval worker can render the
-# result to a LIVE fragment (`render_eval_html`). Pre-instantiated (the worker
-# does NOT auto-instantiate) — Bonito is already precompiled in the depot, so
-# this resolves fast.
-function bonito_project()
-    d = mktempdir(; prefix = "bt-eval-bonito-")
-    bonito = pkgdir(Bonito)   # the v5 source the test env actually resolved (sandbox-safe)
-    open(joinpath(d, "Project.toml"), "w") do io
-        write(io, """
-        name = "btbon"
-        uuid = "$(string(Base.UUID(rand(UInt128))))"
-        version = "0.0.1"
-
-        [deps]
-        Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
-
-        [sources]
-        Bonito = {path = "$bonito"}
-        """)
-    end
-    run(pipeline(`$(Base.julia_cmd()) --project=$d -e "import Pkg; Pkg.instantiate()"`;
-                 stdout = devnull, stderr = devnull))
-    return d
-end
-
 @testset "bt_eval e2e — rich result renders as a LIVE Bonito fragment (not text fallback)" begin
-    project = bonito_project()
+    project = EVALENV   # LIVE fragment asserted → needs the bridge
     @info "bonito project env" project
     s = TK.dev_server(; agent = msg -> [
         text("rendering it live"),
@@ -571,7 +565,7 @@ end
 # now via the plain bt_julia_eval render path. `$(obs)` must reach the test source
 # as a literal `$` (escaped) so it's Bonito JS interpolation, not Julia's.
 @testset "bt_eval e2e — INTERACTIVE result is live over the eval bridge" begin
-    project = bonito_project()
+    project = EVALENV   # interactivity rides the bridge → needs the bridge
     # Mirror app_interactive.jl's proven pattern: the displayed value is a Julia
     # `map` over a click counter, computed IN THE WORKER (7×clicks). The onclick
     # only bumps the raw counter; "C=7" can ONLY appear if the click round-tripped

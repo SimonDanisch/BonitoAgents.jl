@@ -50,7 +50,8 @@ checkpoint entirely.
 ### The result is the live value
 
 Whatever the eval returns is rendered into the chat as a **live embed**, not a
-text repr. A number, an array, a `DataFrame`, an image, and, crucially, a
+text repr. A string (with its line breaks kept), a number, an array, a
+`DataFrame`, an image, and, crucially, a
 Bonito `App` or a WGLMakie figure, which stay *interactive*: a slider drag or a
 button click round trips to the Julia object still living in the worker's
 session. The value is held in the worker and rendered on demand
@@ -98,15 +99,61 @@ enforces hygiene instead:
 The agent sees what it needs, and a stray `rand(10_000, 10_000)` cannot blow up
 the context window.
 
+### Running on another worker
+
+```
+bt_julia_eval(code; worker = "MacBook", env_path?, timeout?, …)
+bt_sync_folder(src, worker; dst?)
+```
+
+Every eval-family tool takes a `worker`: the display name of another online
+worker. The call then runs there instead of on the chat's own worker, in that
+machine's own sessions (its own `env_path`s and state; `bt_julia_continue`,
+`bt_julia_interrupt` and `bt_julia_restart` address them with the same
+argument). Under the hood the chat's MCP asks the server, the server spawns a
+BonitoMCP *eval host* on the other worker for this chat (once; it lives as long
+as the chat's session), and relays the call. The card in the chat wears a filled
+**⇢ MacBook** badge next to the tool name, its live stdout streams in as usual,
+and a returned plot or app renders live over the same bridge. One caveat there:
+a chat holds one live-render bridge, so alternating live values between two
+machines retires the older embed each time (text results, streaming and the rest
+are unaffected).
+
+This is **off by default**. The chat header has a *remote julia* pill next to
+the permissions pill; the server enforces it at relay time, so switching it on
+needs no restart, and switching it off ends the chat's evals on other machines.
+While it is off a call with `worker` fails and tells the agent where the switch
+is. `bt_julia_list_sessions` lists the other workers (and their live sessions)
+so the agent can find the names.
+
+The other machine has its own filesystem: `bt_sync_folder` copies a folder from
+the chat's worker to the target (through the server's mirror, so a second call
+only moves what changed) — the project, its `Project.toml`/`Manifest.toml`, the
+data. It needs the same switch.
+
 ## `bt_show`, a file into the chat
 
-`bt_show(path)` renders a worker-side file into the transcript: images and
-videos inline (click for a lightbox), text files as syntax-highlighted code.
+`bt_show(path)` renders a worker-side file into the transcript, as whatever the
+file is: images and video inline (click for a lightbox), audio with a player,
+markdown rendered, CSV as a sortable table, notebooks with their outputs, 3D
+geometry (`.obj`/`.stl`/`.ply`/`.glb`/`.gltf`) in an interactive view, PDF in the
+browser's own viewer, HTML in a sandboxed frame, source as syntax-highlighted
+code, and opaque bytes as a hex dump. These are the same renderers you get when you open the file as a tab,
+so a file looks the same whichever way you reached it.
+
 `bt_julia_eval` already auto-saves rich values (Makie / Plots figures, color
 matrices) to `<env>/.bonitoAgents/show/` and reports the path, so the usual flow
 is: eval a figure, then `bt_show` its path when the user should see the picture
-rather than interact with it. The file is fetched from the worker on demand, so
-a plot the agent just wrote to `/tmp/plot.png` shows up seconds later.
+rather than interact with it. The file is fetched from the worker on demand — and
+re-fetched exactly when the worker's copy changed, so re-rendering a plot to the
+same `/tmp/plot.png` shows the NEW picture, not the one from the first `bt_show`.
+
+Media URLs refer to the worker's disk path and survive closing or reloading a
+chat, even when the output was never viewed. Serving a file does not require a
+live Julia evaluation session. Keep the source file on disk and the worker
+connected; `bt_show` is a view of that file, not an archived snapshot. Updated
+workers support byte-range reads for seeking; older workers transfer the file
+to the server first.
 
 ## Live apps, from one returned value
 

@@ -13,7 +13,12 @@
 
 using Test
 import BonitoAgents
-meaningful_title(x) = BonitoAgents.meaningful_title(x)
+import AgentProviders
+# The stripping itself now lives in `AgentProviders.meaningful_prompt` (shared
+# with the worker, dispatched per provider) and is covered by that package's
+# tests; `meaningful_title` is the server's presentation layer on top of it.
+# These prompts are Claude's wrappers, so bind the provider once here.
+meaningful_title(x) = BonitoAgents.meaningful_title(AgentProviders.ClaudeCodeAgent(), x)
 
 @testset "meaningful_title — strips claude-agent-acp wrappers" begin
 

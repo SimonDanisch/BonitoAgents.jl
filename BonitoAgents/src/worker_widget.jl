@@ -8,35 +8,55 @@ mutable struct WorkerCard
     worker_id        :: String          # KeyedList key
     error_obs        :: Observable{String}
     picker_state     :: Observable{String}    # worker_id of the open picker
+    gh_state         :: Observable{String}    # worker_id of the open GitHub form
     discover_state   :: Observable{String}    # worker_id of the open panel
     busy             :: Observable            # BUSY_IDLE-shape NamedTuple
     discover_busy    :: Observable{Bool}
     discover_results :: Observable{Vector{Dict{String,Any}}}
     do_import        :: Function
+    do_github        :: Function
     trigger_scan     :: Function
     remote_picker    :: RemoteFolderPicker
     name_obs         :: Observable{String}
     initials_obs     :: Observable{String}
 end
 
+# Where the folder picker should open for `worker_id`: the worker's own working
+# directory, which it reports as `projects_root` (BonitoWorker defaults it to the
+# `pwd()` the operator installed from). That is the folder the user thinks of as
+# "where my projects are" — the picker used to open at the worker's $HOME
+# instead, which on a machine that keeps its code elsewhere meant browsing down
+# from `/home/<user>` on every single create.
+#
+# "" if the worker hasn't said hello yet; `list_dir` reads that as $HOME, which
+# is the only sensible fallback when we don't know any better.
+function worker_start_dir(state::ServerState, worker_id::AbstractString)
+    w = get(state.workers[], String(worker_id), nothing)
+    w === nothing && return ""
+    return normalize_worker_path(w.projects_root)
+end
+
 function WorkerCard(state::ServerState, worker_id::AbstractString;
                      error_obs::Observable{String},
                      picker_state::Observable{String},
+                     gh_state::Observable{String},
                      discover_state::Observable{String},
                      busy::Observable,
                      discover_busy::Observable{Bool},
                      discover_results::Observable{Vector{Dict{String,Any}}},
                      do_import::Function,
+                     do_github::Function,
                      trigger_scan::Function)
     w0 = get(state.workers[], worker_id, nothing)
     initial_name     = w0 === nothing ? worker_id : w0.name
     initial_initials = w0 === nothing ? derive_initials(worker_id) :
                                         worker_initials(w0)
     WorkerCard(state, String(worker_id),
-                error_obs, picker_state, discover_state,
+                error_obs, picker_state, gh_state, discover_state,
                 busy, discover_busy, discover_results,
-                do_import, trigger_scan,
-                RemoteFolderPicker(state, worker_id),
+                do_import, do_github, trigger_scan,
+                RemoteFolderPicker(state, String(worker_id),
+                                   worker_start_dir(state, worker_id)),
                 Observable(initial_name),
                 Observable(initial_initials))
 end
@@ -49,13 +69,14 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
 
     status_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w === nothing ? :unknown : (isopen(w) ? :online : :offline)
+        w === nothing ? :unknown : (!isopen(w) ? :offline :
+                                    (w.update_state === :available ? :update : :online))
     end
     subtitle_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
         w === nothing ? "(removed)" : worker_subtitle(w)
     end
-    is_online_obs = map(s -> s == :online, status_obs)
+    is_online_obs = map(s -> s == :online || s == :update, status_obs)
     title_attr = let w = get(state.workers[], wid, nothing)
         w === nothing ? "(removed)" :
             "$(w.hostname) · home: $(w.home)"
@@ -64,8 +85,27 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, new_proj_btn.value) do clicked
         clicked || return
-        c.picker_state[]   = c.picker_state[] == wid ? "" : wid
+        opening = c.picker_state[] != wid
+        # EVERY open starts at the worker's working directory — not just the
+        # first. The picker instance is stable per card (that's what keeps a
+        # Bonito re-render from resetting it mid-browse), so without this it
+        # reopens wherever the last create left it, or worse onto a path typed
+        # into the address bar that never existed: the folder rows then come
+        # back empty and "+ New folder" fails on the missing parent, with no way
+        # back but retyping. `reset_to_worker!` also clears the stale selection
+        # and error, and re-reads `projects_root` in case the worker reconnected
+        # from somewhere else. Same thing the dashboard's New Project form does
+        # via its `on(np_worker)` listener.
+        opening && reset_to_worker!(c.remote_picker, wid, worker_start_dir(state, wid))
+        c.picker_state[]   = opening ? wid : ""
         c.error_obs[]      = ""
+    end
+
+    gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bt-btn bt-btn-secondary")
+    on(session, gh_btn.value) do clicked
+        clicked || return
+        c.gh_state[] = c.gh_state[] == wid ? "" : wid
+        c.error_obs[] = ""
     end
 
     name_input = DOM.input(
@@ -132,6 +172,26 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         status_dot(s)
     end
 
+    update_notice = map(state.workers) do workers
+        w = get(workers, wid, nothing)
+        w === nothing || w.update_state !== :available ? nothing :
+            DOM.span(w.update_message; class = "bt-worker-update-note")
+    end
+    update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")
+    on(session, update_btn.value) do clicked
+        clicked || return
+        @async try
+            force_worker_update!(state, wid)
+            c.error_obs[] = "Update requested; it starts after active work finishes."
+        catch e
+            c.error_obs[] = "Could not request update: $(sprint(showerror, e))"
+        end
+    end
+    update_btn_class = map(state.workers) do workers
+        w = get(workers, wid, nothing)
+        w !== nothing && w.update_state === :available ? "" : "bt-hidden"
+    end
+
     # Remove worker. The confirm() lives in JS so we never fire the
     # destructive call without an explicit OK; only then does the trigger
     # Observable flip and the Julia handler run `remove_worker!`.
@@ -159,33 +219,40 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     online_class  = map(o -> o ? "bt-card-actions"            : "bt-card-actions bt-hidden", is_online_obs)
     offline_class = map(o -> o ? "bt-card-actions bt-hidden"  : "bt-card-actions",            is_online_obs)
     actions_block = DOM.div(
-        DOM.div(new_proj_btn; class = online_class),
+        DOM.div(new_proj_btn, gh_btn, DOM.div(update_btn; class = update_btn_class); class = online_class),
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
     card_body = DOM.div(
-        DOM.div(status_dot_obs, initials_input, name_input, remove_btn;
+        DOM.div(status_dot_obs, initials_input, name_input;
                 class = "bt-card-title"),
         DOM.div(subtitle_obs; class = "bt-card-meta", title = title_attr);
         class = "bt-card-body")
 
-    # Top row of the worker pill: identity + actions. The discover details lives
-    # inside the SAME pill (below this row), so a worker with a collapsed project
-    # list takes the same space as a bare card — no separate pill underneath.
-    card_row = DOM.div(card_body, actions_block; class = "bt-card-row")
+    # Top row of the worker pill: identity, then the actions, then the remove ✕
+    # at the far right (after the buttons, not floating in the middle of the
+    # title row). The discover details lives inside the SAME pill (below this
+    # row), so a worker with a collapsed project list takes the same space as a
+    # bare card — no separate pill underneath.
+    card_row = DOM.div(card_body, actions_block, remove_btn; class = "bt-card-row")
 
     is_picking_obs = map(s -> s == wid, c.picker_state)
     picker_form    = render_remote_picker_form(session, c, wid)
     picker_class   = map(p -> p ? "bt-form-wrapper" : "bt-form-wrapper bt-hidden", is_picking_obs)
     picker_block   = DOM.div(picker_form; class = picker_class)
 
+    is_gh_obs = map(s -> s == wid, c.gh_state)
+    gh_form   = render_github_form(session, c, wid)
+    gh_class  = map(g -> g ? "bt-form-wrapper" : "bt-form-wrapper bt-hidden", is_gh_obs)
+    gh_block  = DOM.div(gh_form; class = gh_class)
+
     # Project list is a `<details>` nested INSIDE the card so the closed state is
     # just a thin "▸ projects (N)" toggle row — no separate pill chrome. Fed
     # from state.discovered (no scan needed on first paint); the per-card Rescan
     # button refreshes it.
-    card = DOM.div(card_row, render_discover_panel(session, c, wid); class = "bt-card")
+    card = DOM.div(card_row, update_notice, render_discover_panel(session, c, wid); class = "bt-card")
 
     return Bonito.jsrender(session,
-        DOM.div(card, picker_block; class = "bt-worker-cell"))
+        DOM.div(card, picker_block, gh_block; class = "bt-worker-cell"))
 end
 
 function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::String)
@@ -195,18 +262,30 @@ function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::
 
     on(session, create_btn.value) do clicked
         clicked || return
-        is_busy_idle(c.busy[]) || return
-        chosen = String(strip(rp.selected[]))
+        # `is_busy_running`, not `is_busy_idle`: the progress card parks on the
+        # LAST outcome (:ok / :err) so the user can read it, and a guard that
+        # demanded :idle would refuse every click after the first operation for
+        # the rest of the window's life.
+        refuse_if_busy(c.busy, c.error_obs, "Can't create a chat right now") && return
+        # The path field IS the selection — nothing else to resolve. A path that
+        # doesn't exist yet ("type /newname to create it") is created on the
+        # WORKER here (mkpath) before import; `do_import` itself stays strict
+        # because the discover-session resume path needs an existing cwd.
+        chosen = picker_path(rp)
         if isempty(chosen)
-            c.error_obs[] = "Pick a folder on the worker first (Browse → Choose)."
+            c.error_obs[] = "Enter a folder path first."
             return
         end
-        rp.selected[] = ""
-        c.do_import(wid, chosen)
+        @async try
+            real = ensure_worker_dir(c.state, wid, chosen)
+            c.do_import(wid, real)
+        catch e
+            c.error_obs[] = "Failed to create folder: $(sprint(showerror, e))"
+        end
     end
     on(session, cancel_btn.value) do clicked
         clicked || return
-        is_busy_idle(c.busy[]) || return
+        is_busy_running(c.busy[]) && return
         c.picker_state[] = ""
         c.error_obs[]    = ""
     end
@@ -219,16 +298,64 @@ function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::
 
     DOM.div(
         DOM.label(label_obs),
-        DOM.div(
-            remote_folder_picker_render(session, rp),
-            map(rp.selected) do sel
-                isempty(sel) ? DOM.div() :
-                    DOM.div("✓ selected: $sel",
-                            style = Styles("color" => "#065f46",
-                                            "font-size" => "12px",
-                                            "margin-top" => "4px"))
-            end),
+        DOM.div(remote_folder_picker_render(session, rp)),
         DOM.div(cancel_btn, create_btn, class = "bt-form-actions");
+        class = "bt-form")
+end
+
+# Per-worker "From GitHub" form. The worker clone flow needs a worker, so it
+# lives on the worker card (like "+ From GitHub" lives next to "+ Project");
+# the old dashboard "+ From GitHub" that carried its own worker select is gone.
+function render_github_form(session::Bonito.Session, c::WorkerCard, wid::String)
+    open_btn  = Bonito.Button("Open"; style=nothing, class = "bt-btn")
+    cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
+    url       = Observable("")
+    err       = Observable("")
+
+    on(session, open_btn.value) do clicked
+        clicked || return
+        refuse_if_busy(c.busy, c.error_obs, "Can't clone right now") && return
+        u = String(strip(url[]))
+        if isempty(u)
+            err[] = "GitHub URL required."
+            return
+        end
+        @async try
+            p = c.do_github(wid, u)
+            err[] = ""
+            c.gh_state[] = ""
+            c.error_obs[] = ""
+        catch e
+            err[] = sprint(showerror, e)
+        end
+    end
+    on(session, cancel_btn.value) do clicked
+        clicked || return
+        c.gh_state[] = ""
+        c.error_obs[] = ""
+    end
+
+    display_name_obs = map(c.state.workers) do workers
+        w = get(workers, wid, nothing)
+        w === nothing ? wid : w.name
+    end
+    label_obs = map(n -> "Clone into $n", display_name_obs)
+
+    DOM.div(
+        DOM.label(label_obs),
+        DOM.input(type = "text", placeholder = "https://github.com/<owner>/<repo>",
+                  value = url, class = "bt-gh-url",
+                  oninput = js"event => $(url).notify(event.target.value)"),
+        DOM.div("Repo → just clone. Issue/PR → clone + auto-prompt 'fix this'.";
+                style = Styles("font-size" => "11px",
+                               "color" => "var(--bt-text-muted)",
+                               "margin-bottom" => "4px")),
+        map(err) do m
+            isempty(m) ? DOM.div() :
+                DOM.div(m; style = Styles("color" => "var(--bt-error, #b91c1c)",
+                                          "font-size" => "12px"))
+        end,
+        DOM.div(cancel_btn, open_btn, class = "bt-form-actions");
         class = "bt-form")
 end
 
@@ -275,10 +402,16 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
                                 nothing : String(sid_raw)
         w_name = String(get(payload, "worker", ""))
+        prov_raw = get(payload, "provider", nothing)
+        provider = (prov_raw === nothing || isempty(String(prov_raw))) ?
+                       nothing : String(prov_raw)
         pick[] = Dict{String,Any}()              # reset so the same row can re-fire
         isempty(w_name) && return
-        is_busy_idle(c.busy[]) || return         # drop double-clicks while a start is in flight
-        c.do_import(w_name, path; resume_session_id = resume_session_id)
+        # Drop double-clicks while a start is in flight (see create_btn above
+        # for why this asks "running?" and not "idle?").
+        refuse_if_busy(c.busy, c.error_obs, "Can't open that chat right now") && return
+        c.do_import(w_name, path; resume_session_id = resume_session_id,
+                    provider = provider)
     end
     # Plain DOM (not Bonito.Button) so the onclick can `preventDefault` the
     # enclosing <details> summary toggle (Rescan should NOT collapse the panel
@@ -462,6 +595,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             $(pick).notify({
                 path:       btn.dataset.btSessionPath || '',
                 session_id: btn.dataset.btSessionId   || '',
+                provider:   btn.dataset.btProvider    || '',
                 worker:     btn.dataset.btWorkerId    || '',
             });
         });

@@ -1,0 +1,190 @@
+# The SAME MCP tool must produce the SAME typed card no matter which agent ran
+# it. Only claude-agent-acp states the tool's name outright; the others label it
+# their own way, and before `resolve_mcp_tool` that made `bt_julia_eval` render
+# as a bare generic card — no code preview, the eval descriptor leaking through
+# as raw text — depending purely on the backend.
+#
+# Driven by frames captured VERBATIM from the real binaries driving the real
+# btworker MCP server (AgentClientProtocol/test/fixtures/*.jsonl), because this
+# is exactly the class of bug a hand-written mock hides: every agent's shape
+# here was a surprise.
+@testitem "unit:agent_tool_naming" tags = [:unit] begin
+    import AgentClientProtocol
+    import JSON
+    const ACP = AgentClientProtocol
+
+    fixtures = joinpath(dirname(dirname(pathof(ACP))), "test", "fixtures")
+
+    # Replay one captured turn through the real parser and return its tool calls.
+    function replay_tools(file)
+        out = Channel{Any}(256)
+        st  = ACP.TurnState()
+        for l in eachline(joinpath(fixtures, file))
+            ACP.parse_update!(out, st, ACP.parse_session_update(JSON.parse(l)))
+        end
+        ACP.close_turn!(out, st); close(out)
+        return [x for x in collect(out) if x isa ACP.ToolCall]
+    end
+    replay_tool(file) = only(replay_tools(file))
+
+    @testset "$agent renders bt_julia_eval as the typed eval card" for (agent, file) in (
+            ("kimi",     "kimi_mcp_tool_call.jsonl"),
+            ("opencode", "opencode_mcp_tool_call.jsonl"))
+        tc = replay_tool(file)
+        m  = BonitoAgents.replayed_tool_msg(tc)
+        @test m isa BonitoAgents.JuliaEvalToolMsg
+        @test BonitoAgents.tool_key(m) == "bt_julia_eval"
+        @test m.server == "btworker"
+        # The code preview is filled — the user-visible symptom was an empty one.
+        @test m.code == "1+1"
+        @test !isempty(m.env_path)
+        # Only the tool's real result reaches the body; no argument JSON.
+        @test [c.text for c in tc.content if c isa ACP.TextContent] == ["2"]
+    end
+
+    # Codex needs its own arm: it is the only agent that ships neither the name
+    # NOR the arguments in a usable form (both are buried in a
+    # server/tool/arguments envelope) and returns the result out-of-band in
+    # `rawOutput`, so all three recoveries have to land for the card to render.
+    # Its own auto-review rides alongside as a separate `think` tool.
+    @testset "codex renders bt_julia_eval as the typed eval card" begin
+        tools = replay_tools("codex_mcp_tool_call.jsonl")
+        tc = only([t for t in tools if t isa ACP.MCPCall])
+        m  = BonitoAgents.replayed_tool_msg(tc)
+        @test m isa BonitoAgents.JuliaEvalToolMsg
+        @test BonitoAgents.tool_key(m) == "bt_julia_eval"
+        @test m.server == "btworker"
+        @test m.code == "1+1"
+        @test m.env_path == "/tmp/codexprobe"
+        # The eval card's own summary is the env it ran in.
+        @test BonitoAgents.eval_env_summary(m) == "env /tmp/codexprobe"
+        @test [c.text for c in tc.content if c isa ACP.TextContent] == ["2"]
+
+        # The review is not an MCP call and must stay a generic card.
+        review = only([t for t in tools if t isa ACP.GenericTool])
+        @test BonitoAgents.replayed_tool_msg(review) isa BonitoAgents.GenericToolMsg
+
+        # A Julia error: codex reports it as a COMPLETED call whose result
+        # content is the stacktrace, so the card must still be the typed eval
+        # card with the failing code in its preview.
+        failed = replay_tool("codex_mcp_tool_error.jsonl")
+        fm = BonitoAgents.replayed_tool_msg(failed)
+        @test fm isa BonitoAgents.JuliaEvalToolMsg
+        @test fm.code == "sqrt(-1)"
+        @test failed.status == "completed"
+        @test occursin("DomainError with -1.0", failed.content[end].text)
+    end
+
+    # Codex's NATIVE tools. It names none of them: a shell call is titled with
+    # the command line itself, so the card depends entirely on the `execute` +
+    # `command` shape, and its output exists only in `rawOutput`.
+    @testset "codex native tools render with their arguments" begin
+        sh, ed = replay_tools("codex_native_tools.jsonl")
+
+        bash = BonitoAgents.replayed_tool_msg(sh)
+        @test bash isa BonitoAgents.BashToolMsg
+        @test bash.command == "echo NATIVEPROBE"
+        @test occursin("NATIVEPROBE", sh.content[end].text)
+        # The opening frame's `terminal` pointer is not renderable content.
+        @test !any(c -> c isa ACP.TextContent && occursin("tool content: terminal", c.text),
+                   sh.content)
+
+        edit = BonitoAgents.replayed_tool_msg(ed)
+        @test edit isa BonitoAgents.EditToolMsg
+        # Codex sends no `rawInput` for an edit — the diff carries the path, and
+        # that is what the ✎ affordance resolves through.
+        d = only([c for c in ed.content if c isa ACP.DiffContent])
+        @test basename(d.path) == "notes.txt"
+        @test BonitoAgents.editable_path_from(Dict{String,Any}(), ed.content) == d.path
+    end
+
+    # Codex's image view. It is the only agent that sends an image as a
+    # REFERENCE to a file on the worker rather than base64 bytes, so all the
+    # card needs has to come off that one block: the path to fetch, a mime so
+    # the client treats it as media, and a summary that names the file (the
+    # symptom of dropping it was a "(empty)" body under "0 bytes").
+    @testset "codex image view carries everything the card needs" begin
+        tc = replay_tool("codex_image_view.jsonl")
+        m  = BonitoAgents.replayed_tool_msg(tc)
+        @test m isa BonitoAgents.ReadToolMsg
+        link = only([c for c in tc.content if c isa ACP.ResourceLink])
+        @test ACP.resource_link_path(link) == "/tmp/codexprobe/probe_shot.png"
+        # From `rawInput.path` — this is what the ✎ affordance opens.
+        @test m.file_path == "/tmp/codexprobe/probe_shot.png"
+        # Recognised as media, which is what puts the card in native-image mode.
+        @test BonitoAgents.tool_media_mime(tc.content) == "image/png"
+        @test BonitoAgents.content_summary(BonitoAgents.ReadToolMsg, tc.content) ==
+              "probe_shot.png"
+    end
+
+    # Kimi's NATIVE tools. Two independent things have to line up: the name has
+    # to survive (it is only in the opening title), and the argument keys differ
+    # from claude's (`path` vs `file_path`), each of which alone leaves the card
+    # blank.
+    @testset "kimi native tools render with their arguments" begin
+        cards = Dict{DataType,Vector{Any}}()
+        for file in ("kimi_native_tools.jsonl", "kimi_native_edit_search.jsonl")
+            out = Channel{Any}(2048)
+            st  = ACP.TurnState()
+            for l in eachline(joinpath(fixtures, file))
+                ACP.parse_update!(out, st, ACP.parse_session_update(JSON.parse(l)))
+            end
+            ACP.close_turn!(out, st); close(out)
+            for tc in collect(out)
+                tc isa ACP.ToolCall || continue
+                m = BonitoAgents.replayed_tool_msg(tc)
+                push!(get!(cards, typeof(m), Any[]), m)
+            end
+        end
+
+        reads = get(cards, BonitoAgents.ReadToolMsg, Any[])
+        @test length(reads) == 2                          # one per capture
+        @test all(r -> !isempty(r.file_path), reads)      # `path`, not `file_path`
+
+        edits = get(cards, BonitoAgents.EditToolMsg, Any[])
+        @test length(edits) == 2                          # Write + Edit
+        @test Set(basename.(getfield.(edits, :file_path))) == Set(["fresh.md", "notes.txt"])
+        @test any(e -> e.new_string == "BETA", edits)     # the diff still resolves
+
+        # kimi tags Grep/Glob as kind "read"; only the NAME makes them searches.
+        searches = get(cards, BonitoAgents.SearchToolMsg, Any[])
+        @test length(searches) == 2
+        @test Set(getfield.(searches, :pattern)) == Set(["beta", "*.txt"])
+        # A pattern must never masquerade as a path — `tool_path_hint` opens files.
+        @test all(s -> isempty(s.path), searches)
+        @test all(s -> BonitoAgents.tool_path_hint(s) === nothing, searches)
+
+        @test length(get(cards, BonitoAgents.BashToolMsg, Any[])) == 1
+        @test only(cards[BonitoAgents.BashToolMsg]).command == "echo NATIVEPROBE"
+        @test length(get(cards, BonitoAgents.TaskToolMsg, Any[])) == 1
+    end
+
+    @testset "builtin_msg_type: name refines kind" begin
+        B = BonitoAgents.builtin_msg_type
+        # kimi's coarse kind would give a Read card for a search.
+        @test B("read") == BonitoAgents.ReadToolMsg
+        @test B("read", "Grep") == BonitoAgents.SearchToolMsg
+        @test B("read", "Glob") == BonitoAgents.SearchToolMsg
+        @test B("edit", "Write") == BonitoAgents.EditToolMsg
+        # Claude already agrees, so nothing changes for it.
+        @test B("search", "Grep") == BonitoAgents.SearchToolMsg
+        @test B("edit", "Edit") == BonitoAgents.EditToolMsg
+        # An unknown name falls back to the kind, never to a wrong card.
+        @test B("read", "SomeThirdPartyTool") == BonitoAgents.ReadToolMsg
+        @test B("other", "") == BonitoAgents.GenericToolMsg
+    end
+
+    @testset "resolve_mcp_tool" begin
+        R = BonitoAgents.resolve_mcp_tool
+        @test R("mcp__btworker__bt_julia_eval") == ("btworker", "bt_julia_eval")  # claude, kimi
+        @test R("btworker_bt_julia_eval")       == ("btworker", "bt_julia_eval")  # opencode
+        @test R("btworker__bt_julia_eval")      == ("btworker", "bt_julia_eval")
+        @test R("bt_julia_eval")                == ("", "bt_julia_eval")          # bare
+        @test R("mcp__other__bt_show")          == ("other", "bt_show")
+        # Nothing we can render ⇒ unchanged behaviour, not a wrong card.
+        @test R("Read") === nothing
+        @test R("mcp__playwright__browser_click") === nothing
+        @test R("") === nothing
+        @test R("_bt_julia_eval") === nothing   # no server segment
+    end
+end

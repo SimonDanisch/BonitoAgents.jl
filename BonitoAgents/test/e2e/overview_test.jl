@@ -66,7 +66,7 @@
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
             const file = new File([bytes], 'ov-thumb.png', {type: 'image/png'});
             document.querySelector('$(P).bt-messages').__bt_chat
-                ._attachAddBlob(file, file.type, file.name);
+                .attachAddBlob(file, file.type, file.name);
             return true;
         })()""")
         @test TK.wait_for(s, "thumb queued",

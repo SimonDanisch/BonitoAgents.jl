@@ -41,6 +41,40 @@ tool calls with diff and terminal content, forms, plans, subagent feeds,
 live-app pushes, pacing delays and mid-turn cancellation, so most UI behavior
 can be scripted in a few lines.
 
+## Debugging BonitoAgents itself
+
+The dashboard has a **Debug BonitoAgents** section with a worker picker, and
+every chat header has a **Debug** button (which uses that chat's worker). Both
+open a chat whose working directory is a BonitoAgents source checkout **on that
+worker**, so the agent can read the source, edit it, and open a PR the ordinary
+way.
+
+The worker provides the checkout. A worker that already runs from one (a dev
+install, the test suite) answers with it. An ordinary install clones the
+repository into its environment — `<env>/dev/BonitoAgents`, at the revision
+this server was installed from — and `Pkg.develop`s the monorepo packages from
+it: `dev --local`, done for you. The first press on such a worker therefore
+takes a few minutes (clone + precompile); afterwards a restart of that worker
+runs what the agent edited, and re-running the installer puts the environment
+back on the pinned revision.
+
+That chat additionally gets `bt_dev_*` MCP tools that read the **live process**,
+which is the part the filesystem can't tell you:
+
+| Tool | What it answers |
+|------|-----------------|
+| `bt_dev_inspect` | live workers, projects, chats and eval bridges — plus `section="worker"`, what a worker says about ITSELF (its agent processes, their sockets). When that disagrees with what the server believes, the disagreement is the bug. |
+| `bt_dev_logs` | the server's own `@info`/`@warn`/`@error` ring, filterable by level and substring, with the source location of each record. |
+| `bt_dev_memory` | RSS, GC live bytes and every registry that has historically grown without bound, with an optional GC and a deep `summarysize` pass. For a leak: take a reading, exercise the suspect path, read again with `gc = true`, compare what grew. |
+| `bt_dev_control` | drive the server as a user would — open a chat, send a message, restart a session, rescan a worker, move a project to another machine. |
+
+The tools are attached by a persisted per-project `dev_mode` flag. The button
+sets it; the **Dev mode** item in a chat's ⋯ menu can grant it to any chat by
+hand (behind a confirm, since the tools drive the whole server; the ⋯ trigger
+turns red while it is on), and a chat that got
+it that way is told the source is not in front of it. Pointing an ordinary chat
+at the checkout grants nothing.
+
 ## The walkthrough videos
 
 Two recorders under [`examples/`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/examples)

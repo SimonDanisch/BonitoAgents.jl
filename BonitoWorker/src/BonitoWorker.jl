@@ -4,10 +4,89 @@ module BonitoWorker
 # spawns claude-agent-acp + a dedicated per-session WS each time the server
 # requests a new session.
 #
-# Worker has NO inbound listener — no firewall hole on the worker side.
+# MCP control uses an authenticated loopback listener, with no firewall hole.
 # Single port to open is on the server (8038), already needed for browsers.
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
+using MsgPack
+import Random
+include("mcp_relay.jl")
+import Pkg
+
+# ── The control-WS wire ─────────────────────────────────────────────────────
+# MsgPack in a BINARY frame. Not JSON in a text frame, and the difference is not
+# a matter of taste.
+#
+# A WebSocket TEXT frame is UTF-8 validated by the RECEIVER (HTTP.jl,
+# `http_websockets.jl`: `isvalid(String, data) || _queue_close!(…, 1007)`). This
+# protocol carries filenames, paths, diff hunks and file previews — arbitrary
+# bytes from a filesystem that does not promise UTF-8. One such byte closed the
+# control link with 1007; the worker reconnected, the server re-sent the same
+# command, and the link sat in a loop it could not leave. A binary frame is never
+# validated, so the bad byte travels and gets HANDLED instead of severing the
+# connection that would have reported it.
+#
+# There is no JSON fallback on this wire, deliberately. A receiver that accepted
+# both would let half a migration keep working, and the half that didn't would be
+# discovered by a user rather than by a mismatch — so a text frame here is a hard
+# error naming the cause.
+send_control(ws, payload::AbstractDict) = WebSockets.send(ws, MsgPack.pack(payload))
+
+"""
+    decode_control(frame) -> Dict{String,Any}
+
+Decode one control-WS frame. Binary only; a text frame means the peer still
+speaks the old JSON wire and both ends have to move together.
+"""
+decode_control(frame::AbstractVector{UInt8}) = normalize_wire(MsgPack.unpack(frame))
+decode_control(frame::AbstractString) = error(
+    "BonitoWorker: got a TEXT control frame — the server still speaks the old " *
+    "JSON wire. Server and worker must be updated together; re-run the installer " *
+    "against an updated server.")
+
+"""
+    normalize_wire(x)
+
+Put a decoded MsgPack value back into the shape the handlers were written
+against: `Dict{String,Any}` with `Int64` integers.
+
+MsgPack encodes integers in the NARROWEST type that fits, so `0` decodes as
+`UInt8` and `12345` as `UInt16`, and maps decode as `Dict{Any,Any}`. Unsigned
+arithmetic WRAPS — a `size - 1` on a `UInt8(0)` is 255, surfacing far from the
+cause — so the narrowing is normalised away once here rather than guarded at
+every use. `Bool` is matched before `Integer` on purpose: it is one, and
+widening it would turn `true` into `1`.
+"""
+normalize_wire(x::Bool)           = x
+normalize_wire(x::Integer)        = Int64(x)
+normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
+normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
+normalize_wire(x)                 = x
+
+# Split a string into pieces of at most `cap` codeunits, backing each cut to a
+# codepoint boundary so every piece is a VALID UTF-8 string. Used to ship big
+# replies (the git_diff patch) as a series of bounded frames: a multi-MB single
+# `send` holds the socket's send lock long enough to starve the inline pong,
+# and the server's per-frame decode across one giant frame falls behind its
+# heartbeats. Empty input yields ONE empty chunk so a request is always
+# answered by ≥ 1 frame and can never be mistaken for a missing reply.
+function chunk_string(s::AbstractString, cap::Int = GIT_DIFF_CHUNK_BYTES)
+    s = String(s)
+    isempty(s) && return String[""]
+    chunks = String[]
+    i = firstindex(s)
+    nb = ncodeunits(s)
+    while i <= nb
+        j = min(i + cap, nb + 1)
+        while j <= nb && !isvalid(s, j)
+            j = prevind(s, j)   # back the cut to a codepoint boundary
+        end
+        push!(chunks, String(view(codeunits(s), i:(j - 1))))
+        i = j
+    end
+    return chunks
+end
+using Dates: DateTime, datetime2unix, @dateformat_str
 using Scratch: @get_scratch!
 import AgentProviders   # provider descriptors (find_provider) — the SSOT shared with the server
 
@@ -34,6 +113,11 @@ end
 # display name is just a label — this id is the dict key on the server.
 worker_id_path() = joinpath(config_dir(), "worker_id")
 
+# Where this worker's output goes, named once: `spawn_worker` points the child's
+# stdout/stderr here, `start` claims it as the log the server can read back, and
+# both must agree or the fleet-log tool serves an empty file.
+worker_log_path() = joinpath(config_dir(), "worker.log")
+
 # Install config written by `install!` and read back by `start`.
 config_path() = joinpath(config_dir(), "config.json")
 
@@ -47,10 +131,31 @@ config_path() = joinpath(config_dir(), "config.json")
 # already holds it.
 pidfile_path() = joinpath(config_dir(), "worker.pid")
 
+# The pidfile is two lines: the pid, then the `julia_bin()` the worker runs on.
+# The second line is what lets a re-install tell "the live worker is on the
+# Julia this install uses" from "it is on the one juliaup defaulted to LAST
+# time" — without it a reinstall after `juliaup default 1.12` left a 1.13
+# worker (and its 1.13 BonitoMCP launch command) running forever, because
+# nothing else about the install had changed. Files written before the second
+# line existed still parse (a missing line reads as `nothing`).
+pidfile_lines(path::AbstractString) = split(read(path, String), '\n'; keepempty = false)
+
 # The pid recorded in the pidfile, or `nothing` if absent/empty/garbage.
 function read_pidfile(path::AbstractString = pidfile_path())
     isfile(path) || return nothing
-    return tryparse(Int, strip(read(path, String)))
+    lines = pidfile_lines(path)
+    isempty(lines) && return nothing
+    return tryparse(Int, strip(first(lines)))
+end
+
+# The julia binary the pidfile's worker was started from, or `nothing` for a
+# pidfile that predates the record (or has none).
+function pidfile_julia(path::AbstractString = pidfile_path())
+    isfile(path) || return nothing
+    lines = pidfile_lines(path)
+    length(lines) >= 2 || return nothing
+    julia = strip(lines[2])
+    return isempty(julia) ? nothing : String(julia)
 end
 
 # Pid of a *live, other* worker holding the pidfile, or `nothing` if the slot is
@@ -71,7 +176,7 @@ end
 # detects as dead and overwrites.
 function claim_pidfile!(path::AbstractString = pidfile_path())
     mkpath(dirname(path))
-    write(path, string(getpid()))
+    write(path, string(getpid(), '\n', julia_bin(), '\n'))
     atexit() do
         # Only remove if it's still ours — a successor that took over the slot
         # must keep its own claim.
@@ -167,15 +272,104 @@ end
 # cross-platform: a `.sh`/`.cmd` wrapper would need an OS-specific variant,
 # but `julia` + an argv array runs identically on Linux/macOS/Windows.
 #
-# `julia_bin()` resolves the current interpreter; `Base.active_project()` is
-# whatever env this worker itself runs in (the shared `@bonito-agents` after a
+# `julia_launcher()` resolves WHICH julia — see there; it is deliberately not the
+# version-specific binary this process happens to run from. `Base.active_project()`
+# is whatever env this worker itself runs in (the shared `@bonito-agents` after a
 # normal install, or the monorepo project in dev) — BonitoMCP is co-installed
 # there, so the MCP process resolves it without any extra setup.
 julia_bin() = joinpath(Sys.BINDIR::String, Base.julia_exename())
 
-function mcp_args()
+# The Julia channel this process belongs to, e.g. "1.12". A CHANNEL and not the
+# patch version: juliaup registers `1.12`, not `1.12.7`, so `+1.12.7` is rejected
+# with "not installed" while `+1.12` follows the channel forward.
+julia_channel() = "$(VERSION.major).$(VERSION.minor)"
+
+# Stable launcher candidates, in the order we trust them. juliaup's own install
+# puts one at `~/.juliaup/bin/julia`; a distro package may instead put
+# `julialauncher` behind plain `julia` on PATH (openSUSE does). Neither path
+# moves when a version is added or removed.
+function juliaup_launcher_candidates()
+    exe  = Sys.iswindows() ? "julia.exe" : "julia"
+    outs = String[joinpath(homedir(), ".juliaup", "bin", exe)]
+    onpath = Sys.which("julia")
+    onpath === nothing || push!(outs, String(onpath))
+    return outs
+end
+
+# Does `exe +channel` actually land on the Julia we are running from?
+#
+# Probed rather than assumed, because everything about this is guesswork
+# otherwise: `exe` may not be a launcher at all (a plain julia treats `+1.12` as
+# a script name and exits non-zero, which is the answer we want), the channel may
+# not be registered, or the launcher may be for a different depot. Writing a
+# launch command we have not run is precisely the mistake this whole function
+# exists to undo — it stays invisible until the next restart.
+function launcher_resolves_here(exe::AbstractString, channel::AbstractString)
+    isfile(exe) || return false
+    out = IOBuffer()
+    ok = try
+        success(pipeline(`$exe +$channel --startup-file=no -e 'print(Sys.BINDIR)'`;
+                         stdout = out, stderr = devnull))
+    catch e
+        # ENOENT/EACCES on something that looked like a file a moment ago, or is
+        # not executable. An ordinary "no, not this candidate" — anything else is
+        # a real bug and belongs on the surface.
+        e isa Base.IOError || rethrow()
+        return false
+    end
+    return ok && strip(String(take!(out))) == Sys.BINDIR::String
+end
+
+"""
+    julia_launcher() -> Cmd
+
+The `julia` every process this worker launches on its own behalf runs on: the
+systemd unit's ExecStart, a respawned background worker, and the BonitoMCP
+server claude-agent-acp starts for each chat. The `Cmd` is the executable plus
+whatever argument pins it, so `\$(julia_launcher()) --project=… -e …` composes
+and `.exec` splits into the command + argv the MCP config wants.
+
+NOT `julia_bin()`. That is `Sys.BINDIR`, and under juliaup BINDIR is a
+VERSION-specific directory which the next `juliaup update` DELETES. A unit that
+bakes it execs a julia that no longer exists and systemd restart-loops on it
+forever — measured here as 41 failed EXECs in the 2.5 minutes before someone
+happened to re-run the installer, with the worker simply absent throughout. An
+MCP config that bakes it is the same failure one level down: every new chat's
+`bt_*` tools fail to start until the worker is restarted.
+
+So prefer juliaup's launcher, which lives at a stable path, and pin the CHANNEL
+on it. That combination is what gets both properties at once:
+
+  * `juliaup update` within the channel keeps working — the launcher re-resolves
+    to the new patch release, and nothing has to be rewritten;
+  * `juliaup default <other>` does NOT quietly move the worker onto a different
+    Julia, which a bare launcher (or `/usr/bin/env julia`) would. Moving is what
+    re-running the installer under the new default is for — it restarts the
+    worker on the Julia it ran under (see `spawn_worker` / `install_service!`).
+
+Only removing the channel outright breaks it, and that is a deliberate act rather
+than a side effect of routine maintenance.
+
+Falls back to `julia_bin()` when no launcher checks out — a plain install has no
+launcher and does not have the problem either, since nothing deletes its bindir
+out from under it.
+"""
+function julia_launcher()
+    channel = julia_channel()
+    for exe in juliaup_launcher_candidates()
+        launcher_resolves_here(exe, channel) && return `$exe +$channel`
+    end
+    return `$(julia_bin())`
+end
+
+# The (command, argv) pair claude-agent-acp launches BonitoMCP with. Split from
+# one `julia_launcher()` so the channel pin (`+1.12`) rides in the argv.
+mcp_exe(launcher::Cmd = julia_launcher()) = String(first(launcher.exec))
+
+function mcp_args(launcher::Cmd = julia_launcher())
     project = something(Base.active_project(), "@bonito-agents")
     return String[
+        launcher.exec[2:end]...,
         "--project=$(project)",
         "--startup-file=no",
         "--threads=auto",
@@ -213,7 +407,11 @@ end
 # baked in because systemd --user services do NOT inherit the interactive
 # shell's PATH — without it the worker can't find `claude-agent-acp`/`node`/`git`
 # at runtime. We capture the install-time PATH, which has them resolved.
-function render_service_unit(; julia::AbstractString = julia_bin(),
+#
+# The ExecStart command prefix: `julia_launcher()` as unit text (`exe +channel`).
+service_julia_cmd() = join(julia_launcher().exec, ' ')
+
+function render_service_unit(; julia::AbstractString = service_julia_cmd(),
                                project::AbstractString = "@bonito-agents",
                                projects_root::AbstractString = pwd(),
                                memory_max::AbstractString = "85%",
@@ -475,13 +673,24 @@ end
 function write_config!(; server_url::AbstractString,
                           secret::AbstractString,
                           projects_root::AbstractString = pwd(),
-                          name::AbstractString = default_worker_name(load_or_generate_worker_id()))
+                          name::AbstractString = default_worker_name(load_or_generate_worker_id()),
+                          # The installer records the spec it installed. The server sends
+                          # its current spec in the authenticated hello acknowledgement;
+                          # this is what lets the worker notice a later server upgrade
+                          # without polling a third-party service.
+                          update_spec::Union{AbstractDict,Nothing} = nothing,
+                          # Direct callers are dev/test rigs. The public
+                          # installer opts in below after recording a real spec.
+                          auto_update::Bool = false)
     config = Dict(
         "server_url"    => String(server_url),
         "secret"        => String(secret),
         "name"          => String(name),
         "projects_root" => abspath(projects_root),
+        "auto_update"   => auto_update,
     )
+    update_spec === nothing || (config["update_spec"] = Dict{String,Any}(
+        String(k) => String(v) for (k, v) in update_spec))
     cfg = config_path()
     write(cfg, JSON.json(config))
     @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
@@ -504,13 +713,15 @@ function install!(; server_url::String,
                     secret::String,
                     projects_root::String = pwd(),
                     run_mode::Symbol = :prompt,
+                    update_spec::Union{AbstractDict,Nothing} = nothing,
+                    auto_update::Bool = true,
                     # Did the underlying Pkg env actually move forward (per
                     # `install.jl`'s before/after tree-sha diff)? When `true`,
                     # the running worker / service is restarted so the new
                     # code is actually loaded — otherwise the user only sees
                     # the new package version after a manual kill.
                     code_changed::Bool = true)
-    cfg = write_config!(; server_url, secret, projects_root)
+    cfg = write_config!(; server_url, secret, projects_root, update_spec, auto_update)
 
     mode = run_mode == :prompt ? choose_run_mode() : run_mode
     result = apply_run_mode!(mode; projects_root = abspath(projects_root),
@@ -574,14 +785,32 @@ end
 # `force_restart=true` (set by the installer when the Pkg env actually moved
 # forward) stops the live worker first and then respawns — without this the
 # pidfile keeps a stale process alive after a `git pull`-style update, and the
-# user never sees the new code load. The PID-lock invariant is preserved:
-# `stop_running_worker!` waits for exit before we spawn the replacement.
+# user never sees the new code load. The same happens when the live worker runs
+# on a different Julia than this install does (`replace_reason`). The PID-lock
+# invariant is preserved: `stop_running_worker!` waits for exit before we spawn
+# the replacement.
+# Keep one previous generation, like `rotate_log_if_big!` does for the server.
+# Safe only between worker incarnations — see the call site.
+function rotate_spawn_log!(logfile::AbstractString)
+    (isfile(logfile) && filesize(logfile) > LOG_MAX_BYTES) || return nothing
+    try
+        mv(logfile, logfile * ".1"; force = true)
+    catch e
+        # A log we cannot rotate is not a reason to refuse to start a worker.
+        e isa Base.IOError || e isa SystemError || rethrow()
+        @warn "BonitoWorker: could not rotate $logfile" exception = e
+    end
+    return nothing
+end
+
 function spawn_worker(; force_restart::Bool = false)
-    logfile = joinpath(config_dir(), "worker.log")
+    logfile = worker_log_path()
     other = running_worker_pid()
     if other !== nothing
-        if force_restart
-            @info "BonitoWorker: stopping live worker to load updated code" pid = other
+        reason = replace_reason(; force_restart, recorded_julia = pidfile_julia(),
+                                  current_julia = julia_bin())
+        if reason !== nothing
+            @info "BonitoWorker: stopping live worker: $(reason)" pid = other
             stop_running_worker!()
         else
             # Don't launch a duplicate on top of a healthy live worker — the
@@ -592,11 +821,34 @@ function spawn_worker(; force_restart::Bool = false)
             return nothing, logfile
         end
     end
+    # The one moment nothing holds a descriptor on the log: the previous worker
+    # has exited and the next has not started. `append = true` below means the
+    # file otherwise grows for the life of the install — bound it HERE rather
+    # than from inside the worker, which cannot rename a file its parent's fd
+    # points at without losing every line written afterwards.
+    rotate_spawn_log!(logfile)
     project = something(Base.active_project(), "@bonito-agents")
-    cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
+    cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
     proc = run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true);
                wait = false)
     return proc, logfile
+end
+
+# Why a live worker has to go before this install spawns its own, or `nothing`
+# to leave it running. Pure, so the decision is testable without a worker.
+#
+# `recorded_julia` is the pidfile's second line — `nothing` for a pidfile written
+# before that line existed. Unknown counts as different: the one-off restart it
+# costs is nothing next to the failure it rules out, which is a worker quietly
+# staying on the Julia juliaup defaulted to LAST time.
+function replace_reason(; force_restart::Bool,
+                          recorded_julia::Union{AbstractString,Nothing},
+                          current_julia::AbstractString)
+    force_restart && return "loading updated code"
+    recorded_julia === nothing &&
+        return "its pidfile does not say which Julia it runs on; this install uses $(current_julia)"
+    recorded_julia == current_julia && return nothing
+    return "it runs on $(recorded_julia); this install uses $(current_julia)"
 end
 
 """
@@ -631,7 +883,14 @@ function _bind_lifetime_to_parent!()
 end
 
 function start(; force::Bool = false)
-    _bind_lifetime_to_parent!()
+    # Before anything can log: the file is a redirect of fd 1 and 2, so starting
+    # it late means the first seconds of a worker's life — which is where a
+    # failed dial or a bad config shows up — go to wherever the service manager
+    # happened to point them, i.e. nowhere we can read from another machine.
+    # NOT a redirect: `spawn_worker` already launched us with stdout/stderr on
+    # this very file. We only claim it as the log `read_log_file` serves, and
+    # install the timestamping logger so the lines can be sliced by time.
+    start_file_log!(worker_log_path(); redirect = false)
     cfg = config_path()
     isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
                           "(`curl -fsSL <server-url>/install.jl | julia -`)")
@@ -642,6 +901,11 @@ function start(; force::Bool = false)
         return nothing
     end
     claim_pidfile!()
+    # AFTER the pidfile is ours: that is the proof no other incarnation of this
+    # worker is alive, which is exactly what makes killing anything carrying our
+    # id safe. Before the claim, a duplicate start would reap the RUNNING
+    # worker's agents.
+    reap_stray_agents!()
     config = JSON.parse(read(cfg, String))
     worker_id = load_or_generate_worker_id()
     connect_and_serve(;
@@ -650,6 +914,7 @@ function start(; force::Bool = false)
         worker_id     = worker_id,
         name          = String(get(config, "name", default_worker_name(worker_id))),
         projects_root = String(get(config, "projects_root", pwd())),
+        update_config = Dict{String,Any}(config),
     )
 end
 
@@ -666,15 +931,31 @@ function connect_and_serve(; server_url::String,
                             secret::String,
                             worker_id::String     = load_or_generate_worker_id(),
                             name::String          = default_worker_name(worker_id),
-                            mcp_command::String   = julia_bin(),
-                            mcp_arguments::Vector{String} = mcp_args(),
+                            # Probed ONCE here (it spawns a julia per candidate),
+                            # then split into the command + argv the hello frame
+                            # carries.
+                            launcher::Cmd         = julia_launcher(),
+                            mcp_command::String   = mcp_exe(launcher),
+                            mcp_arguments::Vector{String} = mcp_args(launcher),
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             agent_bin::String     = find_agent_bin(),
+                            # `nothing` is the standalone/dev default. Only a real
+                            # installer writes an auto-update-enabled config.
+                            update_config::Union{Dict{String,Any},Nothing} = nothing,
                             retry_delay::Real     = 5.0)
+    # Here rather than in `start()`: this is the one function EVERY worker goes
+    # through, and `worker_standalone.jl` (the monorepo dev loop and the
+    # real-agent test) calls it directly — so binding in `start()` only meant the
+    # standalone worker was the one that could outlive its spawner, which is
+    # exactly the one a test spawns and then has to kill by hand.
+    _bind_lifetime_to_parent!()
+    # Stamped once, for the debug chat's uptime readout (`worker_state`). Not a
+    # `const` computed at load: that bakes the precompiling machine's clock.
+    WORKER_STARTED[] == 0.0 && (WORKER_STARTED[] = time())
     while true
         try
             run_control_session(; server_url, secret, worker_id, name, mcp_command,
-                                  mcp_arguments, projects_root, agent_bin)
+                                  mcp_arguments, projects_root, agent_bin, update_config)
         catch e
             e isa InterruptException && rethrow()
             @error "BonitoWorker: control session crashed; reconnecting" exception=(e, catch_backtrace())
@@ -700,13 +981,171 @@ end
 # close + re-dial recovers.
 
 # Control WS lifecycle
+#
+# Answer a heartbeat ping on its OWN task rather than inline in the read loop.
+# Every handler reply (git_diff chunks, list_project_files…) is a WS send under
+# the socket's send lock; a multi-MB one being written in ANOTHER task would
+# make the inline pong queue behind it and go stale — the server reads that as
+# a dead link and reaps a perfectly healthy worker. Even spawned, the pong can
+# still lose a race against a pathological send, but any single frame here is
+# down to GIT_DIFF_CHUNK_BYTES, so the worst-case wait shrinks to milliseconds.
+function send_pong(ws)
+    try
+        send_control(ws, Dict("type" => "pong"))
+    catch e
+        # A dead/locked link: the reconnect loop is already handling that, and
+        # the watchdog will kill the zombie transport when appropriate. Just log
+        # and drop the pong rather than bubbling an error into the reader.
+        @warn "BonitoWorker: pong send failed (control link dying?)" exception = e
+    end
+    return nothing
+end
+
+# ── Worker self-update ───────────────────────────────────────────────────────
+#
+# The server is the authority for which worker build belongs with its wire
+# protocol. It advertises that build in the authenticated hello acknowledgement;
+# a worker never polls GitHub, nor does it execute a downloaded installer script.
+# The install spec is persisted with the local config so an unchanged server is a
+# cheap string comparison, not a Pkg operation.
+const _AUTO_UPDATE_LOCK = ReentrantLock()
+const _AUTO_UPDATE_TASK = Ref{Union{Task,Nothing}}(nothing)
+const _AUTO_UPDATE_PENDING = Ref(false)
+
+const _UPDATE_SPEC_KEYS = ("repo", "rev", "source_id", "bonito_url", "bonito_rev")
+
+function update_spec_from_wire(x)
+    x isa AbstractDict || return nothing
+    spec = Dict{String,String}()
+    for key in _UPDATE_SPEC_KEYS
+        value = get(x, key, nothing)
+        value isa AbstractString && !isempty(value) || return nothing
+        spec[key] = String(value)
+    end
+    return spec
+end
+
+function configured_update_spec(config::AbstractDict)
+    update_spec_from_wire(get(config, "update_spec", nothing))
+end
+
+auto_update_enabled(config::AbstractDict) = get(config, "auto_update", false) === true
+
+update_needed(config::AbstractDict, target::AbstractDict) =
+    auto_update_enabled(config) && configured_update_spec(config) != target
+
+function worker_idle_for_update()
+    sessions_empty = lock(_SESSION_PROCS_LOCK) do
+        isempty(_SESSION_PROCS)
+    end
+    sessions_empty || return false
+    return lock(_EVAL_HOSTS_LOCK) do
+        isempty(_EVAL_HOSTS)
+    end
+end
+
+function write_update_spec!(config::Dict{String,Any}, target::Dict{String,String})
+    config["update_spec"] = target
+    write(config_path(), JSON.json(config))
+    return nothing
+end
+
+function update_packages!(target::Dict{String,String})
+    # This is intentionally the same package set and resolution policy as the
+    # first-run installer. `add` moves a worker across branches/tags; unscoped
+    # `update` also refreshes transitive registry deps whose compat tightened.
+    Pkg.activate("bonito-agents"; shared = true)
+    specs = [
+        # `source_id` is an immutable reachable commit when the server can
+        # provide one. That makes a worker match the server, rather than racing
+        # ahead to whatever a moving branch points at after the server deployed.
+        Pkg.PackageSpec(name = "RemoteSync", url = target["repo"], subdir = "RemoteSync", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "BonitoWorker", url = target["repo"], subdir = "BonitoWorker", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "BonitoMCP", url = target["repo"], subdir = "BonitoMCP", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "AgentProviders", url = target["repo"], subdir = "AgentProviders", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "Bonito", url = target["bonito_url"], rev = target["bonito_rev"]),
+    ]
+    Pkg.add(specs)
+    Pkg.update()
+    return nothing
+end
+
+function spawn_updated_worker!()
+    project = something(Base.active_project(), "@bonito-agents")
+    cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start(force=true)")`
+    logfile = joinpath(config_dir(), "worker.log")
+    run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true); wait = false)
+    return nothing
+end
+
+function replace_with_updated_worker!()
+    # A systemd-managed worker must be replaced by its unit. Spawning a detached
+    # child here would work once, but leave systemd believing its service exited
+    # cleanly and therefore not start it after the next boot (`Restart=on-failure`).
+    if service_installed() && systemd_user_available()
+        run(`systemctl --user restart $SERVICE_NAME`; wait = false)
+    else
+        spawn_updated_worker!()
+    end
+    return nothing
+end
+
+function run_auto_update!(config::Dict{String,Any}, target::Dict{String,String})
+    # Do not cut an agent or an eval out from underneath a user. Marking the
+    # worker pending also rejects new sessions, so the observed idle state stays
+    # true through the update and replacement.
+    while !worker_idle_for_update()
+        sleep(1)
+    end
+    @info "BonitoWorker: updating to the server's worker build" rev=target["rev"]
+    try
+        update_packages!(target)
+        write_update_spec!(config, target)
+    catch e
+        e isa InterruptException && rethrow()
+        @error "BonitoWorker: automatic update failed; retrying in five minutes" exception=(e, catch_backtrace())
+        lock(_AUTO_UPDATE_LOCK) do
+            _AUTO_UPDATE_PENDING[] = false
+        end
+        # A transient network or registry failure must not turn automatic update
+        # into "wait for the next reconnect". Clear the admission gate first so
+        # the worker remains useful, then make one delayed, coalesced retry.
+        Base.errormonitor(@async begin
+            sleep(300)
+            schedule_auto_update!(config, target)
+        end)
+        return nothing
+    end
+    @info "BonitoWorker: update installed; starting replacement"
+    replace_with_updated_worker!()
+    # The replacement claims the pidfile and reconnects before this process
+    # exits. Background installs need the detached successor explicitly;
+    # systemd installs receive a `systemctl restart` above.
+    exit(0)
+end
+
+function schedule_auto_update!(config::Dict{String,Any}, target_wire; force::Bool = false)
+    target = update_spec_from_wire(target_wire)
+    target === nothing && return nothing       # server predates the feature
+    (force || update_needed(config, target)) || return nothing
+    lock(_AUTO_UPDATE_LOCK) do
+        task = _AUTO_UPDATE_TASK[]
+        task !== nothing && !istaskdone(task) && return nothing
+        _AUTO_UPDATE_PENDING[] = true
+        _AUTO_UPDATE_TASK[] = Base.errormonitor(@async run_auto_update!(config, target))
+    end
+    return nothing
+end
+
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                                mcp_arguments, projects_root, agent_bin,
-                               agent_env::Dict{String,String} = Dict{String,String}())
+                               update_config::Union{Dict{String,Any},Nothing} = nothing,
+                               agent_env::Dict{String,String} = Dict{String,String}(),
+                               hello_timeout::Real = 30.0)
     control_url = ws_url(server_url, "/worker-ws")
     @info "BonitoWorker: connecting to control WS" control_url worker_id name
     WebSockets.open(control_url) do ws
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"          => "hello",
             "secret"        => secret,
             "worker_id"     => worker_id,
@@ -717,14 +1156,41 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             "mcp_path"      => mcp_command,
             "mcp_args"      => mcp_arguments,
             "projects_root" => projects_root,
-        )))
+            "auto_update"   => update_config !== nothing && auto_update_enabled(update_config),
+            "update_spec"   => update_config === nothing ? nothing : configured_update_spec(update_config),
+        ))
 
-        ack_raw = WebSockets.receive(ws)
-        ack = JSON.parse(String(ack_raw))
+        # The hello/ack exchange is the ONE window with NO watchdog on either
+        # side. The receive-watchdog below is armed from `heartbeat_interval`,
+        # which arrives IN the ack; the server's own zombie reaper only watches
+        # workers it has already registered. So a server that upgrades the
+        # socket and then never answers leaves this `receive` blocked forever —
+        # measured on 2026-09-11: a worker sat here 14m37s and recovered only
+        # when the server PROCESS died, not because anything noticed.
+        #
+        # Bounded, then killed at the TRANSPORT (not `close(ws)` — same
+        # sendlock-deadlock reasoning as the watchdog below), which makes the
+        # blocked receive throw and hands control back to the retry loop.
+        ack_raw = let ch = Channel{Any}(1)
+            Base.errormonitor(@async put!(ch, try
+                WebSockets.receive(ws)
+            catch e
+                e                       # hand the failure over, don't race two throws
+            end))
+            if timedwait(() -> isready(ch), Float64(hello_timeout)) !== :ok
+                close_transport_quietly!(ws)
+                error("server did not answer the registration hello within " *
+                      "$(hello_timeout)s — it is up but wedged; re-dialling")
+            end
+            v = take!(ch)
+            v isa Exception ? throw(v) : v
+        end
+        ack = decode_control(ack_raw)
         if !get(ack, "ok", false)
             error("server rejected hello: $(get(ack, "error", "unknown"))")
         end
         @info "BonitoWorker: registered with server" name=name
+        update_config === nothing || schedule_auto_update!(update_config, get(ack, "update_spec", nothing))
 
         last_rx  = Ref(time())
         hb_alive = Ref(true)
@@ -741,45 +1207,89 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                     # lock, so close(ws) would deadlock behind it. The transport
                     # close wakes all blocked readers/writers; the retry loop then
                     # re-dials over the new interface.
-                    try ws.close_transport!() catch end
+                    close_transport_quietly!(ws)
                     break
                 end
             end)
         end
 
-        for frame in ws
-            last_rx[] = time()
-            cmd = JSON.parse(String(frame))
-            t = get(cmd, "type", "")
-            if t == "open_session"
-                @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
-            elseif t == "close_session"
-                @async handle_close_session(cmd)
-            elseif t == "open_transfer"
-                @async handle_open_transfer(server_url, secret, cmd)
-            elseif t == "list_dir"
-                @async handle_list_dir(ws, cmd)
-            elseif t == "stat_path"
-                @async handle_stat_path(ws, cmd)
-            elseif t == "list_project_files"
-                @async handle_list_project_files(ws, cmd)
-            elseif t == "inspect_path"
-                @async handle_inspect_path(ws, cmd)
-            elseif t == "tail_file"
-                @async handle_tail_file(ws, cmd)
-            elseif t == "kill_file_writers"
-                @async handle_kill_file_writers(ws, cmd)
-            elseif t == "scan_sessions"
-                @async handle_scan_sessions(ws, cmd)
-            elseif t == "clone_repo"
-                @async handle_clone_repo(ws, cmd)
-            elseif t == "ping"
-                WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
-            else
-                @warn "BonitoWorker: unknown control frame" type=t
+        relay = get(ack, "mcp_relay", 0) == 1 ? start_mcp_relay(ws) : nothing
+        try
+            for frame in ws
+                last_rx[] = time()
+                cmd = decode_control(frame)
+                t = get(cmd, "type", "")
+                if t in ("mcp_frame", "mcp_close")
+                    handle_mcp_relay_frame!(relay, cmd)
+                elseif t == "open_session"
+                    pending_update = lock(_AUTO_UPDATE_LOCK) do
+                        _AUTO_UPDATE_PENDING[]
+                    end
+                    if pending_update
+                        report_open_session_failed(ws, String(get(cmd, "sid", "")),
+                            "worker is installing a server update; it will reconnect shortly")
+                    else
+                        @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env, mcp_relay = relay)
+                    end
+                elseif t == "close_session"
+                    @async handle_close_session(cmd)
+                elseif t == "open_transfer"
+                    @async handle_open_transfer(server_url, secret, cmd)
+                elseif t == "list_dir"
+                    @async handle_list_dir(ws, cmd)
+                elseif t == "make_dir"
+                    @async handle_make_dir(ws, cmd)
+                elseif t == "ensure_dir"
+                    @async handle_ensure_dir(ws, cmd)
+                elseif t == "stat_path"
+                    @async handle_stat_path(ws, cmd)
+                elseif t == "read_file_range"
+                    @async handle_read_file_range(ws, cmd)
+                elseif t == "list_project_files"
+                    @async handle_list_project_files(ws, cmd)
+                elseif t == "inspect_path"
+                    @async handle_inspect_path(ws, cmd)
+                elseif t == "tail_file"
+                    @async handle_tail_file(ws, cmd)
+                elseif t == "kill_file_writers"
+                    @async handle_kill_file_writers(ws, cmd)
+                elseif t == "scan_sessions"
+                    @async handle_scan_sessions(ws, cmd)
+                elseif t == "clone_repo"
+                    @async handle_clone_repo(ws, cmd)
+                elseif t == "git_diff"
+                    @async handle_git_diff(ws, cmd)
+                elseif t == "find_repos"
+                    @async handle_find_repos(ws, cmd)
+                elseif t == "worker_state"
+                    @async handle_worker_state(ws, cmd; mcp_command, mcp_arguments)
+                elseif t == "read_log"
+                    @async handle_read_log(ws, cmd)
+                elseif t == "debug_checkout"
+                    @async handle_debug_checkout(ws, cmd)
+                elseif t == "open_eval_host"
+                    @async handle_open_eval_host(ws, cmd; server_url, worker_id, mcp_command, mcp_arguments, mcp_relay = relay)
+                elseif t == "close_eval_host"
+                    @async handle_close_eval_host(ws, cmd; mcp_relay = relay)
+                elseif t == "stage_session"
+                    @async handle_stage_session(ws, cmd)
+                elseif t == "install_session"
+                    @async handle_install_session(ws, cmd)
+                elseif t == "discard_staging"
+                    @async handle_discard_staging(ws, cmd)
+                elseif t == "ping"
+                    @async send_pong(ws)
+                elseif t == "force_update"
+                    update_config === nothing || schedule_auto_update!(update_config,
+                        get(cmd, "update_spec", nothing); force = true)
+                else
+                    @warn "BonitoWorker: unknown control frame" type=t
+                end
             end
+        finally
+            hb_alive[] = false
+            relay === nothing || close(relay)
         end
-        hb_alive[] = false
         @info "BonitoWorker: control WS closed by server"
     end
 end
@@ -791,11 +1301,11 @@ end
 function report_open_session_failed(ws, sid::AbstractString, reason::AbstractString)
     @error "BonitoWorker: open_session failed" sid reason
     try
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"  => "open_session_failed",
             "sid"   => sid,
             "error" => reason,
-        )))
+        ))
     catch e
         @warn "BonitoWorker: could not report open_session failure" sid exception=e
     end
@@ -819,7 +1329,29 @@ const _SESSION_PROCS_LOCK = ReentrantLock()
 # keep running serves nobody, and its lazy re-opened successor (same cwd, fresh
 # proc) would coexist with it. Kill the procs and kill the session transports
 # so relays wedged on half-open sockets (the WLAN→LAN incident) unwind too.
+"""
+    close_transport_quietly!(ws)
+
+Kill a socket's transport, tolerating one that is already gone.
+
+Not `try … catch end`: closing a dead socket is an EXPECTED failure and the only
+one worth ignoring here. A bare catch also swallows `InterruptException`, so a
+Ctrl-C landing during a teardown sweep was absorbed by whichever close happened
+to be running — the process kept going and the user pressed it again.
+"""
+function close_transport_quietly!(ws)
+    ws === nothing && return nothing
+    try
+        ws.close_transport!()
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "BonitoWorker: transport already closed" exception = e
+    end
+    return nothing
+end
+
 function reap_all_sessions!(reason::AbstractString)
+    reap_all_eval_hosts!(reason)
     entries = lock(_SESSION_PROCS_LOCK) do
         snap = collect(_SESSION_PROCS)
         empty!(_SESSION_PROCS)
@@ -829,14 +1361,15 @@ function reap_all_sessions!(reason::AbstractString)
     @info "BonitoWorker: reaping all agent sessions" n=length(entries) reason
     for (cwd, e) in entries
         kill_proc!(e.proc)
-        e.ws === nothing || try e.ws.close_transport!() catch end
+        close_transport_quietly!(e.ws)
     end
     return nothing
 end
 
 function handle_open_session(ws, server_url::String, secret::String, agent_bin::String,
                               cmd::AbstractDict;
-                              agent_env::Dict{String,String} = Dict{String,String}())
+                              agent_env::Dict{String,String} = Dict{String,String}(),
+                              mcp_relay::Union{MCPRelay,Nothing} = nothing)
     sid           = String(get(cmd, "sid", ""))
     cwd           = String(get(cmd, "cwd", pwd()))
     # `cmd.env` is per-session overrides from the open_session command.
@@ -881,27 +1414,27 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         end
     end
 
-    # `BONITOAGENTS_SERVER_URL` flows from here all the way down to BonitoMCP's
-    # eval-ws dial-back: claude-agent-acp inherits this env, and MCP children
-    # spawned by the agent inherit it too. The worker is the right side to set
-    # it — `server_url` is the URL we ourselves dialed in on, so by construction
+    # Supply the URL to the agent, and explicitly to our MCP entry in the ACP
+    # relay below: some agents filter the environment inherited by MCP children.
+    # The worker sets it because `server_url` is the URL we dialed in on, so it is
     # reachable. The server cannot reliably guess its own outward URL (see
     # `Bonito.online_url` behavior under `proxy_url="."`), so it stays out of
     # the URL-naming business.
-    # Provider-specific env (e.g. Claude's CLAUDE_* vars) comes from the descriptor;
-    # the worker layers live ENV under it and the server-url on top. Live ENV stays
-    # the base so the agent inherits PATH etc.; `provider.env` and the per-session
-    # overrides win.
-    env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
-                provider.env,
-                Dict("BONITOAGENTS_SERVER_URL"  => server_url),
-                env_overrides)
+    env = provider_env(provider,
+                       merge(Dict("BONITOAGENTS_SERVER_URL" => server_url), env_overrides))
 
     # `provider.args` carries any required subcommand (e.g. `["acp"]` for
-    # mimo/opencode, whose ACP server lives under that subcommand).
+    # mimo/opencode/kimi, whose ACP server lives under that subcommand).
     agent_args = provider.args
     proc = try
-        open(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd), "r+")
+        # `detach` = `setsid()` in the child before exec, so the agent leads its
+        # OWN process group and everything it spawns (the MCP servers, and the
+        # Julia eval workers under those) is in that group. Without it the agent
+        # sat in ours: `kill_proc!` reached the agent alone and its children were
+        # orphaned one level down, which is how a killed chat left julia
+        # processes running. It does NOT make the agent survive us on purpose —
+        # `kill_proc!` now signals the group explicitly.
+        open(detach(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd)), "r+")
     catch e
         return report_open_session_failed(ws, sid,
             "failed to spawn agent ($resolved_agent_bin $(join(agent_args, ' '))): $(sprint(showerror, e))")
@@ -934,7 +1467,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
                     (_SESSION_PROCS[cwd] = (proc = proc, ws = ws))
             end
 
-            ws_to_proc = @async relay_ws_to_proc(ws, proc)
+            ws_to_proc = @async relay_ws_to_proc(ws, proc; server_url, mcp_relay, owner = sid)
             proc_to_ws = @async relay_proc_to_ws(proc, ws)
             try
                 wait(ws_to_proc)
@@ -951,6 +1484,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         # errors are reported too; harmless if the session already came up.
         report_open_session_failed(ws, sid, "ACP session error: $(sprint(showerror, e))")
     finally
+        mcp_relay === nothing || revoke_mcp_grants!(mcp_relay, sid)
         # Deregister (only if still us — a fast reopen on the same cwd may have
         # replaced the entry) so a late close_session can't kill a newer session.
         lock(_SESSION_PROCS_LOCK) do
@@ -980,7 +1514,233 @@ function handle_close_session(cmd)
     kill_proc!(entry.proc)
     # Also kill the dial-back transport: a relay parked on a half-open socket
     # (send holds ws.sendlock) is unreachable by the proc kill alone.
-    entry.ws === nothing || try entry.ws.close_transport!() catch end
+    close_transport_quietly!(entry.ws)
+end
+
+# ── Eval hosts: Julia for ANOTHER worker's chat, run here ────────────────────
+# "Run this on the MacBook" from a chat whose agent lives on the desktop: the
+# server asks THIS worker to spawn a BonitoMCP eval host for that chat
+# (`BonitoMCP.run_eval_host`), which dials the server's /mcp-ws and serves the
+# relayed evals with the same session manager the chat's own MCP uses. One host
+# per chat per worker; the process is the same julia + project the MCP itself is
+# launched with (`mcp_command`/`mcp_arguments`, only the entry point differs),
+# so it runs on the pinned julia and sees the same packages.
+#
+#     {type:"open_eval_host", request_id, project_id, env:{…}}
+#  -> {type:"open_eval_host_response", request_id, ok:true, pid, existed}
+#     {type:"close_eval_host", request_id, project_id}
+#  -> {type:"close_eval_host_response", request_id, ok:true, killed}
+#
+# The host's lifetime is the chat's: the server closes it when the chat's
+# session ends or remote Julia is switched off, and a host that loses the server
+# exits on its own (BonitoMCP.HOST_ORPHAN_S). Reaped with the agent sessions on
+# link loss, and, like an agent, stamped with `AGENT_OWNER_ENV` so a stray from a
+# previous incarnation of this worker is found and killed at the next start.
+const _EVAL_HOSTS = Dict{String,Any}()          # project_id => Process
+const _EVAL_HOSTS_LOCK = ReentrantLock()
+
+# The MCP's argv with its `-e` entry point swapped for the eval host's.
+function eval_host_arguments(mcp_arguments::Vector{String})
+    i = findlast(==("-e"), mcp_arguments)
+    (i === nothing || i == length(mcp_arguments)) &&
+        error("the MCP launch arguments carry no `-e` entry point to derive the eval host from: $(mcp_arguments)")
+    args = copy(mcp_arguments)
+    args[i + 1] = "using BonitoMCP; BonitoMCP.run_eval_host()"
+    return args
+end
+
+function open_eval_host!(project_id::AbstractString, env::AbstractDict;
+                         server_url::AbstractString, worker_id::AbstractString,
+                         mcp_command::AbstractString, mcp_arguments::Vector{String},
+                         mcp_relay::Union{MCPRelay,Nothing} = nothing)
+    isempty(project_id) && error("open_eval_host: project_id is empty")
+    isempty(mcp_command) && error("open_eval_host: this worker has no MCP launch command")
+    lock(_EVAL_HOSTS_LOCK) do
+        existing = get(_EVAL_HOSTS, project_id, nothing)
+        if existing !== nothing && process_running(existing)
+            return (pid = Int(getpid(existing)), existed = true)
+        end
+        host_env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
+                         Dict{String,String}(String(k) => String(v) for (k, v) in env),
+                         Dict("BONITOAGENTS_SERVER_URL" => String(server_url),
+                              "BONITOAGENTS_EVAL_HOST_WORKER" => String(worker_id),
+                              AGENT_OWNER_ENV => String(worker_id)))
+        if mcp_relay !== nothing
+            revoke_mcp_grants!(mcp_relay, "host:" * project_id)
+            merge!(host_env, mcp_relay_env(mcp_relay, project_id; host = true, owner = "host:" * project_id))
+        end
+        args = eval_host_arguments(mcp_arguments)
+        # `detach`: the host leads its own process group, so killing it reaches
+        # the eval workers it spawned — same as an agent (see handle_open_session).
+        proc = try
+            open(detach(Cmd(`$mcp_command $args`; env = host_env)), "r")
+        catch
+            mcp_relay === nothing || revoke_mcp_grants!(mcp_relay, "host:" * project_id)
+            rethrow()
+        end
+        _EVAL_HOSTS[project_id] = proc
+        @info "BonitoWorker: eval host started" project_id pid = getpid(proc)
+        return (pid = Int(getpid(proc)), existed = false)
+    end
+end
+
+function close_eval_host!(project_id::AbstractString)
+    proc = lock(_EVAL_HOSTS_LOCK) do
+        pop!(_EVAL_HOSTS, project_id, nothing)
+    end
+    proc === nothing && return false
+    @info "BonitoWorker: eval host closed" project_id
+    kill_proc!(proc)
+    return true
+end
+
+function reap_all_eval_hosts!(reason::AbstractString)
+    procs = lock(_EVAL_HOSTS_LOCK) do
+        snap = collect(values(_EVAL_HOSTS))
+        empty!(_EVAL_HOSTS)
+        snap
+    end
+    isempty(procs) && return nothing
+    @info "BonitoWorker: reaping eval hosts" n = length(procs) reason
+    foreach(kill_proc!, procs)
+    return nothing
+end
+
+function handle_open_eval_host(ws, cmd::AbstractDict; server_url, worker_id,
+                               mcp_command, mcp_arguments, mcp_relay = nothing)
+    reply = Dict{String,Any}("type" => "open_eval_host_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        env = get(cmd, "env", Dict{String,Any}())
+        r = open_eval_host!(String(get(cmd, "project_id", "")),
+                            env isa AbstractDict ? env : Dict{String,Any}();
+                            server_url = String(server_url), worker_id = String(worker_id),
+                            mcp_command = String(mcp_command), mcp_arguments, mcp_relay)
+        Dict{String,Any}("ok" => true, "pid" => r.pid, "existed" => r.existed)
+    end
+end
+
+function handle_close_eval_host(ws, cmd::AbstractDict; mcp_relay = nothing)
+    mcp_relay === nothing || revoke_mcp_grants!(mcp_relay, "host:" * String(get(cmd, "project_id", "")))
+    reply = Dict{String,Any}("type" => "close_eval_host_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        Dict{String,Any}("ok" => true,
+                         "killed" => close_eval_host!(String(get(cmd, "project_id", ""))))
+    end
+end
+
+# The env var every agent (and everything it spawns) is stamped with, naming the
+# worker that owns it. See `provider_env` and `reap_stray_agents!`.
+const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
+
+# The environment for EVERY provider process we spawn — the chat session and the
+# `session/list` scan alike. Live ENV is the base so the agent inherits PATH etc.;
+# the descriptor's provider-specific vars (Claude's `CLAUDE_*`, …) win over it,
+# and `extra` (server url, per-session overrides) wins over those.
+#
+# `AGENT_OWNER_ENV` is the part that must not be skipped. It is our own mark on
+# the process and everything it spawns, and `reap_agents_owned_by` reads it back
+# to tell a leftover of a PREVIOUS incarnation of this worker from a process
+# belonging to a worker that is alive right now (the id is stable across
+# restarts, the pid is not). A process spawned WITHOUT the mark is one that
+# nothing can ever clean up: the scan spawn used to skip this, and its strays —
+# a Julia agent still precompiling outlives the SIGTERM that ends the scan — were
+# invisible to both halves of the reaper, at ~500 MB each.
+function provider_env(provider, extra::AbstractDict = Dict{String,String}())
+    return merge(Dict(string(k) => string(v) for (k, v) in ENV),
+                 provider.env,
+                 Dict(AGENT_OWNER_ENV => load_or_generate_worker_id()),
+                 extra)
+end
+
+"""
+    kill_process_group!(proc)
+
+SIGKILL the process GROUP `proc` leads (it does, via `detach` at spawn), so the
+agent's children go with it. No-op on Windows, on a dead proc, or — the guard
+that matters — if the group turns out to be our own: signalling that would take
+the worker down with it.
+"""
+function kill_process_group!(proc)
+    Sys.isunix() || return nothing
+    pid = try
+        getpid(proc)
+    catch e
+        e isa InterruptException && rethrow()
+        return nothing            # already reaped; nothing to signal
+    end
+    pid > 0 || return nothing
+    pgid = Int(ccall(:getpgid, Cint, (Cint,), pid))
+    # -1 = the process is gone (its group with it). Equal to ours = `detach`
+    # didn't take; killing it would be suicide.
+    (pgid <= 0 || pgid == Int(ccall(:getpgid, Cint, (Cint,), 0))) && return nothing
+    ccall(:kill, Cint, (Cint, Cint), -pgid, 9)
+    return nothing
+end
+
+"""
+    reap_stray_agents!() -> Int
+
+Kill agent processes left behind by a PREVIOUS incarnation of this worker, and
+return how many. Called once at startup.
+
+This is the half that `kill_process_group!` cannot cover: a worker killed with
+SIGKILL runs no cleanup at all, so its agents survive, get reparented to init,
+and are invisible from then on. Measured: 3 per full e2e run, accumulating to 55
+live orphans (oldest 41 hours) over a few days — individually small, collectively
+enough memory pressure to make unrelated tests fail on timing.
+
+Ownership is read from `/proc/<pid>/environ`, matching OUR stable `worker_id`.
+That is deliberately narrower than "any agent": another worker running right now
+on the same machine has a different id, and its agents are none of our business.
+A previous incarnation of ourselves has the SAME id — and by the time we are
+starting, it is not running.
+"""
+reap_stray_agents!() = reap_agents_owned_by(load_or_generate_worker_id())
+
+"""
+    reap_agents_owned_by(worker_id) -> Int
+
+The same sweep for an EXPLICIT worker id. `dev_server` needs this: every test
+server gets a throwaway config dir, hence a fresh id, so the startup sweep above
+can never match a previous run's leftovers — it is looking for an id that has
+never existed before. The server knows the id it handed out, so it can reap on
+the way down instead.
+
+Only call this once the worker owning `worker_id` is gone, or you will kill the
+agents of a session that is still in use.
+"""
+function reap_agents_owned_by(worker_id::AbstractString)
+    (Sys.isunix() && isdir("/proc")) || return 0
+    isempty(worker_id) && return 0
+    # The trailing NUL matters. `/proc/<pid>/environ` is a NUL-SEPARATED blob, so
+    # a bare `NAME=<id>` also matches `NAME=<id>-something` — and worker ids are
+    # not prefix-free. Without the terminator this reaps another worker's LIVE
+    # agents, which the test for it caught on the first run.
+    mark = AGENT_OWNER_ENV * "=" * worker_id * "\0"
+    me   = getpid()
+    n    = 0
+    for entry in readdir("/proc")
+        pid = tryparse(Int, entry)
+        (pid === nothing || pid == me) && continue
+        environ = try
+            read("/proc/$pid/environ", String)
+        catch e
+            e isa InterruptException && rethrow()
+            continue              # gone between readdir and read, or not ours to read
+        end
+        occursin(mark, environ) || continue
+        try
+            ccall(:kill, Cint, (Cint, Cint), Cint(pid), 9)
+            n += 1
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "BonitoWorker: could not reap stray agent" pid exception = e
+        end
+    end
+    n > 0 && @info "BonitoWorker: reaped orphaned agent processes" count = n worker_id
+    return n
 end
 
 # Kill + close an agent process, tolerating an already-dead/closed one.
@@ -1002,6 +1762,15 @@ function kill_proc!(proc)
     catch e
         e isa Base.IOError || @warn "BonitoWorker: SIGKILL failed" exception=e
     end
+    # The agent's CHILDREN. `detach` at spawn made the agent its own group
+    # leader, so one signal to `-pgid` reaches the MCP servers it started and the
+    # Julia eval workers under those. Killing only the agent left those running:
+    # they are what actually holds the memory (a julia eval worker is hundreds of
+    # MB; the node agent is tens).
+    #
+    # Sent AFTER the agent is down, and guarded so we can never signal our own
+    # group — same belt-and-braces as BonitoMCP's `reap_process_tree`.
+    kill_process_group!(proc)
     try
         close(proc)
     catch e
@@ -1048,9 +1817,77 @@ function handle_list_dir(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "list_dir response failed" exception=e
+    end
+end
+
+"""
+Respond to `{type:"make_dir", request_id, parent, name}` — the folder picker's
+"New folder", so a project can start in a folder that doesn't exist yet.
+
+    {type: "make_dir_response", request_id, path}
+    {type: "make_dir_response", request_id, error: "..."}
+
+`name` is a single path segment: separators and `..` are rejected so this can
+only ever create a child of `parent`.
+"""
+function handle_make_dir(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    parent     = String(get(cmd, "parent", ""))
+    name       = strip(String(get(cmd, "name", "")))
+
+    response = try
+        isempty(name) && error("folder name is required")
+        (occursin('/', name) || occursin('\\', name) || name == ".." || name == ".") &&
+            error("folder name must be a single path segment, got: $name")
+        isdir(parent) || error("not a directory: $parent")
+        full = joinpath(parent, name)
+        ispath(full) && error("already exists: $full")
+        mkdir(full)
+        Dict("type" => "make_dir_response", "request_id" => request_id,
+             "path" => abspath(full))
+    catch e
+        Dict("type" => "make_dir_response", "request_id" => request_id,
+             "error" => sprint(showerror, e))
+    end
+    try
+        send_control(ws, response)
+    catch e
+        @warn "make_dir response failed" exception=e
+    end
+end
+
+# Ensure a directory exists on the worker, creating it (and any missing
+# parents) if it doesn't. Backs the picker's "type `/newname` to create it"
+# flow: the path field always shows the target, and a non-existent folder is
+# created the moment the user commits a create on it — no separate "+ New
+# folder" step, and multi-segment targets (`a/b/c`) work in one shot.
+#
+#     {type:"ensure_dir", request_id, path}
+#     {type:"ensure_dir_response", request_id, path}   # normalized abspath
+#     {type:"ensure_dir_response", request_id, error}
+function handle_ensure_dir(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    path       = strip(String(get(cmd, "path", "")))
+
+    response = try
+        isempty(path) && error("path is required")
+        # A path that exists but is not a directory (a file) must be refused —
+        # mkpath would silently succeed against it and create a sibling.
+        ispath(path) && !isdir(path) && error("not a directory: $path")
+        mkpath(path)
+        Dict("type" => "ensure_dir_response", "request_id" => request_id,
+             "path" => abspath(path))
+    catch e
+        Dict("type" => "ensure_dir_response", "request_id" => request_id,
+             "error" => sprint(showerror, e))
+    end
+    try
+        send_control(ws, response)
+    catch e
+        @warn "ensure_dir response failed" exception=e
     end
 end
 
@@ -1059,8 +1896,20 @@ end
 # a transfer that ends in an empty editor.
 #
 #     {type:"stat_path", request_id, path}
-#  -> {type:"stat_path_response", request_id, path, exists, isfile, isdir, size}
+#  -> {type:"stat_path_response", request_id, path, exists, isfile, isdir, size, mtime}
 #     {type:"stat_path_response", request_id, error:"..."}  on failure
+#
+# `mtime` (Unix seconds, Float64) is the file's version stamp: the server pairs
+# it with `size` as the freshness key for its mirror copy, so a file REGENERATED
+# at the same path (a re-rendered plot, a re-recorded video) is re-fetched
+# instead of served from the first-ever transfer. 0.0 when there's no file.
+#
+# The pair only works if the mtime is FINE-GRAINED enough to separate two writes
+# that land in the same second at the same size — otherwise the key silently says
+# "unchanged" for a file that changed, which is the exact bug it exists to fix.
+# Measured, not assumed: `mtime` resolves to well under a millisecond (two
+# same-size writes 6ms apart differ), and the JSON round-trip on this wire keeps
+# the full Float64 — `1.7870720314021704e9` survives serialize+parse unchanged.
 function handle_stat_path(ws, cmd::AbstractDict)
     request_id = String(get(cmd, "request_id", ""))
     raw_path   = String(get(cmd, "path", ""))
@@ -1074,17 +1923,42 @@ function handle_stat_path(ws, cmd::AbstractDict)
              "exists"     => ispath(raw_path),
              "isfile"     => isf,
              "isdir"      => isdir(raw_path),
-             "size"       => isf ? filesize(raw_path) : 0)
+             "range_reads" => true,
+             "size"       => isf ? filesize(raw_path) : 0,
+             "mtime"      => isf ? mtime(raw_path) : 0.0)
     catch e
         Dict("type"       => "stat_path_response",
              "request_id" => request_id,
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "stat_path response failed" exception=e
     end
+end
+
+# Keep each control frame bounded so media reads cannot monopolize the worker's
+# heartbeat/session connection. No eval process or asset registration is involved.
+const FILE_RANGE_BYTES = 256 * 1024
+
+function handle_read_file_range(ws, cmd::AbstractDict)
+    response = Dict{String,Any}("type" => "read_file_range_response",
+        "request_id" => String(get(cmd, "request_id", "")))
+    try
+        path = String(cmd["path"])
+        start, count = Int(cmd["start"]), Int(cmd["count"])
+        start >= 0 && 0 <= count <= FILE_RANGE_BYTES || error("invalid file range")
+        response["data"] = open(path) do io
+            seek(io, start)
+            read(io, count)
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        response["error"] = sprint(showerror, e)
+    end
+    send_control(ws, response)
+    return nothing
 end
 
 # Directories never worth indexing/recursing for the project file list — VCS
@@ -1136,7 +2010,7 @@ function handle_list_project_files(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "list_project_files response failed" exception=e
     end
@@ -1167,7 +2041,7 @@ function handle_inspect_path(ws, cmd::AbstractDict)
              "error"      => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "inspect_path response failed" exception=e
     end
@@ -1304,7 +2178,7 @@ function handle_kill_file_writers(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "kill_file_writers response failed" exception=e
     end
@@ -1342,7 +2216,7 @@ function handle_tail_file(ws, cmd::AbstractDict)
              "error" => sprint(showerror, e))
     end
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "tail_file response failed" exception=e
     end
@@ -1396,22 +2270,27 @@ function inspect_git_subrepo(abs_dir::AbstractString, root::AbstractString)
     head_time  = 0.0
     dirty_count = 0
     branch     = ""
-    try
-        head_sha = strip(read(Cmd(`git rev-parse HEAD`; dir = abs_dir), String))
-    catch end
-    try
-        # %ct is committer Unix time. Falls back to 0.0 if HEAD is unborn.
-        out = read(Cmd(`git log -1 --format=%ct HEAD`; dir = abs_dir), String)
-        head_time = parse(Float64, strip(out))
-    catch end
-    try
-        # `--porcelain` is line-per-change; count non-empty lines.
-        out = read(Cmd(`git status --porcelain`; dir = abs_dir), String)
-        dirty_count = count(!isempty, split(out, '\n'))
-    catch end
-    try
-        branch = strip(read(Cmd(`git rev-parse --abbrev-ref HEAD`; dir = abs_dir), String))
-    catch end
+    # `git_capture`, not `try … catch end`. These four calls have real expected
+    # failures — an unborn HEAD, a directory that stopped being a repo — and the
+    # bare catch answered ALL of them the same way, including the ones that are
+    # bugs (git missing, a permission error) and the one that is a user:
+    # `InterruptException` was swallowed too, so Ctrl-C during a scan did
+    # nothing. `git_capture` already draws that line correctly for the rest of
+    # this file: a non-zero exit is an ANSWER, anything else propagates.
+    let r = git_capture(abs_dir, `rev-parse HEAD`)
+        r.ok && (head_sha = strip(r.out))
+    end
+    let r = git_capture(abs_dir, `log -1 --format=%ct HEAD`)   # %ct = committer Unix time
+        # Present but unparseable is not the same as absent; `tryparse` keeps the
+        # 0.0 default without inventing a number.
+        r.ok && (head_time = something(tryparse(Float64, strip(r.out)), 0.0))
+    end
+    let r = git_capture(abs_dir, `status --porcelain`)          # line-per-change
+        r.ok && (dirty_count = count(!isempty, split(r.out, '\n')))
+    end
+    let r = git_capture(abs_dir, `rev-parse --abbrev-ref HEAD`)
+        r.ok && (branch = strip(r.out))
+    end
     return Dict(
         "path"        => rel,
         "head_sha"    => head_sha,
@@ -1492,9 +2371,415 @@ function handle_clone_repo(ws, cmd::AbstractDict)
 
     response = clone_repo_response(request_id, url, dst_path, pr_raw, git_clone!)
     try
-        WebSockets.send(ws, JSON.json(response))
+        send_control(ws, response)
     catch e
         @warn "clone_repo response failed" exception=e
+    end
+end
+
+# ── Debug checkout: the BonitoAgents source, on THIS worker ──────────────────
+# Backs the server's "Debug BonitoAgents" chat. That chat needs the source in
+# front of its agent, on the worker it runs on — and a normal install has none:
+# the packages sit in `~/.julia/packages/...` as plain trees. So the worker
+# provides a checkout of its own, the way a developer would: `dev --local` into
+# the environment the worker runs in, i.e. a clone at `<env>/dev/BonitoAgents`
+# with the monorepo packages developed from it. Restarting the worker then runs
+# whatever the agent edited there, which is what makes the chat a real
+# debugging loop rather than a read-only one. A re-run of the installer
+# (`Pkg.add` against the repo) puts the env back on the pinned revision.
+#
+#     {type:"debug_checkout", request_id, repo, rev, packages}
+#  -> {type:"debug_checkout_response", request_id, path, mode, created}
+#     {type:"debug_checkout_response", request_id, error:"..."}  on failure
+#
+# `mode` is "running" when this worker already runs FROM a checkout (a monorepo
+# dev setup, the test suite) — then that checkout is the answer and nothing is
+# cloned or developed; "developed" otherwise. `created` says whether THIS call
+# made the clone (a repeat call finds it and leaves the user's edits alone).
+
+"""
+    source_checkout_root() -> String | nothing
+
+The git repository this worker's own code is loaded from, or `nothing` when it
+runs from an ordinary install (a package tree under `~/.julia/packages`).
+
+Walks up from `pkgdir(BonitoWorker)` to a `.git` — a directory (clone) or a file
+(worktree / submodule) — and only accepts a root that actually IS the monorepo
+(has `BonitoWorker/Project.toml` and `BonitoAgents/Project.toml`). Without that
+check a dotfiles repository in `\$HOME` would claim `~/.julia/packages/...`.
+"""
+function source_checkout_root()
+    dir = pkgdir(@__MODULE__)
+    dir === nothing && return nothing
+    cur = abspath(String(dir))
+    while true
+        ispath(joinpath(cur, ".git")) && is_monorepo_root(cur) && return cur
+        parent = dirname(cur)
+        parent == cur && return nothing
+        cur = parent
+    end
+end
+
+is_monorepo_root(dir::AbstractString) =
+    isfile(joinpath(dir, "BonitoWorker", "Project.toml")) &&
+    isfile(joinpath(dir, "BonitoAgents", "Project.toml"))
+
+# Where `dev --local` puts the clone for the environment `project` (a
+# Project.toml path): next to it, under `dev/`, named after the repository.
+debug_checkout_dir(project::AbstractString) =
+    joinpath(dirname(abspath(project)), "dev", "BonitoAgents")
+
+# Two clicks racing each other would clone into the same directory twice; the
+# second waits here and then finds the checkout in place.
+const DEBUG_CHECKOUT_LOCK = ReentrantLock()
+
+"""
+    debug_checkout(; repo, rev, packages, project = Base.active_project(),
+                     running_root = source_checkout_root(), logfile)
+        -> (path, mode, created)
+
+Make the BonitoAgents source available on this worker and return where it is.
+`project` is the environment to develop into, `running_root` the checkout this
+process already runs from (if any) and `logfile` where the develop's output
+goes — all parameters so the test suite, which itself runs from a checkout, can
+exercise the clone path against a throwaway environment.
+"""
+function debug_checkout(; repo::AbstractString, rev::AbstractString,
+                          packages::Vector{String},
+                          project::Union{AbstractString,Nothing} = Base.active_project(),
+                          running_root::Union{AbstractString,Nothing} = source_checkout_root(),
+                          logfile::AbstractString = joinpath(config_dir(), "debug_checkout.log"))
+    running_root === nothing || return (path = String(running_root), mode = "running", created = false)
+    project === nothing && error("this worker has no active project to develop the checkout into")
+    isempty(repo) && error("no repository url to clone")
+    isempty(rev) && error("no revision to check out")
+    lock(DEBUG_CHECKOUT_LOCK) do
+        dest = debug_checkout_dir(project)
+        created = false
+        if !ispath(joinpath(dest, ".git"))
+            ispath(dest) && error("$(dest) exists but is not a git checkout; move it away first")
+            mkpath(dirname(dest))
+            created = true
+            try
+                # A full clone, not a shallow one: `rev` is whatever the server
+                # runs — a branch, a tag or a bare sha — and only a full history
+                # is guaranteed to contain a sha. The agent also wants `git log`.
+                git_or_error(`clone $(repo) $(dest)`)
+                git_or_error(`-C $(dest) checkout $(rev)`)
+            catch e
+                # Only a directory WE created is removed, so a retry starts
+                # clean; a pre-existing checkout is never touched.
+                rm(dest; recursive = true, force = true)
+                rethrow(e)
+            end
+        end
+        develop_checkout!(dest, packages, project, logfile)
+        return (path = dest, mode = "developed", created = created)
+    end
+end
+
+# Run one git command; on failure the error carries git's own output, which is
+# the part the user needs ("Repository not found", "could not resolve host",
+# "pathspec 'v9' did not match").
+function git_or_error(args::Cmd)
+    out = IOBuffer()
+    ok = success(pipeline(`git $(args)`; stdout = out, stderr = out))
+    ok && return nothing
+    error("git $(join(args.exec, ' ')) failed:\n$(strip(String(take!(out))))")
+end
+
+# `Pkg.develop` the monorepo packages found under `dest` into `project`, in a
+# subprocess: Pkg in this long-lived process would hold registries and depot
+# state for the rest of the worker's life, and a subprocess also gets the
+# precompile (auto after `develop`) out of our process and into a log. That log
+# is the error message when it fails — the useful line is at its tail.
+function develop_checkout!(dest::AbstractString, packages::Vector{String},
+                           project::AbstractString, logfile::AbstractString)
+    paths = String[]
+    for name in packages
+        p = joinpath(dest, name)
+        if isfile(joinpath(p, "Project.toml"))
+            push!(paths, p)
+        else
+            @warn "BonitoWorker: debug checkout has no package '$(name)'; not developing it" dest
+        end
+    end
+    isempty(paths) && error("none of $(join(packages, ", ")) exist under $(dest)")
+    # The explicit `precompile` is deliberate: the develop's own auto-precompile
+    # is off under `JULIA_PKG_PRECOMPILE_AUTO=0`, and a checkout that is not
+    # precompiled here gets precompiled by the FIRST chat's BonitoMCP spawn
+    # instead — minutes inside claude-agent-acp's MCP start-up timeout.
+    code = "import Pkg; Pkg.develop([Pkg.PackageSpec(path = p) for p in ARGS]); Pkg.precompile()"
+    cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $(code) $(paths)`
+    # `@stdlib` has to be on the load path for `import Pkg`; a parent that pruned
+    # its own load path (`Pkg.test` sets `@:<testdir>`) must not take that away.
+    cmd = addenv(cmd, "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'))
+    mkpath(dirname(logfile))
+    ok = open(logfile, "w") do io
+        success(pipeline(cmd; stdout = io, stderr = io))
+    end
+    ok && return nothing
+    tail = isfile(logfile) ? join(last(readlines(logfile), 30), '\n') : "(no log)"
+    error("Pkg.develop of $(join(basename.(paths), ", ")) into $(project) failed; " *
+          "full log at $(logfile):\n$(tail)")
+end
+
+function debug_checkout_response(request_id::AbstractString, repo::AbstractString,
+                                 rev::AbstractString, packages::Vector{String})
+    try
+        r = debug_checkout(; repo, rev, packages)
+        return Dict("type" => "debug_checkout_response", "request_id" => request_id,
+                    "path" => r.path, "mode" => r.mode, "created" => r.created)
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict("type" => "debug_checkout_response", "request_id" => request_id,
+                    "error" => sprint(showerror, e))
+    end
+end
+
+function handle_debug_checkout(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    repo       = String(get(cmd, "repo", ""))
+    rev        = String(get(cmd, "rev", ""))
+    packages   = Vector{String}(get(cmd, "packages", String[]))
+    response = debug_checkout_response(request_id, repo, rev, packages)
+    try
+        send_control(ws, response)
+    catch e
+        @warn "debug_checkout response failed" exception = e
+    end
+end
+
+# ── Session state: carrying an agent's conversation to another worker ────────
+# Backs "Continue this chat on <worker>". The project's files travel through the
+# server's mirror (RemoteSync); the agent's OWN record of the conversation has to
+# travel too, or the agent on the new machine starts with no memory of the chat.
+# For Claude Code that record is `~/.claude/projects/<encoded cwd>/`: the
+# transcript jsonl, the subagent transcripts and the project memory (see
+# `AgentProviders.session_state_format`). Three RPCs, all driven by the server:
+#
+#     {type:"stage_session", request_id, provider, cwd, session_id, staging}
+#  -> {type:"stage_session_response", request_id, path, entries:[...], bytes}
+#        Copy the session's entries out of the transcript dir into `staging`,
+#        so the server pulls exactly that session and nothing else.
+#     {type:"install_session", request_id, provider, cwd, old_cwd, session_id, staging}
+#  -> {type:"install_session_response", request_id, path, entries:[...]}
+#        Move the staged entries into the transcript dir for `cwd` on THIS
+#        worker. The transcript names its working directory on every line and
+#        the agent files the session under the encoded cwd, so the recorded
+#        `old_cwd` is rewritten to `cwd` on the way in. An entry that already
+#        exists as a directory (the project memory) is merged file by file.
+#     {type:"discard_staging", request_id, staging}
+#  -> {type:"discard_staging_response", request_id}
+#        Remove a staging directory (the source side, after the pull).
+#
+# Every `staging` path must be a directory directly under a
+# `.bonitoagents-transfer` folder (`AgentProviders.TRANSFER_DIRNAME`); the worker
+# refuses anything else, so a bad request can never make it copy into, or
+# delete, an arbitrary folder. Errors ride back in the response.
+
+function check_staging_path(staging::AbstractString)
+    isempty(staging) && error("staging path is empty")
+    path = abspath(staging)
+    basename(dirname(path)) == AgentProviders.TRANSFER_DIRNAME ||
+        error("staging path must be a directory under $(AgentProviders.TRANSFER_DIRNAME): $(staging)")
+    return path
+end
+
+function session_format(provider::AbstractString)
+    fmt = AgentProviders.session_state_format(AgentProviders.find_provider(provider))
+    fmt === nothing && error("provider '$(provider)' keeps no session record this worker can move")
+    return fmt
+end
+
+tree_bytes(path::AbstractString) = isdir(path) ?
+    sum(Int[filesize(joinpath(root, f)) for (root, _, files) in walkdir(path) for f in files]; init = 0) :
+    filesize(path)
+
+"""
+    stage_session(; provider, cwd, session_id, staging, home = homedir())
+        -> (path, entries, bytes)
+
+Copy the on-disk record of `session_id` (run by `provider` in `cwd`) into the
+`staging` directory, which is created fresh. Errors when the transcript itself is
+missing; optional entries (subagent transcripts, project memory) are copied when
+present and listed in `entries`.
+"""
+function stage_session(; provider::AbstractString, cwd::AbstractString,
+                         session_id::AbstractString, staging::AbstractString,
+                         home::AbstractString = homedir())
+    isempty(session_id) && error("session id is empty")
+    fmt  = session_format(provider)
+    dest = check_staging_path(staging)
+    src_dir = AgentProviders.transcript_dir(fmt, home, cwd)
+    # Always a fresh directory: a leftover from an interrupted move must not be
+    # mistaken for this session's files.
+    isdir(dest) && rm(dest; recursive = true)
+    mkpath(dest)
+    entries = String[]
+    bytes = 0
+    for e in AgentProviders.session_state_entries(fmt, session_id)
+        src = joinpath(src_dir, e.name)
+        if !ispath(src)
+            if e.required
+                rm(dest; recursive = true)
+                error("no transcript for session $(session_id) under $(src_dir)")
+            end
+            continue
+        end
+        cp(src, joinpath(dest, e.name))
+        push!(entries, e.name)
+        bytes += tree_bytes(src)
+    end
+    return (path = dest, entries = entries, bytes = bytes)
+end
+
+"""
+    install_session(; provider, cwd, old_cwd, session_id, staging, home = homedir())
+        -> (path, entries)
+
+Move a staged session record (see [`stage_session`](@ref)) into the transcript
+directory for `cwd` on this worker, rewriting the working directory recorded in
+the transcripts from `old_cwd` to `cwd`. The staging directory is removed.
+"""
+function install_session(; provider::AbstractString, cwd::AbstractString,
+                           old_cwd::AbstractString, session_id::AbstractString,
+                           staging::AbstractString, home::AbstractString = homedir())
+    isempty(session_id) && error("session id is empty")
+    fmt = session_format(provider)
+    src = check_staging_path(staging)
+    isdir(src) || error("staging directory does not exist: $(src)")
+    dest_dir = AgentProviders.transcript_dir(fmt, home, cwd)
+    relocate_transcripts!(fmt, src, old_cwd, cwd)
+    mkpath(dest_dir)
+    entries = String[]
+    for e in AgentProviders.session_state_entries(fmt, session_id)
+        from = joinpath(src, e.name)
+        if !ispath(from)
+            e.required && error("the staged session has no $(e.name)")
+            continue
+        end
+        place_entry!(from, joinpath(dest_dir, e.name))
+        push!(entries, e.name)
+    end
+    remove_staging!(src)
+    return (path = dest_dir, entries = entries)
+end
+
+# Remove a staging directory, and the transfer folder itself once it holds
+# nothing else — a move leaves no trace under the projects root.
+function remove_staging!(staging::AbstractString)
+    rm(staging; recursive = true, force = true)
+    parent = dirname(staging)
+    isdir(parent) && isempty(readdir(parent)) && rm(parent)
+    return nothing
+end
+
+# Land one staged entry. A directory that already exists at the destination
+# (the project memory, which every session in that cwd shares) is merged file
+# by file, newer files winning; anything else is moved into place.
+function place_entry!(from::AbstractString, to::AbstractString)
+    if isdir(from) && isdir(to)
+        for (root, _, files) in walkdir(from), f in files
+            target = joinpath(to, relpath(joinpath(root, f), from))
+            mkpath(dirname(target))
+            mv(joinpath(root, f), target; force = true)
+        end
+        rm(from; recursive = true)
+    else
+        mv(from, to; force = true)
+    end
+    return nothing
+end
+
+# The transcript names its working directory on every line (`"cwd":"…"`), and
+# the agent files the session under the encoded cwd — so both have to name the
+# NEW directory or the agent won't find its own history. Streamed line by line
+# so a transcript of hundreds of MB never sits in memory at once. The value is
+# matched in its JSON-encoded form, so a path with characters JSON escapes
+# (Windows backslashes) is rewritten correctly. Returns the number of rewritten
+# lines.
+function relocate_transcripts!(::AgentProviders.JsonlTranscripts, dir::AbstractString,
+                               old_cwd::AbstractString, new_cwd::AbstractString)
+    old_cwd == new_cwd && return 0
+    from = "\"cwd\":" * JSON.json(String(old_cwd))
+    to   = "\"cwd\":" * JSON.json(String(new_cwd))
+    n = 0
+    for (root, _, files) in walkdir(dir), f in files
+        endswith(f, ".jsonl") || continue
+        path = joinpath(root, f)
+        tmp  = path * ".relocating"
+        open(tmp, "w") do out
+            for line in eachline(path; keep = true)
+                occursin(from, line) && (n += 1)
+                write(out, replace(line, from => to))
+            end
+        end
+        mv(tmp, path; force = true)
+    end
+    return n
+end
+
+"""
+    discard_staging(; staging)
+
+Remove a staging directory left on this worker by [`stage_session`](@ref).
+"""
+function discard_staging(; staging::AbstractString)
+    remove_staging!(check_staging_path(staging))
+    return nothing
+end
+
+# Run `f` and send `reply` (already carrying `type` + `request_id`) extended with
+# its result, or with `error` when it throws. The reply's type is spelled out at
+# each call site on purpose: the server's dispatch is an allow-list, and the
+# `unit:worker_rpc_dispatch` test pairs every `"type" => "…_response"` literal in
+# this file with an arm over there.
+function reply_with(f, ws, reply::Dict{String,Any})
+    response = try
+        merge(reply, f())
+    catch e
+        e isa InterruptException && rethrow()
+        merge(reply, Dict{String,Any}("error" => sprint(showerror, e)))
+    end
+    try
+        send_control(ws, response)
+    catch e
+        @warn "BonitoWorker: $(reply["type"]) failed to send" exception = e
+    end
+end
+
+function handle_stage_session(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "stage_session_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        r = stage_session(; provider   = String(get(cmd, "provider", "")),
+                            cwd        = String(get(cmd, "cwd", "")),
+                            session_id = String(get(cmd, "session_id", "")),
+                            staging    = String(get(cmd, "staging", "")))
+        Dict{String,Any}("path" => r.path, "entries" => r.entries, "bytes" => r.bytes)
+    end
+end
+
+function handle_install_session(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "install_session_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        r = install_session(; provider   = String(get(cmd, "provider", "")),
+                              cwd        = String(get(cmd, "cwd", "")),
+                              old_cwd    = String(get(cmd, "old_cwd", "")),
+                              session_id = String(get(cmd, "session_id", "")),
+                              staging    = String(get(cmd, "staging", "")))
+        Dict{String,Any}("path" => r.path, "entries" => r.entries)
+    end
+end
+
+function handle_discard_staging(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "discard_staging_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        discard_staging(; staging = String(get(cmd, "staging", "")))
+        Dict{String,Any}()
     end
 end
 
@@ -1569,12 +2854,49 @@ function handle_open_transfer(server_url::String, secret::String,
     end
 end
 
-# Byte-shuttle between WS frame and subprocess stdio
-function relay_ws_to_proc(ws, proc)
+# Complete our MCP launch environment at the worker, which knows the reachable
+# server URL. In particular, Codex does not inherit arbitrary parent env vars.
+# Only touch our injected stdio entry; other MCP servers and ACP traffic retain
+# their original configuration. Apply on both new and resumed sessions.
+function inject_mcp_server_url(line::String, server_url::AbstractString;
+                               mcp_relay = nothing, owner::AbstractString = "")
+    isempty(server_url) && mcp_relay === nothing && return line
+    msg = JSON.parse(line)
+    msg isa AbstractDict || return line
+    get(msg, "method", nothing) in ("session/new", "session/load", "session/fork", "session/resume") || return line
+    params = get(msg, "params", nothing)
+    params isa AbstractDict || return line
+    servers = get(params, "mcpServers", nothing)
+    servers isa AbstractVector || return line
+    changed = false
+    for mcp in servers
+        mcp isa AbstractDict || continue
+        get(mcp, "name", nothing) == "btworker" || continue
+        get(mcp, "type", "stdio") == "stdio" || continue
+        env = get!(mcp, "env", Any[])
+        values = Dict(String(e["name"]) => String(e["value"]) for e in env)
+        # The URL remains available to the separate rich-display bridge. Control
+        # requests use only the local grant; they need no server address/secret.
+        isempty(server_url) || (values["BONITOAGENTS_SERVER_URL"] = String(server_url))
+        if mcp_relay !== nothing
+            project_id = get(values, "BONITOAGENTS_PROJECT_ID", "")
+            isempty(project_id) && error("injected MCP is missing its chat identity")
+            merge!(values, mcp_relay_env(mcp_relay, project_id; owner))
+        end
+        mcp["env"] = [Dict("name" => k, "value" => v) for (k, v) in sort!(collect(values); by = first)]
+        changed = true
+    end
+    return changed ? JSON.json(msg) : line
+end
+
+# Byte-shuttle between WS frame and subprocess stdio, with the worker's URL
+# supplied explicitly in our MCP launch configuration.
+function relay_ws_to_proc(ws, proc; server_url::AbstractString = "",
+                          mcp_relay = nothing, owner::AbstractString = "")
     try
         while !WebSockets.isclosed(ws)
             frame = WebSockets.receive(ws)
-            line  = String(frame)
+            line  = inject_mcp_server_url(String(frame), server_url; mcp_relay, owner)
             endswith(line, '\n') || (line *= "\n")
             write(proc.in, line)
             flush(proc.in)
@@ -1678,6 +3000,8 @@ by `last_used` descending. Each entry has:
                         `running = false`.
 - `pid`               — set only when `running === true`; the OS PID of the
                         live Claude CLI process. `nothing` otherwise.
+- `provider`          — which agent owns the session, as a wire name
+                        ("KimiCode"). Absent on rows from the Claude file scan.
 - `first_prompt`      — short preview of the first user-message text in the
                         jsonl (whitespace-collapsed, truncated to
                         PREVIEW_MAX_CHARS). `nothing` if the jsonl contains no
@@ -1761,44 +3085,13 @@ function scan_jsonl_metadata(jsonl::AbstractString)
     return (cwd, preview)
 end
 
-# Pseudo-XML wrappers Claude Code injects into "user" messages: IDE context,
-# system reminders, slash-command invocations, local bash command caveats and
-# output, and an ever-growing list of others. The FIRST user records in a
-# session are usually wholly these, so the literal first user text gives a
-# useless preview like "<ide_opened_file>The user opened the file …".
-#
-# Rather than enumerate the tag names (the list keeps growing — every new
-# Claude Code release adds wrappers like `<local-command-caveat>`), we strip
-# ANY leading `<tag>…</tag>` block whose closer matches the opener, and skip
-# messages whose remainder still starts with a bare opener — those are
-# system-commentary records (e.g. `<ide_opened_file>The user opened …` with
-# no closing tag) and contain no user prose.
-const LEADING_TAG_BLOCK  = r"\A\s*<\s*([A-Za-z][\w-]*)\s*>.*?<\s*/\s*\1\s*>"is
-const LEADING_TAG_OPENER = r"\A\s*<\s*[A-Za-z][\w-]*\s*>"
-
-function strip_injected_context(raw::AbstractString)
-    s = String(raw)
-    # Strip closed leading blocks one at a time. Slash-command lines emit
-    # several adjacent blocks (`<command-name>…</command-name>\n<command-args>…`),
-    # so we loop until no leading block remains.
-    while occursin(LEADING_TAG_BLOCK, s)
-        s = replace(s, LEADING_TAG_BLOCK => ""; count = 1)
-    end
-    return strip(s)
-end
-
-# The real user prose from a message, or `nothing` if the message is purely
-# injected context / tooling noise (so the scan keeps looking for a real one).
-function meaningful_prompt(raw::AbstractString)
-    s = strip_injected_context(raw)
-    isempty(s) && return nothing
-    # A leftover bare opener (e.g. `<ide_opened_file>The user opened …` with
-    # no `</ide_opened_file>`) is system commentary, not user text — skip it
-    # so the scan picks up the next real user message.
-    occursin(LEADING_TAG_OPENER, s) && return nothing
-    startswith(s, "Caveat: The messages below were generated by the user") && return nothing
-    return s
-end
+# Wrapper-stripping lives in AgentProviders (shared with the server, dispatched
+# per provider) — see `strip_injected_context` there. These records come from
+# `~/.claude/projects/*.jsonl`, so the provider is Claude by construction.
+# `find_provider` hands back the memoised singleton; constructing a descriptor
+# per record would re-run `Sys.which` on every line of every scanned session.
+meaningful_prompt(raw::AbstractString) =
+    AgentProviders.meaningful_prompt(AgentProviders.find_provider("ClaudeCode"), raw)
 
 # Return the real user prose from one jsonl record, or `nothing` if this record
 # isn't a real user prompt (wrong role, or wholly injected context — see
@@ -1981,15 +3274,178 @@ function handle_scan_sessions(ws, cmd::AbstractDict)
         @warn "BonitoWorker: scan_claude_sessions failed" exception=e
         Dict{String,Any}[]
     end
+    # …plus every other provider that can list its own sessions over ACP.
+    append!(sessions, scan_acp_providers())
     try
-        WebSockets.send(ws, JSON.json(Dict(
+        send_control(ws, Dict(
             "type"       => "scan_sessions_result",
             "request_id" => request_id,
             "sessions"   => sessions,
-        )))
+        ))
     catch e
         @warn "BonitoWorker: scan_sessions response failed" exception=e
     end
+end
+
+"""
+    scan_acp_providers() -> Vector{Dict}
+
+Discovered sessions from every installed provider that can list its own over
+ACP, in the same row shape as `scan_claude_sessions`.
+
+Claude keeps its sessions as files we can walk (`~/.claude/projects`), which is
+why discovery started there — but that only ever finds Claude. ACP has a
+`session/list` method, advertised via `agentCapabilities.sessionCapabilities.list`,
+so any agent that supports it can be asked directly. Verified against kimi
+0.29.2, which returns `{sessionId, cwd, title, updatedAt}` per session plus a
+`nextCursor`.
+
+Costs one short-lived agent process per provider, so it runs only on an explicit
+scan (first connect / Rescan), never per chat. Providers whose binary isn't
+installed, or that don't advertise `list`, are skipped.
+"""
+function scan_acp_providers()
+    rows = Dict{String,Any}[]
+    for prov in AgentProviders.current_providers()
+        prov isa AgentProviders.BinAgent || continue
+        # ClaudeCode is covered by the file scan (which also yields subagents,
+        # liveness and pids that `session/list` doesn't carry).
+        prov isa AgentProviders.ClaudeCodeAgent && continue
+        isfile(prov.bin) || Sys.which(prov.bin) !== nothing || continue
+        try
+            append!(rows, acp_list_sessions(prov))
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "BonitoWorker: ACP session listing failed" provider=AgentProviders.provider_name(prov) exception=e
+        end
+    end
+    return rows
+end
+
+# A session/list `title` cleaned the same way the file scan cleans a first
+# prompt. Wholly-injected titles (a resumed session's transcript preamble) have
+# no user prose to show, so fall back to the truncated raw text rather than a
+# blank row.
+function acp_title(raw)
+    raw isa AbstractString && !isempty(strip(raw)) || return ""
+    s = String(raw)
+    # A provider switch replays the chat as a prelude, so the FIRST prompt of
+    # the new session is that whole transcript and the session lists as "Below
+    # is a transcript of our previous conversation…". The user's actual text
+    # follows the last divider.
+    m = findlast("My new message:", s)
+    if m !== nothing
+        s = String(strip(s[nextind(s, last(m)):end]))
+    elseif startswith(s, "Below is a transcript of our previous conversation")
+        # Agents truncate the title (kimi at ~200 chars), so the divider is
+        # often cut off — the real message is simply not in the string. Better
+        # an empty preview, which falls back to the folder name, than a row
+        # titled with our own prelude.
+        return ""
+    end
+    isempty(s) && return ""
+    t = meaningful_prompt(s)
+    return clean_preview(t === nothing ? s : t)
+end
+
+# ISO-8601 (`2026-07-29T11:58:30.751Z`) → epoch seconds, to match the mtime the
+# file scan reports. Unparseable stamps sort last rather than throwing.
+function acp_epoch(s)
+    s isa AbstractString && !isempty(s) || return 0.0
+    try
+        return datetime2unix(DateTime(first(s, 19), dateformat"yyyy-mm-ddTHH:MM:SS"))
+    catch e
+        e isa InterruptException && rethrow()
+        return 0.0
+    end
+end
+
+# Drive one provider's `session/list` over stdio and normalize the result.
+#
+# This spawns a REAL provider process, so it is spawned and reaped exactly like a
+# chat session: stamped via `provider_env`, `detach`ed so it leads its own group,
+# and torn down with `kill_proc!`. It used to be a bare `open(Cmd(...))` reaped
+# with a bare SIGTERM, and both halves of that leaked — a `julia -m MockACP`
+# still precompiling outlives SIGTERM, and with no ownership mark and no group of
+# its own the survivor was invisible to `reap_agents_owned_by` AND to the group
+# kill. Measured at 7 orphans (~500 MB each) over one e2e run.
+function acp_list_sessions(prov; timeout::Real = 20.0)
+    proc = open(detach(Cmd(`$(prov.bin) $(prov.args)`; env = provider_env(prov))), "r+")
+    rows = Dict{String,Any}[]
+    try
+        replies = Dict{Int,Any}()
+        reader = @async begin
+            for line in eachline(proc)
+                isempty(strip(line)) && continue
+                msg = nothing
+                try
+                    msg = JSON.parse(line)
+                catch e
+                    e isa InterruptException && rethrow()
+                    msg = nothing             # notifications we don't care about
+                end
+                msg isa AbstractDict && haskey(msg, "id") &&
+                    (replies[Int(msg["id"])] = msg)
+            end
+        end
+        Base.errormonitor(reader)
+        ask(id, method, params) = begin
+            write(proc, JSON.json(Dict("jsonrpc" => "2.0", "id" => id,
+                                       "method" => method, "params" => params)), "\n")
+            flush(proc)
+            t0 = time()
+            while !haskey(replies, id) && !istaskdone(reader) && time() - t0 < timeout
+                sleep(0.05)
+            end
+            get(replies, id, nothing)
+        end
+
+        init = ask(0, "initialize", Dict(
+            "protocolVersion" => 1,
+            "clientCapabilities" => Dict(
+                "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
+                "elicitation" => prov.elicitation)))
+        init isa AbstractDict && haskey(init, "result") || return rows
+        caps = get(get(init["result"], "agentCapabilities", Dict()), "sessionCapabilities", nothing)
+        caps isa AbstractDict && haskey(caps, "list") || return rows   # can't list
+
+        kind = AgentProviders.provider_name(prov)
+        id, cursor = 1, nothing
+        while true
+            params = cursor === nothing ? Dict{String,Any}() : Dict("cursor" => cursor)
+            resp = ask(id, "session/list", params)
+            resp isa AbstractDict && haskey(resp, "result") || break
+            res = resp["result"]
+            for s in get(res, "sessions", [])
+                s isa AbstractDict || continue
+                cwd = String(get(s, "cwd", ""))
+                isempty(cwd) && continue
+                push!(rows, Dict{String,Any}(
+                    "path"              => cwd,
+                    "name"              => basename(cwd),
+                    "session_id"        => String(get(s, "sessionId", "")),
+                    "last_used"         => acp_epoch(get(s, "updatedAt", "")),
+                    "kind"              => "session",
+                    "agent_type"        => nothing,      # not a subagent
+                    "provider"          => kind,
+                    "parent_session_id" => nothing,
+                    "running"           => false,   # not reported by session/list
+                    "pid"               => nothing,
+                    # `title` is the raw first prompt, so it carries the same
+                    # injected-context noise the file scan already strips (a
+                    # resumed session shows up titled "Below is a transcript of
+                    # our previous conversation…").
+                    "first_prompt"      => acp_title(get(s, "title", "")),
+                ))
+            end
+            cursor = get(res, "nextCursor", nothing)
+            cursor === nothing && break
+            id += 1
+        end
+    finally
+        kill_proc!(proc)
+    end
+    return rows
 end
 
 # Locate an executable on PATH. On Windows, `Sys.which` finds `.exe` but does
@@ -2011,6 +3467,637 @@ function find_agent_bin()
     bin = which_executable("claude-agent-acp")
     bin !== nothing && return bin
     return "claude-agent-acp"
+end
+
+# ── git diff RPC (backs the change-review tab) ───────────────────────────────
+# The review tab asks "what has changed in this folder?" and gets back ONE
+# unified patch, parsed on the server (review.jl). Doing the parse there rather
+# than here keeps this side to plumbing and makes the parser testable headlessly.
+#
+#     {type:"git_diff", request_id, path, base?}
+#  -> {type:"git_diff_response", request_id, repo, branch, head, base, patch}
+#     {type:"git_diff_response", request_id, error:"..."}
+#
+# `base` empty ⇒ the working tree against HEAD, i.e. everything the agent has
+# touched and not committed — the common case for reviewing a turn's work.
+# Otherwise it's the working tree against that ref (a branch, a tag, a sha), for
+# reviewing a whole feature branch.
+#
+# UNTRACKED files are included as synthetic "new file" patches. Without them a
+# review of an agent's work silently misses every file it CREATED, which is
+# usually the most important thing to look at.
+
+# Run a git command in `dir`, returning (ok, stdout). Never throws: a non-zero
+# exit is an answer here (no commits yet, not a repo, unknown ref), and each
+# caller decides what that means.
+function git_capture(dir::AbstractString, args::Cmd)
+    out = IOBuffer()
+    ok = try
+        # LC_ALL/GIT_* pinned so we parse a stable, un-localised, un-paged,
+        # un-coloured output no matter how the user's git is configured.
+        cmd = setenv(`git -C $dir $args`,
+                     merge(ENV, Dict("LC_ALL" => "C", "GIT_PAGER" => "cat",
+                                     "GIT_OPTIONAL_LOCKS" => "0", "GIT_CONFIG_NOSYSTEM" => "1")))
+        success(pipeline(cmd; stdout = out, stderr = devnull))
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "git_capture failed" dir args exception = e
+        false
+    end
+    return (ok = ok, out = String(take!(out)))
+end
+
+# The empty-tree object. Diffing against it is how you get "everything is new"
+# on a repo with no commits yet — `git diff HEAD` there just fails.
+const GIT_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# Untracked files are capped: a review pane is not the place to render a
+# node_modules someone forgot to ignore, and a 5 MB generated file adds nothing.
+const GIT_UNTRACKED_MAX_FILES = 200
+const GIT_UNTRACKED_MAX_BYTES = 512 * 1024
+
+# A synthetic unified-diff section for an untracked file, so it reads exactly
+# like a git-reported addition. Binary / oversized files get the same "Binary
+# files differ" line git itself emits, so the server's parser needs no special
+# case for them.
+function untracked_patch(root::AbstractString, rel::AbstractString)
+    abs = joinpath(root, rel)
+    isfile(abs) || return ""
+    header = "diff --git a/$(rel) b/$(rel)\nnew file mode 100644\n"
+    sz = filesize(abs)
+    sz > GIT_UNTRACKED_MAX_BYTES &&
+        return header * "Binary files /dev/null and b/$(rel) differ\n"
+    bytes = try
+        read(abs)
+    catch e
+        e isa InterruptException && rethrow()
+        # Returning "" would drop the file from the review with nothing said —
+        # the reviewer would see a diff that silently omits a new file. Say it
+        # in the log AND in the patch, so the omission is visible where the
+        # decision is being made. (A `git status` race — the file vanished
+        # between listing and reading — is the common case; a permission
+        # problem is the other.)
+        @warn "untracked_patch: could not read a new file; it is listed but not shown" path = abs exception = e
+        return header * "Binary files /dev/null and b/$(rel) differ\n"
+    end
+    0x00 in view(bytes, 1:min(length(bytes), 8192)) &&
+        return header * "Binary files /dev/null and b/$(rel) differ\n"
+    text = String(bytes)
+    lines = split(text, '\n')
+    # A file with a trailing newline splits into a final empty element that is
+    # NOT a line of the file.
+    endswith(text, '\n') && !isempty(lines) && pop!(lines)
+    isempty(lines) && return header * "--- /dev/null\n+++ b/$(rel)\n"
+    io = IOBuffer()
+    print(io, header, "--- /dev/null\n+++ b/$(rel)\n@@ -0,0 +1,$(length(lines)) @@\n")
+    for l in lines
+        println(io, "+", l)
+    end
+    endswith(text, '\n') || println(io, "\\ No newline at end of file")
+    return String(take!(io))
+end
+
+# Computed diff vs. what the reviewer wants to see — untracked files the agent
+# created are visible only via patches fabricating "new file" hunks, so the
+# agent's work arrives intact.
+#
+#     {type:"git_diff", request_id, path, base}
+#  -> EITHER {type:"git_diff_response", request_id, error:"..."}  (one frame)
+#     OR (chunked — multi-MB patches must not stall heartbeat pongs with one
+#         giant send; each frame ≤ GIT_DIFF_CHUNK_BYTES, metadata rides frame 1)
+#        {type:"git_diff_chunk", request_id, index, total,
+#         repo, branch, head, base, scope,        # only on index == 1
+#         chunk:"…"}                              # every frame
+#     `total == 1` degenerates to today's single-frame shutdown, so callers can
+#     treat "one chunk" and "one response" as the same turn.
+const GIT_DIFF_CHUNK_BYTES = 256 * 1024
+
+function git_diff_response(request_id::AbstractString, path::AbstractString,
+                           base::AbstractString)
+    try
+        isempty(path) && error("missing path")
+        isdir(path) || error("not a directory: $path")
+        top = git_capture(path, `rev-parse --show-toplevel`)
+        top.ok || error("not a git repository: $path")
+        root = strip(top.out)
+
+        head_res = git_capture(root, `rev-parse --short HEAD`)
+        head = head_res.ok ? strip(head_res.out) : ""
+        branch_res = git_capture(root, `rev-parse --abbrev-ref HEAD`)
+        branch = branch_res.ok ? strip(branch_res.out) : ""
+
+        # Empty base ⇒ working tree vs HEAD (vs the empty tree on a fresh repo,
+        # where HEAD doesn't resolve). An explicit base is used verbatim so the
+        # user can review against a branch, tag or sha.
+        effective = isempty(base) ? (isempty(head) ? GIT_EMPTY_TREE : "HEAD") : base
+
+        # Scope the diff to the FOLDER that was asked about, not the whole
+        # repository. A project is routinely a package inside a bigger checkout,
+        # and reviewing `dev/Foo` should not hand you every change in the
+        # monorepo. `.` (project == repo root) means no pathspec at all, which
+        # keeps the common case byte-identical to before.
+        rel = relpath(abspath(path), root)
+        scope = (rel == "." || startswith(rel, "..")) ? String[] : [rel]
+
+        diff = git_capture(root,
+            `diff --no-color --no-ext-diff --find-renames -U3 $effective -- $scope`)
+        diff.ok || error("git diff against '$(effective)' failed (unknown ref?)")
+        patch = diff.out
+
+        untracked = git_capture(root, `ls-files --others --exclude-standard -z -- $scope`)
+        if untracked.ok
+            rels = filter(!isempty, split(untracked.out, '\0'))
+            for rel in Iterators.take(rels, GIT_UNTRACKED_MAX_FILES)
+                patch *= untracked_patch(root, String(rel))
+            end
+        end
+
+        return Dict("type" => "git_diff_response", "request_id" => request_id,
+                    "repo" => root, "branch" => branch, "head" => head,
+                    "base" => effective, "patch" => patch,
+                    # "" ⇒ the whole repo; otherwise the sub-path the diff was
+                    # limited to, so the UI can say so rather than showing a repo
+                    # root next to a diff that is not the repo's.
+                    "scope" => isempty(scope) ? "" : first(scope))
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict("type" => "git_diff_response", "request_id" => request_id,
+                    "error" => sprint(showerror, e))
+    end
+end
+
+# Split the reply into ≤ GIT_DIFF_CHUNK_BYTES frames; metadata (repo/branch/
+# head/base/scope) rides frame 1 only, every frame carries `chunk`. The ERROR
+# path keeps the old single `git_diff_response` frame: the server routes it via
+# `deliver_rpc_response!`, which also resolves a chunked registration, so an
+# older server without the `git_diff_chunk` arm still sees every error.
+function handle_git_diff(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    response = git_diff_response(request_id,
+                                 String(get(cmd, "path", "")),
+                                 String(get(cmd, "base", "")))
+    if haskey(response, "error")
+        # One frame, still `git_diff_response` shaped: the server routes it via
+        # `deliver_rpc_response!`, which also resolves a chunked registration.
+        try
+            send_control(ws, response)
+        catch e
+            @warn "git_diff error response failed" exception = e
+        end
+        return
+    end
+    chunks = chunk_string(String(response["patch"]))
+    total  = length(chunks)
+    for (idx, chunk) in enumerate(chunks)
+        frame = Dict{String,Any}("type" => "git_diff_chunk",
+                                 "request_id" => request_id,
+                                 "index" => idx, "total" => total,
+                                 "chunk" => chunk)
+        if idx == 1
+            for k in ("repo", "branch", "head", "base", "scope")
+                frame[k] = String(get(response, k, ""))
+            end
+        end
+        try
+            send_control(ws, frame)
+        catch e
+            @warn "git_diff chunk send failed" request_id index=idx total=total exception = e
+            return
+        end
+    end
+    return
+end
+
+# ── finding the repositories under a folder ─────────────────────────────────
+# A project folder is very often NOT itself a checkout — it's a workspace that
+# HOLDS several, one per dependency being developed. The review tab has to be
+# able to point at one of those, so it needs the list.
+#
+#     {type:"find_repos", request_id, path, max_depth?}
+#  -> {type:"find_repos_response", request_id, path, repos:[abs…],
+#      truncated:Bool, unreadable:Int}
+#     {type:"find_repos_response", request_id, error:"..."}
+#
+# The list is what the picker offers, so it has to arrive while the tab is
+# opening, not seconds later. Three things keep it cheap, and all three matter:
+#
+#   • STOP AT A HIT. A directory holding `.git` is a repository and we don't
+#     descend into it. This is the big one: a checkout is where the files
+#     actually are, so walking into one costs more than the entire rest of the
+#     scan (unpruned, a tree with Makie in it takes ~15× longer and finds
+#     exactly the same repositories).
+#   • DEPTH LIMIT. Checkouts live near the top of a workspace — `dev/Foo`, not
+#     `a/b/c/d/e/Foo`. Past a few levels the scan is paying for depth nobody
+#     organises their code at.
+#   • DIRECTORY BUDGET. Depth alone doesn't bound a tree that is wide rather
+#     than deep, and this runs while a user waits.
+#
+# Measured on a real workspace (11 checkouts, one of them Makie): 28 readdirs,
+# 158 stats, ~10 ms warm. A whole `$HOME` — far wider than this is meant for —
+# stays under 50 ms.
+const FIND_REPOS_MAX_DEPTH = 4
+const FIND_REPOS_MAX_DIRS  = 4000
+
+"""
+    find_repos(root; max_depth) -> (repos, truncated, unreadable)
+
+Absolute paths of the git checkouts at or under `root`, breadth-first so the
+shallow ones (the ones a workspace is organised around) are found first and a
+truncated scan is still the useful half.
+
+`truncated` says the budget ran out — the caller MUST surface that rather than
+present a partial list as the whole answer. `unreadable` counts directories that
+could not be listed: a scan across a whole home directory routinely crosses a few
+of those, and it is a fact about the result, not a failure to abort on.
+"""
+function find_repos(root::AbstractString; max_depth::Int = FIND_REPOS_MAX_DEPTH,
+                                          max_dirs::Int = FIND_REPOS_MAX_DIRS)
+    repos = String[]
+    unreadable = 0
+    visited = 0
+    truncated = false
+    queue = Tuple{String,Int}[(abspath(root), 0)]
+    while !isempty(queue)
+        if visited >= max_dirs
+            truncated = true
+            break
+        end
+        dir, depth = popfirst!(queue)
+        visited += 1
+        names = try
+            readdir(dir)
+        catch e
+            # EACCES on a directory we may not list, ENOTDIR on something that
+            # stopped being a directory between the stat and here. Both are
+            # ordinary facts about a filesystem walk — counted and reported, not
+            # swallowed and not fatal. Anything else is a real bug: rethrow.
+            e isa Base.IOError || rethrow()
+            unreadable += 1
+            continue
+        end
+        # `.git` is a DIRECTORY in a normal checkout and a FILE in a worktree or
+        # submodule ("gitdir: …"). Both are repositories to git, so test for the
+        # name rather than for a directory.
+        if ".git" in names
+            push!(repos, dir)
+            continue
+        end
+        depth >= max_depth && continue
+        for name in names
+            # Hidden directories hold caches, not the checkouts a user reviews —
+            # and `.git` itself is the one we just ruled out.
+            startswith(name, '.') && continue
+            child = joinpath(dir, name)
+            # `islink` before `isdir`: `isdir` FOLLOWS links, so a link pointing
+            # at an ancestor turns the walk into an infinite one.
+            islink(child) && continue
+            isdir(child) && push!(queue, (child, depth + 1))
+        end
+    end
+    return (repos = repos, truncated = truncated, unreadable = unreadable)
+end
+
+function find_repos_response(request_id::AbstractString, path::AbstractString,
+                             max_depth::Int)
+    try
+        isempty(path) && error("missing path")
+        isdir(path) || error("not a directory: $path")
+        found = find_repos(path; max_depth = max_depth)
+        return Dict("type" => "find_repos_response", "request_id" => request_id,
+                    "path" => abspath(path), "repos" => found.repos,
+                    "truncated" => found.truncated, "unreadable" => found.unreadable)
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict("type" => "find_repos_response", "request_id" => request_id,
+                    "error" => sprint(showerror, e))
+    end
+end
+
+function handle_find_repos(ws, cmd::AbstractDict)
+    depth = get(cmd, "max_depth", FIND_REPOS_MAX_DEPTH)
+    response = find_repos_response(String(get(cmd, "request_id", "")),
+                                   String(get(cmd, "path", "")),
+                                   depth isa Integer ? Int(depth) : FIND_REPOS_MAX_DEPTH)
+    try
+        send_control(ws, response)
+    catch e
+        @warn "find_repos response failed" exception = e
+    end
+end
+
+# ── our own log file (the debug chat's view of ANY machine's log) ────────────
+# A dev-mode chat always runs on a WORKER, and nothing but the server runs on the
+# server host — so an agent debugging an incident can natively read exactly one
+# machine's log: the one it sits on. This is the reader both sides use;
+# BonitoAgents depends on BonitoWorker, so the server calls it directly for its
+# own file and asks each worker over the control WS for theirs.
+#
+# We write the file ourselves rather than reading journald. journald would work
+# on the Linux boxes and nowhere else — half this fleet is macOS and Windows —
+# and reading a system unit's journal also depends on the reading user's groups.
+# A plain file has neither problem, needs no subprocess, and we control rotation.
+#
+# The critical design point, and the reason this is a REDIRECT of fd 1/2 rather
+# than a logger sink: the evidence that matters most never passes through the
+# logger. `errormonitor` prints "UNHANDLED TASK ERROR" straight to stderr, and
+# the runtime's fatal-signal handler writes its thread dump to fd 2 from C. A
+# sink that only saw `@info`/`@warn`/`@error` would have missed BOTH on
+# 2026-09-11. Measured: with the file-backed redirect below, an `@info` record, a
+# bare `println`, an errormonitor failure and a `signal 15` thread dump all land
+# in the file. A PIPE-backed redirect would also capture them but needs a live
+# task to drain it — which is exactly what a dying process does not have — so it
+# would lose the crash dump. File-backed it is.
+
+const LOG_MAX_BYTES  = 32 * 1024 * 1024   # per generation; two are kept
+const LOG_TAIL_BYTES = 4 * 1024 * 1024    # the most we ever read back
+const LOG_MAX_LINES  = 2000               # …and the most we ever return
+const LOG_ROTATE_CHECK_S = 30.0
+
+# Process-global because the thing it describes — fd 1 and fd 2 — is.
+const LOG_FILE   = Ref("")
+const LOG_HANDLE = Ref{Union{IOStream,Nothing}}(nothing)
+
+"""
+    log_file_path() -> String
+
+Where this process is writing its log, or `""` if [`start_file_log!`](@ref) was
+never called (a REPL, a test runner, an embedder that wants its own output).
+"""
+log_file_path() = LOG_FILE[]
+
+# Timestamps on our own records, because a log you cannot line up against
+# another machine's answers nothing. Lines we do NOT format — stack traces, a
+# signal dump, whatever a dependency prints — stay verbatim and are read as
+# continuations of the stamped record above them (see `read_log_file`).
+#
+# Written against `Base.CoreLogging` and `Libc.strftime` rather than the
+# `Logging` stdlib's `ConsoleLogger`: `ConsoleLogger` is not in Base, and this
+# package's dependencies are deliberately few. One record is ONE stamped line
+# plus indented continuations, which is what makes the file greppable and what
+# `read_log_file`'s time filter parses.
+const CoreLogging = Base.CoreLogging
+
+struct TimestampLogger <: CoreLogging.AbstractLogger
+    stream    :: IO
+    min_level :: CoreLogging.LogLevel
+end
+
+CoreLogging.min_enabled_level(l::TimestampLogger) = l.min_level
+CoreLogging.shouldlog(::TimestampLogger, level, _module, group, id) = true
+# A throwing `show` on a logged value must not take the process down from
+# inside logging; report it in place instead.
+CoreLogging.catch_exceptions(::TimestampLogger) = true
+
+function CoreLogging.handle_message(l::TimestampLogger, level, message, _module, group,
+                                    id, file, line; kwargs...)
+    buf = IOBuffer()
+    print(buf, Libc.strftime("%Y-%m-%dT%H:%M:%S", time()), ' ',
+          uppercase(string(level)), ": ", message)
+    for (k, v) in kwargs
+        print(buf, "  ", k, "=", v)
+    end
+    print(buf, "  @ ", _module, ' ', basename(String(something(file, ""))), ':', line)
+    # Indent every continuation so one record stays one visual block and the
+    # stamp regex cannot match mid-record.
+    println(l.stream, replace(String(take!(buf)), '\n' => "\n    "))
+    flush(l.stream)
+    return nothing
+end
+
+"""
+    start_file_log!(path; redirect = true, max_bytes = LOG_MAX_BYTES,
+                    timestamps = true) -> String
+
+Declare `path` to be this process's log — the file [`read_log_file`](@ref) serves
+— and make sure everything this process emits lands in it. Returns the path;
+idempotent, so two `serve()` calls in one process share the file.
+
+`redirect` is the difference between the two callers:
+
+  * `true` (the SERVER) — we point fd 1 and fd 2 at the file ourselves, and we
+    own rotation because we own the descriptors.
+  * `false` (the WORKER) — our PARENT already did it: `spawn_worker` launches us
+    with `stdout`/`stderr` piped to this exact file, which is strictly better
+    than doing it here because it also captures whatever Julia prints before
+    this code runs (precompilation, a load error). Redirecting again would point
+    us at a second file and split the log in half, and rotating would rename the
+    file out from under the parent's descriptor — which follows the inode, so
+    every later line would vanish into an unlinked file.
+
+`timestamps` installs [`TimestampLogger`](@ref) either way, since `since`/`until`
+in `read_log_file` need something to match.
+"""
+function start_file_log!(path::AbstractString; redirect::Bool = true,
+                         max_bytes::Integer = LOG_MAX_BYTES, timestamps::Bool = true)
+    LOG_FILE[] == String(path) && return LOG_FILE[]
+    mkpath(dirname(String(path)))
+    if redirect
+        io = open(String(path), "a")
+        redirect_stdout(io)
+        redirect_stderr(io)
+        LOG_HANDLE[] = io
+    end
+    LOG_FILE[] = String(path)
+    timestamps && CoreLogging.global_logger(TimestampLogger(stderr, CoreLogging.Info))
+    redirect && Base.errormonitor(@async while true
+        sleep(LOG_ROTATE_CHECK_S)
+        rotate_log_if_big!(Int(max_bytes))
+    end)
+    return LOG_FILE[]
+end
+
+# Two generations, `path` and `path.1`, so the disk cost is bounded at
+# 2 × max_bytes no matter how long the process runs. The order matters: point
+# fd 1/2 at the NEW file before closing the old handle, or output written in
+# between is lost rather than merely landing in `.1`.
+function rotate_log_if_big!(max_bytes::Int)
+    path = LOG_FILE[]
+    isempty(path) && return nothing
+    (isfile(path) && filesize(path) > max_bytes) || return nothing
+    old = LOG_HANDLE[]
+    mv(path, path * ".1"; force = true)
+    io = open(path, "a")
+    redirect_stdout(io)
+    redirect_stderr(io)
+    LOG_HANDLE[] = io
+    old === nothing || close(old)
+    return nothing
+end
+
+# Read back at most the last LOG_TAIL_BYTES: the file is bounded but still tens
+# of megabytes, and seeking beats reading it whole.
+function tail_lines(path::AbstractString)
+    sz = filesize(path)
+    from = max(0, sz - LOG_TAIL_BYTES)
+    text = open(path, "r") do io
+        seek(io, from)
+        read(io, String)
+    end
+    ls = split(text, '\n')
+    # A seek lands mid-line; that fragment is not a line.
+    from > 0 && !isempty(ls) && popfirst!(ls)
+    return [String(l) for l in ls if !isempty(l)]
+end
+
+# Our stamps are ISO and fixed-width, so a lexicographic compare IS a time
+# compare, and a shorter bound ("2026-09-11 14:40") compares correctly as a
+# prefix. `T` or space both work on input.
+normalize_stamp(s::AbstractString) = replace(strip(String(s)), ' ' => 'T')
+const STAMP_RE = r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+
+"""
+    read_log_file(; path = log_file_path(), lines = 200, grep = "", since = "", until = "")
+
+This machine's log, newest last. Always returns a Dict — a process that never
+started a log file is an ANSWER, not an exception, because the fan-out across a
+fleet must report that machine rather than fail on it.
+
+Untimestamped lines (stack traces, a signal dump) inherit the timestamp of the
+record above them, so `since`/`until` keep a trace attached to the line that
+raised it instead of slicing it in half.
+"""
+function read_log_file(; path::AbstractString = log_file_path(), lines::Integer = 200,
+                       grep::AbstractString = "", since::AbstractString = "",
+                       until::AbstractString = "")
+    host = gethostname()
+    base = Dict{String,Any}("host" => host, "path" => String(path))
+    isempty(path) && return merge(base, Dict{String,Any}("ok" => false,
+        "error" => "this process is not writing a log file (start_file_log! was never called)"))
+    isfile(path) || return merge(base, Dict{String,Any}("ok" => false,
+        "error" => "no log file at $path on $host"))
+
+    ls = tail_lines(path)
+    note = ""
+    lo, hi = normalize_stamp(since), normalize_stamp(until)
+    if !isempty(lo) || !isempty(hi)
+        cur, saw_stamp = "", false
+        ls = [l for l in ls if begin
+            m = match(STAMP_RE, l)
+            if m !== nothing
+                cur = String(m.captures[1]); saw_stamp = true
+            end
+            (isempty(lo) || cur >= lo) && (isempty(hi) || cur <= hi)
+        end]
+        # A time filter over a log written before the timestamping logger
+        # existed matches nothing. Say so: an empty list is indistinguishable
+        # from a quiet machine, and that is the wrong thing to conclude.
+        saw_stamp || (note = "no line in the window carries a timestamp — this log " *
+                             "predates the timestamping logger, so `since`/`until` " *
+                             "cannot select from it; retry without them")
+    end
+    isempty(grep) || (needle = lowercase(grep);
+                      ls = [l for l in ls if occursin(needle, lowercase(l))])
+    n = clamp(Int(lines), 1, LOG_MAX_LINES)
+    length(ls) > n && (ls = ls[(end - n + 1):end])
+    r = Dict{String,Any}("ok" => true, "lines" => ls, "returned" => length(ls),
+                         "capped_at" => n, "bytes" => filesize(path))
+    isempty(note) || (r["note"] = note)
+    return merge(base, r)
+end
+
+# The control-WS half of the above.
+#     {type:"read_log", request_id, lines, since, until, grep}
+#  -> {type:"read_log_response", request_id, ok, host, path, lines, …}
+function handle_read_log(ws, cmd::AbstractDict)
+    rid = String(get(cmd, "request_id", ""))
+    response = try
+        r = read_log_file(; lines = Int(get(cmd, "lines", 200)),
+                            since = String(get(cmd, "since", "")),
+                            until = String(get(cmd, "until", "")),
+                            grep  = String(get(cmd, "grep", "")))
+        merge(Dict{String,Any}("type" => "read_log_response", "request_id" => rid), r)
+    catch e
+        e isa InterruptException && rethrow()
+        Dict{String,Any}("type" => "read_log_response", "request_id" => rid,
+                         "ok" => false, "error" => sprint(showerror, e))
+    end
+    try
+        send_control(ws, response)
+    catch e
+        @warn "read_log response failed" exception = e
+    end
+end
+
+# ── worker self-report (the debug chat's view of THIS process) ───────────────
+# The server can describe itself (BonitoAgents' dev_api.jl); this is the other
+# half. A "why is this chat stuck" question is usually answered on the worker:
+# an agent process that died, a session whose dial-back socket is gone, a worker
+# that's been up for a week and grown to several GB.
+#
+#     {type:"worker_state", request_id}
+#  -> {type:"worker_state_response", request_id, …}
+
+const WORKER_STARTED = Ref(0.0)   # set on the first connect_and_serve
+
+# Resident set size in bytes on Linux, `Sys.maxrss()` (the PEAK) elsewhere —
+# the `kind` field says which, because "is it growing" needs the current value.
+function worker_rss()
+    if Sys.islinux() && isfile("/proc/self/statm")
+        fields = split(read("/proc/self/statm", String))
+        length(fields) >= 2 &&
+            return (bytes = parse(Int, fields[2]) * Sys.PAGESIZE, kind = "current")
+    end
+    return (bytes = Sys.maxrss(), kind = "peak")
+end
+
+function worker_state_response(request_id::AbstractString;
+                               mcp_command::AbstractString = "",
+                               mcp_arguments::Vector{String} = String[])
+    try
+        sessions = lock(_SESSION_PROCS_LOCK) do
+            [Dict("cwd" => cwd,
+                  # A session whose agent has exited but whose entry is still
+                  # here is exactly the "chat looks alive, nothing happens" bug.
+                  "agent_running" => !process_exited(e.proc),
+                  # No guard: we hold the `Process` in `_SESSION_PROCS`, so its
+                  # handle is alive and `getpid` can't fail. If that assumption
+                  # ever breaks, the enclosing try reports it as an `error` field
+                  # rather than quietly reporting a session with no pid.
+                  "agent_pid" => Int(getpid(e.proc)),
+                  "acp_socket" => e.ws !== nothing)
+             for (cwd, e) in _SESSION_PROCS]
+        end
+        rss = worker_rss()
+        gc = Base.gc_num()
+        return Dict("type" => "worker_state_response", "request_id" => request_id,
+                    "pid" => getpid(),
+                    "uptime_s" => WORKER_STARTED[] == 0.0 ? 0.0 :
+                                  round(time() - WORKER_STARTED[]; digits = 1),
+                    "julia" => string(VERSION),
+                    "threads" => Threads.nthreads(),
+                    "hostname" => gethostname(),
+                    "project" => something(Base.active_project(), ""),
+                    "worker_package" => something(pkgdir(@__MODULE__), ""),
+                    "agent_bin" => something(find_agent_bin(), ""),
+                    # What the hello frame told the server, not a fresh probe:
+                    # the point of reporting it is to compare the two.
+                    "mcp_command" => String(mcp_command),
+                    "mcp_args" => mcp_arguments,
+                    "source_checkout" => something(source_checkout_root(), ""),
+                    "rss_bytes" => rss.bytes,
+                    "rss_kind" => rss.kind,
+                    "gc_live_bytes" => Base.gc_live_bytes(),
+                    "total_allocated" => gc.allocd + gc.total_allocd,
+                    "gc_time_ns" => gc.total_time,
+                    "sessions" => sessions,
+                    "session_count" => length(sessions))
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict("type" => "worker_state_response", "request_id" => request_id,
+                    "error" => sprint(showerror, e))
+    end
+end
+
+function handle_worker_state(ws, cmd::AbstractDict;
+                             mcp_command::AbstractString = "",
+                             mcp_arguments::Vector{String} = String[])
+    response = worker_state_response(String(get(cmd, "request_id", ""));
+                                     mcp_command, mcp_arguments)
+    try
+        send_control(ws, response)
+    catch e
+        @warn "worker_state response failed" exception = e
+    end
 end
 
 end # module BonitoWorker

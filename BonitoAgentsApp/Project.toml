@@ -23,7 +23,7 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 # user's default browser (see `open_browser`), so no Electron is bundled.
 
 [sources]
-Bonito = {rev = "master", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
+Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoAgents = {path = "../BonitoAgents"}
 # BonitoBook is a transitive dep (via BonitoAgents); pin its branch at the root
 # too so resolution always honors the sd/llm-improvements tip (which allows

@@ -66,8 +66,10 @@ function run_suite(server)
             @test TK.eval_js(server, "document.body.innerText.includes('workers online')") == true
         end
 
-        # One chat for the whole conversation.
-        pid = TK.new_chat(server; title = "Workflows")
+        # One chat for the whole conversation. The FOLDER is called "Workflows":
+        # a project is named after its folder's basename (the picker has no
+        # Name field), and that name is what the sidebar shows.
+        pid = TK.new_chat(server; cwd = mkpath(joinpath(mktempdir(), "Workflows")))
 
         @testset "open a project (new chat via folder picker)" begin
             @test !isempty(pid)
@@ -122,18 +124,26 @@ function run_suite(server)
             # the session never restarted and the header showed "switch failed".
             # (Switching to the SAME provider is a no-op early-return, which is why
             # a single mock backend can never exercise this path.)
-            opts = TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return s ? [...s.options].map(o => o.textContent.trim()) : []; })()")
+            opts = TK.agent_options(server)
             @test "Mock Agent" in opts
             @test "Mock Agent 2" in opts
+            # Every registered provider reaches the dropdown, not just the mocks
+            # — the menu is built from `current_providers()`, so a provider that
+            # is registered but missing here means the UI and the registry drifted.
+            for p in ("Claude Code", "MiMo Code", "OpenCode", "Kimi Code")
+                @test p in opts
+            end
             # Must really start on the default — otherwise the switch below would be
             # a no-op early-return and prove nothing.
-            @test TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent'; })()") == true
+            @test TK.current_agent(server) == "Mock Agent"
 
             TK.switch_agent(server, "Mock Agent 2")
             # The dropdown reflects the new provider (this alone does NOT prove the
             # switch worked — `provider[]` is set before the restart that can fail).
             @test TK.wait_for(server, "provider = Mock Agent 2",
-                "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent 2'; })()";
+                "(() => { const p = document.querySelector('.bt-header-provider-pick');
+                          const v = p && p.querySelector('.bt-msearch-value');
+                          return !!v && v.textContent.trim() === 'Mock Agent 2'; })()";
                 timeout = 10) == true
             # Wait for the switch to FULLY settle BEFORE sending a turn: the header
             # status clears to "" (from "Switching…") only after `switch_provider!`

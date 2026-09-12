@@ -45,6 +45,12 @@ function install_workspace!(session::Bonito.Session,
         activate_panel!(ws, "chat")
     end
 
+    # Chat code only ever holds the `pane`, so this is the one route from a chat
+    # to "show a different project in this window" (the header's Debug button).
+    on(session, pane.navigate) do pid
+        isempty(pid) || (current_view[] = pid)
+    end
+
     # A detached app's panel content: an empty frame the embed is moved INTO by
     # the glue below once the panel mounts. (A `Bonito.onload` on the content
     # doesn't fire reliably through the workspace's parking-pool shipping path,

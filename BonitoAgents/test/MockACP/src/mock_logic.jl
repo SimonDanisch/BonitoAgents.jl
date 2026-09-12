@@ -32,6 +32,31 @@
 #                         test prove the cancel-then-restart escalation
 #                         works against an uncooperative agent.
 #
+# ── Badly-behaved cancel (the shapes that actually broke us) ────────────────
+# Every cancel bug we shipped lived in the gap between "the client asked to
+# stop" and "the agent finished stopping". The scenarios above are all polite:
+# they break their loop on `cancelled[]` and answer `cancelled` immediately, so
+# that gap is zero and the interesting states never occur. These three make it
+# real.
+#
+#   cancel_orphan_tool  — open a tool, then on cancel answer `cancelled`
+#                         WITHOUT ever sending a terminal frame for it. The
+#                         real adapter does this when its interrupt floor
+#                         elapses. A tool's update channel closes on its
+#                         terminal frame and the chat's consumer BLOCKS
+#                         draining it, so an orphan parks the renderer: the
+#                         agent keeps talking and nothing shows up until a
+#                         reload replays it.
+#   slow_cancel         — keep streaming for BT_MOCK_ACP_CANCEL_DELAY_MS after
+#                         the cancel before answering. Models
+#                         claude-agent-acp's `DEFAULT_FORCE_CANCEL_GRACE_MS`
+#                         (30 s) wait for the SDK to yield. The window a
+#                         message can be typed into, and lost.
+#   swallow_next_prompt — once cancelled, answer the NEXT prompt `end_turn`
+#                         with no output at all, the way the adapter settles a
+#                         turn queued during an interrupt ("no in-flight SDK
+#                         work to interrupt"). The user's message vanishes.
+#
 # Stdin EOF → exit(0). The `LocalTransport` close(); `kill` cycle relies on
 # this: closing stdin makes us drop out of the dispatcher loop cleanly.
 
@@ -54,6 +79,12 @@ DISPATCHER_ADDR::String = ""
 # a `session/cancel` — simulates a wedged agent that ignores cancel, so a test can
 # exercise the chat's re-cancel → force-close escalation.
 IGNORE_CANCEL::Bool     = false
+# How long `slow_cancel` keeps streaming after `session/cancel` before it
+# answers. The real floor is 30 s; tests want it short but non-zero.
+CANCEL_DELAY_MS::Int    = 1500
+# Refuse `session/load` unless the transcript sits under the cwd it is loaded
+# in (see `transcript_path`). Declared here, before `_configure!` assigns it.
+STRICT_LOAD::Bool       = false
 
 function _configure!()
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
@@ -62,6 +93,37 @@ function _configure!()
     global CHUNK_MS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNK_MS", "0")))
     global DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
     global IGNORE_CANCEL   = get(ENV, "BT_MOCK_ACP_IGNORE_CANCEL", "") == "1"
+    global CANCEL_DELAY_MS = parse(Int, String(get(ENV, "BT_MOCK_ACP_CANCEL_DELAY_MS", "1500")))
+    # Advertise a config option with MORE choices than the client's searchable-
+    # dropdown threshold, so the model picker renders as `.bt-msearch` instead of
+    # a native <select>. Opt-in: every other suite asserts against the plain
+    # pills, and a real agent only reports this many models for some providers.
+    global MANY_CHOICES    = get(ENV, "BT_MOCK_ACP_MANY_CHOICES", "") == "1"
+    # Behave like Claude Code about WHERE a session lives: `session/load` only
+    # succeeds when the transcript for that session sits under the encoded cwd
+    # it is asked to load in (see `transcript_path`). Opt-in: the resume suites
+    # bind ids the mock never created, and keep the unconditional ack.
+    global STRICT_LOAD     = get(ENV, "BT_MOCK_ACP_STRICT_LOAD", "") == "1"
+    return nothing
+end
+
+# The mock's "transcript": the same per-cwd layout Claude Code keeps under
+# `~/.claude/projects/<encoded cwd>/<session id>.jsonl`, here under `~/.mockacp`
+# (`AgentProviders.session_state_format(MockAgent())`), so "continue this chat
+# on another worker" — which moves that file and rewrites its recorded cwd — is
+# testable end to end without a real agent. Written on session/new while
+# `STRICT_LOAD` is set.
+transcript_path(cwd::AbstractString, sid::AbstractString) =
+    joinpath(homedir(), ".mockacp", "projects",
+             replace(String(cwd), r"[^A-Za-z0-9]" => "-"), String(sid) * ".jsonl")
+function write_transcript!(cwd::AbstractString)
+    isempty(cwd) && return nothing
+    path = transcript_path(cwd, SESSION)
+    mkpath(dirname(path))
+    open(path, "w") do io
+        println(io, JSON.json(Dict("type" => "user", "cwd" => String(cwd),
+                                   "sessionId" => SESSION, "version" => "mock")))
+    end
     return nothing
 end
 
@@ -129,13 +191,29 @@ sub_meta(ev::AbstractDict) =
 resp(id, result) =
     emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
 
+resp_error(id, code, message) =
+    emit(Dict("jsonrpc" => "2.0", "id" => id,
+              "error" => Dict("code" => code, "message" => message)))
+
 # Per-prompt sleep helper: zero-cost in normal scenarios, configurable for
 # the "stress timing" tests that want pacing in the stream.
 pause() = CHUNK_MS > 0 && sleep(CHUNK_MS / 1000)
 
 # Track whether the agent is currently honoring cancel — toggled by the
 # `session/cancel` handler (also drives "ignore_cancel" which clears it).
+# PER-PROMPT: `session/prompt` clears it, so a streaming loop that watches it
+# runs afresh for each turn.
 const cancelled = Ref(false)
+
+# Whether a cancel has EVER been seen. Sticky, precisely because `cancelled` is
+# not: a scenario about what happens to prompts sent AFTER an interrupt cannot
+# ask `cancelled[]`, which the arriving prompt has already cleared. That is what
+# broke `swallow_next_prompt` — it read `cancelled[]` to decide whether to
+# swallow, so the very prompt it was meant to swallow had reset the flag and it
+# took the streaming branch instead, looping forever on a cancel that was never
+# coming. The chat then stayed legitimately busy and the suite blamed the
+# product (`e2e:cancel_misbehaving`'s "chat is usable again" timeout).
+const INTERRUPTED = Ref(false)
 
 # Drive ONE `session/prompt`. The dispatcher catches throws so a scenario
 # can `exit(1)` to simulate a crash without crashing the dispatcher first.
@@ -247,6 +325,51 @@ function handle_prompt(prompt_id, scenario::AbstractString)
         end
         tool_call_update("tc-b", Dict("status" => "completed"))
         resp(prompt_id, Dict("stopReason" => "end_turn"))
+    elseif scenario == "cancel_orphan_tool"
+        # A tool is running when the stop lands, and it NEVER reports terminal.
+        tool_call("in_progress"; id = "orphan-1", title = "long tool")
+        while !cancelled[]
+            sleep(0.05)
+        end
+        # Deliberately no `tool_call_update` for orphan-1 — that is the whole
+        # point. Keep TALKING first, THEN answer: these chunks arrive while the
+        # client is still parked on the orphan's stream, so they only ever reach
+        # the screen if the response's boundary releases it. A client that never
+        # releases shows none of this, which is exactly what the test asserts.
+        for i in 1:3
+            agent_chunk("after-cancel$i "); sleep(0.05)
+        end
+        resp(prompt_id, Dict("stopReason" => "cancelled"))
+    elseif scenario == "slow_cancel"
+        # Stream until cancelled, then keep going for the grace window before
+        # answering — the adapter's interrupt floor, where a typed message can
+        # be swallowed.
+        # Paced deliberately: `pause()` is a no-op at the default CHUNK_MS=0, and
+        # an unpaced loop floods the socket faster than the client can drain,
+        # which tests the buffer rather than the cancel.
+        i = 0
+        while !cancelled[]
+            i += 1; agent_chunk("pre$i "); sleep(0.1)
+        end
+        t0 = time()
+        while time() - t0 < CANCEL_DELAY_MS / 1000
+            agent_chunk("winddown "); sleep(0.1)
+        end
+        resp(prompt_id, Dict("stopReason" => "cancelled"))
+    elseif scenario == "swallow_next_prompt"
+        # First prompt streams and honors the cancel. EVERY later prompt is
+        # answered `end_turn` with no output — the adapter settling a turn that
+        # was queued while it was interrupting. Keys on the STICKY latch: the
+        # per-prompt `cancelled` was cleared by this very prompt's arrival.
+        if INTERRUPTED[]
+            resp(prompt_id, Dict("stopReason" => "end_turn"))
+        else
+            i = 0
+            while !cancelled[]
+                i += 1; agent_chunk("work$i "); sleep(0.1)
+            end
+            resp(prompt_id, Dict("stopReason" => "cancelled"))
+        end
     elseif scenario == "crash"
         # Mimic an agent that segfaulted mid-turn: no response, just exit.
         exit(1)
@@ -486,6 +609,8 @@ function run_dispatcher_prompt(prompt_id)
                 "_meta" => meta))
             upd("tool_call_update", Dict{String,Any}(
                 "toolCallId" => tid, "status" => "completed", "_meta" => meta))
+        elseif et == "worker_mcp_call"
+            emit_real_mcp_call(ev)
         elseif et == "bt_eval_open"
             # The dispatcher announces the eval BEFORE running it (mirrors real
             # claude: the tool opens, the args stream in on an update, and the
@@ -502,6 +627,7 @@ function run_dispatcher_prompt(prompt_id)
             get(ev, "env_path", nothing) === nothing ||
                 (raw_input["env_path"] = String(ev["env_path"]))
             haskey(ev, "timeout") && (raw_input["timeout"] = ev["timeout"])
+            haskey(ev, "worker")  && (raw_input["worker"]  = String(ev["worker"]))
             toolname = String(get(ev, "tool", "mcp__btworker__bt_julia_eval"))
             meta = Dict("claudeCode" => Dict("toolName" => toolname))
             upd("tool_call", Dict{String,Any}(
@@ -565,6 +691,137 @@ function run_dispatcher_prompt(prompt_id)
                     "toolCallId" => tid, "status" => "completed",
                     "content" => packed, "_meta" => meta))
             end
+        elseif et == "kimi_tool"
+            # A tool call in KIMI's wire dialect rather than claude's. Captured
+            # verbatim from kimi 0.29.2 (see AgentClientProtocol/test/fixtures/
+            # kimi_*.jsonl); the differences that matter to the chat are:
+            #
+            #   • NO `_meta.claudeCode` envelope anywhere — the tool's identity
+            #     is the ACP `title` on the OPENING frame only.
+            #   • That title is then REPLACED by a human sentence ("Running:
+            #     echo hi") on a later frame, so a consumer that re-reads it
+            #     loses the name.
+            #   • The arguments STREAM as growing `content` text (partial JSON),
+            #     and `rawInput` appears only once, near the end.
+            #
+            # Claude's shape is emitted by every other event here, so both live
+            # side by side and the chat has to handle each.
+            tid  = String(get(ev, "id", "ktool-$(next_tool_id)")); next_tool_id += 1
+            name = String(ev["name"])
+            kind = String(get(ev, "kind", "other"))
+            args = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
+            args_json = JSON.json(args)
+            text_block(s) = Any[Dict{String,Any}(
+                "type" => "content", "content" => Dict("type" => "text", "text" => s))]
+
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => kind,
+                "title" => name, "status" => "pending",
+                "content" => text_block("")))
+            # Partial-JSON prefixes, the way kimi types the arguments out. A few
+            # cut points are enough to prove none of them leak into the output.
+            n = lastindex(args_json)
+            for frac in (0.25, 0.5, 0.75)
+                cut = thisind(args_json, max(1, floor(Int, n * frac)))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => "in_progress",
+                    "content" => text_block(args_json[1:cut])))
+                pause()
+            end
+            # The one frame that carries `rawInput` — and swaps in a human title.
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid, "status" => "in_progress", "kind" => kind,
+                "title" => String(get(ev, "human_title", "Running $name")),
+                "rawInput" => args, "content" => text_block(args_json)))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid,
+                "status" => String(get(ev, "status", "completed")),
+                "content" => pack_tool_content(get(ev, "content", Any[]))))
+        elseif et == "codex_tool"
+            # A tool call in CODEX's wire dialect. Captured verbatim from
+            # @agentclientprotocol/codex-acp 1.11.0 (see
+            # AgentClientProtocol/test/fixtures/codex_*.jsonl); it breaks in a
+            # different place than kimi:
+            #
+            #   • It names NO tool anywhere — no `_meta.claudeCode`, and its
+            #     titles are display strings (a shell call is titled with the
+            #     command line itself, spaces and all).
+            #   • An MCP call is WRAPPED: `rawInput` is
+            #     {server, tool, arguments} and the title is `mcp.<server>.<tool>`.
+            #   • The RESULT never appears as content — an MCP call reports
+            #     `rawOutput.result` (the MCP CallToolResult) or
+            #     `rawOutput.error`, a shell call `rawOutput.formatted_output`,
+            #     and a shell call's opening content is a bare `terminal`
+            #     pointer we never subscribe to.
+            tid    = String(get(ev, "id", "cxtool-$(next_tool_id)")); next_tool_id += 1
+            args   = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
+            status = String(get(ev, "status", "completed"))
+            server = get(ev, "server", nothing)
+            if server !== nothing
+                # MCP call: the envelope rides BOTH frames, and the terminal
+                # frame carries no `_meta` at all.
+                tool  = String(ev["tool"])
+                envelope = Dict{String,Any}("server" => String(server),
+                                            "tool" => tool, "arguments" => args)
+                upd("tool_call", Dict{String,Any}(
+                    "toolCallId" => tid, "kind" => "execute",
+                    "title" => "mcp.$(server).$(tool)", "status" => "in_progress",
+                    "rawInput" => envelope,
+                    "_meta" => Dict{String,Any}("is_mcp_tool_call" => true)))
+                pause()
+                # Success AND tool-reported failure both come back as a normal
+                # `CallToolResult` under `result` — a bt_julia_eval that raised
+                # is still a COMPLETED call whose content is the stacktrace
+                # (verified: codex_mcp_tool_error.jsonl). `error` is reserved
+                # for a failure at the MCP layer itself.
+                err = get(ev, "error", nothing)
+                rout = err === nothing ?
+                    Dict{String,Any}("result" => Dict{String,Any}(
+                                         "content" => [Dict{String,Any}("type" => "text",
+                                                                        "text" => String(t))
+                                                       for t in get(ev, "output", String[])],
+                                         "structuredContent" => nothing,
+                                         "_meta" => Dict{String,Any}("elapsed_s" => 0.26,
+                                                                     "status" => "completed")),
+                                     "error" => nothing) :
+                    Dict{String,Any}("result" => nothing,
+                                     "error" => Dict{String,Any}("message" => String(err)))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => status,
+                    "rawInput" => envelope, "rawOutput" => rout))
+            else
+                # Shell call: title IS the command, output only in rawOutput.
+                cmd = String(ev["command"])
+                upd("tool_call", Dict{String,Any}(
+                    "toolCallId" => tid, "kind" => "execute",
+                    "title" => cmd, "status" => "in_progress",
+                    "content" => [Dict{String,Any}("type" => "terminal",
+                                                   "terminalId" => tid)],
+                    "rawInput" => Dict{String,Any}("command" => cmd,
+                                                   "cwd" => String(get(ev, "cwd", pwd())))))
+                pause()
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => status,
+                    "rawOutput" => Dict{String,Any}(
+                        "formatted_output" => String(get(ev, "output", "")),
+                        "exit_code" => Int(get(ev, "exit_code", 0)))))
+            end
+        elseif et == "codex_image"
+            # Codex's image VIEW: a `resource_link` naming a file on the worker,
+            # not the bytes. Frame shape copied from the real capture in
+            # AgentClientProtocol/test/fixtures/codex_image_view.jsonl —
+            # claude/kimi send `ImageContent` instead, so this is the only
+            # dialect that makes the chat go and fetch the file.
+            tid  = String(get(ev, "id", "cximg-$(next_tool_id)")); next_tool_id += 1
+            path = String(ev["path"])
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "read",
+                "title" => "View Image $(path)", "status" => "completed",
+                "content" => [Dict{String,Any}("type" => "content",
+                    "content" => Dict{String,Any}("type" => "resource_link",
+                                                  "name" => path, "uri" => path))],
+                "locations" => [Dict{String,Any}("path" => path)],
+                "rawInput" => Dict{String,Any}("path" => path)))
         elseif et == "tool"
             # Generic tool call of any kind (edit/search/execute/other). Opens
             # the bubble, then (unless complete=false) ships content + a final
@@ -591,6 +848,11 @@ function run_dispatcher_prompt(prompt_id)
             # tool_call_update; ACP merges this `rawInput` into the live
             # MCPCall/GenericTool so the eval extras + ✎ path hint materialise.
             haskey(ev, "raw_input") && (fields["rawInput"] = ev["raw_input"])
+            # A terminal tool_call_update can carry a `rawOutput` STRING with NO
+            # content (real claude-agent-acp for a completed Edit: the diff rode
+            # earlier updates, the completed frame just has the "… updated
+            # successfully …" rawOutput). The chat's ACP layer normalizes that.
+            haskey(ev, "raw_output") && (fields["rawOutput"] = String(ev["raw_output"]))
             upd("tool_call_update", fields)
         elseif et == "todo"
             # Live plan/todo list. Real claude-agent-acp reports todos as
@@ -599,6 +861,14 @@ function run_dispatcher_prompt(prompt_id)
             # with the same set mutates the one live list in place; the chat
             # pins it to the taskbar until the turn ends or all items finish.
             upd("plan", Dict("entries" => get(ev, "entries", Any[])))
+        elseif et == "session_notice"
+            if SESSION_NOTICE_SUPPORTED[]
+                upd("session_info_update", Dict("_meta" => Dict("jetbrains" => Dict(
+                    "air" => Dict("version" => 1, "sessionFailure" => ev["record"])))))
+            else
+                upd("agent_message_chunk", Dict("content" => Dict("type" => "text",
+                    "text" => "Warning: " * ev["record"]["title"])))
+            end
         elseif et == "usage"
             # Context/cost telemetry — the shape claude-agent-acp ≥ 0.44 emits
             # after every assistant message.
@@ -680,6 +950,31 @@ end
 # message the test process should respond to. Written by the dispatcher
 # loop on each `session/prompt`.
 const LAST_PROMPT = Ref{String}("")
+const SESSION_NOTICE_SUPPORTED = Ref(false)
+
+# A `model` config option with 12 choices — past the client's
+# MODEL_SEARCH_THRESHOLD (8), which is what makes it render the searchable
+# dropdown. Distinct, greppable labels so a filter test can assert on exactly
+# which rows survive.
+function many_choice_model_option()
+    Dict(
+        "id" => "model", "name" => "Model", "category" => "model",
+        "currentValue" => "alpha-01",
+        "options" => [
+            Dict("value" => "alpha-01", "name" => "Alpha One",   "description" => "first alpha"),
+            Dict("value" => "alpha-02", "name" => "Alpha Two",   "description" => "second alpha"),
+            Dict("value" => "alpha-03", "name" => "Alpha Three", "description" => "third alpha"),
+            Dict("value" => "beta-01",  "name" => "Beta One",    "description" => "first beta"),
+            Dict("value" => "beta-02",  "name" => "Beta Two",    "description" => "second beta"),
+            Dict("value" => "beta-03",  "name" => "Beta Three",  "description" => "third beta"),
+            Dict("value" => "gamma-01", "name" => "Gamma One",   "description" => "first gamma"),
+            Dict("value" => "gamma-02", "name" => "Gamma Two",   "description" => "second gamma"),
+            Dict("value" => "gamma-03", "name" => "Gamma Three", "description" => "third gamma"),
+            Dict("value" => "delta-01", "name" => "Delta One",   "description" => "first delta"),
+            Dict("value" => "delta-02", "name" => "Delta Two",   "description" => "second delta"),
+            Dict("value" => "delta-03", "name" => "Delta Three", "description" => "third delta"),
+        ])
+end
 
 # Dispatcher: read JSON-RPC frames from stdin, route by `method`. Returns
 # when stdin EOFs (parent closed our stdin → time to die).
@@ -691,13 +986,43 @@ function dispatch_loop()
         method = String(get(msg, "method", ""))
         id     = get(msg, "id", nothing)
         if method == "initialize" && id !== nothing
-            # Empty caps + agentCapabilities is what the real agent's
-            # session/new reply leans on; the chat layer doesn't read
-            # initialize's result beyond presence.
-            resp(id, Dict())
+            caps = get(get(msg, "params", Dict()), "clientCapabilities", Dict())
+            air = get(get(get(caps, "_meta", Dict()), "jetbrains", Dict()), "air", Dict())
+            SESSION_NOTICE_SUPPORTED[] = get(air, "version", 0) == 1 &&
+                "sessionFailure" in get(air, "capabilities", [])
+            # `loadSession` must match reality (we answer session/load below):
+            # the server reads it to decide whether to persist the session id.
+            resp(id, Dict("protocolVersion" => 1,
+                          "agentCapabilities" => Dict("loadSession" => true)))
         elseif method == "session/new" && id !== nothing
-            resp(id, Dict("sessionId" => SESSION))
+            set_mcp_config!(get(msg, "params", Dict()))
+            # Only under strict_load: the transcript is what that mode checks,
+            # and writing one for every mock chat would litter `~/.mockacp`
+            # with a folder per temp cwd of every suite.
+            STRICT_LOAD && write_transcript!(String(get(get(msg, "params", Dict()), "cwd", "")))
+            resp(id, MANY_CHOICES ?
+                Dict("sessionId" => SESSION, "configOptions" => [many_choice_model_option()]) :
+                Dict("sessionId" => SESSION))
+            # Real agents push their slash commands right after session/new
+            # (verified on claude-agent-acp and kimi), which is what makes `/`
+            # autocomplete work on a chat you haven't typed in yet. Emitting
+            # them only as turn events made that untestable.
+            upd("available_commands_update", Dict("availableCommands" => [
+                Dict("name" => "compact", "description" => "Compact the chat history"),
+                Dict("name" => "clear",   "description" => "Clear the conversation"),
+            ]))
         elseif method == "session/load" && id !== nothing
+            set_mcp_config!(get(msg, "params", Dict()))
+            # An id a real agent no longer knows (rotated, pruned, another
+            # agent's). Opt-in by id so the other resume tests keep their ack.
+            load_params = get(msg, "params", Dict())
+            load_sid = String(get(load_params, "sessionId", ""))
+            load_cwd = String(get(load_params, "cwd", ""))
+            if occursin("stale", load_sid) ||
+               (STRICT_LOAD && !isfile(transcript_path(load_cwd, load_sid)))
+                resp_error(id, -32602, "Session not found")
+                continue
+            end
             # Dispatcher mode: re-stream the scripted history as session/update
             # frames BEFORE the load response — exactly how real claude-agent-acp
             # replays a resumed session's jsonl. Other scenarios keep the bare
@@ -733,6 +1058,7 @@ function dispatch_loop()
             # Notification — no response. Flip the flag so the current
             # prompt's loop (if it's checking) exits and replies cancelled.
             cancelled[] = true
+            INTERRUPTED[] = true      # sticky; survives the next prompt's reset
         end
         # Anything else: silently ignore. The real agent does the same
         # for unknown methods.

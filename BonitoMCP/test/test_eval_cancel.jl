@@ -41,3 +41,30 @@ const M = BonitoMCP
         M.kill_session!(s)
     end
 end
+
+# A bare SIGINT is delivered to whichever task the worker happens to be running.
+# Every session start!s a 4Hz stdout flusher, so the flusher kept taking the
+# exception (its `catch` rethrows anything that isn't an IO error) and dying
+# while the eval slept on — cancel and bt_julia_interrupt both silently did
+# nothing. `request_interrupt!` throws into the tracked eval task instead, and
+# only falls back to a signal when the worker is too wedged to answer.
+@testset "interrupt targets the eval task, not whatever task is running" begin
+    # `sleep` and blocking IO WAIT, so the throw reaches them directly; a tight
+    # loop never yields to Malt's message loop, so it must escalate to SIGINT.
+    for (label, code, want) in (("sleep",       "sleep(60); 42",                :targeted),
+                                ("blocking IO", "read(`sleep 60`, String)",     :targeted),
+                                ("tight loop",  "x = 0; while true; x += 1; end", :signal))
+        @testset "$label" begin
+            s = M.JuliaSession(nothing; is_temp = true)
+            try
+                @test M.execute(s, code; timeout = 3.0).status == :running
+                @test M.request_interrupt!(s) === want
+                @test timedwait(() -> s.in_flight === nothing || istaskdone(s.in_flight),
+                                20.0) === :ok
+                @test M.is_alive(s)        # interrupting must not cost the session
+            finally
+                M.kill_session!(s)
+            end
+        end
+    end
+end

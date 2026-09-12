@@ -86,9 +86,11 @@ function seed_temp_env_with_bonito!(env_dir::AbstractString)
 end
 
 # The minimum Bonito version with the remote-app proxy API that the live-render
-# bridge needs. The eval worker uses the PROJECT's own Bonito (we never touch its
-# LOAD_PATH); if that Bonito is older, the bridge setup errors clearly and only
-# live-render display is affected — plain `bt_julia_eval` text output is untouched.
+# bridge needs. The eval worker uses the PROJECT's own Bonito — we never stack an
+# entry onto its search path to supply one (`worker_env` only ever RESTORES the
+# default when a parent leaked `JULIA_LOAD_PATH`). If that Bonito is older, the
+# bridge setup errors clearly and only live-render display is affected — plain
+# `bt_julia_eval` text output is untouched.
 const MIN_BRIDGE_BONITO = v"5"
 
 # ── JuliaSession ────────────────────────────────────────────────────────────
@@ -113,7 +115,9 @@ mutable struct JuliaSession
     stream_channel::Channel{String}     # real-time stdout/stderr chunks for /mcp-ws streaming
     dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
     dial_error::String                  # last eval-bridge setup/connect failure (live-render bridge)
+    bonito_mismatch::String             # project env's Bonito version when it's too old for the bridge ("" = ok); drives the chat's one-click upgrade card
     closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
+    pgid::Int                           # worker's own process group (0 = none); reaped in kill_session!
 end
 
 function JuliaSession(env_path;
@@ -124,7 +128,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), Channel{String}(Inf), false, "", false)
+                        ReentrantLock(), Channel{String}(Inf), false, "", "", false, 0)
 end
 
 # The chat routes live stream chunks by this key (matched against the eval
@@ -134,19 +138,33 @@ stream_route(s::JuliaSession) = s.is_temp ? TEMP_KEY : String(s.env_path)
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
 
-# Env overrides for the eval worker so it behaves like a bare
-# `julia --project=env_path`. The BonitoAgentsApp bundle launcher exports a fixed
-# `JULIA_LOAD_PATH` (bundle project + stdlib, with NO `@`); Malt workers inherit
-# the parent env, so without this override the worker resolves packages against
-# the BUNDLE's project and ignores `--project=env_path` entirely. Malt's `env`
-# kwarg can only SET vars (it routes through `Base.byteenv`, which can't express
-# removal), so we reset `JULIA_LOAD_PATH` to Julia's documented default — exactly
-# what an un-set `JULIA_LOAD_PATH` would yield: `@` (the active project, i.e.
-# env_path via --project), `@v#.#` (shared default env), `@stdlib`. Keeps the
-# worker on the PROJECT's Bonito/WGLMakie, never the bundle's precompiled copies;
-# JULIA_DEPOT_PATH is left as-is so the worker keeps a writable precompile depot.
-const DEFAULT_LOAD_PATH = join(["@", "@v#.#", "@stdlib"], Sys.iswindows() ? ";" : ":")
-worker_env() = ["JULIA_LOAD_PATH" => DEFAULT_LOAD_PATH]
+"""
+    worker_env() -> Vector{String}
+
+Environment overrides for a spawned eval worker. Empty unless there is something
+to REPAIR.
+
+The one thing worth repairing is an inherited `JULIA_LOAD_PATH`. An eval worker
+gets `--project=<env_path>` and is supposed to resolve packages exactly as
+`julia --project=<env_path>` would in a clean shell. That only holds if nothing
+upstream exported `JULIA_LOAD_PATH` — and things do: `Pkg.test` runs its test
+process with `JULIA_LOAD_PATH="@:<testdir>"`, which has no `@stdlib`, so an eval
+worker inheriting it cannot load a single stdlib (`using Markdown` →
+"Package Markdown not found in current path"). Any host that embeds BonitoMCP
+inside such a process hands its workers the same broken path.
+
+We do not GUESS a value: we restore Julia's DEFAULT (`@`, `@v#.#`, `@stdlib`),
+which is precisely "the project on the command line decides, with the usual
+fallbacks". BonitoAgents itself no longer leaks the variable (see
+`BonitoAgentsApp.worker_command`, which passes `--project` on the command line
+for exactly this reason), so in normal use this returns an empty vector and
+nothing is touched.
+"""
+function worker_env()
+    haskey(ENV, "JULIA_LOAD_PATH") || return String[]
+    sep = Sys.iswindows() ? ';' : ':'
+    return ["JULIA_LOAD_PATH=" * join(("@", "@v#.#", "@stdlib"), sep)]
+end
 
 # Build the exeflags vector. Handles juliaup `+channel` syntax + custom flags.
 function build_exeflags(env_path, julia_cmd)::Vector{String}
@@ -218,7 +236,8 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
                 :(isdefined(Main, :RemoteProxy) &&
                   Main.RemoteProxy.BRIDGE[] !== nothing &&
                   Main.RemoteProxy.BRIDGE[].driver.ws[] !== nothing))
-        catch
+        catch e
+            e isa InterruptException && rethrow()
             false
         end
         if worker_ws_live(); s.dial_error = ""; return s; end
@@ -245,6 +264,7 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
              v === nothing ? "unknown" : string(v))
         end)
         if !ok
+            s.bonito_mismatch = vstr    # drives the chat's one-click upgrade card
             s.dial_error = "the live-render bridge needs Bonito ≥ $(MIN_BRIDGE_BONITO) " *
                 "(the remote-app proxy API), but this chat's project env resolved " *
                 "Bonito v$(vstr). Add a Bonito ≥ $(MIN_BRIDGE_BONITO) to the project " *
@@ -299,6 +319,7 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
         end
         if ready
             s.dial_error = ""
+            s.bonito_mismatch = ""   # bridge connected ⇒ this env's Bonito is fine
         else
             s.dial_error = "the RemoteProxy bridge was built on the worker but never connected to $wsurl within 30s — the eval worker couldn't reach the BonitoAgents server (wrong/unreachable BONITOAGENTS_SERVER_URL, server gone, or the dial_loop crashed). Check the worker log for a 'dial loop crashed' / 'dial failed' warning."
             @warn "BonitoMCP: bridge dial not connected 30s after setup" wsurl
@@ -337,6 +358,8 @@ function start!(s::JuliaSession)
         env            = worker_env(),
         exeflags       = build_exeflags(s.env_path, s.julia_cmd),
     )
+    # Before anything can spawn: everything the eval starts inherits this group.
+    s.pgid = isolate_worker!(s)
     # Background pumps drain worker stdout/stderr into our buffer (the agent's
     # copy, drained into the MCP response) AND push each chunk to stream_channel.
     # Both streams merge into the same buffer — same UX as a normal REPL.
@@ -347,17 +370,17 @@ function start!(s::JuliaSession)
     # closes in kill_session!.
     s.stream_forward = Threads.@spawn stream_forward_loop!(s)
 
-    # The worker is a plain `julia --project=env_path`: `--project` sets the env,
-    # and `worker_env()` resets JULIA_LOAD_PATH to Julia's default so the inherited
-    # bundle JULIA_LOAD_PATH can't shadow it (see worker_env). Packages resolve
-    # exactly as the user's env dictates — we do NOT stack any extra entry. If
+    # The worker is a plain `julia --project=env_path`: packages resolve exactly
+    # as the user's env dictates and we do NOT stack any extra entry. If
     # bt_show_app needs a proxy-aware Bonito, the project's env must declare it
     # (surfaced as a dial_error otherwise); we never silently inject a Bonito.
+    # `worker_env()` is what makes that claim TRUE rather than merely intended —
+    # see its comment.
 
     # Auto-Revise (best-effort) + load our format helper. The trailing
     # `; nothing` is load-bearing: include() returns the module object and
     # Malt can't serialise a `Module` reference back to the parent.
-    Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch; end; nothing))
+    Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch e; e isa InterruptException && rethrow(); end; nothing))
     Malt.remote_eval_fetch(s.worker, :(include($(helper_payload_path())); nothing))
     # The worker's PIPED stdout/stderr are write-buffered: plain `println`s in
     # user code would reach the host (and the chat's live stream tail) in
@@ -371,8 +394,9 @@ function start!(s::JuliaSession)
             flush(stderr)
             sleep(0.25)
         end
-    catch
+    catch e
         # stream closed — worker shutting down
+        (e isa Base.IOError || e isa EOFError) || rethrow()
     end; nothing))
 
     # Interactive-app dial-back is lazy (ensure_eval_dialed! from bt_show_app),
@@ -380,7 +404,7 @@ function start!(s::JuliaSession)
 
     if s.is_test
         Malt.remote_eval_fetch(s.worker,
-            :(try; using TestEnv; TestEnv.activate(); catch; end; nothing))
+            :(try; using TestEnv; TestEnv.activate(); catch e; e isa InterruptException && rethrow(); end; nothing))
     end
     return s
 end
@@ -399,7 +423,11 @@ function pump_pipe!(s::JuliaSession, pipe)
             # drains + drops (see stream_forward_loop!). Raw bytes (ANSI intact) —
             # the chat strips codes for the tail; keeping them keeps colored
             # rendering possible later without a wire change.
-            try isopen(s.stream_channel) && put!(s.stream_channel, String(data)) catch end
+            try
+                isopen(s.stream_channel) && put!(s.stream_channel, String(data))
+            catch e
+                e isa InvalidStateException || rethrow()   # channel raced closed
+            end
         end
     catch e
         e isa EOFError && return
@@ -537,12 +565,17 @@ function execute(s::JuliaSession, code::AbstractString;
         # user-defined types Malt's serialiser wouldn't recognise on the parent
         # side). A user error propagates here to `format_error`.
         code_str = String(code)
+        # Registering the task is what makes `interrupt_eval` able to target THIS
+        # eval instead of whatever task a SIGINT happens to land on.
         wrapped = quote
+            Main.BonitoMCPHelper.EVAL_TASK[] = current_task()
             try
                 Main.BonitoMCPHelper.eval_and_format($code_str, $out_dir, $max_bytes, $full_output)
             catch __mcp_err__
                 Main.BonitoMCPHelper.format_error(__mcp_err__, catch_backtrace(),
                                                    $max_bytes, $full_output)
+            finally
+                Main.BonitoMCPHelper.EVAL_TASK[] = nothing
             end
         end
         s.in_flight = Malt.remote_eval(s.worker, wrapped)
@@ -558,10 +591,38 @@ function continue_eval!(s::JuliaSession;
     end
 end
 
+"""
+    request_interrupt!(s; grace) -> Symbol
+
+Stop the in-flight eval, returning `:targeted` or `:signal` for how it was done.
+
+SIGINT alone is unreliable here: Julia delivers it to whichever task the worker
+happens to be running, and every session has a 4Hz stdout flusher waking up
+constantly — the flusher took the exception and died while the eval ran on. So
+ask the worker to throw directly into the eval task, and keep SIGINT for code
+too wedged to answer (a tight loop never yields to Malt's message loop, which is
+also why the ack is awaited with a timeout rather than fetched).
+"""
+function request_interrupt!(s::JuliaSession; grace::Real = 2.0)
+    ack = Malt.remote_eval(s.worker, :(Main.BonitoMCPHelper.interrupt_eval()))
+    if timedwait(() -> istaskdone(ack), grace) === :ok
+        delivered = try
+            fetch(ack) === true
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "request_interrupt!: worker refused the targeted throw" exception = e
+            false
+        end
+        delivered && return :targeted
+    end
+    Malt.interrupt(s.worker)
+    return :signal
+end
+
 function interrupt!(s::JuliaSession)
     @lock s.lock begin
         s.in_flight === nothing && error("No eval in flight on this session.")
-        Malt.interrupt(s.worker)
+        request_interrupt!(s)
         # Generous timeout: the user's code might be in a try/catch that swallows
         # InterruptException briefly, but should yield within 30s.
         return await_or_yield(s, 30.0)
@@ -603,6 +664,10 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
         end
         value_blocks = result.blocks
         html         = result.html
+        # `wants_display` (from format_value): the value would have rendered live
+        # but there was no bridge — the handler pairs it with a Bonito-version
+        # mismatch to offer the upgrade card. Absent on the error/nothing payloads.
+        wants_display = hasproperty(result, :wants_display) && result.wants_display
         # M11: the task is done, but the worker's final `println`s may still be
         # in the OS pipe — the pump task hasn't necessarily flushed them into our
         # buffer by the time `fetch` returns. Without a settle, that trailing
@@ -639,7 +704,7 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
             push!(blocks, Dict{String,Any}("type" => "text", "text" => output))
         append!(blocks, value_blocks)
         return (status = :completed, blocks = blocks, html = html,
-                is_error = is_error, elapsed_s = elapsed)
+                is_error = is_error, elapsed_s = elapsed, wants_display = wants_display)
     end
     return (status = :running, partial = partial, elapsed_s = elapsed,
             code = s.in_flight_code)
@@ -650,11 +715,96 @@ end
 # RemoteException → InterruptException or whatever the user's code threw).
 interrupt_echo(e) = "\e[91mERROR: $(sprint(showerror, e))\e[39m"
 
+# ── Reaping what the eval spawned ───────────────────────────────────────────
+# Julia neither tracks nor reaps processes started with `run`, so a test suite,
+# server or `sleep 300` launched by eval'd code outlives the worker that started
+# it — killing the worker leaves it running forever.
+#
+# unix: the worker gets its own process group at startup, which we kill as a
+# unit. The kernel keeps the group intact when the leader dies, so this holds
+# even when the worker is SIGKILLed (no atexit handler can run then).
+# Windows has no process groups, and an orphan can't be found by walking down
+# from a dead parent — so there we snapshot the tree *before* teardown instead.
+
+worker_pid(s::JuliaSession) = s.worker === nothing ? 0 : Int(getpid(s.worker.proc))
+
+"""
+    isolate_worker!(s) -> Int
+
+Return the worker's own process group id, creating one if it isn't a leader
+already (Malt spawns detached, so normally it is). 0 if unavailable.
+"""
+function isolate_worker!(s::JuliaSession)
+    Sys.isunix() || return 0
+    pgid = Malt.remote_eval_fetch(s.worker, quote
+        pgid() = Int(ccall(:getpgid, Cint, (Cint,), 0))
+        pgid() == getpid() || ccall(:setsid, Cint, ())   # already a leader → EPERM, fine
+        pgid()
+    end)::Int
+    # Only ever trust a group the worker LEADS. Any other value means it still
+    # shares OUR group, and killing that would take down the MCP server itself.
+    return pgid == worker_pid(s) ? pgid : 0
+end
+
+function child_pids(pid::Integer)
+    out = Int[]
+    cmd = Sys.iswindows() ?
+        `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ParentProcessId=$pid').ProcessId"` :
+        `pgrep -P $pid`
+    # Both exit non-zero when there simply are no children, so ignorestatus.
+    txt = try
+        read(pipeline(ignorestatus(cmd), stderr = devnull), String)
+    catch e
+        e isa InterruptException && rethrow()
+        e isa Base.IOError || rethrow()      # pgrep/powershell not installed
+        @debug "child_pids: process enumeration unavailable" exception = e
+        return out
+    end
+    for line in eachline(IOBuffer(txt))
+        n = tryparse(Int, strip(line))
+        n === nothing || push!(out, n)
+    end
+    return out
+end
+
+function descendant_pids(pid::Integer)
+    out, stack = Int[], Int[pid]
+    while !isempty(stack)
+        for c in child_pids(pop!(stack))
+            c in out && continue
+            push!(out, c)
+            push!(stack, c)
+        end
+    end
+    return out
+end
+
+# `pgid` comes from isolate_worker!, `strays` from a pre-teardown snapshot.
+function reap_process_tree(pgid::Int, strays::Vector{Int} = Int[])
+    # Belt and braces: never signal our own group, that would kill the server.
+    if Sys.isunix() && pgid != 0 && pgid != Int(ccall(:getpgid, Cint, (Cint,), 0))
+        ccall(:kill, Cint, (Cint, Cint), -pgid, 9)
+    end
+    for p in strays
+        success(pipeline(`taskkill /F /PID $p`, stdout = devnull, stderr = devnull))
+    end
+    return nothing
+end
+
 # ── Lifecycle ───────────────────────────────────────────────────────────────
 function kill_session!(s::JuliaSession)
+    # Snapshot first: once the worker is gone, a Windows orphan is unreachable.
+    strays = (Sys.iswindows() && is_alive(s)) ? descendant_pids(worker_pid(s)) : Int[]
     if is_alive(s)
-        try Malt.stop(s.worker) catch end
+        try
+            Malt.stop(s.worker)
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "kill_session!: Malt.stop failed (worker already gone?)" exception = e
+        end
     end
+    reap_process_tree(s.pgid, strays)
+    s.pgid = 0
     # Deliberately NOT taken under s.lock: kill_session! must be able to reap a
     # worker whose eval ignored the interrupt, and that eval's await_or_yield
     # poll holds s.lock for its whole duration — locking here would deadlock the
@@ -666,9 +816,19 @@ function kill_session!(s::JuliaSession)
     s.worker = nothing
     s.in_flight = nothing
     # Closing the channel ends stream_forward_loop! (the `for` over it returns).
-    try close(s.stream_channel) catch end
-    s.is_temp && s.env_path !== nothing && isdir(s.env_path) &&
-        try rm(s.env_path; recursive = true, force = true) catch end
+    try
+        close(s.stream_channel)
+    catch e
+        e isa InvalidStateException || rethrow()   # already closed
+    end
+    if s.is_temp && s.env_path !== nothing && isdir(s.env_path)
+        try
+            rm(s.env_path; recursive = true, force = true)
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "kill_session!: removing temp env failed (already gone?)" env_path = s.env_path exception = e
+        end
+    end
     return nothing
 end
 
@@ -682,9 +842,14 @@ mutable struct SessionManager
     lock::ReentrantLock                 # guards BOTH `sessions` and `creating`
 end
 
-SessionManager() = SessionManager(Dict{String,JuliaSession}(),
-                                  Dict{String,Task}(),
-                                  ReentrantLock())
+function SessionManager()
+    m = SessionManager(Dict{String,JuliaSession}(), Dict{String,Task}(), ReentrantLock())
+    # Malt's own atexit stops the workers but not what they spawned — reap the
+    # process groups too. A SIGKILLed server runs no handler at all and still
+    # leaks; nothing in-process can fix that (see reap_process_tree).
+    atexit(() -> shutdown!(m))
+    return m
+end
 
 const TEMP_KEY = "__temp__"
 
@@ -753,7 +918,14 @@ function build_session!(m::SessionManager, key::String, env_path::Union{String,N
         start!(s)
     catch
         @lock m.lock delete!(m.creating, key)
-        s === nothing || (try kill_session!(s) catch end)
+        if s !== nothing
+            try
+                kill_session!(s)
+            catch kill_e
+                kill_e isa InterruptException && rethrow()
+                @debug "build_session!: reaping half-started session failed" exception = kill_e
+            end
+        end
         rethrow()
     end
     @lock m.lock begin
@@ -843,7 +1015,12 @@ end
 function shutdown!(m::SessionManager)
     @lock m.lock begin
         for s in values(m.sessions)
-            try kill_session!(s) catch end
+            try
+                kill_session!(s)
+            catch e
+                e isa InterruptException && rethrow()
+                @debug "shutdown!: kill_session! failed" exception = e
+            end
         end
         empty!(m.sessions)
     end
