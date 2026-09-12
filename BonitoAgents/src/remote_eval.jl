@@ -22,7 +22,7 @@
 # per project.
 #
 # OFF BY DEFAULT, per chat: `ProjectInfo.remote_eval`. The switch sits in the
-# chat header next to the permissions pill. It is enforced HERE, at relay time —
+# chat's ⋯ menu, next to 'Dev mode'. It is enforced HERE, at relay time —
 # not in the MCP process, which the agent drives — so it takes effect without a
 # restart and cannot be argued around. Switching it off shuts the chat's hosts
 # down; so does the end of the chat's session (`stop_session!`).
@@ -65,6 +65,11 @@ function set_remote_eval!(state::ServerState, project_id::AbstractString, on::Bo
         lock(state.lock) do; save_projects!(state); end
         safe_notify!(state.projects)
         on || close_eval_hosts!(state, p.id)
+        # The ONLY record that this was ever flipped. Without it a report of
+        # "the header says on and the agent still says off" has nothing to check
+        # against: no log line, and the flag is not in any report either (it is
+        # in `project_report` now, which it was not when this first bit).
+        @info "remote julia switched" project_id = p.id name = p.name on = on
     end
     return p
 end
@@ -99,10 +104,20 @@ function remote_eval_project(state::ServerState, caller::AbstractString)
     isempty(caller) && error("running Julia on another worker needs a chat (this control channel carries no project id)")
     p = get(state.projects[], caller, nothing)
     p === nothing && error("unknown chat '$(caller)'")
-    p.remote_eval || error(
-        "Running Julia on another worker is switched OFF for this chat. The user can " *
-        "switch it on in the chat header ('remote julia', next to the permissions pill); " *
-        "ask them rather than retrying.")
+    if !p.remote_eval
+        # Name the chat the SERVER resolved. The user reads the switch in one
+        # chat's header; this call arrives on the control channel of whatever
+        # project id was baked into that MCP process at spawn. When the two
+        # disagree — several chats open on the same folder, a session that
+        # outlived a re-registered project — the old message ("switched OFF for
+        # this chat") sent everyone looking at the right switch on the wrong
+        # chat. The id makes that mismatch visible in the transcript itself.
+        @warn "remote julia refused" caller = caller project = p.name worker_path = p.worker_path
+        error("Running Julia on another worker is switched OFF for chat '$(caller)' " *
+              "($(p.name)). Turn it on in THAT chat's ⋯ menu → 'Remote julia' — if its " *
+              "header already reads on, you are looking at a different chat on the same " *
+              "folder, and this is the one that needs it. Ask rather than retrying.")
+    end
     return p
 end
 

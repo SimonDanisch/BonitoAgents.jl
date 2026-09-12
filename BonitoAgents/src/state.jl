@@ -134,7 +134,7 @@ mutable struct ProjectInfo
     dev_mode::Bool
     # May this chat's agent run Julia (and copy folders) on OTHER workers via
     # `bt_julia_eval(worker = …)` / `bt_sync_folder`? Off by default; the switch
-    # sits in the chat header next to the permissions pill, and the server
+    # sits in the chat's ⋯ menu next to 'Dev mode', and the server
     # enforces it at relay time (remote_eval.jl), so no restart is involved.
     # Persisted: a granted capability must survive a server restart, and must
     # never be derived from anything else.

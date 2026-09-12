@@ -99,6 +99,7 @@ class BonitoChat {
         this.EST_HEIGHT = 80;
         this.OVERSCAN = 8;
         this.initialLoad = false;
+        this.pendingAnchor = null;
         this.bootstrapped = false;
         this.measuredHeightSum = 0;
         this.measuredHeightCount = 0;
@@ -115,6 +116,7 @@ class BonitoChat {
                 if (idx === undefined) continue;
                 const h = e.borderBoxSize && e.borderBoxSize.length ? e.borderBoxSize[0].blockSize : e.target.offsetHeight;
                 if (h > 0 && this.heights.get(idx) !== h) {
+                    if (!this.heightIsFinal(e.target)) continue;
                     this.heights.set(idx, h);
                     changed = true;
                 }
@@ -180,6 +182,7 @@ class BonitoChat {
         const markUserInput = ()=>{
             this.lastUserInputT = performance.now();
             this.pendingUserScroll = true;
+            this.pendingAnchor = null;
             this.cancelPendingScroll();
         };
         container.addEventListener('wheel', markUserInput, {
@@ -420,6 +423,7 @@ class BonitoChat {
         if (this.waitingEl) this.viewportObserver.observe(this.waitingEl);
         if (this.thinkingEl) this.viewportObserver.observe(this.thinkingEl);
         if (window.visualViewport) {
+            this.lastViewportHeight = null;
             this.onVisualViewportResize = ()=>this.onViewportResize();
             window.visualViewport.addEventListener('resize', this.onVisualViewportResize);
         }
@@ -603,6 +607,7 @@ class BonitoChat {
         for (const node of this.cache.values())node.remove();
         this.cache.clear();
         this.heights.clear();
+        this.pendingAnchor = null;
         this.rendered.clear();
         this.nodeById.clear();
         this.observed.clear();
@@ -787,7 +792,7 @@ class BonitoChat {
         }
         this.updateDOM(s, e);
         const userDriving = this.scrollbarDrag || this.pendingUserScroll || performance.now() - this.lastUserInputT < 400;
-        if (wasAtBottom && !userDriving && this.container.scrollHeight !== preHeight) {
+        if (this.followMode && wasAtBottom && !userDriving && this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
             this.prevScrollTop = this.container.scrollTop;
         }
@@ -802,6 +807,7 @@ class BonitoChat {
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
+            node.__btIdx = idx;
             this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
             fresh.push([
@@ -848,6 +854,17 @@ class BonitoChat {
         for(let i = s; i <= e; i++)if (!this.cache.has(i)) return true;
         return false;
     }
+    heightIsFinal(node) {
+        if (!node || !node.querySelector) return true;
+        if (node.classList.contains('bt-tool-live')) return false;
+        if (node.dataset.btAutoExpand || node.dataset.btAutoMount) return false;
+        if (node.querySelector('.bt-collapsable-loading')) return false;
+        for (const m of node.querySelectorAll('img, video')){
+            if (m.tagName === 'IMG' && !m.complete) return false;
+            if (m.offsetHeight === 0) return false;
+        }
+        return true;
+    }
     measureNodes(pairs) {
         if (!this.measureEl || pairs.length === 0) return;
         const cs = getComputedStyle(this.container);
@@ -859,7 +876,7 @@ class BonitoChat {
         for (const [idx, node] of toMeasure){
             const h = node.offsetHeight;
             if (h > 0) {
-                this.heights.set(idx, h);
+                if (this.heightIsFinal(node)) this.heights.set(idx, h);
                 this.measuredHeightSum += h;
                 this.measuredHeightCount++;
             }
@@ -917,8 +934,10 @@ class BonitoChat {
         let want;
         if (n && n.isConnected) {
             want = n.offsetTop - a.off;
+            this.pendingAnchor = null;
         } else {
             want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
+            this.pendingAnchor = a;
             this.queueRefresh();
         }
         if (Math.abs(this.container.scrollTop - want) > 1) {
@@ -1005,7 +1024,7 @@ class BonitoChat {
     updateDOM(s, e) {
         if (s > e) return;
         const sticky = this.activeKeyAnchor();
-        const anchor = this.initialLoad || sticky ? null : this.captureAnchor();
+        const anchor = this.initialLoad || sticky ? null : this.pendingAnchor || this.captureAnchor();
         for (const idx of [
             ...this.rendered
         ]){
@@ -1150,6 +1169,7 @@ class BonitoChat {
         if (!this.cache.has(idx)) {
             const node = this.createNode(msg);
             this.cache.set(idx, node);
+            node.__btIdx = idx;
             this.keyByIdx.set(idx, filterKey(msg));
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
@@ -1418,6 +1438,8 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        const bodyWillChange = (msg.expand || msg.expand_full) && !node.collapsable?.expanded || msg.show_mime && msg.show_mime !== node.dataset.showMime;
+        if (bodyWillChange && this.heights.delete(node.__btIdx)) this.queueRefresh();
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) {
@@ -1647,6 +1669,7 @@ class BonitoChat {
         this.refresh();
     }
     setKeyHidden(key, hidden) {
+        this.pendingAnchor = null;
         const anchor = this.followMode ? null : this.captureKeyAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache){
@@ -2801,8 +2824,12 @@ class BonitoChat {
     onViewportResize() {
         if (this.fullscreenActive()) return;
         const vv = window.visualViewport;
-        const app = this.app || this.container.closest('.bt-app');
-        if (app) app.style.height = vv.height + 'px';
+        const h = Math.round(vv.height);
+        if (this.lastViewportHeight !== h) {
+            this.lastViewportHeight = h;
+            const app = this.app || this.container.closest('.bt-app');
+            if (app) app.style.height = h + 'px';
+        }
         if (this.followMode) this.queueScrollToBottom();
     }
     applyUserScroll(prevTop) {
@@ -2821,6 +2848,7 @@ class BonitoChat {
         }
     }
     setFollowMode(on) {
+        if (on) this.pendingAnchor = null;
         if (this.followMode === on) return;
         this.followMode = on;
         if (on) {

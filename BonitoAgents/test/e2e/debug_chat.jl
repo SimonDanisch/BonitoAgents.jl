@@ -52,7 +52,7 @@ const VISIBLE_PANE = """([...document.querySelectorAll('.bt-chatpane')].find(p =
 # different questions and both are used.
 const DEVMODE_BTN = """($(VISIBLE_PANE)?.querySelector('.bt-header-devmode'))"""
 const DEVMODE_LABEL = """($(DEVMODE_BTN)?.textContent || '')"""
-const DEVMODE_ON = """(!!$(DEVMODE_BTN)?.classList.contains('bt-header-devmode-on'))"""
+const DEVMODE_ON = """(!!$(DEVMODE_BTN)?.classList.contains('bt-cap-on'))"""
 # Open the visible pane's ⋯ menu and click the item with `cls`: what a user does.
 click_menu_item(server, cls) = TK.eval_js(server, """(() => {
     const p = $(VISIBLE_PANE);

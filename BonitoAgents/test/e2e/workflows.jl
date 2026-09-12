@@ -124,7 +124,7 @@ function run_suite(server)
             # the session never restarted and the header showed "switch failed".
             # (Switching to the SAME provider is a no-op early-return, which is why
             # a single mock backend can never exercise this path.)
-            opts = TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return s ? [...s.options].map(o => o.textContent.trim()) : []; })()")
+            opts = TK.agent_options(server)
             @test "Mock Agent" in opts
             @test "Mock Agent 2" in opts
             # Every registered provider reaches the dropdown, not just the mocks
@@ -135,13 +135,15 @@ function run_suite(server)
             end
             # Must really start on the default — otherwise the switch below would be
             # a no-op early-return and prove nothing.
-            @test TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent'; })()") == true
+            @test TK.current_agent(server) == "Mock Agent"
 
             TK.switch_agent(server, "Mock Agent 2")
             # The dropdown reflects the new provider (this alone does NOT prove the
             # switch worked — `provider[]` is set before the restart that can fail).
             @test TK.wait_for(server, "provider = Mock Agent 2",
-                "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent 2'; })()";
+                "(() => { const p = document.querySelector('.bt-header-provider-pick');
+                          const v = p && p.querySelector('.bt-msearch-value');
+                          return !!v && v.textContent.trim() === 'Mock Agent 2'; })()";
                 timeout = 10) == true
             # Wait for the switch to FULLY settle BEFORE sending a turn: the header
             # status clears to "" (from "Switching…") only after `switch_provider!`

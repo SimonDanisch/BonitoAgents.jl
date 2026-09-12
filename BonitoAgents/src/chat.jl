@@ -6854,8 +6854,11 @@ function dropdown_pill(category::AbstractString, current_label::AbstractString,
         nothing
     trigger = DOM.div(
         DOM.span(category * ": "; class = "bt-header-meta-cat"),
-        DOM.span(current_label),
-        " ▾";
+        DOM.span(current_label; class = "bt-msearch-value"),
+        # A styled span, not the bare text node `" ▾"` it used to be: that
+        # inherited the pill's 12px font and sat on the text baseline, so the
+        # glyph rode low and crowded the label.
+        DOM.span("▾"; class = "bt-msearch-caret");
         class = strip("bt-header-meta-item bt-header-meta-pick bt-msearch-trigger " * extra_class),
         onclick = js"""event => { event.stopPropagation(); const t = event.currentTarget;
             $(ChatLib).then(lib => lib.msearchOpen(t)); }""",
@@ -7168,10 +7171,6 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # (review.jl), the project's git diff with a comment affordance on every
     # line. Needs the window's workspace, so it says so outside the unified shell.
     review_click = Observable("")
-    review_button = DOM.button("Review";
-        class   = "bt-btn bt-btn-secondary bt-btn-sm bt-header-review",
-        title   = "Review this project's uncommitted changes — ask about or comment on any line",
-        onclick = js"event => $(review_click).notify('__click__')")
     on(session, review_click) do s
         s == "__click__" || return
         review_click[] = ""
@@ -7343,55 +7342,113 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # trigger itself turns red: that this chat's agent can drive the whole
     # server should be legible at a glance, not something you discover by opening
     # the menu.
-    devmode_trigger = Observable("")
-    devmode_on = map(session, state.projects) do projects
-        q = isempty(project_id) ? nothing : get(projects, project_id, nothing)
-        return q !== nothing && q.dev_mode
-    end
-    devmode_class = map(session, devmode_on) do on
-        on ? "bt-menu-item bt-menu-danger bt-header-devmode bt-header-devmode-on" :
-             "bt-menu-item bt-menu-danger bt-header-devmode"
-    end
-    # The ON state shows through the class alone (red, bold, a ": on" suffix
-    # from CSS) — no label Observable. `devmode_on` re-fires on EVERY
-    # `state.projects` notify, and a text update aimed at a pane that has since
-    # been pruned (a move, a close) throws in the browser; a class update on a
-    # gone node does not.
-    devmode_item = isempty(project_id) ? nothing :
-        DOM.button("Dev mode";
-            class = devmode_class,
-            title = "Dangerous: give this chat's agent live introspection into " *
-                    "the server it runs on, and the ability to drive it. " *
-                    "Restarts the session.",
-            # Which way to toggle is read from the item's own class, not from a
-            # value captured at render: `class` tracks `devmode_on`, so this stays
-            # correct after another tab flips the same project.
+    # ── Per-chat capability switches (the ⋯ menu) ────────────────────────────
+    # "Dev mode" and "Remote julia" are the same widget: a capability this
+    # chat's agent is granted, off by default, flipped rarely and read almost
+    # never. ONE implementation, because both of them shipped broken in
+    # DIFFERENT ways while they were two hand-rolled copies, and neither failure
+    # was visible from the UI.
+    #
+    # Four rules, each of which is a bug that actually happened:
+    #
+    #  1. ONE DOM node, built once. A button rebuilt inside a `map(…)` loses its
+    #     click to an orphaned element (the restart button above carries the
+    #     same warning) — that is how the remote-julia switch came to do nothing
+    #     in EITHER direction while the header cheerfully read "on".
+    #  2. The state is carried by the CLASS, never by a text Observable, and CSS
+    #     renders ": on" / ": off" / ": …" from it. A label you cannot read is a
+    #     switch you cannot trust; a text update aimed at a pane that has since
+    #     been pruned throws in the browser, where a class update does not.
+    #  3. The click sends "toggle" and nothing else. No direction is captured at
+    #     render time or read back out of the DOM, so nothing can be stale when
+    #     it lands: the server flips whatever the record says at that moment.
+    #  4. While a flip is in flight the item says so and further clicks are
+    #     DROPPED, so an impatient double-click on a slow one (dev mode restarts
+    #     the session) cannot queue two opposite flips.
+    function capability_item(name, reads, apply!; hook::String, danger = false,
+                             confirm_text = "", title = "")
+        # `is_on` exists even with no project (the menu trigger's colour reads
+        # it), so the caller never has to special-case a missing switch.
+        is_on = map(session, state.projects) do projects
+            q = isempty(project_id) ? nothing : get(projects, project_id, nothing)
+            return q !== nothing && reads(q)
+        end
+        isempty(project_id) && return (item = nothing, is_on = is_on)
+        pending = Observable(false)
+        cls = map(session, is_on, pending) do on, busy
+            # `hook` is the stable selector the e2e suite queries by; the
+            # `bt-cap-*` classes carry the STATE. Keeping them separate means a
+            # restyle cannot silently break a test's handle on the control.
+            "bt-menu-item bt-cap-item $(hook)" *
+                (danger ? " bt-menu-danger" : "") *
+                (on ? " bt-cap-on" : "") * (busy ? " bt-cap-busy" : "")
+        end
+        trigger = Observable("")
+        # The confirm (dev mode only) needs a direction, and reads it from the
+        # item's own class. Worst case on a stale class is a confirm shown while
+        # turning OFF, which is harmless — the grant itself never depends on it.
+        gate = isempty(confirm_text) ? "" :
+            "if (!el.classList.contains('bt-cap-on') && !confirm($(repr(confirm_text)))) return;"
+        item = DOM.button(name;
+            class = cls, title = title,
             onclick = js"""event => {
+                const el = event.currentTarget;
                 $(Bonito.JSString(close_menu_js))
-                if (event.currentTarget.classList.contains('bt-header-devmode-on')) {
-                    $(devmode_trigger).notify('off');
-                    return;
-                }
-                if (confirm("Enable dev mode for this chat?\n\nIts agent gets tools that read AND DRIVE this server: it can send messages into, restart or close ANY chat here, and move chats between machines.\n\nThis restarts the chat session."))
-                    $(devmode_trigger).notify('on');
+                if (el.classList.contains('bt-cap-busy')) return;
+                $(Bonito.JSString(gate))
+                $(trigger).notify('toggle');
             }""")
-    on(session, devmode_trigger) do want
-        isempty(want) && return
-        devmode_trigger[] = ""
-        isempty(project_id) && return
-        want_on = want == "on"
-        Base.errormonitor(@async try
-            safe_set!(header_status, want_on ? "Enabling dev mode…" : "Disabling dev mode…")
-            set_dev_mode!(state, project_id, want_on)
-            # The restart IS the switch as far as the agent is concerned.
+        on(session, trigger) do v
+            isempty(v) && return
+            trigger[] = ""
+            pending[] && return                       # a flip is already running
+            q = get(state.projects[], project_id, nothing)
+            q === nothing && return
+            want = !reads(q)                          # decided HERE, against the record
+            pending[] = true
+            Base.errormonitor(@async try
+                apply!(want)
+            catch e
+                @warn "capability toggle failed" name project_id want exception = (e, catch_backtrace())
+                problem("$(name) could not be turned " * (want ? "on" : "off"),
+                        error_detail(e, catch_backtrace()))
+            finally
+                safe_set!(pending, false)
+            end)
+        end
+        return (item = item, is_on = is_on)
+    end
+
+    remote = capability_item("Remote julia", q -> q.remote_eval,
+        want -> set_remote_eval!(state, project_id, want);
+        hook = "bt-header-remote",
+        title = "Let this chat's agent run Julia and copy folders on OTHER " *
+                "workers (bt_julia_eval with worker=…, bt_sync_folder). Off by " *
+                "default; the server enforces it, and switching it off stops " *
+                "the evals running there.")
+    remote_item = remote.item
+
+    dev = capability_item("Dev mode", q -> q.dev_mode,
+        function (want)
+            safe_set!(header_status, want ? "Enabling dev mode…" : "Disabling dev mode…")
+            set_dev_mode!(state, project_id, want)
+            # The restart IS the switch as far as the agent is concerned: the
+            # tools ride the MCP process's environment, which is rebuilt on
+            # bring-up (`refresh_injected_env`).
             restart_chat_session!(model)
             safe_set!(header_status, "")
-        catch e
-            @warn "toggling dev mode failed" project_id want_on exception = (e, catch_backtrace())
-            safe_set!(header_status, "")
-            problem("Dev mode could not be " * (want_on ? "enabled" : "disabled"))
-        end)
-    end
+        end;
+        hook = "bt-header-devmode",
+        danger = true,
+        confirm_text = "Enable dev mode for this chat?\n\nIts agent gets tools that " *
+                       "read AND DRIVE this server: it can send messages into, restart " *
+                       "or close ANY chat here, and move chats between machines.\n\n" *
+                       "This restarts the chat session.",
+        title = "Dangerous: give this chat's agent live introspection into " *
+                "the server it runs on, and the ability to drive it. " *
+                "Restarts the session.")
+    devmode_item = dev.item
+    devmode_on   = dev.is_on
 
     menu_trigger_class = map(session, devmode_on) do on
         on ? "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger bt-menu-trigger-danger" :
@@ -7415,9 +7472,23 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 document.addEventListener('click', m.__close, true);
             }
         }""")
+    # In the ⋯ menu with every other one-shot action, not as a lone button in
+    # the strip. The strip is for what the user READS continuously (the context
+    # meter) and for the pickers that describe the session; a verb parked next
+    # to them reads as a sixth setting.
+    review_item = DOM.button("Review changes";
+        class   = "bt-menu-item bt-header-review",
+        title   = "Review this project's uncommitted changes — ask about or comment on any line",
+        onclick = js"""event => {
+            $(Bonito.JSString(close_menu_js))
+            $(review_click).notify('__click__');
+        }""")
+
     menu = DOM.div(
         menu_trigger,
         DOM.div(
+            review_item,
+            DOM.div(; class = "bt-menu-sep"),
             continue_items,
             menu_item("Compact", "compact";
                 title = "Summarize the conversation so far to free up context (/compact)"),
@@ -7428,6 +7499,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 menu_item("Debug BonitoAgents", "debug"; class = "bt-header-debug",
                     title = "Open a chat on BonitoAgents' own source on this worker, with live " *
                             "introspection into the server running this window"),
+            remote_item,
             devmode_item;
             class = "bt-menu-list");
         class = "bt-menu bt-header-menu")
@@ -7498,44 +7570,6 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         end
     end
 
-    # ── Remote Julia switch ──────────────────────────────────────────────────
-    # May this chat's agent run Julia on OTHER workers (`bt_julia_eval(worker =
-    # …)`, `bt_sync_folder`)? Off by default. It sits next to the permissions
-    # pill because it is one: a capability the user grants per chat. The server
-    # enforces it at relay time (remote_eval.jl), so flipping it needs no restart;
-    # switching it off shuts the chat's eval hosts down. Two states, so it is a
-    # TOGGLE, not a picker: one click flips it, and the pill reads its own state
-    # (accent when on). Rebuilt from `state.projects`, the source of truth.
-    remote_toggle = Observable("")
-    remote_pill = map(session, state.projects) do projects
-        q = isempty(project_id) ? nothing : get(projects, project_id, nothing)
-        q === nothing && return DOM.span(; class = "bt-hidden")
-        on_now = q.remote_eval
-        # Hoisted: a nested string literal inside the `js"…"` macro does not parse.
-        flip_to = on_now ? "off" : "on"
-        DOM.button(
-            DOM.span("remote julia: "; class = "bt-header-meta-cat"),
-            DOM.span(on_now ? "on" : "off");
-            class = "bt-header-meta-item bt-header-meta-pick bt-header-remote" *
-                    (on_now ? " bt-header-remote-on" : ""),
-            title = "Let this chat's agent run Julia and copy folders on OTHER workers " *
-                    "(bt_julia_eval with worker=…, bt_sync_folder). Off by default; " *
-                    "the server enforces it, and switching it off stops the evals there. " *
-                    "Click to turn it " * flip_to * ".",
-            onclick = js"event => $(remote_toggle).notify($(flip_to))")
-    end
-    on(session, remote_toggle) do v
-        isempty(v) && return
-        remote_toggle[] = ""
-        isempty(project_id) && return
-        try
-            set_remote_eval!(state, project_id, v == "on")
-        catch e
-            @warn "remote julia switch failed" project_id exception = (e, catch_backtrace())
-            problem("Could not change the remote julia switch: " * first(split(sprint(showerror, e), '\n')))
-        end
-    end
-
     # ── Narrow-pane collapse toggle ──────────────────────────────────────────
     # Pure-CSS checkbox pattern (label wraps its own input — no id/for pair, so
     # several chat panes never collide). Invisible on wide panes; a container
@@ -7561,19 +7595,21 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         DOM.div(
             status_dot,
             title_node,
+            # On the TITLE row, not a row of its own: a full-width line holding
+            # one short path wasted a third of the header's height on nothing.
+            # It shares the flexible left area with the title and ellipsizes.
+            env_line,
             reconnect_chip,
             # Sits LEFT of the actions, in the flexible area: its width changes
             # are absorbed by the gap, so the controls never reflow.
             DOM.span(header_status; class="bt-header-status"),
             more_toggle,
             DOM.div(
-                DOM.div(usage_node, meta_line, remote_pill, provider_select;
+                DOM.div(usage_node, meta_line, provider_select;
                         class = "bt-header-session"),
-                review_button,
                 menu;
                 class="bt-header-actions"),
             class="bt-header-row"),
-        env_line,
         # Lens search bar — always visible. JS (`setupLens`) builds the input
         # + autocomplete + saved-lens chips inside it and wires it to `comm`.
         DOM.div(class="bt-lens-bar");

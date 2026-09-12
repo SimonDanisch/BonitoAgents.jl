@@ -1397,17 +1397,48 @@ Switch the chat's agent/provider via the header dropdown, e.g. "Mock Agent",
 """
 function switch_agent(s::TestServer, label::AbstractString)
     l = json(String(label))
+    # The provider control is a `dropdown_pill`, not a native <select> (the
+    # project bans those). Its rows carry the click handler themselves, so
+    # clicking the row IS the selection — no need to open the list first.
     ok = eval_js(s, """(() => {
-        const sel = document.querySelector('.bt-header-provider-select');
-        if (!sel) return false;
-        const opt = [...sel.options].find(o => (o.textContent||'').trim() === $l || o.value === $l);
-        if (!opt) return false;
-        sel.value = opt.value;
-        sel.dispatchEvent(new Event('input', {bubbles: true}));
-        sel.dispatchEvent(new Event('change', {bubbles: true}));
+        const pick = document.querySelector('.bt-header-provider-pick');
+        const wrap = pick && pick.closest('.bt-msearch');
+        if (!wrap) return false;
+        const item = [...wrap.querySelectorAll('.bt-msearch-item')]
+            .find(o => (o.textContent||'').trim() === $l);
+        if (!item) return false;
+        item.click();
         return true; })()""")
     ok === true || error("switch_agent: provider option $(repr(label)) not found")
     return s
+end
+
+"""
+    agent_options(s) -> Vector{String}
+
+Every agent/provider the header dropdown offers, in display order.
+"""
+function agent_options(s::TestServer)
+    return eval_js(s, """(() => {
+        const pick = document.querySelector('.bt-header-provider-pick');
+        const wrap = pick && pick.closest('.bt-msearch');
+        return wrap ? [...wrap.querySelectorAll('.bt-msearch-item')]
+            .map(o => (o.textContent||'').trim()) : [];
+    })()""")
+end
+
+"""
+    current_agent(s) -> String
+
+The agent/provider the header dropdown currently shows.
+"""
+function current_agent(s::TestServer)
+    v = eval_js(s, """(() => {
+        const pick = document.querySelector('.bt-header-provider-pick');
+        const val  = pick && pick.querySelector('.bt-msearch-value');
+        return val ? (val.textContent||'').trim() : "";
+    })()""")
+    return v === nothing ? "" : String(v)
 end
 
 """

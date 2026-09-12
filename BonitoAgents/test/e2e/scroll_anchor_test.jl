@@ -8,6 +8,8 @@
     S = SharedServer
     s = S.server()
     TK = S.TK
+    # Keep the viewport reproducible when this shares a browser with other suites.
+    TK.set_window_size(s, 1280, 820)
 
     # One turn, MANY separate bubbles: tool events break the text coalescing,
     # so this yields ~30 small text bubbles + 30 tool rows in a single send.
@@ -55,7 +57,7 @@
         c.dispatchEvent(new Event('scroll', {bubbles: true}));
     })()"""); sleep(0.8))
 
-    # The real-world churn: heights in the TOP SPACER region (below the
+    # The real-world churn: heights in the TOP SPACER region (above the
     # rendered window) get set LARGER than their estimate — prefetch
     # measurement and EST_HEIGHT adaptation only ever touch UNRENDERED
     # indices; the ResizeObserver keeps every rendered node's map entry
@@ -75,7 +77,7 @@
         let inflated = 0;
         for (let i = 0; i < winStart; i++) {
             const h = ch.heights.get(i) ?? ch.EST_HEIGHT;
-            ch.heights.set(i, h + 90);   // prefetch measured them ~90px taller
+            ch.heights.set(i, h + 900);  // large media rows replace short estimates
             inflated++;
         }
         ch.refresh();
@@ -88,9 +90,10 @@
     })()"""
 
     @testset "height churn above the viewport must not move the view" begin
-        # Churn heights in the top spacer (below the rendered window) LARGER than
-        # their estimate — the same shape as a background prefetch re-measuring
-        # unrendered rows taller. When the map-based visibleRange() shifts off the
+        # Churn heights above the rendered window with a media-sized correction
+        # to exercise anchor eviction and temporary scroll clamping, rather than
+        # relying on previous suites' layout to exceed the overscan. When the
+        # map-based visibleRange() shifts off the
         # DOM's real top-visible node the anchor gets EVICTED, and restoreAnchor
         # then used a cumHeight() virtual position that omitted the container
         # padding + gap-after-spacer, landing ~a row short — so the follow-up

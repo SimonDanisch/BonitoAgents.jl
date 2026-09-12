@@ -28,7 +28,13 @@
         @test p.remote_eval === false
         err = try; BT.dev_request(st, "remote_eval", eval_args("MacBook"), "p1"); ""
               catch e; sprint(showerror, e) end
-        @test occursin("switched OFF", err) && occursin("chat header", err)
+        @test occursin("switched OFF", err)
+        # Where the switch actually is now (the ⋯ menu, next to Dev mode) …
+        @test occursin("Remote julia", err)
+        # … and WHICH chat the server resolved. Several chats can be open on one
+        # folder, each with its own switch, so "this chat" sent people to the
+        # right switch on the wrong chat.
+        @test occursin("p1", err)
         # The companion tool is gated by the same switch.
         err = try
             BT.dev_request(st, "sync_folder", Dict{String,Any}("worker" => "MacBook", "src" => "/a"), "p1"); ""

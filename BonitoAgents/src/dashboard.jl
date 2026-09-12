@@ -2691,7 +2691,7 @@ function dashboard_app(state::ServerState)
         progress = Observable{Any}(BUSY_IDLE)
         DOM.div(
             DashboardStyles,
-            Bonito.ConnectionIndicator(),
+            connection_led(),
             progress_overlay(session, progress),
             dashboard_dom(session, view; progress = progress))
     end

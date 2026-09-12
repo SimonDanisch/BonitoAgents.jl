@@ -202,6 +202,7 @@ class BonitoChat {
         this.EST_HEIGHT    = 80;    // adapted to the measured average, see measureNodes
         this.OVERSCAN      = 8;
         this.initialLoad   = false;
+        this.pendingAnchor = null; // evicted reading position awaiting remount
         this.bootstrapped = false; // first msgs.count seen (guards initialLoad re-arm)
         this.measuredHeightSum      = 0;     // running mean of measured heights → EST_HEIGHT
         this.measuredHeightCount    = 0;
@@ -239,6 +240,20 @@ class BonitoChat {
                 // h>0 guard keeps the last measured height through a
                 // hide/show cycle, so re-showing restores exact sizes.
                 if (h > 0 && this.heights.get(idx) !== h) {
+                    // Only pin a height the node has finished growing into.
+                    //
+                    // In follow mode EVERY message is briefly rendered as it
+                    // arrives, and a `bt_show` bubble is still unsized then —
+                    // its media url is a worker round-trip. So this fires with
+                    // the bare 24.5px bubble of a message that ends up at
+                    // 154px, and it then scrolls out of the window, where the
+                    // node is detached, has no layout, and can never be
+                    // corrected. `effHeight` hands that to every spacer and to
+                    // `indexAt`, so one frozen row mis-places every index past
+                    // it — which is what makes scrolling up land somewhere
+                    // else. Skipping leaves the row on EST_HEIGHT until the
+                    // media lands and this fires again with the real size.
+                    if (!this.heightIsFinal(e.target)) continue;
                     this.heights.set(idx, h);
                     changed = true;
                 }
@@ -439,6 +454,7 @@ class BonitoChat {
         const markUserInput = () => {
             this.lastUserInputT = performance.now();
             this.pendingUserScroll = true;
+            this.pendingAnchor = null;
             this.cancelPendingScroll();
         };
         container.addEventListener('wheel',      markUserInput, { passive: true });
@@ -779,6 +795,9 @@ class BonitoChat {
         if (this.thinkingEl) this.viewportObserver.observe(this.thinkingEl);
 
         if (window.visualViewport) {
+            // Last height we WROTE onto .bt-app, so a resize event that reports
+            // the same geometry costs nothing (see onViewportResize).
+            this.lastViewportHeight = null;
             this.onVisualViewportResize = () => this.onViewportResize();
             window.visualViewport.addEventListener('resize', this.onVisualViewportResize);
         }
@@ -960,6 +979,7 @@ class BonitoChat {
         for (const node of this.cache.values()) node.remove();
         this.cache.clear();
         this.heights.clear();
+        this.pendingAnchor = null;
         this.rendered.clear();
         this.nodeById.clear();
         this.observed.clear();
@@ -1241,7 +1261,9 @@ class BonitoChat {
         // ("wheel did nothing" at the bottom edge).
         const userDriving = this.scrollbarDrag || this.pendingUserScroll ||
             (performance.now() - this.lastUserInputT) < 400;
-        if (wasAtBottom && !userDriving &&
+        // An evicted anchor can temporarily clamp scrollTop to the bottom.
+        // That is a geometry artifact, not a request to leave reading mode.
+        if (this.followMode && wasAtBottom && !userDriving &&
             this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
             // Programmatic write, possibly event-less (offscreen): keep the
@@ -1266,6 +1288,7 @@ class BonitoChat {
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
+            node.__btIdx = idx;
             this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
             // Do NOT observe at creation — a node is observed only while it's
@@ -1340,12 +1363,24 @@ class BonitoChat {
         return false;
     }
 
-    // Measure freshly-created (detached) nodes in the hidden off-screen
-    // host: one batch insert, one layout pass, real heights for everything
-    // the prefetcher caches. Estimates then only ever exist for the few
-    // frames before a chunk arrives — scrollbar geometry stays truthful,
-    // which is what keeps direct thumb drags smooth (no drift to correct,
-    // no freeze needed). Nodes already in the live DOM are skipped.
+    // Has this node finished filling in, or is its height still provisional?
+    // Running tools may not have announced their media yet. Deferred bodies
+    // and loading placeholders also precede the actual content. Media needs
+    // a layout box; merely having a <video> in the DOM does not establish size.
+    heightIsFinal(node) {
+        if (!node || !node.querySelector) return true;
+        if (node.classList.contains('bt-tool-live')) return false;
+        if (node.dataset.btAutoExpand || node.dataset.btAutoMount) return false;
+        if (node.querySelector('.bt-collapsable-loading')) return false;
+        for (const m of node.querySelectorAll('img, video')) {
+            if (m.tagName === 'IMG' && !m.complete) return false;
+            if (m.offsetHeight === 0) return false;
+        }
+        return true;
+    }
+
+    // Batch-measure prefetched nodes at the column width. Cache completed
+    // static rows; asynchronous rows stay on the estimate until ready.
     measureNodes(pairs) {
         if (!this.measureEl || pairs.length === 0) return;
         const cs = getComputedStyle(this.container);
@@ -1359,7 +1394,7 @@ class BonitoChat {
         for (const [idx, node] of toMeasure) {
             const h = node.offsetHeight;
             if (h > 0) {
-                this.heights.set(idx, h);
+                if (this.heightIsFinal(node)) this.heights.set(idx, h);
                 this.measuredHeightSum += h;
                 this.measuredHeightCount++;
             }
@@ -1434,6 +1469,7 @@ class BonitoChat {
         let want;
         if (n && n.isConnected) {
             want = n.offsetTop - a.off;
+            this.pendingAnchor = null;
         } else {
             // The re-window EVICTED the anchor: a large estimate shift (e.g. a
             // background prefetch re-measuring unrendered rows ABOVE the viewport
@@ -1447,6 +1483,10 @@ class BonitoChat {
             // so the queued refresh's captureAnchor picked the NEIGHBOURING row
             // and the view jumped ~1 row — a stuck drift on above-viewport churn.
             want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
+            // Keep the original row until it is mounted again. The virtual
+            // position can still contain estimates; capturing a new DOM anchor
+            // on the correction pass would pin whichever neighbour they reach.
+            this.pendingAnchor = a;
             this.queueRefresh();
         }
         if (Math.abs(this.container.scrollTop - want) > 1) {
@@ -1592,7 +1632,8 @@ class BonitoChat {
         // DOM capture — re-capturing mid-settle would faithfully preserve the
         // drift the toggle reflow just caused (see captureKeyAnchor).
         const sticky = this.activeKeyAnchor();
-        const anchor = (this.initialLoad || sticky) ? null : this.captureAnchor();
+        const anchor = (this.initialLoad || sticky) ? null :
+            (this.pendingAnchor || this.captureAnchor());
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
                 const node = this.cache.get(idx);
@@ -1795,6 +1836,7 @@ class BonitoChat {
         if (!this.cache.has(idx)) {
             const node = this.createNode(msg);
             this.cache.set(idx, node);
+            node.__btIdx = idx;
             this.keyByIdx.set(idx, filterKey(msg));
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
@@ -2208,6 +2250,12 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        // Content metadata can arrive AFTER the terminal status. A measured
+        // collapsed header is then obsolete even if it has left the window.
+        // Invalidate on the representation change, not on ordinary eviction.
+        const bodyWillChange = ((msg.expand || msg.expand_full) && !node.collapsable?.expanded) ||
+            (msg.show_mime && msg.show_mime !== node.dataset.showMime);
+        if (bodyWillChange && this.heights.delete(node.__btIdx)) this.queueRefresh();
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
@@ -2542,6 +2590,7 @@ class BonitoChat {
     // the real (collapsed) layout exactly. Nodes created later pick up the
     // current state in createNode.
     setKeyHidden(key, hidden) {
+        this.pendingAnchor = null;
         // Hold the read position across the toggle. Applying visibility reflows
         // the transcript (matching rows collapse to / expand from 0px), which
         // moves the viewport BEFORE refresh's own anchor runs — refresh then
@@ -4142,9 +4191,33 @@ class BonitoChat {
         // `updateDOM` now refuses to drop it, but the scroll is still wrong: the
         // user asked for fullscreen, not for the conversation to move.
         if (this.fullscreenActive()) return;
-        const vv  = window.visualViewport;
-        const app = this.app || this.container.closest('.bt-app');
-        if (app) app.style.height = vv.height + 'px';
+        const vv = window.visualViewport;
+        // Do NOTHING when the geometry is what we already wrote.
+        //
+        // `visualViewport.resize` is not one event per keyboard slide: a phone
+        // fires it for the IME candidate bar appearing and disappearing, for
+        // keyboard height changes, and for address-bar nudges — several times
+        // per typed character. Each one used to write `.bt-app`'s height
+        // unconditionally, which re-lays-out `.bt-messages`, which runs the
+        // container's ResizeObserver, which calls `sizeTail()` and chases the
+        // tail: a full layout + scroll cycle per event. And since the write
+        // changes layout, it can provoke the next resize event itself — so the
+        // cycle feeds back, which is what a wobble IS.
+        //
+        // Rounded, because the fractional jitter is exactly the noise to drop.
+        //
+        // ONLY the style write is skipped, never the chase. The write is the
+        // half that feeds back (it changes layout, which can provoke the next
+        // resize event); the chase only moves scrollTop and cannot. Skipping
+        // BOTH was measurably worse: the repeated write was also acting as a
+        // periodic re-pin, and without it `e2e:composer_wobble` picked up a 2px
+        // drift on a keystroke that resized nothing.
+        const h = Math.round(vv.height);
+        if (this.lastViewportHeight !== h) {
+            this.lastViewportHeight = h;
+            const app = this.app || this.container.closest('.bt-app');
+            if (app) app.style.height = h + 'px';
+        }
         if (this.followMode) this.queueScrollToBottom();
     }
 
@@ -4200,6 +4273,7 @@ class BonitoChat {
     // zone (any pixel visible, less than a viewport to go) → true. Layout
     // shifts never toggle it.
     setFollowMode(on) {
+        if (on) this.pendingAnchor = null;
         if (this.followMode === on) return;
         this.followMode = on;
         if (on) {

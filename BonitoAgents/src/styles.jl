@@ -10,6 +10,39 @@
 #   • one-shot actions go into a `.bt-menu` popover, not into a row of buttons;
 #   • outcomes are reported by a toast, never by rewriting a button's label;
 #   • spacing from the `--bt-space-*` scale, radii from `--bt-radius(-sm)`.
+"""
+    connection_led() -> Bonito.ConnectionIndicator
+
+The browser↔server websocket LED, dressed as part of this app instead of a
+stray dot in the page corner.
+
+Three things are changed from Bonito's default. It uses OUR status palette, the
+same greens and reds as every other liveness dot in the window
+(`--bt-status-*`), so one glance reads the same everywhere. It is 8px with a
+soft ring rather than 10px with a hard glow. And it sits bottom-LEFT, over the
+sidebar: the default `top: 10px; right: 10px` lands exactly on the chat
+header's ⋯ button, which is both a collision and the worst possible place for
+something the user must not confuse with a control.
+
+`Styles(default, indicator.style)` merges ours last, so these win — including
+unsetting `top`/`right`, which the constructor's own kwargs cannot express.
+
+NOT the same signal as the in-chat status dot: that one is the AGENT session's
+liveness, this one is whether this browser tab can still talk to the server at
+all. Both matter, and they fail independently.
+"""
+connection_led() = Bonito.ConnectionIndicator(;
+    connected_color     = "#16a34a",   # --bt-status-online
+    connecting_color    = "#f59e0b",   # --bt-warning
+    disconnected_color  = "#dc2626",   # --bt-status-offline
+    no_connection_color = "#94a3b8",   # --bt-text-faint
+    size = 8,
+    style = Bonito.Styles(
+        "top" => "auto", "right" => "auto",
+        "bottom" => "10px", "left" => "10px",
+        "box-shadow" => "0 0 0 3px var(--bt-bg), 0 0 0 4px rgba(15,23,42,0.08)",
+        "opacity" => "0.85"))
+
 const BASE_CSS = [
     CSS(":root",
         # `color-scheme` is NOT declared here — see the `html:root` rule in the
@@ -574,7 +607,9 @@ const ChatStyles = Bonito.Styles(
     # to the title rather than pushed to the far edge.
     CSS(".bt-header-title",
         "font-weight" => "600", "font-size" => "14px",
-        "min-width" => "0", "overflow" => "hidden",
+        # A floor so the path next to it can never squeeze the chat's name to
+        # nothing; the path yields first (`flex: 0 100 auto` on `.bt-header-env`).
+        "min-width" => "4rem", "overflow" => "hidden",
         "text-overflow" => "ellipsis", "white-space" => "nowrap",
         "flex" => "0 1 auto"),
     # Inline-editable variant (an <input> over ProjectInfo.title). Reads as
@@ -593,7 +628,16 @@ const ChatStyles = Bonito.Styles(
         "padding" => "2px 6px",
         "margin" => "-2px -6px",
         "border-radius" => "var(--bt-radius-sm)",
-        "flex" => "1 1 auto",
+        # Sized to its TEXT, not to the space available. It used to be
+        # `flex: 1 1 auto` with a 420px cap, which was invisible while the title
+        # sat alone before a wide gap — but the path moved onto this row, and a
+        # 420px box of transparent input left it stranded mid-header. `max-width`
+        # stays as the cap for a very long title; a browser without
+        # `field-sizing` falls back to an input's default width, which is a
+        # sensible box rather than a collapse.
+        "field-sizing" => "content",
+        "flex" => "0 1 auto",
+        "min-width" => "4rem",
         "max-width" => "420px",
         "cursor" => "text",
         "transition" => "background 80ms, box-shadow 80ms"),
@@ -608,12 +652,21 @@ const ChatStyles = Bonito.Styles(
         "margin-left" => "6px"),
     # Project-env sub-line under the title row. Muted monospace, single line
     # with ellipsis so a long absolute path never widens the header.
+    # Inline on the title row now, not a row of its own — a full-width line for
+    # one short path spent a third of the header's height on nothing. It yields
+    # before the title does (shrink 100 vs the title's 1, same reasoning as the
+    # tool row) and ellipsizes from the LEFT, because the tail of a path is the
+    # part that identifies it.
     CSS(".bt-header-env",
         "font-family" => "ui-monospace, monospace", "font-size" => "11px",
         "color" => "var(--bt-text-muted)", "font-weight" => "400",
-        "margin-top" => "2px", "max-width" => "100%",
+        "flex" => "0 100 auto", "min-width" => "0",
+        "direction" => "rtl", "text-align" => "left",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
+    # `direction: rtl` moves the ellipsis to the front; this keeps the path
+    # itself reading left-to-right inside it.
+    CSS(".bt-header-env", "unicode-bidi" => "plaintext"),
     # ── Reconnect chip ───────────────────────────────────────────────────────
     # Shown next to the title only when the agent session has died (hidden via
     # `bt-hidden` otherwise): the one failure the user must notice without
@@ -669,10 +722,20 @@ const ChatStyles = Bonito.Styles(
         "overflow" => "hidden",
         "max-width" => "100%",
         "flex" => "0 1 auto", "min-width" => "0"),
-    CSS(".bt-header-actions .bt-header-session .bt-header-meta",
-        "display" => "contents"),
+    # `display: contents` dissolves the wrapper so its CHILD becomes the flex
+    # cell. `.bt-header-meta` always needed this; `.bt-msearch` started needing
+    # it when every pill became a `dropdown_pill`, which wraps its trigger in
+    # one. Without it the visible pill sits at `.bt-header-session > .bt-msearch
+    # > .bt-msearch-trigger` — one level deeper than the reset below reaches —
+    # so it kept `.bt-header-meta-item`'s own border, background and 6px radius
+    # INSIDE the group's border: every pill drawn twice, which is what "what on
+    # earth happened to the buttons" looked like.
+    # (Safe now: `.bt-msearch-list` is `position: fixed` and placed by JS from
+    # the trigger's rect, so it no longer needs `.bt-msearch` as its containing
+    # block.)
     CSS(".bt-header-actions .bt-header-session > *, " *
-        ".bt-header-actions .bt-header-session .bt-header-meta > *",
+        ".bt-header-actions .bt-header-session .bt-header-meta > *, " *
+        ".bt-header-actions .bt-header-session .bt-msearch > .bt-msearch-trigger",
         "border" => "0", "border-left" => "1px solid var(--bt-border)",
         "margin-left" => "-1px",
         "border-radius" => "0", "background" => "transparent",
@@ -680,12 +743,28 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "12px", "line-height" => "18px",
         "display" => "inline-flex", "align-items" => "center",
         "white-space" => "nowrap", "cursor" => "default"),
+    # AFTER the reset above, and that ORDER is the whole point. The reset sets
+    # `display: inline-flex` on every cell it matches; this selector has the
+    # SAME specificity (0,3,0), so declared earlier it silently lost and the
+    # wrapper kept a box — with its own `border-left` sitting 0.7px from the
+    # trigger's, which is the doubled `[ |` at the group's left edge. Dissolving
+    # the wrapper leaves exactly one cell, and one hairline, per pill.
+    CSS(".bt-header-actions .bt-header-session .bt-header-meta, " *
+        ".bt-header-actions .bt-header-session .bt-msearch",
+        "display" => "contents"),
     CSS(".bt-header-actions .bt-header-session .bt-header-meta-pick, " *
-        ".bt-header-actions .bt-header-session .bt-msearch, " *
-        ".bt-header-actions .bt-header-session .bt-header-provider-select",
+        ".bt-header-actions .bt-header-session .bt-msearch",
         "cursor" => "pointer"),
-    CSS(".bt-header-actions .bt-header-session .bt-header-meta-pick:hover, " *
-        ".bt-header-actions .bt-header-session .bt-header-provider-select:hover",
+    # The caret: its own span so it can sit on the pill's centre line instead of
+    # the text baseline, muted so the VALUE is what the eye lands on.
+    CSS(".bt-msearch-caret",
+        "font-size" => "9px", "line-height" => "1",
+        "margin-left" => "5px",
+        "color" => "var(--bt-text-faint)",
+        "flex" => "0 0 auto",
+        "transform" => "translateY(0.5px)"),
+    CSS(".bt-msearch-value", "font-weight" => "500"),
+    CSS(".bt-header-actions .bt-header-session .bt-header-meta-pick:hover",
         "background" => "var(--bt-surface-2)"),
     # The context meter ("21.8k/200k · 11% · $0.42", usage_update telemetry):
     # the one thing the user reads all the time, so it stays in the strip. Mono
@@ -702,34 +781,31 @@ const ChatStyles = Bonito.Styles(
     # The label is a Bonito string-Observable: it renders as an INNER span
     # (the fast-path swap node), so the outer node is never `:empty` itself.
     CSS(".bt-header-usage:has(> span:empty)", "display" => "none !important"),
-    # ── Provider switcher ────────────────────────────────────────────────────
-    # Native <select>, chrome-stripped: the session group carries the border.
-    CSS(".bt-header-provider-select",
-        "appearance" => "none",
-        "-webkit-appearance" => "none",
-        "border" => "0",
-        "background" => "transparent",
-        "color" => "var(--bt-text)",
-        "font" => "inherit", "font-size" => "12px",
-        "cursor" => "pointer",
-        "white-space" => "nowrap"),
-    CSS(".bt-header-provider-select:focus",
-        "outline" => "2px solid var(--bt-accent)",
-        "outline-offset" => "-2px"),
+    # (The provider switcher's own rules are gone with its native <select>: it
+    # is a `dropdown_pill` now, styled by the `.bt-msearch` / `.bt-header-meta`
+    # rules above like every other pill in the strip.)
     # The ⋯ trigger turns red while dev mode is on: that this chat's agent can
     # drive the whole server should be legible without opening the menu.
     CSS(".bt-menu-trigger",
         "font-weight" => "700", "padding-left" => "8px", "padding-right" => "8px"),
     CSS(".bt-menu-trigger-danger",
         "border-color" => "rgba(239,68,68,0.5)", "color" => "var(--bt-error)"),
-    CSS(".bt-header-devmode-on", "font-weight" => "600"),
-    # The remote-julia toggle reads its own state: quiet when off, accent when
-    # this chat's agent may run code on other machines.
-    CSS(".bt-header-actions .bt-header-session .bt-header-remote-on",
-        "color" => "var(--bt-accent)", "font-weight" => "600"),
-    CSS(".bt-header-actions .bt-header-session .bt-header-remote-on .bt-header-meta-cat",
-        "color" => "var(--bt-accent)"),
-    CSS(".bt-header-devmode-on::after", "content" => "\": on\""),
+    # ── Per-chat capability switches (chat.jl::capability_item) ──────────────
+    # The state is rendered from the CLASS and nothing else — no text
+    # Observable aimed at a node a pruned pane may have taken with it. Every
+    # state is spelled out, including OFF: an item that just reads "Dev mode"
+    # tells you nothing about whether your click did anything.
+    CSS(".bt-cap-item::after", "content" => "\": off\"", "opacity" => "0.7"),
+    CSS(".bt-cap-item.bt-cap-on::after", "content" => "\": on\"", "opacity" => "1"),
+    # In flight (dev mode restarts the session, which takes seconds). The item
+    # also stops accepting clicks while this is set — see `capability_item`.
+    CSS(".bt-cap-item.bt-cap-busy::after", "content" => "\": …\""),
+    CSS(".bt-cap-item.bt-cap-busy", "opacity" => "0.6", "cursor" => "default"),
+    # ON is an accent, not a warning: running Julia on another of YOUR machines
+    # is a normal thing to want. Dev mode is `bt-menu-danger` on top of this,
+    # because it hands the agent the whole server.
+    CSS(".bt-cap-item.bt-cap-on", "font-weight" => "600"),
+    CSS(".bt-cap-item.bt-cap-on:not(.bt-menu-danger)", "color" => "var(--bt-accent)"),
     # Transient status of a long-running header action ("Switching to…",
     # "Continuing on MacBook: Sending 12/40…"). Lives in the flexible left
     # area (before the auto-margin), capped + ellipsized so it never reflows

@@ -61,15 +61,15 @@ panel_geometry_ok(s) = TK.eval_js(s, """(() => {
     const acts = p.querySelector('.bt-header-actions');
     const tog  = p.querySelector('.bt-header-more-toggle');
     const row  = p.querySelector('.bt-header-row');
-    const rev  = p.querySelector('.bt-header-review');
-    const sel  = p.querySelector('.bt-header-provider-select');
-    if (!acts || !tog || !row || !rev) return 'missing-el';
+    // The ⋯ trigger, not Review: Review moved INTO that menu, so the stretched
+    // member of the stacked panel is the menu itself.
+    const men  = p.querySelector('.bt-header-menu');
+    if (!acts || !tog || !row || !men) return 'missing-el';
     const a = acts.getBoundingClientRect(), t = tog.getBoundingClientRect(),
-          r = row.getBoundingClientRect(),  y = rev.getBoundingClientRect();
+          r = row.getBoundingClientRect(),  y = men.getBoundingClientRect();
     if (a.top < t.bottom - 1) return 'panel-not-below-toggle';
     if (a.width < 0.9 * r.width) return 'panel-not-full-width';
-    if (y.width < 0.9 * a.width) return 'review-not-stretched';
-    if (sel && getComputedStyle(sel).textAlign !== 'center') return 'select-not-centered';
+    if (y.width < 0.9 * a.width) return 'menu-not-stretched';
     // No placeholder children: an empty span (the old xsync placeholder) or a
     // rendered-but-empty meta div costs a flex-gap slot and doubles a row gap.
     if (acts.querySelector(':scope > span:empty')) return 'phantom-empty-child';
@@ -207,8 +207,12 @@ function run_suite(server)
             @test glyph(s) == "✕"
             @test visible(s, ".bt-lens-bar")
             @test visible(s, ".bt-header-env")
-            @test visible(s, ".bt-header-review")
             @test visible(s, ".bt-header-menu")
+            # Review lives in the ⋯ menu now, so what has to be reachable here
+            # is the trigger; the item itself is one click away like every
+            # other action.
+            @test visible(s, ".bt-header-menu .bt-menu-trigger")
+            @test TK.eval_js(s, "!!$(PANE).querySelector('.bt-header-menu .bt-header-review')") == true
             @test panel_geometry_ok(s) == "ok"
 
             # Collapse again: back to the bare row.

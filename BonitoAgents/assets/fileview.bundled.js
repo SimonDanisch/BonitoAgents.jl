@@ -67,8 +67,9 @@ function initFrame(el) {
     const src = el.dataset.frameSrc;
     if (src) el.src = src;
 }
+let driver = null;
 function install(meshLib) {
-    if (window.__btFileViewDriver) return window.__btFileViewDriver;
+    if (driver) return driver;
     const initOne = (el)=>{
         if (el.dataset[READY] === "1") return;
         el.dataset[READY] = "1";
@@ -115,12 +116,12 @@ function install(meshLib) {
         childList: true,
         subtree: true
     });
-    window.__btFileViewDriver = {
+    driver = {
         observer,
         scan,
         drain
     };
-    return window.__btFileViewDriver;
+    return driver;
 }
 export { install as install };
 

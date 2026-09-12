@@ -106,11 +106,21 @@ function initFrame(el) {
  * wins and later ones are no-ops, so the shell and an individually-rendered
  * panel can both ask for it.
  *
+ * The once-guard is MODULE scope, not `window`. An ES6 module is evaluated once
+ * per page, so `driver` below already is the per-page singleton; a
+ * `window.__btFileViewDriver` flag added nothing except a global, and globals of
+ * that shape are how a second instance ends up dispatching into the first one's
+ * closure (see Bonito's AGENTS.md §4). Nothing here closes over per-instance
+ * state — the observer watches `document.body` and `scan` takes its root as an
+ * argument — so this is a straight swap.
+ *
  * `meshLib` is `assets/meshview.js`, passed in rather than imported so the two
  * modules stay independently bundleable.
  */
+let driver = null;
+
 export function install(meshLib) {
-    if (window.__btFileViewDriver) return window.__btFileViewDriver;
+    if (driver) return driver;
 
     const initOne = (el) => {
         if (el.dataset[READY] === "1") return;
@@ -176,6 +186,6 @@ export function install(meshLib) {
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
-    window.__btFileViewDriver = { observer, scan, drain };
-    return window.__btFileViewDriver;
+    driver = { observer, scan, drain };
+    return driver;
 }
