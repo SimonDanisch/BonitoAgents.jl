@@ -1,8 +1,8 @@
 # Black-box media e2e: a `bt_show` of an image and a video must render as
 # clickable, range-streamable media (the bt_julia_eval+bt_show merge / media
 # fast-path work). Drives only the DOM:
-#   • image → <img class=bt-media> inside .bt-media-wrap, src = /assets/<key>
-#   • video → <video class=bt-media><source src=/assets/<key>>
+#   • image → <img class=bt-media> inside .bt-media-wrap, src = /worker-file/<key>
+#   • video → <video class=bt-media><source src=/worker-file/<key>>
 #   • clicking the image opens the .bt-lightbox-overlay
 #   • the browser can Range-fetch the src and gets HTTP 206 (streaming)
 # dev_server is local, so the worker reads the same /tmp we write here.
@@ -36,15 +36,15 @@
     TK.eval_js(s, "[...document.querySelectorAll('.bt-tool-msg .bt-tool-header')].forEach(h=>h.click()); true")
 
     @test TK.wait_for(s, "image renders as streamed asset",
-        "(() => { const i = document.querySelector('.bt-media-wrap img.bt-media'); " *
-        "return !!i && (i.getAttribute('src')||'').startsWith('/assets/'); })()"; timeout = 30)
+        "(() => { const i = document.querySelector('.bt-tool-body .bt-media-wrap img.bt-media'); " *
+        "return !!i && (i.getAttribute('src')||'').startsWith('/worker-file/'); })()"; timeout = 30)
 
     @test TK.wait_for(s, "video renders as streamed asset",
-        "(() => { const v = document.querySelector('.bt-media-wrap video.bt-media source'); " *
-        "return !!v && (v.getAttribute('src')||'').startsWith('/assets/'); })()"; timeout = 30)
+        "(() => { const v = document.querySelector('.bt-tool-body .bt-media-wrap video.bt-media source'); " *
+        "return !!v && (v.getAttribute('src')||'').startsWith('/worker-file/'); })()"; timeout = 30)
 
     # Lightbox: clicking the image opens a fullscreen overlay.
-    TK.eval_js(s, "document.querySelector('.bt-media-wrap img.bt-media').click(); true")
+    TK.eval_js(s, "document.querySelector('.bt-tool-body .bt-media-wrap img.bt-media').click(); true")
     @test TK.wait_for(s, "lightbox overlay opened",
         "!!document.querySelector('.bt-lightbox-overlay .bt-lightbox-media')"; timeout = 10)
     # Esc closes it.
@@ -52,15 +52,18 @@
     @test TK.wait_for(s, "lightbox closed",
         "!document.querySelector('.bt-lightbox-overlay')"; timeout = 10)
 
+    # Scope to tool bodies in the active chat. Other opened panes retain images
+    # whose fixtures may already have been deleted by an earlier test.
     # Streaming: the browser Range-fetches the asset and gets 206 Partial Content.
     TK.eval_js(s, """(async () => {
         window.__rangeStatus = null;
-        const src = document.querySelector('.bt-media-wrap img.bt-media').getAttribute('src');
+        const src = document.querySelector('.bt-tool-body .bt-media-wrap img.bt-media').getAttribute('src');
         const r = await fetch(src, { headers: { Range: 'bytes=0-99' } });
         window.__rangeStatus = r.status;
     })(); true""")
-    @test TK.wait_for(s, "range request returned 206",
-        "window.__rangeStatus === 206"; timeout = 15)
+    @test TK.wait_for(s, "range request completed",
+        "window.__rangeStatus !== null"; timeout = 15)
+    @test TK.eval_js(s, "window.__rangeStatus") == 206
 
     @test isempty(TK.js_errors(s))
     rm(png; force = true); rm(mp4; force = true)

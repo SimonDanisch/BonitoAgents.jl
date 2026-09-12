@@ -320,6 +320,12 @@ end
 const DOWNLOAD_ROUTE_RE = r"^/download/([A-Za-z0-9_-]+)"
 
 function add_download_routes!(srv::Bonito.Server, state::ServerState)
+    Bonito.route!(srv, r"^/worker-file/([A-Za-z0-9_-]+)(?:$|\?)" => function(context)
+        wid = String(context.match.captures[1])
+        params = HTTP.queryparams(HTTP.URI(context.request.target))
+        worker_file_response(state, context.request, wid,
+            String(get(params, "path", "")), String(get(params, "token", "")))
+    end)
     Bonito.route!(srv, DOWNLOAD_ROUTE_RE => function(context)
         pid    = String(context.match.captures[1])
         params = HTTP.queryparams(HTTP.URI(context.request.target))
@@ -330,6 +336,90 @@ function add_download_routes!(srv::Bonito.Server, state::ServerState)
         params = HTTP.queryparams(HTTP.URI(context.request.target))
         attachment_response(state, pid, String(get(params, "file", "")))
     end)
+end
+
+# These URLs depend only on persisted worker identity, path, and server secret.
+# Signing limits access to files exposed by the UI, including bt_show files
+# outside the project tree. No browser/eval session owns or unregisters them.
+worker_file_token(state::ServerState, worker_id::String, path::String) =
+    bytes2hex(SHA.hmac_sha256(Vector{UInt8}(codeunits(state.worker_secret)),
+        codeunits(JSON.json([worker_id, path]))))
+
+function worker_file_url(state::ServerState, worker_id::String, path::String)
+    token = worker_file_token(state, worker_id, path)
+    return "/worker-file/$(HTTP.escapeuri(worker_id))?path=$(HTTP.escapeuri(path))&token=$token"
+end
+
+# Compatibility for workers predating range reads. Keep a versioned mirror so
+# seeking in a video doesn't copy the whole file again for every Range request.
+function worker_file_copy_response(state::ServerState, request, worker_id::String,
+                                   path::String, info)
+    key = worker_file_token(state, worker_id, path)
+    dst = joinpath(state.state_dir, "worker-files", key, basename(path))
+    dst_lock = lock(state.lock) do
+        get!(ReentrantLock, state.show_fetch_inflight, dst)
+    end
+    return lock(dst_lock) do
+        stamp = (size=info.size, mtime=info.mtime)
+        previous = lock(state.lock) do
+            get(state.show_mirror_stamps, dst, nothing)
+        end
+        if !isfile(dst) || previous != stamp
+            mkpath(dirname(dst))
+            fetch_file_from_worker(state, worker_id, path, dst)
+            after = stat_worker_path(state, worker_id, path)
+            lock(state.lock) do
+                delete!(state.show_mirror_stamps, dst)
+                (size=after.size, mtime=after.mtime) == stamp &&
+                    (state.show_mirror_stamps[dst] = stamp)
+            end
+        end
+        # Mirror mtimes are transfer times. Do not let a browser validate them
+        # at whole-second precision and miss two rapid rewrites of the source.
+        return Bonito.serve_asset(request, nothing, dst,
+                                   string(Bonito.file_mimetype(path)), "no-store")
+    end
+end
+
+function worker_file_response(state::ServerState, request, worker_id::String,
+                              path::String, token::String)
+    isempty(path) && return HTTP.Response(400, "missing path")
+    token == worker_file_token(state, worker_id, path) ||
+        return HTTP.Response(403, "invalid file token")
+    try
+        info = stat_worker_path(state, worker_id, path)
+        info.isfile || return HTTP.Response(404, ["Cache-Control" => "no-store"],
+                                            "file no longer exists on worker")
+        mime = string(Bonito.file_mimetype(path))
+        if !info.range_reads
+            # Workers installed before range reads still work through the existing
+            # transfer protocol. Upgrading them enables seeking without a full copy.
+            return worker_file_copy_response(state, request, worker_id, path, info)
+        end
+        range = Bonito.parse_byte_range(HTTP.header(request, "Range", ""), info.size)
+        if range === nothing && !isempty(HTTP.header(request, "Range", ""))
+            return HTTP.Response(416, ["Content-Range" => "bytes */$(info.size)"])
+        end
+        start, stop = range === nothing ? (0, info.size - 1) : range
+        body = UInt8[]
+        sizehint!(body, stop - start + 1)
+        offset = start
+        while offset <= stop
+            count = min(256 * 1024, stop - offset + 1)
+            bytes = read_worker_file_range(state, worker_id, path, offset, count)
+            length(bytes) == count || error("file changed while reading: $path")
+            append!(body, bytes)
+            offset += count
+        end
+        headers = ["Content-Type" => mime, "Cache-Control" => "no-cache",
+                   "Accept-Ranges" => "bytes", "Content-Length" => string(length(body))]
+        range === nothing || push!(headers, "Content-Range" => "bytes $start-$stop/$(info.size)")
+        return HTTP.Response(range === nothing ? 200 : 206, headers; body)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "worker file: read failed" worker_id path exception = (e, catch_backtrace())
+        return HTTP.Response(502, ["Cache-Control" => "no-store"], "could not read file from worker")
+    end
 end
 
 # /attachment/<pid>?file=<name> — serve a pasted/dropped image from the

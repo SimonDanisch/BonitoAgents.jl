@@ -124,6 +124,32 @@ struct UnknownUpdate <: SessionUpdate
     raw::AbstractDict
 end
 
+# Opt-in, versioned codex-acp extension. Classification comes exclusively from
+# this metadata envelope; agent_message_chunk text is never inspected.
+struct SessionNoticeNotif <: SessionUpdate
+    record::Dict{String,Any}
+end
+
+session_notice_capability() = Dict("jetbrains" => Dict("air" => Dict(
+    "version" => 1, "capabilities" => ["sessionFailure"])))
+
+function session_notice_record(params::AbstractDict)
+    value = params
+    for key in ("_meta", "jetbrains", "air")
+        value = get(value, key, nothing)
+        value isa AbstractDict || return nothing
+    end
+    get(value, "version", nothing) == 1 || return nothing
+    record = get(value, "sessionFailure", nothing)
+    record isa AbstractDict || return nothing
+    all(k -> get(record, k, nothing) isa AbstractString, ("id", "severity", "title")) || return nothing
+    isempty(record["id"]) && return nothing
+    get(record, "revision", nothing) isa Integer || return nothing
+    record["revision"] >= 0 || return nothing
+    record["severity"] in ("warning", "error") || return nothing
+    return Dict{String,Any}(record)
+end
+
 # claude-agent-acp forwards every SUBAGENT session/update (text chunks,
 # tool_calls, tool_call_updates of a running Task/Agent tool) as a normal
 # update whose `_meta.claudeCode.parentToolUseId` names the parent Task's
@@ -742,6 +768,9 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
         return AgentMessageChunk(parse_content_block(get(params, "content", Dict())))
     elseif kind == "user_message_chunk"
         return UserMessageChunk(parse_content_block(get(params, "content", Dict())))
+    elseif kind == "session_info_update"
+        record = session_notice_record(params)
+        return record === nothing ? UnknownUpdate(kind, params) : SessionNoticeNotif(record)
     elseif kind == "agent_thought_chunk"
         return AgentThoughtChunk(parse_content_block(get(params, "content", Dict())))
     elseif kind == "plan"

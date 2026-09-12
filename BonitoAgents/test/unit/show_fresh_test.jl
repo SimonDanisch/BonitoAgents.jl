@@ -15,6 +15,7 @@
 
 using Test
 import BonitoAgents
+using HTTP
 const BT = BonitoAgents
 
 @testset "mirror freshness against a live worker" begin
@@ -109,6 +110,57 @@ const BT = BonitoAgents
         @testset "stat_worker_path carries the mtime the stamp needs" begin
             info = BT.stat_worker_path(st, wid, probe)
             @test info.isfile && info.size > 0 && info.mtime > 0
+        end
+
+        @testset "disk URLs outlive displays and serve fresh byte ranges" begin
+            # There is no eval bridge in this rig. These requests go through the
+            # real worker connection, with different server/worker directories.
+            payload = repeat(UInt8[0, 1, 2, 3, 255], 120_000)
+            special = joinpath(worker_dir, "a #? ü.png")
+            write(special, payload)
+            url = BT.worker_file_url(st, wid, special)
+            base = "http://127.0.0.1:$(st.srv.port)"
+            getfile(headers = Pair{String,String}[]) = HTTP.get(base * url, headers; status_exception=false)
+            @test getfile().body == payload  # crosses several control frames
+            r = getfile(["Range" => "bytes=262140-262160"])
+            @test r.status == 206
+            @test r.body == payload[262141:262161]
+            @test HTTP.header(r, "Content-Range") == "bytes 262140-262160/600000"
+            @test HTTP.header(r, "Cache-Control") == "no-cache"
+            @test getfile(["Range" => "bytes=-5"]).body == payload[end-4:end]
+            @test getfile(["Range" => "bytes=599995-"]).body == payload[end-4:end]
+            @test getfile(["Range" => "bytes=600000-"]).status == 416
+
+            # Older workers use the established transfer protocol. Seeking
+            # should reuse that mirror; rewriting the source must replace it.
+            copy_request = HTTP.Request("GET", url, ["Range" => "bytes=0-4"])
+            copy_response() = BT.worker_file_copy_response(st, copy_request, wid, special,
+                                                           BT.stat_worker_path(st, wid, special))
+            @test copy_response().body == payload[1:5]
+            key = BT.worker_file_token(st, wid, special)
+            cached = joinpath(st.state_dir, "worker-files", key, basename(special))
+            write(cached, "CACHE")
+            @test String(copy_response().body) == "CACHE"
+            write(special, "REGENERATED")
+            @test String(copy_response().body) == "REGEN"
+
+            # The same URL still works with no chat record, and changing bytes
+            # under the same path cannot leave a cached proxy asset behind.
+            saved = pop!(st.projects[], pid)
+            try
+                write(special, "new bytes")
+                @test String(getfile().body) == "new bytes"
+                restored = BT.ServerState(state_dir=mktempdir(), working_dir=mktempdir(),
+                                          worker_secret=st.worker_secret)
+                @test BT.worker_file_url(restored, wid, special) == url
+            finally
+                st.projects[][pid] = saved
+            end
+            @test HTTP.get(base * url * "x"; status_exception=false).status == 403
+            other = replace(url, "path=" => "path=x")
+            @test HTTP.get(base * other; status_exception=false).status == 403
+            rm(special)
+            @test getfile().status == 404
         end
     finally
         close(h)

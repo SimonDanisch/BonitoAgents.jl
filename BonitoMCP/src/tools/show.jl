@@ -62,6 +62,9 @@ function julia_show_handler(args::AbstractDict)
         "content" => [Dict("type" => "text", "text" => "error: not a file: $path")],
         "isError" => true,
     )
+    # Persist the location as the tool sees it now. A later chat view may have
+    # a different working directory and must not reinterpret a relative path.
+    path = abspath(path)
     mime = show_mime_from_path(path)
     sz   = filesize(path)
     text = "shown: $path ($mime, $(bt_show_format_bytes(sz)))"

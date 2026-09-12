@@ -538,6 +538,8 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "stat_path_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "read_file_range_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "list_project_files_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "scan_sessions_result"
@@ -1128,6 +1130,7 @@ function stat_worker_path(state::ServerState, worker_name::String, path::Abstrac
     return (exists = Bool(get(resp, "exists", false)),
             isfile = Bool(get(resp, "isfile", false)),
             isdir  = Bool(get(resp, "isdir", false)),
+            range_reads = Bool(get(resp, "range_reads", false)),
             size   = Int(get(resp, "size", 0)),
             # A worker predating the mtime field reports 0.0 — that pins the
             # fingerprint to `size` alone, which is weaker but never WRONG
@@ -1135,6 +1138,20 @@ function stat_worker_path(state::ServerState, worker_name::String, path::Abstrac
             # `refresh = true` path bypasses the fingerprint entirely.
             mtime  = Float64(get(resp, "mtime", 0.0)),
             path   = String(get(resp, "path", path)))
+end
+
+function read_worker_file_range(state::ServerState, worker_id::String,
+                                path::String, start::Int, count::Int)
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict("type" => "read_file_range",
+            "request_id" => rid, "path" => path, "start" => start, "count" => count))
+        take_pending!(state, ch, rid, 30.0, "read_file_range on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    haskey(resp, "error") && error("read_file_range: $(resp["error"])")
+    return ctrl_bytes(resp["data"])
 end
 
 """

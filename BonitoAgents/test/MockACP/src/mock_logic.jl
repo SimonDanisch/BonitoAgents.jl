@@ -859,6 +859,14 @@ function run_dispatcher_prompt(prompt_id)
             # with the same set mutates the one live list in place; the chat
             # pins it to the taskbar until the turn ends or all items finish.
             upd("plan", Dict("entries" => get(ev, "entries", Any[])))
+        elseif et == "session_notice"
+            if SESSION_NOTICE_SUPPORTED[]
+                upd("session_info_update", Dict("_meta" => Dict("jetbrains" => Dict(
+                    "air" => Dict("version" => 1, "sessionFailure" => ev["record"])))))
+            else
+                upd("agent_message_chunk", Dict("content" => Dict("type" => "text",
+                    "text" => "Warning: " * ev["record"]["title"])))
+            end
         elseif et == "usage"
             # Context/cost telemetry — the shape claude-agent-acp ≥ 0.44 emits
             # after every assistant message.
@@ -940,6 +948,7 @@ end
 # message the test process should respond to. Written by the dispatcher
 # loop on each `session/prompt`.
 const LAST_PROMPT = Ref{String}("")
+const SESSION_NOTICE_SUPPORTED = Ref(false)
 
 # A `model` config option with 12 choices — past the client's
 # MODEL_SEARCH_THRESHOLD (8), which is what makes it render the searchable
@@ -975,6 +984,10 @@ function dispatch_loop()
         method = String(get(msg, "method", ""))
         id     = get(msg, "id", nothing)
         if method == "initialize" && id !== nothing
+            caps = get(get(msg, "params", Dict()), "clientCapabilities", Dict())
+            air = get(get(get(caps, "_meta", Dict()), "jetbrains", Dict()), "air", Dict())
+            SESSION_NOTICE_SUPPORTED[] = get(air, "version", 0) == 1 &&
+                "sessionFailure" in get(air, "capabilities", [])
             # `loadSession` must match reality (we answer session/load below):
             # the server reads it to decide whether to persist the session id.
             resp(id, Dict("protocolVersion" => 1,

@@ -166,6 +166,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict(
             "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
+            "_meta" => ACP.session_notice_capability(),
             "elicitation" => a.provider.elicitation),
         "clientInfo"         => Dict("name"    => "BonitoAgents.WorkerAgent",
                                      "version" => "0.1.0")))

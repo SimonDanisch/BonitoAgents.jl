@@ -68,6 +68,11 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
             # the chat side must be able to recover the path from that text
             @test BT.parse_show_path(txt) == f
 
+            cd(dir) do
+                relative = BonitoMCP.julia_show_handler(Dict("path" => "clip.mp4"))
+                @test BT.parse_show_path(relative["content"][1]["text"]) == f
+            end
+
             @test BonitoMCP.julia_show_handler(Dict("path" => ""))["isError"] == true
             @test BonitoMCP.julia_show_handler(Dict("path" => joinpath(dir, "nope")))["isError"] == true
         end

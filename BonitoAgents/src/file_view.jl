@@ -12,8 +12,8 @@
 # chain of extension tests at every call site. Adding a format is one `file_kind`
 # entry plus one `render_file` method.
 #
-# Bytes: media (image/video/audio/pdf/html) is STREAMED from the worker through
-# the eval bridge as a range-capable `/assets/<key>` url — a multi-GB video
+# Bytes: media (image/video/audio/pdf/html) is streamed from the worker through
+# a stable `/worker-file/` URL with byte-range support. A multi-GB video
 # scrubs without ever being copied to the server. Everything we have to parse
 # (text, csv, notebooks, geometry) is mirrored to the server first via
 # `fetch_show_file`, which re-fetches exactly when the worker's copy changed.

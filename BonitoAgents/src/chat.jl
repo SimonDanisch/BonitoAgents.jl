@@ -139,6 +139,7 @@ mutable struct ChatModel
     # Status surface for the chat header (banner + reconnect state).
     session_alive::Observable{Bool}
     last_error::Observable{String}
+    session_notice::Observable{Dict{String,Any}}
 
     # True while a turn is in flight (set/cleared around the `run_chat!` turn).
     # The single source of truth for the busy spinner — the header binds its
@@ -338,6 +339,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(Dict{String,Any}()),
         Observable(true),
         Observable(""),
+        Observable(Dict{String,Any}()), # latest typed provider notice
         busy_active,
         Observable(false),          # yolo (auto-continue mode; off by default)
         Observable(""),             # yolo_reminders (appended to each continue-prompt)
@@ -430,6 +432,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.comm),
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
+            map(identity, session, m.session_notice),
             map(identity, session, m.busy_active),
             map(identity, session, m.yolo),
             map(identity, session, m.yolo_reminders),
@@ -3073,23 +3076,21 @@ function media_element(src, mime::AbstractString, is_video::Bool; filename::Abst
         (isempty(filename) ? (;) : (; dataFilename = String(filename)))...)
 end
 
-# Source for a worker media file: a streamed proxied-asset url when the worker
-# bridge is live (range reads on demand, no whole-file copy), else the
-# copy-then-serve local Asset fallback (e.g. a reloaded chat with no live worker).
-# The URL always includes a ?v=<mtime> cache-buster so the browser fetches the
-# latest bytes after a file is regenerated (video re-recorded, image re-rendered).
-# The bridge path bakes the mtime into the URL in RemoteProxy.jl's asset_url handler;
-# for the fallback path we append it here using the server-side mirror's mtime.
+# Disk media belongs to the worker, not the chat's eval process. Its signed URL
+# remains valid after chat teardown/reload; the HTTP route reads the current file
+# through the worker control connection and revalidates on every browser request.
 function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
-    eb = eval_bridge_for(st.state, st.project_id)
-    if eb !== nothing
-        proj = get(st.state.projects[], st.project_id, nothing)
-        worker_src = (isabspath(st.path) || proj === nothing) ? st.path :
-            joinpath(proj.worker_path, st.path)
-        try
-            return worker_asset_url(eb, worker_src)  # mtime baked in by RemoteProxy
+    proj = get(st.state.projects[], st.project_id, nothing)
+    if proj !== nothing
+        info = try
+            stat_worker_path(st.state, proj.worker_id, show_worker_path(st))
         catch e
-            @warn "bt_show: stream via bridge failed; copying instead" exception = (e, catch_backtrace()) path = st.path
+            e isa WorkerUnreachableError || rethrow()
+            nothing
+        end
+        if info !== nothing
+            info.isfile || error("file no longer exists on worker: $(st.path)")
+            return worker_file_url(st.state, proj.worker_id, info.path)
         end
     end
     local_path = fetch_show_file(st)
@@ -3100,7 +3101,7 @@ function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = n
 end
 
 # Inline image from a tool result (e.g. Read on a PNG ships an ACP ImageContent).
-# Stream it from the worker when we can resolve a file path + live bridge (so big
+# Stream it from the worker when we can resolve a file path (so big
 # images don't ride as base64 through chat history); else fall back to the ACP
 # base64 the agent sent. Either way it gets the lightbox via `media_element`.
 """
@@ -3127,12 +3128,18 @@ function read_image_element(state::ServerState, project_id::AbstractString,
     # (recovered from its rawOutput parts); a video mime in an <img> renders
     # nothing, so pick the element from the mime rather than assuming image.
     is_video = startswith(c.mime_type, "video/")
-    eb = isempty(project_id) ? nothing : eval_bridge_for(state, project_id)
-    if fp !== nothing && eb !== nothing
+    proj = get(state.projects[], project_id, nothing)
+    if fp !== nothing && proj !== nothing
         try
-            return media_element(worker_asset_url(eb, String(fp)), c.mime_type, is_video; filename = fname)
+            st = ShowTool(state, String(project_id), proj.server_path, String(fp))
+            info = stat_worker_path(state, proj.worker_id, show_worker_path(st))
+            if info.isfile
+                return media_element(worker_file_url(state, proj.worker_id, info.path),
+                    c.mime_type, is_video; filename = fname)
+            end
         catch e
-            @warn "read image: stream via bridge failed; inlining base64" exception = (e, catch_backtrace())
+            e isa InterruptException && rethrow()
+            @warn "read image: worker file unavailable; inlining base64" exception = (e, catch_backtrace())
         end
     end
     return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, is_video; filename = fname)
@@ -3767,6 +3774,16 @@ wire_final(m::SummaryMsg) = Dict{String,Any}("type" => "summary_final", "id" => 
 # `process_update!`; text messages use the default (drain the text deltas).
 process!(chat::ChatModel, m::AgentClientProtocol.Message) =
     process_update!(send!(chat, to_message(chat, m)), m)
+
+function process!(chat::ChatModel, m::AgentClientProtocol.SessionNotice)
+    notice = shared(chat).session_notice
+    previous = notice[]
+    if get(previous, "id", nothing) == m.record["id"]
+        get(previous, "revision", -1) >= m.record["revision"] && return nothing
+    end
+    notice[] = copy(m.record)
+    return nothing
+end
 
 # Thoughts get special handling. This agent redacts the plaintext reasoning
 # (the model returns thinking blocks with an empty `thinking` field and only an
@@ -6165,6 +6182,7 @@ function bring_up_once!(model::ChatModel)
         # the new client can emit against it.
         chat_emit(s, Dict{String,Any}("type" => "session_reset"))
 
+        s.session_notice[] = Dict{String,Any}()
         start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
         s.session_alive[] = true
         s.last_error[] = ""
@@ -6523,6 +6541,7 @@ keep_in_history(m::AgentClientProtocol.Plan)         = m.live
 # reaching the reconciler should fail loudly so its history policy is a
 # decision, not an accident.
 keep_in_history(::AgentClientProtocol.ConfigUpdate)   = false
+keep_in_history(::AgentClientProtocol.SessionNotice)  = false
 keep_in_history(::AgentClientProtocol.ModeUpdate)     = false
 keep_in_history(::AgentClientProtocol.UsageUpdate)    = false
 keep_in_history(::AgentClientProtocol.CommandsUpdate) = false
@@ -8725,6 +8744,31 @@ function relabel_file_tabs!(ws)
     return nothing
 end
 
+function session_notice_view(session::Bonito.Session, model::ChatModel)
+    box = DOM.div(
+        DOM.div(DOM.strong(; class="bt-session-notice-label"),
+                DOM.div(; class="bt-session-notice-text")),
+        DOM.button("×"; class="bt-btn bt-btn-ghost bt-btn-sm", type="button",
+                   title="Dismiss notice");
+        class="bt-session-notice", role="status", hidden=true)
+    Bonito.onload(session, box, js"""(el) => {
+        const notice = $(model.session_notice);
+        const render = info => {
+            el.hidden = !info.id;
+            el.dataset.noticeId = info.id || '';
+            el.dataset.severity = info.severity || '';
+            el.querySelector('.bt-session-notice-label').textContent =
+                info.severity === 'error' ? 'Provider error' : 'Provider warning';
+            el.querySelector('.bt-session-notice-text').textContent =
+                (info.title || '') + (typeof info.details === 'string' ? '\n' + info.details : '');
+        };
+        el.querySelector('button').onclick = () => { el.hidden = true; };
+        notice.on(render);
+        render(notice.value);
+    }""")
+    return box
+end
+
 # Thin entry point for the per-session `comm` listener wired up in
 # `jsrender(::ChatModel)`. Parses once, dispatches once. The
 # `session::Session` closure binding flows through unchanged because
@@ -8813,6 +8857,7 @@ function Bonito.jsrender(session::Session, m::ChatModel)
 
     Bonito.jsrender(session, DOM.div(
         chat_header(session, model),
+        session_notice_view(session, model),
         # The messages area + the taskbar share a positioning context so the
         # taskbar floats over the MESSAGES, anchored below the (variable-
         # height) header instead of on top of it.

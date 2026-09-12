@@ -148,6 +148,13 @@ rather than interact with it. The file is fetched from the worker on demand — 
 re-fetched exactly when the worker's copy changed, so re-rendering a plot to the
 same `/tmp/plot.png` shows the NEW picture, not the one from the first `bt_show`.
 
+Media URLs refer to the worker's disk path and survive closing or reloading a
+chat, even when the output was never viewed. Serving a file does not require a
+live Julia evaluation session. Keep the source file on disk and the worker
+connected; `bt_show` is a view of that file, not an archived snapshot. Updated
+workers support byte-range reads for seeking; older workers transfer the file
+to the server first.
+
 ## Live apps, from one returned value
 
 There is no separate "show app" tool: an interactive app is just a value

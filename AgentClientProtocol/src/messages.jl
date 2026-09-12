@@ -140,6 +140,9 @@ Plan(entries::Vector{PlanEntry}) = Plan(entries, true)
 struct ConfigUpdate <: Message
     options::Vector{ConfigOption}        # complete updated state (spec)
 end
+struct SessionNotice <: Message
+    record::Dict{String,Any}
+end
 struct ModeUpdate <: Message
     mode_id::String
 end
@@ -615,6 +618,13 @@ end
 # WITHOUT closing the currently-streaming text bubble (unlike tools/plans,
 # which are content boundaries).
 parse_update!(out, st, u::ConfigOptionUpdateNotif) = (put!(out, ConfigUpdate(u.options)); nothing)
+function parse_update!(out, st, u::SessionNoticeNotif)
+    # Release a streaming text consumer so a retry notice is visible while the
+    # provider is stalled, rather than waiting for the end of its answer.
+    st.current_message === nothing || (close(st.current_message); st.current_message = nothing)
+    put!(out, SessionNotice(u.record))
+    return nothing
+end
 parse_update!(out, st, u::CurrentModeUpdateNotif)  = (put!(out, ModeUpdate(u.mode_id)); nothing)
 parse_update!(out, st, u::UsageUpdateNotif) =
     (put!(out, UsageUpdate(u.used, u.size, u.cost_amount, u.cost_currency, u.origin_kind)); nothing)

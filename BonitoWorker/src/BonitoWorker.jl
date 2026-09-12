@@ -1071,6 +1071,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_ensure_dir(ws, cmd)
             elseif t == "stat_path"
                 @async handle_stat_path(ws, cmd)
+            elseif t == "read_file_range"
+                @async handle_read_file_range(ws, cmd)
             elseif t == "list_project_files"
                 @async handle_list_project_files(ws, cmd)
             elseif t == "inspect_path"
@@ -1731,6 +1733,7 @@ function handle_stat_path(ws, cmd::AbstractDict)
              "exists"     => ispath(raw_path),
              "isfile"     => isf,
              "isdir"      => isdir(raw_path),
+             "range_reads" => true,
              "size"       => isf ? filesize(raw_path) : 0,
              "mtime"      => isf ? mtime(raw_path) : 0.0)
     catch e
@@ -1743,6 +1746,29 @@ function handle_stat_path(ws, cmd::AbstractDict)
     catch e
         @warn "stat_path response failed" exception=e
     end
+end
+
+# Keep each control frame bounded so media reads cannot monopolize the worker's
+# heartbeat/session connection. No eval process or asset registration is involved.
+const FILE_RANGE_BYTES = 256 * 1024
+
+function handle_read_file_range(ws, cmd::AbstractDict)
+    response = Dict{String,Any}("type" => "read_file_range_response",
+        "request_id" => String(get(cmd, "request_id", "")))
+    try
+        path = String(cmd["path"])
+        start, count = Int(cmd["start"]), Int(cmd["count"])
+        start >= 0 && 0 <= count <= FILE_RANGE_BYTES || error("invalid file range")
+        response["data"] = open(path) do io
+            seek(io, start)
+            read(io, count)
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        response["error"] = sprint(showerror, e)
+    end
+    send_control(ws, response)
+    return nothing
 end
 
 # Directories never worth indexing/recursing for the project file list — VCS

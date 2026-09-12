@@ -12,16 +12,8 @@
 #     those are asserted below — they are the security contract, not decoration.
 #
 #   • missing file → a `shown: /tmp/does-not-exist.png (image/png, 0B)` whose file
-#     is on neither the server nor the worker disk. The body must render WITHOUT
-#     crashing the chat and WITHOUT a fatal JS error: render_show_file takes the
-#     image branch (.png), show_media_src asks the live worker bridge for an
-#     `/assets/<key>` url (which it hands out without an isfile check — the 404
-#     only surfaces when the browser range-fetches the bytes, and a broken <img>
-#     load does NOT fire window.onerror), so an <img class=bt-media> renders with
-#     a dead src. If instead the fetch path throws, the ToolRenderCommand handler
-#     catches it and mounts `<div class="bt-tool-error">tool body unavailable…`.
-#     Either outcome is graceful; the assertion is "the slot renders something and
-#     window.__errs stays empty".
+#     is on neither the server nor the worker disk. The body must render a
+#     visible error without crashing the rest of the chat.
 #
 #   • csv + obj → the rich kinds rendered INLINE. Same renderers the workspace
 #     file tab uses, but reaching the DOM by a different route (`dom_in_js` into
@@ -102,7 +94,7 @@
     @test TK.eval_js(s, """(() => {
         const f = document.querySelector('.bt-tool-body[data-tool-id="html1"] iframe.bt-fv-frame');
         const src = f && (f.getAttribute('src') || '');
-        return !!src && src.startsWith('/assets/') && !f.hasAttribute('srcdoc');
+        return !!src && src.startsWith('/worker-file/') && !f.hasAttribute('srcdoc');
     })()""") === true
 
     # ── the rich kinds render INLINE too, with working behaviour ─────────────
@@ -134,15 +126,11 @@
         })()"""; timeout = 40)
 
     # ── missing file → graceful (some body, no crash) ────────────────────────
-    # Either an <img>/media-wrap with a dead /assets/ src (live-bridge fast path)
-    # or the .bt-tool-error placeholder (fetch path threw, handler caught it).
     @test TK.wait_for(s, "missing-file body renders gracefully",
         """(() => {
             const slot = document.querySelector('.bt-tool-body[data-tool-id="missing1"]');
             if (!slot) return false;
-            return slot.querySelector('.bt-media-wrap') !== null
-                || slot.querySelector('img') !== null
-                || slot.querySelector('.bt-tool-error') !== null;
+            return slot.querySelector('.bt-tool-error') !== null;
         })()""";
         timeout = 30)
 
