@@ -145,11 +145,7 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
 
     p = ProjectInfo(id, proj_name, worker_name, server_path, worker_path, now(UTC))
     p.auto_prompt = auto_prompt
-    lock(state.lock) do
-        state.projects[][id] = p
-        save_projects!(state)
-    end
-    safe_notify!(state.projects)
+    add_project!(state, p)
 
     notify_progress(progress, :phase, (msg = "Starting chat session…",))
     ensure_project_session!(state, p)

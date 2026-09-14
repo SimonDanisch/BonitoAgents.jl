@@ -165,6 +165,8 @@ const BASE_CSS = [
         "z-index" => "60",
         "text-align" => "left"),
     CSS(".bt-menu-open > .bt-menu-list", "display" => "block"),
+    CSS(".bt-chat-icon-menu", "position" => "fixed", "display" => "block",
+        "right" => "auto", "bottom" => "auto", "z-index" => "10000"),
     CSS(".bt-menu-title",
         "font-size" => "11px", "font-weight" => "600",
         "letter-spacing" => "0.06em", "text-transform" => "uppercase",
@@ -459,12 +461,17 @@ const ChatStyles = Bonito.Styles(
             "border-left" => "0", "margin-left" => "0",
             "border-top" => "1px solid var(--bt-border)", "margin-top" => "-1px",
             "justify-content" => "center"),
-        # The ⋯ menu stretches with the other stacked controls (its wrapper is
-        # inline-flex in the strip); the popover still anchors to its right edge.
+        # No menu inside the menu: the expanded panel IS the ⋯ menu. The
+        # actions menu's own ⋯ trigger goes, and its popover list lays out in
+        # flow as part of the stack, so every action is one tap away.
         CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu",
-            "display" => "flex"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-menu-trigger",
-            "flex" => "1 1 auto"),
+            "display" => "flex", "flex-direction" => "column"),
+        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu > .bt-menu-trigger",
+            "display" => "none"),
+        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu > .bt-menu-list",
+            "display" => "block", "position" => "static", "min-width" => "0",
+            "padding" => "0", "border" => "0", "box-shadow" => "none",
+            "background" => "transparent"),
         # Stacked controls all span the panel with centered labels — the Sync
         # button's compact `max-width` cap and the provider select's start
         # alignment only make sense in the wide control strip. Descendant
@@ -900,6 +907,17 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-meta-pick:focus-within",
         "outline" => "2px solid var(--bt-accent)",
         "outline-offset" => "1px"),
+    # A provider switch in flight: the pill reads "switching to X…" in the
+    # accent colour, a spinner replaces the caret, and clicks are ignored until
+    # the new session is up (a failure surfaces as a toast).
+    CSS(".bt-msearch-busy", "pointer-events" => "none", "color" => "var(--bt-accent)"),
+    CSS(".bt-msearch-busy .bt-msearch-caret", "display" => "none"),
+    CSS(".bt-msearch-busy::after",
+        "content" => "\"\"", "display" => "inline-block", "flex" => "0 0 auto",
+        "width" => "10px", "height" => "10px", "margin-left" => "6px",
+        "border" => "2px solid var(--bt-border-strong)",
+        "border-top-color" => "var(--bt-accent)", "border-radius" => "50%",
+        "animation" => "bt-prog-spin 0.7s linear infinite"),
     # The <select> is chrome-stripped — the pill wrapper carries the
     # border/background, matching the bare provider <select> (which has no arrow
     # either, so they stay identical).

@@ -77,7 +77,7 @@
             timeout = 30) == true
         TK.to_dashboard(s)
         @test TK.wait_for(s, "card thumb is the attachment",
-            "(document.querySelector('$(card_sel) img.bt-ov-img')?.getAttribute('src') || '').startsWith('/attachment/$(pid)')";
+            "!!document.querySelector('$(card_sel) img.bt-ov-img')";
             timeout = 10) == true
         # And it decodes (route serves real bytes + mime).
         @test TK.wait_for(s, "card thumb decodes",

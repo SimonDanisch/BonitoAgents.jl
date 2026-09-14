@@ -23,7 +23,7 @@ function claim_project!(state::ServerState, p::ProjectInfo, worker_id::String)
         p.locked_at = now(UTC)
         save_projects!(state)
     end
-    safe_notify!(state.projects)
+    notify_projects!(state)
     return p
 end
 
@@ -33,7 +33,7 @@ function release_project!(state::ServerState, p::ProjectInfo)
         p.locked_at = nothing
         save_projects!(state)
     end
-    safe_notify!(state.projects)
+    notify_projects!(state)
     return p
 end
 
@@ -196,9 +196,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     # scan reports the provider per row, so a resumed kimi thread comes back up
     # under kimi instead of the default.
     p.provider = provider
-    lock(state.lock) do
-        state.projects[][id] = p
-    end
+    track_project!(state, p)
 
     if sync
         @info "Pulling project from worker" worker=worker_name worker_path server_path
@@ -219,7 +217,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     lock(state.lock) do
         save_projects!(state)
     end
-    safe_notify!(state.projects)
+    notify_projects!(state)
 
     notify_progress(progress, :phase, (msg = "Starting chat session…",))
     maybe_start(p)
@@ -246,17 +244,17 @@ function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress
             error("Project '$(p.name)' is already syncing")
         p.backup_status = :syncing
     end
-    safe_notify!(state.projects)
+    notify_projects!(state)
     try
         sync_dir_from_worker!(state, p.worker_id, p.worker_path, p.server_path;
                               on_progress = on_progress)
         p.backup_status = :synced
         p.last_sync_at  = now(UTC)
         save_projects!(state)
-        safe_notify!(state.projects)
+        notify_projects!(state)
     catch e
         p.backup_status = :stale
-        safe_notify!(state.projects)
+        notify_projects!(state)
         rethrow(e)
     end
     return p
@@ -370,7 +368,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     if p.dismissed
         p.dismissed = false
         lock(state.lock) do; save_projects!(state); end
-        safe_notify!(state.projects)
+        notify_projects!(state)
     end
 
     claim_project!(state, p, w.worker_id)
@@ -609,7 +607,7 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
     p.worker_path        = target_path
     carried || (p.resume_session_id = nothing)
     save_projects!(state)
-    safe_notify!(state.projects)
+    notify_projects!(state)
     return p
 end
 
@@ -778,12 +776,7 @@ function copy_to!(state::ServerState, p::ProjectInfo, target_worker_id::Abstract
                          new_server_path, target_path, now(UTC))
     new_p.backup_status = :synced
     new_p.last_sync_at  = now(UTC)
-    lock(state.lock) do
-        state.projects[][new_id] = new_p
-        save_projects!(state)
-    end
-    safe_notify!(state.projects)
-    return new_p
+    return add_project!(state, new_p)
 end
 
 # Dashboard styles — modern surface + spacing system, status dots, smooth transitions
@@ -1942,9 +1935,9 @@ function backup_pill(p::ProjectInfo)
     end
 end
 
-# project_card replaced by the `ProjectCard` widget (see project_widget.jl),
-# which holds stable per-project_id identity so KeyedList can diff the
-# project list without remounting every card on every state.projects notify.
+# There is no per-project dashboard card any more: projects live in the worker
+# pills and the sidebar, and a chat's title is edited in its header
+# (`chat_title_input`, chat_title.jl) over the one `ProjectInfo.title`.
 
 """
     dashboard_dom(session, state; current_view = nothing) → DOM
@@ -2292,7 +2285,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.label("Source project"),
         map(session, state.projects, cp_src_worker) do projects, wid
             wid_projs = sort([p for p in values(projects) if p.worker_id == wid];
-                             by = p -> lowercase(project_display_title(p)))
+                             by = p -> lowercase(p.title[]))
             isempty(wid_projs) ?
                 DOM.div("No projects on this worker";
                         style = Styles("color"=>"var(--bt-text-muted)", "font-size"=>"12px")) :
@@ -2300,8 +2293,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                     # Listed by the name the user knows the chat by (its title,
                     # or the folder when it has none), with the folder alongside
                     # when the two differ.
-                    (DOM.option(project_display_title(p) == p.name ? p.name :
-                                    "$(project_display_title(p)) ($(p.name))";
+                    (DOM.option(titled(p) ? "$(p.title[]) ($(p.name))" : p.name;
                                 value=p.id,
                                 selected=p.id==cp_src_project[]) for p in wid_projs)...;
                     class = "bt-cp-src-project",
@@ -2505,8 +2497,8 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # ("running on workers"). The only card-only feature was move-to-worker,
     # which is being redesigned. Project creation stays on the dashboard via the
     # + New project / + From GitHub buttons; the projects themselves live in the
-    # worker pills and the sidebar. (`ProjectCard`, `sync_request`,
-    # `open_request` remain defined for the future move-to-worker redesign.)
+    # worker pills and the sidebar. (`sync_request` / `open_request` above
+    # remain defined for the future move-to-worker redesign.)
 
     # One form, one source of truth: which one is open right now. Only
     # copy-project remains on the dashboard; new-project and GitHub clone moved

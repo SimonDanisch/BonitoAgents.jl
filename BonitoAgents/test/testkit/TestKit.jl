@@ -1318,11 +1318,17 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # (`.bt-error`): a rejected Create never opens a chat, and without this the
     # run burns the full timeout and reports "chat view opened" instead of the
     # reason the server gave.
+    # The FORM's error only. The worker card's discover panel renders session-
+    # scan failures with the same class inside `.bt-errors-list`, and the server
+    # auto-scans on a worker's first connect — spawning every installed ACP
+    # provider, which can outlive the 15s scan budget on a busy box. That is
+    # real UI, not a rejected Create.
+    FORM_ERROR = "[...document.querySelectorAll('.bt-error')].find(e => !e.closest('.bt-errors-list'))"
     ok = wait_for(s, "chat view opened (or form error)",
-        "(() => { if (document.querySelector('.bt-error')) return true; " *
+        "(() => { if ($FORM_ERROR) return true; " *
         "return !!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane'); })()";
         timeout = 90)
-    err = eval_js(s, "(() => { const e = document.querySelector('.bt-error'); " *
+    err = eval_js(s, "(() => { const e = $FORM_ERROR; " *
                      "return e ? (e.innerText||'').trim() : ''; })()")
     isempty(String(err)) || error("new_chat: the dashboard rejected Create — $(err)" *
                                   worker_log_tail(s))

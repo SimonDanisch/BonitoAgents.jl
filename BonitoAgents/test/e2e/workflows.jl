@@ -137,7 +137,34 @@ function run_suite(server)
             # a no-op early-return and prove nothing.
             @test TK.current_agent(server) == "Mock Agent"
 
+            # The pill that was clicked must show the switch in flight (the mock's
+            # restart can settle faster than a poll, so record it as it happens).
+            # Reach the strip THROUGH the pill: `.bt-header-provider-pick` is
+            # pane-scoped by the TestKit shim, `.bt-header-session` is not, and on
+            # the shared server the first one in the document can be a hidden pane.
+            @test TK.eval_js(server, """(() => {
+                window.__btSawSwitching = false;
+                const pick = document.querySelector('.bt-header-provider-pick');
+                const strip = pick && pick.closest('.bt-header-session');
+                if (!strip) return false;
+                const obs = new MutationObserver(() => {
+                    const p = document.querySelector('.bt-header-provider-pick.bt-msearch-busy');
+                    if (p && (p.textContent || '').includes('switching to Mock Agent 2')) {
+                        window.__btSawSwitching = true; obs.disconnect();
+                    }
+                });
+                obs.observe(strip, { childList: true, subtree: true, attributes: true, characterData: true });
+                return true; })()""") == true
             TK.switch_agent(server, "Mock Agent 2")
+            # Wait for the switch to FULLY settle BEFORE sending a turn: the pill
+            # leaves its busy state only after `switch_provider!` finishes the
+            # restart and the new session is alive — never "switch failed".
+            # Sending a turn before this races the half-torn-down session (the
+            # new backend spawn) and the turn errors ("connection torn down").
+            @test TK.wait_for(server, "switch settled (pill no longer busy)",
+                "(() => { const p = document.querySelector('.bt-header-provider-pick'); return !!p && !p.classList.contains('bt-msearch-busy'); })()";
+                timeout = 30) == true
+            @test TK.eval_js(server, "window.__btSawSwitching === true") == true
             # The dropdown reflects the new provider (this alone does NOT prove the
             # switch worked — `provider[]` is set before the restart that can fail).
             @test TK.wait_for(server, "provider = Mock Agent 2",
@@ -145,14 +172,6 @@ function run_suite(server)
                           const v = p && p.querySelector('.bt-msearch-value');
                           return !!v && v.textContent.trim() === 'Mock Agent 2'; })()";
                 timeout = 10) == true
-            # Wait for the switch to FULLY settle BEFORE sending a turn: the header
-            # status clears to "" (from "Switching…") only after `switch_provider!`
-            # finishes the restart and the new session is alive — never "switch
-            # failed". Sending a turn before this races the half-torn-down session
-            # (the new backend spawn) and the turn errors ("connection torn down").
-            @test TK.wait_for(server, "switch settled (status cleared, not failed)",
-                "(() => { const s=document.querySelector('.bt-header-status'); return !!s && (s.innerText||'').trim() === ''; })()";
-                timeout = 30) == true
             # The real proof the switch SUCCEEDED: the new backend is LIVE and
             # answers a fresh turn. A failed switch leaves the old session dead and
             # no reply ever lands.

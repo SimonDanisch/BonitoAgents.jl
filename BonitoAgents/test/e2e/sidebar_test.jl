@@ -109,6 +109,74 @@
             TK.screenshot(server, joinpath(tempdir(), "sidebar_image_icon.png"))
         end
 
+        @testset "image identity survives new output, source deletion, reload and shuffle" begin
+            dir = mktempdir()
+            red = joinpath(dir, "identity-red.svg")
+            blue = joinpath(dir, "identity-blue.svg")
+            write(red, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"73\" height=\"41\"><rect width=\"73\" height=\"41\" fill=\"red\"/></svg>")
+            write(blue, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"97\" height=\"53\"><rect width=\"97\" height=\"53\" fill=\"blue\"/></svg>")
+            try
+                server.agent_fn[] = prompt -> begin
+                    path = occursin("second", prompt) ? blue : red
+                    [TK.tool(; kind="other", tool_name="bt_show", title=basename(path),
+                        content=[TK.text_block("shown: $path (image/svg+xml, 120B)")]),
+                     TK.text("picture ready"), TK.end_turn()]
+                end
+                pid = TK.new_chat(server; cwd=mktempdir(), title="recognizable chat")
+                icon = ".bt-side-item[data-project-id=\"$pid\"] .bt-proj-thumb"
+                thumb = ".bt-ov-card[data-project-id=\"$pid\"] .bt-ov-thumb"
+                decoded(width) = "(() => { const i=document.querySelector($(repr(icon))); return !!i && i.complete && i.naturalWidth === $width; })()"
+                TK.send_message(server, "first picture")
+                @test TK.wait_for(server, "worker image becomes a decoded icon", decoded(73); timeout=60)
+                original = TK.eval_js(server, "document.querySelector($(repr(icon))).src")
+                TK.eval_js(server, "window.__recognitionIcon = document.querySelector($(repr(icon))); true")
+                rm(red)  # the icon must be independent of the worker's original
+                TK.send_message(server, "second picture")
+                @test TK.wait_for(server, "new image shown in chat",
+                    "[...document.querySelectorAll('.bt-media')].some(i => i.naturalWidth === 97)"; timeout=60)
+                @test TK.eval_js(server, "document.querySelector($(repr(icon))) === window.__recognitionIcon")
+                @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
+                @test TK.eval_js(server, decoded(73))
+
+                TK.eval_js(server, "document.querySelector($(repr(icon))).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:50, clientY:100})); true")
+                @test TK.wait_for(server, "shuffle menu opens",
+                    "!!document.querySelector('.bt-chat-icon-menu [role=menuitem]')"; timeout=10)
+                @test TK.eval_js(server, """(() => {
+                    const b = document.querySelector('.bt-chat-icon-menu [role=menuitem]');
+                    const r = b.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 &&
+                        r.right <= innerWidth && r.bottom <= innerHeight &&
+                        document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === b &&
+                        getComputedStyle(b).fontFamily === getComputedStyle(document.querySelector('.bt-shell')).fontFamily;
+                })()""")
+                TK.screenshot(server, joinpath(tempdir(), "sidebar_icon_menu.png"))
+                @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
+                TK.eval_js(server, "document.querySelector('.bt-chat-icon-menu [role=menuitem]').click(); true")
+                @test TK.wait_for(server, "explicit shuffle picks the other picture", decoded(97); timeout=30)
+                shuffled = TK.eval_js(server, "document.querySelector($(repr(icon))).src")
+                @test shuffled != original
+                rm(blue)
+                TK.navigate(server, "/?pid=$pid")
+                @test TK.wait_for(server, "chosen picture decodes after reload without its source", decoded(97); timeout=60)
+                @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == shuffled
+
+                TK.to_dashboard(server)
+                @test TK.wait_for(server, "overview shares the same identity",
+                    "document.querySelector($(repr(thumb * " img")))?.src === $(repr(shuffled))"; timeout=20)
+                TK.eval_js(server, "document.querySelector($(repr(thumb))).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:300, clientY:150})); true")
+                @test TK.wait_for(server, "overview shuffle menu opens",
+                    "!!document.querySelector('.bt-chat-icon-menu [role=menuitem]')"; timeout=10)
+                TK.eval_js(server, "document.querySelector('.bt-chat-icon-menu [role=menuitem]').click(); true")
+                @test TK.wait_for(server, "shuffle recovers the saved original", decoded(73); timeout=30)
+                TK.open_chat(server, pid)
+                @test TK.wait_for(server, "identity survives reopening", decoded(73); timeout=30)
+                TK.screenshot(server, joinpath(tempdir(), "sidebar_persistent_icon.png"))
+            finally
+                rm(dir; recursive=true, force=true)
+                server.agent_fn[] = _ -> [TK.text("ok"), TK.end_turn()]
+            end
+        end
+
         @testset "✕ closes a chat" begin
             before = TK.eval_js(server, "document.querySelectorAll($(repr(ITEMS))).length")
             TK.eval_js(server, "document.querySelector($(repr(ITEMS)) + ' .bt-side-close').click(); true")

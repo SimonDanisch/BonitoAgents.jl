@@ -1,7 +1,6 @@
 # Headless: the recent-chats overview data layer (overview.jl) — the card
 # selection (last N by chat.md mtime), the user-prompt snippets (system tags /
-# interruption markers stripped, auto-continues skipped), and the last-image
-# resolution (user attachments via the /attachment route). Everything derives
+# interruption markers stripped, auto-continues skipped), and persistent chat image identities. Everything derives
 # from the persisted store, so these tests exercise exactly the code path a
 # server restart takes (no live ChatModel involved).
 @testitem "unit:overview" tags = [:unit] begin
@@ -25,7 +24,7 @@
     function seed_chat!(state, pid, name, prompts; title = nothing)
         cwd = mktempdir()
         p = BT.ProjectInfo(pid, name, "w1", cwd, cwd, BT.now(BT.UTC))
-        p.title = title
+        title === nothing || (p.title[] = title)
         state.projects[][pid] = p
         chat_dir = BT.chat_storage_dir(state, pid, cwd)
         sess = BT.load_session(chat_dir, cwd)
@@ -84,21 +83,69 @@
         @test isempty(state.chat_models)
     end
 
-    @testset "overview_image: newest user attachment wins, missing files skipped" begin
+    @testset "chat image is a durable identity, changed only by explicit shuffle" begin
         state = newstate()
         p = seed_chat!(state, "imgproj01", "imgchat", String[])
         att = joinpath(p.server_path, BT.ATTACHMENT_DIR_NAME)
         mkpath(att)
-        write(joinpath(att, "2026-01-01_000000_aaaa1111.png"), UInt8[1, 2, 3])
-        msgs = BT.ChatMsg[
-            BT.UserMsg("first\n\n[attached files in this message]\n  - .bt-attachments/2026-01-01_000000_aaaa1111.png"),
-            BT.UserMsg("later, file gone\n\n[attached files in this message]\n  - .bt-attachments/2026-01-01_000000_gone0000.png"),
-        ]
+        picture(color) = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"80\" height=\"60\"><rect width=\"80\" height=\"60\" fill=\"$color\"/></svg>"
+        red, blue = picture("red"), picture("blue")
+        write(joinpath(att, "red.svg"), red)
+        write(joinpath(att, "notes.txt"), "not an image")
+        attachment(name) = BT.UserMsg("look\n\n[attached files in this message]\n  - .bt-attachments/$name")
+        msgs = BT.ChatMsg[attachment("red.svg")]
+        append!(msgs, [BT.UserMsg("later message $i") for i in 1:250])
+        push!(msgs, attachment("missing.png"), attachment("notes.txt"))
         chat_dir = BT.chat_storage_dir(state, p.id, p.server_path)
-        img = BT.overview_image(state, p, msgs, chat_dir)
-        # The newest message's file is missing → falls back to the older one.
-        @test img == "/attachment/imgproj01?file=2026-01-01_000000_aaaa1111.png"
-        # No attachments at all → nothing.
-        @test BT.overview_image(state, p, BT.ChatMsg[BT.UserMsg("no image")], chat_dir) === nothing
+        selected = BT.select_chat_icon!(state, p, msgs, chat_dir)
+        @test selected !== nothing
+        @test read(selected, String) == red  # searches beyond the old 200-message window
+        @test dirname(selected) == BT.chat_icon_dir(state, p)
+
+        write(joinpath(att, "blue.svg"), blue)
+        push!(msgs, attachment("blue.svg"))
+        @test BT.select_chat_icon!(state, p, msgs, chat_dir) == selected
+        @test BT.chat_icon_image(state, p).local_path == selected
+        @test isempty(state.chat_models)  # does not need a live chat
+
+        # The chosen source can be overwritten/deleted, and the server can
+        # restart with NO worker or model. The image bytes remain identical.
+        write(joinpath(att, "red.svg"), "overwritten")
+        rm(joinpath(att, "red.svg"))
+        restarted = BT.ServerState(; state_dir=state.state_dir,
+            working_dir=state.working_dir, worker_secret="x")
+        @test BT.chat_icon_image(restarted, p).local_path == selected
+        @test read(selected, String) == red
+
+        shuffled = BT.select_chat_icon!(restarted, p, msgs, chat_dir; shuffle=true)
+        @test shuffled != selected
+        @test read(shuffled, String) == blue
+        again = BT.ServerState(; state_dir=state.state_dir,
+            working_dir=state.working_dir, worker_secret="x")
+        @test BT.chat_icon_image(again, p).local_path == shuffled
+        @test read(selected, String) == red  # old mounted URLs also keep working
+        rm(joinpath(att, "blue.svg"))
+        @test BT.select_chat_icon!(again, p, msgs, chat_dir; shuffle=true) == selected
+        @test BT.select_chat_icon!(again, p, msgs, chat_dir; shuffle=true) == shuffled
+        @test BT.select_chat_icon!(again, p, BT.ChatMsg[], chat_dir) == shuffled
+    end
+
+    @testset "old unopened chats acquire their image from persisted history" begin
+        state = newstate()
+        prompts = ["look\n\n[attached files in this message]\n  - .bt-attachments/old.svg"]
+        append!(prompts, ["later message $i" for i in 1:250])
+        p = seed_chat!(state, "old-image", "old chat", prompts; title="old chat")
+        att = joinpath(p.server_path, BT.ATTACHMENT_DIR_NAME)
+        mkpath(att)
+        bytes = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"73\" height=\"41\"/>"
+        write(joinpath(att, "old.svg"), bytes)
+        BT.chat_icon_image(state, p)
+        task = state.chat_icons[p.id].task
+        task === nothing || wait(task)
+        image = BT.chat_icon_image(state, p)
+        @test image !== nothing
+        @test read(image.local_path, String) == bytes
+        @test isempty(state.chat_models)
+        @test isempty(state.worker_control_ws)
     end
 end

@@ -108,11 +108,15 @@ mutable struct ProjectInfo
     # to retype it. Cleared (and persisted as nothing) once the prompt has
     # been delivered, so a session restart doesn't re-fire.
     auto_prompt::Union{String,Nothing}
-    # Editable human-readable title for the chat, shown in the sidebar and
-    # project card. Auto-set from the first meaningful user prompt in
-    # `send_message!` if it's still `nothing`; a user edit pins it. `nothing`
-    # → the sidebar/card falls back to `name` (folder basename).
-    title::Union{String,Nothing}
+    # The chat's title — the ONE value every view shows, exactly as shown. The
+    # header input binds a session child of it; the homebar row, overview card
+    # and discovered-session row read `p.title[]` on rebuild. Never empty: it
+    # starts as the folder name (`default_title`), the first meaningful prompt
+    # replaces that (`send_message!`), a user edit pins it, a blank edit puts
+    # the default back. Writing it is the whole job: the hook `track_project!`
+    # installs persists the table and fans the change out to every tab, so no
+    # writer has to remember either.
+    title::Observable{String}
     # Closed-from-the-homebar flag. The ✕ on a sidebar entry sets this true
     # (and persists it); it drops the chat out of the "Open chats" list WITHOUT
     # forgetting the thread — the conversation still lives on disk and reappears
@@ -154,7 +158,7 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
                 nothing,                 # resume_session_id
                 nothing,                 # provider
                 nothing,                 # auto_prompt
-                nothing,                 # title
+                Observable(String(name)), # title: the folder, until a prompt or the user names it
                 false,                   # dismissed
                 Dict{String,String}(),   # desired_config
                 false,                   # dev_mode
@@ -212,6 +216,15 @@ mutable struct ChunkAccumulator
     received :: Int
     buf      :: IOBuffer
     meta     :: Dict{String,Any}
+end
+
+# The image itself and its selection live in the chat directory. This cache
+# keeps history scans and worker transfers off the sidebar's render task.
+Base.@kwdef mutable struct ChatIconState
+    path::Union{Nothing,String} = nothing
+    stamp::Any = nothing
+    task::Union{Nothing,Task} = nothing
+    lock::ReentrantLock = ReentrantLock()
 end
 
 mutable struct ServerState
@@ -349,6 +362,7 @@ mutable struct ServerState
     # is not a cache hit — only a stamp that still matches the worker's current
     # stat is. See `fetch_show_file` / `mirror_is_current`.
     show_mirror_stamps :: Dict{String,@NamedTuple{size::Int, mtime::Float64}}
+    chat_icons :: Dict{String,ChatIconState}
     # LRU of project_ids whose agent is currently BOUND, most-recently last. Capped:
     # binding past the cap closes the oldest idle session (reaps its agent; lazy
     # ACP re-binds it from disk history on the next turn). Bounds agent processes.
@@ -412,6 +426,7 @@ function ServerState(; state_dir::String,
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
         Dict{String,@NamedTuple{size::Int, mtime::Float64}}(),  # show_mirror_stamps
+        Dict{String,ChatIconState}(),             # chat_icons
         String[],                                 # bound_lru
         Observable(Dict{String,String}()),        # default_session_config (load_settings! below)
         Observable(Any[]),                        # last_config_options
@@ -460,6 +475,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.session_inflight,
             s.show_fetch_inflight,
             s.show_mirror_stamps,
+            s.chat_icons,
             s.bound_lru,               # shared registry — one per server
             # SHARED (not bridged): the home writes these and
             # `effective_session_config` reads them off the parent at bring-up, so
@@ -740,8 +756,14 @@ worker_initials(w::WorkerInfo) =
     w.initials === nothing || isempty(w.initials) ? derive_initials(w.name) :
                                                     w.initials
 
-project_display_title(p::ProjectInfo) =
-    p.title === nothing || isempty(p.title) ? p.name : p.title
+# The title a chat starts with, before a prompt or the user names it: its folder.
+default_title(p::ProjectInfo) = p.name
+
+# Has a prompt or the user named it yet? Views never ask — they show `p.title[]`
+# either way — only the writers that must not overwrite a name do (the
+# first-prompt backfill, the repair sweep, the debug-chat promotion), plus the
+# homebar membership below.
+titled(p::ProjectInfo) = p.title[] != default_title(p)
 
 """
     chat_in_sidebar(p) -> Bool
@@ -754,7 +776,7 @@ folder→threads browser's "already open, hide it" dedup — so all three agree 
 exactly which chats are open.
 """
 chat_in_sidebar(p::ProjectInfo) =
-    !p.dismissed && (p.title !== nothing || p.resume_session_id !== nothing)
+    !p.dismissed && (titled(p) || p.resume_session_id !== nothing)
 
 # Setting an Observable propagates to the browser via Bonito's WebSocket;
 # if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
@@ -865,6 +887,46 @@ notify_chats!(s::ServerState) = safe_notify!(root_state(s).chat_signal)
 # cards) or its status (sidebar LEDs). See `turn_signal`'s field doc for why the
 # two are separate.
 notify_turn!(s::ServerState) = safe_notify!(root_state(s).turn_signal)
+
+# The projects / workers tables changed (a title, a bound session, a rename, a
+# worker's status). Same root-routing rule: the table itself is ONE shared Dict,
+# but a session view's `projects`/`workers` Observables are one-way children —
+# notifying the view a caller happened to hold reached that tab alone, which is
+# how a header rename showed "HOTS" while the same tab's homebar (listening on
+# its own child) kept the auto-title. Every writer goes through these.
+notify_projects!(s::ServerState) = safe_notify!(root_state(s).projects)
+notify_workers!(s::ServerState)  = safe_notify!(root_state(s).workers)
+
+# The one door into the projects table. Every project — created, imported,
+# copied, or loaded back from projects.json — enters through here, which is
+# where its title hook goes: a write to `p.title` from anywhere (first-prompt
+# backfill, header edit, dev API, the repair sweep) persists the table and
+# notifies every tab by itself. Saves nothing on entry: creation paths save the
+# new record themselves, and the loader has nothing new to write.
+function track_project!(s::ServerState, p::ProjectInfo)
+    lock(s.lock) do
+        s.projects[][p.id] = p
+    end
+    on(p.title) do _
+        try
+            save_projects!(s)
+        catch e
+            # The title is live and reaches every tab below; only the copy on
+            # disk is behind, and the next write of the table catches it up.
+            @warn "projects.json write failed after a title change" project = p.id exception = (e, catch_backtrace())
+        end
+        notify_projects!(s)
+    end
+    return p
+end
+
+# A new project: into the table, onto disk, out to every tab.
+function add_project!(s::ServerState, p::ProjectInfo)
+    track_project!(s, p)
+    save_projects!(s)
+    notify_projects!(s)
+    return p
+end
 
 # ── Persistence ───────────────────────────────────────────────────────────
 # Atomic JSON write: serialise to a UNIQUE sibling temp file first, then rename
@@ -997,7 +1059,7 @@ function save_projects!(s::ServerState)
                      "resume_session_id" => p.resume_session_id,
                      "provider"      => p.provider,
                      "auto_prompt"   => p.auto_prompt,
-                     "title"         => p.title,
+                     "title"         => p.title[],
                      "dismissed"     => p.dismissed,
                      "dev_mode"      => p.dev_mode,
                      "remote_eval"   => p.remote_eval,
@@ -1035,9 +1097,9 @@ function load_projects!(s::ServerState)
             ap = get(d, "auto_prompt", nothing)
             p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
                                        nothing : String(ap)
+            # Older files carry null / "" for "never titled": the default stands.
             ti = get(d, "title", nothing)
-            p.title = (ti === nothing || (ti isa AbstractString && isempty(ti))) ?
-                                       nothing : String(ti)
+            ti isa AbstractString && !isempty(ti) && (p.title[] = String(ti))
             # Pre-`dismissed` projects.json entries default to shown (false), so
             # an upgrade doesn't suddenly hide anyone's existing open chats.
             p.dismissed = get(d, "dismissed", false) === true
@@ -1053,7 +1115,7 @@ function load_projects!(s::ServerState)
                     v isa AbstractString && (p.desired_config[String(k)] = String(v))
                 end
             end
-            s.projects[][p.id] = p
+            track_project!(s, p)
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
         end

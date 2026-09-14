@@ -58,11 +58,12 @@ include("mcp_relay.jl")
 include("remote_app.jl")       # eval-result bridge — live worker Bonito results in the browser
 include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + app detach controller
 include("persistence.jl")
+include("chat_icons.jl")        # durable, user-controlled chat image identities
 include("overview.jl")         # recent-chats overview cards (dashboard header)
 include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)
 include("session_widget.jl")   # SessionRow widget (one row per discovered Claude Code session)
-include("project_widget.jl")   # ProjectCard widget (stable per project_id, used by KeyedList)
+include("chat_title.jl")       # chat_title_input — the one editor over ProjectInfo.title
 include("file_tree.jl")        # WorkerFileTree — lazy, searchable project file tree (sidebar)
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template

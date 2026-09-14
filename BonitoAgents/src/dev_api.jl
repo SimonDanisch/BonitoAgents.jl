@@ -285,7 +285,7 @@ function project_report(p::ProjectInfo)
     return Dict{String,Any}(
         "id"                => p.id,
         "name"              => p.name,
-        "title"             => jsonable(p.title),
+        "title"             => p.title[],
         "worker_id"         => p.worker_id,
         "worker_path"       => p.worker_path,
         "server_path"       => p.server_path,
@@ -716,7 +716,7 @@ function dev_control(state::ServerState, ::Val{:open_chat}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
     ensure_project_session!(state, p)
     return Dict{String,Any}("ok" => true, "project_id" => p.id,
-                            "title" => project_display_title(p))
+                            "title" => p.title[])
 end
 
 function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDict)
@@ -742,7 +742,7 @@ function dev_control(state::ServerState, ::Val{:close_chat}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
     p.dismissed = true
     lock(state.lock) do; save_projects!(state); end
-    safe_notify!(state.projects)
+    notify_projects!(state)
     return Dict{String,Any}("ok" => true, "project_id" => p.id, "dismissed" => true)
 end
 
@@ -758,7 +758,7 @@ function dev_control(state::ServerState, ::Val{:set_title}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
     set_project_title!(state, p.id, String(get(args, "title", "")))
     return Dict{String,Any}("ok" => true, "project_id" => p.id,
-                            "title" => project_display_title(state.projects[][p.id]))
+                            "title" => state.projects[][p.id].title[])
 end
 
 # Continue a chat on another worker. The SAME operation as the chat header's
@@ -873,7 +873,7 @@ function set_dev_mode!(state::ServerState, project_id::AbstractString, on::Bool)
     if p.dev_mode != on
         p.dev_mode = on
         lock(state.lock) do; save_projects!(state); end
-        safe_notify!(state.projects)
+        notify_projects!(state)
     end
     return p
 end
@@ -925,27 +925,23 @@ function ensure_debug_project!(state::ServerState; worker_id::AbstractString = "
         # An ordinary chat already sitting on the checkout is PROMOTED here —
         # this is the one path that may grant `dev_mode`, and it's the user
         # clicking the button that does it.
-        changed = !existing.dev_mode || existing.dismissed || existing.title === nothing
+        changed = !existing.dev_mode || existing.dismissed
         existing.dev_mode = true
         existing.dismissed = false
-        existing.title === nothing && (existing.title = DEBUG_PROJECT_TITLE)
         if changed
             lock(state.lock) do; save_projects!(state); end
-            safe_notify!(state.projects)
+            notify_projects!(state)
         end
+        # An untitled chat takes the debug title; the write persists by itself.
+        titled(existing) || (existing.title[] = DEBUG_PROJECT_TITLE)
         return existing
     end
 
     p = ProjectInfo(string(uuid4())[1:8], basename(root), wid,
                     compute_server_path(state, wid, basename(root)), root, now(UTC))
     p.dev_mode = true
-    p.title = DEBUG_PROJECT_TITLE
-    lock(state.lock) do
-        state.projects[][p.id] = p
-        save_projects!(state)
-    end
-    safe_notify!(state.projects)
-    return p
+    p.title[] = DEBUG_PROJECT_TITLE
+    return add_project!(state, p)
 end
 
 const DEBUG_PROJECT_TITLE = "Debug BonitoAgents"

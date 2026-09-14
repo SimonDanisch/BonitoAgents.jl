@@ -1,38 +1,21 @@
 # ── Recent-chats overview ────────────────────────────────────────────────
 # The dashboard header's overview section: the last `OVERVIEW_LIMIT` chats as
 # cards, each showing the chat's persistent title, its message count + last
-# activity, the last few user prompts (system tags stripped), and the last
-# image that was displayed in the chat (user attachment or bt_show result).
+# activity, the last few user prompts (system tags stripped), and a stable
+# image chosen from the chat (user attachment or bt_show result).
 #
-# Persistence model: everything derives from what's already on disk —
-# `chat.md` (messages, mtime = last activity), `.bt-attachments/` (user
-# images) and the bt_show server mirror — so the section survives restarts
-# with no extra bookkeeping. For LIVE chats the in-memory msgs_store is used
-# instead of re-parsing chat.md, and the cards re-render on `turn_signal`
-# (every turn boundary, via the ChatModel's busy_active hook), `chat_signal`
-# (chat open/close) and `projects` (title edits), which is what keeps them up
-# to date.
+# Titles and messages come from chat history; the image is a persistent
+# snapshot shared with the sidebar (chat_icons.jl).
 
-const OVERVIEW_LIMIT = 6           # cards shown
-const OVERVIEW_SNIPPETS = 3        # user prompts per card
-
-# How far back a card looks for its thumbnail. The scan is NOT free: for every
-# `ToolMsg` it passes it calls `tool_content_for_render`, which falls through to
-# a DISK READ for anything past the tool-content cache cap
-# (`TOOL_CONTENT_CACHE_CAP`, 256). Unbounded, a long chat with no image walked
-# its ENTIRE history and paid a file read per tool — survivable when the cards
-# only rebuilt on chat open/close, but they now also rebuild on every turn
-# boundary (see `turn_signal`), which put that walk in the middle of streaming.
-# An image hundreds of messages back is not "the last image the chat displayed"
-# in any useful sense, so the bound costs nothing real.
-const OVERVIEW_IMAGE_SCAN = 200
+const OVERVIEW_LIMIT = 6
+const OVERVIEW_SNIPPETS = 3
 
 struct ChatCardData
     pid         :: String
     title       :: String
     msg_count   :: Int
     snippets    :: Vector{String}   # last user prompts, oldest first
-    image       :: Any              # nothing | String (attachment route URL) | Bonito.Asset
+    image       :: Any              # nothing | Bonito.Asset (persistent snapshot)
     last_active :: Float64          # unix mtime of chat.md
     status      :: Symbol           # chat_status: :offline | :online | :active
 end
@@ -64,38 +47,6 @@ function overview_snippets(msgs::Vector{ChatMsg};
         length(out) >= limit && break
     end
     return out
-end
-
-# The most recent image the chat DISPLAYED, scanning newest-first:
-#   • a user attachment (files under `<server_path>/.bt-attachments/`,
-#     served inline via the /attachment route), or
-#   • a bt_show image whose file is already on the server mirror / show
-#     cache (`show_server_path`; no worker fetch from here — a cache miss
-#     just means "no thumbnail" until the chat renders it once).
-function overview_image(state::ServerState, p::ProjectInfo,
-                        msgs::Vector{ChatMsg}, chat_dir::AbstractString;
-                        limit::Int = OVERVIEW_IMAGE_SCAN)
-    for m in Iterators.take(Iterators.reverse(msgs), limit)
-        if m isa UserMsg
-            _, rels = split_attachment_suffix(m.text)
-            for rel in Iterators.reverse(rels)
-                isfile(joinpath(p.server_path, rel)) || continue
-                return "/attachment/$(p.id)?file=$(HTTP.escapeuri(basename(rel)))"
-            end
-        elseif m isa ToolMsg && tool_key(m) == "bt_show"
-            content = tool_content_for_render(m, chat_dir)
-            isempty(content) && continue
-            ref = find_show_reference(content)
-            ref === nothing && continue
-            path = parse_show_path(ref)
-            path === nothing && continue
-            any(ext -> endswith(lowercase(path), ext), SHOW_IMAGE_EXTS) || continue
-            local_path = show_server_path(ShowTool(state, p.id, p.server_path, path))
-            isfile(local_path) || continue
-            return Bonito.Asset(local_path)
-        end
-    end
-    return nothing
 end
 
 # Messages + chat_dir for a project: the live model's store when the chat is
@@ -135,10 +86,10 @@ function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
         msgs, chat_dir = overview_msgs(state, p)
         push!(cards, ChatCardData(
             p.id,
-            project_display_title(p),
+            p.title[],
             length(msgs),
             overview_snippets(msgs; provider = project_provider(p)),
-            overview_image(state, p, msgs, chat_dir),
+            chat_icon_image(state, p),
             mt,
             chat_status(state, p)))
     end
@@ -267,6 +218,7 @@ function recent_chats_dom(session::Bonito.Session, state::ServerState,
         return DOM.div(OverviewStyles, grid; class = "bt-overview")
     return DOM.div(OverviewStyles, grid;
         class = "bt-overview",
+        oncontextmenu = chat_icon_contextmenu(session, state, ".bt-ov-thumb"),
         onclick = js"""event => {
             const card = event.target.closest('.bt-ov-card');
             if (card && card.dataset.projectId)

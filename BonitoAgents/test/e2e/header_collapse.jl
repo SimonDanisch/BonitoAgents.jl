@@ -14,6 +14,9 @@
 #   * check: ✕ glyph, actions/env/search all visible; the panel is in flow
 #     below the toggle and its controls span the full row (the Review button
 #     stretches with it; the provider select centers),
+#   * no menu inside the menu: the actions menu's own ⋯ trigger is gone from
+#     the panel and its items (Review, Restart, …) are laid out in flow right
+#     there; picking one closes the panel like it closes the popover,
 #   * uncheck: back to the collapsed row,
 #   * the checked state must never leak into the wide layout: widening the
 #     pane with the menu open shows the plain wide header again.
@@ -81,6 +84,31 @@ panel_geometry_ok(s) = TK.eval_js(s, """(() => {
     const cat = p.querySelector('.bt-header-meta-cat');
     if (cat && getComputedStyle(cat).display === 'none') return 'cat-hidden-in-panel';
     return 'ok'; })()""")
+
+# The popover's items are part of the expanded panel: laid out in flow (not an
+# absolutely positioned dropdown), inside the actions stack, and whole.
+flat_menu_ok(s) = TK.eval_js(s, """(() => {
+    const p = $(PANE);
+    const men  = p && p.querySelector('.bt-header-menu');
+    const list = men && men.querySelector('.bt-menu-list');
+    const acts = p && p.querySelector('.bt-header-actions');
+    if (!list || !acts) return 'missing-el';
+    if (men.classList.contains('bt-menu-open')) return 'popover-state';
+    if (getComputedStyle(list).position !== 'static') return 'list-not-in-flow';
+    const l = list.getBoundingClientRect(), a = acts.getBoundingClientRect();
+    if (l.top < a.top - 1 || l.bottom > a.bottom + 1) return 'list-outside-panel';
+    const items = [...list.querySelectorAll('.bt-menu-item')].filter(b => b.offsetParent !== null);
+    if (items.length < 3) return 'too-few-items:' + items.length;
+    for (const b of items) {
+        const r = b.getBoundingClientRect();
+        if (r.left < a.left - 1 || r.right > a.right + 1) return 'item-clipped';
+    }
+    return 'ok'; })()""")
+
+more_checked(s) = TK.eval_js(s, """(() => {
+    const p = $(PANE);
+    const c = p && p.querySelector('.bt-header-more-check');
+    return c ? c.checked : 'no-check'; })()""")
 
 # Resize + let the container query re-evaluate; poll on the toggle's visibility
 # flipping rather than a blind sleep.
@@ -208,12 +236,34 @@ function run_suite(server)
             @test visible(s, ".bt-lens-bar")
             @test visible(s, ".bt-header-env")
             @test visible(s, ".bt-header-menu")
-            # Review lives in the ⋯ menu now, so what has to be reachable here
-            # is the trigger; the item itself is one click away like every
-            # other action.
-            @test visible(s, ".bt-header-menu .bt-menu-trigger")
-            @test TK.eval_js(s, "!!$(PANE).querySelector('.bt-header-menu .bt-header-review')") == true
+            # No menu inside the menu: the panel shows the actions themselves,
+            # not a second ⋯ button that would open a popover over it.
+            @test !visible(s, ".bt-header-menu .bt-menu-trigger")
+            @test visible(s, ".bt-header-menu .bt-header-review")
+            @test visible(s, ".bt-header-menu .bt-header-restart")
+            @test flat_menu_ok(s) == "ok"
             @test panel_geometry_ok(s) == "ok"
+
+            # Picking an action closes the panel, as it closes the popover on
+            # wide panes. Review is the harmless one: it opens the review pane
+            # of this throwaway chat.
+            @test more_checked(s) == true
+            @test TK.eval_js(s, "($(PANE).querySelector('.bt-header-menu .bt-header-review').click(), 'clicked')") == "clicked"
+            TK.wait_for(s, "panel closed after picking an action",
+                """(() => {
+                    const p = $(PANE);
+                    const a = p && p.querySelector('.bt-header-actions');
+                    return a ? a.offsetParent === null : false; })()"""; timeout = 5)
+            @test more_checked(s) == false
+            @test glyph(s) == "⋯"
+
+            # Reopen for the collapse-by-toggle path below.
+            @test click_toggle(s) == "clicked"
+            TK.wait_for(s, "collapse menu re-expanded",
+                """(() => {
+                    const p = $(PANE);
+                    const a = p && p.querySelector('.bt-header-actions');
+                    return a ? a.offsetParent !== null : false; })()"""; timeout = 5)
 
             # Collapse again: back to the bare row.
             @test click_toggle(s) == "clicked"
@@ -232,6 +282,9 @@ function run_suite(server)
             @test visible(s, ".bt-header-actions")
             @test visible(s, ".bt-lens-bar")
             @test visible(s, ".bt-header-env")
+            # …and the actions menu is a popover again: trigger shown, list not.
+            @test visible(s, ".bt-header-menu .bt-menu-trigger")
+            @test !visible(s, ".bt-header-menu .bt-menu-list")
         finally
             TK.set_window_size(s, 1280, 820)
         end

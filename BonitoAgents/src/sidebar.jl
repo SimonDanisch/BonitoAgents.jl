@@ -192,10 +192,7 @@ struct SidebarChat
     # `querySelectorAll('.bt-side-led')` + `closest('.bt-side-item').dataset` —
     # a global re-broadcast plus a DOM lookup to undo it.
     status  :: Observable{Symbol}
-    # The last image this chat displayed, used as its icon. Read out of the
-    # chat's messages, so it follows `turn_signal` — the signal whose whole job
-    # is "an open chat's content changed", and the one the dashboard's overview
-    # cards already ride to pick up the same picture.
+    # Persistent image identity, shared with the dashboard.
     image   :: Observable{Any}
     tree    :: Union{Nothing,WorkerFileTree}
     active0 :: Bool        # first paint only; the nav handler owns it afterwards
@@ -252,7 +249,7 @@ function set_row!(obs::Observable, value)
     return obs
 end
 
-# `overview_image` hands back a FRESH `Bonito.Asset` for the same file on every
+# `chat_icon_image` hands back a FRESH `Bonito.Asset` for the same file on every
 # call, and an Asset compares by identity — so the generic method above would
 # see the same picture as a change and swap the icon node every turn. Two
 # assets are the same picture iff they point at the same file. Every OTHER
@@ -286,30 +283,6 @@ function refresh!(state::ServerState, c::SidebarChat, p::ProjectInfo,
     set_row!(c.status,  status)
     set_row!(c.image,   chat_icon_image(state, p))
     return c
-end
-
-"""
-    chat_icon_image(state, p) -> image or nothing
-
-The last image this chat displayed, read from its LIVE model only.
-
-Deliberately not `overview_msgs`: that falls back to parsing the chat's whole
-persisted history off disk when no model is loaded, and this runs per row inside
-the list derivation. Rows without a loaded model would otherwise parse their
-full transcripts before the page could paint. Keep that disk work out of the
-sidebar render path.
-
-A closed chat keeps its identicon until it is opened, which is exactly when it
-gains the model this reads.
-"""
-function chat_icon_image(state::ServerState, p::ProjectInfo)
-    model = lock(state.lock) do
-        get(state.chat_models, p.id, nothing)
-    end
-    model === nothing && return nothing
-    sh = shared(model)
-    msgs = lock(() -> copy(sh.msgs_store), sh.lock)
-    return overview_image(state, p, msgs, model.chat_dir)
 end
 
 """
@@ -430,7 +403,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         # restart; reopening from the dashboard clears it (bring_up_project_session!).
         p.dismissed = true
         lock(state.lock) do; save_projects!(state); end
-        safe_notify!(state.projects)
+        notify_projects!(state)
         # Flip the view away FIRST, then tear the session down off the event
         # task (T21). `stop_session!` closes the transport (network I/O) and the
         # ChatModel, which can block for seconds — running it inline froze the
@@ -482,7 +455,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         wtag(p) = haskey(workers, p.worker_id) ?
                     worker_initials(workers[p.worker_id]) :
                     derive_initials(p.worker_id)
-        base(p) = project_display_title(p)
+        base(p) = p.title[]
         base_counts = Dict{String,Int}()
         for p in open_projs; base_counts[base(p)] = get(base_counts, base(p), 0) + 1; end
 
@@ -537,7 +510,8 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         }""")
     header = DOM.div(collapse_btn; class = "bt-side-header")
 
-    aside = DOM.aside(header, body; class = "bt-sidebar", dataBootId = server_boot_id())
+    aside = DOM.aside(header, body; class = "bt-sidebar", dataBootId = server_boot_id(),
+        oncontextmenu = chat_icon_contextmenu(session, state, ".bt-side-icon-wrap"))
 
     # Delegated click handler: one listener on the aside. A click on a
     # `.bt-side-close` ✕ routes to `close_trigger`; anything else on a
@@ -1069,8 +1043,15 @@ struct LoadingState
     inflight :: Set{String}
     errors   :: Dict{String,String}
     retry    :: Observable{String}
+    # Bumped when a bring-up finishes or is retried: the overlay re-evaluates
+    # for the CURRENT view. Never re-notify `current_view` for this: that
+    # broadcasts a navigation to the browser, and if the user clicked away
+    # while the bring-up ran, the stale pid lands after their (un-echoed)
+    # local change and the browser shows the chat while the server says Home.
+    settled  :: Observable{Int}
 end
-LoadingState() = LoadingState(Set{String}(), Dict{String,String}(), Observable(""))
+LoadingState() = LoadingState(Set{String}(), Dict{String,String}(), Observable(""), Observable(0))
+settled!(ls::LoadingState) = safe_set!(ls.settled, ls.settled[] + 1)
 
 # Loading screen for a project whose ChatModel isn't cached yet. Replaces the
 # old bare "Starting chat for X…" text, which had two problems: it never
@@ -1080,9 +1061,9 @@ LoadingState() = LoadingState(Set{String}(), Dict{String,String}(), Observable("
 #
 # This view depends on `state.workers`, so it re-renders on every worker
 # status change — giving us, for free, the offline message AND a re-attempt
-# when the worker comes (back) online. When a bring-up task finishes it
-# `notify`s `current_view` (value unchanged → pure re-render kick), so
-# `unified_main`'s outer `map` re-evaluates and swaps to the now-cached chat.
+# when the worker comes (back) online. When a bring-up task finishes it bumps
+# `ls.settled`, so `unified_main`'s overlay `map` re-evaluates for whatever the
+# current view is by then and swaps to the now-cached chat.
 #
 # The state machine (per project id, see `LoadingState`):
 #   offline worker        → "worker is offline" card (no task, no spinner)
@@ -1151,7 +1132,7 @@ function project_loading_view(state::ServerState, pid::String,
                     @warn "loading: chat bring-up failed" project = proj.name exception = e
                 finally
                     delete!(ls.inflight, pid)
-                    safe_notify!(current_view)   # re-render: show chat, or the error card
+                    settled!(ls)   # re-render: show chat, or the error card
                 end
             end
         end
@@ -1336,7 +1317,7 @@ function unified_main(session::Bonito.Session, state::ServerState,
     # until the chat module's settle events dismiss it. (It used to go
     # display:none here, exposing ~1s of bare background before the
     # now-removed per-chat curtain painted.)
-    overlay = map(session, current_view) do pid
+    overlay = map(session, current_view, ls.settled) do pid, _
         if isempty(pid)
             DOM.div(; style = Styles("display" => "none"))
         elseif haskey(state.chat_models, pid)
@@ -1481,7 +1462,7 @@ function unified_app(state::ServerState)
         on(session, ls.retry) do retry_pid
             isempty(retry_pid) && return
             delete!(ls.errors, retry_pid)
-            safe_notify!(current_view)
+            settled!(ls)
         end
         # The window's PlotPane handle wraps a BonitoWidgets.Workspace. Created
         # BEFORE the sidebar + unified_main so it can be passed down to the chat

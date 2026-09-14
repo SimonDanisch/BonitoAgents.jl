@@ -264,7 +264,7 @@ end
             r = BT.dev_request(st, "control", Dict("op" => "set_title", "project_id" => pid,
                                                    "title" => "Renamed By Dev API"))
             @test r["ok"] === true
-            @test st.projects[][pid].title == "Renamed By Dev API"
+            @test st.projects[][pid].title[] == "Renamed By Dev API"
 
             r2 = BT.dev_request(st, "control", Dict("op" => "close_chat", "project_id" => pid))
             @test r2["dismissed"] === true
@@ -302,7 +302,7 @@ end
                 @test p.dev_mode
                 @test p.worker_id == wid
                 @test p.worker_path == root
-                @test p.title == BT.DEBUG_PROJECT_TITLE
+                @test p.title[] == BT.DEBUG_PROJECT_TITLE
                 # Idempotent: clicking the button twice reuses the chat — also
                 # when the worker is left for it to pick (the only one here).
                 @test BT.ensure_debug_project!(st).id == p.id

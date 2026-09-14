@@ -155,7 +155,7 @@ function run_suite(server)
                 p = BT.ProjectInfo("renamed-other", "Other", wid,
                                    seeded.other, seeded.other, BT.Dates.now())
                 p.resume_session_id = "cccc3333"
-                p.title = "Renamed Other Chat"
+                p.title[] = "Renamed Other Chat"
                 p.dismissed = true
                 state.projects[]["renamed-other"] = p
             end

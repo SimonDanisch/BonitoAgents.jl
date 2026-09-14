@@ -289,6 +289,10 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     project_id::AbstractString="",
     mcp_servers=AgentClientProtocol.MCPServer[],
     agent::Union{AgentProvider,Nothing}=nothing)
+    # A chat outlives the tab that opened it, so it holds the ROOT state: a
+    # session view's Observables are one-way children that die with their tab,
+    # and a model built from one notified (and later saw) only that session.
+    state = root_state(state)
     chat_dir = chat_storage_dir(state, project_id, cwd)
     chat_session = load_session(chat_dir, cwd)
     msgs_store = load_history(chat_session)
@@ -6321,24 +6325,18 @@ end
 
 # Set `p.title` from the user's first meaningful prompt — what makes the
 # sidebar / project card read `[DT] resume the build refactor` instead of
-# `[DT] ClaudeExperiments`. Idempotent: only fires while `title` is still
-# `nothing` (a user edit pins it forever). No-op for projects whose
+# `[DT] ClaudeExperiments`. Idempotent: only fires while `title` is still the
+# default (a user edit pins it forever). No-op for projects whose
 # state.projects[] entry is gone (project removed mid-send).
 function backfill_project_title!(model::ChatModel, prompt::AbstractString)
     pid = model.project_id
     isempty(pid) && return
     haskey(model.state.projects[], pid) || return
     p = model.state.projects[][pid]
-    p.title === nothing || return
+    titled(p) && return
     t = meaningful_title(agent_kind(model.agent), prompt)
     t === nothing && return
-    p.title = t
-    try
-        save_projects!(model.state)
-    catch e
-        @warn "backfill_project_title!: persist failed" exception=e
-    end
-    safe_notify!(model.state.projects)
+    p.title[] = t      # persists + reaches every tab through the title hook
     return nothing
 end
 
@@ -6362,7 +6360,7 @@ function record_bound_session!(model::ChatModel, session_id::AbstractString)
     catch e
         @warn "record_bound_session!: persist failed" exception=e
     end
-    safe_notify!(model.state.projects)
+    notify_projects!(model.state)
     return nothing
 end
 
@@ -7041,42 +7039,16 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     end
 
     # ── Editable chat title ───────────────────────────────────────────────
-    # The header title is an inline-editable input over `ProjectInfo.title`
-    # (the same field the sidebar label and the auto-backfill use). Editing
-    # here persists via `set_project_title!`, which notifies
-    # `state.projects` — so the sidebar entry and every other tab's header
-    # update in lockstep. An empty edit clears the override back to the
-    # folder name. Session-scoped `map` so the listener dies with the tab.
-    fallback_title = basename(rstrip(cwd, '/'))
-    title_val = map(session, state.projects) do projects
-        q = isempty(project_id) ? nothing : get(projects, project_id, nothing)
-        q === nothing ? fallback_title : project_display_title(q)
-    end
-    title_edit = Observable("")
-    on(session, title_edit) do t
-        isempty(project_id) && return
-        haskey(state.projects[], project_id) || return
-        try
-            set_project_title!(state, project_id, t)
-        catch e
-            @warn "chat title edit failed" project_id exception = e
-        end
-    end
-    title_node = if isempty(project_id)
-        DOM.div(DOM.span(fallback_title; title=worker_dir), class="bt-header-title")
+    # An inline-editable input bound to the chat's one title observable
+    # (`ProjectInfo.title`), so it cannot disagree with the homebar row or
+    # with any other tab. A chat with no project entry (removed while open)
+    # shows the folder name, read-only.
+    title_node = if project_now === nothing
+        DOM.div(DOM.span(basename(rstrip(cwd, '/')); title=worker_dir), class="bt-header-title")
     else
-        DOM.input(; type = "text",
-            class = "bt-header-title bt-header-title-edit",
-            value = title_val,
-            title = "Chat title — click to edit · folder: $worker_dir",
-            onchange  = js"event => $(title_edit).notify(event.target.value)",
-            onkeydown = js"""event => {
-                if (event.key === 'Enter') { event.target.blur(); }
-                else if (event.key === 'Escape') {
-                    event.target.value = $(title_val).value;
-                    event.target.blur();
-                }
-            }""")
+        chat_title_input(session, project_now;
+            class   = "bt-header-title bt-header-title-edit",
+            tooltip = "Chat title — click to edit · folder: $worker_dir")
     end
 
     # Project environment this chat's eval sessions run in (the Project.toml /
@@ -7210,12 +7182,16 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # capture-phase document listener that closes on a click outside. One
     # listener per open (a re-open replaces it), removed on every close path.
     menu_pick = Observable("")
+    # Picking an item closes whatever holds it: the popover on wide panes, and
+    # on narrow panes the expanded ⋯ panel the items are laid out in.
     close_menu_js = """
         const m = event.currentTarget.closest('.bt-menu');
         if (m) {
             m.classList.remove('bt-menu-open');
             if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
-        }"""
+        }
+        const more = event.currentTarget.closest('.bt-header')?.querySelector('.bt-header-more-check');
+        if (more) more.checked = false;"""
     menu_item(text, action; class = "", title = "") = DOM.button(text;
         class = strip("bt-menu-item " * class),
         title = title,
@@ -7548,14 +7524,21 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # Each entry is a provider singleton (a `BinAgent` descriptor): the stable
     # `provider_name` ("ClaudeCode", …) is the value, `label` the text. The set
     # offered is `current_providers()` — the mock appears only when its env is set.
-    provider_select = map(session, model.provider) do cur
+    # Label of the provider a switch is bringing up, "" when idle. The pill
+    # ITSELF carries the in-flight state ("switching to OpenCode…", spinner,
+    # not clickable): the feedback sits on the control that was used, not in
+    # a muted status line at the far end of the header.
+    switching = Observable("")
+    provider_select = map(session, model.provider, switching) do cur, sw
         items = [(label = label(p), value = provider_name(p),
                   title = "Switch this chat to " * label(p), current = p === cur)
                  for p in current_providers()]
-        dropdown_pill("agent", label(cur), items,
+        busy = !isempty(sw)
+        dropdown_pill("agent", busy ? "switching to $(sw)…" : label(cur), items,
             v -> js"""event => { const t = event.currentTarget;
                     $(ChatLib).then(lib => lib.msearchSelect(t, $(provider_choice), 'provider', $(v))); }""";
-            tooltip = "Switch AI agent backend", extra_class = "bt-header-provider-pick")
+            tooltip = busy ? "Bringing up $(sw)…" : "Switch AI agent backend",
+            extra_class = "bt-header-provider-pick" * (busy ? " bt-msearch-busy" : ""))
     end
     on(session, provider_choice) do pick
         (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
@@ -7570,7 +7553,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         end
         current = model.provider[]
         new_provider === current && return
-        header_status[] = "Switching to $(label(new_provider))…"
+        switching[] = label(new_provider)
         @async begin
             try
                 switch_provider!(model, new_provider)
@@ -7578,12 +7561,12 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 # errors (sets `last_error`, keeps the chat object alive), so a
                 # failed switch returns normally. Surface it from the resulting
                 # session state instead of relying on an exception.
-                safe_set!(header_status, "")
+                safe_set!(switching, "")
                 model.session_alive[] ||
                     problem("Switching to $(label(new_provider)) failed; the session did not come up")
             catch e
                 @warn "provider switch failed" exception=(e, catch_backtrace())
-                safe_set!(header_status, "")
+                safe_set!(switching, "")
                 problem("Switching to $(label(new_provider)) failed")
             end
         end
@@ -7658,6 +7641,11 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
     # up MiMo, which reads as "switched, but the model picker is still Claude's".
     # `start_chat_client!` repopulates it from the new session's config.
     s.session_meta[] = Any[]
+    # The context meter too: those numbers were the OLD provider's session (a
+    # codex window of 258.4k kept showing under "Opus (1M context)"). The new
+    # session reports its own on its first turn; until then, or for an agent
+    # that never sends usage, the meter stays hidden rather than stale.
+    s.usage[] = nothing
 
     # Every chat's agent is a `WorkerAgent`: keep the worker wiring, change only
     # WHICH provider it spawns. A switch must start a FRESH session:
@@ -7699,7 +7687,7 @@ function record_project_provider!(model::ChatModel, provider::BinAgent)
     catch e
         @warn "record_project_provider!: persist failed" exception = e
     end
-    safe_notify!(model.state.projects)
+    notify_projects!(model.state)
     return nothing
 end
 

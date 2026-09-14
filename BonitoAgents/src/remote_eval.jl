@@ -63,7 +63,7 @@ function set_remote_eval!(state::ServerState, project_id::AbstractString, on::Bo
     if p.remote_eval != on
         p.remote_eval = on
         lock(state.lock) do; save_projects!(state); end
-        safe_notify!(state.projects)
+        notify_projects!(state)
         on || close_eval_hosts!(state, p.id)
         # The ONLY record that this was ever flipped. Without it a report of
         # "the header says on and the agent still says off" has nothing to check

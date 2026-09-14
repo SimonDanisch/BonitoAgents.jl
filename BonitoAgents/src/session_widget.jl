@@ -74,9 +74,8 @@ function resolve_session_title!(sr::SessionRow, projects::AbstractDict)
     want = session_preview_title(sr.preview)
     if !isempty(sr.session_id)
         for p in values(projects)
-            if p.resume_session_id == sr.session_id && p.title !== nothing &&
-               !isempty(strip(String(p.title)))
-                want = String(p.title)
+            if p.resume_session_id == sr.session_id && titled(p)
+                want = p.title[]
                 break
             end
         end

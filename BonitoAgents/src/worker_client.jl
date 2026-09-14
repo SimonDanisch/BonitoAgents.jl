@@ -441,8 +441,8 @@ function handle_worker_control(state::ServerState, ws)
         # migrate_legacy_worker_refs!, the project list also needs to
         # know (the project card shows the worker name and that lookup
         # was previously broken).
-        safe_notify!(state.workers)
-        safe_notify!(state.projects)
+        notify_workers!(state)
+        notify_projects!(state)
         @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
 
         # Reconcile this worker's projects against its filesystem: drop any whose
@@ -691,7 +691,7 @@ function teardown_worker_control!(state::ServerState, worker_id::AbstractString,
             teardown_eval_bridge!(state, pid)
             close_eval_hosts!(state, pid)
         end
-        safe_notify!(state.workers)
+        notify_workers!(state)
         # NOT notify_chats!: the chats are kept, so the active-chats list is
         # unchanged — they just render offline until the worker returns.
         release_projects_for_worker!(state, worker_id)
@@ -738,7 +738,7 @@ function rename_worker!(state::ServerState, worker_id::AbstractString,
     isempty(new) && error("Worker name must not be empty")
     state.workers[][worker_id].name = new
     save_workers!(state)
-    safe_notify!(state.workers)
+    notify_workers!(state)
     return state.workers[][worker_id]
 end
 
@@ -753,21 +753,24 @@ function set_worker_initials!(state::ServerState, worker_id::AbstractString,
     state.workers[][worker_id].initials = isempty(s) ? nothing :
         (length(s) > 4 ? String(first(s, 4)) : String(s))
     save_workers!(state)
-    safe_notify!(state.workers)
+    notify_workers!(state)
     return state.workers[][worker_id]
 end
 
-# Project chat title — what `[WW] <title>` renders in the sidebar/card.
-# Empty string clears the override (the UI falls back to `p.name`, the
-# folder basename).
+# A user's rename of a chat. Blank puts the default (the folder name) back.
+# Writing the observable is all there is to it: the title hook
+# (`track_project!`) persists and fans out. Same value = no-op, so committing
+# an unchanged input doesn't rewrite projects.json.
+function set_project_title!(p::ProjectInfo, new_title::AbstractString)
+    s = String(strip(new_title))
+    isempty(s) && (s = default_title(p))
+    p.title[] == s || (p.title[] = s)
+    return p
+end
 function set_project_title!(state::ServerState, project_id::AbstractString,
                             new_title::AbstractString)
     haskey(state.projects[], project_id) || error("Unknown project_id: $project_id")
-    s = strip(String(new_title))
-    state.projects[][project_id].title = isempty(s) ? nothing : String(s)
-    save_projects!(state)
-    safe_notify!(state.projects)
-    return state.projects[][project_id]
+    return set_project_title!(state.projects[][project_id], new_title)
 end
 
 """
@@ -838,8 +841,8 @@ function remove_worker!(state::ServerState, worker_id::AbstractString;
             @debug "remove_worker!: closing control WS failed" exception=e
         end
     end
-    safe_notify!(state.workers)
-    remove_projects && safe_notify!(state.projects)
+    notify_workers!(state)
+    remove_projects && notify_projects!(state)
     notify_chats!(state)        # evicted chats drop out of the active-chats sidebar
     @info "Worker removed" worker_id=wid removed_projects=length(dropped)
     return nothing
@@ -1391,7 +1394,7 @@ function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
         end
         save_projects!(state)
     end
-    safe_notify!(state.projects)
+    notify_projects!(state)
     @info "pruned project(s) with missing worker paths" worker = worker_id count = length(dead) ids = dead
     return length(dead)
 end
@@ -1455,7 +1458,6 @@ end
 # different cleaned string (wrapper + prose where the wrapper part leaked
 # through the older regex). Clean titles round-trip to themselves and the
 # sweep ignores them.
-title_is_broken(::AgentProvider, ::Nothing) = false
 function title_is_broken(provider::AgentProvider, t::AbstractString)
     s = String(t)
     cleaned = meaningful_title(provider, s)
@@ -1477,8 +1479,11 @@ same state is a no-op the second time.
 """
 function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
     wid = String(worker_id)
-    fixed = 0
-    lock(state.lock) do
+    # Decide under the lock, write outside it: each title write runs the hook
+    # (projects.json + a notify to every tab), which has no business inside
+    # the table lock.
+    repairs = lock(state.lock) do
+        out = Pair{ProjectInfo,String}[]
         for (pid, p) in state.projects[]
             p.worker_id == wid || continue
             # The wrappers to peel are the ones of the agent that WROTE the
@@ -1486,7 +1491,11 @@ function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
             # nothing and resolves to the default — which is Claude, the
             # assumption this used to hardcode for every project alike.
             provider = project_provider(p)
-            title_is_broken(provider, p.title) || continue
+            # A chat still on its default (the folder name) was never titled by
+            # a prompt, so there is no wrapper to peel — whatever the filter
+            # would make of the folder name.
+            titled(p) || continue
+            title_is_broken(provider, p.title[]) || continue
             # Prefer the original prompt — re-running the filter against the
             # raw first user message recovers any prose the old truncation
             # dropped on the floor.
@@ -1496,15 +1505,19 @@ function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
             # Fall back to cleaning the saved title in place — strictly an
             # improvement over the leaked form even when chat.md isn't
             # available (cwd moved, project imported, …).
-            new_title === nothing && (new_title = meaningful_title(provider, String(p.title)))
-            p.title = new_title === nothing ? nothing : String(new_title)
-            fixed += 1
+            new_title === nothing && (new_title = meaningful_title(provider, p.title[]))
+            # Nothing usable anywhere: back to the default, so the next real
+            # prompt can title it cleanly.
+            push!(out, p => (new_title === nothing ? default_title(p) : String(new_title)))
         end
-        fixed > 0 && save_projects!(state)
+        out
     end
-    fixed > 0 && (@info "refresh_broken_titles!: repaired $(fixed) project title(s)" worker_id=wid;
-                   safe_notify!(state.projects))
-    return fixed
+    for (p, t) in repairs
+        p.title[] = t
+    end
+    isempty(repairs) ||
+        @info "refresh_broken_titles!: repaired $(length(repairs)) project title(s)" worker_id=wid
+    return length(repairs)
 end
 
 """
