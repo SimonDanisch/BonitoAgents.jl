@@ -74,11 +74,11 @@ function identicon_svg(id::AbstractString, hue_key::AbstractString = id)
 end
 
 # Renders one icon: an identicon tile seeded by `p.id` (the pattern + hue
-# make each chat recognisable at a glance) with the worker's initials on
-# top (`[DT]`-style — Desktop/HP Laptop/…) so the user also reads which
-# machine hosts the chat. Pass `worker_tag = ""` to fall back to the folder
-# initials (used when a worker isn't connected). `size_px` lets the sidebar
-# reuse this at 32 px and the project_card at e.g. 24 px.
+# make each chat recognisable at a glance) with the chat's own initials on
+# top. The worker (`[DT]`-style tag — Desktop/HP Laptop/…) only goes into the
+# tooltip: in the sidebar the ring around the icon says which machine hosts
+# the chat. `size_px` lets the sidebar reuse this at 32 px and the
+# project_card at e.g. 24 px.
 # Value-only form: everything the icon needs, and nothing that can change under
 # it. `SidebarChat` holds these three strings rather than a `ProjectInfo`,
 # because a row outlives any single render and a `ProjectInfo` is mutable shared
@@ -86,13 +86,13 @@ end
 function project_icon_for(id::AbstractString, name::AbstractString,
                           hue_key::AbstractString, worker_tag::AbstractString = "";
                           size_px::Int = 32, image = nothing)
-    label = isempty(worker_tag) ? project_initials(name) : String(worker_tag)
+    label = project_initials(name)
     tip   = isempty(worker_tag) ? String(name) : "$(worker_tag) · $(name)"
     # A chat that has shown a picture IS that picture — a plot or a screenshot
     # is far easier to pick out of a list than two letters on a coloured tile.
-    # The identicon stays underneath as the loading/erroring state, and the
-    # worker tag moves to the tooltip (the LED already carries liveness, and
-    # two glyphs over a thumbnail at 32px is noise).
+    # The identicon stays underneath as the loading/erroring state; the worker
+    # tag moves to the tooltip, and in the sidebar the ring around the icon
+    # keeps saying which machine (two glyphs over a thumbnail at 32px is noise).
     image === nothing || return DOM.div(
         DOM.img(; src = image, alt = "", class = "bt-proj-thumb", loading = "lazy");
         class = "bt-proj-icon bt-proj-icon-img",
@@ -119,25 +119,10 @@ project_icon(p::ProjectInfo, worker_tag::AbstractString = ""; size_px::Int = 32)
 function sidebar_entry(label::AbstractString, icon::Bonito.Node,
                         target_value::AbstractString, title::AbstractString;
                         active::Bool = false, closeable::Bool = false,
-                        extra_class::AbstractString = "",
-                        status::Union{Symbol,Nothing} = nothing)
-    # The icon now carries the worker initials (project_icon does the
-    # styling); the title span only needs the chat title text.
-    # Status LED (green pulse / yellow / red) nestled as a presence badge on the
-    # icon's bottom-right corner (anchored to the icon, so it stays put whether
-    # the rail is expanded or collapsed to icons). This form is only used by
-    # the static "Home"
-    # entry (status === nothing, so no LED); the chat rows are `SidebarChat`,
-    # which owns a `status` Observable and renders it as a CLASS.
-    icon_node = if status === nothing
-        icon
-    else
-        DOM.div(icon,
-                DOM.span(""; class = "bt-side-led", title = string(status),
-                         dataStatus = string(status));
-                class = "bt-side-icon-wrap")
-    end
-    kids = Any[icon_node, DOM.span(label; class = "bt-side-name")]
+                        extra_class::AbstractString = "")
+    # Only the static "Home" entry uses this form; chat rows are `SidebarChat`,
+    # which own a `status` Observable and render it as the icon's glow class.
+    kids = Any[icon, DOM.span(label; class = "bt-side-name")]
     # A ✕ to close (stop) an active chat. Plain markup — the delegated
     # handler on the aside reads `.bt-side-close` and routes to close_trigger
     # rather than current_view, so no per-entry Observable is interpolated
@@ -171,7 +156,7 @@ end
 # Only `label` and `icon` can change for a row that stays; both are Observables
 # updated in place. Everything else is already updated in place by JS and must
 # NOT be recomputed here: `.bt-side-active` is toggled from `data-project-id`
-# on navigation, the status LED follows the row's own `status` Observable, and `.bt-tree-open`
+# on navigation, the status glow follows the row's own `status` Observable, and `.bt-tree-open`
 # is toggled by the row's own hint — a re-render is what used to lose them.
 struct SidebarChat
     pid     :: String
@@ -185,11 +170,13 @@ struct SidebarChat
     # icon in the list — the churn this refactor exists to remove, moved down
     # one level.
     tag     :: Observable{String}
+    # The machine's fixed colour, drawn as a ring around the icon. Follows the
+    # worker id, which only changes when the project is moved.
+    color   :: Observable{String}
     # ONE source of truth, owned by the row. `chat_status` computes it and
     # `refresh!` writes it HERE; the DOM binds to it and nothing else touches
-    # the LED. It replaces a `Dict` of every pid shipped to JS on four
-    # separate signals, which then found each row by
-    # `querySelectorAll('.bt-side-led')` + `closest('.bt-side-item').dataset` —
+    # the glow. It replaces a `Dict` of every pid shipped to JS on four
+    # separate signals, which then found each row by a DOM lookup —
     # a global re-broadcast plus a DOM lookup to undo it.
     status  :: Observable{Symbol}
     # Persistent image identity, shared with the dashboard.
@@ -199,19 +186,19 @@ struct SidebarChat
 end
 
 function Bonito.jsrender(session::Bonito.Session, c::SidebarChat)
-    # The LED's state rides its CLASS, not `data-status`: Bonito attribute
-    # updates assign a JS property, so `data-*` freezes at its initial value —
-    # which is exactly why the old code had to poke it from JS.
-    led_class = map(session, c.status) do st
-        "bt-side-led bt-led-$(st)"
-    end
+    # Liveness is the icon's glow. Its state rides the wrapper's CLASS, not
+    # `data-status`: Bonito attribute updates assign a JS property, so `data-*`
+    # freezes at its initial value — which is exactly why the old code had to
+    # poke it from JS.
     icon_node = DOM.div(
         map(session, c.tag, c.image) do t, img
             project_icon_for(c.pid, c.name, c.hue_key, t; image = img)
-        end,
-        DOM.span(""; class = led_class,
-                 title = map(session, c.status) do st; string(st) end);
-        class = "bt-side-icon-wrap")
+        end;
+        class = map(session, c.status) do st; "bt-side-icon-wrap bt-glow-$(st)" end,
+        # The ring colour rides `style`, which does track: a string assigned to
+        # `el.style` is forwarded to `cssText`.
+        style = map(session, c.color) do col; "--bt-worker:$(col)" end,
+        title = map(session, c.status) do st; string(st) end)
     item = DOM.div(
         icon_node,
         DOM.span(c.label; class = "bt-side-name"),
@@ -276,10 +263,11 @@ field now means adding a line here and nowhere else.
 """
 function refresh!(state::ServerState, c::SidebarChat, p::ProjectInfo,
                   label::AbstractString, tooltip::AbstractString,
-                  tag::AbstractString, status::Symbol)
+                  tag::AbstractString, color::AbstractString, status::Symbol)
     set_row!(c.label,   String(label))
     set_row!(c.tooltip, String(tooltip))
     set_row!(c.tag,     String(tag))
+    set_row!(c.color,   String(color))
     set_row!(c.status,  status)
     set_row!(c.image,   chat_icon_image(state, p))
     return c
@@ -336,7 +324,7 @@ end
 """
     chat_status(state, p) -> Symbol
 
-One of `:active`, `:online`, `:offline` — the sidebar LED state.
+One of `:active`, `:online`, `:offline` — the sidebar icon's glow.
 
   * `:offline`  — worker entry is missing OR its status isn't `:online`.
                   Nothing the agent can do until the worker reconnects.
@@ -421,14 +409,14 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # ONE unified "Open chats" list. A project is "open" iff the user has
     # touched it before — `title` backfilled or `resume_session_id` set
     # (both persist in projects.json, so the list survives a server OR
-    # worker restart). The per-entry LED encodes liveness:
+    # worker restart). The per-entry glow encodes liveness:
     #   green pulse — agent turn in flight (busy_active true) = "working"
     #   green       — worker online, idle (live ChatModel OR resumable)
     #   red         — worker offline / missing
     # ONE derivation for the list, off EVERY signal that can change what a row
     # shows: `chat_signal` (a chat opened/closed), `projects` (added/removed or
     # retitled), `workers` (online/offline), `turn_signal` (a turn started or
-    # ended — which flips the LED and can leave a new picture in the chat).
+    # ended — which flips the glow and can leave a new picture in the chat).
     #
     # `turn_signal` used to be excluded here, because re-running this map once
     # meant re-rendering the whole list and an open file tree was swapped out
@@ -464,15 +452,16 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             b = base(p)
             label = base_counts[b] > 1 ? "$b · $(thread_tag(p))" : b
             st = chat_status(state, p)
+            col = worker_color(p.worker_id)
             tooltip = "[$t] $label · folder: $(p.name) · $(st)"
             row = get!(rows, p.id) do
                 SidebarChat(p.id, p.name, folder_hue_key(p),
                             Observable(label), Observable(tooltip), Observable(t),
-                            Observable(st), Observable{Any}(nothing),
+                            Observable(col), Observable(st), Observable{Any}(nothing),
                             pane === nothing ? nothing : WorkerFileTree(state, p.id, pane),
                             active_pid == p.id)
             end
-            refresh!(state, row, p, label, tooltip, t, st)
+            refresh!(state, row, p, label, tooltip, t, col, st)
         end
     end
 
@@ -510,8 +499,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         }""")
     header = DOM.div(collapse_btn; class = "bt-side-header")
 
-    aside = DOM.aside(header, body; class = "bt-sidebar", dataBootId = server_boot_id(),
-        oncontextmenu = chat_icon_contextmenu(session, state, ".bt-side-icon-wrap"))
+    aside = DOM.aside(header, body; class = "bt-sidebar", dataBootId = server_boot_id())
 
     # Delegated click handler: one listener on the aside. A click on a
     # `.bt-side-close` ✕ routes to `close_trigger`; anything else on a
@@ -665,41 +653,35 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-active",
         "border-left-color" => "var(--bt-accent)",
         "background" => "var(--bt-surface-2)"),
-    # Per-entry status LED: a 6px dot nestled into the icon's bottom-right
-    # corner. No outline ring — the dot sits ON the colored tile, where any
-    # of the three status colors reads cleanly against it. A `bt-led-*` CLASS
-    # picks the state; active pulses softly, the other two are flat.
-    # Position is relative to the entry so the LED follows the icon when
-    # the entry wraps over two lines on a narrow column.
+    # Machine and liveness both live on the icon. The wrapper draws a thin ring
+    # in the worker's fixed colour (`--bt-worker`, set on the wrapper) right on
+    # the picture's edge, following its corners; its negative margin keeps the
+    # row at the icon's own size. Liveness only shows when it departs from the
+    # norm: an idle chat is plain, a turn in flight pulses a green glow, and a
+    # chat whose worker is down is greyed out. Only the wrapper's class and
+    # colour ever change, so a status change never re-renders the icon. The
+    # pulse peak reaches the row's edge but no further, so the sidebar's
+    # overflow clipping never cuts it.
     CSS(".bt-side-item", "position" => "relative"),
-    # Icon + presence-badge wrapper: the LED nestles on the icon's corner and
-    # rides with it whether the rail is expanded or collapsed.
     CSS(".bt-side-icon-wrap",
         "position" => "relative", "flex-shrink" => "0",
-        "display" => "flex", "line-height" => "0"),
-    CSS(".bt-side-led",
-        "position" => "absolute",
-        "right" => "-2px", "bottom" => "-2px",
-        "width" => "10px", "height" => "10px",
-        "border-radius" => "50%",
-        "border" => "2px solid var(--bt-surface)",
-        "box-sizing" => "border-box",
-        "background" => "var(--bt-text-faint)",
-        "transition" => "background 120ms"),
-    CSS(".bt-side-led.bt-led-offline",
-        "background" => "var(--bt-status-offline)"),    # red — worker down
-    # online = ACP/worker up, idle. Solid green (NOT yellow): an open/online
-    # chat is a healthy steady state, not a warning.
-    CSS(".bt-side-led.bt-led-online",
-        "background" => "var(--bt-status-online)"),     # green (solid)
-    # active = an agent turn is in flight. Same green, but pulsing = "working".
-    CSS(".bt-side-led.bt-led-active",
-        "background" => "var(--bt-status-active)",      # green
-        "animation" => "bt-side-led-pulse 1.1s ease-in-out infinite"),
-    CSS("@keyframes bt-side-led-pulse",
-        CSS("0%",   "box-shadow" => "0 0 0 0 rgba(22,163,74,0.55)"),
-        CSS("70%",  "box-shadow" => "0 0 0 5px rgba(22,163,74,0)"),
-        CSS("100%", "box-shadow" => "0 0 0 0 rgba(22,163,74,0)")),
+        "display" => "flex", "line-height" => "0",
+        "margin" => "-1.5px",
+        "border" => "1.5px solid var(--bt-worker, transparent)",
+        "border-radius" => "10px",
+        "transition" => "box-shadow 250ms"),
+    CSS(".bt-side-icon-wrap .bt-proj-icon",
+        "transition" => "filter 250ms, opacity 250ms"),
+    CSS(".bt-glow-active",
+        "animation" => "bt-icon-glow 1.4s ease-in-out infinite"),
+    # Full status green at every phase: a solid 1px halo that swells to a
+    # 3px glow, so a single glance catches it regardless of where the cycle is.
+    CSS("@keyframes bt-icon-glow",
+        CSS("0%",   "box-shadow" => "0 0 3px 1px var(--bt-status-active)"),
+        CSS("50%",  "box-shadow" => "0 0 9px 3px var(--bt-status-active)"),
+        CSS("100%", "box-shadow" => "0 0 3px 1px var(--bt-status-active)")),
+    CSS(".bt-glow-offline .bt-proj-icon",
+        "filter" => "grayscale(1)", "opacity" => "0.5"),
     # A chat that has shown a picture wears it. `cover` so a wide plot or a tall
     # screenshot both fill the tile without letterboxing, and the radius is on
     # the wrapper with `overflow:hidden` so the image inherits the same corners

@@ -138,12 +138,15 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # `[DT]` tag — short worker initials shown next to every chat/project that
     # lives on this worker. Up to 4 chars (room for a short emoji). Empty
     # input clears the override and the UI falls back to derive_initials(name).
+    # The pill's border is the worker's fixed colour: the same ring the
+    # sidebar draws around this machine's chat icons.
     initials_input = DOM.input(
         type      = "text",
         value     = c.initials_obs,
         maxlength = 4,
         class     = "bt-card-initials bt-card-initials-edit",
-        title     = "Worker tag (1–4 chars, emoji ok) — shown as [XX] in chat labels",
+        style     = "border:1.5px solid $(worker_color(wid))",
+        title     = "Worker tag (1–4 chars, emoji ok) — shown as [XX] in chat labels; its colour rings this machine's chat icons",
         onblur    = js"event => $(c.initials_obs).notify(event.target.value)",
         onkeydown = js"""event => {
             if (event.key === 'Enter')  { event.target.blur(); }

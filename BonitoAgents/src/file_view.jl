@@ -205,7 +205,8 @@ looks_binary(bytes::AbstractVector{UInt8}) = 0x00 in view(bytes, 1:min(length(by
 # the image, and reports its pixel size once the browser knows it.
 function render_file(::ImageFile, ::InlineView, fv::FileView, session)
     st = fv.file
-    return media_element(show_media_src(st, session), "", false; filename = basename(st.path))
+    return media_element(show_media_src(st, session), "", false;
+                         filename = basename(st.path), worker_path = show_worker_path(st))
 end
 
 function render_file(::ImageFile, ::PanelView, fv::FileView, session)

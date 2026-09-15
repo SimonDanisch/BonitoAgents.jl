@@ -1715,6 +1715,7 @@ class BonitoChat {
                         img.className = 'bt-user-att-img';
                         img.src = a.url;
                         img.alt = a.name || 'attachment';
+                        img.dataset.attachmentName = a.name;
                         img.loading = 'lazy';
                         img.addEventListener('click', ()=>openLightbox(img));
                         img.addEventListener('error', ()=>{

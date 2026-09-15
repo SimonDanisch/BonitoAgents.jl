@@ -432,6 +432,10 @@ end
 # the response is cacheable forever.
 const ATTACHMENT_ROUTE_RE = r"^/attachment/([A-Za-z0-9_-]+)"
 
+# Bare, well-formed filename only — no separators, no dot-dot, one of the
+# extensions `save_attachment` can produce.
+is_attachment_name(file::AbstractString) = occursin(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9]+$", file)
+
 function attachment_response(state::ServerState, project_id::AbstractString,
                              file::AbstractString)
     occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
@@ -441,9 +445,7 @@ function attachment_response(state::ServerState, project_id::AbstractString,
     proj === nothing &&
         return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
                              body = "unknown project '$project_id'\n")
-    # Bare, well-formed filename only — no separators, no dot-dot, one of the
-    # extensions `save_attachment` can produce.
-    occursin(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9]+$", file) ||
+    is_attachment_name(file) ||
         return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
                              body = "invalid attachment name\n")
     mime = get(ATTACHMENT_MIME_BY_EXT, lowercase(lstrip(splitext(file)[2], '.')), nothing)

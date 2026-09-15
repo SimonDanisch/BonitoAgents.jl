@@ -109,12 +109,52 @@
             TK.screenshot(server, joinpath(tempdir(), "sidebar_image_icon.png"))
         end
 
-        @testset "image identity survives new output, source deletion, reload and shuffle" begin
+        @testset "icons wear the worker's ring and pulse while working, no dot" begin
+            # Machine = a ring in the worker's fixed colour; liveness = the icon
+            # pulses during a turn and greys out when the worker is down. Idle
+            # is plain. The old presence LED is gone.
+            @test TK.eval_js(server, "document.querySelectorAll('.bt-side-led').length") == 0
+            wrap = "[...document.querySelectorAll('.bt-side-item.bt-side-active .bt-side-icon-wrap')].find(e => e.offsetParent)"
+            @test TK.wait_for(server, "the open chat's icon is online",
+                "!!$(wrap)?.classList.contains('bt-glow-online')"; timeout = 20) == true
+            ring = TK.eval_js(server, """(() => {
+                const cs = getComputedStyle($(wrap));
+                return {worker: cs.getPropertyValue('--bt-worker').trim(), border: cs.borderTopColor,
+                        width: parseFloat(cs.borderTopWidth), shadow: cs.boxShadow};
+            })()""")
+            @test startswith(ring["worker"], "oklch(")
+            @test ring["border"] != "rgba(0, 0, 0, 0)"  # the ring is drawn in the worker colour
+            @test ring["width"] > 0
+            @test ring["shadow"] == "none"               # idle is plain
+            # Every chat on this worker shares the colour.
+            @test TK.eval_js(server, """(() => {
+                const wraps = [...document.querySelectorAll('.bt-side-item[data-project-id] .bt-side-icon-wrap')].filter(e => e.offsetParent);
+                return [...new Set(wraps.map(e => getComputedStyle(e).getPropertyValue('--bt-worker').trim()))];
+            })()""") == [ring["worker"]]
+            # A turn in flight breathes, then settles; only the wrapper's class moves.
+            server.agent_fn[] = _ -> [TK.delay(2500), TK.text("done"), TK.end_turn()]
+            TK.eval_js(server, "window.__glowIcon = $(wrap).querySelector('.bt-proj-icon'); true")
+            TK.send_message(server, "glow")
+            @test TK.wait_for(server, "the icon pulses while the agent works",
+                "!!$(wrap)?.classList.contains('bt-glow-active')"; timeout = 20) == true
+            @test TK.eval_js(server, "getComputedStyle($(wrap)).animationName") == "bt-icon-glow"
+            TK.screenshot(server, joinpath(tempdir(), "sidebar_ring_glow.png"))
+            @test TK.wait_for(server, "and settles when the turn ends",
+                "!!$(wrap)?.classList.contains('bt-glow-online')"; timeout = 30) == true
+            @test TK.eval_js(server, "$(wrap).querySelector('.bt-proj-icon') === window.__glowIcon")
+            server.agent_fn[] = _ -> [TK.text("ok"), TK.end_turn()]
+        end
+
+        @testset "image identity survives new output and source deletion; right-click sets it" begin
             dir = mktempdir()
+            cwd = mktempdir()
             red = joinpath(dir, "identity-red.svg")
             blue = joinpath(dir, "identity-blue.svg")
             write(red, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"73\" height=\"41\"><rect width=\"73\" height=\"41\" fill=\"red\"/></svg>")
             write(blue, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"97\" height=\"53\"><rect width=\"97\" height=\"53\" fill=\"blue\"/></svg>")
+            menuitem = "document.querySelector('.bt-chat-icon-menu [role=menuitem]')"
+            visible = "[...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent)"
+            rightclick(target) = TK.eval_js(server, "$(target).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:420, clientY:300})); true")
             try
                 server.agent_fn[] = prompt -> begin
                     path = occursin("second", prompt) ? blue : red
@@ -122,7 +162,7 @@
                         content=[TK.text_block("shown: $path (image/svg+xml, 120B)")]),
                      TK.text("picture ready"), TK.end_turn()]
                 end
-                pid = TK.new_chat(server; cwd=mktempdir(), title="recognizable chat")
+                pid = TK.new_chat(server; cwd, title="recognizable chat")
                 icon = ".bt-side-item[data-project-id=\"$pid\"] .bt-proj-thumb"
                 thumb = ".bt-ov-card[data-project-id=\"$pid\"] .bt-ov-thumb"
                 decoded(width) = "(() => { const i=document.querySelector($(repr(icon))); return !!i && i.complete && i.naturalWidth === $width; })()"
@@ -132,44 +172,70 @@
                 TK.eval_js(server, "window.__recognitionIcon = document.querySelector($(repr(icon))); true")
                 rm(red)  # the icon must be independent of the worker's original
                 TK.send_message(server, "second picture")
-                @test TK.wait_for(server, "new image shown in chat",
-                    "[...document.querySelectorAll('.bt-media')].some(i => i.naturalWidth === 97)"; timeout=60)
+                shown = "[...$(visible).querySelectorAll('.bt-media')].find(i => i.naturalWidth === 97)"
+                @test TK.wait_for(server, "new image shown in chat", "!!$(shown)"; timeout=60)
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))) === window.__recognitionIcon")
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
                 @test TK.eval_js(server, decoded(73))
 
-                TK.eval_js(server, "document.querySelector($(repr(icon))).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:50, clientY:100})); true")
-                @test TK.wait_for(server, "shuffle menu opens",
-                    "!!document.querySelector('.bt-chat-icon-menu [role=menuitem]')"; timeout=10)
-                @test TK.eval_js(server, """(() => {
-                    const b = document.querySelector('.bt-chat-icon-menu [role=menuitem]');
+                # Right-click on the new picture in the chat: its one action
+                # makes it the icon. Opening the menu alone changes nothing.
+                rightclick(shown)
+                @test TK.wait_for(server, "the picture's menu opens", "!!$(menuitem)"; timeout=10)
+                menu = TK.eval_js(server, """(() => {
+                    const b = $(menuitem);
                     const r = b.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 &&
-                        r.right <= innerWidth && r.bottom <= innerHeight &&
-                        document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === b &&
-                        getComputedStyle(b).fontFamily === getComputedStyle(document.querySelector('.bt-shell')).fontFamily;
+                    const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                    return {label: b.textContent,
+                            onscreen: r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 &&
+                                      r.right <= innerWidth && r.bottom <= innerHeight,
+                            hit: hit === b ? 'menu' : (hit ? hit.tagName + '.' + hit.className : 'nothing'),
+                            font: getComputedStyle(b).fontFamily,
+                            chatFont: getComputedStyle($(visible)).fontFamily};
                 })()""")
-                TK.screenshot(server, joinpath(tempdir(), "sidebar_icon_menu.png"))
+                @test menu["label"] == "Set as chat icon"
+                @test menu["onscreen"] == true
+                @test menu["hit"] == "menu"
+                @test menu["font"] == menu["chatFont"]  # styled like the chat it floats over
+                TK.screenshot(server, joinpath(tempdir(), "chat_icon_menu.png"))
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
-                TK.eval_js(server, "document.querySelector('.bt-chat-icon-menu [role=menuitem]').click(); true")
-                @test TK.wait_for(server, "explicit shuffle picks the other picture", decoded(97); timeout=30)
-                shuffled = TK.eval_js(server, "document.querySelector($(repr(icon))).src")
-                @test shuffled != original
+                TK.eval_js(server, "$(menuitem).click(); true")
+                @test TK.wait_for(server, "the picked picture becomes the icon", decoded(97); timeout=30)
+                @test TK.eval_js(server, "!document.querySelector('.bt-chat-icon-menu')")
+                @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") != original
+
+                # A user attachment is picked the same way.
+                server.agent_fn[] = _ -> [TK.text("ok"), TK.end_turn()]
+                TK.eval_js(server, """(() => {
+                    const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+                    const bin = atob(b64); const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    const file = new File([bytes], 'identity-dot.png', {type: 'image/png'});
+                    $(visible).__bt_chat.attachAddBlob(file, file.type, file.name);
+                    return true; })()""")
+                @test TK.wait_for(server, "attachment queued in the composer",
+                    "document.querySelectorAll('.bt-attachment-thumb').length >= 1"; timeout=10)
+                TK.send_message(server, "and this one")
+                attached = "[...$(visible).querySelectorAll('.bt-user-att-img')].find(i => i.complete && i.naturalWidth === 1)"
+                @test TK.wait_for(server, "attachment shown in chat", "!!$(attached)"; timeout=60)
+                rightclick(attached)
+                @test TK.wait_for(server, "the attachment's menu opens", "!!$(menuitem)"; timeout=10)
+                TK.eval_js(server, "$(menuitem).click(); true")
+                @test TK.wait_for(server, "the attachment becomes the icon", decoded(1); timeout=30)
+                chosen = TK.eval_js(server, "document.querySelector($(repr(icon))).src")
+
+                # Both sources are gone; the identity is a copy and survives a reload.
                 rm(blue)
+                rm(joinpath(cwd, ".bt-attachments"); recursive=true)
                 TK.navigate(server, "/?pid=$pid")
-                @test TK.wait_for(server, "chosen picture decodes after reload without its source", decoded(97); timeout=60)
-                @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == shuffled
+                @test TK.wait_for(server, "chosen picture decodes after reload without its source", decoded(1); timeout=60)
+                @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == chosen
 
                 TK.to_dashboard(server)
                 @test TK.wait_for(server, "overview shares the same identity",
-                    "document.querySelector($(repr(thumb * " img")))?.src === $(repr(shuffled))"; timeout=20)
-                TK.eval_js(server, "document.querySelector($(repr(thumb))).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:300, clientY:150})); true")
-                @test TK.wait_for(server, "overview shuffle menu opens",
-                    "!!document.querySelector('.bt-chat-icon-menu [role=menuitem]')"; timeout=10)
-                TK.eval_js(server, "document.querySelector('.bt-chat-icon-menu [role=menuitem]').click(); true")
-                @test TK.wait_for(server, "shuffle recovers the saved original", decoded(73); timeout=30)
+                    "document.querySelector($(repr(thumb * " img")))?.src === $(repr(chosen))"; timeout=20)
                 TK.open_chat(server, pid)
-                @test TK.wait_for(server, "identity survives reopening", decoded(73); timeout=30)
+                @test TK.wait_for(server, "identity survives reopening", decoded(1); timeout=30)
                 TK.screenshot(server, joinpath(tempdir(), "sidebar_persistent_icon.png"))
             finally
                 rm(dir; recursive=true, force=true)

@@ -218,7 +218,6 @@ function recent_chats_dom(session::Bonito.Session, state::ServerState,
         return DOM.div(OverviewStyles, grid; class = "bt-overview")
     return DOM.div(OverviewStyles, grid;
         class = "bt-overview",
-        oncontextmenu = chat_icon_contextmenu(session, state, ".bt-ov-thumb"),
         onclick = js"""event => {
             const card = event.target.closest('.bt-ov-card');
             if (card && card.dataset.projectId)

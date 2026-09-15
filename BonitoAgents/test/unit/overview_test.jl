@@ -83,7 +83,7 @@
         @test isempty(state.chat_models)
     end
 
-    @testset "chat image is a durable identity, changed only by explicit shuffle" begin
+    @testset "chat image is a durable identity, changed only by an explicit pick" begin
         state = newstate()
         p = seed_chat!(state, "imgproj01", "imgchat", String[])
         att = joinpath(p.server_path, BT.ATTACHMENT_DIR_NAME)
@@ -102,6 +102,7 @@
         @test read(selected, String) == red  # searches beyond the old 200-message window
         @test dirname(selected) == BT.chat_icon_dir(state, p)
 
+        # New pictures do not change the identity.
         write(joinpath(att, "blue.svg"), blue)
         push!(msgs, attachment("blue.svg"))
         @test BT.select_chat_icon!(state, p, msgs, chat_dir) == selected
@@ -117,17 +118,33 @@
         @test BT.chat_icon_image(restarted, p).local_path == selected
         @test read(selected, String) == red
 
-        shuffled = BT.select_chat_icon!(restarted, p, msgs, chat_dir; shuffle=true)
-        @test shuffled != selected
-        @test read(shuffled, String) == blue
+        # "Set as chat icon" on a picture in the chat replaces the identity,
+        # which then survives a restart and the loss of its source as well.
+        wait(BT.set_chat_icon!(restarted, p, false, "blue.svg"))
+        chosen = BT.chat_icon_image(restarted, p).local_path
+        @test chosen != selected
+        @test read(chosen, String) == blue
+        @test readdir(BT.chat_icon_dir(restarted, p)) == sort([basename(chosen), "selected"])
+        rm(joinpath(att, "blue.svg"))
         again = BT.ServerState(; state_dir=state.state_dir,
             working_dir=state.working_dir, worker_secret="x")
-        @test BT.chat_icon_image(again, p).local_path == shuffled
-        @test read(selected, String) == red  # old mounted URLs also keep working
-        rm(joinpath(att, "blue.svg"))
-        @test BT.select_chat_icon!(again, p, msgs, chat_dir; shuffle=true) == selected
-        @test BT.select_chat_icon!(again, p, msgs, chat_dir; shuffle=true) == shuffled
-        @test BT.select_chat_icon!(again, p, BT.ChatMsg[], chat_dir) == shuffled
+        @test BT.chat_icon_image(again, p).local_path == chosen
+        @test read(chosen, String) == blue
+        @test BT.select_chat_icon!(again, p, msgs, chat_dir) == chosen
+
+        # A picture that cannot be read leaves the identity alone; picking the
+        # current one again is a no-op.
+        @test_logs (:warn, r"picture unavailable") match_mode=:any wait(BT.set_chat_icon!(again, p, false, "missing.png"))
+        @test BT.chat_icon_image(again, p).local_path == chosen
+        write(joinpath(att, "blue.svg"), blue)
+        wait(BT.set_chat_icon!(again, p, false, "blue.svg"))
+        @test BT.chat_icon_image(again, p).local_path == chosen
+        @test readdir(BT.chat_icon_dir(again, p)) == sort([basename(chosen), "selected"])
+
+        # Only pictures the chat itself serves are accepted.
+        @test_throws ArgumentError BT.set_chat_icon!(again, p, false, "../secret.png")
+        @test_throws ArgumentError BT.set_chat_icon!(again, p, false, "notes.txt")
+        @test_throws ArgumentError BT.set_chat_icon!(again, p, true, "relative/plot.png")
     end
 
     @testset "old unopened chats acquire their image from persisted history" begin

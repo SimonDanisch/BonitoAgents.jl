@@ -3050,8 +3050,10 @@ event => {
 # proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
 # an <img>/<video> src. `mime` only matters for the <video><source> type. Images
 # enlarge on click; videos keep native controls for clicks and enlarge via the ⤢
-# button (so a frame click still plays/pauses).
-function media_element(src, mime::AbstractString, is_video::Bool; filename::AbstractString = "")
+# button (so a frame click still plays/pauses). `worker_path` names the file on
+# the worker; a picture that has one can be made the chat's icon (chat_icons.jl).
+function media_element(src, mime::AbstractString, is_video::Bool;
+                       filename::AbstractString = "", worker_path::AbstractString = "")
     inner = is_video ?
         # `playsinline` is not cosmetic: without it iOS Safari force-enters its
         # own fullscreen the moment you press play, so every tap on a video went
@@ -3077,7 +3079,8 @@ function media_element(src, mime::AbstractString, is_video::Bool; filename::Abst
         class = "bt-media-actions")
     return DOM.div(inner, actions;
         class = "bt-media-wrap",
-        (isempty(filename) ? (;) : (; dataFilename = String(filename)))...)
+        (isempty(filename) ? (;) : (; dataFilename = String(filename)))...,
+        (isempty(worker_path) ? (;) : (; dataWorkerPath = String(worker_path)))...)
 end
 
 # Disk media belongs to the worker, not the chat's eval process. Its signed URL
@@ -3139,7 +3142,7 @@ function read_image_element(state::ServerState, project_id::AbstractString,
             info = stat_worker_path(state, proj.worker_id, show_worker_path(st))
             if info.isfile
                 return media_element(worker_file_url(state, proj.worker_id, info.path),
-                    c.mime_type, is_video; filename = fname)
+                    c.mime_type, is_video; filename = fname, worker_path = info.path)
             end
         catch e
             e isa InterruptException && rethrow()
@@ -8830,7 +8833,9 @@ function Bonito.jsrender(session::Session, m::ChatModel)
         # Overscroll tail: empty space the user can scroll into below the
         # last message (~30% of the pane; JS sizes it from clientHeight).
         DOM.div(class="bt-messages-tail");
-        class="bt-messages")
+        class="bt-messages",
+        # Right-click on a picture offers to make it the chat's icon.
+        oncontextmenu = chat_icon_contextmenu(session, model))
 
     # Init snapshot: comm events fired before this tab connected are gone, so
     # bake the CURRENT slash-command set into the connect call (a tab opened

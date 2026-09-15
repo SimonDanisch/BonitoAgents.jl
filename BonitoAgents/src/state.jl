@@ -756,6 +756,15 @@ worker_initials(w::WorkerInfo) =
     w.initials === nothing || isempty(w.initials) ? derive_initials(w.name) :
                                                     w.initials
 
+# A fixed colour per machine, derived from the install id so a rename, a
+# restart or another server all agree on it. The sidebar rings every chat icon
+# with it and the worker card's tag pill wears it, which is how the mapping is
+# learned. OKLCH with fixed lightness and chroma: only the hue moves, so a
+# yellow ring weighs the same as a blue one (in HSL it looks washed out).
+worker_color(worker_id::AbstractString) =
+    "oklch(52% 0.19 $(Int(hash("worker:" * worker_id) % 360)))"
+worker_color(w::WorkerInfo) = worker_color(w.worker_id)
+
 # The title a chat starts with, before a prompt or the user names it: its folder.
 default_title(p::ProjectInfo) = p.name
 
