@@ -657,11 +657,10 @@ const SidebarStyles = Bonito.Styles(
     # in the worker's fixed colour (`--bt-worker`, set on the wrapper) right on
     # the picture's edge, following its corners; its negative margin keeps the
     # row at the icon's own size. Liveness only shows when it departs from the
-    # norm: an idle chat is plain, a turn in flight pulses a green glow, and a
-    # chat whose worker is down is greyed out. Only the wrapper's class and
-    # colour ever change, so a status change never re-renders the icon. The
-    # pulse peak reaches the row's edge but no further, so the sidebar's
-    # overflow clipping never cuts it.
+    # norm: an idle chat is plain, a turn in flight pulses a thin green edge
+    # (from nothing to about 3px and back), and a chat whose worker is down
+    # greys out under a steady red edge. Only the wrapper's class and colour
+    # ever change, so a status change never re-renders the icon.
     CSS(".bt-side-item", "position" => "relative"),
     CSS(".bt-side-icon-wrap",
         "position" => "relative", "flex-shrink" => "0",
@@ -674,12 +673,15 @@ const SidebarStyles = Bonito.Styles(
         "transition" => "filter 250ms, opacity 250ms"),
     CSS(".bt-glow-active",
         "animation" => "bt-icon-glow 1.4s ease-in-out infinite"),
-    # Full status green at every phase: a solid 1px halo that swells to a
-    # 3px glow, so a single glance catches it regardless of where the cycle is.
+    # From nothing to a hairline of status green about 3px wide and back: a
+    # heartbeat at the icon's edge, not a cloud around it.
     CSS("@keyframes bt-icon-glow",
-        CSS("0%",   "box-shadow" => "0 0 3px 1px var(--bt-status-active)"),
-        CSS("50%",  "box-shadow" => "0 0 9px 3px var(--bt-status-active)"),
-        CSS("100%", "box-shadow" => "0 0 3px 1px var(--bt-status-active)")),
+        CSS("0%",   "box-shadow" => "0 0 0 0 transparent"),
+        CSS("50%",  "box-shadow" => "0 0 2px 1px var(--bt-status-active)"),
+        CSS("100%", "box-shadow" => "0 0 0 0 transparent")),
+    # Worker down: the picture greys out and the same hairline turns red, steady.
+    CSS(".bt-glow-offline",
+        "box-shadow" => "0 0 2px 1px var(--bt-status-offline)"),
     CSS(".bt-glow-offline .bt-proj-icon",
         "filter" => "grayscale(1)", "opacity" => "0.5"),
     # A chat that has shown a picture wears it. `cover` so a wide plot or a tall
