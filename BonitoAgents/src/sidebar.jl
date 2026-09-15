@@ -73,12 +73,15 @@ function identicon_svg(id::AbstractString, hue_key::AbstractString = id)
         "<g fill='hsl(", hue, ", 65%, 38%)'>", String(take!(cells)), "</g></svg>")
 end
 
-# Renders one icon: an identicon tile seeded by `p.id` (the pattern + hue
-# make each chat recognisable at a glance) with the chat's own initials on
-# top. The worker (`[DT]`-style tag — Desktop/HP Laptop/…) only goes into the
-# tooltip: in the sidebar the ring around the icon says which machine hosts
-# the chat. `size_px` lets the sidebar reuse this at 32 px and the
-# project_card at e.g. 24 px.
+# Renders one icon: a picture with the worker's initials (`[DT]`-style —
+# Desktop/HP Laptop/…) as a badge in its corner, so the user reads which machine
+# hosts the chat on EVERY icon. The picture is either the chat's own (a plot or a
+# screenshot it showed, far easier to pick out of a list than two letters on a
+# tile) or, until it has one, an identicon generated from `id` (pattern) and
+# `hue_key` (colour, shared by chats in one folder). One code path: the identicon
+# is just an image too. Pass `worker_tag = ""` to fall back to the folder
+# initials (used when a worker isn't connected). `size_px` lets the sidebar
+# reuse this at 32 px and the project_card at e.g. 24 px.
 # Value-only form: everything the icon needs, and nothing that can change under
 # it. `SidebarChat` holds these three strings rather than a `ProjectInfo`,
 # because a row outlives any single render and a `ProjectInfo` is mutable shared
@@ -86,25 +89,17 @@ end
 function project_icon_for(id::AbstractString, name::AbstractString,
                           hue_key::AbstractString, worker_tag::AbstractString = "";
                           size_px::Int = 32, image = nothing)
-    label = project_initials(name)
+    label = isempty(worker_tag) ? project_initials(name) : String(worker_tag)
     tip   = isempty(worker_tag) ? String(name) : "$(worker_tag) · $(name)"
-    # A chat that has shown a picture IS that picture — a plot or a screenshot
-    # is far easier to pick out of a list than two letters on a coloured tile.
-    # The identicon stays underneath as the loading/erroring state; the worker
-    # tag moves to the tooltip, and in the sidebar the ring around the icon
-    # keeps saying which machine (two glyphs over a thumbnail at 32px is noise).
-    image === nothing || return DOM.div(
-        DOM.img(; src = image, alt = "", class = "bt-proj-thumb", loading = "lazy");
-        class = "bt-proj-icon bt-proj-icon-img",
-        style = string("width:$(size_px)px;height:$(size_px)px;"),
-        title = tip)
-    DOM.div(label;
-        class = "bt-proj-icon",
-        style = string("background-image:url(\"data:image/svg+xml;utf8,",
-                       identicon_svg(id, hue_key), "\");",
-                       "background-size:cover;",
-                       "width:$(size_px)px;height:$(size_px)px;",
-                       "line-height:$(size_px)px;font-size:$(round(Int, size_px*0.42))px"),
+    src   = image === nothing ?
+        "data:image/svg+xml;base64," * base64encode(identicon_svg(id, hue_key)) : image
+    # `bt-proj-icon-img` only marks an icon that wears the chat's OWN picture
+    # (tests and the overview key on it); the markup is the same either way.
+    return DOM.div(
+        DOM.img(; src, alt = "", class = "bt-proj-thumb", loading = "lazy"),
+        DOM.span(label; class = "bt-proj-tag");
+        class = image === nothing ? "bt-proj-icon" : "bt-proj-icon bt-proj-icon-img",
+        style = "width:$(size_px)px;height:$(size_px)px;",
         title = tip)
 end
 
@@ -684,30 +679,27 @@ const SidebarStyles = Bonito.Styles(
         "box-shadow" => "0 0 2px 1px var(--bt-status-offline)"),
     CSS(".bt-glow-offline .bt-proj-icon",
         "filter" => "grayscale(1)", "opacity" => "0.5"),
-    # A chat that has shown a picture wears it. `cover` so a wide plot or a tall
-    # screenshot both fill the tile without letterboxing, and the radius is on
-    # the wrapper with `overflow:hidden` so the image inherits the same corners
-    # as the identicon it replaces.
-    CSS(".bt-proj-icon-img",
-        "overflow" => "hidden", "background" => "var(--bt-surface-2)",
-        "padding" => "0"),
+    # Every icon is a picture: the chat's own, or its generated identicon. `cover`
+    # so a wide plot or a tall screenshot both fill the tile without letterboxing;
+    # the radius sits on the tile with `overflow:hidden` so the image and the
+    # badge share its corners.
+    CSS(".bt-proj-icon",
+        "position" => "relative", "overflow" => "hidden",
+        "border-radius" => "8px", "background" => "var(--bt-surface-2)",
+        "flex-shrink" => "0", "user-select" => "none",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
     CSS(".bt-proj-thumb",
         "width" => "100%", "height" => "100%",
         "object-fit" => "cover", "display" => "block"),
-    CSS(".bt-proj-icon",
-        "border-radius" => "8px",
-        "color" => "#fff", "font-weight" => "600",
-        "text-align" => "center",
-        "flex-shrink" => "0",
-        "user-select" => "none",
-        # Initials sit on the identicon pattern — a soft shadow keeps them
-        # legible over both the light and dark pattern cells.
-        "text-shadow" => "0 1px 2px rgba(15,23,42,0.45)",
-        "font-family" => "'Inter', system-ui, sans-serif",
-        # Flex-center the contents so the home <img> sits perfectly in the
-        # middle. For initials we still use line-height (set inline by
-        # `project_icon`) which falls into the same flex box gracefully.
-        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
+    # The worker tag: a small dark pane in the corner, clipped by the tile's own
+    # rounded corner, readable over any picture. Sized for 1 to 4 characters at 32px.
+    CSS(".bt-proj-tag",
+        "position" => "absolute", "right" => "0", "bottom" => "0",
+        "font-size" => "9px", "line-height" => "1", "font-weight" => "700",
+        "letter-spacing" => "0.02em", "padding" => "2px 3px 2px 4px",
+        "color" => "#fff", "background" => "rgba(15,23,42,0.72)",
+        "border-radius" => "5px 0 0 0", "pointer-events" => "none",
+        "font-family" => "'Inter', system-ui, sans-serif"),
     # Home icon: borderless 32px slot, glyph in muted text color so it sits
     # quietly above the colorful project tiles. The SVG ships with white
     # strokes, so we recolor it via a CSS filter.

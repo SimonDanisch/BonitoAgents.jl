@@ -20,6 +20,7 @@
 # `.bt-side-active` from JS on `data-project-id`, the status LED is rewritten
 # by `status_obs`, and ✕ is a delegated handler on the aside.
 @testitem "e2e:sidebar" tags = [:e2e] begin
+    import BonitoAgents as BT
     include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
     using .TestKit
     const TK = TestKit
@@ -88,7 +89,7 @@
             # The identicon is the fallback, not the identity: a plot or a
             # screenshot is what makes a row findable in a list. Same composer
             # path `e2e:overview` uses to give a dashboard card its thumbnail.
-            had = TK.eval_js(server, "document.querySelectorAll('.bt-proj-thumb').length")
+            had = TK.eval_js(server, "document.querySelectorAll('.bt-proj-icon-img').length")
             TK.eval_js(server, """(() => {
                 const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
                 const bin = atob(b64); const bytes = new Uint8Array(bin.length);
@@ -101,11 +102,17 @@
                 "document.querySelectorAll('.bt-attachment-thumb').length >= 1"; timeout = 10) == true
             TK.send_message(server, "look at this")
             @test TK.wait_for(server, "the row wears the image",
-                "document.querySelectorAll('.bt-proj-thumb').length > $(had)"; timeout = 60) == true
+                "document.querySelectorAll('.bt-proj-icon-img').length > $(had)"; timeout = 60) == true
             # …and it is the real attachment, decoded — not a broken <img>.
             @test TK.wait_for(server, "the icon image decodes",
-                """(() => { const i = document.querySelector('.bt-proj-thumb');
+                """(() => { const i = document.querySelector('.bt-proj-icon-img .bt-proj-thumb');
                     return !!(i && i.complete && i.naturalWidth > 0); })()"""; timeout = 20) == true
+            # Every icon wears the worker's initials as the same badge, picture
+            # or identicon: which machine a chat runs on is always readable.
+            worker = only(values(server.h.state.workers[]))
+            tags = TK.eval_js(server, "[...document.querySelectorAll('.bt-side-item[data-project-id] .bt-proj-tag')].map(e => e.textContent)")
+            @test !isempty(tags) && all(==(BT.worker_initials(worker)), tags)
+            @test TK.eval_js(server, "document.querySelectorAll('.bt-side-item[data-project-id] .bt-proj-icon').length") == length(tags)
             TK.screenshot(server, joinpath(tempdir(), "sidebar_image_icon.png"))
         end
 
