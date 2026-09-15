@@ -199,18 +199,28 @@
                 card_shows("re-after-interrupt", "42"); timeout = 60) == true
 
             # ── 4. a folder travels A → B ────────────────────────────────────
+            # The payload includes a file well over the websocket layer's 16 MiB
+            # message limit (a 57 MB file used to break the pipe), and the
+            # destination already holds a file of its own, which a sync must
+            # never delete (a mirror-style push once emptied a live folder).
             src = mkpath(joinpath(mktempdir(), "payload"))
             write(joinpath(src, "hello.txt"), "from A\n")
             mkpath(joinpath(src, "deep")); write(joinpath(src, "deep", "n.txt"), "nested\n")
+            big = rand(UInt8, 20 * 1024 * 1024 + 4321)
+            write(joinpath(src, "big.bin"), big)
             dst = BT.worker_join(worker_b.projects_root, "payload-on-b")
+            mkpath(dst)
+            write(joinpath(dst, "already-on-b.txt"), "B's own file\n")
             server.agent_fn[] = _ -> [real_call("bt_sync_folder"; id = "re-sync",
                                                   src = src, worker = "worker-b", dst = dst),
                                       TK.end_turn()]
             TK.send_message(server, "ship the folder")
             @test TK.wait_for(server, "the folder synced",
-                card_shows("re-sync", "synced"); timeout = 120) == true
+                card_shows("re-sync", "synced"); timeout = 300) == true
             @test read(joinpath(dst, "hello.txt"), String) == "from A\n"
             @test read(joinpath(dst, "deep", "n.txt"), String) == "nested\n"
+            @test read(joinpath(dst, "big.bin")) == big
+            @test read(joinpath(dst, "already-on-b.txt"), String) == "B's own file\n"
 
             old_channel = BT.mcp_ctrl_for(state, pid)
             BT.restart_chat_session!(state.chat_models[pid])
@@ -244,7 +254,7 @@
             # (the agent looked its chat up as "the first project on this worker
             # with this folder"), so the new chat's header read on while its
             # agent was refused, naming a chat the user was not looking at.
-            pid2 = TK.new_chat(server; cwd = cwd)
+            pid2 = TK.new_chat(server; cwd = cwd, worker = state.workers[][p.worker_id].name)
             @test pid2 != pid
             p2 = state.projects[][pid2]
             @test p2.worker_id == p.worker_id && p2.worker_path == p.worker_path

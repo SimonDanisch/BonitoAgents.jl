@@ -11,8 +11,8 @@
     state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
     path = "/sim/VulkanDev"
     for pid in ("old-thread", "new-thread")
-        state.projects[][pid] = BT.ProjectInfo(pid, "VulkanDev", "w1", path,
-                                               joinpath(state.working_dir, pid), BT.now(BT.UTC))
+        state.projects[][pid] = BT.ProjectInfo(pid, "VulkanDev", "w1", joinpath(state.working_dir, pid),
+                                               path, BT.now(BT.UTC))
     end
     a = BT.WorkerAgent(state, "w1", path; project_id = "new-thread")
     @test a.project_id == "new-thread"

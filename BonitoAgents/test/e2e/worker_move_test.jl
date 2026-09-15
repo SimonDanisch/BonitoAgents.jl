@@ -107,6 +107,13 @@
             target_id = worker_b.worker_id
             @test worker_b.online[]
             @test worker_a_id != target_id
+            # Something already lives where the move will land. A move adds the
+            # project's files there; it must never delete what it did not bring
+            # (a move once emptied a live folder this way, 2026-09-15).
+            proj_dir_b_expected = BT.worker_join(worker_b.projects_root, p.name)
+            mkpath(proj_dir_b_expected)
+            stray_on_b = joinpath(proj_dir_b_expected, "already-here.txt")
+            write(stray_on_b, "B had this before the move\n")
 
             # The chat works on A before the move (round-trips through A's agent).
             TK.send_message(server, "before-move")
@@ -174,7 +181,6 @@
                 timeout = 120) == true
 
             # The header shows B's path once the chat is re-bound and rebuilt.
-            proj_dir_b_expected = BT.worker_join(worker_b.projects_root, p.name)
             @test TK.wait_for(server, "header shows the chat on B",
                 "$(header_env) === $(TK.json(replace(proj_dir_b_expected, homedir() => "~")))";
                 timeout = 120) == true
@@ -200,8 +206,11 @@
             @test read(joinpath(proj_dir_b, "newfile.txt"), String) == "added on A\n"
             @test read(joinpath(proj_dir_b, "deep", "nested.txt"), String) ==
                   "hidden treasure\n"
-            # Server mirror is byte-identical to B's copy (full directory match).
-            @test project_files(p.server_path) == project_files(proj_dir_b)
+            # Every mirrored file arrived byte-identical, and B's own file is
+            # still there: the push is additive.
+            files_b = project_files(proj_dir_b)
+            @test all(get(files_b, rel, nothing) == bytes for (rel, bytes) in project_files(p.server_path))
+            @test read(stray_on_b, String) == "B had this before the move\n"
 
             # ── The agent's memory followed ──────────────────────────────────
             # The transcript now sits under B's cwd, naming B's cwd; the
@@ -288,8 +297,79 @@
             # what is recorded now — not the one whose transcript was gone.
             @test p2.resume_session_id !== nothing
 
-            kill(worker_b_proc)
+        # A worker that is gone cannot be pulled from, so a move away from it can
+        # only push the server's mirror. Two cases, both through the header menu:
+        # a mirror that WAS synced (the first move pre-pulled it) is pushed, and
+        # adds only; a mirror that never was is refused before anything moves.
+        @testset "source worker offline, synced mirror: the move adds from the mirror" begin
+            TK.kill_worker!(worker_b_proc)                # B, the chat's current worker, dies
+            t0 = time()
+            while worker_b.online[] && time() - t0 < 30; sleep(0.1); end
+            @test !worker_b.online[]
+            @test p.last_sync_at !== nothing              # the first move pulled it into the mirror
+            target_on_a = BT.worker_join(worker_a.projects_root, p.name)
+            mkpath(target_on_a)
+            stray_on_a = joinpath(target_on_a, "a-had-this.txt")
+            write(stray_on_a, "A's own file\n")
+
+            TK.open_chat(server, pid)
+            @test TK.eval_js(server, open_menu) == true
+            @test TK.wait_for(server, "the menu offers worker A",
+                "$(continue_items).includes($(repr(worker_a.name)))"; timeout = 30) == true
+            @test TK.eval_js(server, click_continue(worker_a.name)) == true
+            @test TK.wait_for(server, "the move from the mirror completes",
+                """(() => { const c = document.querySelector('.bt-prog.bt-prog-ok');
+                    return !!c && (c.querySelector('.bt-prog-title')?.textContent || '')
+                        .includes('Continued on ' + $(repr(worker_a.name))); })()"""; timeout = 120) == true
+            @test p.worker_id == worker_a_id
+            @test p.worker_path == target_on_a
+            @test read(joinpath(target_on_a, "README.md"), String) == "version 2: edited on A out of band\n"
+            @test read(joinpath(target_on_a, "deep", "nested.txt"), String) == "hidden treasure\n"
+            @test read(stray_on_a, String) == "A's own file\n"      # the push added, it did not mirror
         end
+
+        @testset "source worker offline, never synced: the move is refused, nothing is touched" begin
+            cwd3 = mktempdir()
+            write(joinpath(cwd3, "precious.txt"), "only on A\n")
+            pid3 = TK.new_chat(server; cwd = cwd3, title = "neversynced")   # A is the only live card
+            p3 = state.projects[][pid3]
+            @test p3.worker_id == worker_a_id
+            @test p3.last_sync_at === nothing
+            worker_c_proc = TK.add_worker!(server; name = "worker-c")
+            try
+                t0 = time()
+                while time() - t0 < 30 &&
+                      !any(w -> w.name == "worker-c" && w.online[], values(state.workers[]))
+                    sleep(0.1)
+                end
+                worker_c = only(w for w in values(state.workers[]) if w.name == "worker-c")
+                @test worker_c.online[]
+                target_on_c = BT.worker_join(worker_c.projects_root, p3.name)
+                mkpath(target_on_c)
+                write(joinpath(target_on_c, "c-had-this.txt"), "C's own file\n")
+
+                TK.kill_worker!(server)                        # A, the source, dies
+                t0 = time()
+                while worker_a.online[] && time() - t0 < 30; sleep(0.1); end
+                @test !worker_a.online[]
+
+                @test TK.eval_js(server, open_menu) == true
+                @test TK.wait_for(server, "the menu offers worker C",
+                    "$(continue_items).includes(\"worker-c\")"; timeout = 30) == true
+                @test TK.eval_js(server, click_continue("worker-c")) == true
+                @test TK.wait_for(server, "the move is refused and says why",
+                    """(() => { const c = document.querySelector('.bt-prog.bt-prog-err');
+                        return !!c && (c.innerText || '').includes('never synced'); })()"""; timeout = 120) == true
+                @test p3.worker_id == worker_a_id
+                @test p3.worker_path == cwd3
+                @test readdir(target_on_c) == ["c-had-this.txt"]
+                @test read(joinpath(target_on_c, "c-had-this.txt"), String) == "C's own file\n"
+                @test read(joinpath(cwd3, "precious.txt"), String) == "only on A\n"
+            finally
+                TK.kill_worker!(worker_c_proc)
+            end
+        end
+        end   # "Continue on worker B (A → B), memory carried" and its offline-source follow-ups
 
         @test isempty(TK.js_errors(server))
     finally

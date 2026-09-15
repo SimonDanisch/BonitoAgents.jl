@@ -585,11 +585,20 @@ function transfer_project!(state::ServerState, p::ProjectInfo,
             @warn "pre-pull from source worker failed; continuing with server's existing mirror" project=p.name source=p.worker_id exception=e
         end
     else
-        @info "source worker offline; moving from server's existing mirror" project=p.name source=p.worker_id target=target_id
+        # The mirror is the only copy we can push. It must BE a copy: a project
+        # registered without a sync has an empty mirror, and pushing that used
+        # to arrive at the target with mirror semantics and delete every file
+        # of a live project there (2026-09-15). Refuse rather than guess.
+        p.last_sync_at === nothing &&
+            error("Cannot move $(p.name): its worker is offline and the server holds no copy " *
+                  "of it (never synced). Bring the worker online, or sync the project to the server first.")
+        @info "source worker offline; moving from server's existing mirror" project=p.name source=p.worker_id target=target_id last_sync_at=p.last_sync_at
     end
 
     notify_progress(progress, :phase,
         (msg = "Pushing $(p.name) → $(target_w.name)…",))
+    # The push is additive: whatever already sits at the target path stays. A
+    # move never empties a folder it did not fill.
     sync_dir_to_worker!(state, target_id, p.server_path, target_path;
                          on_progress = progress)
 

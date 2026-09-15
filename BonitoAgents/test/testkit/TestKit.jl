@@ -507,13 +507,19 @@ sees nothing until it shuts down itself.
 function kill_worker!(s::TestServer)
     proc = s.h.worker_proc
     proc === nothing && error("kill_worker!: this dev server has no worker process handle")
+    kill_worker!(proc)
+    return s
+end
+
+# The same for a worker spawned by `add_worker!`, whose handle is the launcher too.
+function kill_worker!(proc::Base.Process)
     BonitoWorker.kill_process_group!(proc)
     try
         kill(proc, Base.SIGKILL)
     catch e
         e isa Base.IOError || rethrow()
     end
-    return s
+    return proc
 end
 
 """
@@ -1279,13 +1285,16 @@ the chat view is open. Returns the new chat's project id. `title` is accepted
 but unused (the picker names a project after its folder's basename).
 """
 function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
-                                   title::AbstractString = "")
+                                   title::AbstractString = "",
+                                   worker::AbstractString = "")
     # `title` is accepted for call-site compatibility but no longer drives the
     # UI: the per-worker picker has no Name field, so a project is named after
     # its folder's basename (dashboard.jl `project_name_from_path`, via the
     # card's Create → `do_import`). The suite keys on the returned project id,
     # not the sidebar title, so this is safe. `cwd` is the folder the chat is
-    # created from.
+    # created from. `worker` names the card to press "+ Project" on; with two
+    # workers up the cards follow the worker list's order (a Dict), so a test
+    # that needs the chat on a particular worker must say which.
     to_dashboard(s)
     # Wait for a worker card to be on screen. Its "+ Project" toggle is the only
     # create path now (the dashboard's global "+ New project" form is gone).
@@ -1308,7 +1317,9 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # labelled +Project" when called right after another chat was created (seen
     # in `e2e:header_collapse`, which does exactly that between testsets).
     CLICK_CARD_BTN_JS = """(() => {
-        const b = [...document.querySelectorAll('button')].find(b =>
+        const cards = [...document.querySelectorAll('.bt-card')].filter(c =>
+            $(isempty(worker) ? "true" : "(c.querySelector('input.bt-card-name')?.value || '').trim() === $(json(String(worker)))"));
+        const b = cards.flatMap(c => [...c.querySelectorAll('button')]).find(b =>
             b.offsetParent && (b.innerText || '').trim() === '+ Project');
         if (!b) return false; b.click(); return true; })()"""
     opened = false

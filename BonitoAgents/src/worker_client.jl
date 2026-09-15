@@ -960,6 +960,9 @@ end
     sync_dir_to_worker!(worker_name, src, dst; on_progress=nothing, quick_check=true)
 
 Send the contents of server-side `src` to worker-side `dst` via librsync.
+Additive: files under `dst` that `src` lacks are left alone, always. The
+only receiver that mirrors (deletes what the sender lacks) is the server's own
+pull, `sync_dir_from_worker!`.
 Resumable: subsequent calls compute deltas against the worker's existing
 files, so unchanged content isn't retransmitted. `quick_check=false` makes
 the worker delta-check files even when size+mtime match (rsync --checksum
@@ -1040,8 +1043,12 @@ function sync_dir_from_worker!(state::ServerState, worker_name::String,
     try
         notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
         wsio = RemoteSync.WebSocketIO(ws)
+        # The server's mirror tracks the worker, deletions included: this is the
+        # ONE receiver that mirrors, and the folder is the server's own. The
+        # receiver still refuses to empty a populated mirror for an empty worker
+        # folder.
         RemoteSync.receive_directory(dst, wsio; on_progress = on_progress,
-                                     quick_check = quick_check)
+                                     quick_check = quick_check, delete_extraneous = true)
         notify_progress(on_progress, :phase, (msg = "Done",))
     finally
         close_ws_safe(ws)

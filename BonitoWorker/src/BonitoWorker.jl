@@ -2880,6 +2880,9 @@ function handle_open_transfer(server_url::String, secret::String,
                 dst = String(cmd["dst_path"])
                 qc  = get(cmd, "quick_check", true) === true
                 mkpath(dst)
+                # A push onto this machine only adds and updates. Whatever else
+                # lives under `dst` is the user's and stays; there is no field
+                # in the command that can change that.
                 RemoteSync.receive_directory(dst, wsio; quick_check = qc)
                 @info "BonitoWorker: transfer to_worker complete" dst
             elseif direction == "from_worker"
