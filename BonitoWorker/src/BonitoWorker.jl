@@ -1011,6 +1011,7 @@ end
 const _AUTO_UPDATE_LOCK = ReentrantLock()
 const _AUTO_UPDATE_TASK = Ref{Union{Task,Nothing}}(nothing)
 const _AUTO_UPDATE_PENDING = Ref(false)
+const _AUTO_UPDATE_GEN = Ref(0)      # bumped when an immediate request supersedes a waiting one
 
 const _UPDATE_SPEC_KEYS = ("repo", "rev", "source_id", "bonito_url", "bonito_rev")
 
@@ -1090,14 +1091,42 @@ function replace_with_updated_worker!()
     return nothing
 end
 
-function run_auto_update!(config::Dict{String,Any}, target::Dict{String,String})
-    # Do not cut an agent or an eval out from underneath a user. Marking the
-    # worker pending also rejects new sessions, so the observed idle state stays
-    # true through the update and replacement.
-    while !worker_idle_for_update()
-        sleep(1)
+# `report(status; error)` tells the server how a requested update is going
+# ("installing" / "failed"), so its card reflects this worker rather than a
+# guess. The default is silent, for updates the worker decided on by itself.
+function run_auto_update!(config::Dict{String,Any}, target::Dict{String,String};
+                          immediate::Bool = false, gen::Int = _AUTO_UPDATE_GEN[],
+                          report = (status; error = "") -> nothing)
+    if immediate
+        # "Update now": the server has checked that no turn is running here.
+        # Idle agent processes are respawned by their chats on the next message,
+        # so cutting them costs nothing; refusing new sessions from here on keeps
+        # the worker idle through the install and the replacement. (The gate is
+        # already up: `schedule_auto_update!` raised it before spawning us.)
+        lock(_AUTO_UPDATE_LOCK) do; _AUTO_UPDATE_PENDING[] = true; end
+        reap_all_sessions!("installing a server update now")
+    else
+        # Wait for the worker to fall idle by itself. New sessions are NOT
+        # refused while waiting: a worker that always hosts an open chat would
+        # otherwise be unusable for as long as it stays outdated. The gate goes
+        # up only once idle, and comes down again if a session slipped in. A
+        # generation bump means an immediate request took over: back off.
+        while true
+            _AUTO_UPDATE_GEN[] == gen || return nothing
+            worker_idle_for_update() || (sleep(1); continue)
+            superseded = lock(_AUTO_UPDATE_LOCK) do
+                _AUTO_UPDATE_GEN[] == gen || return true
+                _AUTO_UPDATE_PENDING[] = true
+                false
+            end
+            superseded && return nothing
+            worker_idle_for_update() && break
+            lock(_AUTO_UPDATE_LOCK) do; _AUTO_UPDATE_PENDING[] = false; end
+            sleep(1)
+        end
     end
-    @info "BonitoWorker: updating to the server's worker build" rev=target["rev"]
+    @info "BonitoWorker: updating to the server's worker build" rev=target["rev"] immediate
+    immediate || report("installing")
     try
         update_packages!(target)
         write_update_spec!(config, target)
@@ -1107,6 +1136,7 @@ function run_auto_update!(config::Dict{String,Any}, target::Dict{String,String})
         lock(_AUTO_UPDATE_LOCK) do
             _AUTO_UPDATE_PENDING[] = false
         end
+        report("failed"; error = sprint(showerror, e))
         # A transient network or registry failure must not turn automatic update
         # into "wait for the next reconnect". Clear the admission gate first so
         # the worker remains useful, then make one delayed, coalesced retry.
@@ -1124,15 +1154,42 @@ function run_auto_update!(config::Dict{String,Any}, target::Dict{String,String})
     exit(0)
 end
 
-function schedule_auto_update!(config::Dict{String,Any}, target_wire; force::Bool = false)
+# `force` skips the "is it needed" check; `immediate` also skips waiting for
+# idle (see `run_auto_update!`). An immediate request supersedes a task that is
+# still only waiting, so "Update now" is not ignored because the worker had
+# already queued a patient update at hello time.
+function schedule_auto_update!(config::Dict{String,Any}, target_wire;
+                               force::Bool = false, immediate::Bool = false,
+                               report = (status; error = "") -> nothing)
     target = update_spec_from_wire(target_wire)
     target === nothing && return nothing       # server predates the feature
     (force || update_needed(config, target)) || return nothing
     lock(_AUTO_UPDATE_LOCK) do
         task = _AUTO_UPDATE_TASK[]
-        task !== nothing && !istaskdone(task) && return nothing
-        _AUTO_UPDATE_PENDING[] = true
-        _AUTO_UPDATE_TASK[] = Base.errormonitor(@async run_auto_update!(config, target))
+        if task !== nothing && !istaskdone(task)
+            # Installing already (gate up): leave it. Still waiting for idle
+            # (gate down): an immediate request takes over; the generation bump
+            # makes the waiting task back off at its next check.
+            (_AUTO_UPDATE_PENDING[] || !immediate) && return nothing
+        end
+        gen = (_AUTO_UPDATE_GEN[] += 1)
+        # Raised HERE for an immediate install, not in the task: the caller reads
+        # the gate right after this call to tell the server "installing".
+        immediate && (_AUTO_UPDATE_PENDING[] = true)
+        _AUTO_UPDATE_TASK[] = Base.errormonitor(@async run_auto_update!(config, target; immediate, gen, report))
+    end
+    return nothing
+end
+
+# The worker's account of a requested update, for the server's worker card.
+# Best effort: the socket may already be gone when a late failure is reported.
+function report_update_status(ws, status::AbstractString; error::AbstractString = "")
+    try
+        send_control(ws, Dict("type" => "update_status", "status" => String(status),
+                              "error" => String(error)))
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "BonitoWorker: could not report update status" status exception=e
     end
     return nothing
 end
@@ -1280,8 +1337,16 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 elseif t == "ping"
                     @async send_pong(ws)
                 elseif t == "force_update"
-                    update_config === nothing || schedule_auto_update!(update_config,
-                        get(cmd, "update_spec", nothing); force = true)
+                    if update_config === nothing
+                        report_update_status(ws, "unsupported";
+                            error = "this worker runs without an update config")
+                    else
+                        report = (status; error = "") -> report_update_status(ws, status; error)
+                        schedule_auto_update!(update_config, get(cmd, "update_spec", nothing);
+                            force = true, immediate = get(cmd, "immediate", false) === true, report)
+                        installing = lock(_AUTO_UPDATE_LOCK) do; _AUTO_UPDATE_PENDING[]; end
+                        report(installing ? "installing" : "waiting")
+                    end
                 else
                     @warn "BonitoWorker: unknown control frame" type=t
                 end

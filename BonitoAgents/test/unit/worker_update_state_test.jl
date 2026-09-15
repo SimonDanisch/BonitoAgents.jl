@@ -28,11 +28,48 @@
     older = Dict{String,Any}("auto_update" => true, "update_spec" => wire(merge(spec, Dict("rev" => "v0.2.0"))))
     st, msg = BT.worker_update_state(older, spec)
     @test st === :available
-    @test occursin("idle", msg)
+    @test occursin("Update now", msg)
 
     # Auto-update switched off does not make an outdated worker current.
     manual = Dict{String,Any}("auto_update" => false, "update_spec" => wire(merge(spec, Dict("rev" => "v0.2.0"))))
     st, msg = BT.worker_update_state(manual, spec)
     @test st === :available
     @test occursin("Auto-update is off", msg)
+
+    # "Update now" means now: the worker cuts idle agent processes, so the one
+    # thing the server refuses is a turn in flight, which only the server can
+    # see. An open but idle chat is not "active work".
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
+    cwd = mktempdir()
+    state.projects[]["proj"] = BT.ProjectInfo("proj", "name", "w1", cwd, cwd, BT.now(BT.UTC))
+    model = BT.ChatModel(state, cwd; project_id = "proj", agent = BT.WorkerAgent(state, "w1", "/p"))
+    state.chat_models["proj"] = model
+    @test_throws BT.WorkerUnreachableError BT.force_worker_update!(state, "w1")  # not connected
+    state.worker_control_ws["w1"] = nothing
+    @test !BT.worker_turn_in_flight(state, "w1")
+    model.busy_active[] = true
+    @test BT.worker_turn_in_flight(state, "w1")
+    @test_throws ArgumentError BT.force_worker_update!(state, "w1")
+    @test !BT.worker_turn_in_flight(state, "other-worker")
+
+    # The card shows the worker's own account of a requested update: installing,
+    # waiting for idle, or failed with the error. A failure returns the worker
+    # to `:available`, so the button comes back instead of "Updating" for ever.
+    state.workers[]["w1"] = BT.WorkerInfo("w1", "Desktop", "ws://x", "x", nothing, "host", "/home/u",
+                                          "julia", String[], "/home/u/projects", :online, BT.now(BT.UTC))
+    w = state.workers[]["w1"]
+    @test BT.apply_update_status!(state, "w1", Dict{String,Any}("status" => "installing"))
+    @test w.update_state === :updating
+    @test occursin("restarts and reconnects", w.update_message)
+    @test BT.apply_update_status!(state, "w1", Dict{String,Any}("status" => "waiting"))
+    @test w.update_state === :updating
+    @test occursin("once no chat runs", w.update_message)
+    @test BT.apply_update_status!(state, "w1", Dict{String,Any}("status" => "failed", "error" => "Pkg.add: no such rev."))
+    @test w.update_state === :available
+    @test occursin("failed on the worker: Pkg.add: no such rev. It retries", w.update_message)
+    @test BT.apply_update_status!(state, "w1", Dict{String,Any}("status" => "unsupported", "error" => "no update config"))
+    @test w.update_state === :reinstall
+    @test_logs (:warn, r"unknown status") match_mode=:any (@test !BT.apply_update_status!(state, "w1", Dict{String,Any}("status" => "dancing")))
+    @test w.update_state === :reinstall              # unknown status changes nothing
+    @test !BT.apply_update_status!(state, "nobody", Dict{String,Any}("status" => "installing"))
 end

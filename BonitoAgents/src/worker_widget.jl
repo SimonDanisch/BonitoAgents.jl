@@ -182,14 +182,17 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         w === nothing || w.update_state === :current ? nothing :
             DOM.span(w.update_message; class = "bt-worker-update-note")
     end
+    # Success needs no banner: `force_worker_update!` flips the worker to
+    # `:updating`, which hides this button and changes the note, and the
+    # replacement worker's hello flips it back to `:current`.
     update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, update_btn.value) do clicked
         clicked || return
         @async try
             force_worker_update!(state, wid)
-            c.error_obs[] = "Update requested; it starts after active work finishes."
+            c.error_obs[] = ""
         catch e
-            c.error_obs[] = "Could not request update: $(sprint(showerror, e))"
+            c.error_obs[] = "Could not update: $(sprint(showerror, e))"
         end
     end
     update_btn_class = map(state.workers) do workers

@@ -367,9 +367,9 @@ function worker_update_state(hello::AbstractDict, update_spec::AbstractDict)
     installed = get(hello, "update_spec", nothing)
     (installed === nothing || installed == update_spec) && return (:current, "")
     get(hello, "auto_update", false) === true && return (:available,
-        "A worker update is available. It will install when this worker is idle.")
+        "A worker update is available. It installs by itself once no chat runs here; Update now installs it right away and restarts this worker's chats.")
     return (:available,
-        "A worker update is available. Auto-update is off on this worker; use Update now or reinstall.")
+        "A worker update is available. Auto-update is off here: Update now installs it right away and restarts this worker's chats, or reinstall.")
 end
 
 # Handler for /worker-ws — runs once per worker, for the worker's lifetime.
@@ -561,6 +561,8 @@ function handle_worker_control(state::ServerState, ws)
                     elseif t == "pong"
                         last_pong[] = time()
                         pong_seen[] = true
+                    elseif t == "update_status"
+                        apply_update_status!(state, worker_id, cmd)
                     elseif t == "list_dir_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "make_dir_response"
@@ -1605,12 +1607,67 @@ function worker_state(state::ServerState, worker_id::AbstractString; timeout::Re
     return Dict{String,Any}(resp)
 end
 
+# Is an agent turn running in any chat on this worker? Only the server knows:
+# the worker sees agent processes, which exist for every open chat, busy or not.
+function worker_turn_in_flight(state::ServerState, worker_id::AbstractString)
+    models = lock(state.lock) do
+        ChatModel[m for (pid, m) in state.chat_models
+                  if (p = get(state.projects[], pid, nothing)) !== nothing &&
+                     p.worker_id == worker_id]
+    end
+    return any(m -> m.busy_active[], models)
+end
+
+# "Update now" means now. The worker is told to install immediately, cutting its
+# idle agent processes (their chats respawn them on the next message); a turn
+# in flight is the one thing we refuse to cut. The card's state flips to
+# `:updating` here and back to `:current` when the replacement worker's hello
+# arrives, so the button's feedback is the worker's real state, not a banner.
 function force_worker_update!(state::ServerState, worker_id::AbstractString)
-    haskey(state.worker_control_ws, String(worker_id)) ||
+    wid = String(worker_id)
+    haskey(state.worker_control_ws, wid) ||
         throw(WorkerUnreachableError("force update", "worker is not connected"))
-    send_command(state, String(worker_id), Dict("type" => "force_update",
-                                                 "update_spec" => current_worker_update_spec()))
+    worker_turn_in_flight(state, wid) &&
+        throw(ArgumentError("a chat on this worker is mid-turn; let it finish or stop it, then update"))
+    send_command(state, wid, Dict("type" => "force_update", "immediate" => true,
+                                  "update_spec" => current_worker_update_spec()))
+    # Interim wording: the worker's own `update_status` frame replaces it within
+    # a moment. A worker predating that frame never sends one, so this stays,
+    # and stays true.
+    set_worker_update!(state, wid, :updating, "Update requested; waiting for the worker to confirm.")
     return nothing
+end
+
+function set_worker_update!(state::ServerState, worker_id::AbstractString, st::Symbol, msg::AbstractString)
+    found = lock(state.lock) do
+        w = get(state.workers[], String(worker_id), nothing)
+        w === nothing && return false
+        w.update_state = st
+        w.update_message = String(msg)
+        true
+    end
+    found && notify_workers!(state)
+    return found
+end
+
+# The worker's account of a requested update (`update_status` frame): what the
+# card shows from here on is the worker's state, not our guess.
+function apply_update_status!(state::ServerState, worker_id::AbstractString, cmd::AbstractDict)
+    status = String(get(cmd, "status", ""))
+    err    = String(get(cmd, "error", ""))
+    st, msg = if status == "installing"
+        (:updating, "Updating: the worker installs the server's build, then restarts and reconnects by itself. Its chats rebind on their next message.")
+    elseif status == "waiting"
+        (:updating, "Update requested; this worker installs it once no chat runs on it.")
+    elseif status == "failed"
+        (:available, "The update failed on the worker: $(rstrip(err, '.')). It retries in five minutes; see the worker's log.")
+    elseif status == "unsupported"
+        (:reinstall, "This worker cannot update itself: $(rstrip(err, '.')). Reinstall it with the install command.")
+    else
+        @warn "Worker update_status: unknown status" worker_id status
+        return false
+    end
+    return set_worker_update!(state, worker_id, st, msg)
 end
 
 """
