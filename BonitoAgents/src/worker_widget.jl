@@ -70,7 +70,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     status_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
         w === nothing ? :unknown : (!isopen(w) ? :offline :
-                                    (w.update_state === :available ? :update : :online))
+                                    (w.update_state !== :current ? :update : :online))
     end
     subtitle_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
@@ -175,9 +175,11 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         status_dot(s)
     end
 
+    # The note shows for every non-current state; the button only where the
+    # worker can act on it (a `:reinstall` worker does not know `force_update`).
     update_notice = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w === nothing || w.update_state !== :available ? nothing :
+        w === nothing || w.update_state === :current ? nothing :
             DOM.span(w.update_message; class = "bt-worker-update-note")
     end
     update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")

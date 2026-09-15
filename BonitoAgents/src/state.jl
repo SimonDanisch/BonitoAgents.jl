@@ -36,7 +36,7 @@ mutable struct WorkerInfo
     # reconnects (the WorkerInfo is reused, not rebuilt). Query with `isopen(w)`.
     online::Observable{Bool}
     last_check::DateTime
-    update_state::Symbol               # :current | :available
+    update_state::Symbol               # :current | :available | :reinstall (too old to self-update)
     update_message::String
 end
 

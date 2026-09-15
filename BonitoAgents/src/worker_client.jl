@@ -353,6 +353,25 @@ function deliver_chunk!(state::ServerState, cmd::AbstractDict)
     return
 end
 
+# What the hello frame says about this worker's install, against the spec this
+# server hands out. A worker from before self-updating sends neither
+# `auto_update` nor `update_spec`: it cannot install anything by itself and does
+# not understand `force_update`, so the only remedy is a reinstall, and the card
+# has to say so instead of showing it green. A current worker without a
+# configured spec (a dev worker spawned from a checkout) cannot be judged and
+# counts as current. Whether auto-update is on only changes the message: an
+# outdated worker is outdated either way.
+function worker_update_state(hello::AbstractDict, update_spec::AbstractDict)
+    haskey(hello, "auto_update") || return (:reinstall,
+        "This worker is too old to update itself. Reinstall it on that machine with the install command.")
+    installed = get(hello, "update_spec", nothing)
+    (installed === nothing || installed == update_spec) && return (:current, "")
+    get(hello, "auto_update", false) === true && return (:available,
+        "A worker update is available. It will install when this worker is idle.")
+    return (:available,
+        "A worker update is available. Auto-update is off on this worker; use Update now or reinstall.")
+end
+
 # Handler for /worker-ws — runs once per worker, for the worker's lifetime.
 function handle_worker_control(state::ServerState, ws)
     worker_id = "?"
@@ -383,11 +402,7 @@ function handle_worker_control(state::ServerState, ws)
         # intervals ⇒ half-open link ⇒ close + re-dial). Workers predating the
         # field simply ignore it.
         update_spec = current_worker_update_spec()
-        installed_spec = get(hello, "update_spec", nothing)
-        auto_update = get(hello, "auto_update", false) === true
-        update_available = auto_update && installed_spec != update_spec
-        update_message = update_available ?
-            "A worker update is available. It will install when this worker is idle." : ""
+        update_state, update_message = worker_update_state(hello, update_spec)
         send_control(ws, Dict("ok" => true,
                               "registered_as" => display_name,
                               "worker_id"     => worker_id,
@@ -423,7 +438,7 @@ function handle_worker_control(state::ServerState, ws)
             String(get(hello, "projects_root", "")),
             online_obs,
             now(UTC),
-            update_available ? :available : :current,
+            update_state,
             update_message,
         )
         # All shared-state writes for this worker's registration go in one
