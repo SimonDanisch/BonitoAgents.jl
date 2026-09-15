@@ -79,18 +79,22 @@ end
 # screenshot it showed, far easier to pick out of a list than two letters on a
 # tile) or, until it has one, an identicon generated from `id` (pattern) and
 # `hue_key` (colour, shared by chats in one folder). One code path: the identicon
-# is just an image too. Pass `worker_tag = ""` to fall back to the folder
-# initials (used when a worker isn't connected). `size_px` lets the sidebar
+# is just an image too. The badge is the worker's and nothing else's: callers
+# pass the worker's tag and full name (`worker_label`), never a stand-in, and
+# hovering the icon reads "<worker> · <folder>". `size_px` lets the sidebar
 # reuse this at 32 px and the project_card at e.g. 24 px.
 # Value-only form: everything the icon needs, and nothing that can change under
 # it. `SidebarChat` holds these three strings rather than a `ProjectInfo`,
 # because a row outlives any single render and a `ProjectInfo` is mutable shared
 # state — reading it later would give whatever the last writer left behind.
 function project_icon_for(id::AbstractString, name::AbstractString,
-                          hue_key::AbstractString, worker_tag::AbstractString = "";
+                          hue_key::AbstractString, worker_tag::AbstractString,
+                          worker_name::AbstractString;
                           size_px::Int = 32, image = nothing)
-    label = isempty(worker_tag) ? project_initials(name) : String(worker_tag)
-    tip   = isempty(worker_tag) ? String(name) : "$(worker_tag) · $(name)"
+    isempty(worker_tag) && throw(ArgumentError("a chat icon needs its worker's tag"))
+    isempty(worker_name) && throw(ArgumentError("a chat icon needs its worker's name"))
+    label = String(worker_tag)
+    tip   = "$(worker_name) · $(name)"
     src   = image === nothing ?
         "data:image/svg+xml;base64," * base64encode(identicon_svg(id, hue_key)) : image
     # `bt-proj-icon-img` only marks an icon that wears the chat's OWN picture
@@ -103,8 +107,20 @@ function project_icon_for(id::AbstractString, name::AbstractString,
         title = tip)
 end
 
-project_icon(p::ProjectInfo, worker_tag::AbstractString = ""; size_px::Int = 32) =
-    project_icon_for(p.id, p.name, folder_hue_key(p), worker_tag; size_px = size_px)
+# The worker a chat lives on, as the two strings its icon shows: the short tag
+# for the badge and the full name for the tooltip. A worker the server has no
+# record of (a stale id) is named by that id rather than by a guess.
+function worker_label(workers::AbstractDict, p::ProjectInfo)
+    w = get(workers, p.worker_id, nothing)
+    w === nothing && return (derive_initials(p.worker_id), String(p.worker_id))
+    return (worker_initials(w), w.name)
+end
+worker_label(state::ServerState, p::ProjectInfo) = worker_label(state.workers[], p)
+
+function project_icon(state::ServerState, p::ProjectInfo; size_px::Int = 32)
+    tag, wname = worker_label(state, p)
+    return project_icon_for(p.id, p.name, folder_hue_key(p), tag, wname; size_px = size_px)
+end
 
 # A single sidebar row: icon + label + identifying data-attribute. NO
 # Observables interpolated in here — the click handler and the
@@ -165,6 +181,7 @@ struct SidebarChat
     # icon in the list — the churn this refactor exists to remove, moved down
     # one level.
     tag     :: Observable{String}
+    wname   :: Observable{String}   # the worker's full name, for the icon's tooltip
     # The machine's fixed colour, drawn as a ring around the icon. Follows the
     # worker id, which only changes when the project is moved.
     color   :: Observable{String}
@@ -186,8 +203,8 @@ function Bonito.jsrender(session::Bonito.Session, c::SidebarChat)
     # freezes at its initial value — which is exactly why the old code had to
     # poke it from JS.
     icon_node = DOM.div(
-        map(session, c.tag, c.image) do t, img
-            project_icon_for(c.pid, c.name, c.hue_key, t; image = img)
+        map(session, c.tag, c.wname, c.image) do t, wn, img
+            project_icon_for(c.pid, c.name, c.hue_key, t, wn; image = img)
         end;
         class = map(session, c.status) do st; "bt-side-icon-wrap bt-glow-$(st)" end,
         # The ring colour rides `style`, which does track: a string assigned to
@@ -258,10 +275,12 @@ field now means adding a line here and nowhere else.
 """
 function refresh!(state::ServerState, c::SidebarChat, p::ProjectInfo,
                   label::AbstractString, tooltip::AbstractString,
-                  tag::AbstractString, color::AbstractString, status::Symbol)
+                  tag::AbstractString, wname::AbstractString, color::AbstractString,
+                  status::Symbol)
     set_row!(c.label,   String(label))
     set_row!(c.tooltip, String(tooltip))
     set_row!(c.tag,     String(tag))
+    set_row!(c.wname,   String(wname))
     set_row!(c.color,   String(color))
     set_row!(c.status,  status)
     set_row!(c.image,   chat_icon_image(state, p))
@@ -435,28 +454,25 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         # `[WW] <title>`: WW is the worker's editable initials, carried by the
         # icon. Two siblings of the same folder get a tail thread-tag so their
         # rows stay distinguishable when the titles coincide.
-        wtag(p) = haskey(workers, p.worker_id) ?
-                    worker_initials(workers[p.worker_id]) :
-                    derive_initials(p.worker_id)
         base(p) = p.title[]
         base_counts = Dict{String,Int}()
         for p in open_projs; base_counts[base(p)] = get(base_counts, base(p), 0) + 1; end
 
         map(open_projs) do p
-            t = wtag(p)
+            t, wn = worker_label(workers, p)
             b = base(p)
             label = base_counts[b] > 1 ? "$b · $(thread_tag(p))" : b
             st = chat_status(state, p)
             col = worker_color(p.worker_id)
-            tooltip = "[$t] $label · folder: $(p.name) · $(st)"
+            tooltip = "$(wn) [$t] · $label · folder: $(p.name) · $(st)"
             row = get!(rows, p.id) do
                 SidebarChat(p.id, p.name, folder_hue_key(p),
-                            Observable(label), Observable(tooltip), Observable(t),
+                            Observable(label), Observable(tooltip), Observable(t), Observable(wn),
                             Observable(col), Observable(st), Observable{Any}(nothing),
                             pane === nothing ? nothing : WorkerFileTree(state, p.id, pane),
                             active_pid == p.id)
             end
-            refresh!(state, row, p, label, tooltip, t, col, st)
+            refresh!(state, row, p, label, tooltip, t, wn, col, st)
         end
     end
 
@@ -1464,7 +1480,7 @@ function unified_app(state::ServerState)
             ChatStyles,
             SidebarStyles,
             WorkspaceStageStyles,
-            connection_led(),
+            connection_guard(session),
             sidebar,
             stage,
             # The window's ONE progress card (position:fixed, top-centered).

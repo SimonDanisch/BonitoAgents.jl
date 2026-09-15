@@ -113,6 +113,9 @@
             tags = TK.eval_js(server, "[...document.querySelectorAll('.bt-side-item[data-project-id] .bt-proj-tag')].map(e => e.textContent)")
             @test !isempty(tags) && all(==(BT.worker_initials(worker)), tags)
             @test TK.eval_js(server, "document.querySelectorAll('.bt-side-item[data-project-id] .bt-proj-icon').length") == length(tags)
+            # Hovering an icon names the worker in full, then the folder.
+            titles = TK.eval_js(server, "[...document.querySelectorAll('.bt-side-item[data-project-id] .bt-proj-icon')].map(e => e.title)")
+            @test all(startswith(worker.name * " · "), titles)
             TK.screenshot(server, joinpath(tempdir(), "sidebar_image_icon.png"))
         end
 

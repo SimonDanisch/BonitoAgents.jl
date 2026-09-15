@@ -174,7 +174,7 @@ function overview_card_dom(state::ServerState, c::ChatCardData)
     thumb = if c.image !== nothing
         DOM.img(; src = c.image, alt = "", class = "bt-ov-img", loading = "lazy")
     elseif p !== nothing
-        project_icon(p)                       # identicon placeholder
+        project_icon(state, p)                # identicon placeholder
     else
         DOM.div()
     end

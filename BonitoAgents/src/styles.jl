@@ -11,37 +11,161 @@
 #   • outcomes are reported by a toast, never by rewriting a button's label;
 #   • spacing from the `--bt-space-*` scale, radii from `--bt-radius(-sm)`.
 """
-    connection_led() -> Bonito.ConnectionIndicator
+    connection_guard(session) -> Node
 
-The browser↔server websocket LED, dressed as part of this app instead of a
-stray dot in the page corner.
+The browser↔server websocket's status, made impossible to miss when it matters.
 
-Three things are changed from Bonito's default. It uses OUR status palette, the
-same greens and reds as every other liveness dot in the window
-(`--bt-status-*`), so one glance reads the same everywhere. It is 8px with a
-soft ring rather than 10px with a hard glow. And it sits bottom-LEFT, over the
-sidebar: the default `top: 10px; right: 10px` lands exactly on the chat
-header's ⋯ button, which is both a collision and the worst possible place for
-something the user must not confuse with a control.
+Two parts, one JS object registered with Bonito's connection machinery (it has a
+single indicator slot, so this replaces the stock LED rather than sitting next
+to it). The LED: 8px, bottom-LEFT over the sidebar, in OUR status palette
+(`--bt-status-*`), so one glance reads the same as every other liveness dot in
+the window. The default top-right spot lands on the chat header's ⋯ button.
 
-`Styles(default, indicator.style)` merges ours last, so these win — including
-unsetting `top`/`right`, which the constructor's own kwargs cannot express.
+The guard: the moment the socket drops, an overlay covers the window and the
+composer is locked, and both stay until the socket is back. The overlay turns
+visible only once the drop has lasted longer than a blink, so the routine
+sub-second reconnect on a healthy link does not flash a modal. Anything typed
+or sent while Bonito is reconnecting is at risk, so a small dot changing colour
+was not a warning, it was a way to lose work. "connecting" is the retry phase,
+shown as reconnecting; "disconnected" is Bonito giving up after its retries,
+shown with a reload button. Before the first successful connection nothing is
+shown: the page is still loading then.
 
 NOT the same signal as the in-chat status dot: that one is the AGENT session's
 liveness, this one is whether this browser tab can still talk to the server at
 all. Both matter, and they fail independently.
 """
-connection_led() = Bonito.ConnectionIndicator(;
-    connected_color     = "#16a34a",   # --bt-status-online
-    connecting_color    = "#f59e0b",   # --bt-warning
-    disconnected_color  = "#dc2626",   # --bt-status-offline
-    no_connection_color = "#94a3b8",   # --bt-text-faint
-    size = 8,
-    style = Bonito.Styles(
-        "top" => "auto", "right" => "auto",
-        "bottom" => "10px", "left" => "10px",
-        "box-shadow" => "0 0 0 3px var(--bt-bg), 0 0 0 4px rgba(15,23,42,0.08)",
-        "opacity" => "0.85"))
+function connection_guard(session::Bonito.Session)
+    css = Styles(
+        CSS(".bt-conn-led",
+            "position" => "fixed", "bottom" => "10px", "left" => "10px",
+            "width" => "8px", "height" => "8px", "border-radius" => "50%",
+            "background" => "var(--bt-text-faint)",
+            "box-shadow" => "0 0 0 3px var(--bt-bg), 0 0 0 4px rgba(15,23,42,0.08)",
+            "opacity" => "0.85", "z-index" => "9999", "pointer-events" => "none",
+            "transition" => "background 200ms"),
+        CSS(".bt-conn-led[data-status=\"connected\"]",  "background" => "var(--bt-status-online)"),
+        CSS(".bt-conn-led[data-status=\"connecting\"]", "background" => "var(--bt-warning)"),
+        CSS(".bt-conn-led[data-status=\"disconnected\"]", "background" => "var(--bt-status-offline)"),
+        # The overlay blocks from the first millisecond of a drop but only BECOMES
+        # VISIBLE if the drop outlasts a blink: Bonito reconnects a healthy local
+        # link within milliseconds, and a modal flashing on every such blip would
+        # be noise. `animation-delay` keeps it fully transparent until then.
+        CSS(".bt-conn-modal",
+            "display" => "none", "position" => "fixed", "inset" => "0", "z-index" => "10050",
+            "align-items" => "center", "justify-content" => "center",
+            "background" => "rgba(15,23,42,0.35)", "backdrop-filter" => "blur(2px)",
+            "opacity" => "0"),
+        CSS(".bt-conn-modal.bt-conn-open",
+            "display" => "flex", "animation" => "bt-conn-appear 120ms ease-out 350ms forwards"),
+        CSS("@keyframes bt-conn-appear", CSS("to", "opacity" => "1")),
+        # The card: a status glyph, a title, one plain sentence, a live "for N s"
+        # line, and a reload button that is always there. Reloading is the one
+        # thing a user can do about a dead link, so it never hides behind a state.
+        CSS(".bt-conn-card",
+            "display" => "flex", "flex-direction" => "column", "align-items" => "center",
+            "text-align" => "center", "gap" => "6px",
+            "width" => "min(380px, calc(100vw - 32px))", "padding" => "28px 28px 24px",
+            "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+            "border" => "1px solid var(--bt-border)", "border-radius" => "14px",
+            "box-shadow" => "0 24px 60px rgba(15,23,42,0.28), 0 2px 8px rgba(15,23,42,0.12)",
+            "font-family" => "'Inter', system-ui, -apple-system, sans-serif"),
+        CSS(".bt-conn-glyph",
+            "position" => "relative", "width" => "44px", "height" => "44px", "margin-bottom" => "8px",
+            "border-radius" => "50%", "border" => "3px solid var(--bt-border)",
+            "border-top-color" => "var(--bt-warning)",
+            "animation" => "bt-conn-spin 0.9s linear infinite"),
+        CSS("@keyframes bt-conn-spin", CSS("to", "transform" => "rotate(360deg)")),
+        # Given up: the ring stops, turns red and shows an exclamation mark.
+        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph",
+            "animation" => "none", "border-color" => "var(--bt-status-offline)",
+            "background" => "color-mix(in srgb, var(--bt-status-offline) 12%, transparent)"),
+        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph::after",
+            "content" => "\"!\"", "position" => "absolute", "inset" => "0",
+            "display" => "flex", "align-items" => "center", "justify-content" => "center",
+            "font-weight" => "700", "font-size" => "22px", "color" => "var(--bt-status-offline)"),
+        CSS(".bt-conn-title",
+            "font-size" => "15px", "font-weight" => "600", "line-height" => "1.3"),
+        CSS(".bt-conn-msg",
+            "font-size" => "13px", "line-height" => "1.5", "color" => "var(--bt-text-muted)",
+            "max-width" => "32ch"),
+        CSS(".bt-conn-elapsed",
+            "font-size" => "12px", "color" => "var(--bt-text-faint)",
+            "font-variant-numeric" => "tabular-nums", "min-height" => "16px"),
+        CSS(".bt-conn-reload", "margin-top" => "12px", "padding" => "8px 16px"),
+        CSS(".bt-conn-reload svg", "width" => "14px", "height" => "14px", "flex-shrink" => "0"))
+    led = DOM.div(; class = "bt-conn-led", dataStatus = "connecting", title = "Connecting to the server…")
+    refresh_icon = Bonito.SVG.svg(
+        Bonito.SVG.path(d = "M13.5 8a5.5 5.5 0 1 1-1.6-3.9"),
+        Bonito.SVG.path(d = "M13.5 2.5v2.4h-2.4");
+        viewBox = "0 0 16 16", fill = "none", stroke = "currentColor",
+        var"stroke-width" = "1.8", var"stroke-linecap" = "round", var"stroke-linejoin" = "round",
+        var"aria-hidden" = "true")
+    modal = DOM.div(
+        DOM.div(
+            DOM.div(; class = "bt-conn-glyph"),
+            DOM.div("Reconnecting to the server"; class = "bt-conn-title"),
+            DOM.div("The link to the server dropped. The composer is locked until it is back, so nothing you type is lost."; class = "bt-conn-msg"),
+            DOM.div(""; class = "bt-conn-elapsed"),
+            DOM.button(refresh_icon, "Reload page"; class = "bt-btn bt-conn-reload", type = "button",
+                       onclick = js"() => window.location.reload()");
+            class = "bt-conn-card", role = "alertdialog", var"aria-live" = "assertive");
+        class = "bt-conn-modal", dataStatus = "connecting")
+    root = DOM.div(css, led, modal; class = "bt-conn-guard")
+    Bonito.onload(session, root, js"""(root) => {
+        const led     = root.querySelector('.bt-conn-led');
+        const modal   = root.querySelector('.bt-conn-modal');
+        const title   = modal.querySelector('.bt-conn-title');
+        const msg     = modal.querySelector('.bt-conn-msg');
+        const elapsed = modal.querySelector('.bt-conn-elapsed');
+        const titles = {connected: 'Connected to the server', connecting: 'Reconnecting to the server…',
+                        disconnected: 'Disconnected from the server', no_connection: 'No server connection'};
+        const copy = {
+            connecting:   ['Reconnecting to the server',
+                           'The link to the server dropped. The composer is locked until it is back, so nothing you type is lost.'],
+            disconnected: ['Connection lost',
+                           'Reconnecting did not succeed. Reload the page to continue; anything sent since the drop did not reach the server.'],
+        };
+        // While the guard is up, a keystroke aimed at an editable element goes
+        // nowhere: the overlay stops clicks, this stops the textarea that still
+        // had focus when the socket dropped.
+        const swallow = e => { const t = e.target; if (t && t.closest && t.closest('input, textarea, [contenteditable]')) { e.preventDefault(); e.stopPropagation(); } };
+        let wasConnected = false, blocking = false, since = 0, ticker = null;
+        function tick() {
+            const s = Math.max(0, Math.round((Date.now() - since) / 1000));
+            elapsed.textContent = modal.dataset.status === 'disconnected'
+                ? 'Gave up after ' + s + ' s'
+                : (s < 1 ? 'Trying again…' : 'Trying again for ' + s + ' s');
+        }
+        function setBlocked(on, status) {
+            modal.dataset.status = status;
+            if (on && copy[status]) { title.textContent = copy[status][0]; msg.textContent = copy[status][1]; }
+            if (on === blocking) { on && tick(); return; }
+            blocking = on;
+            modal.classList.toggle('bt-conn-open', on);
+            if (on) {
+                since = Date.now(); tick();
+                ticker = setInterval(tick, 1000);
+                const a = document.activeElement;
+                a && a.closest && a.closest('input, textarea, [contenteditable]') && a.blur();
+                document.addEventListener('keydown', swallow, true);
+                document.addEventListener('paste', swallow, true);
+            } else {
+                clearInterval(ticker); ticker = null;
+                document.removeEventListener('keydown', swallow, true);
+                document.removeEventListener('paste', swallow, true);
+            }
+        }
+        Bonito.register_connection_indicator({ onStatusChange(status) {
+            led.dataset.status = status; led.title = titles[status] || titles.disconnected;
+            if (status === 'connected') { wasConnected = true; setBlocked(false, status); return; }
+            if (status === 'no_connection') { setBlocked(false, status); return; }
+            if (!wasConnected) return;            // first load: the page is still coming up
+            setBlocked(true, status);
+        }});
+    }""")
+    return root
+end
 
 const BASE_CSS = [
     CSS(":root",
