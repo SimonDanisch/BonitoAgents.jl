@@ -202,10 +202,15 @@ end
 # read and won't act on a queued SIGTERM before we'd give up anyway, so a long
 # grace just delays every close. An idle/reconnecting worker exits on SIGTERM in
 # ~0.2s and returns early, well under this window.
+# `proc` is usually juliaup's launcher with the real julia as its child, so a
+# signal to the handle alone can leave the actual worker (and its control
+# socket) alive. `detach` at spawn made the launcher a group leader: signal the
+# GROUP, gracefully first, then hard.
 function stop_worker_proc!(proc::Base.Process; grace_s::Real = 1.5)
     process_exited(proc) && return
+    BonitoWorker.kill_process_group!(proc, Base.SIGTERM)
     try
-        kill(proc)                       # SIGTERM
+        kill(proc)                       # SIGTERM to the leader too, in case it left its group
     catch e
         e isa Base.IOError || rethrow()
     end
@@ -215,6 +220,7 @@ function stop_worker_proc!(proc::Base.Process; grace_s::Real = 1.5)
         sleep(0.05)
     end
     @warn "dev_server: worker ignored SIGTERM within grace window; sending SIGKILL" grace_s
+    BonitoWorker.kill_process_group!(proc)
     try
         kill(proc, Base.SIGKILL)
     catch e

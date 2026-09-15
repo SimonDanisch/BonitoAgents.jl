@@ -851,10 +851,15 @@ is_stale_session_error(e) =
 # `Base.notify(::Observable)` aborts at the FIRST throwing listener, so one stale
 # tab would starve every later-registered tab (T6). Instead we fire each listener
 # in its own try: a stale-session error deregisters just that dead listener (so
-# it stops costing us on every future notify) and we keep going; a real error is
-# rethrown so it surfaces. We iterate a SNAPSHOT of the listener list because we
-# mutate it (deregistration) and a listener may itself (de)register. The
-# `Consume` short-circuit semantics of `Base.notify` are preserved.
+# it stops costing us on every future notify) and we keep going; any other error
+# is logged with its backtrace and that listener is skipped for this round. It
+# is NOT rethrown: the callers are server-side state changes (a worker
+# registering, a worker's teardown), and unwinding those over a UI listener's
+# bug left a worker unable to register at all, with the exception swallowed by
+# the websocket layer (Laptop, 2026-09-15). We iterate a SNAPSHOT of the
+# listener list because we mutate it (deregistration) and a listener may itself
+# (de)register. The `Consume` short-circuit semantics of `Base.notify` are
+# preserved.
 # `Bonito.Observables` is the Observables module re-reachable through Bonito
 # (which `using`s it) — Observables isn't a direct dep of this package.
 function safe_notify!(obs::Observable)
@@ -873,7 +878,7 @@ function safe_notify!(obs::Observable)
                 @warn "safe_notify!: dropping a stale browser-session listener" errtype=typeof(e)
                 push!(dead, f)
             else
-                rethrow()
+                @error "safe_notify!: a listener failed; skipping it for this notify" listener=f exception=(e, catch_backtrace())
             end
         end
     end

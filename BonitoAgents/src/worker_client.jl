@@ -634,13 +634,24 @@ function handle_worker_control(state::ServerState, ws)
             is_stale_session_error(e) ||
                 @warn "Worker control loop ended" worker_id=worker_id exception=(e, catch_backtrace())
         end
+    catch e
+        # Anything escaping the registration path (between the hello and the
+        # frame loop) would otherwise vanish into the websocket layer, which
+        # closes the socket without a word: the worker sees "closed by server",
+        # redials, and loops forever with nothing in our log.
+        is_peer_gone(e) ||
+            @error "Worker control handler failed" worker_id exception=(e, catch_backtrace())
     finally
         # `hb_alive` only exists once registration reached the watchdog block —
         # a rejected/failed hello lands here without it.
         @isdefined(hb_alive) && (hb_alive[] = false)
         foreach(ch -> close_mcp_channel!(ch; notify_worker = false), values(mcp_channels))
         empty!(mcp_channels)
-        teardown_worker_control!(state, worker_id, ws)
+        try
+            teardown_worker_control!(state, worker_id, ws)
+        catch e
+            @error "Worker teardown failed" worker_id exception=(e, catch_backtrace())
+        end
     end
 end
 

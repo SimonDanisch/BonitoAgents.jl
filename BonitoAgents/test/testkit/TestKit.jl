@@ -496,6 +496,27 @@ function scrub_mock_env!()
 end
 
 """
+    kill_worker!(s::TestServer)
+
+Take the dev worker down the way a dying machine would: SIGKILL its whole
+process group. The handle in `s.h.worker_proc` is juliaup's launcher with the
+real julia as its child, so `kill(s.h.worker_proc)` alone reaches only the
+launcher and leaves the worker, and its control socket, alive — the server then
+sees nothing until it shuts down itself.
+"""
+function kill_worker!(s::TestServer)
+    proc = s.h.worker_proc
+    proc === nothing && error("kill_worker!: this dev server has no worker process handle")
+    BonitoWorker.kill_process_group!(proc)
+    try
+        kill(proc, Base.SIGKILL)
+    catch e
+        e isa Base.IOError || rethrow()
+    end
+    return s
+end
+
+"""
     dev_server(; agent = msg -> end_turn(), port = nothing, kwargs...) -> TestServer
 
 Start a real BonitoAgents dev server, swap the worker's `claude-agent-acp`

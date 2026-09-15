@@ -1655,14 +1655,14 @@ function provider_env(provider, extra::AbstractDict = Dict{String,String}())
 end
 
 """
-    kill_process_group!(proc)
+    kill_process_group!(proc, signal = 9)
 
-SIGKILL the process GROUP `proc` leads (it does, via `detach` at spawn), so the
-agent's children go with it. No-op on Windows, on a dead proc, or — the guard
-that matters — if the group turns out to be our own: signalling that would take
-the worker down with it.
+Signal the process GROUP `proc` leads (it does, via `detach` at spawn), so the
+agent's children go with it; SIGKILL unless told otherwise. No-op on Windows, on
+a dead proc, or — the guard that matters — if the group turns out to be our own:
+signalling that would take the worker down with it.
 """
-function kill_process_group!(proc)
+function kill_process_group!(proc, signal::Integer = 9)
     Sys.isunix() || return nothing
     pid = try
         getpid(proc)
@@ -1675,7 +1675,7 @@ function kill_process_group!(proc)
     # -1 = the process is gone (its group with it). Equal to ours = `detach`
     # didn't take; killing it would be suicide.
     (pgid <= 0 || pgid == Int(ccall(:getpgid, Cint, (Cint,), 0))) && return nothing
-    ccall(:kill, Cint, (Cint, Cint), -pgid, 9)
+    ccall(:kill, Cint, (Cint, Cint), -pgid, Cint(signal))
     return nothing
 end
 
