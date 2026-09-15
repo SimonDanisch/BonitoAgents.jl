@@ -238,6 +238,42 @@
             @test TK.wait_for(server, "refused again",
                 card_shows("re-off2", "switched OFF"); timeout = 60) == true
 
+            # ── 6. a second chat on the SAME folder obeys ITS OWN switch ─────
+            # Both threads share worker A and the folder; each has a switch.
+            # The new thread's tools used to inherit the FIRST thread's identity
+            # (the agent looked its chat up as "the first project on this worker
+            # with this folder"), so the new chat's header read on while its
+            # agent was refused, naming a chat the user was not looking at.
+            pid2 = TK.new_chat(server; cwd = cwd)
+            @test pid2 != pid
+            p2 = state.projects[][pid2]
+            @test p2.worker_id == p.worker_id && p2.worker_path == p.worker_path
+            @test p2.remote_eval === false
+            @test TK.wait_for(server, "the sibling's switch reads off",
+                "$(remote_state) === 'off'"; timeout = 30) == true
+            @test TK.eval_js(server, open_menu) == true
+            @test TK.wait_for(server, "the sibling's menu is open", menu_open; timeout = 10) == true
+            @test TK.eval_js(server, set_switch("on")) == true
+            t0 = time()
+            while !p2.remote_eval && time() - t0 < 10; sleep(0.05); end
+            @test p2.remote_eval === true
+            @test p.remote_eval === false            # the first thread's switch is untouched
+            server.agent_fn[] = _ -> [real_eval(
+                "string(\"host=\", get(ENV, \"BONITOAGENTS_EVAL_HOST_WORKER\", \"none\"))";
+                worker = "worker-b", id = "re-sibling"), TK.end_turn()]
+            TK.send_message(server, "run on worker-b from the sibling")
+            @test TK.wait_for(server, "the sibling's eval ran on worker B under its own switch",
+                card_shows("re-sibling", "host=" * worker_b.worker_id); timeout = 420) == true
+            @test TK.eval_js(server, card_shows("re-sibling", "switched OFF")) == false
+            @test length(BT.eval_hosts_of(state, pid2)) == 1
+            # …and the first thread, switch still off, is refused under ITS id.
+            TK.open_chat(server, pid)
+            server.agent_fn[] = _ -> [real_eval("1 + 1"; worker = "worker-b", id = "re-first-off"),
+                                      TK.end_turn()]
+            TK.send_message(server, "and from the first thread?")
+            @test TK.wait_for(server, "the first thread is refused, naming itself",
+                card_shows("re-first-off", "switched OFF for chat '" * pid * "'"); timeout = 60) == true
+
             kill(worker_b_proc)
         end
 

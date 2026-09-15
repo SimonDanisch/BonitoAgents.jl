@@ -402,6 +402,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
             p.name wanted = p.provider opening_with = provider_name(prov)
 
     agent = WorkerAgent(state, w.worker_id, p.worker_path;
+                        project_id        = p.id,
                         mcp               = mcp,
                         resume_session_id = p.resume_session_id,
                         provider          = prov)

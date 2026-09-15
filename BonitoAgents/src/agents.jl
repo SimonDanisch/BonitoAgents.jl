@@ -37,6 +37,10 @@ mutable struct WorkerAgent <: AgentProvider
     state              :: ServerState
     worker_id          :: String
     worker_path        :: String
+    # The chat this agent speaks for. Several chats can share one worker AND
+    # one folder, so (worker_id, worker_path) does not identify a chat; the MCP
+    # identity, the dev-tools grant and the prompt appendix all key on THIS.
+    project_id         :: String
     mcp                :: Vector{ACP.MCPServer}
     resume_session_id  :: Union{String,Nothing}
     provider           :: BinAgent                  # which provider the worker spawns
@@ -80,11 +84,12 @@ function project_provider(p::ProjectInfo)
 end
 
 WorkerAgent(state::ServerState, worker_id::AbstractString, worker_path::AbstractString;
+            project_id::AbstractString = "",
             mcp = ACP.MCPServer[],
             resume_session_id::Union{String,Nothing} = nothing,
             provider::BinAgent = default_provider(),
             handler::ACP.Handler = ACP.DiscardHandler()) =
-    WorkerAgent(state, String(worker_id), String(worker_path),
+    WorkerAgent(state, String(worker_id), String(worker_path), String(project_id),
                 collect(ACP.MCPServer, mcp), resume_session_id, provider, handler,
                 Ref{Any}(nothing), nothing, ACP.Message[], ReentrantLock(), false,
                 false)   # loads_sessions: set by the handshake in start!
@@ -120,13 +125,15 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     haskey(a.state.worker_control_ws, a.worker_id) ||
         error("Worker '$(a.worker_id)' is not connected")
 
-    # Find the project this session belongs to. NOT cosmetic: both the MCP
-    # environment and the system-prompt appendix below are derived from it.
-    project_id = ""
-    for p in values(a.state.projects[])
-        p.worker_id == a.worker_id && p.worker_path == a.worker_path &&
-            (project_id = p.id; break)
-    end
+    # The chat this session belongs to. NOT cosmetic: the MCP environment (and
+    # with it which chat's "Remote julia" / "Dev mode" switches its tools obey)
+    # and the system-prompt appendix below are derived from it. This used to be
+    # looked up as "the first project on this worker with this folder", which
+    # with two chats on one folder handed the newer chat's tools the OLDER
+    # chat's identity: its switch read on, the agent was refused (2026-09-15).
+    project_id = a.project_id
+    isempty(project_id) &&
+        error("agent for $(a.worker_path) on '$(a.worker_id)' was built without its chat's project id")
 
     # Re-derived on every bring-up, NOT taken from what `a.mcp` was built with.
     # `eval_dialback_env` reads the project's live `dev_mode`, and the appendix
