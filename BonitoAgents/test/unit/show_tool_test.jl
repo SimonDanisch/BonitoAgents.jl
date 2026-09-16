@@ -237,14 +237,14 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         chat_dir = mktempdir()
         showtc = ACP.GenericTool("tid", "other", "bt_show", "completed",
                                   ACP.ToolContent[ACP.TextContent("shown: /x/v.mp4 (video/mp4, 1MB)")],
-                                  Channel{ACP.ToolCall}(1))
+                                  ACP.MessageStream{ACP.ToolCall}())
         BT.persist_tool_content!(chat_dir, showtc)
         @test BT.tool_header_dict(BT.GenericToolMsg(BT.Message("tid","other","","bt_show","completed","",
                                                      0.0, 0.0, nothing)), chat_dir)["expand"] == true
 
         readtc = ACP.GenericTool("tid2", "read", "cat", "completed",
                                   ACP.ToolContent[ACP.TextContent("plain file contents")],
-                                  Channel{ACP.ToolCall}(1))
+                                  ACP.MessageStream{ACP.ToolCall}())
         BT.persist_tool_content!(chat_dir, readtc)
         @test !haskey(BT.tool_header_dict(BT.GenericToolMsg(BT.Message("tid2","read","","cat","completed","",
                                                               0.0, 0.0, nothing)), chat_dir), "expand")
@@ -264,7 +264,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         chat_dir = mktempdir()
         imgtc = ACP.GenericTool("img1", "other", "bt_show", "completed",
                                  ACP.ToolContent[ACP.TextContent("shown: /p/plot.png (image/png, 34 KB)")],
-                                 Channel{ACP.ToolCall}(1))
+                                 ACP.MessageStream{ACP.ToolCall}())
         BT.persist_tool_content!(chat_dir, imgtc)
         d = BT.tool_header_dict(BT.GenericToolMsg(BT.Message("img1","other","","bt_show","completed","",
                                                    0.0, 0.0, nothing)), chat_dir)
@@ -274,7 +274,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         # Non-show tools carry no show_mime.
         plaintc = ACP.GenericTool("p1", "read", "cat", "completed",
                                    ACP.ToolContent[ACP.TextContent("file contents")],
-                                   Channel{ACP.ToolCall}(1))
+                                   ACP.MessageStream{ACP.ToolCall}())
         BT.persist_tool_content!(chat_dir, plaintc)
         @test !haskey(BT.tool_header_dict(BT.GenericToolMsg(BT.Message("p1","read","","cat","completed","",
                                                               0.0, 0.0, nothing)), chat_dir), "show_mime")
@@ -283,7 +283,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         # but does NOT auto-expand (that's bt_show's behavior only).
         imgread = ACP.GenericTool("r1", "read", "Read x.png", "completed",
                                    ACP.ToolContent[ACP.ImageContent("aGk=", "image/png")],
-                                   Channel{ACP.ToolCall}(1))
+                                   ACP.MessageStream{ACP.ToolCall}())
         BT.persist_tool_content!(chat_dir, imgread)
         d2 = BT.tool_header_dict(BT.GenericToolMsg(BT.Message("r1","read","","Read x.png","completed","",
                                                     0.0, 0.0, nothing)), chat_dir)

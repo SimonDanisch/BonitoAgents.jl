@@ -194,7 +194,7 @@ end
                     ACP.signal_rendered!(msg)
                     msg === stop && break
                 elseif msg isa ACP.AgentMessage
-                    push!(texts, msg.text * join(collect(msg.updates)))
+                    push!(texts, (wait(msg); ACP.text(msg)))
                 end
             end
             @test timedwait(() -> istaskdone(drainer), 10.0) === :ok
@@ -293,7 +293,7 @@ end
                 if msg isa ACP.ToolCall
                     tools_seen[] += 1
                     last_status = msg.status
-                    for snap in msg.updates
+                    ACP.each_update(msg) do snap
                         last_status = snap.status
                         sleep(0.0005)        # slow consumer → producer must drop-oldest
                     end
@@ -385,7 +385,7 @@ end
         tool1 = first(values(st1.tools))
         ACP.seal_message!(st1)                       # what a plain boundary does
         @test haskey(st1.tools, "eval-1")
-        @test isopen(tool1.updates)                  # ...and still streaming
+        @test isopen(tool1.stream)                  # ...and still streaming
 
         # Cancelled span: the tool is released, so nothing can block on it.
         st2  = ACP.TurnState(); out2 = Channel{ACP.Message}(64)
@@ -393,7 +393,7 @@ end
         tool2 = first(values(st2.tools))
         ACP.close_turn!(out2, st2)                   # what an ABANDONED boundary does
         @test tool2.status == "failed"
-        @test !isopen(tool2.updates)                 # the consumer is freed
+        @test !isopen(tool2.stream)                 # the consumer is freed
         @test isempty(st2.tools)
 
         # And the flag rides the boundary marker itself.
@@ -618,7 +618,7 @@ end
             put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("still working")))
             @test timedwait(() -> Base.n_avail(client.messages) >= 1, 5.0) === :ok
             msg = take!(client.messages)
-            @test msg isa ACP.AgentMessage && msg.text == "still working"
+            @test msg isa ACP.AgentMessage && ACP.text(msg) == "still working"
 
             # With a prompt of ours open, the cancel is a STATE, and the frames
             # behind it still arrive — that is the whole change. Asserted on the
@@ -629,8 +629,10 @@ end
             @test ACP.cancel!(client) == true
             @test ACP.session_activity(conn) isa ACP.Cancelling
             put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("backlog")))
-            @test timedwait(() -> isready(msg.updates), 5.0) === :ok
-            @test take!(msg.updates) == "backlog"
+            # The delta lands in the message's STATE (its pump folds it), so the
+            # assertion is about what the message now says, not what is queued.
+            @test timedwait(() -> length(msg.stream.items[]) > 1, 5.0) === :ok
+            @test msg.stream.items[][end] == "backlog"
         finally
             close(conn)
         end

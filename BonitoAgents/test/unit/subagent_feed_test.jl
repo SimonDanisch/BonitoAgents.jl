@@ -27,7 +27,7 @@ function headless_model()
 end
 
 task_call(id) = ACP.TaskCall(id, "other", "Investigate", "in_progress",
-    ACP.ToolContent[], Channel{ACP.ToolCall}(4),
+    ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(),
     "Investigate the thing", "go do it", true, nothing, "")
 
 act_text(pid, s)              = ACP.SubagentActivity(pid, :text, "", s, "")

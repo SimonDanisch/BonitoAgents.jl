@@ -83,7 +83,7 @@ toolnotif(id, title) = ACP.ToolCallNotif(id, title, "execute", "completed",
     [], ACP.ToolCallLocation[], "Bash", Dict{String,Any}(), Dict{String,Any}())
 planupd(items) = ACP.PlanUpdate([ACP.PlanEntry(c, "medium", st) for (c, st) in items])
 bg_task_call(id) = ACP.TaskCall(id, "other", "Run tests", "in_progress",
-    ACP.ToolContent[], Channel{ACP.ToolCall}(4),
+    ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(),
     "Run the suite", "go", true, nothing, "")   # run_in_background = true, no outputFile
 
 @testset "text/tool/text keeps boundaries — tool NOT dropped, text NOT merged (#23)" begin
@@ -443,14 +443,14 @@ end
     mk(call) = BT.to_message(model, call)
 
     fg_bash = mk(ACP.BashCall("b1", "execute", "grep -r foo", "in_progress",
-        ACP.ToolContent[], Channel{ACP.ToolCall}(4), "grep -r foo", false, nothing))
+        ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(), "grep -r foo", false, nothing))
     bg_bash = mk(ACP.BashCall("b2", "execute", "sleep 600", "in_progress",
-        ACP.ToolContent[], Channel{ACP.ToolCall}(4), "sleep 600", true, nothing))
+        ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(), "sleep 600", true, nothing))
     fg_task = mk(ACP.TaskCall("t1", "other", "Investigate", "in_progress",
-        ACP.ToolContent[], Channel{ACP.ToolCall}(4), "Investigate", "go", false, nothing, ""))
+        ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(), "Investigate", "go", false, nothing, ""))
     bg_task = mk(bg_task_call("t2"))
     reader  = mk(ACP.GenericTool("r1", "read", "Read /a/very/big/file.jl",
-        "in_progress", ACP.ToolContent[], Channel{ACP.ToolCall}(4),
+        "in_progress", ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(),
         "Read", Dict{String,Any}()))
 
     @test BT.is_taskbar_item(bg_bash) == true    # detached work: yes
@@ -542,7 +542,7 @@ end
 
     # The stream ends — a worker dying, a session closing, a cancel. ACP flips the
     # tool terminal and closes its channel, which is what lets the renderer's
-    # `for snap in m.updates` return and run its `finally`.
+    # `for snap in m.stream` return and run its `finally`.
     close(cli)
     cons = lock(() -> BT.shared(model).main_consumer[].task, BT.shared(model).lock)
     @test timedwait(() -> istaskdone(cons), 10.0) === :ok

@@ -3777,10 +3777,17 @@ wire_final(m::SummaryMsg) = Dict{String,Any}("type" => "summary_final", "id" => 
 # ── Rendering one ACP message into a bubble ─────────────────────────────────
 # `process!` is the per-message renderer used by the `run_chat!` loop: turn the
 # clean ACP message into a chat bubble, `send!` it, then stream its `updates`
-# into that bubble via `process_update!`. Only tools/plan override
-# `process_update!`; text messages use the default (drain the text deltas).
-process!(chat::ChatModel, m::AgentClientProtocol.Message) =
-    process_update!(send!(chat, to_message(chat, m)), m)
+# into that bubble via `process_update!`, from the cursor the commit stopped at.
+# Only tools/plan override `process_update!`; text messages use the default.
+function process!(chat::ChatModel, m::AgentClientProtocol.Message)
+    # Commit what the message says RIGHT NOW, then stream from exactly that
+    # point. The cursor is not decoration: a text message keeps its chunks, so a
+    # bubble built from the first `n` and then fed the stream from 0 would print
+    # those `n` twice (it did — "First paragraph. First paragraph. Still…").
+    rendered = length(m.stream.items[])
+    b = send!(chat, to_message(chat, m, rendered))
+    return process_update!(b, m; from = rendered)
+end
 
 function process!(chat::ChatModel, m::AgentClientProtocol.SessionNotice)
     notice = shared(chat).session_notice
@@ -3801,7 +3808,7 @@ end
 # an agent that DOES expose plaintext still renders one.
 function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true, "count" => 0))
-    text = m.text
+    text = AgentClientProtocol.text(m)
     # Liveness counter for long thinks. The reasoning plaintext is redacted, so
     # we have nothing to render — but each streamed (empty) chunk still ticks the
     # channel, so the running chunk count is the only real-time proof that the
@@ -3809,7 +3816,7 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     n = 0
     last_emit = 0.0
     try
-        for delta in m.updates
+        AgentClientProtocol.each_update(m) do delta
             text *= delta
             n += 1
             # Throttled to ~6/s — the count is a liveness ticker, and a wire
@@ -4030,11 +4037,20 @@ function persist_desired_config!(model::ChatModel, cfg_id::AbstractString, value
     return nothing
 end
 
-to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) = AgentMsg(chat, m.text)
+# `upto` is how many chunks the caller is committing (see `process!`); anything
+# that is complete the moment it is built ignores it.
+to_message(chat::ChatModel, m::AgentClientProtocol.Message, upto::Integer) = to_message(chat, m)
+to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage, upto::Integer) =
+    AgentMsg(chat, AgentClientProtocol.text(m, upto))
+to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) =
+    AgentMsg(chat, AgentClientProtocol.text(m))
 # Compact-summary "user" messages get their own centered kind. ACP doesn't carry
 # Claude Code's `isCompactSummary` flag, so we route on the verbatim opening.
-to_message(chat::ChatModel, m::AgentClientProtocol.UserMessage) =
-    is_summary_text(m.text) ? SummaryMsg(chat, m.text) : UserMsg(chat, m.text)
+function to_message(chat::ChatModel, m::AgentClientProtocol.UserMessage,
+                    upto::Integer = typemax(Int))
+    t = AgentClientProtocol.text(m, upto)
+    return is_summary_text(t) ? SummaryMsg(chat, t) : UserMsg(chat, t)
+end
 # Typed dispatch on the ACP variant — one method per concrete `ToolCall`.
 to_message(chat::ChatModel, tc::AgentClientProtocol.GenericTool)   = build_tool_msg(chat, tc)
 to_message(chat::ChatModel, tc::AgentClientProtocol.BashCall)      = build_tool_msg(chat, tc)
@@ -4106,9 +4122,9 @@ end
 snap_summary(b::JuliaEvalCall, snap)  = eval_env_summary(b)
 
 # Default: stream the message's text deltas into the bubble, then finalize.
-function process_update!(b::ChatMsg, m::AgentClientProtocol.Message)
+function process_update!(b::ChatMsg, m::AgentClientProtocol.Message; from::Int = 0)
     try
-        for delta in m.updates
+        AgentClientProtocol.each_update(m; from) do delta
             append!(b, delta)
         end
     finally
@@ -4130,7 +4146,7 @@ end
 # A tool's `updates` channel yields the (mutated) ToolCall after each change.
 # `b::ToolMsg` covers every concrete variant — they all carry the same five
 # header fields the update path touches.
-function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
+function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int = 0)
     h = b.message
     try
         # INSIDE the try. `send!` already put this bubble in the store, so a
@@ -4168,7 +4184,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
              haskey(d0, "editable") || haskey(d0, "live_embed")) &&
                 chat_emit(h.chat, d0)
         end
-        for snap in m.updates
+        AgentClientProtocol.each_update(m) do snap
             prev_status = h.status
             h.status = snap.status
             h.title = snap_title(b, snap.title)
@@ -4366,12 +4382,12 @@ end
 # TaskBar (membership IS liveness) — the bar's own loop then streams the file and
 # `finished!`es it when the shell exits. Non-background bashes fall through to
 # the generic ToolMsg handling.
-function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
+function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall; from::Int = 0)
     h = b.message
     try
         pin_tool!(h.chat, b)          # inside the try — see the ToolMsg method
         persist_tool_content!(h.chat.chat_dir, m)
-        for snap in m.updates
+        AgentClientProtocol.each_update(m) do snap
             h.status  = snap.status
             h.title   = snap.title
             h.summary = content_summary(builtin_msg_type(snap.kind), snap.content)
@@ -4605,8 +4621,8 @@ end
 # stay — they're used by `poll_output_file!` and `finalize!`.)
 
 # Todos are one-shot snapshots — nothing to stream, just finalize (persist).
-process_update!(b::TodoListMsg, ::AgentClientProtocol.Plan) = (close(b); nothing)
-process_update!(b::TodoListMsg, ::AgentClientProtocol.TodoWriteCall) = (close(b); nothing)
+process_update!(b::TodoListMsg, ::AgentClientProtocol.Plan; from::Int = 0) = (close(b); nothing)
+process_update!(b::TodoListMsg, ::AgentClientProtocol.TodoWriteCall; from::Int = 0) = (close(b); nothing)
 
 # ── TodoList lifecycle ───────────────────────────────────────────────────────
 # A LIVE todo list is NOT a chat message: it lives on `shared(chat).live_todo`
@@ -4620,11 +4636,9 @@ process_update!(b::TodoListMsg, ::AgentClientProtocol.TodoWriteCall) = (close(b)
 # SessionUpdates (verified on a live session's acp.jsonl — 26 plan updates,
 # 0 TodoWrite tool_calls). The TodoWrite tool_call path is therefore inert:
 # its entries also suffer the streamed-rawInput emptiness at announcement.
-# We just drain its update channel so the consumer can move on.
-function process!(::ChatModel, m::AgentClientProtocol.TodoWriteCall)
-    for _ in m.updates; end
-    return nothing
-end
+# Ignoring it is now literally nothing to do — the message folds its own stream,
+# so there is no channel left for an uninterested consumer to drain.
+process!(::ChatModel, ::AgentClientProtocol.TodoWriteCall) = nothing
 
 # A SEALED plan (`live = false`) is ACP telling us this list's stream is over and
 # will never update again: the turn was cancelled, the agent died, the worker went
@@ -4973,13 +4987,43 @@ end
 # have one.
 #
 # `StreamFlush` markers travel this stream as turn boundaries — see `flush_main!`.
+# May this message's rendering hold the consumer?
+#
+# A tool call may not. It stays open for as long as the tool runs — an eval, a
+# build, a background shell, minutes at a time — and the single renderer sat
+# INSIDE it, so every message the agent sent afterwards waited for that tool to
+# finish and then arrived in one burst. (Seen on the live server as "render
+# barrier timed out — renderer alive but not draining; rendering = :MCPCall,
+# stuck_for = 57.1".) Its bubble is still committed in arrival order; only the
+# following of its stream moves off the consumer's task.
+#
+# Text and thoughts stay inline: they stream token chunks and end with the
+# message, so they cost milliseconds, and keeping them here keeps their bubbles
+# strictly ordered.
+renders_async(::AgentClientProtocol.Message)  = false
+renders_async(::AgentClientProtocol.ToolCall) = true
+# The odd one out: it commits no bubble at all (see its `process!`).
+renders_async(::AgentClientProtocol.TodoWriteCall) = false
+
 function main_consumer!(chat::ChatModel, messages)
     s = shared(chat)
+    # Tool renders still in flight, with the message each one follows.
+    inflight = Tuple{Task,AgentClientProtocol.Message}[]
+    # Everything whose stream has ENDED must be on screen before a marker says
+    # so. A tool that is still OPEN is not waited for: it cannot be "rendered"
+    # in any complete sense, and blocking here for it would put the freeze back
+    # exactly where it was, one step later.
+    settle_finished!() = filter!(inflight) do (t, msg)
+        (istaskdone(t) || AgentClientProtocol.isdone(msg)) || return true
+        wait(t)
+        return false
+    end
     for m in messages
         if m isa AgentClientProtocol.StreamFlush
             # Everything before this point is rendered. A latch, so however many
             # waiters there are (a turn's cleanup waits on its own marker more
             # than once on the error path), all of them are released.
+            settle_finished!()
             AgentClientProtocol.signal_rendered!(m)
             continue
         end
@@ -5010,14 +5054,29 @@ function main_consumer!(chat::ChatModel, messages)
         # keeps going.
         s.rendering[] = (nameof(typeof(m)), time())
         try
-            process!(chat, m)
+            if renders_async(m)
+                # Commit here, in arrival order; follow the stream over there.
+                b = send!(chat, to_message(chat, m))
+                push!(inflight, (Base.errormonitor(@async begin
+                    try
+                        process_update!(b, m)
+                    catch e
+                        @error "rendering a tool update failed" project_id = chat.project_id exception = (e, catch_backtrace())
+                    end
+                end), m))
+            else
+                process!(chat, m)
+            end
         catch e
             @error "rendering an agent message failed" project_id = chat.project_id exception = (e, catch_backtrace())
             close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, e))]")))
         finally
             s.rendering[] = nothing
         end
+        filter!(((t, _),) -> !istaskdone(t), inflight)   # reap, so this can't grow
     end
+    # The stream ended: let every tool render finish before the consumer does.
+    foreach(((t, _),) -> wait(t), inflight)
     return nothing
 end
 
@@ -6528,8 +6587,8 @@ end
 
 # Which replayed messages belong in persisted history. Redacted/empty thoughts
 # and empty text turns leave no trace (consistent with `process!(::Thought)`).
-keep_in_history(m::AgentClientProtocol.AgentMessage) = !isempty(strip(m.text))
-keep_in_history(m::AgentClientProtocol.UserMessage)  = !isempty(strip(m.text))
+keep_in_history(m::AgentClientProtocol.AgentMessage) = !isempty(strip(AgentClientProtocol.text(m)))
+keep_in_history(m::AgentClientProtocol.UserMessage)  = !isempty(strip(AgentClientProtocol.text(m)))
 keep_in_history(m::AgentClientProtocol.Thought)      = false
 keep_in_history(m::AgentClientProtocol.ToolCall)     = true
 # A SEALED plan is not a history entry — it is the end-of-life signal for a list
@@ -6551,11 +6610,16 @@ keep_in_history(::AgentClientProtocol.CommandsUpdate) = false
 # claude's tool_use id (the one id that survives the replay, stored as ToolMsg.id);
 # user/agent turns on text; plans on entries. Different shapes never match.
 msg_matches(a::ToolMsg,  b::AgentClientProtocol.ToolCall)     = tool_id(a) == b.id
-msg_matches(a::UserMsg,  b::AgentClientProtocol.UserMessage)  =
-    !is_summary_text(b.text) && strip(a.text) == strip(b.text)
-msg_matches(a::SummaryMsg, b::AgentClientProtocol.UserMessage) =
-    is_summary_text(b.text) && strip(a.text) == strip(b.text)
-msg_matches(a::AgentMsg, b::AgentClientProtocol.AgentMessage) = strip(a.text) == strip(b.text)
+function msg_matches(a::UserMsg, b::AgentClientProtocol.UserMessage)
+    t = AgentClientProtocol.text(b)
+    return !is_summary_text(t) && strip(a.text) == strip(t)
+end
+function msg_matches(a::SummaryMsg, b::AgentClientProtocol.UserMessage)
+    t = AgentClientProtocol.text(b)
+    return is_summary_text(t) && strip(a.text) == strip(t)
+end
+msg_matches(a::AgentMsg, b::AgentClientProtocol.AgentMessage) =
+    strip(a.text) == strip(AgentClientProtocol.text(b))
 msg_matches(a::TodoListMsg, b::AgentClientProtocol.Plan)         = plan_entries_compatible(a.entries, b.entries)
 msg_matches(a::TodoListMsg, b::AgentClientProtocol.TodoWriteCall) = plan_entries_compatible(a.entries, b.entries)
 msg_matches(::ChatMsg,   ::AgentClientProtocol.Message)       = false
@@ -6654,12 +6718,14 @@ end
 # the splice/rewrite path). The only side effect is the id-keyed tool-content
 # file, which is position-independent.
 replayed_to_msg(model::ChatModel, m::AgentClientProtocol.AgentMessage) =
-    AgentMsg(string(uuid4()), m.text)
+    AgentMsg(string(uuid4()), AgentClientProtocol.text(m))
 # The UserMsg carries the chat back-ref so its wire dict can resolve the
 # project's /attachment URLs (msg_to_dict) — a parentless UserMsg renders
 # the raw "[attached files …]" suffix instead of the inline gallery.
-replayed_to_msg(model::ChatModel, m::AgentClientProtocol.UserMessage) =
-    is_summary_text(m.text) ? SummaryMsg(m.text) : UserMsg(shared(model), m.text)
+function replayed_to_msg(model::ChatModel, m::AgentClientProtocol.UserMessage)
+    t = AgentClientProtocol.text(m)
+    return is_summary_text(t) ? SummaryMsg(t) : UserMsg(shared(model), t)
+end
 function replayed_to_msg(model::ChatModel, m::AgentClientProtocol.ToolCall)
     isempty(m.content) || persist_tool_content!(model.chat_dir, m)
     # Replay always lands as a finished call (no live updates afterwards).

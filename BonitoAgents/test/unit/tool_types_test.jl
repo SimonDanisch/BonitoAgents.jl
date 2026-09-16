@@ -20,7 +20,7 @@ const CV        = Union{ACP.DiffContent, ACP.ImageContent, ACP.TextContent}
 # routing as the live `build_tool_msg`).
 gt(kind, name, title; content = CV[]) =
     BT.replayed_tool_msg(ACP.GenericTool("id_$name", kind, title, "completed",
-        collect(CV, content), Channel{ACP.ToolCall}(0), name, Dict{String,Any}()))
+        collect(CV, content), ACP.MessageStream{ACP.ToolCall}(), name, Dict{String,Any}()))
 # An MCP tool message of the type `tool_name` routes to, arguments parsed
 # from `raw` exactly like the live path (`apply_input!`).
 function mcp(tool_name; raw = Dict{String,Any}())

@@ -3,6 +3,10 @@ module AgentClientProtocol
 using JSON
 using Base64
 using HTTP
+# A message's streamed content is an Observable its consumers subscribe to
+# (`MessageStream`), which is what keeps a reader from having to block on a
+# channel — and what lets a second reader exist at all.
+using Observables
 
 include("types.jl")
 include("connection.jl")

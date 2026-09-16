@@ -297,17 +297,20 @@ end
 # Collect a session/load update stream into the resumed history. Split out of
 # `replay_history` so it can be driven with synthetic channels in tests.
 #
-# Each message owns a bounded delta channel; we drain them CONCURRENTLY (one
-# task per message), NOT sequentially. A message the agent leaves open mid-
-# stream — e.g. a tool whose terminal `tool_call_update` is never re-sent during
-# session/load — must not block the `out` consumer. If it did, then on any
-# history longer than `BUF` the feeder backs up on the bounded `out`, stops
-# draining `updates`, the single dispatcher can never deliver the session/load
-# response sitting behind that backlog, `updates` never closes, and the whole
-# resume deadlocks ("restoring the conversation…" forever). `close(TurnState)`
-# at stream end force-terminates + closes every still-open channel, so the
-# concurrent drainers all finish. (The previous sequential `for m in out;
-# drain_message!(m)` is what wedged on large resumed sessions.)
+# Replay has no UI to stream into: we want each message whole. Nothing here has
+# to drain anything for that — every message folds its own stream through its own
+# pump — so this collects in wire order and then waits for those pumps to finish.
+#
+# That is the whole reason `MessageStream` exists. The channel-per-message design
+# this replaces needed a `drain_message!` method for EVERY message type, since an
+# unread bounded channel backs the feeder up on `out`, the single dispatcher then
+# never delivers the `session/load` response sitting behind that backlog, and the
+# resume hangs on "restoring the conversation…". Three types never got a method,
+# and every resume that replayed one died on the `MethodError` instead.
+#
+# `close_turn!` at stream end closes every still-open message (a tool whose
+# terminal `tool_call_update` the agent never re-sent during load), so every pump
+# reaches its end and `wait` returns.
 function collect_replayed_updates(updates, response)
     out = Channel{Message}(BUF)
     feeder = Base.errormonitor(@async begin
@@ -321,14 +324,18 @@ function collect_replayed_updates(updates, response)
             close(out)
         end
     end)
-    msgs     = Message[]
-    drainers = Task[]
+    msgs = Message[]
     for m in out
         push!(msgs, m)                                          # preserve wire order
-        push!(drainers, Base.errormonitor(@async drain_message!(m)))
     end
-    foreach(wait, drainers)
     wait(feeder)
+    # Every streaming message is complete once its pump has drained what the
+    # feeder sent. A message with no stream (config, mode, usage, a plan) has
+    # nothing to wait for, which is the case that used to need a method nobody
+    # remembered to write.
+    for m in msgs
+        m isa StreamingMessage && wait(m.stream)
+    end
     result = take!(response)
     result isa Exception && throw(result)
     return msgs, result

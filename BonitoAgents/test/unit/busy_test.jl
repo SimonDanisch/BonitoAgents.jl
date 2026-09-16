@@ -32,7 +32,7 @@ end
 # Feed a background BashCall through the real render+update path so the tool ends
 # up IN THE TASKBAR (a live background shell) exactly as the wire would produce it.
 function launch_bg_bash!(model, id)
-    ch = Channel{ACP.ToolCall}(2)
+    ch = ACP.MessageStream{ACP.ToolCall}()
     bc = ACP.BashCall(id, "execute", "monitor loop", "in_progress",
                       ACP.ToolContent[], ch, "monitor loop", true, nothing)
     m = BT.to_message(model, bc)

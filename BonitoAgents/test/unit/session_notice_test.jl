@@ -33,11 +33,11 @@
     st = ACP.TurnState()
     ACP.parse_update!(out, st, ACP.AgentMessageChunk(ACP.TextContent("Before")))
     message = take!(out)
-    @test isopen(message.updates)
+    @test isopen(message.stream)
     ACP.parse_update!(out, st, parsed)
-    @test !isopen(message.updates)
+    @test !isopen(message.stream)
     @test take!(out) isa ACP.SessionNotice
     ACP.parse_update!(out, st, ACP.AgentMessageChunk(ACP.TextContent("After")))
-    @test take!(out).text == "After"
+    @test ACP.text(take!(out)) == "After"
     close(st.current_message)
 end
