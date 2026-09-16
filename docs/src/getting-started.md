@@ -96,6 +96,12 @@ From the dashboard home:
   into a project.
 - **From GitHub**: clone a repository straight onto a worker.
 
+Discover, folder picking and cloning live on each worker's own card, so the
+machine is chosen before the folder is. **Copy project** (Settings card) is the
+one that crosses machines: it snapshots a project's files onto another worker as
+a new project. To carry an existing chat elsewhere instead — its files *and* the
+agent's memory — use that chat's ⋯ menu → *Continue on*.
+
 Opening a project starts (or resumes) its agent lazily on the first message.
 The provider dropdown in the chat header selects which agent runs, Claude
 Code by default. See [Agent Providers](@ref).

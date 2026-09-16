@@ -34,10 +34,8 @@ reused for the rest of the worker's life.
 """
 function server()
     if SERVER[] === nothing
-        # Mock agent uses TestKit's default tiny `test/mocks` env (instantiate it
-        # once: `julia --project=test/mocks -e 'using Pkg; Pkg.instantiate()'`) —
-        # its small manifest keeps the per-chat mock-agent cold start fast, which
-        # matters under load (a big env can blow the 90s chat-bind timeout).
+        # Mock agent = the `MockACP` package inside the test env; its cold start
+        # is what the 90 s chat-bind timeout is measured against.
         s = TK.dev_server(agent = default_agent)
         TK.open_browser(s)
         SERVER[] = s

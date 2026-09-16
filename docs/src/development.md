@@ -31,10 +31,31 @@ julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=[
 julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=["e2e:media"])'   # one item
 ```
 
-`test_args` entries are OR-ed into a regex over test-item names. The e2e items
-share one long-lived dev server per test worker, which is deliberate so
-cleanup and leak paths soak under accumulation. Tests are never retried: a
-flaky test is a bug, and several production races were found exactly this way.
+`test_args` entries are OR-ed into a regex over test-item names. An extra
+`i/n` argument runs the i-th of n shards of that selection, which is how CI
+fans the e2e items out:
+
+```bash
+julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '^e2e:' 3/8     # CI's shard 3
+```
+
+The shard list is built from the `@testitem` names in the source, so CI cannot
+drift from the suite. The hand-written job-per-suite matrix it replaced had
+drifted: one entry no item answered to (a red job every run) and nine items
+nothing ever ran. Eight shard jobs also cost about a tenth of the runner time,
+because a job's fixed cost — checkout, apt, a 730 MB depot restore — dwarfs the
+sub-minute item it used to run.
+
+Budgets are per ITEM (`testitem_timeout` in `runtests.jl`), not per job: a
+wedged item fails itself and the worker respawns with a fresh dev server.
+Compilation happens in its own CI step (`.github/scripts/warmup.jl` imports
+each env's deps in a fresh process), so no test ever waits on a DOM while the
+machine is busy compiling.
+
+The e2e items share one long-lived dev server per test worker, which is
+deliberate so cleanup and leak paths soak under accumulation. Tests are never
+retried: a flaky test is a bug, and several production races were found exactly
+this way.
 
 The mock agent's event DSL (`test/testkit/TestKit.jl`) covers text chunks,
 tool calls with diff and terminal content, forms, plans, subagent feeds,
@@ -64,7 +85,7 @@ which is the part the filesystem can't tell you:
 | Tool | What it answers |
 |------|-----------------|
 | `bt_dev_inspect` | live workers, projects, chats and eval bridges — plus `section="worker"`, what a worker says about ITSELF (its agent processes, their sockets). When that disagrees with what the server believes, the disagreement is the bug. |
-| `bt_dev_logs` | the server's own `@info`/`@warn`/`@error` ring, filterable by level and substring, with the source location of each record. |
+| `bt_dev_logs` | logs from any machine in the fleet. `source="server"` or `source="<worker>"` reads that process's log FILE, which survives restarts and holds what no logger sees (unhandled task errors, fatal signal dumps); `source="all"` reads everyone at once. The default `"ring"` is the server's in-memory `@info`/`@warn`/`@error` records, filterable by level and substring. |
 | `bt_dev_memory` | RSS, GC live bytes and every registry that has historically grown without bound, with an optional GC and a deep `summarysize` pass. For a leak: take a reading, exercise the suspect path, read again with `gc = true`, compare what grew. |
 | `bt_dev_control` | drive the server as a user would — open a chat, send a message, restart a session, rescan a worker, move a project to another machine. |
 

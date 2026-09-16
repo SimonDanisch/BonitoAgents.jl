@@ -78,7 +78,12 @@ The main area is a VSCode-style workspace
 ([BonitoWidgets](https://github.com/SimonDanisch/BonitoWidgets.jl)). The chat,
 file editors and detached app embeds are panels you drag into tab groups,
 split horizontally or vertically, float as windows, and dock back. Collapse the
-sidebar (`Ctrl`/`⌘`+`B`) for a full-bleed view. The layout is responsive: on a
+sidebar (`Ctrl`/`⌘`+`B`) for a full-bleed view. Every chat in it carries an
+icon: the chat's own picture once it has shown one (a plot, a screenshot — far
+easier to find in a list than two letters), an identicon coloured by its folder
+until then, and in the corner a badge with the initials of the machine it runs
+on. The badge is the worker's and nothing else's; hovering names it in full.
+The layout is responsive: on a
 phone the sidebar folds to icons and panels stack, so the same dashboard drives
 a chat from your desk or your pocket.
 
@@ -128,3 +133,8 @@ ended · Reconnect** chip appears next to the title.
   until their writer exits.
 - The **search lens** (`/` box above the transcript) filters the transcript by
   type or fuzzy text, and saved lenses come back on a click.
+- If the **browser loses the server**, a modal takes the window and locks the
+  composer — anything typed while the socket is down would be lost. It names how
+  long the reconnect has been running, offers a reload, and lifts by itself when
+  the connection is back. A sub-second blip, which is the usual case, never
+  shows it.

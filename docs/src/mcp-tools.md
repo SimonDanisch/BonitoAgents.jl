@@ -131,6 +131,32 @@ the chat's worker to the target (through the server's mirror, so a second call
 only moves what changed) — the project, its `Project.toml`/`Manifest.toml`, the
 data. It needs the same switch.
 
+## `bt_wait`, pausing a turn
+
+```
+bt_wait(seconds; until?, poll?, reason?)
+```
+
+The one way an agent can be idle on purpose. A tool call is what pauses a turn —
+the agent blocks on the result — so this is that shape with nothing inside it:
+no subprocess, no task-bar entry, no completion notification, because the result
+*is* the completion.
+
+It exists because the alternatives are worse. A foreground `sleep` is blocked by
+the harness and a backgrounded command returns immediately, so an agent waiting
+on a forty-minute render ended its turn, was re-invoked seconds later, saw the
+job still running, and started another sleeper to poll with. One session left
+over a hundred orphaned sleep processes behind, each firing its own notification
+on expiry.
+
+`seconds` is required, even together with `until`, and capped at an hour: an
+unbounded wait on an event that may never arrive is a wedged chat. `until` is a
+shell condition, re-checked every `poll` seconds (5 by default) and returning
+the moment it exits 0 — `bt_wait(600; until = "test -f out/done.flag")` costs
+only as long as the job does. Reaching the bound is a normal result, not an
+error: the agent gets a plain "not yet" and decides, one round trip per hour
+instead of one per eight seconds.
+
 ## `bt_show`, a file into the chat
 
 `bt_show(path)` renders a worker-side file into the transcript, as whatever the

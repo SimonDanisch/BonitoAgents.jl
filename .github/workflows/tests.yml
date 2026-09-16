@@ -1,17 +1,27 @@
 # Unit + end-to-end tests for BonitoAgents.
 #
-# Structure: one `setup` job instantiates + updates the git-pinned forks +
-# PRECOMPILES the whole stack ONCE, then `unit` and a fan-out `e2e` matrix run
-# in PARALLEL, each reusing setup's compiled depot. The forks (ElectronCall,
-# Bonito, …) live in BonitoAgents/[sources]; setup pins them to their branch
-# HEADs and shares the resolved Manifest so the downstream jobs compile nothing.
+# `setup` resolves the envs once and shares two things with every other job: the
+# resolved Manifests (an artifact) and a compiled depot (a run-scoped cache).
+# `unit` and the `e2e` shards then run in parallel off both.
 #
-# Why a run-scoped cache key (`…-${{ github.run_id }}`): setup `Pkg.update`s the
-# forks to moving branch HEADs, so the precompiled images are only guaranteed
-# valid within THIS run. The `restore-keys` fallback still warm-starts package
-# downloads/artifacts from a prior run; only the (fast, incremental) precompile
-# re-runs in setup. The downstream jobs restore setup's exact cache, so they
-# skip compilation entirely.
+# The e2e items are SHARDED — 8 jobs, every 8th item — and not one job per suite.
+# A suite item runs for well under a minute, while a job costs a checkout, an apt
+# install and a 730 MB depot restore, so a job per suite burned ~9 runner-hours
+# per push to run ~70 minutes of test.
+#
+# Two things the jobs depend on:
+#
+#   • COMPILE OUTSIDE THE TEST. Every job warms its envs in a separate step
+#     (`.github/scripts/warmup.jl` imports each env's deps). Whatever the depot
+#     cache fails to provide is paid there, where no test is waiting on a DOM.
+#     Jobs used to compile the stack (~220 s) inside a `timeout 420` wrapper and
+#     get killed mid-suite; the per-ITEM budget now lives in runtests.jl.
+#
+#   • NOBODY RE-RESOLVES. The forks (Bonito, BonitoBook, BonitoWidgets,
+#     ElectronCall, Makie) are pinned to moving branch HEADs in [sources], so a
+#     job that resolved for itself would get other commits than the ones setup
+#     compiled. Manifest.toml is gitignored, so setup shares its resolved ones as
+#     an artifact and every downstream job copies them in before touching Julia.
 name: Tests
 
 on:
@@ -27,19 +37,19 @@ concurrency:
 
 env:
   JULIA_VERSION: '1.12'
-  # The depot we cache + share across jobs. Keyed on the lockfile-independent
-  # Project.toml set (Manifest is gitignored/regenerated); run_id pins it to
-  # this run so the precompiled images match what setup produced.
+  # Keyed on the Project.toml set (the Manifests are gitignored and regenerated);
+  # `run_id` pins it to this run, because setup updates the forks to branch HEADs
+  # and the compiled images only match the commits THIS run resolved.
   DEPOT_KEY_PREFIX: julia-depot-v1
-  # Suppress post-instantiate auto-precompile everywhere; the setup job's
-  # explicit Pkg.precompile() still runs (it's not the auto pass).
+  # Resolving never precompiles; the explicit warmup step does, in a fresh process.
   JULIA_PKG_PRECOMPILE_AUTO: '0'
 
 jobs:
-  # ── Compile once ──────────────────────────────────────────────────────────
+  # ── Resolve + compile once ────────────────────────────────────────────────
   setup:
-    name: setup (instantiate + precompile)
+    name: setup (resolve + compile)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -47,8 +57,8 @@ jobs:
         with:
           version: ${{ env.JULIA_VERSION }}
 
-      # Save the depot under a run-scoped key; warm-start from any prior run's
-      # depot via restore-keys so package tarballs/artifacts aren't re-downloaded.
+      # Save under a run-scoped key; warm-start from any earlier run via
+      # restore-keys so package tarballs and artifacts aren't re-downloaded.
       - uses: actions/cache@v4
         with:
           path: ~/.julia
@@ -57,33 +67,45 @@ jobs:
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
 
-      - name: Instantiate + refresh the git-pinned forks, then precompile
-        # Update the forks to their branch HEADs (a restored cache can otherwise
-        # keep a stale tree even after a fork branch moves) and precompile the
-        # whole stack so the downstream jobs compile nothing.
+      - name: Resolve + refresh the git-pinned forks
+        # The UI forks (Bonito, BonitoBook, BonitoWidgets) are [sources] of the
+        # main env; ElectronCall is TEST-only, and the eval envs carry their own
+        # Bonito/Makie pins — update each fork in the env it actually lives in
+        # (`Pkg.update(["ElectronCall"])` on the main env errors with "not found
+        # in project or manifest").
         run: |
-          # The UI forks (Bonito, BonitoBook, BonitoWidgets) live in
-          # BonitoAgents/[sources]; ElectronCall is a TEST-only fork, in
-          # test/[sources]. Update + precompile EACH env where its forks actually
-          # live — `Pkg.update(["ElectronCall"])` on the main env errors with
-          # "not found in project or manifest" (ElectronCall isn't a main dep).
           julia --project=BonitoAgents -e '
             using Pkg
             Pkg.instantiate()
-            Pkg.update(["Bonito", "BonitoWidgets", "BonitoBook"])
-            Pkg.precompile()'
+            Pkg.update(["Bonito", "BonitoWidgets", "BonitoBook"])'
           julia --project=BonitoAgents/test -e '
             using Pkg
             Pkg.instantiate()
-            Pkg.update(["ElectronCall", "Bonito", "BonitoWidgets", "BonitoBook"])
-            Pkg.precompile()'
+            Pkg.update(["ElectronCall", "Bonito", "BonitoWidgets", "BonitoBook"])'
+          for env in evalenv altenv; do
+            julia --project=BonitoAgents/test/$env -e 'using Pkg; Pkg.instantiate()'
+          done
 
-      # (The old separate `test/mocks` agent env is gone — the mock is now the
-      # `MockACP` package inside the test env above, precompiled with it.)
+      - name: The eval proxy's two sides must share one Bonito
+        # `[sources]` pins a BRANCH, not a commit: resolve the server-side env and
+        # the eval-worker envs at different moments and they land on different
+        # trees. The embed then renders its static DOM and never comes alive,
+        # which reads as a timing flake in eight different e2e suites.
+        run: |
+          julia .github/scripts/check_pins.jl \
+            BonitoAgents/test/Manifest.toml \
+            BonitoAgents/test/evalenv/Manifest.toml \
+            BonitoAgents/test/altenv/Manifest.toml
 
-      # The downstream jobs MUST reuse this exact Manifest (the forks moved in
-      # the update above) or they'd re-resolve to other commits and miss the
-      # precompile cache. Manifest.toml is gitignored, so share it as an artifact.
+      - name: Compile the stack
+        # A FRESH process per env, after all resolving is done. Compiling from the
+        # process that just resolved builds images against the versions that
+        # process had loaded, which every later process rejects and rebuilds.
+        run: |
+          for env in BonitoAgents BonitoAgents/test BonitoAgents/test/evalenv BonitoAgents/test/altenv; do
+            julia --project=$env .github/scripts/warmup.jl
+          done
+
       - name: Share the resolved Manifests
         uses: actions/upload-artifact@v4
         with:
@@ -91,14 +113,17 @@ jobs:
           path: |
             BonitoAgents/Manifest.toml
             BonitoAgents/test/Manifest.toml
+            BonitoAgents/test/evalenv/Manifest.toml
+            BonitoAgents/test/altenv/Manifest.toml
           if-no-files-found: error
           retention-days: 1
 
-  # ── Unit tests (path/JS-escaping regressions) ─────────────────────────────
+  # ── Unit tests (headless) ─────────────────────────────────────────────────
   unit:
     name: unit tests
     needs: setup
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -108,120 +133,49 @@ jobs:
         with:
           name: manifests
           path: manifests-dl
+      # The artifact is rooted at BonitoAgents/ (the common ancestor of the four
+      # uploaded paths), so this one copy restores all of them.
       - name: Restore the shared Manifests
+        # …and fail here if they didn't land where they're expected, rather than
+        # let the job silently re-resolve to other fork commits than setup's.
         run: |
-          cp manifests-dl/Manifest.toml BonitoAgents/Manifest.toml
-          cp manifests-dl/test/Manifest.toml BonitoAgents/test/Manifest.toml
+          cp -r manifests-dl/. BonitoAgents/
+          test -f BonitoAgents/Manifest.toml
+          test -f BonitoAgents/test/Manifest.toml
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
           key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
-      - name: Instantiate (no-op against the cached depot)
-        run: julia --project=BonitoAgents/test -e 'using Pkg; Pkg.instantiate()'
+      - name: Warm the envs this job loads
+        run: |
+          for env in BonitoAgents BonitoAgents/test; do
+            julia --project=$env .github/scripts/warmup.jl
+          done
+
       - name: Unit tests
-        # runtests.jl + ReTestItems + the test deps all live in the TEST env
-        # (BonitoAgents/test), not the main package. Filter to the headless
-        # `unit:*` items; the e2e matrix runs the browser items.
+        # runtests.jl + ReTestItems + the test deps live in the TEST env, not the
+        # main package. `unit` matches the `unit:*` item names; the e2e shards
+        # take the browser items.
         run: julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl unit
 
       - name: RemoteSync transfer tests (incl. close-vs-tail stress)
-        # RemoteSync is a path [source] of BonitoAgents, so its deps (HTTP,
-        # librsync_jll, …) are already in this env — run its suite here rather
-        # than spin up a separate project. Guards the single-file + directory
-        # close-vs-tail race regressions that production file-open relies on.
+        # RemoteSync is a path [source] of BonitoAgents, so its deps are already
+        # in this env — run its suite here rather than spin up a separate project.
+        # Guards the close-vs-tail race that production file-open relies on.
         run: julia --project=BonitoAgents RemoteSync/test/runtests.jl
 
-  # ── E2E suite — one parallel job per scenario ─────────────────────────────
+  # ── E2E suite — sharded across parallel jobs ──────────────────────────────
   e2e:
-    name: 'E2E — ${{ matrix.suite }}'
+    name: 'E2E ${{ matrix.shard }}/8'
     needs: setup
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       DISPLAY: ":99"
     strategy:
       fail-fast: false
       matrix:
-        suite:
-          - app_reload
-          - app_scroll
-          - attach_mobile
-          - auto_prompt
-          - background_tab
-          - bonito_upgrade
-          - bt_eval
-          - bt_eval_types
-          - bt_wait
-          - cancel_escalation
-          - cancel_misbehaving
-          - chat_attach
-          - chat_cancel
-          - chat_close_rename
-          - chat_controls
-          - chat_features
-          - chat_finalize_guard
-          - chat_remount
-          - chat_show
-          - chat_show_extras
-          - chat_streaming_sustained
-          - codex_wire
-          - copy_project
-          - cross_worker
-          - cross_worker_sync_ui
-          - dashboard_layout
-          - debug_chat
-          - edit_diff
-          - errors
-          - eval_embed_park
-          - file_download
-          - file_open
-          - file_open_fresh
-          - file_tree
-          - file_view
-          - filter_scroll
-          - folder_threads
-          - follow_pill
-          - header_collapse
-          - kimi_wire
-          - layout_fixes
-          - leak_cycle
-          - lens
-          - media
-          - model_search
-          - multipane
-          - new_project
-          - outdated_worker
-          - overview
-          - panel_move_scroll
-          - queued_messages
-          - render_error
-          - remote_eval
-          - resume_discover
-          - resume_eager_bind
-          - resume_no_jserrors
-          - review
-          - review_folder
-          - review_scope
-          - scroll_anchor
-          - scroll_chase
-          - scroll_persist
-          - session_changes
-          - session_sync
-          - smoke
-          - streamed_tool_input
-          - streaming_flood
-          - subagent_feed
-          - subagent_poll
-          - todo_taskbar
-          - todo_worker_death
-          - tool_rendering
-          - two_tab
-          - usage_commands
-          - virtual_scroll
-          - worker_lifecycle
-          - worker_move
-          - worker_zombie
-          - workflows
-          - yolo_mode
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -238,41 +192,35 @@ jobs:
           name: manifests
           path: manifests-dl
       - name: Restore the shared Manifests
+        # …and fail here if they didn't land where they're expected, rather than
+        # let the job silently re-resolve to other fork commits than setup's.
         run: |
-          cp manifests-dl/Manifest.toml BonitoAgents/Manifest.toml
-          cp manifests-dl/test/Manifest.toml BonitoAgents/test/Manifest.toml
+          cp -r manifests-dl/. BonitoAgents/
+          test -f BonitoAgents/Manifest.toml
+          test -f BonitoAgents/test/Manifest.toml
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
           key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
-      - name: Instantiate (no-op against the cached depot)
-        run: julia --project=BonitoAgents/test -e 'using Pkg; Pkg.instantiate()'
-      - name: 'E2E — ${{ matrix.suite }}'
-        # Run the suite's `@testitem` through runtests.jl (it owns the
-        # SharedServer setup + ReTestItems harness); the bare `e2e/<suite>.jl`
-        # is just the TestKit logic and isn't standalone-runnable. ONE worker =
-        # one dev_server (no fan-out), hardcoded in runtests.jl — no env knob.
-        #
-        # The filter is `Regex(join(ARGS,"|"))` matched against testitem names,
-        # so it is FULLY ANCHORED — `^e2e:<suite>$`, one suite per job.
-        #
-        # Anchoring to the e2e namespace alone is not enough. A bare `file_tree`
-        # also matches `unit:file_tree`, which starts its OWN dev_server + worker
-        # subprocess inside this job's process — two servers and two workers at
-        # once, and the e2e tree then reads an empty/foreign project (reproduced
-        # locally: `e2e:file_tree` passes 19/19 alone and 10/19 under the bare
-        # filter). `lens` and `cross_worker` pulled in unit items the same way.
-        #
-        # The trailing `$` matters just as much, because four suites are prefix-
-        # contained in a sibling: bt_eval/bt_eval_types, chat_show/chat_show_extras,
-        # file_open/file_open_fresh, cross_worker/cross_worker_sync_ui. Unanchored,
-        # those jobs run BOTH — the sibling never gets its own runner or its own
-        # 420s, and `e2e:bt_eval` alone already takes ~3m30s, so the pair would
-        # simply time out. Every suite is its own matrix entry now, so each one
-        # needs to match exactly itself.
+      - name: Warm the test + eval envs
+        # The eval envs matter as much as the test env: an eval item's Malt worker
+        # mounts a render inside a 30 s DOM wait, and a worker that compiles
+        # WGLMakie on first touch never makes it.
         run: |
-          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
-            julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '^e2e:${{ matrix.suite }}$'
+          for env in BonitoAgents/test BonitoAgents/test/evalenv BonitoAgents/test/altenv; do
+            julia --project=$env .github/scripts/warmup.jl
+          done
+
+      - name: 'E2E shard ${{ matrix.shard }}/8'
+        # `^e2e:` selects the browser items, `N/8` takes this job's share. The
+        # filter is matched against testitem NAMES and is anchored on purpose: a
+        # bare `e2e` would also match nothing useful, while a bare suite name like
+        # `file_tree` matches `unit:file_tree` too, which starts a SECOND
+        # dev_server inside this process (reproduced: `e2e:file_tree` passes 19/19
+        # alone, 10/19 with the unit item alongside it).
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '^e2e:' ${{ matrix.shard }}/8
 
   # ── Single required check for branch protection ───────────────────────────
   all-green:
@@ -280,4 +228,4 @@ jobs:
     needs: [unit, e2e]
     runs-on: ubuntu-latest
     steps:
-      - run: echo "unit + all e2e suites passed"
+      - run: echo "unit + all e2e shards passed"

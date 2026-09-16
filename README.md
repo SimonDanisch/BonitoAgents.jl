@@ -56,9 +56,12 @@ included ([`AgentProviders/`](AgentProviders/)).
   block, either asked into the chat immediately or batched into one
   instruction for the agent to work through.
 - Agents get MCP tools backed by a persistent Julia session per project:
-  `julia_eval` with warm state and disciplined output, `bt_show` to render
-  any worker-side file into the chat, and `bt_show_app` to embed a running
-  Bonito app whose interactions round trip to Julia on the worker.
+  `bt_julia_eval` with warm state and disciplined output, which renders
+  whatever it returns as what it is — a returned Bonito app or Makie figure
+  comes back live in the card and its interactions round trip to Julia on the
+  worker; `bt_show` to render any worker-side file into the chat; `bt_wait` so
+  a turn can actually block on long work; and a `worker =` argument on the
+  eval family to run all of it on another machine.
 - Chats persist on disk, browser reconnects resume where you left off, and
   existing Claude Code sessions on a worker can be imported with their
   history.

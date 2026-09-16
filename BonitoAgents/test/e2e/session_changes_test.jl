@@ -21,7 +21,7 @@
 #   • SummaryMsg (legacy #1): a `.bt-summary-msg` is rendered only for an ACP
 #     `UserMessage` whose text starts with `SUMMARY_PREFIX` (see
 #     `is_summary_text` + `adopt_replayed!`/`msg_for` in src/chat.jl). The mock
-#     agent (test/mocks/mock_claude_agent_acp.jl) has NO event that emits a
+#     agent (test/MockACP) has NO event that emits a
 #     `UserMessage` — a `text` event always becomes an `agent_message_chunk`
 #     (→ `.bt-agent-msg`). The legacy test reached it only by calling
 #     `BT.send!(chat, BT.SummaryMsg(...))` against an in-process model, which is
