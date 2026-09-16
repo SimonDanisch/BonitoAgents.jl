@@ -86,16 +86,18 @@ jobs:
             julia --project=BonitoAgents/test/$env -e 'using Pkg; Pkg.instantiate()'
           done
 
-      - name: The eval proxy's two sides must share one Bonito
-        # `[sources]` pins a BRANCH, not a commit: resolve the server-side env and
-        # the eval-worker envs at different moments and they land on different
-        # trees. The embed then renders its static DOM and never comes alive,
-        # which reads as a timing flake in eight different e2e suites.
+      - name: Every pin took, and the eval proxy shares one Bonito
+        # Two silent failures this catches: a `[sources]` entry that did nothing
+        # (it only governs packages the project DECLARES — in [extras] it is
+        # ignored and the registry version wins), and the server-side env and the
+        # eval-worker envs landing on different commits of the same branch. Both
+        # end as an embed that renders its static DOM and never comes alive,
+        # which reads as a timing flake across eight e2e suites.
         run: |
           julia .github/scripts/check_pins.jl \
-            BonitoAgents/test/Manifest.toml \
-            BonitoAgents/test/evalenv/Manifest.toml \
-            BonitoAgents/test/altenv/Manifest.toml
+            BonitoAgents/test \
+            BonitoAgents/test/evalenv \
+            BonitoAgents/test/altenv
 
       - name: Compile the stack
         # A FRESH process per env, after all resolving is done. Compiling from the
