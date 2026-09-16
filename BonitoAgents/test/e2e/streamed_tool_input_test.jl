@@ -103,10 +103,19 @@
         # budget as the Monaco-body wait above: both ride the same late args
         # update, and 10s was the odd one out (it timed out on CI while its
         # sibling passed).
-        @test TK.wait_for(s, "⏱ badge inserted late",
+        badge_ok = TK.wait_for(s, "⏱ badge inserted late",
             "(() => { const b = document.querySelector('.bt-tool-timeout'); " *
             "return b && b.innerText.indexOf('60') !== -1; })()";
-            timeout = 15) == true
+            timeout = 15)
+        # If it is missing, say what the card actually looks like — this failed
+        # on CI three runs running with nothing to go on but the timeout.
+        badge_ok || @info "badge missing — card state" card = TK.eval_js(s,
+            "(() => { const n = $(card("ev1")); return n ? " *
+            "{header: !!n.querySelector('.bt-tool-header'), " *
+            " stashed: n.dataset.btTimeoutS || null, " *
+            " connected: n.isConnected, " *
+            " html: (n.outerHTML || '').slice(0, 300)} : 'no card'; })()")
+        @test badge_ok == true
 
         # The ⊗ stop button inserted late (bt_julia_eval is EVAL_STOPPABLE).
         @test TK.wait_for(s, "⊗ stop button inserted late",

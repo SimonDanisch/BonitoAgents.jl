@@ -1166,9 +1166,13 @@ class BonitoChat {
         }
         this.applyHeaderBadges(node);
     }
-    applyHeaderBadges(node) {
-        const headerEl = node?.querySelector?.('.bt-tool-header');
-        if (!headerEl || !node.dataset) return;
+    applyHeaderBadges(node, attempt = 0) {
+        if (!node || !node.dataset) return;
+        const headerEl = node.querySelector?.('.bt-tool-header');
+        if (!headerEl) {
+            if (attempt < 6 && (node.dataset.btTimeoutS || node.dataset.btWorker)) setTimeout(()=>this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
+            return;
+        }
         const secs = node.dataset.btTimeoutS;
         if (secs && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');

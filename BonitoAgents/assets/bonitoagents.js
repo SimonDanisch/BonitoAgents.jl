@@ -1836,9 +1836,19 @@ class BonitoChat {
 
     // Insert the header badges this card is owed, from what its updates stashed
     // on it. Idempotent, and a no-op before the header exists.
-    applyHeaderBadges(node) {
-        const headerEl = node?.querySelector?.('.bt-tool-header');
-        if (!headerEl || !node.dataset) return;
+    applyHeaderBadges(node, attempt = 0) {
+        if (!node || !node.dataset) return;
+        const headerEl = node.querySelector?.('.bt-tool-header');
+        if (!headerEl) {
+            // No header YET. The card may still be a placeholder, or be out of
+            // the virtual window; whichever path builds it, it is not this one.
+            // Back off and look again rather than dropping the badge for good.
+            // setTimeout, not rAF: a hidden/offscreen window throttles frames to
+            // ~1Hz and the ladder would stretch to a minute.
+            if (attempt < 6 && (node.dataset.btTimeoutS || node.dataset.btWorker))
+                setTimeout(() => this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
+            return;
+        }
         const secs = node.dataset.btTimeoutS;
         if (secs && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');
