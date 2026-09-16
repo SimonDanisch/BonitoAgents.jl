@@ -177,10 +177,19 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
 
     # The note shows for every non-current state; the button only where the
     # worker can act on it (a `:reinstall` worker does not know `force_update`).
+    # ALWAYS a node, hidden when there is nothing to say — never `nothing`.
+    # `map` types its Observable from the FIRST result, so a union of `nothing`
+    # and a node makes every later notify of the other kind throw
+    # ("Cannot convert Nothing to Node{HTMLSVG}", and the mirror image).
+    # `safe_notify!` then skips this listener for good, and the card's update
+    # notice silently stops tracking the worker — observed on the live server,
+    # once per worker notify. Same shape as `update_btn_class` below.
     update_notice = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w === nothing || w.update_state === :current ? nothing :
-            DOM.span(w.update_message; class = "bt-worker-update-note")
+        quiet = w === nothing || w.update_state === :current
+        DOM.span(quiet ? "" : w.update_message;
+                 class = quiet ? "bt-worker-update-note bt-hidden" :
+                                 "bt-worker-update-note")
     end
     # Success needs no banner: `force_worker_update!` flips the worker to
     # `:updating`, which hides this button and changes the note, and the
