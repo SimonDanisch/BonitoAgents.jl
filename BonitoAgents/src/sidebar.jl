@@ -710,13 +710,18 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-proj-thumb",
         "width" => "100%", "height" => "100%",
         "object-fit" => "cover", "display" => "block"),
-    # The worker tag: a small dark pane in the corner, clipped by the tile's own
-    # rounded corner, readable over any picture. Sized for 1 to 4 characters at 32px.
+    # The worker tag: a pane in the corner, clipped by the tile's own rounded
+    # corner, readable over any picture. It wears the MACHINE'S colour, the same
+    # one as the ring, so badge and ring read as one identity. White letters on
+    # `worker_color`'s lightness (OKLCH 52%) carry a soft shadow rather than a
+    # darker pane, so the colour stays exactly the worker's.
+    # Sized for 1 to 4 characters at 32px.
     CSS(".bt-proj-tag",
         "position" => "absolute", "right" => "0", "bottom" => "0",
         "font-size" => "9px", "line-height" => "1", "font-weight" => "700",
         "letter-spacing" => "0.02em", "padding" => "2px 3px 2px 4px",
-        "color" => "#fff", "background" => "rgba(15,23,42,0.72)",
+        "color" => "#fff", "background" => "var(--bt-worker, #0f172a)",
+        "text-shadow" => "0 1px 2px rgba(15,23,42,0.55)",
         "border-radius" => "5px 0 0 0", "pointer-events" => "none",
         "font-family" => "'Inter', system-ui, sans-serif"),
     # Home icon: borderless 32px slot, glyph in muted text color so it sits

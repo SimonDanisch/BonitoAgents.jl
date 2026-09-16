@@ -131,8 +131,12 @@
             ring = TK.eval_js(server, """(() => {
                 const cs = getComputedStyle($(wrap));
                 const icon = getComputedStyle($(wrap).querySelector('.bt-proj-icon'));
+                // The colour a shadow is drawn in: everything before its offsets.
+                const shadowColor = s => s.slice(0, s.search(/ -?[0-9.]+px/)).trim();
                 return {worker: cs.getPropertyValue('--bt-worker').trim(),
-                        border: cs.borderTopWidth, shadow: icon.boxShadow};
+                        border: cs.borderTopWidth, shadow: icon.boxShadow,
+                        ringColor: shadowColor(icon.boxShadow),
+                        badgeColor: getComputedStyle($(wrap).querySelector('.bt-proj-tag')).backgroundColor};
             })()""")
             @test startswith(ring["worker"], "oklch(")
             # The ring is a spread shadow on the TILE (a rounded border renders
@@ -140,6 +144,9 @@
             @test parseInt_px(ring["border"]) == 0
             @test occursin("1.5px", ring["shadow"])
             @test count(",", ring["shadow"]) <= 3        # one shadow layer: the ring
+            # The badge wears the machine's colour too — exactly the ring's, so
+            # the two read as one identity.
+            @test ring["badgeColor"] == ring["ringColor"]
             # Every chat on this worker shares the colour.
             @test TK.eval_js(server, """(() => {
                 const wraps = [...document.querySelectorAll('.bt-side-item[data-project-id] .bt-side-icon-wrap')].filter(e => e.offsetParent);
