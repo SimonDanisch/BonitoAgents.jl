@@ -1830,6 +1830,32 @@ class BonitoChat {
                 this.comm.notify({type: 'tool.render', id: node.dataset.msgId});
             }
         }
+        // Header badges an update stashed while this card was out of the window.
+        this.applyHeaderBadges(node);
+    }
+
+    // Insert the header badges this card is owed, from what its updates stashed
+    // on it. Idempotent, and a no-op before the header exists.
+    applyHeaderBadges(node) {
+        const headerEl = node?.querySelector?.('.bt-tool-header');
+        if (!headerEl || !node.dataset) return;
+        const secs = node.dataset.btTimeoutS;
+        if (secs && !headerEl.querySelector('.bt-tool-timeout')) {
+            const badge = document.createElement('span');
+            badge.className = 'bt-tool-timeout';
+            badge.title = 'Soft eval timeout — the call checkpoints with partial output at this cadence';
+            badge.textContent = `⏱ ${secs}`;
+            headerEl.insertBefore(badge, headerEl.querySelector('.bt-tool-timer') || null);
+        }
+        const worker = node.dataset.btWorker;
+        if (worker && !headerEl.querySelector('.bt-tool-worker')) {
+            const wb = document.createElement('span');
+            wb.className = 'bt-tool-worker';
+            wb.title = 'This runs on another worker';
+            wb.textContent = `⇢ ${worker}`;
+            const title = headerEl.querySelector('.bt-tool-title');
+            headerEl.insertBefore(wb, title ? title.nextSibling : null);
+        }
     }
 
     // ── New messages + streaming ──────────────────────────────────────────
@@ -2382,6 +2408,14 @@ class BonitoChat {
         const stillLive = !node.dataset.toolFinished &&
             !['completed', 'failed'].includes(
                 node.querySelector('.bt-tool-status')?.textContent || '');
+        // Stash what a late update carries, so a card that is NOT mounted yet
+        // (virtualized out of the window on a slow box) can still get its
+        // badges when it lands — the insert below needs a header that exists
+        // right now, nothing re-sends `timeout_s`, and the badge was then gone
+        // for good (CI: "⏱ badge inserted late" timing out while every other
+        // affordance from the same update passed). See `applyHeaderBadges`.
+        if (msg.timeout_s) node.dataset.btTimeoutS = String(msg.timeout_s);
+        if (msg.worker) node.dataset.btWorker = String(msg.worker);
         if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');
             badge.className = 'bt-tool-timeout';

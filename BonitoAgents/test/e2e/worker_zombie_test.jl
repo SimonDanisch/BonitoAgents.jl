@@ -14,13 +14,19 @@
 @testitem "e2e:worker_zombie" setup = [SharedServer] tags = [:e2e] begin
     TK = SharedServer.TK
 
-    # Short, but not shorter than a BUSY box's jitter. At 0.5s/2.5s this item
-    # reaped its OWN healthy worker before the first chat could bind: as the last
-    # of eleven items in a CI shard, a fresh worker needs more than 2.5s to answer
-    # a ping, and the run died on "chat view opened" rather than on anything this
-    # test is about. 8s still proves the reaper (the flip is asserted within 20s).
+    # Start RELAXED and arm the reaper only once the chat is up (see `arm!`
+    # below). Armed from birth at 0.5s/2.5s, this item reaped its OWN healthy
+    # worker: as the last of eleven items in a CI shard, a fresh worker needs
+    # longer than that to answer its first ping, and the run died on "chat view
+    # opened" — never reaching anything this test is about.
     z = TK.dev_server(agent = prompt -> [TK.text("echo: $(prompt)"), TK.end_turn()],
-                      heartbeat_interval = 1.0, heartbeat_deadline = 8.0)
+                      heartbeat_interval = 5.0, heartbeat_deadline = 60.0)
+    # The knobs the zombie detection is measured with, applied when we are ready
+    # to wedge the worker. `state` is mutable and the reaper reads it per tick.
+    function arm!()
+        z.h.state.heartbeat_interval = 0.5
+        z.h.state.heartbeat_deadline = 2.5
+    end
     wpid = getpid(z.h.worker_proc)
     frozen = Ref(false)
     freeze!()   = (run(`kill -STOP $wpid`); frozen[] = true)
@@ -36,6 +42,7 @@
         wid = only(collect(keys(z.h.state.worker_control_ws)))
         @test z.h.state.workers[][wid].online[] == true
 
+        arm!()      # sub-second knobs from here on: the wedge is what we measure
         freeze!()
 
         @testset "a stat timeout fails the open CLOSED, fast, with a toast" begin
@@ -52,7 +59,8 @@
         end
 
         @testset "heartbeat flips the zombie worker offline" begin
-            # interval 1s + deadline 8s → the reaper must fire well within 20s.
+            # interval 0.5s + deadline 2.5s → the reaper must fire well within 20s
+            # (the previous tick may still be sleeping on the relaxed interval).
             flipped = timedwait(20.0; pollint = 0.2) do
                 z.h.state.workers[][wid].online[] == false
             end

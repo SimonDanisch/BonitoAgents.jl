@@ -1164,6 +1164,28 @@ class BonitoChat {
                 });
             }
         }
+        this.applyHeaderBadges(node);
+    }
+    applyHeaderBadges(node) {
+        const headerEl = node?.querySelector?.('.bt-tool-header');
+        if (!headerEl || !node.dataset) return;
+        const secs = node.dataset.btTimeoutS;
+        if (secs && !headerEl.querySelector('.bt-tool-timeout')) {
+            const badge = document.createElement('span');
+            badge.className = 'bt-tool-timeout';
+            badge.title = 'Soft eval timeout — the call checkpoints with partial output at this cadence';
+            badge.textContent = `⏱ ${secs}`;
+            headerEl.insertBefore(badge, headerEl.querySelector('.bt-tool-timer') || null);
+        }
+        const worker = node.dataset.btWorker;
+        if (worker && !headerEl.querySelector('.bt-tool-worker')) {
+            const wb = document.createElement('span');
+            wb.className = 'bt-tool-worker';
+            wb.title = 'This runs on another worker';
+            wb.textContent = `⇢ ${worker}`;
+            const title = headerEl.querySelector('.bt-tool-title');
+            headerEl.insertBefore(wb, title ? title.nextSibling : null);
+        }
     }
     appendNewMessage(msg) {
         const idx = this.totalCount - 1;
@@ -1530,6 +1552,8 @@ class BonitoChat {
             'completed',
             'failed'
         ].includes(node.querySelector('.bt-tool-status')?.textContent || '');
+        if (msg.timeout_s) node.dataset.btTimeoutS = String(msg.timeout_s);
+        if (msg.worker) node.dataset.btWorker = String(msg.worker);
         if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');
             badge.className = 'bt-tool-timeout';
