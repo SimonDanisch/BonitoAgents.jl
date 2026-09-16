@@ -58,7 +58,14 @@
             # take seconds to round-trip, so a short hold would race completion.
             # The third @testset then completes both tools and observes the
             # live preview being torn down on the terminal transition.
-            TK.delay(12000),
+            #
+            # 30s, not 12s: every assertion in the first two testsets is about an
+            # IN-FLIGHT affordance (the ⏱ badge, the ⊗ stop, the live pill), and
+            # the completion below tears all of them down. On a loaded CI runner
+            # the earlier waits ate the 12s hold, so the badge and the live pill
+            # were already gone when their turn came — the failure read as "badge
+            # never appeared" when it had appeared and been removed.
+            TK.delay(30000),
             TK.tool_update("rd1"; status = "completed",
                            content = [TK.text_block("greet() = println(\"hi\")\n")]),
             # Wire contract v3: the eval's content is plain output text (the
@@ -145,10 +152,12 @@
             "return !!st && st.textContent === 'completed' && " *
             "n.querySelector('.bt-eval-stream') === null && " *
             "n.querySelector('.bt-tool-header')?.dataset.expanded === 'true'; })()";
-            timeout = 20) == true
+            # Outlasts the 30s hold above, counted from wherever the in-flight
+            # assertions finished.
+            timeout = 60) == true
         @test TK.wait_for(s, "eval result rendered in body",
             "(($(body("ev1")) || {}).textContent || '').indexOf('42') !== -1";
-            timeout = 15) == true
+            timeout = 30) == true
     end
 
     @test isempty(TK.js_errors(s))

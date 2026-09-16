@@ -30,6 +30,7 @@ mkpath(RESUME_SHOT_DIR)
     try
         TK.open_browser(s; width = 1280, height = 880)
         state = s.h.state
+        @test timedwait(() -> !isempty(state.workers[]), 30.0) === :ok
         wid   = first(keys(state.workers[]))
         cwd   = mktempdir(; prefix = "bt-resume-")
         sid   = "sess-resume-e2e-1"
