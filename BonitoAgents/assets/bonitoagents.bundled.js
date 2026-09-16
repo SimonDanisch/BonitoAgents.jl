@@ -107,6 +107,7 @@ class BonitoChat {
         this.spacerTopHeight = -1;
         this.spacerBottomHeight = -1;
         this.requestedAt = new Map();
+        this.toolBadges = new Map();
         this.epoch = 0;
         this.STREAM_APPLY_MS = 100;
         this.messageHeightObserver = new ResizeObserver((entries)=>{
@@ -1168,12 +1169,14 @@ class BonitoChat {
     }
     applyHeaderBadges(node, attempt = 0) {
         if (!node || !node.dataset) return;
+        const owed = this.toolBadges.get(node.dataset.msgId);
+        if (!owed) return;
         const headerEl = node.querySelector?.('.bt-tool-header');
         if (!headerEl) {
-            if (attempt < 10 && (node.dataset.btTimeoutS || node.dataset.btWorker)) setTimeout(()=>this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
+            if (attempt < 10) setTimeout(()=>this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
             return;
         }
-        const secs = node.dataset.btTimeoutS;
+        const secs = owed.timeout_s;
         if (secs && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');
             badge.className = 'bt-tool-timeout';
@@ -1181,7 +1184,7 @@ class BonitoChat {
             badge.textContent = `⏱ ${secs}`;
             headerEl.insertBefore(badge, headerEl.querySelector('.bt-tool-timer') || null);
         }
-        const worker = node.dataset.btWorker;
+        const worker = owed.worker;
         if (worker && !headerEl.querySelector('.bt-tool-worker')) {
             const wb = document.createElement('span');
             wb.className = 'bt-tool-worker';
@@ -1556,8 +1559,14 @@ class BonitoChat {
             'completed',
             'failed'
         ].includes(node.querySelector('.bt-tool-status')?.textContent || '');
-        if (msg.timeout_s) node.dataset.btTimeoutS = String(msg.timeout_s);
-        if (msg.worker) node.dataset.btWorker = String(msg.worker);
+        if (msg.timeout_s || msg.worker) {
+            const prev = this.toolBadges.get(msg.id) || {};
+            this.toolBadges.set(msg.id, {
+                timeout_s: msg.timeout_s || prev.timeout_s,
+                worker: msg.worker || prev.worker
+            });
+            this.applyHeaderBadges(node);
+        }
         if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');
             badge.className = 'bt-tool-timeout';
@@ -1794,6 +1803,7 @@ class BonitoChat {
                     div.innerHTML = this.toolHTML(msg);
                     if (msg.kind === 'bonito_app' || msg.live_embed) div.dataset.btApp = '1';
                     if (msg.id) div.dataset.msgId = msg.id;
+                    this.applyHeaderBadges(div);
                     if (msg.started_at != null) div.dataset.toolStarted = String(msg.started_at);
                     if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
                     _writeToolElapsed(div);
