@@ -25,6 +25,7 @@
     using .TestKit
     const TK = TestKit
 
+    parseInt_px(v) = (m = match(r"^([0-9.]+)px$", String(v)); m === nothing ? -1.0 : parse(Float64, m[1]))
     ITEMS = ".bt-side-item[data-project-id]:not([data-project-id=''])"
     # Mark every chat row; a rebuilt row loses the mark.
     stamp = """(() => { let n = 0;
@@ -129,13 +130,16 @@
                 "!!$(wrap)?.classList.contains('bt-glow-online')"; timeout = 20) == true
             ring = TK.eval_js(server, """(() => {
                 const cs = getComputedStyle($(wrap));
-                return {worker: cs.getPropertyValue('--bt-worker').trim(), border: cs.borderTopColor,
-                        width: parseFloat(cs.borderTopWidth), shadow: cs.boxShadow};
+                const icon = getComputedStyle($(wrap).querySelector('.bt-proj-icon'));
+                return {worker: cs.getPropertyValue('--bt-worker').trim(),
+                        border: cs.borderTopWidth, shadow: icon.boxShadow};
             })()""")
             @test startswith(ring["worker"], "oklch(")
-            @test ring["border"] != "rgba(0, 0, 0, 0)"  # the ring is drawn in the worker colour
-            @test ring["width"] > 0
-            @test ring["shadow"] == "none"               # idle is plain
+            # The ring is a spread shadow on the TILE (a rounded border renders
+            # thinner at the corners), and idle adds nothing beyond it.
+            @test parseInt_px(ring["border"]) == 0
+            @test occursin("1.5px", ring["shadow"])
+            @test count(",", ring["shadow"]) <= 3        # one shadow layer: the ring
             # Every chat on this worker shares the colour.
             @test TK.eval_js(server, """(() => {
                 const wraps = [...document.querySelectorAll('.bt-side-item[data-project-id] .bt-side-icon-wrap')].filter(e => e.offsetParent);
@@ -147,7 +151,7 @@
             TK.send_message(server, "glow")
             @test TK.wait_for(server, "the icon pulses while the agent works",
                 "!!$(wrap)?.classList.contains('bt-glow-active')"; timeout = 20) == true
-            @test TK.eval_js(server, "getComputedStyle($(wrap)).animationName") == "bt-icon-glow"
+            @test TK.eval_js(server, "getComputedStyle($(wrap).querySelector('.bt-proj-icon')).animationName") == "bt-icon-glow"
             TK.screenshot(server, joinpath(tempdir(), "sidebar_ring_glow.png"))
             @test TK.wait_for(server, "and settles when the turn ends",
                 "!!$(wrap)?.classList.contains('bt-glow-online')"; timeout = 30) == true

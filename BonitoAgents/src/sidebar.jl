@@ -664,36 +664,39 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-active",
         "border-left-color" => "var(--bt-accent)",
         "background" => "var(--bt-surface-2)"),
-    # Machine and liveness both live on the icon. The wrapper draws a thin ring
-    # in the worker's fixed colour (`--bt-worker`, set on the wrapper) right on
-    # the picture's edge, following its corners; its negative margin keeps the
-    # row at the icon's own size. Liveness only shows when it departs from the
-    # norm: an idle chat is plain, a turn in flight pulses a thin green edge
-    # (from nothing to about 3px and back), and a chat whose worker is down
-    # greys out under a steady red edge. Only the wrapper's class and colour
-    # ever change, so a status change never re-renders the icon.
+    # Machine and liveness both live on the icon, and both are SPREAD SHADOWS on
+    # the tile itself rather than a border on a wrapper. A rounded border is
+    # drawn as four sides joined at the arcs, so at a fractional device pixel
+    # ratio the curve spreads over more device pixels at lower opacity and the
+    # corners read thinner than the straight sides. A spread shadow is one
+    # filled path, anti-aliased evenly the whole way round — and it follows the
+    # tile's own radius, so the two can never disagree.
+    #
+    # The ring is the worker's fixed colour (`--bt-worker`, set on the wrapper
+    # and inherited). Liveness only shows when it departs from the norm: an idle
+    # chat is plain, a turn in flight pulses a thin green edge (from nothing to
+    # about 3px and back), and a chat whose worker is down greys out under a
+    # steady red edge. Every rule repeats the ring, because one `box-shadow`
+    # declaration replaces another wholesale. Shadows take no layout space, so
+    # the row stays exactly the icon's size and a status change never moves it.
     CSS(".bt-side-item", "position" => "relative"),
     CSS(".bt-side-icon-wrap",
         "position" => "relative", "flex-shrink" => "0",
-        "display" => "flex", "line-height" => "0",
-        "margin" => "-1.5px",
-        "border" => "1.5px solid var(--bt-worker, transparent)",
-        "border-radius" => "10px",
-        "transition" => "box-shadow 250ms"),
+        "display" => "flex", "line-height" => "0"),
     CSS(".bt-side-icon-wrap .bt-proj-icon",
-        "transition" => "filter 250ms, opacity 250ms"),
-    CSS(".bt-glow-active",
+        "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent)",
+        "transition" => "box-shadow 250ms, filter 250ms, opacity 250ms"),
+    CSS(".bt-glow-active .bt-proj-icon",
         "animation" => "bt-icon-glow 1.4s ease-in-out infinite"),
     # From nothing to a hairline of status green about 3px wide and back: a
     # heartbeat at the icon's edge, not a cloud around it.
     CSS("@keyframes bt-icon-glow",
-        CSS("0%",   "box-shadow" => "0 0 0 0 transparent"),
-        CSS("50%",  "box-shadow" => "0 0 2px 1px var(--bt-status-active)"),
-        CSS("100%", "box-shadow" => "0 0 0 0 transparent")),
+        CSS("0%",   "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 0 0 transparent"),
+        CSS("50%",  "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 2px 1px var(--bt-status-active)"),
+        CSS("100%", "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 0 0 transparent")),
     # Worker down: the picture greys out and the same hairline turns red, steady.
-    CSS(".bt-glow-offline",
-        "box-shadow" => "0 0 2px 1px var(--bt-status-offline)"),
     CSS(".bt-glow-offline .bt-proj-icon",
+        "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 2px 1px var(--bt-status-offline)",
         "filter" => "grayscale(1)", "opacity" => "0.5"),
     # Every icon is a picture: the chat's own, or its generated identicon. `cover`
     # so a wide plot or a tall screenshot both fill the tile without letterboxing;
