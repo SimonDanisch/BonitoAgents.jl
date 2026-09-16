@@ -131,19 +131,21 @@
             ring = TK.eval_js(server, """(() => {
                 const cs = getComputedStyle($(wrap));
                 const icon = getComputedStyle($(wrap).querySelector('.bt-proj-icon'));
-                // The colour a shadow is drawn in: everything before its offsets.
-                const shadowColor = s => s.slice(0, s.search(/ -?[0-9.]+px/)).trim();
                 return {worker: cs.getPropertyValue('--bt-worker').trim(),
                         border: cs.borderTopWidth, shadow: icon.boxShadow,
-                        ringColor: shadowColor(icon.boxShadow),
+                        ringColor: icon.backgroundColor, pad: icon.paddingTop,
+                        thumbRadius: getComputedStyle($(wrap).querySelector('.bt-proj-thumb')).borderTopLeftRadius,
                         badgeColor: getComputedStyle($(wrap).querySelector('.bt-proj-tag')).backgroundColor};
             })()""")
             @test startswith(ring["worker"], "oklch(")
-            # The ring is a spread shadow on the TILE (a rounded border renders
-            # thinner at the corners), and idle adds nothing beyond it.
+            # The ring is the tile's own BACKGROUND with the picture inset and
+            # rounded tighter, not a second shape sharing the picture's curved
+            # edge — two shapes on one curve are each anti-aliased against it and
+            # smear the picture's colour along the corner. Idle draws no shadow.
             @test parseInt_px(ring["border"]) == 0
-            @test occursin("1.5px", ring["shadow"])
-            @test count(",", ring["shadow"]) <= 3        # one shadow layer: the ring
+            @test ring["shadow"] == "none"
+            @test parseInt_px(ring["pad"]) > 0
+            @test parseInt_px(ring["thumbRadius"]) > 0
             # The badge wears the machine's colour too — exactly the ring's, so
             # the two read as one identity.
             @test ring["badgeColor"] == ring["ringColor"]

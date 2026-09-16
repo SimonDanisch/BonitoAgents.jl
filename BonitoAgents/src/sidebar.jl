@@ -664,57 +664,61 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-active",
         "border-left-color" => "var(--bt-accent)",
         "background" => "var(--bt-surface-2)"),
-    # Machine and liveness both live on the icon, and both are SPREAD SHADOWS on
-    # the tile itself rather than a border on a wrapper. A rounded border is
-    # drawn as four sides joined at the arcs, so at a fractional device pixel
-    # ratio the curve spreads over more device pixels at lower opacity and the
-    # corners read thinner than the straight sides. A spread shadow is one
-    # filled path, anti-aliased evenly the whole way round — and it follows the
-    # tile's own radius, so the two can never disagree.
+    # Machine and liveness live on the icon. The machine's colour is the tile's
+    # own BACKGROUND, with the picture inset inside it by 1.5px and rounded a
+    # little tighter — so the ring is not a second shape sharing the picture's
+    # curved edge, it IS the outer shape.
     #
-    # The ring is the worker's fixed colour (`--bt-worker`, set on the wrapper
-    # and inherited). Liveness only shows when it departs from the norm: an idle
-    # chat is plain, a turn in flight pulses a thin green edge (from nothing to
-    # about 3px and back), and a chat whose worker is down greys out under a
-    # steady red edge. Every rule repeats the ring, because one `box-shadow`
-    # declaration replaces another wholesale. Shadows take no layout space, so
-    # the row stays exactly the icon's size and a status change never moves it.
+    # That distinction is the whole point. An opaque fill and a clipped picture
+    # that share one curved boundary are each anti-aliased against it
+    # separately, so the picture's fringe blends through the fill's fringe and
+    # paints a ghost arc of the picture's colour along the corner (measured
+    # 2026-09-16: twelve red-into-green pixels on the bottom corners of a green
+    # worker's icon). Now the silhouette is one shape against the page, and the
+    # picture's own edge meets the machine's colour rather than the page.
+    #
+    # The badge sits in the padding box, so the 1.5px of tile background below
+    # and right of it continues the ring in the same colour: flush, one shape.
+    # Liveness is a glow on the tile: an idle chat is plain, a turn in flight
+    # pulses green, and a dead worker's PICTURE greys out (its machine colour
+    # stays, that is identity, not status).
     CSS(".bt-side-item", "position" => "relative"),
     CSS(".bt-side-icon-wrap",
         "position" => "relative", "flex-shrink" => "0",
         "display" => "flex", "line-height" => "0"),
-    CSS(".bt-side-icon-wrap .bt-proj-icon",
-        "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent)",
-        "transition" => "box-shadow 250ms, filter 250ms, opacity 250ms"),
     CSS(".bt-glow-active .bt-proj-icon",
         "animation" => "bt-icon-glow 1.4s ease-in-out infinite"),
     # From nothing to a hairline of status green about 3px wide and back: a
     # heartbeat at the icon's edge, not a cloud around it.
     CSS("@keyframes bt-icon-glow",
-        CSS("0%",   "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 0 0 transparent"),
-        CSS("50%",  "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 2px 1px var(--bt-status-active)"),
-        CSS("100%", "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 0 0 transparent")),
-    # Worker down: the picture greys out and the same hairline turns red, steady.
+        CSS("0%",   "box-shadow" => "0 0 0 0 transparent"),
+        CSS("50%",  "box-shadow" => "0 0 2px 1px var(--bt-status-active)"),
+        CSS("100%", "box-shadow" => "0 0 0 0 transparent")),
+    # Worker down: the picture greys out under a steady red edge.
     CSS(".bt-glow-offline .bt-proj-icon",
-        "box-shadow" => "0 0 0 1.5px var(--bt-worker, transparent), 0 0 2px 1px var(--bt-status-offline)",
+        "box-shadow" => "0 0 2px 1px var(--bt-status-offline)"),
+    CSS(".bt-glow-offline .bt-proj-thumb",
         "filter" => "grayscale(1)", "opacity" => "0.5"),
     # Every icon is a picture: the chat's own, or its generated identicon. `cover`
-    # so a wide plot or a tall screenshot both fill the tile without letterboxing;
-    # the radius sits on the tile with `overflow:hidden` so the image and the
-    # badge share its corners.
+    # so a wide plot or a tall screenshot both fill the tile without letterboxing.
+    # The tile's background IS the machine's ring; the picture rounds itself and
+    # sits inside the padding, so no two shapes share an edge.
     CSS(".bt-proj-icon",
-        "position" => "relative", "overflow" => "hidden",
-        "border-radius" => "8px", "background" => "var(--bt-surface-2)",
+        "position" => "relative", "box-sizing" => "border-box",
+        "padding" => "1.5px", "background" => "var(--bt-worker, var(--bt-border))",
+        "border-radius" => "9.5px",
         "flex-shrink" => "0", "user-select" => "none",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "transition" => "box-shadow 250ms"),
     CSS(".bt-proj-thumb",
         "width" => "100%", "height" => "100%",
-        "object-fit" => "cover", "display" => "block"),
-    # The worker tag: a pane in the corner, clipped by the tile's own rounded
-    # corner, readable over any picture. It wears the MACHINE'S colour, the same
-    # one as the ring, so badge and ring read as one identity. White letters on
-    # `worker_color`'s lightness (OKLCH 52%) carry a soft shadow rather than a
-    # darker pane, so the colour stays exactly the worker's.
+        "object-fit" => "cover", "display" => "block",
+        "border-radius" => "8px",
+        "transition" => "filter 250ms, opacity 250ms"),
+    # The worker tag: a pane flush into the tile's bottom-right corner, cut by
+    # the tile's own curve. It wears the MACHINE'S colour, the same one as the
+    # ring, so badge and ring read as one identity; white letters carry a soft
+    # shadow rather than a darker pane, so the colour stays exactly the worker's.
     # Sized for 1 to 4 characters at 32px.
     CSS(".bt-proj-tag",
         "position" => "absolute", "right" => "0", "bottom" => "0",
@@ -722,7 +726,7 @@ const SidebarStyles = Bonito.Styles(
         "letter-spacing" => "0.02em", "padding" => "2px 3px 2px 4px",
         "color" => "#fff", "background" => "var(--bt-worker, #0f172a)",
         "text-shadow" => "0 1px 2px rgba(15,23,42,0.55)",
-        "border-radius" => "5px 0 0 0", "pointer-events" => "none",
+        "border-radius" => "5px 0 8px 0", "pointer-events" => "none",
         "font-family" => "'Inter', system-ui, sans-serif"),
     # Home icon: borderless 32px slot, glyph in muted text color so it sits
     # quietly above the colorful project tiles. The SVG ships with white
