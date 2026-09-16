@@ -1844,8 +1844,10 @@ class BonitoChat {
             // the virtual window; whichever path builds it, it is not this one.
             // Back off and look again rather than dropping the badge for good.
             // setTimeout, not rAF: a hidden/offscreen window throttles frames to
-            // ~1Hz and the ladder would stretch to a minute.
-            if (attempt < 6 && (node.dataset.btTimeoutS || node.dataset.btWorker))
+            // ~1Hz and the ladder would stretch to a minute. Ten steps ≈ 50s of
+            // patience in total, which a loaded CI runner needs and which costs
+            // nothing once the badge is in (the retry stops at the first hit).
+            if (attempt < 10 && (node.dataset.btTimeoutS || node.dataset.btWorker))
                 setTimeout(() => this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
             return;
         }

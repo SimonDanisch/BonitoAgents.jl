@@ -1170,7 +1170,7 @@ class BonitoChat {
         if (!node || !node.dataset) return;
         const headerEl = node.querySelector?.('.bt-tool-header');
         if (!headerEl) {
-            if (attempt < 6 && (node.dataset.btTimeoutS || node.dataset.btWorker)) setTimeout(()=>this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
+            if (attempt < 10 && (node.dataset.btTimeoutS || node.dataset.btWorker)) setTimeout(()=>this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
             return;
         }
         const secs = node.dataset.btTimeoutS;
