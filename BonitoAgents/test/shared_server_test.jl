@@ -34,6 +34,12 @@ reused for the rest of the worker's life.
 """
 function server()
     if SERVER[] === nothing
+        # An own-server item may have released ours; it is rebuilt here.
+        TK.register_shared_release!() do
+            s = SERVER[]
+            SERVER[] = nothing
+            s === nothing || close(s)
+        end
         # Mock agent = the `MockACP` package inside the test env; its cold start
         # is what the 90 s chat-bind timeout is measured against.
         s = TK.dev_server(agent = default_agent)

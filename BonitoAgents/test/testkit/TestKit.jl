@@ -534,6 +534,32 @@ returned `TestServer` is the handle every helper takes as its first arg.
 `TestServer` with all the browser/eval helpers — used to seed genuine agent
 sessions (e.g. the docs-walkthrough rig); `agent` is then ignored.
 """
+# The long-lived `SharedServer` stack, if some item in this process started one.
+#
+# ONE dev_server at a time per process is the rule (a server is an electron
+# window, a worker subprocess and a mock agent), and ~70 of the e2e items bring
+# their own. That used to be free: with one item per CI job, an item that built
+# its own server ran in a process where the shared one had never started. Under
+# sharding an earlier item starts it and it stays up, so an own-server item runs
+# two full stacks at once — which is exactly how `e2e:worker_zombie` and
+# `e2e:panel_move_scroll` began timing out on CI while passing locally.
+#
+# `SharedServer` registers a releaser here; `dev_server` calls it before building
+# a new stack, and the shared one restarts lazily the next time an item asks for
+# it.
+const RELEASE_SHARED = Ref{Any}(nothing)
+
+"Register how to tear the shared stack down (called by the SharedServer setup)."
+register_shared_release!(f) = (RELEASE_SHARED[] = f; nothing)
+
+"Tear down the shared stack if one is up, so this process runs one at a time."
+function release_shared!()
+    f = RELEASE_SHARED[]
+    f === nothing && return nothing
+    f()
+    return nothing
+end
+
 function dev_server(; agent::Function = (_msg -> end_turn()),
                       port::Union{Int,Nothing} = nothing,
                       browser_width::Int  = 1280,
@@ -546,6 +572,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       strict_load::Bool = false,
                       kwargs...)
     ensure_display!()
+    # One stack at a time in this process — see `RELEASE_SHARED` above. A
+    # SharedServer item later in the shard rebuilds it lazily.
+    release_shared!()
     agent_ref = Ref{Function}(agent)
 
     # 1. Stand up the TCP dispatcher BEFORE we start the dev server, so the

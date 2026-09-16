@@ -85,7 +85,10 @@ open_discover_panel(server) = TK.eval_js(server,
 function run_suite(server)
     server.agent_fn[] = (msg -> [TK.text("Echo: $msg")])
     state = server.h.state
-    wid   = first(keys(state.workers[]))
+    # The worker dials IN; it is not there the instant the server is, and
+    # `first` on an empty dict is an ArgumentError, not a wait (CI, shard 7).
+    @test timedwait(() -> !isempty(state.workers[]), 30.0) === :ok
+    wid = first(keys(state.workers[]))
 
     # A real running chat so the active-chats sidebar has something to list.
     pid = TK.new_chat(server; title = "RunningChat")

@@ -70,12 +70,16 @@
             TK.send_message(server, "msg $i")
             sleep(0.4)
         end
-        sleep(2)
+        # The premise: content must clear the viewport by a lot, or scrollTop 0
+        # would already be "at the bottom" and this test proves nothing. WAIT for
+        # it rather than sleeping towards it — on a loaded CI runner the eight
+        # replies had rendered 54px of content by the old `sleep(2)`.
+        @test TK.wait_for(server, "transcript taller than the viewport",
+            "(() => { const m = $(metrics_js); return m && (m.h - m.ch) > 800; })()";
+            timeout = 60) == true
 
         m0 = TK.eval_js(server, metrics_js)
         @test m0 !== nothing
-        # The premise: content must clear the viewport by a lot, or scrollTop 0
-        # would already be "at the bottom" and this test proves nothing.
         @test Int(m0["h"]) - Int(m0["ch"]) > 800
 
         @testset "following the bottom survives a park/re-place" begin

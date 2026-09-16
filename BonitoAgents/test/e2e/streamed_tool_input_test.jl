@@ -92,11 +92,14 @@
             "n.querySelector('.bt-tool-header')?.dataset.expanded === 'true'; })()";
             timeout = 15) == true
 
-        # The ⏱ timeout badge inserted late (60s from rawInput.timeout).
+        # The ⏱ timeout badge inserted late (60s from rawInput.timeout). Same
+        # budget as the Monaco-body wait above: both ride the same late args
+        # update, and 10s was the odd one out (it timed out on CI while its
+        # sibling passed).
         @test TK.wait_for(s, "⏱ badge inserted late",
             "(() => { const b = document.querySelector('.bt-tool-timeout'); " *
             "return b && b.innerText.indexOf('60') !== -1; })()";
-            timeout = 10) == true
+            timeout = 15) == true
 
         # The ⊗ stop button inserted late (bt_julia_eval is EVAL_STOPPABLE).
         @test TK.wait_for(s, "⊗ stop button inserted late",
