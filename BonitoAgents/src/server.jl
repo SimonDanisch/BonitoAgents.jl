@@ -161,21 +161,48 @@ end
 #   julia --project=. -m BonitoAgents --public-url https://team.example.com --secret <hex>
 #
 # Flags: --port --host --public-url --secret --state-dir --working-dir
-function (@main)(args::Vector{String})
-    opts = parse_server_args(args)
-    sd_arg = get(opts, "state-dir", "")
-    state_dir = isempty(sd_arg) ?
-        joinpath(homedir(), ".local", "share", "bonitoagents-server") : sd_arg
+"""
+    start_server(opts; state_dir, working_dir) -> Bonito.Server
+
+Configure and start a server PROCESS from parsed command-line options. The one
+place that turns options into a `serve()` call, so the two entry points —
+`bin/bonitoagents-server` (`julia -m BonitoAgents`, the systemd deployment) and
+the desktop bundle's `bonitoagents server` — differ in their DEFAULTS and in
+nothing else.
+
+They used to be two hand-written copies of the same call, and the copies drifted:
+the file-log redirect was added to the app's copy only, so the server that runs a
+whole fleet wrote no log at all and a hang left nothing behind but journald on the
+server host. `state_dir`/`working_dir` are the defaults a caller wants when the
+user passed no `--state-dir`/`--working-dir` (the app roots them under its shared
+data dir; the daemon uses the XDG-ish path below).
+
+Unlike `serve()`, this is for a process that OWNS its stdout, so the file log is
+on: `--log-file` overrides it, `""` means `<state-dir>/logs/server.log`. That file
+is what `bt_dev_logs(source="server")` reads, and the only log that survives the
+restart you do when the server wedges.
+"""
+function start_server(opts::AbstractDict;
+                      state_dir::AbstractString =
+                          joinpath(homedir(), ".local", "share", "bonitoagents-server"),
+                      working_dir::AbstractString = "")
+    sd = let v = get(opts, "state-dir", ""); isempty(v) ? state_dir : v end
+    wd = let v = get(opts, "working-dir", ""); isempty(v) ? working_dir : v end
     secret = get(opts, "secret", "")
-    isempty(secret) && (secret = persisted_worker_secret(state_dir))
-    serve(;
+    isempty(secret) && (secret = persisted_worker_secret(sd))
+    return serve(;
         worker_secret = secret,
         host          = get(opts, "host", "0.0.0.0"),
         port          = parse(Int, get(opts, "port", "8038")),
         public_url    = get(opts, "public-url", ""),
-        state_dir     = state_dir,
-        working_dir   = get(opts, "working-dir", ""),
+        state_dir     = sd,
+        working_dir   = wd,
+        log_file      = get(opts, "log-file", ""),
     )
+end
+
+function (@main)(args::Vector{String})
+    start_server(parse_server_args(args))
     wait()
     return 0
 end

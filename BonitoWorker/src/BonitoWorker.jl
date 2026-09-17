@@ -829,7 +829,12 @@ function spawn_worker(; force_restart::Bool = false)
     rotate_spawn_log!(logfile)
     project = something(Base.active_project(), "@bonito-agents")
     cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
-    proc = run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true);
+    # Tell the child that fd 1/2 ARE the log, so it does not redirect a second
+    # time (that would split the log and rotate the file out from under our
+    # descriptor). Every other way a worker starts — the installer's systemd
+    # unit above all — has no such parent, and must redirect itself.
+    proc = run(pipeline(detach(addenv(cmd, LOG_INHERITED_ENV => "1"));
+                        stdout = logfile, stderr = logfile, append = true);
                wait = false)
     return proc, logfile
 end
@@ -887,10 +892,20 @@ function start(; force::Bool = false)
     # it late means the first seconds of a worker's life — which is where a
     # failed dial or a bad config shows up — go to wherever the service manager
     # happened to point them, i.e. nowhere we can read from another machine.
-    # NOT a redirect: `spawn_worker` already launched us with stdout/stderr on
-    # this very file. We only claim it as the log `read_log_file` serves, and
-    # install the timestamping logger so the lines can be sliced by time.
-    start_file_log!(worker_log_path(); redirect = false)
+    # Redirect unless our PARENT already pointed fd 1/2 at this file —
+    # `spawn_worker` does, and says so through `LOG_INHERITED_ENV`; redirecting
+    # again would split the log in two and rotate the file out from under the
+    # parent's descriptor.
+    #
+    # Every other launch has no such parent, and this used to assume one
+    # unconditionally. The installer's systemd unit runs
+    # `julia -e 'using BonitoWorker; BonitoWorker.start()'` with stdout going to
+    # journald, so the worker DECLARED a log path and wrote nothing to it: on
+    # every machine that runs as a service, `bt_dev_logs(source=<worker>)` read
+    # an empty or months-old file while the real output sat in a journal no
+    # other machine can reach.
+    start_file_log!(worker_log_path();
+                    redirect = get(ENV, LOG_INHERITED_ENV, "") != "1")
     cfg = config_path()
     isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
                           "(`curl -fsSL <server-url>/install.jl | julia -`)")
@@ -3882,6 +3897,11 @@ const LOG_MAX_LINES  = 2000               # …and the most we ever return
 const LOG_ROTATE_CHECK_S = 30.0
 
 # Process-global because the thing it describes — fd 1 and fd 2 — is.
+# Set by `spawn_worker` on the child it launches: "fd 1 and 2 are already this
+# process's log file, do not redirect again". Absent for every other launch
+# (systemd unit, a bare `BonitoWorker.start()`, the app's `worker` mode), which
+# is exactly when the process has to redirect itself.
+const LOG_INHERITED_ENV = "BONITOAGENTS_LOG_INHERITED"
 const LOG_FILE   = Ref("")
 const LOG_HANDLE = Ref{Union{IOStream,Nothing}}(nothing)
 
