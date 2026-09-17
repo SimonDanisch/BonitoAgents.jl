@@ -109,7 +109,12 @@
         # intended. This assertion failed on CI for five runs with the badge
         # present the whole time (the card dump below is what finally showed
         # `<span class="bt-tool-timeout">⏱ 60s</span>` in the header).
-        badge_js = "(() => { const b = document.querySelector('.bt-tool-timeout'); " *
+        # Scoped to THIS card, not `document`. The shared server keeps earlier
+        # items' chats in the page, so a document-wide query returns whichever
+        # eval card is first — which is how this failed while the dump showed
+        # `⏱ 60s` sitting in ev1's own header.
+        badge_js = "(() => { const n = $(card("ev1")); " *
+                   "const b = n && n.querySelector('.bt-tool-timeout'); " *
                    "return !!(b && (b.textContent || '').indexOf('60') !== -1); })()"
         badge_ok = false
         for _ in 1:150
@@ -127,8 +132,10 @@
         @test badge_ok
 
         # The ⊗ stop button inserted late (bt_julia_eval is EVAL_STOPPABLE).
+        # Scoped for the same reason as the badge above.
         @test TK.wait_for(s, "⊗ stop button inserted late",
-            "!!document.querySelector('.bt-tool-stop')"; timeout = 10) == true
+            "(() => { const n = $(card("ev1")); " *
+            "return !!(n && n.querySelector('.bt-tool-stop')); })()"; timeout = 10) == true
 
         # The pill is still live (pulsing/taskbar gate) while the preview shows.
         @test TK.wait_for(s, "pill still live while preview shows",
