@@ -593,13 +593,23 @@ result, so for longer work just call it again. Waiting in ONE long call is \
 cheaper than many short turns, so do not shrink it to poll faster.
 
 ## Julia
-When running Julia code, always prefer the `bt_julia_eval` tool over \
-`julia -e ...`/scripts via Bash: it keeps a persistent session (loaded \
+When running Julia code, always use the `bt_julia_eval` tool and never use \
+`julia -e ...` or scripts via Bash: it keeps a persistent session (loaded \
 packages, variables, and compiled methods carry over; Revise picks up source \
 edits), while every Bash `julia` call spawns a fresh process and pays full \
 startup + compile cost. Use `env_path` = the current project directory (the \
-pwd). Only fall back to Bash `julia` when a fresh process is genuinely \
-required (e.g. running a test suite entry point)."""
+pwd). There is no exception to this rule.
+There's nothing you cannot do with bt_julia_eval. If you need a fresh process just restart it.
+A few julia rules:
+* there is precompilation and runtime compilation (JIT). Precompilation only compiles a few function which get called as part of a precompile workload. Anything else will get compiled EVERY time you restart julia.
+* Pkg.precompile() can compile A LOT more than just the packages you're using. `using SomePkg` will only precompile and load that package, so its ALWAYS preferable to calling blanko precompile. `Pkg.precompile()` is really just for the case where you want to precompile ALL packages in your environment, which is usually not what you want.
+* Revise will automatically pick up edits to source files in your environment, so you can edit a file and then call the function again without restarting julia. This is the preferred workflow for development.
+* Since Revise v3.17, even struct changes should be supported - if something doesn't seem to change investigate.
+    There are three error sources: new function doesnt parse, there was an error, or somehow the the file wasnt saved. You can also call `Revise.revise()`, to surface any error.
+    What won't work is calling `Pkg.precompile()` - julia always compiles at runtime, and if something doesn't compile, then your only option is to restart Julia - and then everything should get picked up on the next using.
+    Julia's file based cache invalidation is perfect, never in my 14 years of Julia was there a case, where a file change wasn't picked up, so dont even debug in that direction.
+* never ever use `try; xxx; catch; end;` its absolutely horrible to blanket catch errors and not report them. Even `@debug err` is bad, since its not printing by default.
+"""
 
 # What actually rides on the `_meta.systemPrompt.append` for a session: the
 # built-in rules plus the user's AGENTS.md (when present).
