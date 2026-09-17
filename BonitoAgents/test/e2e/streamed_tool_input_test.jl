@@ -115,10 +115,12 @@
         end
         badge_ok || @info "badge missing — card state" card = TK.eval_js(s,
             "(() => { const n = $(card("ev1")); return n ? " *
-            "{header: !!n.querySelector('.bt-tool-header'), " *
+            "{hasHeader: !!n.querySelector('.bt-tool-header'), " *
             " cards: document.querySelectorAll('.bt-tool-msg').length, " *
+            " stop: !!n.querySelector('.bt-tool-stop'), " *
             " connected: n.isConnected, " *
-            " html: (n.outerHTML || '').slice(0, 300)} : 'no card'; })()")
+            " header: (n.querySelector('.bt-tool-header')||{}).outerHTML || ''} " *
+            ": 'no card'; })()")
         @test badge_ok
 
         # The ⊗ stop button inserted late (bt_julia_eval is EVAL_STOPPABLE).
