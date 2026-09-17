@@ -47,6 +47,19 @@ const TK = TestKit
 # `(; myapp, other)` paths for the testsets that build projects on them.
 function seed_discovered!(server, wid)
     state = server.h.state
+    # Wait out the AUTOMATIC scan first. The server fires one when a worker
+    # first connects (`worker_client.jl`, guarded by "no cached scan yet"), and
+    # when it lands it OVERWRITES `state.discovered[wid]` — the sink we are
+    # about to seed. Seeding first is a race, and losing it is invisible: the
+    # tree still renders, just with whatever agents are installed on the box
+    # running the suite (mimo/opencode/kimi each list their real sessions), so
+    # `.bt-group` counts pass and every assertion naming MyApp fails. It cost a
+    # full-suite run to diagnose, and it only reproduces when the scan is slow
+    # enough to land after the seed.
+    t0 = time()
+    while time() - t0 < 60 && !lock(() -> haskey(state.last_scan, wid), state.lock)
+        sleep(0.1)
+    end
     base   = mktempdir()
     myapp  = mkpath(joinpath(base, "MyApp"))
     other  = mkpath(joinpath(base, "Other"))
@@ -72,7 +85,10 @@ open_discover_panel(server) = TK.eval_js(server,
 function run_suite(server)
     server.agent_fn[] = (msg -> [TK.text("Echo: $msg")])
     state = server.h.state
-    wid   = first(keys(state.workers[]))
+    # The worker dials IN; it is not there the instant the server is, and
+    # `first` on an empty dict is an ArgumentError, not a wait (CI, shard 7).
+    @test timedwait(() -> !isempty(state.workers[]), 30.0) === :ok
+    wid = first(keys(state.workers[]))
 
     # A real running chat so the active-chats sidebar has something to list.
     pid = TK.new_chat(server; title = "RunningChat")
@@ -142,7 +158,7 @@ function run_suite(server)
                 p = BT.ProjectInfo("renamed-other", "Other", wid,
                                    seeded.other, seeded.other, BT.Dates.now())
                 p.resume_session_id = "cccc3333"
-                p.title = "Renamed Other Chat"
+                p.title[] = "Renamed Other Chat"
                 p.dismissed = true
                 state.projects[]["renamed-other"] = p
             end

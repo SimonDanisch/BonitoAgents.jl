@@ -40,6 +40,8 @@
     try
         TK.open_browser(s; width = 1280, height = 880)
         state = s.h.state
+        # The worker dials IN; `first` on an empty dict throws rather than waits.
+        @test timedwait(() -> !isempty(state.workers[]), 30.0) === :ok
         wid   = first(keys(state.workers[]))
         cwd   = mktempdir(; prefix = "bt-resume-nojs-")
         sid   = "sess-resume-nojs-1"

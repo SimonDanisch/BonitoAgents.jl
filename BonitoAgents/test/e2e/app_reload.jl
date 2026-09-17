@@ -140,6 +140,20 @@ function run_suite(server)
             "(() => { const e=document.querySelector('.rapp-out'); return !!(e && e.innerText==='RAPP=0'); })()";
             timeout = 15) == true
         @test reload_click_until(server, "RAPP=11")
+
+        # Stability: several MORE reloads back-to-back. Each tears down the tab's
+        # page-root (`close_root`) and opens a fresh one; every cycle must re-mount
+        # a LIVE embed (fresh instance @0) whose click still round-trips through the
+        # worker. A leaked page-root or a stale `page_conn` binding would surface
+        # here as a dead embed (RAPP never reaches 0, or the click never lands).
+        for i in 1:4
+            @test reload_and_reopen(server, pid)
+            @test TK.wait_for(server, "reload #$(i + 2): fresh @0",
+                "(() => { const e=document.querySelector('.rapp-out'); return !!(e && e.innerText==='RAPP=0'); })()";
+                timeout = 15) == true
+            @test reload_click_until(server, "RAPP=11")
+        end
+        @test isempty(TK.js_errors(server))
     end
     return server
 end

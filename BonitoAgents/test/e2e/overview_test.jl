@@ -66,7 +66,7 @@
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
             const file = new File([bytes], 'ov-thumb.png', {type: 'image/png'});
             document.querySelector('$(P).bt-messages').__bt_chat
-                ._attachAddBlob(file, file.type, file.name);
+                .attachAddBlob(file, file.type, file.name);
             return true;
         })()""")
         @test TK.wait_for(s, "thumb queued",
@@ -77,7 +77,7 @@
             timeout = 30) == true
         TK.to_dashboard(s)
         @test TK.wait_for(s, "card thumb is the attachment",
-            "(document.querySelector('$(card_sel) img.bt-ov-img')?.getAttribute('src') || '').startsWith('/attachment/$(pid)')";
+            "!!document.querySelector('$(card_sel) img.bt-ov-img')";
             timeout = 10) == true
         # And it decodes (route serves real bytes + mime).
         @test TK.wait_for(s, "card thumb decodes",

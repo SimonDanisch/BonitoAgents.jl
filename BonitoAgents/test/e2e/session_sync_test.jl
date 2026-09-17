@@ -43,17 +43,26 @@
                          length(msgs(state, p.id)) == 2)
         @test texts(state, p.id) == ["hi", "hello"]
 
+        # Mark the session newer than our sync stamp, through the worker-scan
+        # sink. Always write the WHOLE entry: the sink belongs to the real worker
+        # scan, which overwrites it whenever it reports — on a machine where the
+        # scan finds nothing it reports an empty list, and mutating
+        # `discovered[][wid][1]` then died with a BoundsError (CI, every run).
+        function mark_newer!(dt)
+            lock(state.lock) do
+                state.discovered[][wid] = [Dict{String,Any}(
+                    "session_id" => "s", "path" => p.worker_path, "name" => p.name,
+                    "last_used" => time() + dt, "kind" => "session")]
+            end
+            notify(state.discovered)
+        end
+
         # Advance the session OUTSIDE (the CLI): two more turns. Stop the
         # bound session, mark the session newer than our sync stamp via the
         # worker-scan sink, and REOPEN — the tail must appear WITHOUT a send.
         push!(history, TK.user("outside question"), TK.text("outside reply"))
         BA.stop_session!(state, p)
-        lock(state.lock) do
-            state.discovered[][wid] = [Dict{String,Any}(
-                "session_id" => "s", "path" => p.worker_path, "name" => p.name,
-                "last_used" => time() + 5, "kind" => "session")]
-        end
-        notify(state.discovered)
+        mark_newer!(5)
         BA.ensure_project_session!(state, p)
         @test poll(() -> length(msgs(state, p.id)) == 4)
         @test texts(state, p.id) == ["hi", "hello", "outside question", "outside reply"]
@@ -67,10 +76,7 @@
             TK.user("outside question"), TK.text("outside reply"),
             TK.user("post-compact question"), TK.text("post-compact answer")])
         BA.stop_session!(state, p)
-        lock(state.lock) do
-            state.discovered[][wid][1]["last_used"] = time() + 10
-        end
-        notify(state.discovered)
+        mark_newer!(10)
         BA.ensure_project_session!(state, p)
         @test poll(() -> length(msgs(state, p.id)) == 6)
         @test texts(state, p.id)[end-1:end] == ["post-compact question", "post-compact answer"]
@@ -81,10 +87,7 @@
         # ABOVE the user's fresh message — it stays LAST.
         push!(history, TK.user("even newer"), TK.text("even newer reply"))
         BA.stop_session!(state, p)
-        lock(state.lock) do
-            state.discovered[][wid][1]["last_used"] = time() + 15
-        end
-        notify(state.discovered)
+        mark_newer!(15)
         BA.ensure_project_session!(state, p)   # async sync kicks off…
         model = state.chat_models[p.id]
         BA.send_message!(model, BA.UserMsg(model, "typed while stale"))  # …user types NOW

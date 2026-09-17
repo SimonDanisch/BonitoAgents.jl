@@ -30,9 +30,8 @@ function run_suite(server)
         end
 
         @testset "killing the worker process shows it offline" begin
-            wp = server.h.worker_proc
-            @test wp !== nothing
-            kill(wp)   # real disconnect: the worker machine goes away
+            @test server.h.worker_proc !== nothing
+            TK.kill_worker!(server)   # real disconnect: the worker machine goes away
             @test TK.wait_for(server, "0 online",
                 "(() => { const m = document.body.innerText.match(/(\\d+)\\s*\\/\\s*\\d+\\s*workers online/); return m && parseInt(m[1]) === 0; })()"; timeout = 15) == true
             @test TK.wait_for(server, "no online dots",

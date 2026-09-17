@@ -52,14 +52,65 @@ sessions the server had already abandoned.
 
 ## Files between server and worker
 
-Project trees move with librsync-based directory sync (import, and project
-move between workers); single files move over a dedicated transfer channel.
+Project trees move with librsync-based directory sync (import, and continuing
+a chat on another worker); single files move over a dedicated transfer channel.
 The file editor always stats and re-fetches through the worker before showing
 content, and *Save* writes back to the worker. The server-side mirror is a
 cache, never the source of truth. Oversized or binary files are refused with a
 clear message before any transfer starts.
 
+## Continuing a chat on another worker
+
+A chat's ⋯ menu lists every other online worker under *Continue on*. Picking
+one moves the whole chat: the project's files travel through the server to the
+other worker's projects root, the project is re-bound there, and the agent
+session is brought up on the new machine. The agent's own record of the
+conversation travels too. For Claude Code that is the transcript, the subagent
+transcripts and the project memory under `~/.claude/projects/`, rewritten to
+the new working directory, so the agent picks up with its memory intact.
+
+The move refuses to run while a turn is in flight (stop it or wait), and it
+needs the current worker online to carry the conversation; if the record can't
+be carried (a provider without a movable record, the source offline, a failed
+transfer) the chat still moves and the agent starts fresh there. The messages
+already in the chat stay visible either way, and a toast says which of the two
+happened.
+
 ## Managing workers
+
+### Remote Julia transport
+
+Remote Julia requests, replies, stdout, interrupts, and dev-tool requests use
+the workers' existing authenticated connections to the server. Each chat's MCP
+process connects to a loopback listener on its own worker daemon using a token
+scoped to that chat. A remote eval host uses the same local relay on the target
+worker. The server still enforces the chat's **Remote julia** switch.
+
+The control path is:
+
+```text
+chat MCP → local daemon → server → target daemon → eval host
+           loopback      existing worker connections      loopback
+```
+
+Local relay coordinates are supplied explicitly in ACP's MCP launch environment,
+including when a chat is resumed. MCP control does not need the server URL or
+server secret. Worker disconnects close their local channels and fail pending
+control requests; reconnects establish new channels. Queues for slow local
+clients are bounded so they cannot stall worker heartbeats.
+
+The separate interactive-rendering bridge still carries Bonito app/plot traffic.
+Older workers retain the legacy direct MCP control connection. Update the server
+and workers, then restart existing agent sessions to use the daemon relay.
+
+Tests for this boundary are `unit:mcp_relay` (real MCP subprocess with no server
+coordinates, cancellation, disconnects, routing, and queue bounds) and
+`e2e:remote_eval` (real worker daemons and MCP processes, with a deterministic
+agent that filters inherited environment variables). The latter runs in CI.
+TestKit's default in-process MCP simulator remains useful for UI tests but does
+not cover process launch; use `real_process=true` for that coverage.
+
+### Worker controls
 
 Each worker card on the dashboard shows its status dot, lets you rename it,
 and offers *Rescan* to refresh the discovered-sessions list. The `worker.log`

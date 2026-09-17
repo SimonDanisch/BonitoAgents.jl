@@ -9,6 +9,7 @@ module MockACP
 # mock_logic.jl.
 
 include("mock_logic.jl")
+include("real_mcp.jl")
 
 # Application entry point for `julia -m MockACP`. Read the spawner's env (scenario
 # / dispatcher coords), then run the JSON-RPC dispatcher loop until stdin EOFs

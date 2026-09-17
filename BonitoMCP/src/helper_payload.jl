@@ -8,13 +8,31 @@ module BonitoMCPHelper
 
 using Base64
 
-# Soft-scope transform for REPL-style top-level eval (see `repl_eval`). REPL is
-# a stdlib (always in the sysimage), so this import is essentially free; fall
-# back to hard scope (identity) only if it somehow can't resolve.
+# Soft-scope transform for REPL-style top-level eval (see `repl_eval`).
+#
+# `Base.require` rather than `@eval import REPL; REPL.softscope`: the latter
+# creates the `REPL` binding and READS it inside one top-level expression, and
+# under Julia 1.12's stricter world-age rules for global bindings a
+# freshly-created binding is not reliably visible in the world the same
+# expression is running in. `require` hands back the module object, so there is
+# no binding to see.
+#
+# The fallback must be LOUD. Degrading to `identity` silently swaps the eval's
+# scoping rules for the life of the worker — `acc = 0; for i in 1:5; acc += i;
+# end` then dies with "UndefVarError: acc not defined in local scope", which
+# reads as a bug in the user's code, not as "REPL didn't load". The two ways it
+# actually happens: a LOAD_PATH without `@stdlib` (a parent process exporting
+# `JULIA_LOAD_PATH` — `Pkg.test` does exactly that), or a transient failure
+# while precompiling/loading REPL.
+const REPL_PKGID = Base.PkgId(Base.UUID("3fa0cd96-eef1-5676-8a61-b3b8758bbffb"), "REPL")
+
 const SOFTSCOPE = try
-    @eval import REPL
-    REPL.softscope
-catch
+    getfield(Base.require(REPL_PKGID), :softscope)
+catch e
+    e isa InterruptException && rethrow()
+    @warn "bt_julia_eval: could not load REPL, so evals fall back to FILE (hard) scope — " *
+          "a top-level `for`/`while` will NOT be able to assign a global. " *
+          "Usually a LOAD_PATH without `@stdlib`." exception = (e, catch_backtrace()) load_path = LOAD_PATH
     identity
 end
 
@@ -43,6 +61,31 @@ neither property. Backtrace noise from `include_string` is already trimmed
 """
 repl_eval(code::AbstractString) =
     Base.include_string(SOFTSCOPE, Main, String(code), "bt_julia_eval")
+
+# The task currently running an eval, set by the wrapper in session.jl::execute.
+const EVAL_TASK = Ref{Union{Task,Nothing}}(nothing)
+
+"""
+    interrupt_eval() -> Bool
+
+Throw an `InterruptException` into the in-flight eval task, returning whether it
+was delivered. False means the host must escalate to SIGINT.
+
+A bare SIGINT goes to whichever task the scheduler happens to be running, which
+is very often the 4Hz stdout flusher rather than the eval — hence targeting the
+task directly.
+
+Only a task PARKED in a wait queue (`sleep`, blocking IO) can be reached this
+way. `schedule` on an executing task silently fails to stop it and is documented
+as scheduler-corrupting, so a tight loop reports false and takes the signal.
+"""
+function interrupt_eval()
+    t = EVAL_TASK[]
+    (t === nothing || istaskdone(t)) && return false
+    t.queue === nothing && return false     # executing, not parked
+    schedule(t, InterruptException(); error = true)
+    return true
+end
 
 # One worker call: REPL-eval the code, then format the result value. A user
 # error thrown by the eval propagates to the caller's try/catch (→ format_error).
@@ -94,30 +137,91 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
         !full_output && is_large_container(val) ? summarize_container(val) : result_repr(val),
         max_bytes, full_output, "result")
 
-    ref = nothing
+    # Bridge path: park the value for the live embed, and — for a DISPLAY value
+    # (App/plot/rich) — pre-render its DOM to compact, assetless HTML for the
+    # agent. The pre-render runs the App body HERE (inside the eval's captured
+    # stdout), so a render-time error surfaces to the agent as a normal error
+    # instead of failing silently at mount. Throwing inside is caught here and
+    # degrades to the no-bridge text path below.
     if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
-        ref = try
-            Main.RemoteProxy.remote_ref(val)
+        result = try
+            bridge_result(val, repr, max_bytes, full_output)
         catch e
-            @warn "format_value: remote_ref failed; falling back to text/file preview" exception = (e, catch_backtrace())
+            @warn "format_value: bridge path failed; falling back to text/file preview" exception = (e, catch_backtrace())
             nothing
         end
+        result === nothing || return result
     end
-    # A parked ref IS displayed live as the result embed — the pane shows the
-    # value, so there must be ZERO Output for it (`echo = nothing`): the Output
-    # section is captured STDOUT only, never the result repr. The agent still
-    # reads the result from the descriptor's `repr` field.
-    ref === nothing ||
-        return (; blocks = Dict{String,Any}[],
-                  html = result_descriptor(ref, false, repr),
-                  errored = false, echo = nothing)
 
-    # No bridge (standalone MCP): no embed, so the repr echo IS the result —
-    # append it to the output; add an on-disk rich preview when genuinely visual.
+    # No bridge (standalone MCP OR the env's Bonito is too old): no embed, so the
+    # repr echo IS the result — append it to the output; add an on-disk rich
+    # preview when genuinely visual. `wants_display` flags a value that WOULD have
+    # rendered live (a Bonito App / Makie plot / rich image) so the host can offer
+    # the version-upgrade card instead of just degrading to text.
     blocks = Dict{String,Any}[]
     show_block = try_save_rich(val, out_dir, max_bytes)
     show_block === nothing || push!(blocks, show_block)
-    return (; blocks = blocks, html = nothing, errored = false, echo = repr)
+    return (; blocks = blocks, html = nothing, errored = false, echo = repr,
+              wants_display = is_display_type(val) || show_block !== nothing)
+end
+
+# The bridge result: parks `val` for the live embed and builds the agent-facing
+# descriptor. A DISPLAY value (App/plot/rich) is pre-rendered to compact,
+# assetless HTML (`RemoteProxy.summary_html`) so the agent sees the REAL DOM,
+# not a bare note — and because that render runs the App body, a render-time
+# failure comes back as a `CapturedException`: surface it like an error value
+# (park the exception so the embed shows it via `jsrender(::CapturedException)`,
+# echo the terminal-faithful red error so it lands in the agent's captured
+# stdout) while the MCP-level `errored` stays FALSE — the eval succeeded, only
+# the display failed. A plain value keeps its short text repr. Any throw here
+# propagates to `format_value`, which degrades to the no-bridge text path.
+function bridge_result(val, repr::AbstractString, max_bytes::Int, full_output::Bool)
+    RP = Main.RemoteProxy
+    if is_display_type(val)
+        sm = RP.summary_html(val)
+        if sm isa CapturedException
+            ref = RP.remote_ref(sm)
+            echo = "\e[91mERROR: " *
+                   truncate_text(sprint(showerror, sm), max_bytes, full_output, "result") *
+                   "\e[39m"
+            return (; blocks = Dict{String,Any}[],
+                      html = result_descriptor(ref, true, ""), errored = false, echo = echo)
+        end
+        ref = RP.remote_ref(val)
+        return (; blocks = Dict{String,Any}[],
+                  html = result_descriptor(ref, false,
+                           truncate_text(sm, max_bytes, full_output, "result")),
+                  errored = false, echo = nothing)
+    end
+    # Plain value: park for the embed, keep the short text repr (rendering
+    # `App(42)` to `<div>42</div>` is more tokens and less clear than "42").
+    ref = RP.remote_ref(val)
+    return (; blocks = Dict{String,Any}[],
+              html = result_descriptor(ref, false, display_repr(val, repr)),
+              errored = false, echo = nothing)
+end
+
+# The agent-facing `repr` for a value parked as a LIVE embed. For a plain value
+# the repr IS the value, so keep it. For an INTERACTIVE display (a Bonito `App`
+# or a Makie plot/figure) the bare type repr — a lone "App" — reads like nothing
+# happened and leaves the agent unsure the display worked; replace it with an
+# explicit note that the value is now shown live & interactive in the chat. Type
+# match is by name so no Bonito/Makie dependency is needed in the worker env.
+function display_repr(val, repr::AbstractString)
+    n = string(nameof(typeof(val)))
+    kind = n == "App" ? "interactive app" :
+           (startswith(n, "Figure") || n == "Scene" || endswith(n, "Plot")) ? "interactive plot" :
+           nothing
+    kind === nothing && return repr
+    return "⟨$(kind) displayed live in the chat — the user can see and interact with it now⟩"
+end
+
+# A rich, INTERACTIVE display value (Bonito `App` or a Makie plot) by type name —
+# no Bonito/Makie dependency needed in the worker env. Used to decide whether a
+# value that couldn't reach the live bridge would have WANTED to display (so the
+# host can offer the version-upgrade card instead of silently degrading to text).
+is_display_type(val) = let n = string(nameof(typeof(val)))
+    n == "App" || startswith(n, "Figure") || n == "Scene" || endswith(n, "Plot")
 end
 
 # The result descriptor json the chat decodes (BonitoAgents remote_app.jl):
@@ -177,7 +281,9 @@ function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
             if length(png) <= cap
                 return write_show_file(out_dir, base, ".png", "image/png", png, val)
             end
-        catch
+        catch e
+            e isa InterruptException && rethrow()
+            @debug "try_save_rich: PNG encode failed (falling through to next MIME)" exception = e
         end
     end
 
@@ -222,7 +328,8 @@ typeof_short(val) = string(typeof(val).name.name)
 function showable_safe(mime::MIME, val)
     try
         return showable(mime, val)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return false
     end
 end
@@ -235,7 +342,8 @@ function sprint_mime(val, mime::MIME)
         io = IOBuffer()
         show(io, mime, val)
         return take!(io)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return UInt8[]
     end
 end
@@ -273,7 +381,8 @@ function format_error(err, bt, max_bytes::Int, full_output::Bool)
     # Unlike a value, an ERROR keeps its echo in the output stream: the agent
     # must SEE the failure prominently (not buried in a descriptor) to fix the
     # code, and the red console error is the terminal-faithful view. The embed
-    # renders the exception too — redundancy is warranted for errors.
+    # renders the exception too — redundancy is warranted for errors. `remote_ref`
+    # returns the holder id; this IS the error, so the descriptor is always errored.
     html = ref === nothing ? nothing : result_descriptor(ref, true, "")
     return (; blocks = Dict{String,Any}[], html = html, errored = true, echo = echo)
 end

@@ -218,11 +218,22 @@ then `mv`) so a transport crash mid-file leaves the prior version intact.
 signature/delta exchange. Use for user-confirmed directional overwrites
 where correctness beats the round-trips saved by skipping.
 
+`delete_extraneous = true` turns the transfer into a mirror: files under `root`
+that the sender's manifest does not name are deleted once the transfer is
+complete. OFF by default, and meant for a receiver that owns `root` (the
+BonitoAgents server pulling a project into its own mirror). A destination on a
+user's machine is never ours to empty: a project move once pushed a never-synced
+(empty) server mirror to a worker with mirror semantics and deleted every file of
+the live project there (2026-09-15). Even when on, an EMPTY manifest never
+drives deletions: mirroring nothing onto a populated folder is refused before a
+single file goes.
+
 Returns a NamedTuple `(written, deleted, skipped)` with file counts.
 """
 function receive_directory(root::AbstractString, transport::IO;
                            on_progress = nothing,
-                           quick_check::Bool = true)
+                           quick_check::Bool = true,
+                           delete_extraneous::Bool = false)
     mkpath(root)
     notify_progress(on_progress, :wait_manifest, NamedTuple())
 
@@ -233,6 +244,11 @@ function receive_directory(root::AbstractString, transport::IO;
     notify_progress(on_progress, :manifest_received, (count = length(manifest),))
 
     plan = build_plan(root, manifest; quick_check)
+    if delete_extraneous && isempty(manifest)
+        doomed = count(p -> p.action == ACTION_DELETE, plan)
+        doomed == 0 || error("RemoteSync receiver: refusing to delete $(doomed) local file(s) " *
+                             "to mirror an EMPTY source into $(root)")
+    end
     write_frame(transport, TAG_PLAN, encode_plan(plan))
 
     skipped = count(p -> p.action == ACTION_SKIP, plan)
@@ -310,6 +326,7 @@ function receive_directory(root::AbstractString, transport::IO;
 
     for p in plan
         p.action == ACTION_DELETE || continue
+        delete_extraneous || continue
         # DELETE entries are produced by our own `build_plan` from a local
         # walkdir, so they're already canonical — but re-validate before `rm`
         # so an unsafe path can NEVER drive a delete outside root (R1/R7).

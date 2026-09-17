@@ -30,7 +30,7 @@
         replay   = [RU("hi"), RA("hello"), RU("more"), RA("sure")]
         plan = BA.plan_reconcile(existing, replay, 0)
         @test plan.mode == :append
-        @test [m.text for m in plan.adopt] == ["more", "sure"]
+        @test [ACP.text(m) for m in plan.adopt] == ["more", "sure"]
     end
 
     @testset "identical store and replay is a no-op" begin
@@ -51,7 +51,7 @@
                   RU("new question"), RA("new answer")]
         plan = BA.plan_reconcile(existing, replay, 0)
         @test plan.mode == :append
-        @test [m.text for m in plan.adopt] == ["new question", "new answer"]
+        @test [ACP.text(m) for m in plan.adopt] == ["new question", "new answer"]
     end
 
     @testset "pending sends never anchor; adoption lands before them" begin
@@ -62,7 +62,7 @@
         replay   = [RU("hi"), RA("hello"), RU("outside turn"), RA("outside reply")]
         plan = BA.plan_reconcile(existing, replay, 1)
         @test plan.mode == :append
-        @test [m.text for m in plan.adopt] == ["outside turn", "outside reply"]
+        @test [ACP.text(m) for m in plan.adopt] == ["outside turn", "outside reply"]
         # splice position: after the known history, before the pending bubble.
         @test plan.insert_at == 2
     end

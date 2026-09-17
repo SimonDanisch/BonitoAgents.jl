@@ -31,15 +31,70 @@ julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=[
 julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=["e2e:media"])'   # one item
 ```
 
-`test_args` entries are OR-ed into a regex over test-item names. The e2e items
-share one long-lived dev server per test worker, which is deliberate so
-cleanup and leak paths soak under accumulation. Tests are never retried: a
-flaky test is a bug, and several production races were found exactly this way.
+`test_args` entries are OR-ed into a regex over test-item names. An extra
+`i/n` argument runs the i-th of n shards of that selection, which is how CI
+fans the e2e items out:
+
+```bash
+julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl '^e2e:' 3/8     # CI's shard 3
+```
+
+The shard list is built from the `@testitem` names in the source, so CI cannot
+drift from the suite. The hand-written job-per-suite matrix it replaced had
+drifted: one entry no item answered to (a red job every run) and nine items
+nothing ever ran. Eight shard jobs also cost about a tenth of the runner time,
+because a job's fixed cost — checkout, apt, a 730 MB depot restore — dwarfs the
+sub-minute item it used to run.
+
+Budgets are per ITEM (`testitem_timeout` in `runtests.jl`), not per job: a
+wedged item fails itself and the worker respawns with a fresh dev server.
+Compilation happens in its own CI step (`.github/scripts/warmup.jl` imports
+each env's deps in a fresh process), so no test ever waits on a DOM while the
+machine is busy compiling.
+
+The e2e items share one long-lived dev server per test worker, which is
+deliberate so cleanup and leak paths soak under accumulation. Tests are never
+retried: a flaky test is a bug, and several production races were found exactly
+this way.
 
 The mock agent's event DSL (`test/testkit/TestKit.jl`) covers text chunks,
 tool calls with diff and terminal content, forms, plans, subagent feeds,
 live-app pushes, pacing delays and mid-turn cancellation, so most UI behavior
 can be scripted in a few lines.
+
+## Debugging BonitoAgents itself
+
+The dashboard has a **Debug BonitoAgents** section with a worker picker, and
+every chat header has a **Debug** button (which uses that chat's worker). Both
+open a chat whose working directory is a BonitoAgents source checkout **on that
+worker**, so the agent can read the source, edit it, and open a PR the ordinary
+way.
+
+The worker provides the checkout. A worker that already runs from one (a dev
+install, the test suite) answers with it. An ordinary install clones the
+repository into its environment — `<env>/dev/BonitoAgents`, at the revision
+this server was installed from — and `Pkg.develop`s the monorepo packages from
+it: `dev --local`, done for you. The first press on such a worker therefore
+takes a few minutes (clone + precompile); afterwards a restart of that worker
+runs what the agent edited, and re-running the installer puts the environment
+back on the pinned revision.
+
+That chat additionally gets `bt_dev_*` MCP tools that read the **live process**,
+which is the part the filesystem can't tell you:
+
+| Tool | What it answers |
+|------|-----------------|
+| `bt_dev_inspect` | live workers, projects, chats and eval bridges — plus `section="worker"`, what a worker says about ITSELF (its agent processes, their sockets). When that disagrees with what the server believes, the disagreement is the bug. |
+| `bt_dev_logs` | logs from any machine in the fleet. `source="server"` or `source="<worker>"` reads that process's log FILE, which survives restarts and holds what no logger sees (unhandled task errors, fatal signal dumps); `source="all"` reads everyone at once. The default `"ring"` is the server's in-memory `@info`/`@warn`/`@error` records, filterable by level and substring. |
+| `bt_dev_memory` | RSS, GC live bytes and every registry that has historically grown without bound, with an optional GC and a deep `summarysize` pass. For a leak: take a reading, exercise the suspect path, read again with `gc = true`, compare what grew. |
+| `bt_dev_control` | drive the server as a user would — open a chat, send a message, restart a session, rescan a worker, move a project to another machine. |
+
+The tools are attached by a persisted per-project `dev_mode` flag. The button
+sets it; the **Dev mode** item in a chat's ⋯ menu can grant it to any chat by
+hand (behind a confirm, since the tools drive the whole server; the ⋯ trigger
+turns red while it is on), and a chat that got
+it that way is told the source is not in front of it. Pointing an ordinary chat
+at the checkout grants nothing.
 
 ## The walkthrough videos
 

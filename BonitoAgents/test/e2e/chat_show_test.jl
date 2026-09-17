@@ -11,9 +11,9 @@
 #     runtime element that mounts asynchronously on top of it.
 #
 #   • image/png served-asset URL → render_show_file takes the image branch and
-#     `show_media_src` resolves to a streamed worker-asset / `Bonito.Asset` url.
-#     The <img class=bt-media> src must start with `/assets/` (a served, range-
-#     capable Bonito.Asset), NEVER a multi-MB `data:` base64 blob.
+#     `show_media_src` resolves to a stable worker-file URL.
+#     The <img class=bt-media> src must start with `/worker-file/` (with range
+#     support), never a multi-MB `data:` base64 blob.
 #
 # dev_server is local, so the worker reads the same /tmp we write here.
 @testitem "e2e:chat_show" setup = [SharedServer] tags = [:e2e] begin
@@ -26,7 +26,7 @@
     txt_content = "Hello from bt_show preview test\nLine two\nLine three"
     write(txt_path, txt_content)
     # A non-trivial PNG payload: the whole point is that this rides as a served
-    # /assets/ url, not an inlined base64 data: blob.
+    # /worker-file/ url, not an inlined base64 data: blob.
     write(png_path, UInt8.((0:4999) .% 256))
     txt_bytes = filesize(txt_path)
 
@@ -85,10 +85,10 @@
         })()""";
         timeout = 15)
 
-    # ── image/png → served /assets/ url, NOT a data: base64 blob ─────────────
+    # ── image/png → served /worker-file/ url, NOT a data: base64 blob ─────────────
     @test TK.wait_for(s, "image renders as a streamed asset",
         "(() => { const i = document.querySelector('.bt-tool-body[data-tool-id=\"img1\"] .bt-media-wrap img.bt-media'); " *
-        "return !!i && (i.getAttribute('src')||'').startsWith('/assets/'); })()";
+        "return !!i && (i.getAttribute('src')||'').startsWith('/worker-file/'); })()";
         timeout = 30)
 
     # Explicitly assert the negative: the src is NEVER a data: base64 blob.
@@ -96,7 +96,7 @@
         const i = document.querySelector('.bt-tool-body[data-tool-id="img1"] .bt-media-wrap img.bt-media');
         if (!i) return false;
         const src = i.getAttribute('src') || '';
-        return src.startsWith('/assets/') && !src.startsWith('data:');
+        return src.startsWith('/worker-file/') && !src.startsWith('data:');
     })()""") === true
 
     @test isempty(TK.js_errors(s))

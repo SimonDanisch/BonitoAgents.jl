@@ -181,7 +181,7 @@ function scroll_by!(s, delta; steps = 12)
         const N = $(steps); let i = 0;
         const tick = () => { i++;
             c.scrollTop = from + (target - from) * (i / N);
-            if (ch) ch._lastUserInputT = performance.now();
+            if (ch) ch.lastUserInputT = performance.now();
             if (i < N) requestAnimationFrame(tick); };
         tick();
     })()""")

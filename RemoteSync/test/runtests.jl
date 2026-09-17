@@ -160,8 +160,9 @@ function dir_hash(root)
 end
 
 # Run sender + receiver in two tasks bridged by a pipe pair. Returns the
-# (written, deleted, skipped) Stats from the receiver.
-function run_sync(src, dst)
+# (written, deleted, skipped) Stats from the receiver. Keyword arguments go to
+# `receive_directory` (`delete_extraneous`, `quick_check`).
+function run_sync(src, dst; kw...)
     a, b = pipe_pair()
     sender_done = Channel{Any}(1)
     receiver_done = Channel{Any}(1)
@@ -174,7 +175,7 @@ function run_sync(src, dst)
         close(a)
     end
     @async try
-        result = receive_directory(dst, b)
+        result = receive_directory(dst, b; kw...)
         put!(receiver_done, result)
     catch e
         put!(receiver_done, e)
@@ -182,8 +183,8 @@ function run_sync(src, dst)
         close(b)
     end
     s = take!(sender_done); r = take!(receiver_done)
+    r isa Exception && throw(r)      # a receiver refusal EOFs the sender: report the cause
     s isa Symbol || throw(s)
-    r isa Exception && throw(r)
     return r
 end
 
@@ -305,6 +306,41 @@ end
 # server, sender closing the instant `send_directory` returns, every one intact.
 # If a future change breaks the lockstep pacing, this goes red instead of the bug
 # surfacing as a flaky "sync truncated" in production.
+# HTTP 2's websocket closes the connection (1009) on any single incoming message
+# over 16 MiB, and a file's delta used to be sent as ONE message: a 20 MiB file
+# crossed as a 20 MiB message and the receiver dropped the socket, so the sender
+# saw "Broken pipe" and the receiver EOF (a 57 MB sync between two workers,
+# 2026-09-15). Logical frames are now split into messages of at most
+# `MAX_WS_MESSAGE_BYTES`; the receiver reads a byte stream and never notices.
+@testset "a file larger than the websocket message limit crosses in pieces" begin
+    using HTTP, HTTP.WebSockets
+    isdefined(HTTP.WebSockets, :DEFAULT_MAX_FRAME_SIZE) &&
+        @test RemoteSync.MAX_WS_MESSAGE_BYTES < HTTP.WebSockets.DEFAULT_MAX_FRAME_SIZE
+    src = mktempdir(); dst = mktempdir()
+    big = make_blob(20 * 1024 * 1024 + 12345; seed = UInt64(21))
+    write(joinpath(src, "big.bin"), big)
+    port = rand(40000:60000)
+    server_done = Channel{Any}(1)
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        try
+            put!(server_done, receive_directory(dst, WebSocketIO(ws)))
+        catch e
+            put!(server_done, e)
+        end
+    end
+    try
+        sleep(0.2)
+        HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
+            send_directory(src, WebSocketIO(ws))
+        end
+        s = take!(server_done)
+        @test !(s isa Exception)
+        @test read(joinpath(dst, "big.bin")) == big
+    finally
+        close(server)
+    end
+end
+
 @testset "directory sync survives immediate sender close (stress)" begin
     using HTTP, HTTP.WebSockets
     src = mktempdir()
@@ -380,7 +416,7 @@ end
             # And add a new file post-clone.
             write(joinpath(src, "fresh.dat"), make_blob(1_000; seed = UInt64(12)))
 
-            stats = run_sync(src, dst)
+            stats = run_sync(src, dst; delete_extraneous = true)   # a mirror, by request
             @test dir_hash(src) == dir_hash(dst)
             @test stats.deleted == 1
             # The matched file should have skipped; the new + edited counted.
@@ -457,6 +493,37 @@ end
             @test :transfer_done   in stages_sender
             @test :manifest_received in stages_receiver
             @test :transfer_done    in stages_receiver
+        finally
+            rm(src; recursive=true, force=true)
+            rm(dst; recursive=true, force=true)
+        end
+    end
+
+    # Deleting what the sender lacks is a mirror's job and is asked for
+    # explicitly; a plain transfer adds and updates, nothing more. And no
+    # transfer, mirror or not, empties a populated folder for an EMPTY source:
+    # a project move once pushed a never-synced (empty) server mirror with
+    # mirror semantics and deleted every file of a live project (2026-09-15).
+    @testset "deletions are opt-in and never driven by an empty source" begin
+        src = mktempdir(); dst = mktempdir()
+        try
+            write(joinpath(src, "shared.txt"), "from the sender")
+            write(joinpath(dst, "mine.txt"), "only the receiver has this")
+            stats = run_sync(src, dst)                      # default: additive
+            @test stats.deleted == 0
+            @test read(joinpath(dst, "mine.txt"), String) == "only the receiver has this"
+            @test read(joinpath(dst, "shared.txt"), String) == "from the sender"
+
+            empty_src = mktempdir()
+            err = try run_sync(empty_src, dst; delete_extraneous = true); nothing catch e; e end
+            @test err isa ErrorException
+            @test occursin("refusing to delete 2 local file(s)", sprint(showerror, err))
+            @test read(joinpath(dst, "mine.txt"), String) == "only the receiver has this"
+            @test isfile(joinpath(dst, "shared.txt"))
+
+            stats = run_sync(empty_src, dst)                # additive from empty: a no-op
+            @test stats.deleted == 0 && stats.written == 0
+            @test isfile(joinpath(dst, "mine.txt")) && isfile(joinpath(dst, "shared.txt"))
         finally
             rm(src; recursive=true, force=true)
             rm(dst; recursive=true, force=true)

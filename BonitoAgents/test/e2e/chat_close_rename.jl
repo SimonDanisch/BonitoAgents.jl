@@ -190,7 +190,7 @@ function run_suite(server)
                 "(() => { const e=[...document.querySelectorAll('.bt-side-item')].find(x=>x.getAttribute('data-project-id')===$(repr(pid))); const n=e&&e.querySelector('.bt-side-name'); return !!n && n.innerText.trim()==='Renamed Chat'; })()";
                 timeout = 10) == true
             @test header_title(server) == "Renamed Chat"
-            @test server.h.state.projects[][pid].title == "Renamed Chat"
+            @test server.h.state.projects[][pid].title[] == "Renamed Chat"
 
             # Rename survives switching to another chat and back.
             TK.new_chat(server; title = "Other"); TK.send_message(server, "other msg")
@@ -199,6 +199,51 @@ function run_suite(server)
                 "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value==='Renamed Chat'; })()";
                 timeout = 10) == true
             @test sidebar_label(server, pid) == "Renamed Chat"
+        end
+
+        # ── Rename from a LATER session than the one that opened the chat ───
+        # The chat model was built by the page before the reload. Its title
+        # writers used to notify that page's (dead) copy of `projects`, so the
+        # header (mapping over the same copy) showed the new name while this
+        # page's homebar kept the auto-title.
+        @testset "rename after a page reload updates homebar + header" begin
+            pid = TK.new_chat(server; title = "Reloadable")
+            TK.send_message(server, "first message names it")
+            @test TK.wait_for(server, "auto-title in homebar",
+                "(() => { const e=[...document.querySelectorAll('.bt-side-item')].find(x=>x.getAttribute('data-project-id')===$(repr(pid))); const n=e&&e.querySelector('.bt-side-name'); return !!n && n.innerText.trim()==='first message names it'; })()";
+                timeout = 10) == true
+            TK.navigate(server, "/")
+            TK.open_chat(server, pid)
+            @test TK.wait_for(server, "chat reopened after reload",
+                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value==='first message names it'; })()";
+                timeout = 30) == true
+            @test rename_header(server, "HOTS") == "ok"
+            @test TK.wait_for(server, "homebar shows the rename",
+                "(() => { const e=[...document.querySelectorAll('.bt-side-item')].find(x=>x.getAttribute('data-project-id')===$(repr(pid))); const n=e&&e.querySelector('.bt-side-name'); return !!n && n.innerText.trim()==='HOTS'; })()";
+                timeout = 10) == true
+            @test header_title(server) == "HOTS"
+            @test server.h.state.projects[][pid].title[] == "HOTS"
+        end
+
+        # ── First prompt from a LATER page than the one that opened the chat ─
+        # The screenshot case: the header rendered by the reloaded page kept
+        # the folder name while the homebar next to it showed the first-prompt
+        # title. Both bind the one title observable now, so the page that
+        # sends the first message sees the backfill in both places at once.
+        @testset "first prompt after a page reload titles header + homebar" begin
+            pid = TK.new_chat(server; title = "Untitled")
+            folder = server.h.state.projects[][pid].name
+            TK.navigate(server, "/")
+            TK.open_chat(server, pid)
+            @test TK.wait_for(server, "reopened chat shows the folder name",
+                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value===$(repr(folder)); })()";
+                timeout = 30) == true
+            TK.send_message(server, "wie bekomme ich die player daten")
+            @test TK.wait_for(server, "homebar shows the first-prompt title",
+                "(() => { const e=[...document.querySelectorAll('.bt-side-item')].find(x=>x.getAttribute('data-project-id')===$(repr(pid))); const n=e&&e.querySelector('.bt-side-name'); return !!n && n.innerText.trim()==='wie bekomme ich die player daten'; })()";
+                timeout = 10) == true
+            @test header_title(server) == "wie bekomme ich die player daten"
+            @test server.h.state.projects[][pid].title[] == "wie bekomme ich die player daten"
         end
 
         # ── Reopen after close restores the entry UNDER ITS TITLE ───────────
@@ -223,7 +268,7 @@ function run_suite(server)
                 "[...document.querySelectorAll('.bt-side-item')].some(e => e.getAttribute('data-project-id') === $(repr(pid)))";
                 timeout = 15) == true
             @test server.h.state.projects[][pid].dismissed == false
-            @test server.h.state.projects[][pid].title == "Pinned Title"   # title preserved
+            @test server.h.state.projects[][pid].title[] == "Pinned Title"   # title preserved
             @test sidebar_label(server, pid) == "Pinned Title"
         end
     end

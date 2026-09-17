@@ -5,7 +5,7 @@
 # is the launch-ack lie; the fd-close is worthless (the transcript is written
 # append-per-line, so the fd reads "closed" between every write while the subagent
 # is still alive). Only the `end_turn` marker in the content is the real signal.
-# Proves the poller + real worker clear the slot at end_turn, and NOT before.
+# Proves the poller + real worker clear busy at end_turn, and NOT before.
 #
 # Regression (the launch race): the `outputFile` PATH lands on the wire before the
 # file is on disk. A MISSING file, and a still-streaming file with no `end_turn`,
@@ -53,21 +53,43 @@ function run_suite(server)
         @test BA.is_pinned(model, "sub-poll-1")
 
         # (C) The subagent produces its FINAL response — a text message that ends
-        # its turn with `stop_reason":"end_turn"`. The bar's loop must finalize the
-        # pill (dropped from the bar) within a few 1 Hz ticks — no ⊗ needed.
+        # its turn with `stop_reason":"end_turn"`. That is the subagent's own
+        # deterministic finish, and the bar's loop must SEE it within a few 1 Hz
+        # ticks — no ⊗ needed.
+        #
+        # It does not end the pill. The agent still has to auto-wake and say what
+        # happened, and that used to be invisible because the pill vanished right
+        # here. The slot now stays and relabels; see `BgPhase`.
         open(outpath, "a") do io
             println(io, """{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done: found the marker."}]}}""")
         end
-        done = false
+        waiting = false
         t0 = time()
         while time() - t0 < 12
-            (!BA.in_taskbar(task) && !BA.is_pinned(model, "sub-poll-1")) && (done = true; break)
+            (task.phase isa BA.AwaitingReport) && (waiting = true; break)
             sleep(0.5)
         end
-        @test done
-        @test !BA.in_taskbar(task)
+        @test waiting
+        @test BA.in_taskbar(task)                       # still on screen...
+        @test BA.is_pinned(model, "sub-poll-1")
+        @test BA.taskbar_activity(task, time()) == "finished — waiting for the agent"
+        @test BA.tool_finished_at(task) === nothing     # ... and not finalized yet
+
+        # (D) A boundary retires it — `retire_reporting!`, which `begin_turn`
+        # runs on every new turn and `leave_unprompted!` runs when an episode
+        # ends. It is deliberately NOT edge-only: this task finished with the
+        # agent having nothing to say about it, so no auto-wake episode ever
+        # opened and there is no edge to hang it on.
+        BA.retire_reporting!(model)
+        @test task.phase isa BA.Reported
+        gone = false
+        t0 = time()
+        while time() - t0 < 12
+            (!BA.in_taskbar(task) && !BA.is_pinned(model, "sub-poll-1")) && (gone = true; break)
+            sleep(0.5)
+        end
+        @test gone
         @test BA.tool_finished_at(task) !== nothing
-        @test !BA.is_pinned(model, "sub-poll-1")
     end
     return server
 end

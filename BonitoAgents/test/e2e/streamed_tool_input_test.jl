@@ -58,7 +58,14 @@
             # take seconds to round-trip, so a short hold would race completion.
             # The third @testset then completes both tools and observes the
             # live preview being torn down on the terminal transition.
-            TK.delay(12000),
+            #
+            # 30s, not 12s: every assertion in the first two testsets is about an
+            # IN-FLIGHT affordance (the ⏱ badge, the ⊗ stop, the live pill), and
+            # the completion below tears all of them down. On a loaded CI runner
+            # the earlier waits ate the 12s hold, so the badge and the live pill
+            # were already gone when their turn came — the failure read as "badge
+            # never appeared" when it had appeared and been removed.
+            TK.delay(30000),
             TK.tool_update("rd1"; status = "completed",
                            content = [TK.text_block("greet() = println(\"hi\")\n")]),
             # Wire contract v3: the eval's content is plain output text (the
@@ -92,15 +99,43 @@
             "n.querySelector('.bt-tool-header')?.dataset.expanded === 'true'; })()";
             timeout = 15) == true
 
-        # The ⏱ timeout badge inserted late (60s from rawInput.timeout).
-        @test TK.wait_for(s, "⏱ badge inserted late",
-            "(() => { const b = document.querySelector('.bt-tool-timeout'); " *
-            "return b && b.innerText.indexOf('60') !== -1; })()";
-            timeout = 10) == true
+        # The ⏱ timeout badge inserted late (60s from rawInput.timeout). Same
+        # budget as the Monaco-body wait above: both ride the same late args
+        # update, and 10s was the odd one out (it timed out on CI while its
+        # sibling passed).
+        # textContent, NOT innerText. `innerText` is what the element RENDERS,
+        # so it is "" whenever layout says the node is not visible — which in a
+        # headless window it can be while the badge sits in the DOM exactly as
+        # intended. This assertion failed on CI for five runs with the badge
+        # present the whole time (the card dump below is what finally showed
+        # `<span class="bt-tool-timeout">⏱ 60s</span>` in the header).
+        # Scoped to THIS card, not `document`. The shared server keeps earlier
+        # items' chats in the page, so a document-wide query returns whichever
+        # eval card is first — which is how this failed while the dump showed
+        # `⏱ 60s` sitting in ev1's own header.
+        badge_js = "(() => { const n = $(card("ev1")); " *
+                   "const b = n && n.querySelector('.bt-tool-timeout'); " *
+                   "return !!(b && (b.textContent || '').indexOf('60') !== -1); })()"
+        badge_ok = false
+        for _ in 1:150
+            TK.eval_js(s, badge_js) === true && (badge_ok = true; break)
+            sleep(0.1)
+        end
+        badge_ok || @info "badge missing — card state" card = TK.eval_js(s,
+            "(() => { const n = $(card("ev1")); return n ? " *
+            "{hasHeader: !!n.querySelector('.bt-tool-header'), " *
+            " cards: document.querySelectorAll('.bt-tool-msg').length, " *
+            " stop: !!n.querySelector('.bt-tool-stop'), " *
+            " connected: n.isConnected, " *
+            " header: (n.querySelector('.bt-tool-header')||{}).outerHTML || ''} " *
+            ": 'no card'; })()")
+        @test badge_ok
 
         # The ⊗ stop button inserted late (bt_julia_eval is EVAL_STOPPABLE).
+        # Scoped for the same reason as the badge above.
         @test TK.wait_for(s, "⊗ stop button inserted late",
-            "!!document.querySelector('.bt-tool-stop')"; timeout = 10) == true
+            "(() => { const n = $(card("ev1")); " *
+            "return !!(n && n.querySelector('.bt-tool-stop')); })()"; timeout = 10) == true
 
         # The pill is still live (pulsing/taskbar gate) while the preview shows.
         @test TK.wait_for(s, "pill still live while preview shows",
@@ -142,10 +177,12 @@
             "return !!st && st.textContent === 'completed' && " *
             "n.querySelector('.bt-eval-stream') === null && " *
             "n.querySelector('.bt-tool-header')?.dataset.expanded === 'true'; })()";
-            timeout = 20) == true
+            # Outlasts the 30s hold above, counted from wherever the in-flight
+            # assertions finished.
+            timeout = 60) == true
         @test TK.wait_for(s, "eval result rendered in body",
             "(($(body("ev1")) || {}).textContent || '').indexOf('42') !== -1";
-            timeout = 15) == true
+            timeout = 30) == true
     end
 
     @test isempty(TK.js_errors(s))

@@ -96,7 +96,7 @@
             const id   = bub.dataset.msgId;
             if (!id) return 'NO_ID';
             // Arm a pending throttled stream payload (as a live stream would).
-            chat._applyStreamHtml(bub, '<p>PENDING-stale-stream</p>');
+            chat.applyStreamHtml(bub, '<p>PENDING-stale-stream</p>');
             // Empty final: no html. Must blank + finalize (clearing the pending).
             chat.onAgentFinal({ id, html: '' });
             // Stray late chunk after the empty final — must be dropped.

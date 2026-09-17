@@ -36,6 +36,8 @@ mutable struct WorkerInfo
     # reconnects (the WorkerInfo is reused, not rebuilt). Query with `isopen(w)`.
     online::Observable{Bool}
     last_check::DateTime
+    update_state::Symbol               # :current | :available | :reinstall (too old to self-update) | :updating
+    update_message::String
 end
 
 # A worker is "open" while its control WS is connected. Point read; bind to
@@ -91,17 +93,30 @@ mutable struct ProjectInfo
     # the conversation history back to where claude left off; nothing → fresh
     # session/new. Persisted so server restarts still resume.
     resume_session_id::Union{String,Nothing}
+    # Which agent this thread belongs to (`provider_name`: "ClaudeCode",
+    # "KimiCode", …), or nothing for "whatever the default is". Stored because
+    # a thread is not portable between agents: `resume_session_id` above is the
+    # id of a session THAT agent created, and asking a different one to
+    # `session/load` it fails with a session it never made. The name is what
+    # already travels to the worker on every `open_session` (agents.jl), and the
+    # worker resolves it against what it has installed — so this is a
+    # preference, not a promise: `project_provider` falls back if it's gone.
+    provider::Union{String,Nothing}
     # If set, the chat fires this prompt as the first user message the next
     # time it brings up an ACP session — used by the "From GitHub" template
     # to seed "fix this issue" / "review this PR" without the operator having
     # to retype it. Cleared (and persisted as nothing) once the prompt has
     # been delivered, so a session restart doesn't re-fire.
     auto_prompt::Union{String,Nothing}
-    # Editable human-readable title for the chat, shown in the sidebar and
-    # project card. Auto-set from the first meaningful user prompt in
-    # `send_message!` if it's still `nothing`; a user edit pins it. `nothing`
-    # → the sidebar/card falls back to `name` (folder basename).
-    title::Union{String,Nothing}
+    # The chat's title — the ONE value every view shows, exactly as shown. The
+    # header input binds a session child of it; the homebar row, overview card
+    # and discovered-session row read `p.title[]` on rebuild. Never empty: it
+    # starts as the folder name (`default_title`), the first meaningful prompt
+    # replaces that (`send_message!`), a user edit pins it, a blank edit puts
+    # the default back. Writing it is the whole job: the hook `track_project!`
+    # installs persists the table and fans the change out to every tab, so no
+    # writer has to remember either.
+    title::Observable{String}
     # Closed-from-the-homebar flag. The ✕ on a sidebar entry sets this true
     # (and persists it); it drops the chat out of the "Open chats" list WITHOUT
     # forgetting the thread — the conversation still lives on disk and reappears
@@ -116,14 +131,39 @@ mutable struct ProjectInfo
     # record what the user chose and re-assert it on every bring-up — see
     # `apply_session_config!`. Persisted so resume restores the original settings.
     desired_config::Dict{String,String}
+    # "Debug BonitoAgents" chat: this project's cwd is the BonitoAgents source
+    # checkout, and its agent gets the `bt_dev_*` introspection tools (see
+    # dev_api.jl / BonitoMCP tools/dev.jl). Persisted, because the flag is what
+    # keeps the tools attached across a server restart — and because it must NOT
+    # be re-derivable from the path: pointing an ordinary chat at the checkout
+    # should not silently hand it the server's controls.
+    dev_mode::Bool
+    # May this chat's agent run Julia (and copy folders) on OTHER workers via
+    # `bt_julia_eval(worker = …)` / `bt_sync_folder`? Off by default; the switch
+    # sits in the chat's ⋯ menu next to 'Dev mode', and the server
+    # enforces it at relay time (remote_eval.jl), so no restart is involved.
+    # Persisted: a granted capability must survive a server restart, and must
+    # never be derived from anything else.
+    remote_eval::Bool
     # Searchable file index (worker-derived, runtime-only). See ProjectFileIndex.
     file_index::ProjectFileIndex
 end
 
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing, nothing, nothing, nothing,
-                false, Dict{String,String}(), ProjectFileIndex())
+                nothing,                 # locked_by
+                nothing,                 # locked_at
+                :unsynced,               # backup_status
+                nothing,                 # last_sync_at
+                nothing,                 # resume_session_id
+                nothing,                 # provider
+                nothing,                 # auto_prompt
+                Observable(String(name)), # title: the folder, until a prompt or the user names it
+                false,                   # dismissed
+                Dict{String,String}(),   # desired_config
+                false,                   # dev_mode
+                false,                   # remote_eval
+                ProjectFileIndex())      # file_index
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
 # call shape working for tests / fixtures that build a WorkerInfo by hand.
@@ -137,7 +177,7 @@ WorkerInfo(worker_id, name, url, secret, ssh_target, hostname, home,
                # `:online`/`:offline`/`:unknown`) or a ready Observable/Bool.
                status isa Observable ? status :
                    Observable(status === :online || status === true),
-               last_check)
+               last_check, :current, "")
 
 """
     ServerState
@@ -163,6 +203,30 @@ handlers. Five things deserve a paragraph each:
 - `worker_secret` is the auth token every worker presents on its hello
   frame; same secret across all workers, baked into the install script.
 """
+# Accumulator for a MULTI-FRAME (chunked) worker RPC reply, keyed in
+# `pending_chunks` by the same uuid an ordinary `pending_rpcs` entry uses.
+# A multi-MB payload — the git_diff patch — travels as a series of bounded
+# frames so neither side ever packs/sends/unpacks one giant frame. `total` is
+# `nothing` until the FIRST chunk announces how many frames to expect; `meta`
+# collects the reply fields (repo/branch/head/base/scope) that ride on frame 1
+# instead of being repeated per frame; `buf` reassembles the payload in order.
+mutable struct ChunkAccumulator
+    ch       :: Channel{Any}
+    total    :: Union{Int,Nothing}
+    received :: Int
+    buf      :: IOBuffer
+    meta     :: Dict{String,Any}
+end
+
+# The image itself and its selection live in the chat directory. This cache
+# keeps history scans and worker transfers off the sidebar's render task.
+Base.@kwdef mutable struct ChatIconState
+    path::Union{Nothing,String} = nothing
+    stamp::Any = nothing
+    task::Union{Nothing,Task} = nothing
+    lock::ReentrantLock = ReentrantLock()
+end
+
 mutable struct ServerState
     # Convention: every shared-state struct's first field is its lock.
     # Bonito App bodies run on different threads per browser tab and the
@@ -212,12 +276,33 @@ mutable struct ServerState
     # panel pulls the model from here when a project icon is selected.
     chat_models :: Dict{String,Any}   # id → ChatModel
 
+    # id → ReviewState. The change-review tab's state, kept HERE rather than on
+    # its panel because the panel does not survive a page reload: the workspace
+    # is rebuilt from scratch and `open_review!` constructs a fresh
+    # `ReviewPanel`. Everything the user had put into the old one went with it —
+    # which repository was being reviewed, what it was being diffed against, and
+    # (the one that actually hurts) every review comment collected but not yet
+    # sent. A half-written review should not be one F5 away from gone.
+    #
+    # `Any` like `chat_models` above and for the same reason: review.jl is
+    # included after this file, so the concrete type isn't known here.
+    review_states :: Dict{String,Any}
+
     # Bumped (via `notify_chats!`) whenever `chat_models` gains or loses an
     # entry. `chat_models` is a plain Dict (not an Observable), but the
     # left-hand "active chats" sidebar needs to re-render when a chat opens or
     # closes — so it `map`s this signal and snapshots the live keys. The value
     # is meaningless; only the notification matters.
     chat_signal :: Observable{Int}
+
+    # Bumped (via `notify_turn!`) whenever an OPEN chat's content changes — a
+    # turn starting or ending. Distinct from `chat_signal` on purpose: that one
+    # means "the SET of chats changed" and the sidebar body re-renders on it, so
+    # firing it per turn swapped an open file tree out mid-interaction (see the
+    # note in `ChatModel`). Views that care about a chat's CONTENT (the
+    # dashboard's overview cards, the sidebar's in-place status LEDs) subscribe
+    # here instead and update without rebuilding the chat list.
+    turn_signal :: Observable{Int}
 
     # Live worker connections (name → HTTP.WebSocket)
     worker_control_ws :: Dict{String,Any}
@@ -226,6 +311,12 @@ mutable struct ServerState
     # because the answer shape varies (WS for handoff, Dict for rpc result).
     pending_rpcs :: Dict{String,Channel{Any}}
 
+    # Pending request_id → ChunkAccumulator for MULTI-FRAME replies (git_diff).
+    # Same uuid-space as `pending_rpcs`; `deliver_chunk!` grows the accumulator
+    # per frame and resolves the RPC once the announced `total` has arrived,
+    # `take_pending!`/`unregister_rpc!` evict it exactly like a plain RPC.
+    pending_chunks :: Dict{String,ChunkAccumulator}
+
     # Persisted result of "discover Claude Code sessions" per worker:
     # worker_id → Vector of session dicts (session_id, path, first_prompt,
     # last_used, running, kind, …). Backs the dashboard's persistent
@@ -233,6 +324,11 @@ mutable struct ServerState
     # re-scanning (refresh via the per-worker Rescan button). Saved to
     # `discovered.json`; mutated in place + `notify`d like `projects`.
     discovered :: Observable{Dict{String,Vector{Dict{String,Any}}}}
+
+    # worker_id → `time()` of that worker's last session scan. Lets opening a
+    # chat refresh a stale scan without re-scanning on every click. In-memory
+    # only: after a restart the first open re-scans, which is what we want.
+    last_scan :: Dict{String,Float64}
 
     # The base URL workers (and the dashboard's install snippet) should use to
     # reach this server. Set by `serve()` once the Bonito.Server is up —
@@ -246,6 +342,11 @@ mutable struct ServerState
     # same mutex their old globals were already taken under.
     eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (eval-result dial-back)
     mcp_ctrl           :: Dict{String,Any}              # project_id => live MCP control WS
+    # Eval hosts: BonitoMCP processes serving a chat's evals from ANOTHER worker
+    # (remote_eval.jl). "project_id\0worker_id" => that host's live control WS.
+    eval_hosts         :: Dict{String,Any}
+    # Single-flight per host key while one is being spawned + waited for.
+    eval_host_locks    :: Dict{String,ReentrantLock}
     # Live stdout/stderr stream sinks for RUNNING evals: "project_id\0route" =>
     # Channel the MCP pushes chunks into (drained by `eval_stream_loop!`). The MCP
     # forwards worker IO over /mcp-ws (no on-disk log, no polling); the sink exists
@@ -255,6 +356,13 @@ mutable struct ServerState
     # Per-path serialization lock for fetched `bt_show` files (server_dst => lock);
     # a process-level coordination pool, server-scoped here so it dies with the server.
     show_fetch_inflight :: Dict{String,ReentrantLock}
+    # Freshness key for each mirrored worker file: server_dst => the worker-side
+    # `(size, mtime)` the mirror copy was fetched FROM. Paths get reused (a
+    # re-rendered plot, an edited source), so the mere existence of a mirror file
+    # is not a cache hit — only a stamp that still matches the worker's current
+    # stat is. See `fetch_show_file` / `mirror_is_current`.
+    show_mirror_stamps :: Dict{String,@NamedTuple{size::Int, mtime::Float64}}
+    chat_icons :: Dict{String,ChatIconState}
     # LRU of project_ids whose agent is currently BOUND, most-recently last. Capped:
     # binding past the cap closes the oldest idle session (reaps its agent; lazy
     # ACP re-binds it from disk history on the next turn). Bounds agent processes.
@@ -301,16 +409,24 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,WorkerInfo}()),    # workers
         Observable(Dict{String,ProjectInfo}()),   # projects
         Dict{String,Any}(),                       # chat_models
+        Dict{String,Any}(),                       # review_states
         Observable(0),                            # chat_signal
+        Observable(0),                            # turn_signal
         Dict{String,Any}(),                       # worker_control_ws
         Dict{String,Channel{Any}}(),              # pending_rpcs
+        Dict{String,ChunkAccumulator}(),          # pending_chunks
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
+        Dict{String,Float64}(),                   # last_scan
         Ref(""),                                  # base_url (set by serve())
         Dict{String,Any}(),                       # eval_workers
         Dict{String,Any}(),                       # mcp_ctrl
+        Dict{String,Any}(),                       # eval_hosts
+        Dict{String,ReentrantLock}(),             # eval_host_locks
         Dict{String,Channel{String}}(),           # eval_stream_sinks
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
+        Dict{String,@NamedTuple{size::Int, mtime::Float64}}(),  # show_mirror_stamps
+        Dict{String,ChatIconState}(),             # chat_icons
         String[],                                 # bound_lru
         Observable(Dict{String,String}()),        # default_session_config (load_settings! below)
         Observable(Any[]),                        # last_config_options
@@ -342,16 +458,24 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             map(identity, session, s.workers),
             map(identity, session, s.projects),
             s.chat_models,
+            s.review_states,           # shared: the point is surviving a session
             map(identity, session, s.chat_signal),
+            map(identity, session, s.turn_signal),
             s.worker_control_ws,
             s.pending_rpcs,
+            s.pending_chunks,              # shared: one registry per server
             map(identity, session, s.discovered),
+            s.last_scan,               # shared: scan freshness is per server
             s.base_url,
             s.eval_workers,            # shared registries — one per server, all
             s.mcp_ctrl,                # sessions cooperate on the same tables
+            s.eval_hosts,
+            s.eval_host_locks,
             s.eval_stream_sinks,
             s.session_inflight,
             s.show_fetch_inflight,
+            s.show_mirror_stamps,
+            s.chat_icons,
             s.bound_lru,               # shared registry — one per server
             # SHARED (not bridged): the home writes these and
             # `effective_session_config` reads them off the parent at bring-up, so
@@ -426,23 +550,66 @@ end
 # session. (The dashboard textarea shows/edits only the user's AGENTS.md; these
 # rules are composed in at session bring-up via `agents_prompt_appendix`.)
 const BUILTIN_AGENT_RULES = """
-## Background commands
-Never start a long command detached (`&`/nohup) and then poll for it from a \
-second watcher task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, \
-and the like) — such monitors routinely never terminate (PID reuse keeps \
-`kill -0` succeeding) and pile up as zombie background tasks. Run the long \
-command itself as ONE background task (`run_in_background`) with any \
-post-processing (grep/summary) appended after it in the same command; you are \
-notified automatically when it completes.
+## Long-running work: use the tool, never shell backgrounding
+Every kind of long work has a tool that this app TRACKS — it shows in the task \
+bar while it runs, and you are notified automatically when it finishes:
+
+  * a shell command — `Bash` with `run_in_background: true`
+  * a whole sub-task — `Task`/`Agent` with `run_in_background: true`
+  * Julia — `bt_julia_eval`. It keeps running past its soft `timeout`, so pass \
+    a small `timeout`, go do other work, and pick the result up with \
+    `bt_julia_continue`. Never background Julia through Bash.
+
+Backgrounding by shell syntax instead — `&`, `nohup`, `disown`, `setsid`, \
+`screen -dm`, `tmux new -d` — produces an ORPHAN: no completion signal, nothing \
+in the task bar, and no notification. You are then left polling for it, which \
+is the failure the next paragraph is about. Don't do it; there is a tool for \
+every case above.
+
+Never start a long command detached and then poll for it from a second watcher \
+task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, and the like) — \
+such monitors routinely never terminate (PID reuse keeps `kill -0` succeeding) \
+and pile up as zombie background tasks. Run the long command itself as ONE \
+background task (`run_in_background`) with any post-processing (grep/summary) \
+appended after it in the same command.
+
+## Waiting for it: `bt_wait`, never a sleeper
+The tools above START work; none of them WAIT for it. `run_in_background` \
+returns immediately, so if you have nothing else to do the turn simply ends and \
+you are called again seconds later. Turns fire far faster than wall-clock, so \
+"start a `sleep` and check next turn" spawns one orphaned sleeper per cycle — \
+observed live: 130 of them, each firing its own notification on expiry.
+
+When you need to be idle until something finishes, call `bt_wait`. It BLOCKS \
+this turn (a tool call is the only thing that can), leaves no background task \
+and fires no notification:
+
+  * `bt_wait(seconds: 300, reason: "blender render")` — just wait.
+  * `bt_wait(seconds: 600, until: "test -f out/done.flag")` — wait, but return \
+    the moment the condition holds.
+
+`seconds` is required and capped at an hour; hitting the bound is a normal \
+result, so for longer work just call it again. Waiting in ONE long call is \
+cheaper than many short turns, so do not shrink it to poll faster.
 
 ## Julia
-When running Julia code, always prefer the `bt_julia_eval` tool over \
-`julia -e ...`/scripts via Bash: it keeps a persistent session (loaded \
+When running Julia code, always use the `bt_julia_eval` tool and never use \
+`julia -e ...` or scripts via Bash: it keeps a persistent session (loaded \
 packages, variables, and compiled methods carry over; Revise picks up source \
 edits), while every Bash `julia` call spawns a fresh process and pays full \
 startup + compile cost. Use `env_path` = the current project directory (the \
-pwd). Only fall back to Bash `julia` when a fresh process is genuinely \
-required (e.g. running a test suite entry point)."""
+pwd). There is no exception to this rule.
+There's nothing you cannot do with bt_julia_eval. If you need a fresh process just restart it.
+A few julia rules:
+* there is precompilation and runtime compilation (JIT). Precompilation only compiles a few function which get called as part of a precompile workload. Anything else will get compiled EVERY time you restart julia.
+* Pkg.precompile() can compile A LOT more than just the packages you're using. `using SomePkg` will only precompile and load that package, so its ALWAYS preferable to calling blanko precompile. `Pkg.precompile()` is really just for the case where you want to precompile ALL packages in your environment, which is usually not what you want.
+* Revise will automatically pick up edits to source files in your environment, so you can edit a file and then call the function again without restarting julia. This is the preferred workflow for development.
+* Since Revise v3.17, even struct changes should be supported - if something doesn't seem to change investigate.
+    There are three error sources: new function doesnt parse, there was an error, or somehow the the file wasnt saved. You can also call `Revise.revise()`, to surface any error.
+    What won't work is calling `Pkg.precompile()` - julia always compiles at runtime, and if something doesn't compile, then your only option is to restart Julia - and then everything should get picked up on the next using.
+    Julia's file based cache invalidation is perfect, never in my 14 years of Julia was there a case, where a file change wasn't picked up, so dont even debug in that direction.
+* never ever use `try; xxx; catch; end;` its absolutely horrible to blanket catch errors and not report them. Even `@debug err` is bad, since its not printing by default.
+"""
 
 # What actually rides on the `_meta.systemPrompt.append` for a session: the
 # built-in rules plus the user's AGENTS.md (when present).
@@ -450,6 +617,128 @@ function agents_prompt_appendix(s::ServerState)
     user = global_agents_md(s)
     return isempty(user) ? BUILTIN_AGENT_RULES : BUILTIN_AGENT_RULES * "\n\n" * user
 end
+
+"""
+    agents_prompt_appendix(state, project_id) -> String
+
+The system-prompt appendix for ONE chat: the server-wide rules plus, for a
+`dev_mode` project, the briefing that tells the agent where it is and what the
+`bt_dev_*` tools are for. Delivered as system prompt rather than as an opening
+message so the debug chat costs nothing until the user actually asks something.
+"""
+function agents_prompt_appendix(s::ServerState, project_id::AbstractString)
+    base = agents_prompt_appendix(s)
+    isempty(project_id) && return base
+    p = get(s.projects[], String(project_id), nothing)
+    (p === nothing || !p.dev_mode) && return base
+    return base * "\n\n" * dev_mode_briefing(s, p)
+end
+
+# What a dev-mode chat's agent is told about its own situation. Kept short and
+# concrete: the tools carry their own documentation, so this only has to
+# establish WHERE it is and which of the two things in front of it (the source
+# tree, the live process) answers which kind of question.
+#
+# There are two openings because dev mode is granted two ways. The "Debug
+# BonitoAgents" button puts the chat ON the source checkout. The header toggle
+# grants it to ANY project, whose cwd is then an unrelated tree — telling that
+# agent "your working directory is the BonitoAgents source" would be a lie, and
+# an agent that believes it goes on to read the wrong files and report on code
+# that isn't running. `dev_mode_briefing` picks by the project's actual path.
+const DEV_MODE_INTRO_SOURCE = """
+# Debugging BonitoAgents itself
+
+This chat's working directory is the **BonitoAgents source checkout** on the
+worker this chat runs on, at the revision the server you are running inside was
+installed from. The worker's own packages (BonitoWorker, BonitoMCP, …) are
+developed from this checkout, so a restart of that worker runs what you edit
+here. The server runs from its own install; it is this same tree only in a dev
+setup where both share the checkout. `git` works normally, so you can branch,
+commit and open a PR.
+"""
+
+const DEV_MODE_INTRO_ELSEWHERE = """
+# Debugging BonitoAgents from outside its source
+
+Dev mode was switched on for this chat by hand, so you can see what the server
+is doing. Its working directory is an ORDINARY project, **not** the BonitoAgents
+source checkout, so the code that produced the behaviour you are looking at is
+NOT in front of you. Report what the tools show; do not infer the
+implementation from the symptoms, and do not say you checked the source. To read
+or edit BonitoAgents itself, the user wants the "Debug BonitoAgents" button,
+which opens a chat on the checkout.
+"""
+
+const DEV_MODE_TOOLS = """
+You have `bt_dev_*` tools that read the **running process**:
+
+- `bt_dev_inspect` — live workers, projects, chats and eval bridges.
+- `bt_dev_logs` — logs from ANY machine in the fleet. You are running on ONE
+  worker and nothing but the server runs on the server host, so every other
+  machine's log is reachable only through this tool: `source="server"` for the
+  server's log file, `source="<worker name>"` for a worker's, `source="all"`
+  for everyone at once, and the default `"ring"` for the server's in-memory
+  `@info`/`@warn`/`@error` records.
+  Prefer the FILE when the ring cannot hold the answer, which is often. The file
+  is a redirect of the process's stdout and stderr, so it also holds what no
+  logger ever sees: "UNHANDLED TASK ERROR" (printed straight to stderr), the
+  runtime's fatal-signal thread dump, and everything from BEFORE the last
+  restart — the ring starts empty at boot. `since`/`until` take
+  "2026-09-11 14:40" and may span a restart.
+- `bt_dev_memory` — memory and per-registry counters, with an optional GC and a
+  deep `summarysize` pass. For a suspected leak: take a reading, exercise the
+  suspect path, take another with `gc = true`, compare what grew.
+  It also reports `open_fds` / `fd_limit`: a server that serves no NEW
+  connections while its timers keep ticking (flat CPU, no log output) is what fd
+  exhaustion looks like.
+  It sees THIS process only. Leaks that live outside it are invisible here, and
+  one is known: agent subprocesses are spawned as plain children, so a worker
+  that is killed orphans them and nothing reaps them (measured at ~3 per full
+  test-suite run). Clean counters here do not mean "no leak" — for that class,
+  count the processes on the machine.
+- `bt_dev_control` — drive the server the way a user would (open a chat, send a
+  message, restart a session, move a project between machines).
+"""
+
+const DEV_MODE_RULES_SOURCE = """
+Two rules that matter here more than in a normal chat:
+
+1. **The source tree and the running processes are different things.** Code you
+   edit takes effect on the worker only after it restarts, and on the server
+   only if it runs from this same checkout (a dev server, where Revise picks up
+   most changes); a server installed elsewhere keeps running its own code. Say
+   which one you are describing.
+2. **`bt_dev_control` has real effects on the user's live session** — sending a
+   message starts a turn that costs tokens, moving a project writes files on
+   another machine. Say what you are about to do before you do it.
+"""
+
+const DEV_MODE_RULES_ELSEWHERE = """
+Two rules that matter here more than in a normal chat:
+
+1. **You are reporting, not reading.** The tools show the live process; the code
+   behind it is not in this working directory. Quote what you measured, and name
+   the file you would need to read rather than guessing what it says.
+2. **`bt_dev_control` has real effects on the user's live session** — sending a
+   message starts a turn that costs tokens, moving a project writes files on
+   another machine. It reaches every chat on this server, not just this one. Say
+   what you are about to do before you do it.
+"""
+
+const DEV_MODE_BRIEFING_SOURCE =
+    DEV_MODE_INTRO_SOURCE * "\n" * DEV_MODE_TOOLS * "\n" * DEV_MODE_RULES_SOURCE
+const DEV_MODE_BRIEFING_ELSEWHERE =
+    DEV_MODE_INTRO_ELSEWHERE * "\n" * DEV_MODE_TOOLS * "\n" * DEV_MODE_RULES_ELSEWHERE
+
+"""
+    dev_mode_briefing(state, p) -> String
+
+The dev-mode system-prompt briefing for one project, picked by whether its
+working directory actually IS a BonitoAgents checkout on its worker
+([`is_source_checkout_project`](@ref)).
+"""
+dev_mode_briefing(s::ServerState, p::ProjectInfo) =
+    is_source_checkout_project(s, p) ? DEV_MODE_BRIEFING_SOURCE : DEV_MODE_BRIEFING_ELSEWHERE
 
 """
     derive_initials(name) -> String
@@ -477,8 +766,23 @@ worker_initials(w::WorkerInfo) =
     w.initials === nothing || isempty(w.initials) ? derive_initials(w.name) :
                                                     w.initials
 
-project_display_title(p::ProjectInfo) =
-    p.title === nothing || isempty(p.title) ? p.name : p.title
+# A fixed colour per machine, derived from the install id so a rename, a
+# restart or another server all agree on it. The sidebar rings every chat icon
+# with it and the worker card's tag pill wears it, which is how the mapping is
+# learned. OKLCH with fixed lightness and chroma: only the hue moves, so a
+# yellow ring weighs the same as a blue one (in HSL it looks washed out).
+worker_color(worker_id::AbstractString) =
+    "oklch(52% 0.19 $(Int(hash("worker:" * worker_id) % 360)))"
+worker_color(w::WorkerInfo) = worker_color(w.worker_id)
+
+# The title a chat starts with, before a prompt or the user names it: its folder.
+default_title(p::ProjectInfo) = p.name
+
+# Has a prompt or the user named it yet? Views never ask — they show `p.title[]`
+# either way — only the writers that must not overwrite a name do (the
+# first-prompt backfill, the repair sweep, the debug-chat promotion), plus the
+# homebar membership below.
+titled(p::ProjectInfo) = p.title[] != default_title(p)
 
 """
     chat_in_sidebar(p) -> Bool
@@ -491,7 +795,7 @@ folder→threads browser's "already open, hide it" dedup — so all three agree 
 exactly which chats are open.
 """
 chat_in_sidebar(p::ProjectInfo) =
-    !p.dismissed && (p.title !== nothing || p.resume_session_id !== nothing)
+    !p.dismissed && (titled(p) || p.resume_session_id !== nothing)
 
 # Setting an Observable propagates to the browser via Bonito's WebSocket;
 # if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
@@ -510,6 +814,32 @@ function safe_set!(obs::Observable, val)
     return nothing
 end
 
+"""
+    is_peer_gone(e) -> Bool
+
+Whether `e` means "the socket is already gone" — this send or close can never
+succeed and there is nothing to report. ONE predicate for every socket teardown
+path in the server, because the per-site whitelists this replaces were each
+written against the transport of their day and silently stopped covering the
+current one.
+
+`Reseau.IOPoll.NetClosingError` is matched BY NAME, not by importing Reseau: it
+is HTTP's transport internals, which this package reaches only through HTTP and
+does not depend on directly.
+
+Not cosmetic. On 2026-09-11 the worker-heartbeat ping task took exactly that
+error — a bare `struct <: Exception`, so `IOError`/`EOFError`/`WebSocketError`
+all missed it — rethrew, and died as an `UNHANDLED TASK ERROR` in the journal.
+Its death froze `last_ping_ok`, which is the timestamp the zombie reaper reads
+to decide whether a worker is still reachable.
+"""
+is_peer_gone(e) =
+    e isa Base.IOError ||
+    e isa EOFError ||
+    e isa HTTP.WebSockets.WebSocketError ||
+    nameof(typeof(e)) === :NetClosingError ||
+    (e isa ArgumentError && occursin("closed", lowercase(e.msg)))
+
 # Errors a stale browser session raises when we push an update to it: a Bonito
 # JSException (hashed asset 404 after redeploy), or a transport-level failure on
 # a half-dead socket. These are the "this one tab is gone" signals — NOT a bug in
@@ -517,10 +847,7 @@ end
 # rethrows (a real error must not be hidden, T6).
 is_stale_session_error(e) =
     e isa Bonito.JSException ||
-    e isa Base.IOError ||
-    e isa HTTP.WebSockets.WebSocketError ||
-    e isa EOFError ||
-    (e isa ArgumentError && occursin("closed", lowercase(e.msg))) ||
+    is_peer_gone(e) ||
     # Bonito's `update_session_dom!` does `error("Updating the session dom for a
     # closed session")` (a plain ErrorException) when a mapped UI observable fires
     # into a browser session that already closed — e.g. during server shutdown.
@@ -534,10 +861,15 @@ is_stale_session_error(e) =
 # `Base.notify(::Observable)` aborts at the FIRST throwing listener, so one stale
 # tab would starve every later-registered tab (T6). Instead we fire each listener
 # in its own try: a stale-session error deregisters just that dead listener (so
-# it stops costing us on every future notify) and we keep going; a real error is
-# rethrown so it surfaces. We iterate a SNAPSHOT of the listener list because we
-# mutate it (deregistration) and a listener may itself (de)register. The
-# `Consume` short-circuit semantics of `Base.notify` are preserved.
+# it stops costing us on every future notify) and we keep going; any other error
+# is logged with its backtrace and that listener is skipped for this round. It
+# is NOT rethrown: the callers are server-side state changes (a worker
+# registering, a worker's teardown), and unwinding those over a UI listener's
+# bug left a worker unable to register at all, with the exception swallowed by
+# the websocket layer (Laptop, 2026-09-15). We iterate a SNAPSHOT of the
+# listener list because we mutate it (deregistration) and a listener may itself
+# (de)register. The `Consume` short-circuit semantics of `Base.notify` are
+# preserved.
 # `Bonito.Observables` is the Observables module re-reachable through Bonito
 # (which `using`s it) — Observables isn't a direct dep of this package.
 function safe_notify!(obs::Observable)
@@ -556,7 +888,7 @@ function safe_notify!(obs::Observable)
                 @warn "safe_notify!: dropping a stale browser-session listener" errtype=typeof(e)
                 push!(dead, f)
             else
-                rethrow()
+                @error "safe_notify!: a listener failed; skipping it for this notify" listener=f exception=(e, catch_backtrace())
             end
         end
     end
@@ -566,13 +898,59 @@ function safe_notify!(obs::Observable)
     return nothing
 end
 
-# Signal that chat state changed (a chat opened/closed, or a turn started/
-# finished via the ChatModel busy hook) so chat-list consumers (sidebar,
-# recent-chats overview) re-render. Always raised on the ROOT: the per-session
-# Observable bridges are one-way (root → child), so notifying a session view
-# would reach only that one session — the old behaviour, which left every
-# OTHER tab (and any tab opened later) stale until an unrelated global event.
+# Signal that the SET of chats changed (a chat opened or closed) so chat-list
+# consumers re-render. Always raised on the ROOT: the per-session Observable
+# bridges are one-way (root → child), so notifying a session view would reach
+# only that one session — the old behaviour, which left every OTHER tab (and any
+# tab opened later) stale until an unrelated global event.
 notify_chats!(s::ServerState) = safe_notify!(root_state(s).chat_signal)
+
+# Signal that an open chat's CONTENT changed (a turn started or finished). Same
+# root-routing rule as `notify_chats!`, different audience: this one must NOT
+# rebuild the chat list, only the views that read a chat's messages (overview
+# cards) or its status (sidebar LEDs). See `turn_signal`'s field doc for why the
+# two are separate.
+notify_turn!(s::ServerState) = safe_notify!(root_state(s).turn_signal)
+
+# The projects / workers tables changed (a title, a bound session, a rename, a
+# worker's status). Same root-routing rule: the table itself is ONE shared Dict,
+# but a session view's `projects`/`workers` Observables are one-way children —
+# notifying the view a caller happened to hold reached that tab alone, which is
+# how a header rename showed "HOTS" while the same tab's homebar (listening on
+# its own child) kept the auto-title. Every writer goes through these.
+notify_projects!(s::ServerState) = safe_notify!(root_state(s).projects)
+notify_workers!(s::ServerState)  = safe_notify!(root_state(s).workers)
+
+# The one door into the projects table. Every project — created, imported,
+# copied, or loaded back from projects.json — enters through here, which is
+# where its title hook goes: a write to `p.title` from anywhere (first-prompt
+# backfill, header edit, dev API, the repair sweep) persists the table and
+# notifies every tab by itself. Saves nothing on entry: creation paths save the
+# new record themselves, and the loader has nothing new to write.
+function track_project!(s::ServerState, p::ProjectInfo)
+    lock(s.lock) do
+        s.projects[][p.id] = p
+    end
+    on(p.title) do _
+        try
+            save_projects!(s)
+        catch e
+            # The title is live and reaches every tab below; only the copy on
+            # disk is behind, and the next write of the table catches it up.
+            @warn "projects.json write failed after a title change" project = p.id exception = (e, catch_backtrace())
+        end
+        notify_projects!(s)
+    end
+    return p
+end
+
+# A new project: into the table, onto disk, out to every tab.
+function add_project!(s::ServerState, p::ProjectInfo)
+    track_project!(s, p)
+    save_projects!(s)
+    notify_projects!(s)
+    return p
+end
 
 # ── Persistence ───────────────────────────────────────────────────────────
 # Atomic JSON write: serialise to a UNIQUE sibling temp file first, then rename
@@ -678,7 +1056,7 @@ function load_workers!(s::ServerState)
                            # the 12-arg shim's coercion and silently DROPPED
                            # every persisted worker here once `online` became
                            # an Observable ("skipping malformed worker entry").
-                           Observable(false), now(UTC))
+                           Observable(false), now(UTC), :current, "")
             s.workers[][wid] = w
         catch e
             @warn "skipping malformed worker entry" entry=d exception=e
@@ -688,7 +1066,7 @@ end
 
 # Like `save_workers!`: snapshot + write under `state.lock` (reentrant, so
 # callers already holding it are unaffected). Without this, several savers ran
-# unlocked — `sync_project_to_server!`, `rename_worker!`, `sync_across_workers!`,
+# unlocked — `sync_project_to_server!`, `rename_worker!`, `transfer_project!`,
 # title backfill, etc. — iterating `values(s.projects[])` while locked writers
 # mutated the dict, and two of them could share a temp file and rename a
 # half-written projects.json into place (T2).
@@ -703,9 +1081,12 @@ function save_projects!(s::ServerState)
                      "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
                      "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
                      "resume_session_id" => p.resume_session_id,
+                     "provider"      => p.provider,
                      "auto_prompt"   => p.auto_prompt,
-                     "title"         => p.title,
+                     "title"         => p.title[],
                      "dismissed"     => p.dismissed,
+                     "dev_mode"      => p.dev_mode,
+                     "remote_eval"   => p.remote_eval,
                      "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
         atomic_write_json(projects_file(s), data)
@@ -732,22 +1113,33 @@ function load_projects!(s::ServerState)
             sid = get(d, "resume_session_id", nothing)
             p.resume_session_id = (sid === nothing || isempty(String(sid))) ?
                                        nothing : String(sid)
+            # Absent ⇒ nothing ⇒ the default provider, which is what every
+            # project did before this field existed.
+            pv = get(d, "provider", nothing)
+            p.provider = (pv === nothing || isempty(String(pv))) ?
+                                       nothing : String(pv)
             ap = get(d, "auto_prompt", nothing)
             p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
                                        nothing : String(ap)
+            # Older files carry null / "" for "never titled": the default stands.
             ti = get(d, "title", nothing)
-            p.title = (ti === nothing || (ti isa AbstractString && isempty(ti))) ?
-                                       nothing : String(ti)
+            ti isa AbstractString && !isempty(ti) && (p.title[] = String(ti))
             # Pre-`dismissed` projects.json entries default to shown (false), so
             # an upgrade doesn't suddenly hide anyone's existing open chats.
             p.dismissed = get(d, "dismissed", false) === true
+            # Absent ⇒ false. An upgrade must not turn existing chats into debug
+            # chats, and the flag is the only thing that grants the dev tools.
+            p.dev_mode = get(d, "dev_mode", false) === true
+            # Absent ⇒ false: running code on other machines is granted per chat,
+            # never assumed.
+            p.remote_eval = get(d, "remote_eval", false) === true
             dc = get(d, "desired_config", nothing)
             if dc isa AbstractDict
                 for (k, v) in dc
                     v isa AbstractString && (p.desired_config[String(k)] = String(v))
                 end
             end
-            s.projects[][p.id] = p
+            track_project!(s, p)
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
         end
@@ -812,7 +1204,7 @@ end
     thread_dedup_key(p) -> Tuple{String,String,String}
 
 A *thread's* identity: `(worker_id, worker_path, chat_id)`, where `chat_id`
-is the claude session id (`resume_session_id`) or, for a brand-new thread
+is the agent's session id (`resume_session_id`) or, for a brand-new thread
 that hasn't a session yet, the project's own `id`. A folder
 (`(worker_id, worker_path)`) can host several threads, so this is what we
 de-duplicate on — NOT the folder key, which would wrongly merge sibling
@@ -826,7 +1218,7 @@ thread_dedup_key(p::ProjectInfo) =
     thread_tag(p) -> String
 
 A short human tag distinguishing sibling threads of the same folder: the
-claude session id prefix for a resumed thread, or `new <id>` for a fresh one.
+session id prefix for a resumed thread, or `new <id>` for a fresh one.
 Used to disambiguate identical folder names in the active-chats sidebar.
 """
 thread_tag(p::ProjectInfo) =
@@ -837,7 +1229,7 @@ thread_tag(p::ProjectInfo) =
     find_thread(state, worker_id, worker_path, chat_id) -> Union{ProjectInfo,Nothing}
 
 Look up the thread `(worker_id, worker_path, chat_id)`, matching on the
-claude session id (`resume_session_id`). `chat_id === nothing` means "a
+agent's session id (`resume_session_id`). `chat_id === nothing` means "a
 brand-new thread" and never matches an existing one (so "+ New thread" and a
 no-session import always create a fresh thread, while re-importing the same
 session id reuses its thread and importing a *different* session of the same
@@ -873,21 +1265,6 @@ compute_server_path(state::ServerState,
                      worker_name::AbstractString,
                      name::AbstractString) =
     joinpath(state.working_dir, "$(String(worker_name))-$(String(name))")
-
-"""
-    same_name_siblings(state, project_id) -> Vector{ProjectInfo}
-
-Projects that share `project_id`'s display `name` but live on a *different*
-worker. Because `compute_server_path` keeps each worker's mirror separate,
-two workers can both carry a "BonitoAgents" project; these are the candidates
-for an explicit cross-worker reconcile (see `sync_across_workers!`).
-"""
-function same_name_siblings(state::ServerState, project_id::AbstractString)
-    haskey(state.projects[], project_id) || return ProjectInfo[]
-    p = state.projects[][project_id]
-    [q for q in values(state.projects[])
-        if q.id != p.id && q.name == p.name && q.worker_id != p.worker_id]
-end
 
 # Collapse projects.json entries that are the SAME THREAD —
 # `(worker_id, worker_path, chat_id)` (see `thread_dedup_key`). A folder can

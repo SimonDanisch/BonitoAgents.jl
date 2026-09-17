@@ -44,7 +44,7 @@ end
     # The async-launch snapshot carries the outputFile (and status `completed` —
     # the launch ack, which must NOT be read as the subagent finishing).
     snap = ACP.TaskCall("t1", "other", "Investigate", "completed", ACP.ToolContent[],
-                        Channel{ACP.ToolCall}(4), "desc", "prompt", true, nothing,
+                        ACP.MessageStream{ACP.ToolCall}(), "desc", "prompt", true, nothing,
                         "/tmp/agent.output")
     BT.update_from_snap!(task, snap)
     @test task.bg_output_path == "/tmp/agent.output"    # captured the poll target
@@ -113,17 +113,17 @@ end
     # exercised this — the subagent pill never showed on the real wire.)
     model = headless_model()
     initial = ACP.TaskCall("t7", "other", "Investigate", "in_progress", ACP.ToolContent[],
-                           Channel{ACP.ToolCall}(4), "", "", false, nothing, "")  # empty rawInput
+                           ACP.MessageStream{ACP.ToolCall}(), "", "", false, nothing, "")  # empty rawInput
     b = BT.build_tool_msg(model, initial)
     BT.send!(model, b)
     @test b.is_background == false && BT.in_taskbar(b) == false     # not a bg task yet
 
     # The launch-ack update: run_in_background=true AND the transcript outputFile.
     upd = ACP.TaskCall("t7", "other", "Investigate", "completed", ACP.ToolContent[],
-                       Channel{ACP.ToolCall}(4), "", "", true, nothing, "/tmp/t7.output")
-    put!(upd.updates, ACP.TaskCall("t7", "other", "Investigate", "completed", ACP.ToolContent[],
-        Channel{ACP.ToolCall}(4), "", "", true, nothing, "/tmp/t7.output"))
-    close(upd.updates)
+                       ACP.MessageStream{ACP.ToolCall}(), "", "", true, nothing, "/tmp/t7.output")
+    put!(upd.stream, ACP.TaskCall("t7", "other", "Investigate", "completed", ACP.ToolContent[],
+        ACP.MessageStream{ACP.ToolCall}(), "", "", true, nothing, "/tmp/t7.output"))
+    close(upd.stream)
     BT.process_update!(b, upd)
     @test b.is_background == true                                   # flipped off the late signal
     @test b.bg_output_path == "/tmp/t7.output"                     # captured the poll target
@@ -137,13 +137,13 @@ end
     model = headless_model()
     b = BT.build_tool_msg(model,
         ACP.TaskCall("t8", "other", "Investigate", "in_progress", ACP.ToolContent[],
-                     Channel{ACP.ToolCall}(4), "", "", false, nothing, ""))
+                     ACP.MessageStream{ACP.ToolCall}(), "", "", false, nothing, ""))
     BT.send!(model, b)
     upd = ACP.TaskCall("t8", "other", "Investigate", "completed", ACP.ToolContent[],
-                       Channel{ACP.ToolCall}(4), "", "", false, nothing, "/tmp/t8.output")
-    put!(upd.updates, ACP.TaskCall("t8", "other", "Investigate", "completed", ACP.ToolContent[],
-        Channel{ACP.ToolCall}(4), "", "", false, nothing, "/tmp/t8.output"))
-    close(upd.updates)
+                       ACP.MessageStream{ACP.ToolCall}(), "", "", false, nothing, "/tmp/t8.output")
+    put!(upd.stream, ACP.TaskCall("t8", "other", "Investigate", "completed", ACP.ToolContent[],
+        ACP.MessageStream{ACP.ToolCall}(), "", "", false, nothing, "/tmp/t8.output"))
+    close(upd.stream)
     BT.process_update!(b, upd)
     @test b.is_background == true && BT.in_taskbar(b) == true
 end

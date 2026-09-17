@@ -1,0 +1,30 @@
+# A SECOND committed eval-worker project, for `e2e:bt_eval`'s env_path-isolation
+# testset: it runs `Base.active_project()` in two different projects and asserts
+# each result names its OWN one and NOT the other's. That needs two envs whose
+# paths are mutually non-containing — `!occursin(pA, bodyB)` would be a false
+# failure if one path were a prefix of the other, which is why this is `altenv`
+# and not `evalenv2`.
+#
+# Deps are deliberately minimal: only Bonito, pinned to the SAME rev as
+# test/evalenv (and test/Project.toml), so both sides of the eval proxy agree.
+# Bonito is not optional here — the eval worker's live-render bridge is gated on
+# Bonito ≥ 5 (`MIN_BRIDGE_BONITO` in BonitoMCP/src/session.jl), and a project
+# that doesn't declare it resolves whatever the machine's global `@v#.#` env
+# happens to hold. That is exactly how this suite failed: it built its projects
+# with `mktempdir` at runtime, picked up a registered Bonito v4 (no `proxy_send`)
+# from the user's global env, the gate correctly refused the bridge, and every
+# live embed rendered "(result not live — worker gone and no snapshot)" — on that
+# machine only. A committed env with an explicit pin is the whole point of the
+# STRICT e2e policy (CONVENTIONS.md).
+#
+# Instantiated as a warmup in runtests.jl alongside evalenv; same rev, so the
+# depot already has it and resolving is a cache hit.
+name = "altenv"
+uuid = "e7a1d000-0000-4000-8000-000000000003"
+version = "0.0.1"
+
+[deps]
+Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+
+[sources]
+Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}

@@ -252,16 +252,34 @@ function run_suite(server)
             @test BA.in_taskbar(t) == true
             @test TK.eval_js(server,
                 "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG2\"]') !== null") == true
-            # (4) The next prompt tears the between-turn sink down (persisted, final).
-            server.agent_fn[] = p -> Any[TK.text("ack"), TK.end_turn()]
+            # (4) The next prompt seals the auto-wake episode and renders its own
+            # reply after it — one continuous stream, boundaries in wire order.
+            # The renderer is the SAME task throughout: a boundary ends a turn,
+            # not the stream.
+            consumer = lock(BA.shared(model).lock) do
+                BA.shared(model).main_consumer[].task
+            end
+            # A marker with no substring overlap with anything already on the
+            # page. "ack" looked fine and was not: the auto-wake text says
+            # "The b-ACK-ground agent completed", so the follow-up's index
+            # resolved to the auto-wake bubble and the ordering check compared
+            # a message with itself.
+            server.agent_fn[] = p -> Any[TK.text("FOLLOWUP_MARKER_7"), TK.end_turn()]
             TK.send_message(server, "thanks")
             @test TK.wait_for(server, "follow-up turn done",
-                "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('ack'))";
+                "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('FOLLOWUP_MARKER_7'))";
                 timeout = 20) == true
-            bt = lock(BA.shared(model).lock) do
-                BA.shared(model).between_turn[]
+            still = lock(BA.shared(model).lock) do
+                BA.shared(model).main_consumer[].task
             end
-            @test bt === nothing   # torn down at begin_turn!
+            @test still === consumer && !istaskdone(consumer)
+            # The auto-wake bubble is sealed and ORDERED before the new reply.
+            order = TK.eval_js(server, raw"""(() => {
+                const txt = [...document.querySelectorAll('.bt-agent-msg')].map(e => e.innerText||'');
+                return { wake: txt.findIndex(t => t.includes('DONE_MARKER_42')),
+                         reply: txt.findIndex(t => t.includes('FOLLOWUP_MARKER_7')) }; })()""")
+            @test order["wake"] >= 0
+            @test order["reply"] > order["wake"]
         end
 
         @testset "long feed (>50 activities) stays readable, never blank" begin
@@ -273,9 +291,11 @@ function run_suite(server)
             # (the ACP completion frame carries no title) for a tool whose
             # announcement row had already been EVICTED by the feed's own 50-entry
             # window spawned a new EMPTY row — cascading until the whole feed was
-            # empty labels. Drive the real shape: announce 55 titled sub-tools,
-            # THEN complete them title-less (so the early ones are evicted before
-            # their completion lands).
+            # empty labels. That second cause is gone at the root: the subagent
+            # keeps its whole history, so a completion always finds the row that
+            # announced it. Drive the real shape anyway — announce 55 titled
+            # sub-tools, THEN complete them title-less — because the CSS half is
+            # still only observable in a browser.
             server.agent_fn[] = p -> begin
                 evs = Any[TK.text("Delegating."),
                     TK.tool(kind = "other", title = "Long subagent", tool_name = "Task",
@@ -307,9 +327,9 @@ function run_suite(server)
                 if (h && h.dataset.expanded !== 'true') (h.querySelector('.bt-tool-toggle')||h).click();
                 return true; })()""")
             sleep(0.4)
-            # The feed is bounded to 50 rows, none empty (the orphan-completion
-            # fix), and each row keeps its content height (the flex-shrink fix) so
-            # the list SCROLLS rather than squishing rows to an unreadable sliver.
+            # All 55 rows are there — none evicted, none empty — and each keeps
+            # its content height (the flex-shrink fix) so the list SCROLLS rather
+            # than squishing rows to an unreadable sliver.
             # Scope everything to the NEWEST feed: `.bt-task-feed-*` is not in the
             # harness pane-scope shim, and this suite's earlier Task bubbles
             # (task-A, task-BG2) contribute their own feed entries globally.
@@ -323,7 +343,7 @@ function run_suite(server)
                 const minH = Math.min(...rows.slice(0, 10).map(r => r.getBoundingClientRect().height));
                 return { rows: rows.length, empty, minH,
                          scrolls: list ? (list.scrollHeight > list.clientHeight + 5) : false }; })()""")
-            @test metrics["rows"] == 50
+            @test metrics["rows"] == 55            # whole history, nothing evicted
             @test metrics["empty"] == 0            # no blank rows
             @test metrics["minH"] >= 8             # rows not squished to a sliver (was ~2px)
             @test metrics["scrolls"] == true       # overflow scrolls instead of shrinking

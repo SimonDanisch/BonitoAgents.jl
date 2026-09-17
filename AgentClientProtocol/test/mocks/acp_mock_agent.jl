@@ -66,6 +66,20 @@ tool_call_status(id::AbstractString, status::AbstractString) =
     "\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"$id\"," *
     "\"status\":\"$status\"}}}"
 
+# A SUBAGENT's `agent_message_chunk`: the same update, tagged with the parent
+# Task's tool_use id, which is how claude-agent-acp names the owner.
+subagent_text_update(parent::AbstractString, text::AbstractString) =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\"," *
+    "\"update\":{\"sessionUpdate\":\"agent_message_chunk\"," *
+    "\"content\":{\"type\":\"text\",\"text\":\"$text\"}," *
+    "\"_meta\":{\"claudeCode\":{\"parentToolUseId\":\"$parent\"}}}}}"
+
+# A `plan` session/update with one entry at the given status.
+plan_update(content::AbstractString, status::AbstractString) =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\"," *
+    "\"update\":{\"sessionUpdate\":\"plan\",\"entries\":[" *
+    "{\"content\":\"$content\",\"priority\":\"medium\",\"status\":\"$status\"}]}}}"
+
 prompt_done(id::Integer, reason::AbstractString="end_turn") =
     result_frame(id, "{\"stopReason\":\"$reason\"}")
 
@@ -113,6 +127,23 @@ function run_scenario(cws, name::AbstractString, n::Integer = 0)
         answer_setup(cws) || return
         drain_until_close(cws)
 
+    elseif name == "plan_then_idle"
+        # A plan the agent NEVER finishes: wait for the prompt (so the client's
+        # consumer exists — a plan emitted before it would have no sink), send
+        # one entry left `in_progress`, then go quiet WITHOUT resolving the
+        # prompt. The test severs the socket from here: the abandoned-plan case,
+        # which no protocol frame reports.
+        answer_setup(cws) || return
+        pid = nothing
+        while pid === nothing
+            line = recv_frame(cws)
+            line === nothing && return
+            isempty(line) && continue
+            req_method(line) == "session/prompt" && (pid = req_id(line))
+        end
+        emit(cws, plan_update("write the thing", "in_progress"))
+        drain_until_close(cws)
+
     elseif name == "setup_then_swallow"
         # A2 in-flight: complete setup, then READ further requests but never answer
         # them — so a `send_request` after setup stays pending until teardown.
@@ -121,8 +152,8 @@ function run_scenario(cws, name::AbstractString, n::Integer = 0)
 
     elseif name == "concurrent_turns"
         # Two session/prompt turns. Stream one chunk for turn 1, resolve turn 1,
-        # stream one chunk for turn 2, resolve turn 2 — exercising oldest-first
-        # routing + handoff over the real wire.
+        # stream one chunk for turn 2, resolve turn 2 — the steering/handoff
+        # shape, over the real wire.
         answer_setup(cws) || return
         id1 = nothing; id2 = nothing
         while id1 === nothing || id2 === nothing
@@ -133,9 +164,9 @@ function run_scenario(cws, name::AbstractString, n::Integer = 0)
                 id1 === nothing ? (id1 = req_id(line)) : (id2 = req_id(line))
             end
         end
-        emit(cws, text_update("for-turn-1"))      # both open → oldest (turn 1)
+        emit(cws, text_update("for-turn-1"))      # both spans open
         emit(cws, prompt_done(id1))               # handoff: turn 1 resolved
-        emit(cws, text_update("for-turn-2"))      # now routes to turn 2
+        emit(cws, text_update("for-turn-2"))      # same stream, turn 2's span
         emit(cws, prompt_done(id2))
         drain_until_close(cws)
 

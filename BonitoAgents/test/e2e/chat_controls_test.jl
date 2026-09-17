@@ -7,16 +7,18 @@
 #   • Stop button — present while a turn is streaming, and the busy indicator
 #     clears once the turn completes. Clicking stop mid-stream throws no JS
 #     error and doesn't wipe the agent bubble.
-#   • Sync button (`.bt-header-sync`) — clicking fires its handler cleanly (the
-#     legacy `Bonito.notify_observable is not a function` regression) and the
-#     label changes away from "Sync".
-#   • Session-ended Restart button — a `crash` turn hard-kills the mock agent
+#   • The ⋯ menu (`.bt-header-menu`) — closed by default, the trigger opens it,
+#     it lists Compact / Restart session / Debug BonitoAgents / Dev mode, a click
+#     outside closes it, and an item click reaches Julia cleanly (the legacy
+#     `Bonito.notify_observable is not a function` regression): Compact sends
+#     `/compact` as a turn the mock echoes back.
+#   • Session-ended reconnect chip — a `crash` turn hard-kills the mock agent
 #     subprocess (EOFError → `is_session_dead_error` → `session_alive=false`),
-#     so the header restart button gains its dead/pulse class
+#     so the chip next to the title appears with its dead/pulse class
 #     (`.bt-header-restart-dead`). Clicking it runs `restart_chat_session!`,
-#     which respawns the agent and clears the dead class (chat revived).
+#     which respawns the agent and hides the chip again (chat revived).
 #
-# Header + composer controls (`.bt-header-sync`, `.bt-header-restart`,
+# Header + composer controls (`.bt-header-menu`, `.bt-header-reconnect`,
 # `.bt-stop-btn`) render PER chatpane, and the shared-server runs many chats at
 # once. The TestKit pane-scope shim only scopes message selectors, so here we
 # query/click through the VISIBLE pane explicitly (`vpQ` / `vpClick`) to avoid
@@ -88,37 +90,67 @@
         @test TK.eval_js(s, vpHas(".bt-stop-btn")) == true
     end
 
-    @testset "Sync button click fires its handler cleanly" begin
-        @test TK.eval_js(s, vpHas(".bt-header-sync")) == true
+    # Is the visible pane's ⋯ menu open (its list rendered)?
+    menu_open = "(() => { const p=$VP; const l=p && p.querySelector('.bt-header-menu .bt-menu-list'); " *
+                "return !!l && getComputedStyle(l).display !== 'none'; })()"
+    menu_items = "(() => { const p=$VP; return [...(p ? p.querySelectorAll('.bt-header-menu .bt-menu-item') : [])]" *
+                 ".map(b => (b.textContent||'').trim()); })()"
+
+    @testset "⋯ menu: opens, lists the actions, closes outside, item reaches Julia" begin
+        # The strip shows the session group, Review and the ⋯ trigger — the
+        # one-shot actions are NOT a row of buttons any more.
+        @test TK.eval_js(s, vpHas(".bt-header-session")) == true
+        @test TK.eval_js(s, vpHas(".bt-header-review")) == true
+        @test TK.eval_js(s, vpHas(".bt-header-menu .bt-menu-trigger")) == true
+        @test TK.eval_js(s, menu_open) == false
+
+        @test TK.eval_js(s, vpClick(".bt-header-menu .bt-menu-trigger")) == true
+        @test TK.wait_for(s, "menu opened", menu_open; timeout = 5) == true
+        items = TK.eval_js(s, menu_items)
+        for expected in ("Compact", "Restart session", "Debug BonitoAgents", "Dev mode")
+            @test any(i -> startswith(String(i), expected), items)
+        end
+        # With one worker there is nowhere else to continue on: no such group.
+        @test !any(i -> occursin("Continue", String(i)), items)
+
+        # A click anywhere outside closes it.
+        TK.eval_js(s, "document.querySelector('.bt-messages').click(); true")
+        @test TK.wait_for(s, "menu closed by outside click",
+            menu_open * " === false"; timeout = 5) == true
+
+        # An item click reaches Julia cleanly and closes the menu: Compact sends
+        # `/compact` as a turn, which the echo agent answers.
         before_errs = length(TK.js_errors(s))
-
-        @test TK.eval_js(s, vpClick(".bt-header-sync")) == true
-
-        # The sync handler runs server-side (it'll report nothing-to-pull / an
-        # error against the test worker), but the click must reach Julia without
-        # a JS error — the `notify('__click__')` path the legacy test pinned.
-        @test TK.wait_for(s, "sync label changed",
-            vpText(".bt-header-sync") * " !== 'Sync'"; timeout = 10) == true
+        @test TK.eval_js(s, vpClick(".bt-header-menu .bt-menu-trigger")) == true
+        @test TK.wait_for(s, "menu opened again", menu_open; timeout = 5) == true
+        @test TK.eval_js(s, "(() => { const p=$VP; const b=[...p.querySelectorAll('.bt-header-menu .bt-menu-item')]" *
+            ".find(x => (x.textContent||'').trim() === 'Compact'); if(!b) return false; b.click(); return true; })()") == true
+        @test TK.wait_for(s, "menu closed by the item", menu_open * " === false"; timeout = 5) == true
+        @test TK.wait_for(s, "compact went through as a turn",
+            "(document.querySelector('.bt-messages').innerText||'').includes('echo: /compact')";
+            timeout = 30) == true
         @test length(TK.js_errors(s)) == before_errs
     end
 
-    @testset "Session-ended Restart: dead → working state → revived (guarded)" begin
-        # Healthy to start: the header restart button carries no dead class.
-        @test TK.eval_js(s, vpHas(".bt-header-restart")) == true
+    @testset "Session-ended reconnect chip: hidden → dead → working → gone (guarded)" begin
+        # Healthy to start: the chip is in the DOM but hidden, no dead class.
+        @test TK.eval_js(s, vpHas(".bt-header-reconnect")) == true
+        @test TK.eval_js(s, vpHas(".bt-header-reconnect.bt-hidden")) == true
         @test TK.eval_js(s, vpHas(".bt-header-restart-dead")) == false
 
         # A crash turn kills the mock agent mid-prompt → the chat flips
-        # session_alive=false → the restart button pulses (dead class).
+        # session_alive=false → the chip appears and pulses (dead class).
         TK.send_message(s, "crash now")
-        @test TK.wait_for(s, "restart button went dead",
-            vpHas(".bt-header-restart-dead"); timeout = 30) == true
+        @test TK.wait_for(s, "reconnect chip went dead",
+            vpHas(".bt-header-reconnect.bt-header-restart-dead"); timeout = 30) == true
+        @test TK.eval_js(s, vpText(".bt-header-reconnect")) == "Session ended · Reconnect"
 
-        # ONE click starts the restart. The button must immediately swap the red
+        # ONE click starts the restart. The chip must immediately swap the red
         # dead pulse for the "working" state — visual feedback that it's busy, and
         # what stops a user (or an impatient poll) re-clicking a still-broken-looking
-        # button. The dead class is gone while it works.
-        @test TK.eval_js(s, vpClick(".bt-header-restart")) == true
-        @test TK.wait_for(s, "restart shows working state",
+        # control. The dead class is gone while it works.
+        @test TK.eval_js(s, vpClick(".bt-header-reconnect")) == true
+        @test TK.wait_for(s, "chip shows working state",
             vpHas(".bt-header-restart-busy"); timeout = 10, interval = 0.05) == true
         @test TK.eval_js(s, vpHas(".bt-header-restart-dead")) == false
 
@@ -128,14 +160,16 @@
         # single revival + echo below prove they were ignored — before the guard,
         # this double-restart raced the send and the "alive?" turn never rendered.
         for _ in 1:3
-            TK.eval_js(s, vpClick(".bt-header-restart"))
+            TK.eval_js(s, vpClick(".bt-header-reconnect"))
         end
 
-        # Revived: both the working and dead classes clear, composer live again.
+        # Revived: the working and dead classes clear and the chip hides again,
+        # composer live again.
         @test TK.wait_for(s, "restart revived the session",
             "(() => { const p=$VP; if(!p) return false; " *
             "return !p.querySelector('.bt-header-restart-dead') " *
-            "&& !p.querySelector('.bt-header-restart-busy'); })()";
+            "&& !p.querySelector('.bt-header-restart-busy') " *
+            "&& !!p.querySelector('.bt-header-reconnect.bt-hidden'); })()";
             timeout = 60, interval = 0.2) == true
         @test TK.wait_for(s, "composer live after restart",
             "!!document.querySelector('.bt-text-input')"; timeout = 30) == true

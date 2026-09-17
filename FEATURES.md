@@ -19,14 +19,30 @@ enumerates.
   a minute; the worker watches for the server's pings, re-dials over the
   current network, and reaps agent sessions the server abandoned. Requests
   against an unreachable worker fail fast with a toast instead of hanging.
-- librsync-based directory sync for project import and moves between workers;
-  single-file transfers over a dedicated channel.
+- **Continue a chat on another worker** (the chat's ⋯ menu): the project's
+  files move through the server, and so does the agent's own record of the
+  conversation (for Claude Code: transcript, subagent transcripts, project
+  memory), so the agent resumes on the new machine with its memory intact. A
+  provider whose record can't be moved starts fresh there; the chat's history
+  stays visible either way.
+- **Run Julia on another worker**: `bt_julia_eval(worker = "MacBook")` runs on
+  that machine through a BonitoMCP eval host the server spawns there for the
+  chat; the eval card wears the worker's name, stdout streams in, plots render
+  live. Off by default, per chat: a *remote julia* pill in the chat header next
+  to the permissions pill, enforced by the server. `bt_sync_folder` copies
+  code and data across first.
+- librsync-based directory sync underneath (project import, the moves above,
+  folder sync between workers); single-file transfers over a dedicated channel.
 
 ## Projects & sessions
 
 - Create projects by **Discover** (scan a worker for existing Claude Code
   session folders and import with conversation history), **folder picker**
-  (any directory on the worker), or **From GitHub** (clone onto a worker).
+  (any directory on the worker), or **From GitHub** (clone onto a worker) —
+  all three on the worker's own card, so the machine is picked before the
+  folder.
+- **Copy project** snapshots a project's files onto another worker as a new
+  project (the cross-machine case; *Continue on* moves a live chat instead).
 - Chat history persists server-side per project; reopening renders instantly
   from disk. Claude-side history is reconciled on open and after compaction
   (message-order invariant, no duplicates).
@@ -40,8 +56,9 @@ enumerates.
 
 ## Agents & providers
 
-- Pluggable **ACP providers**: Claude Code (default), MiMo, OpenCode, plus a
-  deterministic scriptable **mock agent** for demos and tests (no API key).
+- Pluggable **ACP providers**: Claude Code (default), MiMo, OpenCode, Kimi Code,
+  Codex, plus a deterministic scriptable **mock agent** for demos and tests (no
+  API key).
 - Per-chat provider dropdown, resolved on the worker (binaries checked where
   they run); switching providers takes effect on the next turn.
 - Session **resume**: continue an existing Claude Code session from the
@@ -60,7 +77,7 @@ enumerates.
   calls, thoughts, and plans.
 - **Tool pills** expand in place: Monaco diff viewers for edits, scrollable
   terminal output for shell commands, match lists for searches, and code
-  preview plus stdout/result/error sections for `julia_eval` calls (with a
+  preview plus stdout/result/error sections for `bt_julia_eval` calls (with a
   timeout badge and per-tool stop button).
 - **Todo and plan lists** the agent maintains are pinned to the taskbar with
   live status (pending, in progress, completed) while the turn runs.
@@ -71,6 +88,10 @@ enumerates.
   live line counts, monitored until their writer exits, with per-task stop.
 - Inline **images and videos** with hover copy/download and a click
   **lightbox**; code blocks with hover copy/download.
+- **Image attachments** on the way in: paste, drag-drop, or the composer's
+  attach button, which on a phone opens the camera/gallery sheet. Queued
+  images show as removable thumbnails and render inline in your own message
+  (up to 10 per message, 5 MB each).
 - **Virtualized transcript**: only the visible window is in the DOM, history
   backfills lazily in the background (paused for hidden panes), and the reading
   position is content-anchored, so geometry churn, tab switches and reconnects
@@ -80,31 +101,77 @@ enumerates.
   text, with saved lenses.
 - Messages typed during agent restarts and reconnects are queued, never
   dropped.
+- If the BROWSER loses the server, a modal takes over the window and locks the
+  composer, since anything typed then would be lost: a live "trying again for
+  N s" counter, a reload button, and it lifts itself when the socket is back.
+  Sub-second reconnects, the usual case, never raise it.
+- Every chat in the sidebar wears an **icon**: its own picture once it has
+  shown one (a plot, a screenshot), an identicon coloured by its folder until
+  then, and a corner badge with the initials of the machine it runs on — so the
+  list reads as "which machine, which project" at a glance.
 
 ## Files & workspace
 
 - Sidebar **project file tree**: lazy directory loading, fuzzy full-index
   search (VSCode-style), download affordances.
-- **Monaco file editor** that saves back to the worker (`Ctrl+S`). Opening
-  always fetches the file fresh from the worker; re-activating an open panel
-  live-updates a clean buffer and never clobbers unsaved edits. A pre-open
-  guard refuses folders, binaries and oversized files with a clear toast.
-- File paths in tool pills are clickable and open in the editor.
+- **Rich file viewer**: clicking ANY file opens it as a workspace tab rendered
+  as what it is — images on a transparency checkerboard with their pixel size,
+  range-streamed video and audio, rendered markdown, CSV/TSV as a sortable and
+  filterable table with a sticky header, Jupyter notebooks with their outputs,
+  3D geometry (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in an interactive
+  WebGL view, PDF and HTML in a sandboxed frame, source in Monaco, and opaque
+  bytes as a hex dump. Anything text-backed (markdown, HTML, CSV, SVG) has a
+  Preview/Source toggle over the same editor. Images and video sit centred on a
+  stage and are fitted to it, so a portrait clip keeps its controls on screen.
+- Tabs are named to be **told apart**: a file is its basename until another open
+  file shares it, and then both grow leftwards until they differ — `a/types.jl`
+  and `b/types.jl` rather than two tabs both reading `types.jl`. A tab with
+  unsaved edits carries a dot; closing one discards the buffer without asking,
+  so that dot is the warning.
+- `bt_show` previews in the chat run the SAME renderers, so a file looks the
+  same whether the agent showed it or you opened it.
+- The editor is bound to the file **on the worker**: the header shows the
+  worker path and `Ctrl+S` writes it there, failing loudly rather than saving
+  only the server's mirror copy. Mirrored files are re-fetched exactly when the
+  worker's `(size, mtime)` changed, so a regenerated file at a reused path is
+  never served stale; re-activating an open panel refreshes a clean buffer and
+  never clobbers unsaved edits.
+- File paths in tool pills and search hits are clickable and open in the viewer.
+- **Change review tab**: the project's git diff (including files the agent
+  created) with a comment affordance on every line, in two modes — *Ask* sends
+  the question to the chat immediately with the code context attached, and
+  *Feedback* batches comments and delivers them as one numbered instruction —
+  Send counts what it will deliver and only looks like the primary action once
+  it has something to say. Compare against the working tree or any branch, tag
+  or commit. The diff is scoped to the PROJECT's folder, so a package inside a
+  larger checkout shows its own changes rather than the whole monorepo's.
 - **VSCode-style workspace** (BonitoWidgets): chat, editors and app embeds as
   panels that drag into tab groups, split, float, and dock back.
 
 ## Julia tools (BonitoMCP)
 
-- `julia_eval`: a persistent Malt session per project env, where packages,
+- `bt_julia_eval`: a persistent Malt session per project env, where packages,
   variables and compiled methods stay warm and Revise picks up edits.
+  `bt_julia_continue`/`bt_julia_interrupt`/`bt_julia_restart` address a session
+  that is still running, and every one of them takes `worker =` to run on
+  another machine.
+- **One tool for values and apps**: whatever the eval returns is rendered as
+  what it is — a Bonito app or a Makie figure comes back live in the card, with
+  interactions round-tripping to Julia in the worker's session. Embeds detach
+  into tabs or floating windows and stay alive (WebGL context and sub-session
+  kept, bounded by an LRU with park/resume). There is no separate "show the
+  app" tool to remember, and no string sniffing behind it: the type decides.
 - **Output discipline enforced at the tool layer**: truncation with markers,
   large-container summarization, color matrices and figures returned as
-  images, and a `full_output` bypass.
-- `bt_show`: render worker-side files (images, video, text) into the chat.
-- `bt_show_app`: embed a running Bonito app into the chat, with interactions
-  round-tripping to Julia in the worker's eval session. Embeds detach into
-  tabs or floating windows and stay alive (WebGL context and sub-session kept,
-  bounded by an LRU with park/resume).
+  images, and a `full_output` bypass. The agent gets ANSI-stripped text; the
+  chat gets the full value over the bridge.
+- `bt_show`: render worker-side files (images, video, text, notebooks, 3D
+  geometry) into the chat, through the same renderers the file viewer uses.
+- `bt_sync_folder`: copy a folder to another worker (through the server's
+  mirror, so a second call moves only what changed).
+- `bt_wait`: the one way for an agent to be idle on purpose — a bounded block
+  with an optional shell condition, so waiting on a long render costs one tool
+  call instead of a turn-per-poll loop that leaves orphaned sleepers behind.
 
 ## Deployment
 
@@ -124,9 +191,26 @@ enumerates.
 - `dev_server()`: the whole stack (server, real worker subprocess, mock agent)
   against ephemeral tempdirs, wiped on close.
 - Scriptable mock-agent event DSL (text, tools with diffs, todos, forms,
-  subagent feeds, live apps, real `julia_eval`, pacing, cancellation).
+  subagent feeds, live apps, real `bt_julia_eval`, pacing, cancellation).
 - Black-box e2e suite driving a real dev server through headless Electron
   (DOM in, rendered DOM out; no server introspection; retries forbidden), plus
   fast headless unit items.
+- CI shards the e2e items over eight jobs (`runtests.jl '^e2e:' 3/8`) from the
+  `@testitem` names in the source, so the job list cannot drift from the suite,
+  and compiles the stack in its own step so no test waits on a DOM while the
+  machine is busy compiling.
+- **Debug BonitoAgents**: a one-click chat (dashboard worker picker + button, and
+  every chat header) whose working directory is a BonitoAgents source checkout on
+  the chosen worker — the checkout it runs from, or a `dev --local` clone into its
+  environment at the server's revision, so a worker restart runs the edits — and
+  the agent can read, edit and open a PR against the running application. It additionally gets
+  `bt_dev_*` tools that read the LIVE process — workers, projects, chats and
+  eval bridges, the log of ANY machine in the fleet (the server's ring, or the
+  server's and each worker's log file, which outlives restarts), memory and
+  per-registry leak
+  counters (with an optional GC and deep `summarysize` pass), the worker's
+  account of itself — plus orchestration ops (open a chat, send a message,
+  restart a session, move a project between machines). The tools are attached
+  by a persisted per-project flag, so no ordinary chat can see them.
 - Recorded walkthrough (`examples/walkthrough.jl`) with an animated cursor.
 - Bonito-based documentation site (`docs/`).

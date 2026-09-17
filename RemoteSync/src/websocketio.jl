@@ -79,6 +79,25 @@ function send_frame!(ws::HTTP.WebSockets.WebSocket, bytes::AbstractVector{UInt8}
     return nothing
 end
 
+# HTTP 2's websocket refuses any single incoming message above 16 MiB: it closes
+# the connection with 1009, and the PEER's limit is not ours to raise. To the
+# receiver everything we send is one byte stream (`_refill!` concatenates
+# messages), so a logical frame may cross in as many messages as it needs. A
+# whole-file delta used to go as one message; a 57 MB file then closed the
+# socket under the sender, which saw "Broken pipe" while the receiver saw EOF
+# (2026-09-15). 1 MiB matches `FILE_CHUNK_BYTES` and bounds the allocation per
+# message on both ends.
+const MAX_WS_MESSAGE_BYTES = 1 * 1024 * 1024
+
+function send_chunked!(ws, bytes::Vector{UInt8})
+    n = length(bytes)
+    n <= MAX_WS_MESSAGE_BYTES && return send_frame!(ws, bytes)
+    for start in 1:MAX_WS_MESSAGE_BYTES:n
+        send_frame!(ws, bytes[start:min(start + MAX_WS_MESSAGE_BYTES - 1, n)])
+    end
+    return nothing
+end
+
 is_closed(ws::HTTP.WebSockets.WebSocket) = HTTP.WebSockets.isclosed(ws)
 
 # ── IO interface ───────────────────────────────────────────────────────────
@@ -117,7 +136,7 @@ function Base.close(io::WebSocketIO)
         # `position` rather than `bytesavailable`: after a series of writes,
         # `bytesavailable(IOBuffer)` returns 0 (it counts unread bytes from
         # the current position, not the total writes pending).
-        position(io.outbuf) > 0 && send_frame!(io.ws, take!(io.outbuf))
+        position(io.outbuf) > 0 && send_chunked!(io.ws, take!(io.outbuf))
     catch e
         @warn "WebSocketIO: final flush failed on close (last chunk may be lost)" exception=(e, catch_backtrace())
     end
@@ -197,8 +216,8 @@ function Base.read(io::WebSocketIO, n::Integer)
 end
 
 # Buffered writes: librsync makes lots of small writes during signature/delta
-# generation. We coalesce them into one WS frame per `flush`, which matches
-# our wire protocol (write_frame ends with flush).
+# generation. We coalesce them per `flush`, which matches our wire protocol
+# (write_frame ends with flush), and split anything over `MAX_WS_MESSAGE_BYTES`.
 function Base.write(io::WebSocketIO, b::UInt8)
     write(io.outbuf, b)
     return 1
@@ -211,7 +230,7 @@ end
 function Base.flush(io::WebSocketIO)
     # See note in `close` — must use `position`, not `bytesavailable`.
     position(io.outbuf) == 0 && return nothing
-    send_frame!(io.ws, take!(io.outbuf))
+    send_chunked!(io.ws, take!(io.outbuf))
     return nothing
 end
 

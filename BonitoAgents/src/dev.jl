@@ -130,13 +130,13 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # Build the provider singleton list ONCE here, on the uncontended startup path
     # (ENV is now fully configured; no browser is attached yet). Without this the
     # list is built lazily on the FIRST chat bind — and that first build compiles
-    # four descriptor constructors, reached concurrently from the bind path
+    # every descriptor constructor, reached concurrently from the bind path
     # (`default_provider`) AND the provider-dropdown render (`current_providers`).
     # Under nworkers=4 load that concurrent first-build stalled the bind for >90 s
     # ("chat view opened" timeout); worse, since the memo only caches AFTER a full
     # build, a stalled build was never cached, so every later bind on that worker
     # re-entered the build and re-hung. `refresh_providers!` builds + first-compiles
-    # the four descriptor constructors once here, uncontended, so no bind ever
+    # every descriptor constructor once here, uncontended, so no bind ever
     # first-builds it; it also rebuilds from the now-complete ENV, so a list
     # memoised earlier (before `BT_ENABLE_MOCK_AGENT` was set) can't hide the mock.
     refresh_providers!()
@@ -202,10 +202,15 @@ end
 # read and won't act on a queued SIGTERM before we'd give up anyway, so a long
 # grace just delays every close. An idle/reconnecting worker exits on SIGTERM in
 # ~0.2s and returns early, well under this window.
+# `proc` is usually juliaup's launcher with the real julia as its child, so a
+# signal to the handle alone can leave the actual worker (and its control
+# socket) alive. `detach` at spawn made the launcher a group leader: signal the
+# GROUP, gracefully first, then hard.
 function stop_worker_proc!(proc::Base.Process; grace_s::Real = 1.5)
     process_exited(proc) && return
+    BonitoWorker.kill_process_group!(proc, Base.SIGTERM)
     try
-        kill(proc)                       # SIGTERM
+        kill(proc)                       # SIGTERM to the leader too, in case it left its group
     catch e
         e isa Base.IOError || rethrow()
     end
@@ -215,6 +220,7 @@ function stop_worker_proc!(proc::Base.Process; grace_s::Real = 1.5)
         sleep(0.05)
     end
     @warn "dev_server: worker ignored SIGTERM within grace window; sending SIGKILL" grace_s
+    BonitoWorker.kill_process_group!(proc)
     try
         kill(proc, Base.SIGKILL)
     catch e
@@ -249,6 +255,23 @@ function Base.close(h::DevHandle)
     # systemd's TimeoutStopSec does for the production service.
     if h.worker_proc !== nothing
         stop_worker_proc!(h.worker_proc)
+    end
+    # ...and the agents that worker started. It cannot do this itself: it is
+    # killed, often with SIGKILL, so it runs no cleanup — and the agents are in
+    # their OWN process groups (BonitoWorker spawns them `detach`ed so an agent's
+    # MCP servers and eval workers die with it), so they do not go down with the
+    # worker either.
+    #
+    # BonitoWorker's own startup sweep does not cover this case: every dev_server
+    # gets a THROWAWAY config dir, so the next one looks for an id that has never
+    # existed. We know the id we handed out, so we reap on the way down. Without
+    # this the e2e suite leaked ~3 agent processes per full run, which is how the
+    # box ended up at 93% memory and unrelated tests started failing on timing.
+    try
+        BonitoWorker.reap_agents_owned_by(strip(read(joinpath(h.worker_config, "worker_id"), String)))
+    catch e
+        e isa InterruptException && rethrow()
+        @debug "dev_server: could not reap the worker's agents" exception = e
     end
     # Drop the env we set so this process is left as we found it (the detached
     # worker already inherited it at spawn; this just prevents leakage into

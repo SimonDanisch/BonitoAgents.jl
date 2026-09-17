@@ -96,14 +96,14 @@
         # Both send + stop buttons are always in the DOM (CSS toggles which is
         # visible by busy state); the legacy test clicks `.bt-stop-btn`
         # directly. Make sure the chat's input + stop button are present and
-        # the ESC handler is wired (`_onEscapeKey` is the last listener
-        # `_setupInputs` attaches) before we drive anything.
+        # the ESC handler is wired (`onEscapeKey` is the last listener
+        # `setupInputs` attaches) before we drive anything.
         @test TK.wait_for(s, "$(label): chat mounted",
             "!!document.querySelector('$(P).bt-text-input') && !!document.querySelector('$(P).bt-stop-btn')";
             timeout = 15) == true
         @test TK.wait_for(s, "$(label): ESC handler wired",
             "(() => { const m = document.querySelector('$(P).bt-messages'); " *
-            "return !!m && !!m.__bt_chat && typeof m.__bt_chat._onEscapeKey === 'function'; })()";
+            "return !!m && !!m.__bt_chat && typeof m.__bt_chat.onEscapeKey === 'function'; })()";
             timeout = 15) == true
 
         # Count agent bubbles already visible so we can refer to "the new one"

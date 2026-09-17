@@ -1,26 +1,21 @@
 # ── Recent-chats overview ────────────────────────────────────────────────
 # The dashboard header's overview section: the last `OVERVIEW_LIMIT` chats as
 # cards, each showing the chat's persistent title, its message count + last
-# activity, the last few user prompts (system tags stripped), and the last
-# image that was displayed in the chat (user attachment or bt_show result).
+# activity, the last few user prompts (system tags stripped), and a stable
+# image chosen from the chat (user attachment or bt_show result).
 #
-# Persistence model: everything derives from what's already on disk —
-# `chat.md` (messages, mtime = last activity), `.bt-attachments/` (user
-# images) and the bt_show server mirror — so the section survives restarts
-# with no extra bookkeeping. For LIVE chats the in-memory msgs_store is used
-# instead of re-parsing chat.md, and the cards re-render on `chat_signal`
-# (chat open/close + every turn boundary via the busy_active hook) and
-# `projects` (title edits), which is what keeps them up to date.
+# Titles and messages come from chat history; the image is a persistent
+# snapshot shared with the sidebar (chat_icons.jl).
 
-const OVERVIEW_LIMIT = 6           # cards shown
-const OVERVIEW_SNIPPETS = 3        # user prompts per card
+const OVERVIEW_LIMIT = 6
+const OVERVIEW_SNIPPETS = 3
 
 struct ChatCardData
     pid         :: String
     title       :: String
     msg_count   :: Int
     snippets    :: Vector{String}   # last user prompts, oldest first
-    image       :: Any              # nothing | String (attachment route URL) | Bonito.Asset
+    image       :: Any              # nothing | Bonito.Asset (persistent snapshot)
     last_active :: Float64          # unix mtime of chat.md
     status      :: Symbol           # chat_status: :offline | :online | :active
 end
@@ -28,54 +23,30 @@ end
 # One user prompt → card snippet: drop the attachment suffix and interruption
 # markers, then reuse `meaningful_title` (peels `<system-reminder>`-style tag
 # blocks, collapses whitespace, truncates). `nothing` for system-only text.
-function overview_user_snippet(text::AbstractString)
+function overview_user_snippet(provider::AgentProvider, text::AbstractString)
     base, _ = split_attachment_suffix(text)
     base = replace(base, r"\[Request interrupted[^\]]*\]" => " ")
-    return meaningful_title(base)
+    return meaningful_title(provider, base)
 end
 
-function overview_snippets(msgs::Vector{ChatMsg}; limit::Int = OVERVIEW_SNIPPETS)
+# These messages come off disk (chat.md), so the wrapper rules that have to be
+# peeled off them are the ones of the agent that WROTE them — Claude injects
+# `<system-reminder>` and friends, the others don't. Callers that have the
+# project pass `project_provider(p)`; the default stands for a caller that
+# doesn't, and matches what every project did before the provider was recorded.
+function overview_snippets(msgs::Vector{ChatMsg};
+                           limit::Int = OVERVIEW_SNIPPETS,
+                           provider::AgentProvider = find_provider("ClaudeCode"))
     out = String[]
     for m in Iterators.reverse(msgs)
         m isa UserMsg || continue
         m.auto && continue                       # Yolo auto-continue nudges aren't prompts
-        s = overview_user_snippet(m.text)
+        s = overview_user_snippet(provider, m.text)
         s === nothing && continue
         pushfirst!(out, s)
         length(out) >= limit && break
     end
     return out
-end
-
-# The most recent image the chat DISPLAYED, scanning newest-first:
-#   • a user attachment (files under `<server_path>/.bt-attachments/`,
-#     served inline via the /attachment route), or
-#   • a bt_show image whose file is already on the server mirror / show
-#     cache (`show_server_path`; no worker fetch from here — a cache miss
-#     just means "no thumbnail" until the chat renders it once).
-function overview_image(state::ServerState, p::ProjectInfo,
-                        msgs::Vector{ChatMsg}, chat_dir::AbstractString)
-    for m in Iterators.reverse(msgs)
-        if m isa UserMsg
-            _, rels = split_attachment_suffix(m.text)
-            for rel in Iterators.reverse(rels)
-                isfile(joinpath(p.server_path, rel)) || continue
-                return "/attachment/$(p.id)?file=$(HTTP.escapeuri(basename(rel)))"
-            end
-        elseif m isa ToolMsg && tool_key(m) == "bt_show"
-            content = tool_content_for_render(m, chat_dir)
-            isempty(content) && continue
-            ref = find_show_reference(content)
-            ref === nothing && continue
-            path = parse_show_path(ref)
-            path === nothing && continue
-            any(ext -> endswith(lowercase(path), ext), SHOW_IMAGE_EXTS) || continue
-            local_path = show_server_path(ShowTool(state, p.id, p.server_path, path))
-            isfile(local_path) || continue
-            return Bonito.Asset(local_path)
-        end
-    end
-    return nothing
 end
 
 # Messages + chat_dir for a project: the live model's store when the chat is
@@ -115,10 +86,10 @@ function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
         msgs, chat_dir = overview_msgs(state, p)
         push!(cards, ChatCardData(
             p.id,
-            project_display_title(p),
+            p.title[],
             length(msgs),
-            overview_snippets(msgs),
-            overview_image(state, p, msgs, chat_dir),
+            overview_snippets(msgs; provider = project_provider(p)),
+            chat_icon_image(state, p),
             mt,
             chat_status(state, p)))
     end
@@ -203,7 +174,7 @@ function overview_card_dom(state::ServerState, c::ChatCardData)
     thumb = if c.image !== nothing
         DOM.img(; src = c.image, alt = "", class = "bt-ov-img", loading = "lazy")
     elseif p !== nothing
-        project_icon(p)                       # identicon placeholder
+        project_icon(state, p)                # identicon placeholder
     else
         DOM.div()
     end
@@ -223,14 +194,21 @@ function overview_card_dom(state::ServerState, c::ChatCardData)
         dataProjectId = c.pid)
 end
 
-# The header section. Re-renders the card grid on `chat_signal` (turn
-# boundaries + chat open/close) and `projects` (title edit / rename / new
-# project). One delegated click handler on the LONG-LIVED wrapper routes card
-# clicks to `current_view` — per-card handlers would re-register on every
-# refresh.
+# The header section. Re-renders the card grid on `turn_signal` (a chat's
+# content changed — every turn boundary), `chat_signal` (chat open/close) and
+# `projects` (title edit / rename / new project). One delegated click handler on
+# the LONG-LIVED wrapper routes card clicks to `current_view` — per-card
+# handlers would re-register on every refresh.
+#
+# Cost note for anyone adding a signal here: a rebuild runs `recent_chat_cards`,
+# which stats one `chat.md` per project and — for the `OVERVIEW_LIMIT` chats it
+# actually shows — copies each OPEN chat's `msgs_store` under its lock
+# (`overview_msgs`). That is bounded and fine at turn granularity (twice a turn,
+# six chats), but it is not free per frame: don't wire this to a signal that
+# fires per streamed chunk.
 function recent_chats_dom(session::Bonito.Session, state::ServerState,
                           current_view::Union{Observable{String},Nothing})
-    grid = map(state.chat_signal, state.projects) do _, _projects
+    grid = map(state.chat_signal, state.turn_signal, state.projects) do _, _turn, _projects
         cards = recent_chat_cards(state)
         isempty(cards) && return DOM.div("No chats yet — create a project below.";
                                           class = "bt-ov-empty")

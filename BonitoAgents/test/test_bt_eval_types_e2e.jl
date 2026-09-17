@@ -142,11 +142,48 @@ const CASES = [
     ("er-bounds",     "[1, 2, 3][99]",                              p_text("er-bounds", "BoundsError")),
 ]
 
+# Fixture for the Output-section GEOMETRY test below: 40 lines of plain stdout,
+# far past the 4-line summary window so the section actually scrolls. Kept OUT
+# of CASES because it asserts layout, not a rendered value — and because the
+# geometry test has to send it itself, so the card is the most recent one and
+# can't have been recycled out of the virtual scroll window.
+const GEO_ID   = "geo-lines"
+const GEO_CODE = "for y in 1:40; println(\"line \", lpad(y, 3), \" tail\"); end; nothing"
+
 # One eval per turn — exactly how a user works (one prompt → one eval), and the
 # only flow the harness/chat supports cleanly (multiple tool_calls in a single
 # mock turn don't all render). The user message IS the case id; the scripted agent
 # looks it up and emits that case's bt_eval. One chat → one reused eval worker.
-const BY_ID = Dict(id => code for (id, code, _) in CASES)
+const BY_ID = merge(Dict(id => code for (id, code, _) in CASES),
+                    Dict(GEO_ID => GEO_CODE))
+
+# Measure the live geometry of a card's Output section. Built by concatenation,
+# NOT a triple-quoted literal: Julia dedents those, which silently changes the
+# embedded JS indentation.
+geo_probe(id) =
+    "(() => {" *
+    "const sec = [...document.querySelectorAll('$(jsel(id)) .bt-subsection')].find(" *
+    "  d => (d.querySelector('.bt-subsection-label')||{}).textContent === 'Output'" *
+    "    && d.querySelector('.bt-console')" *
+    "    && d.querySelector('.bt-subsection-body').offsetParent !== null);" *
+    "if (!sec) return JSON.stringify({error: 'no visible Output section'});" *
+    "const body = sec.querySelector('.bt-subsection-body');" *
+    "const con  = sec.querySelector('.bt-console');" *
+    "const cs = getComputedStyle(body), cc = getComputedStyle(con);" *
+    "const rb = body.getBoundingClientRect();" *
+    "const lh = parseFloat(cc.lineHeight);" *
+    # Text height left after EVERY nested box model contribution — body padding
+    # plus whatever chrome the console draws inside it.
+    "const inner = rb.height - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom)" *
+    "  - parseFloat(cc.paddingTop) - parseFloat(cc.paddingBottom)" *
+    "  - parseFloat(cc.borderTopWidth) - parseFloat(cc.borderBottomWidth);" *
+    "return JSON.stringify({state: sec.dataset.state, line_height: lh," *
+    "  lines_visible: inner / lh," *
+    "  scrollbar_px: body.offsetWidth - body.clientWidth," *
+    "  scrollbar_width_css: cs.scrollbarWidth," *
+    "  console_border_px: parseFloat(cc.borderTopWidth)," *
+    "  console_pad_px: parseFloat(cc.paddingLeft)," *
+    "  scrolls: body.scrollHeight > body.clientHeight + 1});})()"
 
 @testset "bt_julia_eval renders $(length(CASES)) output types / stdout / safety / errors (live chat)" begin
     # The one per-worker shared server + browser (see SharedServer). We only swap
@@ -191,6 +228,68 @@ const BY_ID = Dict(id => code for (id, code, _) in CASES)
                 "document.querySelector('$(jsel(id))')?.innerText?.slice(0,400) ?? '(none)'") embed = TK.eval_js(s,
                 "document.querySelector('$(jsel(id)) .bt-embed')?.innerText?.slice(0,200) ?? '(no embed)'")
             @test ok
+        end
+
+        # ── Output-section geometry ───────────────────────────────────────────
+        # The Collapsable body owns BOTH the height cap and the scrollbar, and
+        # three things about that were wrong at once (all visible as "the
+        # scrollbar and the output bubble look weird"):
+        #
+        #  * The summary window showed 3.92 lines, not 4 — so the last row was
+        #    sliced mid-glyph. `max-height` was `N*18px + 16px`, the `+16`
+        #    meant to cover the body's padding; but sizing is content-box, so
+        #    the padding is added by layout anyway, and the console nested
+        #    inside ate a further 16px padding + 1.38px border nobody counted.
+        #  * The scrollbar was the 15px native Linux/Electron bar WITH up/down
+        #    arrow buttons — the thin styling was scoped to `.bt-text-input`
+        #    only, so no scrollable Collapsable body ever got it.
+        #  * `.bt-console` drew its own border+radius+surface INSIDE the
+        #    section, which already draws one. The section owns the scrollbar,
+        #    so the bar rendered in the ~26px channel BETWEEN the console's
+        #    border and the section's — reading as a scrollbar floating
+        #    outside the bubble.
+        #
+        # Sent here (not via CASES) so this card is the most recent one and the
+        # virtual scroller can't have recycled it away before we measure.
+        @testset "output section geometry" begin
+            TK.send_message(s, GEO_ID)
+            @test TK.wait_for(s, "$GEO_ID terminal",
+                "['completed','failed'].includes(document.querySelector('$(jsel(GEO_ID)) .bt-tool-status')?.textContent)";
+                timeout = 60) == true
+            TK.click(s, "$(jsel(GEO_ID)) .bt-tool-header")
+            @test TK.wait_for(s, "$GEO_ID output rendered",
+                p_output(GEO_ID, "line  40 tail"); timeout = 40) == true
+
+            g = JSON.parse(TK.eval_js(s, geo_probe(GEO_ID)))
+            @test get(g, "error", nothing) === nothing
+            @test g["scrolls"] == true            # 40 lines in a 4-line window
+
+            # Whole lines, no sliced last row. Default `summary_lines` is 4.
+            @test g["state"] == "summary"
+            @test isapprox(g["lines_visible"], 4; atol = 0.05)
+
+            # Styled thin scrollbar, not the native arrow-button one.
+            @test g["scrollbar_width_css"] == "thin"
+            @test g["scrollbar_px"] < 15
+
+            # No second box nested inside the section — that's what pushed the
+            # scrollbar out of the bubble.
+            @test g["console_border_px"] == 0
+            @test g["console_pad_px"] == 0
+
+            # Cycling summary → full keeps whole lines too (26 × 18px). Scope
+            # the click to the OUTPUT section — a plain descendant selector
+            # would hit the Code section's header first.
+            out_sec = "[...document.querySelectorAll('$(jsel(GEO_ID)) .bt-subsection')].find(" *
+                      "d => (d.querySelector('.bt-subsection-label')||{}).textContent === 'Output'" *
+                      " && d.querySelector('.bt-subsection-body').offsetParent !== null)"
+            TK.eval_js(s, "(() => { const d = $out_sec;" *
+                          " d.querySelector('.bt-subsection-summary').click(); return true; })()")
+            @test TK.wait_for(s, "$GEO_ID output full",
+                "(() => { const d = $out_sec; return !!d && d.dataset.state === 'full'; })()";
+                timeout = 10) == true
+            gf = JSON.parse(TK.eval_js(s, geo_probe(GEO_ID)))
+            @test isapprox(gf["lines_visible"], 26; atol = 0.05)
         end
 
         TK.screenshot(s, joinpath(SHOT_DIR, "bt_eval-types.png"))

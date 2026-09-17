@@ -1,15 +1,15 @@
 # Server-level e2e for "Yolo mode" (autonomous auto-continue).
 #
 # While Yolo is ON, after each turn ends the app auto-nudges the agent to keep
-# working (`YOLO_CONTINUE_PROMPT`) until the agent answers just `no`. The self-
-# driving loop is: a turn's finalize (`drain_turn!`) enqueues the next continue
+# working (`YOLO_CONTINUE_PROMPT`) until the agent emits the done sentinel. The self-
+# driving loop is: a turn's finalize (`finish_turn!`) enqueues the next continue
 # prompt via `send_message!`, whose own finalize repeats the check — no separate
 # loop task. A bare `no` bails (no re-prompt).
 #
 # Drives the SERVER path (no browser), mirroring cancel_escalation_test /
 # resume_eager_bind: own `TK.dev_server(agent=…)`, `state.chat_models[pid]`,
 # and assert on `msgs_store`. The mock `agent_fn` is a scripted closure with a
-# counter so the continue-prompt replies "still working" once, then "no".
+# counter so the continue-prompt replies "still working" once, then the done sentinel.
 @testitem "e2e:yolo_mode" tags = [:e2e] begin
     include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
     TK = TestKit
@@ -24,15 +24,13 @@
         return false
     end
 
-    # ── Unit-style checks for the bail normalizer ─────────────────────────────
-    @testset "yolo_bail normalizes the bail signal" begin
-        @test BA.yolo_bail("no")
-        @test BA.yolo_bail("No.")
-        @test BA.yolo_bail(" no \n")
-        @test BA.yolo_bail("NO!")
-        @test !BA.yolo_bail("no, here's more")
+    # The bail signal itself is covered by `unit:yolo_bail`; duplicating it here
+    # is how the two drifted apart (this file asserted the old exact-match rule
+    # long after the implementation had moved on). Pin only the one fact this
+    # e2e depends on: the sentinel the mock replies with really does bail.
+    @testset "the sentinel this test replies with is the bail signal" begin
+        @test BA.yolo_bail(BA.YOLO_DONE_SENTINEL)
         @test !BA.yolo_bail("still working on it")
-        @test !BA.yolo_bail("")
     end
 
     # Count auto-continue prompts that landed in the store.
@@ -42,7 +40,7 @@
     end
 
     # Scripted mock: the first user task replies with some text; each Yolo
-    # continue-prompt replies "still working on it" the FIRST time and "no" the
+    # continue-prompt replies "still working on it" the FIRST time and the sentinel the
     # SECOND time → the loop runs one extra turn then bails.
     continue_count = Ref(0)
     function agent_fn(prompt)
@@ -51,7 +49,7 @@
             if continue_count[] == 1
                 return [TK.text("still working on it"), TK.end_turn()]
             else
-                return [TK.text("no"), TK.end_turn()]
+                return [TK.text(BA.YOLO_DONE_SENTINEL), TK.end_turn()]
             end
         else
             return [TK.text("here is the initial result"), TK.end_turn()]
@@ -81,12 +79,12 @@
 
             # Send the user's real task. The task turn finalizes → 1st continue
             # prompt fires; the agent says "still working" → 2nd continue prompt
-            # fires; the agent says "no" → bail (no 3rd prompt).
+            # fires; the agent emits the sentinel → bail (no 3rd prompt).
             BA.send_message!(model, BA.UserMsg(model, "do the thing"))
 
             # (a) At least one continue prompt appeared (auto-continue fired) and
             # (b) eventually EXACTLY two (task→#1, "still working"→#2), then it
-            # STOPS growing because the "no" reply bails.
+            # STOPS growing because the sentinel reply bails.
             @test poll_until(() -> yolo_prompts(model) >= 1; timeout = 30)
             @test poll_until(() -> yolo_prompts(model) == 2; timeout = 30)
 
@@ -99,11 +97,11 @@
                 end
             end
 
-            # (c) The agent answered "no" → bail. Give the loop ample time to
+            # (c) The agent emitted the sentinel → bail. Give the loop ample time to
             # (not) fire a third prompt, then assert the count is frozen at 2.
             @test poll_until(timeout = 30) do
                 BA.lock(model.lock) do
-                    any(m -> m isa BA.AgentMsg && strip(lowercase(m.text)) == "no",
+                    any(m -> m isa BA.AgentMsg && BA.yolo_bail(m.text),
                         model.msgs_store)
                 end
             end
