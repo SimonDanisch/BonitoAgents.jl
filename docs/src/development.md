@@ -43,7 +43,7 @@ The shard list is built from the `@testitem` names in the source, so CI cannot
 drift from the suite. The hand-written job-per-suite matrix it replaced had
 drifted: one entry no item answered to (a red job every run) and nine items
 nothing ever ran. Eight shard jobs also cost about a tenth of the runner time,
-because a job's fixed cost — checkout, apt, a 730 MB depot restore — dwarfs the
+because a job's fixed cost (checkout, apt, a 730 MB depot restore) dwarfs the
 sub-minute item it used to run.
 
 Budgets are per ITEM (`testitem_timeout` in `runtests.jl`), not per job: a
@@ -60,7 +60,13 @@ this way.
 The mock agent's event DSL (`test/testkit/TestKit.jl`) covers text chunks,
 tool calls with diff and terminal content, forms, plans, subagent feeds,
 live-app pushes, pacing delays and mid-turn cancellation, so most UI behavior
-can be scripted in a few lines.
+can be scripted in a few lines. Its MCP simulator runs in-process, which is
+enough for UI work but never exercises a process launch; pass
+`real_process = true` when that is the thing under test. The worker relay that
+carries remote Julia has two items of its own: `unit:mcp_relay` (a real MCP
+subprocess started without any server coordinates, plus cancellation,
+disconnects, routing and queue bounds) and `e2e:remote_eval` (real worker
+daemons and MCP processes end to end).
 
 ## Debugging BonitoAgents itself
 
@@ -72,10 +78,10 @@ way.
 
 The worker provides the checkout. A worker that already runs from one (a dev
 install, the test suite) answers with it. An ordinary install clones the
-repository into its environment — `<env>/dev/BonitoAgents`, at the revision
-this server was installed from — and `Pkg.develop`s the monorepo packages from
-it: `dev --local`, done for you. The first press on such a worker therefore
-takes a few minutes (clone + precompile); afterwards a restart of that worker
+repository into its environment (`<env>/dev/BonitoAgents`, at the revision this
+server was installed from) and `Pkg.develop`s the monorepo packages from it:
+`dev --local`, done for you. The first press on such a worker therefore takes a
+few minutes (clone + precompile); afterwards a restart of that worker
 runs what the agent edited, and re-running the installer puts the environment
 back on the pinned revision.
 
@@ -84,42 +90,60 @@ which is the part the filesystem can't tell you:
 
 | Tool | What it answers |
 |------|-----------------|
-| `bt_dev_inspect` | live workers, projects, chats and eval bridges — plus `section="worker"`, what a worker says about ITSELF (its agent processes, their sockets). When that disagrees with what the server believes, the disagreement is the bug. |
+| `bt_dev_inspect` | live workers, projects, chats and eval bridges, plus `section="worker"`: what a worker says about ITSELF (its agent processes, their sockets). When that disagrees with what the server believes, the disagreement is the bug. |
 | `bt_dev_logs` | logs from any machine in the fleet. `source="server"` or `source="<worker>"` reads that process's log FILE, which survives restarts and holds what no logger sees (unhandled task errors, fatal signal dumps); `source="all"` reads everyone at once. The default `"ring"` is the server's in-memory `@info`/`@warn`/`@error` records, filterable by level and substring. |
 | `bt_dev_memory` | RSS, GC live bytes and every registry that has historically grown without bound, with an optional GC and a deep `summarysize` pass. For a leak: take a reading, exercise the suspect path, read again with `gc = true`, compare what grew. |
-| `bt_dev_control` | drive the server as a user would — open a chat, send a message, restart a session, rescan a worker, move a project to another machine. |
+| `bt_dev_control` | drive the server as a user would: open a chat, send a message, restart a session, rescan a worker, move a project to another machine. |
 
 The tools are attached by a persisted per-project `dev_mode` flag. The button
 sets it; the **Dev mode** item in a chat's ⋯ menu can grant it to any chat by
 hand (behind a confirm, since the tools drive the whole server; the ⋯ trigger
-turns red while it is on), and a chat that got
-it that way is told the source is not in front of it. Pointing an ordinary chat
-at the checkout grants nothing.
+turns red while it is on), and a chat that got it that way is told the source is
+not in front of it. Pointing an ordinary chat at the checkout grants nothing.
 
 ## The walkthrough videos
 
-Two recorders under [`examples/`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/examples)
+Three recorders under [`examples/`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/examples)
 drive a real Electron window with ElectronCall's animated cursor and frame-pump
 recorder, using only trusted input (`ECT.real_click`, `ECT.wheel`) so the clip
-shows exactly what a user does. They write the two videos embedded on the home
-page:
+shows exactly what a user does. The first two write the videos embedded on the
+home page; copy them into `docs/src/assets/` (as `dashboard.mp4` and
+`walkthrough.mp4`) to publish them:
 
 - [`walkthrough_dashboard.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_dashboard.jl)
   → `walkthrough_dashboard.mp4`: the multi-project dashboard tour (open a project
   from its card, switch projects from the sidebar, back to Home). Replays the
   persistent rig (`BT_WALKTHROUGH_RIG`), so it uses no tokens and never prompts
   the agent.
+- [`walkthrough.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl)
+  → `walkthrough.mp4`: the focused tour on the SAME rig. A streaming
+  `bt_julia_eval`, the three-state section collapse, the other three chats, then
+  the Lorenz app steered by its slider, detached and docked beside its source
+  file. Replaying costs nothing, but the app the agent returned is gone after a
+  cold attach, so `BT_WALKTHROUGH_REVIVE=1` spends ONE small turn rebuilding it.
 - [`walkthrough_mock.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl)
-  → `walkthrough.mp4`: the focused `bt_julia_eval` demo (curve-fitting dashboard,
-  degree-slider sweep, streaming cross-validation, three-state collapse,
-  detach/dock/steer). Self-contained: a `MockACP` agent scripts the
-  conversation while the REAL `bt_julia_eval` runs the code.
+  → also `walkthrough.mp4`: the same story with no rig and no agent at all. A
+  `MockACP` scripts the conversation while the REAL `bt_julia_eval` runs the
+  code. Deterministic, which is what you want when the rig is unavailable or you
+  are iterating on the camera work rather than on the content.
+
+`walkthrough.jl` and `walkthrough_mock.jl` write the same filename, so whichever
+you run last is the one you copy into the docs. The rig tour shows four genuine
+agent sessions; the mock one is reproducible anywhere.
 
 ```bash
 # run in an env that dev's ElectronCall with the trusted-input helpers:
-julia --project examples/walkthrough_mock.jl        # → examples/walkthrough.mp4
 julia --project examples/walkthrough_dashboard.jl   # → examples/walkthrough_dashboard.mp4
+BT_WALKTHROUGH_REVIVE=1 julia --project examples/walkthrough.jl   # → examples/walkthrough.mp4
+julia --project examples/walkthrough_mock.jl        # → examples/walkthrough.mp4 (no rig, no tokens)
 ```
+
+The rig itself lives OUTSIDE the repo (it holds machine-local absolute paths),
+so a fresh checkout has nothing to replay and the recorders fail on a missing
+chat. [`walkthrough_seed.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_seed.jl)
+rebuilds it: four projects, one real agent turn each (this is the only step that
+spends tokens), with a check per chat that it produced what the camera needs.
+Name one chat to reseed just that one.
 
 ## Building these docs
 

@@ -17,11 +17,13 @@ bt_julia_eval(code; env_path?, timeout?, full_output?, max_response_bytes?, juli
 Each `env_path` runs in its own Julia subprocess (managed via
 [Malt.jl](https://github.com/JuliaLang/Malt.jl)); top-level bindings, loaded
 modules and compiled methods carry over between calls, so an agent iterating on
-a package pays the load cost once instead of per tool call. Revise is
-auto-loaded (source edits are picked up without a restart), and an `env_path`
-ending in `/test` auto-activates TestEnv so the parent project's test deps are
-visible. Always prefer this over `julia -e` through Bash, which spawns a cold
-process every time.
+a package pays the load cost once instead of per tool call. Revise is loaded
+when the session can see it, either in the project or in your global
+environment, so source edits are picked up without a restart; it is never
+installed into your project on your behalf. An `env_path` ending in `/test`
+auto-activates TestEnv so the parent project's test deps are visible. Always
+prefer this over `julia -e` through Bash, which spawns a cold process every
+time.
 
 Evaluation follows **REPL semantics**, not single-expression splicing: each
 top-level statement runs on its own, so a `for` loop may assign to a global
@@ -51,12 +53,12 @@ checkpoint entirely.
 
 Whatever the eval returns is rendered into the chat as a **live embed**, not a
 text repr. A string (with its line breaks kept), a number, an array, a
-`DataFrame`, an image, and, crucially, a
-Bonito `App` or a WGLMakie figure, which stay *interactive*: a slider drag or a
-button click round trips to the Julia object still living in the worker's
-session. The value is held in the worker and rendered on demand
-(serialize-on-mount over a proxy bridge), so the same result survives collapsing
-and re-expanding the card, and even a browser reload.
+`DataFrame`, an image, and, crucially, a Bonito `App` or a WGLMakie figure,
+which stay *interactive*: a slider drag or a button click round trips to the
+Julia object still living in the worker's session. The value is held in the
+worker and rendered on demand (serialize-on-mount over a proxy bridge), so the
+same result survives collapsing and re-expanding the card, and even a browser
+reload.
 
 Because the value is displayed, it never also gets dumped as text: the **Output
 section shows captured stdout only** (and is absent entirely when the code
@@ -75,13 +77,14 @@ a bounded LRU caps how many stay live at once.
 
 A `bt_julia_eval` pill expands into a body with **Code** and **Output**
 sections and the live result below them. Each section is a three-state
-collapsible; clicking its header cycles **full → summary → collapsed**. The
-summary state is a scrollable ~4-line window onto the content (the scrollbar
-belongs to the section, so the summary is a window, never a truncation), which
-for streaming output stays pinned to the newest line. The card can also be
-widened to the full chat column (the » toggle) when a plot or wide table wants
-the room. A completed eval that returned a value auto-expands so you see the
-result without a click; one that returned `nothing` stays compact.
+collapsible that opens on a **summary**, grows to the **full** content on the
+next click and closes on the one after. The summary is a scrollable ~4-line
+window onto the content, not a truncation (the scrollbar belongs to the
+section, so nothing is ever clipped away), and for streaming output it stays
+pinned to the newest line. The card can also be widened to the full chat column
+(the » toggle) when a plot or wide table wants the room. A completed eval that
+returned a value auto-expands so you see the result without a click; one that
+returned `nothing` stays compact.
 
 ### Output discipline, enforced server-side
 
@@ -128,7 +131,7 @@ so the agent can find the names.
 
 The other machine has its own filesystem: `bt_sync_folder` copies a folder from
 the chat's worker to the target (through the server's mirror, so a second call
-only moves what changed) — the project, its `Project.toml`/`Manifest.toml`, the
+only moves what changed): the project, its `Project.toml`/`Manifest.toml`, the
 data. It needs the same switch.
 
 ## `bt_wait`, pausing a turn
@@ -137,10 +140,10 @@ data. It needs the same switch.
 bt_wait(seconds; until?, poll?, reason?)
 ```
 
-The one way an agent can be idle on purpose. A tool call is what pauses a turn —
-the agent blocks on the result — so this is that shape with nothing inside it:
-no subprocess, no task-bar entry, no completion notification, because the result
-*is* the completion.
+The one way an agent can be idle on purpose. A tool call is what pauses a turn,
+because the agent blocks on its result, so this is that shape with nothing
+inside it: no subprocess, no task-bar entry, no completion notification, because
+the result *is* the completion.
 
 It exists because the alternatives are worse. A foreground `sleep` is blocked by
 the harness and a backgrounded command returns immediately, so an agent waiting
@@ -152,7 +155,7 @@ on expiry.
 `seconds` is required, even together with `until`, and capped at an hour: an
 unbounded wait on an event that may never arrive is a wedged chat. `until` is a
 shell condition, re-checked every `poll` seconds (5 by default) and returning
-the moment it exits 0 — `bt_wait(600; until = "test -f out/done.flag")` costs
+the moment it exits 0, so `bt_wait(600; until = "test -f out/done.flag")` costs
 only as long as the job does. Reaching the bound is a normal result, not an
 error: the agent gets a plain "not yet" and decides, one round trip per hour
 instead of one per eight seconds.
@@ -164,13 +167,14 @@ file is: images and video inline (click for a lightbox), audio with a player,
 markdown rendered, CSV as a sortable table, notebooks with their outputs, 3D
 geometry (`.obj`/`.stl`/`.ply`/`.glb`/`.gltf`) in an interactive view, PDF in the
 browser's own viewer, HTML in a sandboxed frame, source as syntax-highlighted
-code, and opaque bytes as a hex dump. These are the same renderers you get when you open the file as a tab,
-so a file looks the same whichever way you reached it.
+code, and opaque bytes as a hex dump. These are the same renderers you get when
+you open the file as a tab, so a file looks the same whichever way you reached
+it.
 
 `bt_julia_eval` already auto-saves rich values (Makie / Plots figures, color
 matrices) to `<env>/.bonitoAgents/show/` and reports the path, so the usual flow
 is: eval a figure, then `bt_show` its path when the user should see the picture
-rather than interact with it. The file is fetched from the worker on demand — and
+rather than interact with it. The file is fetched from the worker on demand, and
 re-fetched exactly when the worker's copy changed, so re-rendering a plot to the
 same `/tmp/plot.png` shows the NEW picture, not the one from the first `bt_show`.
 
@@ -203,7 +207,6 @@ end
 Returned from an eval, this renders running in the chat; dragging the slider
 recomputes the attractor in the worker and morphs the surface in your browser.
 Detach it beside the chat and keep steering it while you read the code that
-built it. That whole loop, from building the app to steering it to docking it
-beside the chat, is what the recorded
-[`bt_julia_eval` walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl)
-puts on screen.
+built it. That whole loop, from the agent building the app to steering it to
+docking it beside its source file, is the second video on the
+[home page](index.md), recorded against a real agent session.

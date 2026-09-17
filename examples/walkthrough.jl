@@ -33,7 +33,7 @@ isdefined(@__MODULE__, :TestKit) ||
     include(joinpath(@__DIR__, "..", "BonitoAgents", "test", "testkit", "TestKit.jl"))
 const TK  = TestKit
 const ECT = TestKit.ECT
-using BonitoWidgets: groupbody, floattitle
+using BonitoWidgets: groupbody
 import BonitoAgents as BT
 
 const RIG_ROOT = get(ENV, "BT_WALKTHROUGH_RIG",
@@ -96,6 +96,11 @@ function warm_chats!(server, pids)
     end
 end
 
+# Completed `bt_julia_eval`s in a chat. The turn boundary the tour can trust:
+# a flag can flicker, a finished eval cannot un-finish.
+completed_evals(sh) = count(m -> m isa BT.JuliaEvalCall && BT.tool_status(m) == "completed",
+                            sh.msgs_store)
+
 # After a COLD rig attach the eval worker is fresh, so the live app the agent
 # returned during seeding is gone — its embed shows the placeholder. One cheap
 # single-purpose prompt returns a fresh one. Opt-in (BT_WALKTHROUGH_REVIVE=1)
@@ -116,16 +121,141 @@ function revive_live_app!(server, pids)
     isempty(state.worker_control_ws) && error("revive: rig worker never connected")
     model = BT.ensure_project_session!(state, state.projects[][pids["LorenzExplorer"]])
     s = BT.shared(model)
+    # Reads like a person asking, because it IS on camera: this bubble sits in
+    # the Lorenz chat the tour films and the workspace still frames.
+    # The env still has to be named (a cold worker has no Bonito/WGLMakie in the
+    # project env, and the eval fails silently into a dead embed), but it can be
+    # named the way a person would.
     BT.send_message!(model, BT.UserMsg(
-        "Use bt_julia_eval (env_path = \"/sim/Programmieren/ClaudeExperiments\") to " *
-        "build and RETURN the interactive Lorenz visit-density explorer as a Bonito " *
-        "App: a rho Slider(10:60) driving the Axis3 density surface, recomputed in " *
-        "the worker on every drag. Return the App as the LAST expression so it " *
-        "renders live in the chat. Nothing else, no prose."))
+        "Bring the visit-density explorer back up, same ClaudeExperiments env as " *
+        "before: a ρ slider from 10 to 60 driving the Axis3 density surface, " *
+        "recomputed in the worker as I drag. Return the App itself so it runs " *
+        "here in the chat, no prose."))
+    # Wait for the EVAL, not for a flag. `busy_active` reads false between the
+    # prompt landing and the agent's first frame, so waiting on it returned after
+    # 13 seconds — the tour then sent its camera prompt into a chat still working
+    # on this one, both queued, and the camera waited 240s for an eval nobody had
+    # asked for yet. The thing this function exists to produce is a COMPLETED
+    # eval, so that is what it waits for.
+    before = completed_evals(s)
     t0 = time()
-    while !s.busy_active[] && time() - t0 < 60; sleep(2); end
-    while s.busy_active[] && time() - t0 < 420; sleep(5); end
-    @info "revive turn finished" busy = s.busy_active[]
+    while completed_evals(s) == before && time() - t0 < 1800
+        sleep(5)
+        if mod(round(Int, time() - t0), 120) == 0
+            @info "revive: waiting for the app eval" minutes = round((time() - t0) / 60, digits = 1)
+        end
+    end
+    completed_evals(s) == before ?
+        @warn("revive: no completed eval within 30 min — the tour will film a dead embed") :
+        @info("revive turn finished", minutes = round((time() - t0) / 60, digits = 1))
+    # Let the chat settle before the next prompt goes in.
+    t1 = time()
+    while s.busy_active[] && time() - t1 < 120; sleep(2); end
+end
+
+# The Game-of-Life chat's STARTING file: a flat grid whose edges are dead, so
+# the torus refactor is a real, multi-line diff. `walkthrough_seed.jl` seeds the
+# chat with this, and `revive_edit_diff!` writes it back to ask for the same
+# refactor again — one definition, so the two can't drift apart.
+const LIFE_JL_FLAT = """
+# Conway's Game of Life on a flat grid. The edges are dead cells, which
+# makes gliders die at the border; the refactor turns this into a torus.
+function step(grid)
+    n, m = size(grid)
+    out = similar(grid)
+    for i in 1:n, j in 1:m
+        live = 0
+        for di in -1:1, dj in -1:1
+            (di == 0 && dj == 0) && continue
+            ii, jj = i + di, j + dj
+            (1 <= ii <= n && 1 <= jj <= m) || continue
+            live += grid[ii, jj]
+        end
+        out[i, j] = live == 3 || (grid[i, j] == 1 && live == 2) ? 1 : 0
+    end
+    return out
+end
+"""
+
+# The chat still needs a Monaco diff on screen, and a cold attach cannot give
+# one: reloading a chat from disk rebuilds every tool as the GENERIC variant
+# (`persistence.jl` — by design, the typed fields no longer drive live UX), so
+# the Edit card has no diff to mount and renders the "(tool)" placeholder. Only
+# a LIVE edit carries `old_string`/`new_string`, which is what the card rebuilds
+# its diff from. So spend one small turn on the same torus refactor the chat was
+# seeded with, from the same starting file.
+#
+# The page RELOAD at the end is load-bearing, not hygiene: an Edit card
+# auto-expands as soon as those strings land, which is BEFORE the tool's content
+# block arrives, so the body renders the server's "(loading…)" placeholder and
+# nothing re-renders it for the rest of that page's life (a completed tool sends
+# no further update, and the client keeps its non-empty body). A fresh mount
+# renders the diff.
+function revive_edit_diff!(server, pids)
+    state = server.h.state
+    t0 = time()
+    while isempty(state.worker_control_ws) && time() - t0 < 60
+        sleep(0.5)
+    end
+    isempty(state.worker_control_ws) && error("revive: rig worker never connected")
+    project = state.projects[][pids["GameOfLife"]]
+    # The rig's worker is this machine, so its `worker_path` IS the folder the
+    # agent edits (the server-side mirror is a cache, never the source).
+    write(joinpath(project.worker_path, "life.jl"), LIFE_JL_FLAT)
+    model = BT.ensure_project_session!(state, project)
+    sh = BT.shared(model)
+    # This bubble is ON CAMERA (it sits right above the diff in the still), so it
+    # has to read like something a person would type: no "the file is back to
+    # its old version", no tool-choice scolding. Naming the Edit tool once is
+    # both natural and necessary — asked only to "edit the file", the agent
+    # rewrote it through a Bash heredoc, which is a correct refactor and a card
+    # with no diff in it.
+    BT.send_message!(model, BT.UserMsg(
+        "Make the grid wrap as a torus, so a glider leaving the right edge " *
+        "re-enters on the left. Use mod1 for the neighbour lookup and keep " *
+        "step's signature. Edit tool please, one sentence of explanation."))
+    t0 = time()
+    while !sh.busy_active[] && time() - t0 < 120; sleep(2); end
+    while sh.busy_active[] && time() - t0 < 900; sleep(3); end
+    # The tool bubble is committed by the renderer, which runs behind the turn.
+    has_diff() = count(m -> m isa BT.EditToolMsg && !isempty(m.new_string), sh.msgs_store)
+    t1 = time()
+    while has_diff() == 0 && time() - t1 < 30; sleep(2); end
+    diffs = has_diff()
+    diffs == 0 ?
+        @warn("revive: the edit turn produced no diff — the chat still will have no Monaco") :
+        @info("revive: edit diff ready", diffs, minutes = round((time() - t0) / 60, digits = 1))
+    return diffs > 0
+end
+
+# Dock a detached app beside the chat, by its title-bar DOCK button.
+#
+# Not by the title bar itself: a float's title bar only MOVES the window, by
+# design ("dragging one across the workspace never docks it" — BonitoWidgets'
+# workspace docs), so the recorder's old title-bar drag slid the app to the
+# right edge of the screen and left it floating there. The ⧉ button next to the
+# title is the affordance ("Dock (drag to choose where)"), and dragging FROM it
+# aims at a group the same way a tab drag does. Dropping near the group's right
+# edge splits, which is the side-by-side the chat + app shot wants.
+#
+# Returns whether the app actually docked, so a caller filming it can say so.
+function dock_float!(s, ctx; label = "App", into = "Chat", tries = 3)
+    floating() = TK.eval_js(s,
+        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent)") === true
+    dock_button = "[...document.querySelectorAll('.bw-ws-float')]" *
+        ".find(f => (f.querySelector('.bw-float-title-text')?.textContent || '')" *
+        ".startsWith($(repr(label))))?.querySelector('.bw-float-dock')"
+    for attempt in 1:tries
+        ECT.drag(ctx, ECT.JS(el_center_js(dock_button)),
+                 [ECT.JS(groupbody(into; rel = (0.7, 0.5))),
+                  ECT.JS(groupbody(into; rel = (0.94, 0.5)))];
+                 grab = 0.4, move = 1.1)
+        sleep(2.0)
+        floating() || return true
+        @warn "dock_float!: still floating, aiming again" attempt label
+    end
+    @warn "dock_float!: the app never docked" label into
+    return false
 end
 
 # ── camera helpers ───────────────────────────────────────────────────────────
@@ -346,7 +476,10 @@ function demo_eval_features!(s, ctx)
         "\"/sim/Programmieren/ClaudeExperiments\") and nothing else, no prose: " *
         "for i in 1:14; println(\"$(DEMO_MARK) \$i of 14\"); sleep(0.6); end; sum(1:14)")
     # Wait for the live (not-yet-completed) eval to be printing our loop.
-    TK.wait_for(s, "eval streaming stdout", "!!($(streaming_eval_js()))"; timeout = 90)
+    # 240s: a REAL agent has to receive the prompt, pick the tool and start the
+    # eval, and its worker is cold on the first eval of a fresh rig. 90s was the
+    # warm-rig number and it aborted the record.
+    TK.wait_for(s, "eval streaming stdout", "!!($(streaming_eval_js()))"; timeout = 240)
     # The card lands at the very bottom with its Output pane clipped behind the
     # composer — you'd never SEE the loop tick. Scroll the whole card up
     # (follow-mode off) so its Output is fully in frame, then hold while ~8 more
@@ -363,7 +496,14 @@ function demo_eval_features!(s, ctx)
     # Three-state collapse: cycle the Code section header (the first
     # `.bt-subsection`). Assert each transition actually takes, so a broken
     # cycle fails the record. From summary: collapsed → full → summary.
-    code = "($(completed_eval_js()))?.querySelector('.bt-subsection')"
+    # BY LABEL, not "the first one". The eval card's section ORDER changed with
+    # the typed-render work (see `bt_eval: the Output section's click cycle test
+    # was left on the old order`), so `querySelector('.bt-subsection')` started
+    # returning Output — the clicks landed on the wrong section and the record
+    # aborted on a state that was never going to appear. The e2e suite picks it
+    # the same way.
+    code = """[...($(completed_eval_js()))?.querySelectorAll('.bt-subsection') ?? []]
+        .find(d => d.querySelector('.bt-subsection-label')?.textContent === 'Code')"""
     # Park the Code summary in the upper third and freeze follow-mode first:
     # expanding it to "full" grows the card, and with follow-mode ON that
     # auto-scrolls the summary ~270px out from under the cursor between clicks
@@ -371,7 +511,13 @@ function demo_eval_features!(s, ctx)
     # follow-mode off, so the summary holds its spot across all three clicks.
     wheel_to!(s, ctx, "$code?.querySelector('.bt-subsection-summary')"; at = 0.32)
     sleep(0.7)
-    for st in ["summary:false", "full:true", "summary:true"]
+    # The states the CURRENT cycle produces, read off `Bonito.jsrender(::Collapsable)`
+    # in chat.jl: closed → open+summary → open+full → closed. The card auto-expands
+    # with its result, so the Code section starts open+summary and three clicks walk
+    # full:true → full:false → summary:true. The old list (summary:false, full:true,
+    # summary:true) belongs to a cycle that no longer exists, and aborted the record
+    # on a state that was never coming.
+    for st in ["full:true", "full:false", "summary:true"]
         ECT.click(ctx, ECT.JS(el_center_js("$code?.querySelector('.bt-subsection-summary')")))
         TK.wait_for(s, "collapse → $st", """(() => { const d = $code;
             return d && (d.dataset.state + ':' + d.hasAttribute('open')) === $(repr(st)); })()"""; timeout = 8)
@@ -488,10 +634,7 @@ function tour(s, ctx, pids)
         "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent && f.querySelector('canvas'))";
         timeout = 30)
     sleep(1.2)
-    ECT.drag(ctx, ECT.JS(floattitle("App")),
-             [ECT.JS(groupbody("Chat"; rel = (0.7, 0.5))),
-              ECT.JS(groupbody("Chat"; rel = (0.94, 0.5)))];
-             grab = 0.4, move = 1.1)
+    dock_float!(s, ctx)
     sleep(1.6)
 
     # 9 ─ the docked app is still live: one more steer in the plotpane
@@ -587,29 +730,55 @@ function stills(; server = nothing,
             "!!document.querySelector('.bt-sidebar')"; timeout = 60)
         warm_mirrors!(s)
         pids = rig_pids(s.h.state)
-        get(ENV, "BT_WALKTHROUGH_REVIVE", "0") == "1" && revive_live_app!(s, pids)
         warm_chats!(s, pids)
-        ensure_live_embed!(s, pids)
         ctx = s.browser[]
         ECT.install_cursor(ctx; start = (800, 780))
         sleep(0.5)
 
-        # A ─ chat still: the torus diff over its test run (tour step 8 state).
+        # A ─ chat still: the torus diff (the tour's step-8 chat).
+        #
+        # Re-run the refactor live, then mount the page fresh — see
+        # `revive_edit_diff!` for why a replayed Edit card can't show a diff and
+        # why the reload is required rather than tidy.
+        if get(ENV, "BT_WALKTHROUGH_REVIVE", "0") == "1"
+            revive_edit_diff!(s, pids)
+            TK.eval_js(s, "location.reload(); true")
+            sleep(8)
+            TK.install_pane_scope!(s)
+            TK.wait_for(s, "app back after the edit reload",
+                "!!document.querySelector('.bt-sidebar')"; timeout = 60)
+            ECT.install_cursor(ctx; start = (800, 780))
+        end
         TK.set_window_size(s, 1150, 1050)
         sleep(1.0)
         ECT.click(ctx, ECT.JS(side_chat_js("Game of Life: torus mode")))
         sleep(1.5)
-        wheel_to!(s, ctx, pill_js("Edit"; nth = 1))
-        if pill_collapsed(s, "Edit"; nth = 1)
-            ECT.click(ctx, ECT.JS(el_center_js(pill_js("Edit"; nth = 1) *
+        # The NEWEST Edit card: the chat keeps every earlier refactor, and only
+        # the one this run just made carries a diff. Matched on the title
+        # element's textContent, never `innerText` — that reads as empty for a
+        # card the virtual scroller has not laid out yet.
+        newest_edit = """[...document.querySelectorAll('.bt-tool-msg')]
+            .filter(e => e.offsetParent &&
+                (e.querySelector('.bt-tool-title')?.textContent || '').includes('Edit'))
+            .pop()"""
+        wheel_to!(s, ctx, newest_edit)
+        if TK.eval_js(s, "(() => { const p = $(newest_edit); return !!p && " *
+                         "p.querySelector('.bt-tool-header')?.dataset?.expanded !== 'true'; })()") === true
+            ECT.click(ctx, ECT.JS(el_center_js(newest_edit *
                 "?.querySelector('.bt-tool-toggle')")))
-            TK.wait_for(s, "diff mounts",
-                pill_js("Edit"; nth = 1) *
-                "?.querySelector('.monaco-diff-editor-div, .monaco-diff-editor') != null";
-                timeout = 20)
         end
+        TK.wait_for(s, "diff mounts",
+            newest_edit *
+            "?.querySelector('.monaco-diff-editor-div, .monaco-diff-editor') != null";
+            timeout = 90)
         sleep(2.0)                                   # Monaco paint settles
-        wheel_to!(s, ctx, pill_js("Edit"; nth = 1); at = 0.3)
+        # » widens the card to the whole message column. At the default width a
+        # diff of real code is clipped mid-line, which is exactly what the card
+        # has this control for.
+        ECT.click(ctx, ECT.JS(el_center_js(newest_edit *
+            "?.querySelector('.bt-tool-fullwidth')")))
+        sleep(2.0)
+        wheel_to!(s, ctx, newest_edit; at = 0.3)
         sleep(1.0)
         hide_cursor(s)
         chat_png = joinpath(outdir, "screenshot-chat.png")
@@ -617,7 +786,11 @@ function stills(; server = nothing,
         show_cursor(s)
 
         # B ─ workspace still: live surface docked + lorenz.jl in a tab
-        # (tour steps 4 + 6, minus the camera moves).
+        # (tour steps 4 + 6, minus the camera moves). The app the agent
+        # returned is gone after a cold attach, so this is where the optional
+        # revive turn is spent and the embed is brought up.
+        get(ENV, "BT_WALKTHROUGH_REVIVE", "0") == "1" && revive_live_app!(s, pids)
+        ensure_live_embed!(s, pids)
         TK.set_window_size(s, 1600, 900)
         sleep(1.0)
         ECT.click(ctx, ECT.JS(side_chat_js("Lorenz attractor explorer")))
@@ -634,12 +807,19 @@ function stills(; server = nothing,
             "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent && f.querySelector('canvas'))";
             timeout = 30)
         sleep(1.2)
-        ECT.drag(ctx, ECT.JS(floattitle("App")),
-                 [ECT.JS(groupbody("Chat"; rel = (0.7, 0.5))),
-                  ECT.JS(groupbody("Chat"; rel = (0.94, 0.5)))];
-                 grab = 0.4, move = 1.1)
-        sleep(1.6)
+        # A float that doesn't dock keeps its slider and its canvas, so the
+        # still would show a window drifting over the editor instead of the
+        # docked plotpane the caption promises; `dock_float!` verifies.
+        dock_float!(s, ctx)
+        TK.wait_for(s, "docked slider",
+            "[...document.querySelectorAll('input[type=range]')].some(e => e.offsetParent)"; timeout = 15)
         open_lorenz_file!(s, ctx)
+        sleep(2.0)
+        # Opening the file makes IT the active tab in the chat's group, which
+        # hides the chat: the still would be editor + app, and the caption says
+        # chat + app. Click back to Chat, leaving lorenz.jl as the tab beside it.
+        ECT.click(ctx, ECT.JS(el_center_js(
+            "[...document.querySelectorAll('.bw-tab')].find(t => (t.textContent||'').startsWith('Chat'))")))
         sleep(3.0)                                   # Monaco + canvas settle
         hide_cursor(s)
         ws_png = joinpath(outdir, "screenshot-workspace.png")
@@ -688,10 +868,7 @@ function tour_hook(s, ctx, pids)
         "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent && f.querySelector('canvas'))";
         timeout = 30)
     sleep(1.1)
-    ECT.drag(ctx, ECT.JS(floattitle("App")),
-             [ECT.JS(groupbody("Chat"; rel = (0.7, 0.5))),
-              ECT.JS(groupbody("Chat"; rel = (0.94, 0.5)))];
-             grab = 0.4, move = 1.1)
+    dock_float!(s, ctx)
     sleep(1.4)
 
     # Still live, docked: one more steer in the plotpane.

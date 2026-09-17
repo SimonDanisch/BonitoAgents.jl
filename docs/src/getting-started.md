@@ -3,8 +3,8 @@
 ## Install
 
 The fastest way onto one machine is the installer. It downloads the prebuilt
-bundle for your platform (a self-contained Julia + BonitoAgents — no separate
-Julia install needed), puts a `bonito-agents` command on your PATH, and
+bundle for your platform (a self-contained Julia + BonitoAgents, with no
+separate Julia install needed), puts a `bonito-agents` command on your PATH, and
 immediately starts the desktop app: a local dashboard server plus a worker for
 this machine, opened in your browser.
 
@@ -47,7 +47,7 @@ and a logged-in `claude` CLI (run `claude` once and authenticate).
 
 If you would rather run from a checkout (you need
 [Julia](https://julialang.org/install/) 1.12+), the desktop entry point does
-the same thing — dashboard server + local worker + UI in your browser:
+the same thing, giving you dashboard server + local worker + UI in your browser:
 
 ```bash
 git clone https://github.com/SimonDanisch/BonitoAgents.jl
@@ -99,8 +99,8 @@ From the dashboard home:
 Discover, folder picking and cloning live on each worker's own card, so the
 machine is chosen before the folder is. **Copy project** (Settings card) is the
 one that crosses machines: it snapshots a project's files onto another worker as
-a new project. To carry an existing chat elsewhere instead — its files *and* the
-agent's memory — use that chat's ⋯ menu → *Continue on*.
+a new project. To carry an existing chat elsewhere instead, with its files *and*
+the agent's memory, use that chat's ⋯ menu → *Continue on*.
 
 Opening a project starts (or resumes) its agent lazily on the first message.
 The provider dropdown in the chat header selects which agent runs, Claude

@@ -79,20 +79,20 @@ puts it in the ACP title as `mcp__btworker__bt_julia_eval`, OpenCode as
 `btworker_bt_julia_eval`, and Kimi streams the arguments as content text rather
 than `rawInput`. Codex names no tool at all: it wraps the call as
 `rawInput = {server, tool, arguments}` and returns the result only in
-`rawOutput` — an MCP `CallToolResult` for an MCP tool, `formatted_output` for a
+`rawOutput`: an MCP `CallToolResult` for an MCP tool, `formatted_output` for a
 shell command, whose live output it otherwise offers as a terminal handle. All
 of these are normalised back to `(server, tool)` plus the real arguments and
 content, so the code preview, output pane and live embeds behave the same
-everywhere. A recognised tool is also TITLED by its own name — a
+everywhere. A recognised tool is also TITLED by its own name, so a
 `bt_julia_eval` card reads `bt_julia_eval` whoever ran it, rather than
 inheriting whatever the agent chose to call it. A tool we don't recognise is
 left untouched and shows the generic card.
 
 ## The mock agent
 
-`MockAgent` is a deterministic, scriptable ACP agent used by the test suite
-and the recorded
-[`bt_julia_eval` walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl).
+`MockAgent` is a deterministic, scriptable ACP agent used by the test suite and
+by the token-free
+[walkthrough recorder](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl).
 A Julia function maps each prompt to a list of protocol events (text chunks,
 tool calls with diffs, live-app pushes, delays for pacing). It only appears in
 the dropdown when `BT_ENABLE_MOCK_AGENT` is set, which is handy for demos and

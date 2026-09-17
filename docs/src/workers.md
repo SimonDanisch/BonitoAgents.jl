@@ -76,41 +76,27 @@ transfer) the chat still moves and the agent starts fresh there. The messages
 already in the chat stay visible either way, and a toast says which of the two
 happened.
 
-## Managing workers
+## Running Julia on another machine
 
-### Remote Julia transport
-
-Remote Julia requests, replies, stdout, interrupts, and dev-tool requests use
-the workers' existing authenticated connections to the server. Each chat's MCP
-process connects to a loopback listener on its own worker daemon using a token
-scoped to that chat. A remote eval host uses the same local relay on the target
-worker. The server still enforces the chat's **Remote julia** switch.
-
-The control path is:
+An agent can evaluate Julia on any other online worker
+(`bt_julia_eval(code; worker = "MacBook")`, see
+[Julia Tools & Live Apps](@ref)). That traffic needs no new network path:
+requests, replies, streamed stdout and interrupts all ride the authenticated
+connections the workers already hold open to the server.
 
 ```text
 chat MCP → local daemon → server → target daemon → eval host
-           loopback      existing worker connections      loopback
+           loopback       existing worker links    loopback
 ```
 
-Local relay coordinates are supplied explicitly in ACP's MCP launch environment,
-including when a chat is resumed. MCP control does not need the server URL or
-server secret. Worker disconnects close their local channels and fail pending
-control requests; reconnects establish new channels. Queues for slow local
-clients are bounded so they cannot stall worker heartbeats.
+Both ends of the chain are loopback, so an agent's MCP process never learns the
+server URL or the server secret; it talks to its own machine's worker over a
+token scoped to that one chat. The server sits in the middle and enforces the
+chat's **Remote julia** switch on every call, which is why flipping it off ends
+remote evals immediately, with no restart. If a worker drops, its pending calls
+fail with an error instead of hanging, and a reconnect re-establishes the path.
 
-The separate interactive-rendering bridge still carries Bonito app/plot traffic.
-Older workers retain the legacy direct MCP control connection. Update the server
-and workers, then restart existing agent sessions to use the daemon relay.
-
-Tests for this boundary are `unit:mcp_relay` (real MCP subprocess with no server
-coordinates, cancellation, disconnects, routing, and queue bounds) and
-`e2e:remote_eval` (real worker daemons and MCP processes, with a deterministic
-agent that filters inherited environment variables). The latter runs in CI.
-TestKit's default in-process MCP simulator remains useful for UI tests but does
-not cover process launch; use `real_process=true` for that coverage.
-
-### Worker controls
+## Managing workers
 
 Each worker card on the dashboard shows its status dot, lets you rename it,
 and offers *Rescan* to refresh the discovered-sessions list. The `worker.log`

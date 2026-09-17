@@ -18,9 +18,9 @@ growing above the viewport.
   scrollable terminal output, searches into match lists.
 - **Julia evals** (`bt_julia_eval`) stream their stdout into a live terminal
   pane while they run, then settle into Code and Output sections that each
-  collapse three ways (full → a scrollable ~4-line summary → hidden). The
-  return value renders below as a live result, an interactive app included
-  (see [Julia Tools & Live Apps](@ref)).
+  cycle through three states on click: a scrollable ~4-line window, the full
+  content, closed. The return value renders below as a live result, an
+  interactive app included (see [Julia Tools & Live Apps](@ref)).
 - **Questions** (ACP elicitations) render as forms you answer inline.
 - **Plans and todo lists** the agent maintains are pinned to the taskbar while
   the turn runs.
@@ -49,10 +49,10 @@ keeps its controls on screen.
 Tabs are named so you can tell them apart: a file is its basename until another
 open file shares it, at which point both grow leftwards until they differ
 (`a/types.jl` and `b/types.jl`, not two tabs both reading `types.jl`). A tab
-whose editor holds unsaved edits carries a dot — closing a tab throws the buffer
+whose editor holds unsaved edits carries a dot. Closing a tab throws the buffer
 away without asking, so that marker is the warning you get.
 
-The editor is bound to the file **on the worker** — the header shows the worker
+The editor is bound to the file **on the worker**: the header shows the worker
 path and `Ctrl+S` writes it there, failing loudly rather than silently saving
 only the server's copy. Opening re-fetches exactly when the worker's copy
 changed, so you never get yesterday's file at a reused path; re-activating an
@@ -60,7 +60,7 @@ already-open tab refreshes a clean buffer and never overwrites unsaved edits.
 
 ## Reviewing changes
 
-**Review** in the chat header opens the project's git diff as a tab — including
+**Review** in the chat header opens the project's git diff as a tab, including
 files the agent just created, which a plain `git diff` leaves out. Every line
 has a `+`; shift-click a second one to cover a block. Two modes: **Ask** sends
 the question straight into the chat with the file, line and surrounding code
@@ -68,7 +68,7 @@ attached, and **Feedback** collects comments and delivers them as one numbered
 instruction when you press Send. Compare against the working tree or any branch,
 tag or commit, and `⤢` on a file header opens the whole file.
 
-The diff covers the **project's folder**, not the whole repository — a package
+The diff covers the **project's folder**, not the whole repository, so a package
 that lives inside a larger checkout shows its own changes instead of every
 change in the monorepo.
 
@@ -78,14 +78,14 @@ The main area is a VSCode-style workspace
 ([BonitoWidgets](https://github.com/SimonDanisch/BonitoWidgets.jl)). The chat,
 file editors and detached app embeds are panels you drag into tab groups,
 split horizontally or vertically, float as windows, and dock back. Collapse the
-sidebar (`Ctrl`/`⌘`+`B`) for a full-bleed view. Every chat in it carries an
-icon: the chat's own picture once it has shown one (a plot, a screenshot — far
-easier to find in a list than two letters), an identicon coloured by its folder
-until then, and in the corner a badge with the initials of the machine it runs
-on. The badge is the worker's and nothing else's; hovering names it in full.
-The layout is responsive: on a
+sidebar (`Ctrl`/`⌘`+`B`) for a full-bleed view. The layout is responsive: on a
 phone the sidebar folds to icons and panels stack, so the same dashboard drives
 a chat from your desk or your pocket.
+
+Chats are easy to tell apart in a list, because each one carries a picture of
+its own work: the first image it showed, a plot or a screenshot, and an
+identicon coloured by its folder until then. A small badge in the corner gives
+the initials of the machine it runs on, and hovering names that worker in full.
 
 ![The live app docked beside the chat and the built-in editor](assets/screenshot-workspace.png)
 
@@ -93,11 +93,11 @@ a chat from your desk or your pocket.
 
 Agents push results into the chat through the built-in Julia tools
 ([Julia Tools & Live Apps](@ref)). `bt_show` renders a worker-side file with the
-same viewers the file tabs use — images and video inline with a lightbox,
-rendered markdown, tables, geometry, source. And
-whatever `bt_julia_eval` **returns** renders as a live value: a plot, a table,
-or a running Bonito app whose logic executes in the worker's Julia session, so a
-slider drag or button click round trips to real code. Live embeds detach from
+same viewers the file tabs use: images and video inline with a lightbox,
+rendered markdown, tables, geometry, source. And whatever `bt_julia_eval`
+**returns** renders as a live value: a plot, a table, or a running Bonito app
+whose logic executes in the worker's Julia session, so a slider drag or button
+click round trips to real code. Live embeds detach from
 their bubble into a workspace tab or floating window and stay alive there: the
 same DOM node is moved, so their WebGL context and session are kept rather than
 rebuilt.
@@ -110,8 +110,8 @@ meter (tokens used of the window, percent, cost so far; it turns amber past
 three quarters and red past nine tenths), the model, permissions and effort
 pickers, the *remote julia* switch (may this chat's agent run Julia and copy
 folders on other workers; off by default, see the tools page), and the agent
-provider. Next to it **Review** opens the change-review
-tab, and the **⋯ menu** holds everything else: *Continue on* another worker,
+provider. Next to it **Review** opens the change-review tab, and the **⋯ menu**
+holds everything else: *Continue on* another worker,
 *Compact*, *Restart session*, *Debug BonitoAgents* and the *Dev mode* switch.
 Long-running actions report in the muted status line left of the controls;
 outcomes arrive as a toast. When the agent session dies, a red **Session
@@ -134,7 +134,7 @@ ended · Reconnect** chip appears next to the title.
 - The **search lens** (`/` box above the transcript) filters the transcript by
   type or fuzzy text, and saved lenses come back on a click.
 - If the **browser loses the server**, a modal takes the window and locks the
-  composer — anything typed while the socket is down would be lost. It names how
-  long the reconnect has been running, offers a reload, and lifts by itself when
-  the connection is back. A sub-second blip, which is the usual case, never
-  shows it.
+  composer, because anything typed while the socket is down would be lost. It
+  names how long the reconnect has been running, offers a reload, and lifts by
+  itself when the connection is back. A sub-second blip, which is the usual
+  case, never shows it.

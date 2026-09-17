@@ -34,6 +34,23 @@ end
 
 const CARD = ".bt-tool-msg[data-msg-id*=\"ed1\"]"
 
+# The wire a REAL claude-agent-acp edit produces, which is NOT the one above:
+# there is no `content=[diff]` update at all (verified against a live rig chat's
+# persisted tool record — one text block, and the old/new only in rawInput). The
+# case above would pass on a build that could ONLY render a diff it received as
+# content, so this one pins the path that rebuilds it from the call's own input.
+function edit_agent_rawinput_only(prompt::AbstractString)
+    occursin("edit", lowercase(prompt)) || return [TK.text("Echo: $(prompt)")]
+    return [TK.text("editing:"),
+            TK.tool(kind = "edit", title = "Edit src/thing.jl", tool_name = "Edit",
+                    id = "ed2", content = Any[], complete = false,
+                    raw_input = Dict("file_path" => "src/thing.jl",
+                                     "old_string" => OLD, "new_string" => NEW)),
+            TK.tool_update("ed2"; status = "completed", raw_output = SUCCESS)]
+end
+
+const CARD2 = ".bt-tool-msg[data-msg-id*=\"ed2\"]"
+
 function run_suite(server)
     server.agent_fn[] = edit_agent
 
@@ -50,6 +67,24 @@ function run_suite(server)
         # The success rawOutput text is NOT rendered as the body.
         @test TK.eval_js(server,
             "!((document.querySelector('$CARD').innerText)||'').includes('updated successfully')") == true
+
+        @test isempty(TK.js_errors(server))
+    end
+
+    @testset "Edit card renders its diff with no diff update on the wire" begin
+        server.agent_fn[] = edit_agent_rawinput_only
+        TK.new_chat(server; title = "EditDiffRawInput")
+        TK.send_message(server, "make an edit")
+
+        @test TK.wait_for(server, "edit card",
+            "!!document.querySelector('$CARD2')"; timeout = 120) == true
+        @test TK.wait_for(server, "diff renders from rawInput",
+            "(() => { const p = document.querySelector('$CARD2'); return !!(p && p.querySelector('.monaco-diff-editor, .monaco-diff-editor-div')); })()";
+            timeout = 30) == true
+        # …and does not park on the placeholder that an empty first render ships
+        # (the card auto-expands as soon as old/new land, before any content).
+        @test TK.eval_js(server,
+            "!((document.querySelector('$CARD2').textContent)||'').includes('loading…')") == true
 
         @test isempty(TK.js_errors(server))
     end

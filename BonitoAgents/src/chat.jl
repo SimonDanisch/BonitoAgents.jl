@@ -2464,7 +2464,7 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     sections  = Any[]
     # Code preview: the summary state shows ~4 lines (the Monaco editor sizes
     # itself to the content; the Collapsable body caps + scrolls). Header
-    # click cycles full → summary → collapsed.
+    # click cycles summary → full → collapsed.
     isempty(m.code) || push!(sections,
         tool_subsection("Code", monaco_readonly(m.code, "julia")))
     # Wire contract v3: content is `[output_text?, descriptor?]` — the
@@ -3373,7 +3373,15 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     # before any snap with content reached us). Render a quiet placeholder
     # instead of the alarming "details not persisted" message — the next
     # tool_update will trigger a fresh render with real content.
-    isempty(content) &&
+    #
+    # …unless the message can already draw itself from its own INPUT. That is
+    # the Edit card's normal case, not a rare one: `auto_expand_body` opens an
+    # edit as soon as old/new land, which is BEFORE its terminal text block
+    # arrives, so the first render happens with no content. A placeholder that
+    # reaches the user is sticky (the client keeps a non-empty body across
+    # collapse/expand, so only a reload clears it), and an edit never needs one
+    # — its diff is in the call's input the whole time.
+    isempty(content) && !renders_from_input(m) &&
         return DOM.div("(loading…)"; class = "bt-tool-empty bt-tool-loading")
 
     # bt_show output: a "shown: <path>" reference block (scanned across all text
@@ -3404,6 +3412,12 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     # / ReadToolMsg / BashToolMsg / …), never a `kind ==` string test.
     return render_tool_content(state, m, content, project_id)
 end
+
+# Can this tool render a body with no content blocks at all? Only an edit can:
+# its diff is rebuilt from the call's own `old_string`/`new_string` (see
+# `edit_diff_from_input`), which are known before the result comes back.
+renders_from_input(::ToolMsg) = false
+renders_from_input(m::EditToolMsg) = edit_diff_from_input(m) !== nothing
 
 # Default body: text blocks that ARE a fenced code block become Monaco; prose
 # stays markdown; diff blocks (uncommon outside edit) and images render inline.

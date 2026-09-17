@@ -46,7 +46,7 @@ included ([`AgentProviders/`](AgentProviders/)).
 - Chats stream in live, with Monaco diff viewers for edits, terminal output
   for shell commands, inline images, and the agent's todo list pinned while
   it works.
-- A file tree per project, and a viewer that opens ANY file as a tab —
+- A file tree per project, and a viewer that opens ANY file as a tab:
   images, video and audio streamed from the worker, rendered markdown,
   CSVs as sortable tables, notebooks with their outputs, 3D geometry,
   PDF/HTML, source in Monaco, opaque bytes as a hex dump. Text-backed files
@@ -57,7 +57,7 @@ included ([`AgentProviders/`](AgentProviders/)).
   instruction for the agent to work through.
 - Agents get MCP tools backed by a persistent Julia session per project:
   `bt_julia_eval` with warm state and disciplined output, which renders
-  whatever it returns as what it is — a returned Bonito app or Makie figure
+  whatever it returns as what it is, so a returned Bonito app or Makie figure
   comes back live in the card and its interactions round trip to Julia on the
   worker; `bt_show` to render any worker-side file into the chat; `bt_wait` so
   a turn can actually block on long work; and a `worker =` argument on the
@@ -149,20 +149,25 @@ Linux. Re-run it any time to update.
 ## Tour
 
 <p align="center">
-  <img src="BonitoAgents/assets/screenshot-workspace.png" alt="Chat beside the built-in editor in a split workspace" width="850">
+  <img src="BonitoAgents/assets/screenshot-workspace.png" alt="A live Bonito app detached from the chat and docked beside it, with the project file open in a tab" width="850">
 </p>
 
-[`examples/walkthrough.jl`](examples/walkthrough.jl) records a scripted tour
-([`examples/walkthrough.mp4`](examples/walkthrough.mp4)) against a
-deterministic mock agent, so it needs no API key:
-
-```bash
-julia --project=BonitoAgents/test examples/walkthrough.jl
-```
+Two recorded tours are embedded on the
+[documentation home page](https://agents.bonito.sh/): the multi-project
+dashboard, and a single thread followed end to end, from a streaming
+`bt_julia_eval` to the interactive Lorenz app the agent built, docked beside its
+source file. Both are real agent sessions, replayed on camera by
+[`examples/walkthrough_dashboard.jl`](examples/walkthrough_dashboard.jl) and
+[`examples/walkthrough.jl`](examples/walkthrough.jl). If you want to record one
+without an API key,
+[`examples/walkthrough_mock.jl`](examples/walkthrough_mock.jl) tells the same
+story against a deterministic mock agent.
 
 ## Documentation
 
-Getting started, concepts, deployment and API docs live in [`docs/`](docs/):
+Getting started, concepts, deployment and API docs are at
+[agents.bonito.sh](https://agents.bonito.sh/), and their source is
+[`docs/`](docs/):
 
 ```bash
 julia --project=docs -e 'using Pkg; Pkg.instantiate()'

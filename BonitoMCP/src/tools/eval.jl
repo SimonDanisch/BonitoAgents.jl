@@ -384,9 +384,13 @@ and you pay full startup cost on each call.
 
 Each `env_path` runs in its own Julia subprocess (managed via Malt.jl);
 state (top-level bindings, modules, function defs) carries over across
-calls. Revise.jl is auto-loaded so source edits to packages are picked up
-without restart. If the env path ends in `/test`, TestEnv is auto-activated
-so the parent project's test deps are visible.
+calls. Revise.jl is loaded IF the env can see it (the project, or the user's
+global env) so source edits to packages are picked up without restart — it is
+never installed for you. If your edits don't take effect, check
+`isdefined(Main, :Revise)`, and if it is false ask the user to add Revise to
+their global env rather than editing the project's. If the env path ends in
+`/test`, TestEnv is auto-activated so the parent project's test deps are
+visible.
 
 Displaying apps & plots:
   - The return value (the last expression) is rendered in the chat. A Bonito

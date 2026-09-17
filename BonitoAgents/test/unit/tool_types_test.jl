@@ -115,6 +115,26 @@ end
     @test di["command"] == "interrupt (SIGINT) /p" && !haskey(di, "stoppable")
 end
 
+@testset "an edit renders its diff before its result arrives" begin
+    # `auto_expand_body` opens an Edit card the moment old/new land, which is
+    # BEFORE the tool's terminal text block arrives. Rendering with no content
+    # ships the "(loading…)" placeholder, and a card that reaches the user that
+    # way stays on it: collapse/expand does not refetch a non-empty body. An
+    # edit is the one tool that never needs to wait, because its diff comes
+    # from the call's own input.
+    m = gt("edit", "Edit", "edit a.jl")           # no content blocks at all
+    @test isempty(BT.tool_content_for_render(m, ""))
+    @test BT.renders_from_input(m) === false      # nothing to draw yet
+    BT.apply_input!(m, Dict{String,Any}("file_path" => "a.jl",
+                                        "old_string" => "x", "new_string" => "x\ny"))
+    @test BT.renders_from_input(m) === true       # …now the diff is known
+    d = BT.edit_diff_from_input(m)
+    @test d isa ACP.DiffContent && d.new_text == "x\ny"
+    # Every other tool still shows the placeholder when it has no content.
+    @test BT.renders_from_input(gt("read", "Read", "read a.jl")) === false
+    @test BT.renders_from_input(mcp("bt_julia_eval")) === false
+end
+
 @testset "the real interrupt is JuliaEvalCall-only; others no-op" begin
     cm = BT.ChatModel
     evalcall(m)  = which(BT.request_tool_stop!, Tuple{cm, typeof(m)}).sig.parameters[3]

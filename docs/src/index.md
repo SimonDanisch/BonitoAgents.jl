@@ -11,9 +11,9 @@ checkouts with your own Claude subscription.
     driven through BonitoAgents from wiping your entire PC or leaking all your
     secrets.
 
-The dashboard is the home base: every chat on every machine is a live card with
-a thumbnail from its own plots, and you switch between projects straight from the
-cards or the sidebar.
+The dashboard is the home base. Every chat on every machine is a live card,
+carrying a picture from the chat's own work once it has shown one, and you
+switch between projects straight from the cards or the sidebar.
 
 ```@raw html
 <video src="assets/dashboard.mp4" controls autoplay muted loop playsinline
@@ -21,11 +21,16 @@ cards or the sidebar.
 </video>
 ```
 
-And every chat is real: claude-agent-acp sessions driving `bt_julia_eval`. Here
-the agent returns a live curve-fitting dashboard, its degree slider is steered
-from underfit to overfit with the RMSE updating live, a streaming
-cross-validation sweep finds the best degree, and the app is detached into the
-workspace and docked beside the chat, still interactive.
+Every chat in that video is real: claude-agent-acp sessions that actually ran.
+The next video follows a single thread through them: the agent runs a
+`bt_julia_eval` whose stdout streams into the chat line by line, its Code
+section cycles through summary, full and collapsed, and then the tour moves
+through the other chats: a gallery of rendered Julia sets, a Game-of-Life
+refactor with its diff, three subagents reviewing a file in parallel. It ends back on the Lorenz explorer the agent
+built: the app is live in the transcript, its rho slider is dragged and the
+density surface recomputes in the worker, and the whole thing is detached and
+docked beside the chat, still interactive, with `lorenz.jl` open in the editor
+next to it.
 
 ```@raw html
 <video src="assets/walkthrough.mp4" controls autoplay muted loop playsinline
@@ -38,9 +43,10 @@ workspace and docked beside the chat, still interactive.
 - **One dashboard for all machines.** Projects on your laptop, desktop and
   build server appear side by side. Start a refactor on one, review a diff on
   another, answer a permission prompt from the couch.
-- **Rich transcripts.** Agent turns stream live: prose, tool calls as pills
-  that expand into Monaco diff viewers and terminal output, images with a
-  lightbox, plans and todo lists pinned to a taskbar.
+- **Rich transcripts.** Agent turns stream live and land as real documents:
+  prose rendered as CommonMark with syntax-highlighted code, tool calls as pills
+  that expand into Monaco diff viewers or scrollable terminal output, images
+  inline with a lightbox, plans and todo lists pinned to a taskbar.
 - **A real workspace.** A searchable project file tree, a Monaco editor that
   saves back to the worker, and a VSCode-style layout where files, chats and
   live apps drag into tabs, splits and floating windows.
