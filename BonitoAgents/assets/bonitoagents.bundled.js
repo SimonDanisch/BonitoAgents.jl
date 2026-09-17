@@ -1566,6 +1566,7 @@ class BonitoChat {
                 worker: msg.worker || prev.worker
             });
             this.applyHeaderBadges(node);
+            document.querySelectorAll(`.bt-tool-msg[data-msg-id="${CSS.escape(String(msg.id))}"]`).forEach((n)=>this.applyHeaderBadges(n));
         }
         if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');

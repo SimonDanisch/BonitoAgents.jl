@@ -2441,7 +2441,13 @@ class BonitoChat {
                 timeout_s: msg.timeout_s || prev.timeout_s,
                 worker: msg.worker || prev.worker,
             });
-            this.applyHeaderBadges(node);   // covers a header that is not there yet
+            // Apply to every live card with this id, not just the node this
+            // handler happens to hold: after a rebuild that node can be the
+            // detached one, and patching it leaves the card on screen bare.
+            this.applyHeaderBadges(node);
+            document.querySelectorAll(
+                `.bt-tool-msg[data-msg-id="${CSS.escape(String(msg.id))}"]`
+            ).forEach(n => this.applyHeaderBadges(n));
         }
         if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');

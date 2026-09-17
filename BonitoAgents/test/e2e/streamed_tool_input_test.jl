@@ -116,7 +116,7 @@
         badge_ok || @info "badge missing — card state" card = TK.eval_js(s,
             "(() => { const n = $(card("ev1")); return n ? " *
             "{header: !!n.querySelector('.bt-tool-header'), " *
-            " stashed: n.dataset.btTimeoutS || null, " *
+            " cards: document.querySelectorAll('.bt-tool-msg[data-msg-id=\\"ev1\\"]').length, " *
             " connected: n.isConnected, " *
             " html: (n.outerHTML || '').slice(0, 300)} : 'no card'; })()")
         @test badge_ok
