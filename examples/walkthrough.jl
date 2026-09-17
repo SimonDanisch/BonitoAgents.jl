@@ -258,6 +258,66 @@ function dock_float!(s, ctx; label = "App", into = "Chat", tries = 3)
     return false
 end
 
+# The change-review tab, on camera: the agent's refactor as a git diff, a comment
+# on one line of it, batched rather than sent.
+#
+# Two things this beat depends on, both easy to get wrong:
+#   • EVERY chat pane stays mounted (keep-alive), so `document.querySelector`
+#     finds the FIRST ⋯ trigger in the document, which belongs to some other
+#     chat and is invisible. Clicking it does nothing at all. Every selector
+#     here goes through `visible_js`.
+#   • *Feedback* mode, not *Ask*: Ask puts the question in the chat immediately,
+#     which would spend a turn on every re-record. Feedback collects the comment
+#     as a numbered chip and waits for Send, which shows the same mechanic and
+#     costs nothing.
+visible_js(sel) = "[...document.querySelectorAll($(repr(sel)))].find(e => e.offsetParent)"
+
+# Does this project have something to review? *Review changes* runs `git diff`
+# on the worker, so a clean tree (or a folder that is not a repo at all, which
+# every rig project was until the seeder started committing a baseline) opens an
+# EMPTY tab. Filming that is worse than skipping the beat.
+has_uncommitted(dir) =
+    isdir(joinpath(dir, ".git")) &&
+    !success(pipeline(Cmd(`git diff --quiet`; dir = dir);
+                      stdout = devnull, stderr = devnull))
+
+function review_beat!(s, ctx; line_match = "mod1(i + di",
+                      comment = "mod1 twice per neighbour is a lot of integer math; " *
+                                "hoist the row index out of the inner loop.")
+    ECT.click(ctx, ECT.JS(el_center_js(visible_js(".bt-menu-trigger"))))
+    sleep(1.2)
+    ECT.click(ctx, ECT.JS(el_center_js(visible_js(".bt-header-review"))))
+    TK.wait_for(s, "review diff",
+        "!!document.querySelector('.bt-review .bt-rv-line')"; timeout = 60)
+    sleep(2.0)
+
+    ECT.click(ctx, ECT.JS(el_center_js(visible_js(".bt-fv-seg[data-rv-mode=\"feedback\"]")))) 
+    sleep(1.2)
+
+    # The `+` on the line the comment is about. It is the row's own affordance,
+    # so it has to be the row that CHANGED, not the hunk header above it.
+    plus = """[...document.querySelectorAll('.bt-rv-line.bt-rv-add')]
+        .find(l => (l.textContent||'').includes($(repr(line_match))))?.querySelector('.bt-rv-plus')"""
+    ECT.click(ctx, ECT.JS(el_center_js(plus)))
+    TK.wait_for(s, "comment form", "!!document.querySelector('.bt-rv-input')"; timeout = 20)
+    sleep(0.8)
+
+    ECT.click(ctx, ECT.JS(el_center_js("document.querySelector('.bt-rv-input')")))
+    sleep(0.5)
+    ECT.type_text(ctx, comment)
+    sleep(1.0)
+    ECT.click(ctx, ECT.JS(el_center_js("document.querySelector('.bt-rv-form .bt-btn')")))
+    TK.wait_for(s, "comment collected",
+        "document.querySelectorAll('.bt-rv-chip').length > 0"; timeout = 20)
+    sleep(2.5)                                   # rest on the numbered chip
+
+    # Back to the chat: close the tab the way a user would.
+    ECT.click(ctx, ECT.JS(el_center_js(
+        "[...document.querySelectorAll('.bw-tab')].find(t => (t.textContent||'').startsWith('Changes'))?.querySelector('.bw-tab-close')")))
+    sleep(1.5)
+    return nothing
+end
+
 # ── camera helpers ───────────────────────────────────────────────────────────
 # REAL input only: everything on camera must be a genuine input event on a
 # VISIBLE element — no programmatic scrollTo/scrollIntoView, no
@@ -340,6 +400,15 @@ el_center_js(js_el::AbstractString) = """(() => {
 })()"""
 
 # Click a sidebar chat entry by its (persistent) title.
+# The sidebar entry for a rig project, BY PROJECT NAME.
+#
+# Never hardcode the display title: it is the CHAT's title, which the agent
+# writes and a re-seed resets to a truncated copy of the prompt. A tour that
+# matched on the old string died on `resolve_point matched nothing` the first
+# time a chat was re-seeded. The project name is the stable key.
+chat_title(state, name) = state.projects[][rig_pids(state)[name]].title[]
+side_chat_of(state, name) = side_chat_js(chat_title(state, name))
+
 side_chat_js(title) = """(() => {
     const e = [...document.querySelectorAll('.bt-side-item')]
         .find(x => x.offsetParent && (x.innerText||'').includes($(repr(title))));
@@ -569,9 +638,9 @@ function tour(s, ctx, pids)
     #       KEEPS ROTATING through them (varied content, never a frozen frame)
     #       until the revive turn finishes — so a slow WGLMakie load is covered
     #       by more browsing, not a 40s stare at one panning chat.
-    others = [("Julia-set fractal gallery", -700, 3),
-              ("Game of Life: torus mode",  -650, 3),
-              ("Parallel code audit",       -520, 2)]
+    others = [("FractalGallery", -700, 3),
+              ("GameOfLife",     -650, 3),
+              ("TinyServer",     -520, 2)]
     first_pass = true
     let t0 = time()
         while first_pass || (!istaskdone(revive_task) && time() - t0 < 180)
@@ -579,7 +648,7 @@ function tour(s, ctx, pids)
                 if !first_pass && istaskdone(revive_task)
                     break
                 end
-                ECT.click(ctx, ECT.JS(side_chat_js(title)))
+                ECT.click(ctx, ECT.JS(side_chat_of(s.h.state, title)))
                 TK.wait_for(s, "chat visible: $title",
                     "[...document.querySelectorAll('.bt-text-input')].some(e => e.offsetParent)"; timeout = 20)
                 sleep(1.0)
@@ -594,6 +663,22 @@ function tour(s, ctx, pids)
             end
             first_pass = false
         end
+    end
+
+    # 6b ─ the change-review tab, on the Game-of-Life chat whose refactor is
+    #      still uncommitted: the agent's diff, a comment on the mod1 line,
+    #      collected as feedback. This lands inside the window the tour is
+    #      already spending on the revive turn, so it costs the take nothing.
+    gol = s.h.state.projects[][pids["GameOfLife"]]
+    if has_uncommitted(gol.worker_path)
+        ECT.click(ctx, ECT.JS(side_chat_of(s.h.state, "GameOfLife")))
+        TK.wait_for(s, "game of life chat",
+            "[...document.querySelectorAll('.bt-text-input')].some(e => e.offsetParent)"; timeout = 20)
+        sleep(1.0)
+        review_beat!(s, ctx)
+    else
+        @warn "tour: GameOfLife has no uncommitted change — skipping the review beat. " *
+              "Re-run the seed, or `BT_WALKTHROUGH_REVIVE=1` to redo the refactor." dir = gol.worker_path
     end
 
     # 7 ─ back to Lorenz, where the app the agent built is now LIVE. Join the
@@ -751,7 +836,7 @@ function stills(; server = nothing,
         end
         TK.set_window_size(s, 1150, 1050)
         sleep(1.0)
-        ECT.click(ctx, ECT.JS(side_chat_js("Game of Life: torus mode")))
+        ECT.click(ctx, ECT.JS(side_chat_of(s.h.state, "GameOfLife")))
         sleep(1.5)
         # The NEWEST Edit card: the chat keeps every earlier refactor, and only
         # the one this run just made carries a diff. Matched on the title
@@ -793,7 +878,7 @@ function stills(; server = nothing,
         ensure_live_embed!(s, pids)
         TK.set_window_size(s, 1600, 900)
         sleep(1.0)
-        ECT.click(ctx, ECT.JS(side_chat_js("Lorenz attractor explorer")))
+        ECT.click(ctx, ECT.JS(side_chat_of(s.h.state, "LorenzExplorer")))
         TK.wait_for(s, "live slider present",
             "[...document.querySelectorAll('.bt-embed input[type=range]')].some(e => e.offsetParent)";
             timeout = 60)

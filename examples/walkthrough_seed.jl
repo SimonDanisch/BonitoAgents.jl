@@ -146,6 +146,32 @@ function lay_out!(server, s::Seed)
     for (name, body) in s.files
         write(joinpath(dir, name), body)
     end
+    git_baseline!(dir)
+    return dir
+end
+
+"""
+Commit the starting files, so what the agent does next is a REVIEWABLE diff.
+
+*Review changes* runs `git diff` on the worker: in a folder that is not a repo
+it has nothing to show, which is what the demo rig used to be — the whole
+change-review feature was invisible on camera. With a baseline commit, the
+refactor the agent makes during seeding is exactly the uncommitted change a
+user would open Review to read.
+
+Identity is set per-command: the rig must not depend on the recording machine
+having a git identity configured, and must not pick up the real user's.
+"""
+function git_baseline!(dir)
+    git(args...) = run(pipeline(Cmd(`git $(args)`; dir = dir);
+                                stdout = devnull, stderr = devnull))
+    git("init", "-q")
+    git("add", "-A")
+    # `--allow-empty`: a seed can start with no files at all (the gallery builds
+    # everything from the prompt), and an empty baseline is still the right
+    # baseline — every file the agent writes then shows up as an addition.
+    git("-c", "user.email=demo@example.com", "-c", "user.name=Demo",
+        "commit", "-q", "--allow-empty", "-m", "initial state, before the agent touched it")
     return dir
 end
 

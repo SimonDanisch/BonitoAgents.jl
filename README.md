@@ -152,6 +152,10 @@ Linux. Re-run it any time to update.
   <img src="BonitoAgents/assets/screenshot-workspace.png" alt="A live Bonito app detached from the chat and docked beside it, with the project file open in a tab" width="850">
 </p>
 
+<p align="center">
+  <img src="BonitoAgents/assets/screenshot-review.png" alt="Asking about a line of the agent's refactor in the change-review tab" width="850">
+</p>
+
 Two recorded tours are embedded on the
 [documentation home page](https://agents.bonito.sh/): the multi-project
 dashboard, and a single thread followed end to end, from a streaming

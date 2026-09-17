@@ -60,13 +60,17 @@ already-open tab refreshes a clean buffer and never overwrites unsaved edits.
 
 ## Reviewing changes
 
-**Review** in the chat header opens the project's git diff as a tab, including
-files the agent just created, which a plain `git diff` leaves out. Every line
-has a `+`; shift-click a second one to cover a block. Two modes: **Ask** sends
-the question straight into the chat with the file, line and surrounding code
-attached, and **Feedback** collects comments and delivers them as one numbered
-instruction when you press Send. Compare against the working tree or any branch,
-tag or commit, and `⤢` on a file header opens the whole file.
+**Review changes** in the chat's ⋯ menu opens the project's git diff as a tab,
+including files the agent just created, which a plain `git diff` leaves out.
+Every line has a `+`; shift-click a second one to cover a block. Two modes:
+**Ask** sends the question straight into the chat with the file, line and
+surrounding code attached, and **Feedback** collects comments and delivers them
+as one numbered instruction when you press Send.
+
+Compare against the working tree or any branch, tag or commit, and `⤢` on a
+file header opens the whole file.
+
+![Asking about a line of the agent's refactor, in the change-review tab](assets/screenshot-review.png)
 
 The diff covers the **project's folder**, not the whole repository, so a package
 that lives inside a larger checkout shows its own changes instead of every
@@ -110,9 +114,11 @@ meter (tokens used of the window, percent, cost so far; it turns amber past
 three quarters and red past nine tenths), the model, permissions and effort
 pickers, the *remote julia* switch (may this chat's agent run Julia and copy
 folders on other workers; off by default, see the tools page), and the agent
-provider. Next to it **Review** opens the change-review tab, and the **⋯ menu**
-holds everything else: *Continue on* another worker,
-*Compact*, *Restart session*, *Debug BonitoAgents* and the *Dev mode* switch.
+provider. Everything you *do* to a chat lives in the **⋯ menu** next to them:
+*Review changes*, *Continue on* another worker, *Compact*, *Restart session*,
+*Debug BonitoAgents* and the *Dev mode* switch. The strip itself stays what you
+read and set, so a verb never sits among the pickers looking like a sixth
+setting.
 Long-running actions report in the muted status line left of the controls;
 outcomes arrive as a toast. When the agent session dies, a red **Session
 ended · Reconnect** chip appears next to the title.
