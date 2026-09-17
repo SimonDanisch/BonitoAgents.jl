@@ -213,13 +213,6 @@ class BonitoChat {
         this.spacerTopHeight   = -1;    // last written spacer px (skip no-op style writes)
         this.spacerBottomHeight   = -1;
         this.requestedAt  = new Map(); // idx → time of in-flight msgs.request
-        // Header affordances that arrived on a LATE tool update, keyed by tool
-        // id: the ⏱ timeout and the ⇢ worker badge. They cannot live only in
-        // the DOM — a card is rebuilt from `toolHTML` whenever the virtual list
-        // re-renders it, and a badge patched into the old node is gone (CI:
-        // "⏱ badge inserted late" while the card reported header=true and the
-        // value stashed). Applied on every render, so a rebuild keeps them.
-        this.toolBadges   = new Map(); // tool id → {timeout_s, worker}
         // Bumped on msgs.reload (the server SPLICED history — all indices
         // shifted). Every msgs.request carries it and the server echoes it
         // back on msgs.range; a reply from before the reload is dropped in
@@ -1837,46 +1830,6 @@ class BonitoChat {
                 this.comm.notify({type: 'tool.render', id: node.dataset.msgId});
             }
         }
-        // Header badges an update stashed while this card was out of the window.
-        this.applyHeaderBadges(node);
-    }
-
-    // Insert the header badges this card is owed, from what its updates stashed
-    // on it. Idempotent, and a no-op before the header exists.
-    applyHeaderBadges(node, attempt = 0) {
-        if (!node || !node.dataset) return;
-        const owed = this.toolBadges.get(node.dataset.msgId);
-        if (!owed) return;
-        const headerEl = node.querySelector?.('.bt-tool-header');
-        if (!headerEl) {
-            // No header YET. The card may still be a placeholder, or be out of
-            // the virtual window; whichever path builds it, it is not this one.
-            // Back off and look again rather than dropping the badge for good.
-            // setTimeout, not rAF: a hidden/offscreen window throttles frames to
-            // ~1Hz and the ladder would stretch to a minute. Ten steps ≈ 50s of
-            // patience in total, which a loaded CI runner needs and which costs
-            // nothing once the badge is in (the retry stops at the first hit).
-            if (attempt < 10)
-                setTimeout(() => this.applyHeaderBadges(node, attempt + 1), 50 << attempt);
-            return;
-        }
-        const secs = owed.timeout_s;
-        if (secs && !headerEl.querySelector('.bt-tool-timeout')) {
-            const badge = document.createElement('span');
-            badge.className = 'bt-tool-timeout';
-            badge.title = 'Soft eval timeout — the call checkpoints with partial output at this cadence';
-            badge.textContent = `⏱ ${secs}`;
-            headerEl.insertBefore(badge, headerEl.querySelector('.bt-tool-timer') || null);
-        }
-        const worker = owed.worker;
-        if (worker && !headerEl.querySelector('.bt-tool-worker')) {
-            const wb = document.createElement('span');
-            wb.className = 'bt-tool-worker';
-            wb.title = 'This runs on another worker';
-            wb.textContent = `⇢ ${worker}`;
-            const title = headerEl.querySelector('.bt-tool-title');
-            headerEl.insertBefore(wb, title ? title.nextSibling : null);
-        }
     }
 
     // ── New messages + streaming ──────────────────────────────────────────
@@ -2429,26 +2382,6 @@ class BonitoChat {
         const stillLive = !node.dataset.toolFinished &&
             !['completed', 'failed'].includes(
                 node.querySelector('.bt-tool-status')?.textContent || '');
-        // Stash what a late update carries, so a card that is NOT mounted yet
-        // (virtualized out of the window on a slow box) can still get its
-        // badges when it lands — the insert below needs a header that exists
-        // right now, nothing re-sends `timeout_s`, and the badge was then gone
-        // for good (CI: "⏱ badge inserted late" timing out while every other
-        // affordance from the same update passed). See `applyHeaderBadges`.
-        if (msg.timeout_s || msg.worker) {
-            const prev = this.toolBadges.get(msg.id) || {};
-            this.toolBadges.set(msg.id, {
-                timeout_s: msg.timeout_s || prev.timeout_s,
-                worker: msg.worker || prev.worker,
-            });
-            // Apply to every live card with this id, not just the node this
-            // handler happens to hold: after a rebuild that node can be the
-            // detached one, and patching it leaves the card on screen bare.
-            this.applyHeaderBadges(node);
-            document.querySelectorAll(
-                `.bt-tool-msg[data-msg-id="${CSS.escape(String(msg.id))}"]`
-            ).forEach(n => this.applyHeaderBadges(n));
-        }
         if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
             const badge = document.createElement('span');
             badge.className = 'bt-tool-timeout';
@@ -2793,10 +2726,6 @@ class BonitoChat {
                 // terminal update flips the class via `onToolUpdate`; the
                 // final duration is written from these attrs on completion.
                 if (msg.id) div.dataset.msgId = msg.id;
-                // A rebuild starts from the server's payload, so anything a
-                // LATER update added (the ⏱ / ⇢ badges) goes back on here —
-                // after `msgId`, which is how they are looked up.
-                this.applyHeaderBadges(div);
                 if (msg.started_at != null)
                     div.dataset.toolStarted = String(msg.started_at);
                 if (msg.finished_at != null)

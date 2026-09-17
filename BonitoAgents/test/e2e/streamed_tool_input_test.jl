@@ -103,11 +103,14 @@
         # budget as the Monaco-body wait above: both ride the same late args
         # update, and 10s was the odd one out (it timed out on CI while its
         # sibling passed).
-        # Polled by hand rather than with `wait_for`, which THROWS on timeout —
-        # the diagnostic below never ran, and three CI failures said nothing but
-        # "timed out".
+        # textContent, NOT innerText. `innerText` is what the element RENDERS,
+        # so it is "" whenever layout says the node is not visible — which in a
+        # headless window it can be while the badge sits in the DOM exactly as
+        # intended. This assertion failed on CI for five runs with the badge
+        # present the whole time (the card dump below is what finally showed
+        # `<span class="bt-tool-timeout">⏱ 60s</span>` in the header).
         badge_js = "(() => { const b = document.querySelector('.bt-tool-timeout'); " *
-                   "return !!(b && b.innerText.indexOf('60') !== -1); })()"
+                   "return !!(b && (b.textContent || '').indexOf('60') !== -1); })()"
         badge_ok = false
         for _ in 1:150
             TK.eval_js(s, badge_js) === true && (badge_ok = true; break)
