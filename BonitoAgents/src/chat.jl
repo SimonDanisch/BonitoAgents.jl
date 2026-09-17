@@ -378,6 +378,16 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     # (a page reload didn't hit this: the live store's messages kept their ref).
     for m in msgs_store
         m isa UserMsg && m.chat === nothing && (m.chat = model)
+        # Tools need it for the same reason, and the symptom is louder. A tool
+        # body is rendered from the content persisted next to the chat
+        # (`tools/<id>.json`), reached through the chat's `chat_dir` — so a
+        # restored tool with no back-ref has nowhere to read from and
+        # `jsrender(::ToolMsg)` falls through to the "(tool)" placeholder. Four
+        # of those sat in the walkthrough video where the fractal gallery's
+        # `bt_show` images belong. With the ref, a reopened chat renders what it
+        # rendered live: images, diffs (`edit_diff_from_input` reads the
+        # persisted rawInput through the same door), terminal output.
+        m isa ToolMsg && m.message.chat === nothing && (m.message.chat = model)
     end
     # Turn boundaries → `turn_signal` (see the note at `busy_active` above).
     # Deduped against the last value we ACTED on, because `refresh_activity!`

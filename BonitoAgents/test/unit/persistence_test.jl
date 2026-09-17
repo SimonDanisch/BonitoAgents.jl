@@ -98,6 +98,37 @@ end
         @test BonitoAgents.tool_summary(t) == "12 files"
     end
 
+    @testset "a reloaded tool keeps the type that renders it" begin
+        # Reload used to rebuild EVERY tool as the generic variant. That is fine
+        # for a Bash pill (its body is its text) and wrong for an edit: the body
+        # of an edit is its DIFF, rebuilt from the call's own rawInput by the
+        # EditToolMsg renderer, so a reopened refactor showed "The file … has
+        # been updated successfully" where the diff belonged. The persisted
+        # header carries kind + name, which is the same routing the live path
+        # uses.
+        loaded = roundtrip([
+            BonitoAgents.GenericToolMsg(
+                BonitoAgents.Message("e1", "edit", "Edit", "Edit src/a.jl",
+                                     "completed", "a.jl · +1 line", 0.0, 0.0, nothing)),
+            BonitoAgents.GenericToolMsg(
+                BonitoAgents.Message("r1", "read", "Read", "Read src/a.jl",
+                                     "completed", "19 lines", 0.0, 0.0, nothing)),
+            # MCP tools stay generic ON PURPOSE: a restored `bt_julia_eval`
+            # would try to mount a live result embed against a RemoteRef that
+            # died with its worker.
+            BonitoAgents.GenericToolMsg(
+                BonitoAgents.Message("m1", "other", "bt_julia_eval", "bt_julia_eval",
+                                     "completed", "env /p", 0.0, 0.0, nothing)),
+        ])
+        @test loaded[1] isa BonitoAgents.EditToolMsg
+        @test loaded[2] isa BonitoAgents.ReadToolMsg
+        @test loaded[3] isa BonitoAgents.GenericToolMsg
+        # …and the header fields still survive the round trip.
+        @test BonitoAgents.tool_id(loaded[1]) == "e1"
+        @test BonitoAgents.tool_status(loaded[1]) == "completed"
+        @test BonitoAgents.tool_summary(loaded[1]) == "a.jl · +1 line"
+    end
+
     @testset "plan message round-trips" begin
         loaded = roundtrip([BonitoAgents.TodoListMsg([
             BonitoAgents.PlanEntry("step one", "", "completed"),

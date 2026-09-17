@@ -604,6 +604,15 @@ function close_turn!(out::Channel, st::TurnState)
     seal_message!(st)
     for tc in values(st.tools)
         if !is_terminal(tc.status)
+            # This is the ONLY place a tool becomes "failed" without the agent
+            # saying so, and the badge it produces is indistinguishable from a
+            # real failure. Say it out loud: three subagent cards once showed
+            # `failed` for reviews the wire had reported `completed`, and the
+            # only way to tell whether that came from here (a tool still open
+            # at end-of-turn) or from the update path (a completed status that
+            # never landed) was to diff the transcript against acp.jsonl by
+            # hand. Now the server log answers it.
+            @warn "ACP: tool still open at end of turn, marking it failed" tool_id = tc.id title = tc.title last_status = tc.status
             tc.status = "failed"
             put!(tc.stream, tc)
         end

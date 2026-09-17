@@ -553,14 +553,28 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
                 tail = strip(body[nextind(body, title_line.offset + ncodeunits(title_line.match) - 1):end])
                 summary = String(tail)
             end
-            # Reload always lands as the generic variant — by the time chat.md
-            # was written, every tool had reached terminal status, so the
-            # subtype-specific fields (background flag, MCP server, …) no
-            # longer drive any live UX. New tool calls in the resumed session
-            # come through the typed dispatcher again.
-            push!(msgs, GenericToolMsg(Message(string(id), string(kind),
-                                       string(name), tool_title, string(status),
-                                       summary, time(), time(), nothing)))
+            # Reload restores the BUILTIN display types (`builtin_msg_type`,
+            # the same kind+name routing the live path uses) and leaves
+            # everything else generic.
+            #
+            # It used to restore everything as generic, on the reasoning that a
+            # terminal tool's subtype-specific fields no longer drive live UX.
+            # That holds for the background/MCP machinery it was written about,
+            # but not for the RENDERING: an edit's body is its diff, and the
+            # diff is rebuilt from the call's own rawInput
+            # (`edit_diff_from_input`) — which is persisted next to the chat and
+            # only reachable through the typed renderer. Generic-on-reload meant
+            # a reopened refactor showed "The file … has been updated
+            # successfully" where the diff belongs.
+            #
+            # Deliberately NOT the MCP types: a restored `bt_julia_eval` would
+            # try to mount a live result embed against a RemoteRef that died
+            # with its worker. `builtin_msg_type` never returns one (MCP routing
+            # is a separate door), so this restores exactly the display-only
+            # variants — edit, read, search, move, fetch.
+            push!(msgs, builtin_msg_type(string(kind), string(name))(
+                Message(string(id), string(kind), string(name), tool_title,
+                        string(status), summary, time(), time(), nothing)))
         elseif category == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')
