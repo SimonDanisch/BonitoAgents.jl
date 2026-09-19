@@ -3000,7 +3000,46 @@ function decorateCodeBlocks(rootEl) {
         wrap.appendChild(actions);
     });
 }
+function markdownWorkerPath(anchor) {
+    const raw = (anchor.getAttribute('href') || '').trim();
+    if (!raw || raw.startsWith('#') || raw.startsWith('?')) return null;
+    if (/^(mailto|tel|data|blob|javascript):/i.test(raw)) return null;
+    let path = raw;
+    try {
+        const url = new URL(raw, window.location.href);
+        if (url.protocol === 'file:') {
+            path = decodeURIComponent(url.pathname);
+        } else if (url.protocol === 'http:' || url.protocol === 'https:') {
+            if (url.origin !== window.location.origin) return null;
+            path = decodeURIComponent(url.pathname);
+        } else {
+            return null;
+        }
+    } catch (_) {
+        try {
+            path = decodeURIComponent(raw);
+        } catch (_) {
+            path = raw;
+        }
+    }
+    if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(raw)) {
+        const clean = raw.split(/[?#]/, 1)[0];
+        try {
+            path = decodeURIComponent(clean);
+        } catch (_) {
+            path = clean;
+        }
+    }
+    return path || null;
+}
 function linkifyPaths(rootEl) {
+    rootEl.querySelectorAll('a[href]').forEach((el)=>{
+        if (el.classList.contains('bt-path-link')) return;
+        const path = markdownWorkerPath(el);
+        if (!path) return;
+        el.classList.add('bt-path-link');
+        el.dataset.path = path;
+    });
     rootEl.querySelectorAll('code').forEach((el)=>{
         if (el.closest('pre') || el.closest('a')) return;
         const text = (el.textContent || '').trim();

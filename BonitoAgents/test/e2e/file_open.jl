@@ -20,6 +20,10 @@ const TK = TestKit
 const CWD = mktempdir()
 write(joinpath(CWD, "hello.jl"),  "println(\"hi from hello\")\n")
 write(joinpath(CWD, "second.jl"), "const SECOND = 42\n")
+# Regression case from the VideoEditor chat: a real Markdown link to an
+# absolute worker-side video path used to navigate to a dashboard HTTP route.
+write(joinpath(CWD, "clip.mp4"), UInt8[0x00, 0x00, 0x00, 0x18,
+                                      0x66, 0x74, 0x79, 0x70])
 # A file OUTSIDE the project tree: its server path is a cache miss, so opening it
 # routes through fetch_file_from_worker (the real worker transfer) instead of the
 # shared-FS short-circuit — the path a remote worker always takes.
@@ -47,7 +51,9 @@ active_tab_label = "(document.querySelector('.bw-tab.bw-active .bw-tab-label')?.
 agent_script(prompt) = [TK.tool(kind = "read", title = joinpath(CWD, "hello.jl"),
                                  id = "read-real", tool_name = "Read",
                                  content = [TK.text_block("```julia\nprintln(\"hi from hello\")\n```")]),
-                        TK.text("opened.")]
+                        TK.text("Video: [absolute clip]($(joinpath(CWD, "clip.mp4"))) " *
+                                "or [relative clip](clip.mp4). External: " *
+                                "[Julia](https://julialang.org).")]
 
 function run_suite(server)
     server.agent_fn[] = agent_script
@@ -175,6 +181,27 @@ function run_suite(server)
             TK.eval_js(server, "document.querySelector('.bt-tool-title.bt-path-link').click()")
             @test TK.wait_for(server, "click opened the hello.jl editor",
                 "!!document.querySelector('$(panel_sel(joinpath(CWD, "hello.jl")))') || !!document.querySelector('$(panel_sel("hello.jl"))')"; timeout = 36) == true
+        end
+
+        @testset "Markdown file links open in the workspace" begin
+            abs = joinpath(CWD, "clip.mp4")
+            abs_js = TK.json(abs)
+            @test TK.wait_for(server, "absolute Markdown link is a workspace path",
+                "[...document.querySelectorAll('.bt-agent-msg a.bt-path-link')]" *
+                ".some(a => a.dataset.path === $(abs_js))"; timeout = 15) == true
+            @test TK.eval_js(server,
+                "!document.querySelector('.bt-agent-msg a[href=\"https://julialang.org\"]')" *
+                ".classList.contains('bt-path-link')") == true
+
+            TK.eval_js(server,
+                "[...document.querySelectorAll('.bt-agent-msg a.bt-path-link')]" *
+                ".find(a => a.dataset.path === $(abs_js)).click()")
+            @test TK.wait_for(server, "Markdown-linked video panel",
+                "!!document.querySelector('$(panel_sel(abs)) .bt-file-view[data-kind=\"video\"]')";
+                timeout = 36) == true
+            @test TK.eval_js(server,
+                "document.querySelector('.bt-agent-msg a[href=\"clip.mp4\"]').dataset.path") ==
+                  "clip.mp4"
         end
 
         @testset "clicking Home activates + relabels the chat tab" begin

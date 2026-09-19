@@ -4454,11 +4454,58 @@ function decorateCodeBlocks(rootEl) {
     });
 }
 
-// Turn path-looking inline `code` spans inside an agent message into
-// clickable path links (the delegated container listener opens them in the
-// plotpane editor). Fenced blocks (<pre><code>) are skipped — linkifying
-// inside code listings is noise.
+// Turn paths inside an agent message into clickable workspace links. This
+// covers both actual Markdown anchors and inline `code`; fenced code blocks
+// are skipped because linkifying inside code listings is noise.
+// Recover the WORKER path from a Markdown anchor. CommonMark emits a link to
+// /work/media/clip.mp4 as an anchor with that href; left alone, the browser
+// turns it into http://dashboard/work/... and navigates to a route the server
+// cannot serve. Same-origin absolute URLs are the same failure after the
+// browser has resolved the href, so accept those too. Real web links remain
+// ordinary anchors.
+function markdownWorkerPath(anchor) {
+    const raw = (anchor.getAttribute('href') || '').trim();
+    if (!raw || raw.startsWith('#') || raw.startsWith('?')) return null;
+    if (/^(mailto|tel|data|blob|javascript):/i.test(raw)) return null;
+
+    let path = raw;
+    try {
+        const url = new URL(raw, window.location.href);
+        if (url.protocol === 'file:') {
+            path = decodeURIComponent(url.pathname);
+        } else if (url.protocol === 'http:' || url.protocol === 'https:') {
+            // An explicitly external URL is a web link. A same-dashboard URL
+            // is what a leading worker path becomes in the browser.
+            if (url.origin !== window.location.origin) return null;
+            path = decodeURIComponent(url.pathname);
+        } else {
+            return null;
+        }
+    } catch (_) {
+        // Keep the raw relative path; the server resolves it against the
+        // project's worker cwd. A malformed percent escape is still a valid
+        // Unix filename and should not disable the opener.
+        try { path = decodeURIComponent(raw); } catch (_) { path = raw; }
+    }
+
+    // For relative hrefs URL() above resolves against the dashboard origin;
+    // preserve the relative spelling so media/clip.mp4 resolves against the
+    // PROJECT rather than becoming /media/clip.mp4 on the worker.
+    if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(raw)) {
+        const clean = raw.split(/[?#]/, 1)[0];
+        try { path = decodeURIComponent(clean); } catch (_) { path = clean; }
+    }
+    return path || null;
+}
+
 function linkifyPaths(rootEl) {
+    rootEl.querySelectorAll('a[href]').forEach((el) => {
+        if (el.classList.contains('bt-path-link')) return;
+        const path = markdownWorkerPath(el);
+        if (!path) return;
+        el.classList.add('bt-path-link');
+        el.dataset.path = path;
+    });
     rootEl.querySelectorAll('code').forEach((el) => {
         if (el.closest('pre') || el.closest('a')) return;
         const text = (el.textContent || '').trim();
