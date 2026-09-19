@@ -16,8 +16,9 @@
     model.usage[] = (used = 125_500, size = 258_400, cost = nothing, origin = nothing)
     from = model.provider[]
     to = BT.find_provider(BT.provider_name(from) == "OpenCode" ? "KimiCode" : "OpenCode")
-    BT.switch_provider!(model, to)
-    @test model.provider[] === to
+    failure = BT.switch_provider!(model, to)
+    @test failure isa String
+    @test model.provider[] === from
     @test model.usage[] === nothing
     @test isempty(model.session_meta[])
 end

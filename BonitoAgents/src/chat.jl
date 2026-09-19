@@ -7649,18 +7649,15 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         switching[] = label(new_provider)
         @async begin
             try
-                switch_provider!(model, new_provider)
-                # `switch_provider!` → `restart_chat_session!` swallows bring-up
-                # errors (sets `last_error`, keeps the chat object alive), so a
-                # failed switch returns normally. Surface it from the resulting
-                # session state instead of relying on an exception.
+                failure = switch_provider!(model, new_provider)
                 safe_set!(switching, "")
-                model.session_alive[] ||
-                    problem("Switching to $(label(new_provider)) failed; the session did not come up")
+                failure === nothing ||
+                    problem("Switching to $(label(new_provider)) failed", failure)
             catch e
-                @warn "provider switch failed" exception=(e, catch_backtrace())
+                bt = catch_backtrace()
+                @warn "provider switch failed" exception=(e, bt)
                 safe_set!(switching, "")
-                problem("Switching to $(label(new_provider)) failed")
+                problem("Switching to $(label(new_provider)) failed", error_detail(e, bt))
             end
         end
     end
@@ -7714,20 +7711,25 @@ end
 # ── Provider switching ────────────────────────────────────────────────────────
 
 """
-    switch_provider!(model::ChatModel, new_provider::BinAgent)
+    switch_provider!(model::ChatModel, new_provider::BinAgent) -> Union{Nothing,String}
 
-Switch the agent backend for a chat. This:
-1. Updates the provider observable
-2. Points the live `WorkerAgent` at `new_provider` (the worker spawns it on the
-   next bring-up; the chat's cwd / mcp / project context are preserved)
-3. Restarts the session with the new backend
-
-The provider choice is NOT persisted across server restarts — it resets
-to ClaudeCode on construction. This is by design: providers may not be
-available on all machines, so a hard-coded preference would break.
+Switch the agent backend for a chat. The switch is transactional: it starts a
+fresh session under `new_provider` and persists the choice only after that
+session is live. If startup fails, it
+restores the previous provider and its resumable session id; a previously-live
+chat is brought back up on that provider. Returns the failed startup's concrete
+error text, or `nothing` on success.
 """
 function switch_provider!(model::ChatModel, new_provider::BinAgent)
     s = shared(model)
+    agent = s.agent::WorkerAgent
+    previous_provider = s.provider[]
+    previous_resume = agent.resume_session_id
+    was_alive = s.session_alive[]
+    project = get(model.state.projects[], model.project_id, nothing)
+    previous_project_provider = project === nothing ? nothing : project.provider
+    previous_project_resume = project === nothing ? nothing : project.resume_session_id
+
     s.provider[] = new_provider
     # Drop the previous provider's session config (model/mode pills) right away:
     # otherwise the header keeps showing e.g. Claude's model list while we bring
@@ -7748,18 +7750,56 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
     # dead with no model picker. Clearing it routes start! through `session/new`;
     # the chat's history is fed forward to the new agent as a one-shot prelude
     # (see `arm_history_replay!` in start_chat_client!).
-    old = s.agent::WorkerAgent
-    old.provider = new_provider
-    old.resume_session_id = nothing
-    # Remember it: the next bring-up (a reload, a server restart, the model
-    # being evicted) reads this back through `project_provider`. Written next to
-    # the `resume_session_id` clear above because the two travel together — the
-    # id we just dropped belonged to the OLD agent.
-    record_project_provider!(model, new_provider)
+    agent.provider = new_provider
+    agent.resume_session_id = nothing
+    # The project's persisted id belongs to the previous provider too. Clear it
+    # in memory before bring-up: `record_bound_session!` replaces it when the
+    # new provider supports session/load; providers that do not must persist no
+    # id rather than reopening with (say) Claude's UUID next time.
+    project === nothing || (project.resume_session_id = nothing)
 
-    # Restart the session with the new provider
     restart_chat_session!(model)
-    return nothing
+    if s.session_alive[]
+        # Commit only after the worker spawned the provider and ACP completed
+        # initialize + session/new. A missing binary must not poison future
+        # reconnects by persisting an agent that never ran.
+        record_project_provider!(model, new_provider)
+        return nothing
+    end
+
+    failure = isempty(s.last_error[]) ?
+        "$(label(new_provider)) did not establish an ACP session" : s.last_error[]
+
+    # Roll back the in-memory selection and the provider-specific session id.
+    # If this chat was alive before the switch, reconnect the old provider now
+    # instead of leaving the user with a dead chat and a Reconnect button that
+    # only retries the backend that just failed.
+    agent.provider = previous_provider
+    agent.resume_session_id = previous_resume
+    if project !== nothing
+        # Restore and persist the pair together. The target can get far enough
+        # to bind a session id before a later startup step fails; in that case
+        # `record_bound_session!` has already written it, so an in-memory-only
+        # rollback would leave the next reopen with mismatched provider/id data.
+        project.provider = previous_project_provider
+        project.resume_session_id = previous_project_resume
+        try
+            lock(model.state.lock) do; save_projects!(model.state); end
+        catch e
+            @warn "switch_provider!: could not persist rollback" exception = e
+        end
+        notify_projects!(model.state)
+    end
+    s.provider[] = previous_provider
+    if was_alive
+        restart_chat_session!(model)
+        if !s.session_alive[]
+            restore_error = isempty(s.last_error[]) ?
+                "the previous provider also did not establish a session" : s.last_error[]
+            failure *= "\n\nRestoring $(label(previous_provider)) also failed: $restore_error"
+        end
+    end
+    return failure
 end
 
 # Persist which agent a project's thread now belongs to. Same shape as

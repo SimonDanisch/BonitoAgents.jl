@@ -172,6 +172,36 @@ function run_suite(server)
                 timeout = 15) == true
             @test TK.eval_js(server,
                 "document.querySelectorAll('$(panel_sel("subdir"))').length") == 0
+
+            # LAN http:// origins do not expose the async Clipboard API. Force
+            # that browser condition and verify the textarea fallback copies the
+            # complete error card instead of leaving this button inert.
+            copied = TK.eval_js(server, """(() => {
+                const ownClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+                const originalExec = document.execCommand;
+                let copied = '';
+                try {
+                    Object.defineProperty(navigator, 'clipboard', {
+                        value: undefined, configurable: true
+                    });
+                    document.execCommand = command => {
+                        if (command === 'copy') copied = document.activeElement?.value || '';
+                        return command === 'copy';
+                    };
+                    document.querySelector('.bt-prog-err .bt-prog-copy').click();
+                    return copied;
+                } finally {
+                    if (ownClipboard) {
+                        Object.defineProperty(navigator, 'clipboard', ownClipboard);
+                    } else {
+                        delete navigator.clipboard;
+                    }
+                    document.execCommand = originalExec;
+                }
+            })()""")
+            @test occursin("subdir", copied)
+            @test TK.eval_js(server,
+                "document.querySelector('.bt-prog-err .bt-prog-copy').textContent") == "Copied"
         end
 
         @testset "a real .bt-path-link click opens the editor" begin

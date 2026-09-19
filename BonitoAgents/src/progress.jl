@@ -241,10 +241,29 @@ function progress_overlay(session::Bonito.Session, busy::Observable)
             const head = card.querySelector('.bt-prog-title')?.innerText || '';
             const body = card.querySelector('.bt-prog-detail')?.innerText || '';
             const btn  = event.currentTarget;
-            navigator.clipboard.writeText((head + '\n' + body).trim()).then(() => {
+            const text = (head + '\n' + body).trim();
+            const done = () => {
                 btn.textContent = 'Copied';
                 setTimeout(() => { btn.textContent = 'Copy'; }, 1400);
-            });
+            };
+            const fallback = () => {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                try { document.execCommand('copy'); done(); }
+                finally { ta.remove(); }
+            };
+            // The dashboard is commonly opened at a LAN http:// address, where
+            // the async Clipboard API is unavailable. Keep the same textarea
+            // fallback as the install-command and code-block Copy buttons.
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(done, fallback);
+            } else {
+                fallback();
+            }
         }""")
     close_btn = DOM.button("✕";
         class = "bt-btn bt-btn-ghost bt-btn-sm bt-prog-close",

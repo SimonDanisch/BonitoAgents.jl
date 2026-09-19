@@ -110,7 +110,7 @@
             @test mtime(BT.projects_file(st)) == before
         end
 
-        @testset "switching records it, even when the restart can't land" begin
+        @testset "a failed switch rolls the provider back" begin
             st    = fresh_state()
             p     = project!(st, "pp6")
             agent = BT.WorkerAgent(st, "w1", p.worker_path)
@@ -120,18 +120,36 @@
             provs = BT.current_providers()
             other = provs[findfirst(p -> p !== cur, provs)]
 
-            # No worker is connected here, so the restart inside `switch_provider!`
-            # fails and is swallowed by design (the chat stays alive with
-            # `last_error` set). The RECORD still has to stand: it is written with
-            # the `resume_session_id` clear, BEFORE the restart — otherwise a
-            # switch whose bring-up fails would leave the project pointing at the
-            # old agent while the live chat runs the new one, and the next reopen
-            # would hand the new agent's session id to the old one.
-            @test_logs (:error,) match_mode = :any BT.switch_provider!(model, other)
-            @test p.provider == BT.provider_name(other)
-            @test BT.shared(model).agent.provider === other
-            # Cleared for the new agent: the old id means nothing to it.
-            @test BT.shared(model).agent.resume_session_id === nothing
+            # No worker is connected here, so the target cannot start. The
+            # attempted provider must not become the persisted reconnect target.
+            # Keep the previous provider and its session id, and return the real
+            # startup error for the progress card.
+            old = BT.shared(model).provider[]
+            BT.shared(model).agent.resume_session_id = "old-session"
+            BT.shared(model).session_alive[] = false
+            p.resume_session_id = "old-session"
+            failure = Ref{Union{Nothing,String}}(nothing)
+            @test_logs (:error,) match_mode = :any begin
+                failure[] = BT.switch_provider!(model, other)
+            end
+            failure = failure[]
+            @test failure isa String
+            @test occursin("not connected", failure)
+            @test p.provider === nothing
+            @test BT.shared(model).provider[] === old
+            @test BT.shared(model).agent.provider === old
+            @test BT.shared(model).agent.resume_session_id == "old-session"
+            @test p.resume_session_id == "old-session"
+
+            # The rollback reaches disk as one provider/session pair too. This
+            # matters if the failed target bound an id before a later startup
+            # step failed and had already persisted that transient id.
+            st2 = BT.ServerState(; state_dir = st.state_dir,
+                                 working_dir = mktempdir(), worker_secret = "x")
+            p2 = st2.projects[]["pp6"]
+            @test p2.provider === nothing
+            @test p2.resume_session_id == "old-session"
+            @test BT.project_provider(p2) === old
         end
     end
 end
