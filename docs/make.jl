@@ -10,32 +10,39 @@ ci = get(ENV, "CI", "false") == "true"
 
 home = (
     name = "BonitoAgents",
-    text = "Your self-hosted control center for coding agents",
-    tagline = "Run Claude Code (and friends) on any machine you own. Steer them " *
-              "all from one dashboard, in any browser, phone included.",
+    text = "A visual workspace for coding agents",
+    tagline = "Run Julia, inspect rich results, review changes and build live apps " *
+              "across every machine you own.",
     image = "assets/bonitoagents-dark.svg",
     actions = [
         (text = "Get Started", link = "getting-started.html", theme = "brand"),
         (text = "View on GitHub", link = "https://github.com/SimonDanisch/BonitoAgents.jl", theme = "alt"),
     ],
     features = [
-        (title = "Any machine, one dashboard",
-         details = "Workers dial out from your laptops and servers; projects and " *
-                   "chats from all of them live side by side, reachable from any browser.",
-         link = "workers.html"),
-        (title = "Rich chat transcripts",
-         details = "Agent turns stream in as Monaco diffs, terminal output, inline " *
-                   "images and pinned plans, next to a project file tree and a real editor.",
+        (title = "Julia here or on another worker",
+         details = "bt_julia_eval keeps project state warm, streams stdout and renders " *
+                   "rich MIME results in the chat. Pass worker= to run on another machine.",
+         link = "mcp-tools.html"),
+        (title = "Live Bonito apps in the chat",
+         details = "Return an App or WGLMakie figure and use it in place. Interactions " *
+                   "round trip to Julia; detach it beside the chat without stopping it.",
+         link = "mcp-tools.html"),
+        (title = "Every artifact in place",
+         details = "Open markdown, images, video, PDF, notebooks, tables and interactive " *
+                   "3D geometry inside the chat or as editable workspace tabs.",
          link = "chat.html"),
-        (title = "Live, interactive results",
-         details = "Agents hand back running Bonito apps embedded straight into the " *
-                   "conversation: sliders slide, plots orbit, and every interaction " *
-                   "round trips to real Julia.",
-         link = "mcp-tools.html"),
-        (title = "Julia superpowers built in",
-         details = "Persistent per-project Julia sessions as MCP tools: warm state, " *
-                   "disciplined output, figures as images.",
-         link = "mcp-tools.html"),
+        (title = "Review the git diff together",
+         details = "Comment on a changed line or block, ask immediately, or collect " *
+                   "several review notes into one instruction for the agent.",
+         link = "chat.html#Reviewing-changes"),
+        (title = "BonitoAgents can debug itself",
+         details = "Open an agent on its own source with live tools for server state, " *
+                   "worker logs, memory and controls; inspect, edit and test its own code.",
+         link = "development.html#Debugging-BonitoAgents-itself"),
+        (title = "Any machine, one dashboard",
+         details = "Workers dial out from laptops, desktops and servers. Their projects " *
+                   "and chats stay together in one browser workspace.",
+         link = "workers.html"),
     ],
 )
 
