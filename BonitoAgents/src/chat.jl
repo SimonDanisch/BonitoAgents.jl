@@ -7652,7 +7652,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 failure = switch_provider!(model, new_provider)
                 safe_set!(switching, "")
                 failure === nothing ||
-                    problem("Switching to $(label(new_provider)) failed", failure)
+                    problem("Switching to $(label(new_provider)) failed",
+                            provider_startup_detail(model, new_provider, failure))
             catch e
                 bt = catch_backtrace()
                 @warn "provider switch failed" exception=(e, bt)
@@ -7710,15 +7711,37 @@ end
 
 # ── Provider switching ────────────────────────────────────────────────────────
 
+# Keep the worker's concrete startup error and add the setup commands needed for
+# providers whose runtime is not installed by BonitoAgents itself. Provider
+# processes run on the project's worker, which may be a different machine from
+# the web server; naming it here prevents users from installing the adapter on
+# the wrong host.
+function provider_startup_detail(model::ChatModel, provider::BinAgent,
+                                 failure::AbstractString)
+    provider isa CodexAgent || return String(failure)
+    agent = shared(model).agent::WorkerAgent
+    worker = get(model.state.workers[], agent.worker_id, nothing)
+    worker_name = worker === nothing ? agent.worker_id : worker.name
+    return """$(failure)
+
+Codex setup for worker "$(worker_name)" (run as the same user that runs btworker):
+  npm install -g @agentclientprotocol/codex-acp
+  npm install -g @openai/codex
+  codex login
+  command -v codex-acp && codex-acp --version
+
+Instead of `codex login`, set CODEX_API_KEY or OPENAI_API_KEY in the worker's environment and restart the worker."""
+end
+
 """
     switch_provider!(model::ChatModel, new_provider::BinAgent) -> Union{Nothing,String}
 
 Switch the agent backend for a chat. The switch is transactional: it starts a
 fresh session under `new_provider` and persists the choice only after that
-session is live. If startup fails, it
-restores the previous provider and its resumable session id; a previously-live
-chat is brought back up on that provider. Returns the failed startup's concrete
-error text, or `nothing` on success.
+session is live. If startup fails, it restores the previous provider and its
+resumable session id; a previously live chat is brought back up on that
+provider. Returns the failed startup's concrete error text, or `nothing` on
+success.
 """
 function switch_provider!(model::ChatModel, new_provider::BinAgent)
     s = shared(model)

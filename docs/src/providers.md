@@ -55,20 +55,26 @@ rather than ACP, so it plugs in through a separate adapter binary (like Claude
 Code does) that spawns Codex and translates:
 
 ```bash
-npm install -g @agentclientprotocol/codex-acp
-codex login   # or set CODEX_API_KEY / OPENAI_API_KEY
+npm install -g @agentclientprotocol/codex-acp @openai/codex
+codex login
+command -v codex-acp && codex-acp --version
 ```
 
-The adapter bundles a compatible Codex; set `CODEX_PATH` to point it at a
-different one, or `CODEX_AGENT_ACP` to run a different adapter build. It reports
-its model, reasoning effort and approval mode as session-config pills like any
-other provider, and advertises ACP `session/list`, so **Discover** finds Codex
-sessions on the worker too.
+Run these commands on **each worker that should run Codex**, as the same user
+that runs `btworker`. BonitoAgents starts `codex-acp` on that machine, not on the
+web-server machine. The separate Codex CLI provides the `codex login` command;
+instead, you can set `CODEX_API_KEY` or `OPENAI_API_KEY` in the worker's
+environment and restart the worker.
 
-Kimi Code and Codex both advertise ACP `session/load`, but their sessions are
-not resumed across a server restart yet: a project stores its session id without
-the provider that created it, so restoring one under a different provider would
-fail. Only Claude Code resumes today.
+The adapter also bundles a compatible Codex runtime; set `CODEX_PATH` to point
+it at a different one, or `CODEX_AGENT_ACP` to run a different adapter build.
+It reports its model, reasoning effort and approval mode as session-config pills
+like any other provider, and advertises ACP `session/list`, so **Discover** finds
+Codex sessions on the worker too.
+
+Kimi Code and Codex both advertise ACP `session/load`. BonitoAgents stores the
+provider together with its session id, so reopening a project routes the id back
+to the agent that created it.
 
 ### Tool cards across providers
 

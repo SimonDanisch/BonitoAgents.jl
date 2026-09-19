@@ -21,4 +21,13 @@
     @test model.provider[] === from
     @test model.usage[] === nothing
     @test isempty(model.session_meta[])
+
+    codex = BT.find_provider("Codex")
+    detail = BT.provider_startup_detail(model, codex,
+        "failed to spawn agent (codex-acp): no such file")
+    @test startswith(detail, "failed to spawn agent")
+    @test occursin("worker \"w1\"", detail)
+    @test occursin("npm install -g @agentclientprotocol/codex-acp", detail)
+    @test occursin("codex login", detail)
+    @test occursin("CODEX_API_KEY or OPENAI_API_KEY", detail)
 end
