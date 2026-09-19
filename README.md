@@ -11,6 +11,10 @@
   A self-hosted dashboard for running coding agents on your own machines.
 </p>
 
+<p align="center">
+  <a href="https://agents.bonito.sh/"><strong>Documentation</strong></a>
+</p>
+
 > [!WARNING]
 > Use at your own risk: there are no safeguards (yet) preventing an LLM driven
 > through BonitoAgents from wiping your entire PC or leaking all your secrets.
