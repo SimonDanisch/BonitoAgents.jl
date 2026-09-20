@@ -266,9 +266,41 @@ end
             @test r["ok"] === true
             @test st.projects[][pid].title[] == "Renamed By Dev API"
 
+            # close_chat must run the same teardown as the sidebar ×. Hiding the
+            # project alone leaves its ChatModel registered, so close + open
+            # hands a debugger the same wedged consumer it was trying to evict.
+            p = st.projects[][pid]
+            agent = BT.WorkerAgent(st, wid, p.worker_path; project_id = pid)
+            model = BT.ChatModel(st, p.server_path; project_id = pid, agent)
+            st.chat_models[pid] = model
+            push!(st.bound_lru, pid)
+
+            chat = BT.dev_request(st, "inspect",
+                Dict("section" => "chats", "project_id" => pid))
+            @test chat["agent_provider"] == "ClaudeCode"
+            @test chat["session_activity"] == "Idle"
+            @test chat["client_alive"] === false
+            @test chat["restart_inflight"] === false
+            @test chat["rendering"] === nothing
+
             r2 = BT.dev_request(st, "control", Dict("op" => "close_chat", "project_id" => pid))
             @test r2["dismissed"] === true
+            @test r2["session_closed"] === true
             @test st.projects[][pid].dismissed
+            @test !haskey(st.chat_models, pid)
+            @test pid ∉ st.bound_lru
+            @test !isopen(BT.shared(model).user_messages)
+
+            # A cached model is the fast path that used to skip the normal
+            # bring-up's un-dismiss step.
+            reopened = BT.ChatModel(st, p.server_path; project_id = pid,
+                agent = BT.WorkerAgent(st, wid, p.worker_path; project_id = pid))
+            st.chat_models[pid] = reopened
+            r_open = BT.dev_request(st, "control",
+                Dict("op" => "open_chat", "project_id" => pid))
+            @test r_open["ok"] === true
+            @test !p.dismissed
+            BT.stop_session!(st, p)
 
             r3 = BT.dev_request(st, "control", Dict("op" => "rescan_worker", "worker_id" => wid))
             @test r3["ok"] === true

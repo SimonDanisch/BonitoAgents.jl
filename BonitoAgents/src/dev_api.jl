@@ -325,6 +325,9 @@ end
 function chat_report(state::ServerState, project_id::AbstractString, m)
     sh = shared(m)
     nmsgs = lock(() -> length(sh.msgs_store), sh.lock)
+    restarting = lock(() -> sh.restart_inflight[], sh.restart_lock)
+    rendering = lock(() -> sh.rendering[], sh.lock)
+    agent = sh.agent
     return Dict{String,Any}(
         "project_id"     => String(project_id),
         "cwd"            => m.cwd,
@@ -335,6 +338,9 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "last_error"     => sh.last_error[],
         "yolo"           => sh.yolo[],
         "provider"       => string(sh.provider[]),
+        "agent_provider" => provider_name(agent),
+        "session_activity" => string(nameof(typeof(session_activity(sh)))),
+        "client_alive"   => client(agent) !== nothing,
         "turn_in_flight" => sh.turn_in_flight[],
         "turn_seq"       => sh.turn_seq[],
         "taskbar_items"  => length(sh.taskbar.items[]),
@@ -344,6 +350,10 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "consumer_alive" => sh.consumer_task[] !== nothing && !istaskdone(sh.consumer_task[]),
         "poller_alive"   => sh.poller_task[] !== nothing && !istaskdone(sh.poller_task[]),
         "restart_gen"    => sh.restart_gen[],
+        "restart_inflight" => restarting,
+        "rendering"      => rendering === nothing ? nothing : Dict{String,Any}(
+            "kind" => string(first(rendering)),
+            "for_seconds" => max(0.0, round(time() - last(rendering), digits = 1))),
     )
 end
 
@@ -714,6 +724,15 @@ dev_op(state::ServerState, ::Val{:control}, args::AbstractDict) =
 
 function dev_control(state::ServerState, ::Val{:open_chat}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
+    # `ensure_project_session!` clears this inside a real bring-up, but its
+    # cached-model fast path returns before that code. A dev close followed by
+    # open must therefore un-dismiss explicitly even when a live model already
+    # exists (including old servers whose close operation only hid the row).
+    if p.dismissed
+        p.dismissed = false
+        lock(state.lock) do; save_projects!(state); end
+        notify_projects!(state)
+    end
     ensure_project_session!(state, p)
     return Dict{String,Any}("ok" => true, "project_id" => p.id,
                             "title" => p.title[])
@@ -743,7 +762,15 @@ function dev_control(state::ServerState, ::Val{:close_chat}, args::AbstractDict)
     p.dismissed = true
     lock(state.lock) do; save_projects!(state); end
     notify_projects!(state)
-    return Dict{String,Any}("ok" => true, "project_id" => p.id, "dismissed" => true)
+    # Match the sidebar's × button: closing a chat means tearing its live
+    # session down as well as hiding its row. Merely setting `dismissed` leaves
+    # the same ChatModel in `state.chat_models`, so a later `open_chat` returns
+    # the old object. That is especially harmful when this control is being used
+    # to recover a wedged consumer: close + open appears to succeed while the
+    # exact same blocked task, queue and agent remain in memory.
+    stop_session!(state, p)
+    return Dict{String,Any}("ok" => true, "project_id" => p.id,
+                            "dismissed" => true, "session_closed" => true)
 end
 
 function dev_control(state::ServerState, ::Val{:rescan_worker}, args::AbstractDict)
