@@ -25,6 +25,18 @@
     same = Dict{String,Any}("auto_update" => true, "update_spec" => wire(spec))
     @test BT.worker_update_state(same, spec) == (:current, "")
 
+    # Update feedback does not disappear after the replacement worker
+    # reconnects. Every online state has a compact badge; offline cards keep
+    # their existing offline pill and do not claim anything about freshness.
+    badge = BT.worker_update_badge(true, :current)
+    @test badge.label == "Up to date"
+    @test occursin("bt-pill-online", badge.class)
+    @test BT.worker_update_badge(true, :available, "new build").label == "Update available"
+    @test BT.worker_update_badge(true, :updating, "installing").label == "Updating…"
+    @test BT.worker_update_badge(true, :reinstall, "too old").label == "Reinstall needed"
+    @test isempty(BT.worker_update_badge(false, :current).label)
+    @test occursin("bt-hidden", BT.worker_update_badge(false, :current).class)
+
     older = Dict{String,Any}("auto_update" => true, "update_spec" => wire(merge(spec, Dict("rev" => "v0.2.0"))))
     st, msg = BT.worker_update_state(older, spec)
     @test st === :available

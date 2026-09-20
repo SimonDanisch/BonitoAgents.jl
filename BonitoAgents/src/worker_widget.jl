@@ -64,6 +64,34 @@ end
 Base.hash(c::WorkerCard, h::UInt) = hash(c.worker_id, hash(:WorkerCard, h))
 Base.:(==)(a::WorkerCard, b::WorkerCard) = a.worker_id == b.worker_id
 
+# Compact, persistent feedback for the worker's relationship to this server
+# build. The explanatory note below the card is reserved for states that need
+# action; the badge remains visible after a successful reconnect so an update
+# does not appear to have done nothing.
+function worker_update_badge(online::Bool, state::Symbol, message::AbstractString = "")
+    online || return (label = "", class = "bt-pill bt-hidden", title = "")
+    state === :current && return (
+        label = "Up to date",
+        class = "bt-pill bt-pill-online bt-worker-update-badge",
+        title = "This worker matches the server build",
+    )
+    state === :updating && return (
+        label = "Updating…",
+        class = "bt-pill bt-pill-syncing bt-worker-update-badge",
+        title = String(message),
+    )
+    state === :reinstall && return (
+        label = "Reinstall needed",
+        class = "bt-pill bt-pill-warn bt-worker-update-badge",
+        title = String(message),
+    )
+    return (
+        label = "Update available",
+        class = "bt-pill bt-pill-warn bt-worker-update-badge",
+        title = String(message),
+    )
+end
+
 function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     state, wid = c.state, c.worker_id
 
@@ -174,6 +202,12 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     status_dot_obs = map(status_obs) do s
         status_dot(s)
     end
+    update_badge = map(state.workers) do workers
+        w = get(workers, wid, nothing)
+        badge = w === nothing ? worker_update_badge(false, :current) :
+                                worker_update_badge(isopen(w), w.update_state, w.update_message)
+        DOM.span(badge.label; class = badge.class, title = badge.title)
+    end
 
     # The note shows for every non-current state; the button only where the
     # worker can act on it (a `:reinstall` worker does not know `force_update`).
@@ -191,9 +225,9 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
                  class = quiet ? "bt-worker-update-note bt-hidden" :
                                  "bt-worker-update-note")
     end
-    # Success needs no banner: `force_worker_update!` flips the worker to
-    # `:updating`, which hides this button and changes the note, and the
-    # replacement worker's hello flips it back to `:current`.
+    # `force_worker_update!` flips the worker to `:updating`, which hides this
+    # button and changes the note and badge. The replacement worker's hello
+    # flips it back to `:current`, leaving the compact success badge visible.
     update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, update_btn.value) do clicked
         clicked || return
@@ -240,7 +274,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
     card_body = DOM.div(
-        DOM.div(status_dot_obs, initials_input, name_input;
+        DOM.div(status_dot_obs, initials_input, name_input, update_badge;
                 class = "bt-card-title"),
         DOM.div(subtitle_obs; class = "bt-card-meta", title = title_attr);
         class = "bt-card-body")

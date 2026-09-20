@@ -271,6 +271,8 @@ function dev_section(state::ServerState, ::Val{:workers}, ::String)
         "projects_root" => w.projects_root,
         "url"           => w.url,
         "ssh_target"    => jsonable(w.ssh_target),
+        "update_state"  => String(w.update_state),
+        "update_message" => w.update_message,
         "last_check"    => string(w.last_check),
         "last_scan_age_s" => haskey(last_scan, w.worker_id) ?
             round(time() - last_scan[w.worker_id]; digits = 1) : nothing,

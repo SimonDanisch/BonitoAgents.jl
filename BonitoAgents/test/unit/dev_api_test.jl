@@ -117,6 +117,8 @@ end
             @test w["online"] === true
             @test w["control_ws"] === true      # the actual socket, not the flag
             @test !isempty(w["projects_root"])
+            @test w["update_state"] == "current"
+            @test haskey(w, "update_message")
         end
 
         @testset "the worker reports on ITSELF" begin

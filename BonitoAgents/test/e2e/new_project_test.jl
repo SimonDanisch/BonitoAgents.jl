@@ -115,6 +115,9 @@
         TK.to_dashboard(server)
         @test TK.wait_for(server, "worker card rendered",
             "!!document.querySelector('.bt-card-meta')"; timeout = 30) == true
+        @test TK.wait_for(server, "current worker shows update confirmation",
+            "document.querySelector('.bt-worker-update-badge')?.textContent === 'Up to date'";
+            timeout = 30) == true
 
         worker_root = String(TK.eval_js(server, WORKER_ROOT_JS))
         @test !isempty(worker_root)
