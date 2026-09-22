@@ -931,7 +931,8 @@ class BonitoChat {
     }
     restoreAnchor(a) {
         if (!a) return;
-        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        const cached = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        const n = cached && cached.offsetParent !== null ? cached : null;
         let want;
         if (n && n.isConnected) {
             want = n.offsetTop - a.off;

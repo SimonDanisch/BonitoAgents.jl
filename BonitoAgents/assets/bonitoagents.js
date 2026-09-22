@@ -1469,7 +1469,27 @@ class BonitoChat {
     // the viewport changed (|delta| ≤ 1px), so plain scroll ticks never write.
     restoreAnchor(a) {
         if (!a) return;
-        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        // `rendered` is NOT "has a layout box". A live-app embed (an eval card
+        // holding a result embed, a bt_show app) that leaves the window is
+        // PARKED rather than removed — display:none, still in `rendered`, so
+        // its Bonito sub-session and WebGL context survive (see the parking
+        // branch in updateDOM and e2e:eval_embed_park). A lens-/filter-hidden
+        // row is display:none in place too, and a hidden pane hides all of
+        // them at once.
+        //
+        // `offsetTop` on a boxless node reads 0, so pinning on one asked for
+        // scrollTop ≈ 0: the transcript jumped to the very FIRST message. It
+        // needs an eviction and a parked row in the same pass, which is rare in
+        // a text chat and constant in an eval-heavy one — reported as "scroll
+        // slowly up and you suddenly land at the top, 100% of the time" in a
+        // chat whose history is mostly live eval embeds.
+        //
+        // Boxless → treat it as evicted: hold the VIRTUAL position and let the
+        // queued refresh un-park it, which is the branch below. `captureAnchor`
+        // and `restoreKeyAnchor` both skip display:none rows already; this is
+        // the same guard on the one path that was missing it.
+        const cached = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        const n = (cached && cached.offsetParent !== null) ? cached : null;
         let want;
         if (n && n.isConnected) {
             want = n.offsetTop - a.off;

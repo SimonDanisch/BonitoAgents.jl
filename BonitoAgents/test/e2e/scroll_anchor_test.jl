@@ -173,6 +173,77 @@
         TK.eval_js(s, "(() => { ($CH).refresh(); })()")   # settle state for the next testset
     end
 
+    @testset "a PARKED anchor must not pin the pane to the very top" begin
+        # `rendered` is NOT "has a layout box". A live-app embed that leaves the
+        # window is PARKED rather than removed — display:none, kept in
+        # `rendered` so its Bonito sub-session and WebGL context survive (see
+        # e2e:eval_embed_park). `offsetTop` on a boxless node reads 0, so
+        # restoreAnchor asked for scrollTop ≈ 0 and the transcript jumped to the
+        # very FIRST message. Reported from a chat whose history is mostly live
+        # eval embeds: "scroll slowly upward and you suddenly land at the top",
+        # every time.
+        #
+        # Driven through the scroller's own park + restore, like the eviction
+        # above: production needs an eviction and a parked row in the SAME pass,
+        # which is a coincidence in a text chat and the norm in an eval-heavy
+        # one. `captureAnchor` and `restoreKeyAnchor` already skip display:none
+        # rows; this is the path that did not.
+        # Park the pane mid-history and PROVE it stayed there: the preceding
+        # testsets leave their own anchors and churned heights behind, and a
+        # probe that starts at the top proves nothing about a pin to the top.
+        SCROLL_MID = """(() => {
+            const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
+            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+            c.scrollTop = Math.round((c.scrollHeight - c.clientHeight) * 0.5);
+            c.dispatchEvent(new Event('scroll', {bubbles: true}));
+            return Math.round(c.scrollTop);
+        })()"""
+        mid = nothing
+        for _ in 1:10
+            mid = TK.eval_js(s, SCROLL_MID)
+            sleep(0.8)
+            mid = TK.eval_js(s, "Math.round(($CH).container.scrollTop)")
+            Int(mid) > 400 && break
+        end
+        Int(mid) > 400 || @info "scroll_anchor park: pane would not hold mid-history" state =
+            TK.eval_js(s, """(() => { const ch = $CH; const c = ch.container;
+                return JSON.stringify({scrollTop: Math.round(c.scrollTop),
+                    scrollHeight: c.scrollHeight, clientHeight: c.clientHeight,
+                    rendered: ch.rendered.size, total: ch.totalCount,
+                    follow: !!ch.followMode, pending: JSON.stringify(ch.pendingAnchor)}); })()""")
+        @test Int(mid) > 400
+        r = TK.eval_js(s, """(() => {
+            const ch = $CH;
+            const a = ch.captureAnchor();
+            if (!a) return null;
+            const before = Math.round(ch.container.scrollTop);
+            ch.parked.add(a.idx);         // exactly what updateDOM's park
+            ch.applyVisibility(a.idx);    // branch does to a data-bt-app row
+            ch.restoreAnchor(a);
+            return {idx: a.idx, off: a.off, before,
+                    after:   Math.round(ch.container.scrollTop),
+                    boxless: ch.cache.get(a.idx).offsetParent === null};
+        })()""")
+        @test r !== nothing
+        @test r["boxless"] == true              # parking really took the box away
+        @test Int(r["before"]) > 400            # mid-history, not already at the top
+        Int(r["after"]) > div(Int(r["before"]), 2) ||
+            @info "scroll_anchor park FAILED" r
+        @test Int(r["after"]) > div(Int(r["before"]), 2)   # pre-fix: 0 (first message)
+        # ...and the reading row comes back: the queued refresh un-parks it and
+        # the next pin is exact again, at the offset it was captured at.
+        idx = Int(r["idx"]); off = Int(r["off"])
+        @test TK.wait_for(s, "parked reading row re-materialised at its offset",
+            """(() => {
+                const ch = $CH;
+                const n = ch.cache.get($idx);
+                if (!n || !n.isConnected || n.offsetParent === null) return false;
+                return Math.abs((n.offsetTop - ch.container.scrollTop) - ($off)) <= 3;
+            })()"""; timeout = 8) == true
+        TK.eval_js(s, """(() => { const ch = $CH;
+            ch.parked.delete($idx); ch.applyVisibility($idx); ch.refresh(); })()""")
+    end
+
     @testset "a msgs.range reply from before a reload must not be cached" begin
         # The splice race, simulated at the seam: an UNCACHED index receives a
         # reply stamped with the pre-reload epoch. It must be dropped.
