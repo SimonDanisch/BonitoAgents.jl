@@ -128,8 +128,15 @@ ended · Reconnect** chip appears next to the title.
 - **Stop** interrupts the current turn; a hung agent escalates (cancel, then
   force-close) so stop always works.
 - **Yolo mode** (composer toggle) auto-continues an agent that pauses to ask
-  "shall I keep going?". The reminder it injects also tells the agent how to
-  bail out deliberately.
+  "shall I keep going?". Leaving is deliberate and takes two steps: the agent
+  answers the nudge with the `YOLO-COMPLETE` sentinel, which only ASKS to stop,
+  and the loop then puts "are you really done?" back to it — the loop ends on
+  the answer to that, and only when that turn does no work. The composer doubles
+  as the reminders editor while Yolo is armed; the reminders ride along on every
+  prompt, including the confirmation. A turn that fails, gets refused, or
+  repeats the same answer three times without running a tool stops the loop and
+  switches Yolo off, so a provider that is out of credits cannot spin it
+  overnight.
 - **Compact** (⋯ menu) asks the agent to summarize the conversation so far into
   a fresh context, after which the transcript reconciles cleanly.
 - **Continue on** (⋯ menu) moves the chat, its files and the agent's memory to

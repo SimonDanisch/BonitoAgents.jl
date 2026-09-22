@@ -1,15 +1,17 @@
 # Server-level e2e for "Yolo mode" (autonomous auto-continue).
 #
 # While Yolo is ON, after each turn ends the app auto-nudges the agent to keep
-# working (`YOLO_CONTINUE_PROMPT`) until the agent emits the done sentinel. The self-
-# driving loop is: a turn's finalize (`finish_turn!`) enqueues the next continue
-# prompt via `send_message!`, whose own finalize repeats the check — no separate
-# loop task. A bare `no` bails (no re-prompt).
+# working (`YOLO_CONTINUE_PROMPT`). The sentinel does NOT end the loop: it asks
+# to, and the app puts `YOLO_CONFIRM_PROMPT` ("are you really done?") back to the
+# agent — only the answer to THAT ends it. The self-driving loop is: a turn's
+# finalize (`finish_turn!`) enqueues the next prompt via `send_message!`, whose
+# own finalize repeats the check — no separate loop task.
 #
-# Drives the SERVER path (no browser), mirroring cancel_escalation_test /
-# resume_eager_bind: own `TK.dev_server(agent=…)`, `state.chat_models[pid]`,
-# and assert on `msgs_store`. The mock `agent_fn` is a scripted closure with a
-# counter so the continue-prompt replies "still working" once, then the done sentinel.
+# Drives the SERVER path (no browser for the loop itself), mirroring
+# cancel_escalation_test / resume_eager_bind: own `TK.dev_server(agent=…)`,
+# `state.chat_models[pid]`, and assert on `msgs_store`. The mock `agent_fn` is a
+# scripted closure that replies per prompt KIND, which is what makes the two-step
+# protocol observable from outside.
 @testitem "e2e:yolo_mode" tags = [:e2e] begin
     include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
     TK = TestKit
@@ -33,28 +35,29 @@
         @test !BA.yolo_bail("still working on it")
     end
 
-    # Count auto-continue prompts that landed in the store.
-    yolo_prompts(model) = BA.lock(model.lock) do
-        count(m -> m isa BA.UserMsg && occursin(BA.YOLO_CONTINUE_PROMPT, m.text),
-            model.msgs_store)
+    # Count the app's own prompts in the store, by kind.
+    prompts(model, needle) = BA.lock(model.lock) do
+        count(m -> m isa BA.UserMsg && occursin(needle, m.text), model.msgs_store)
+    end
+    yolo_prompts(model)    = prompts(model, BA.YOLO_CONTINUE_PROMPT)
+    confirm_prompts(model) = prompts(model, BA.YOLO_CONFIRM_PROMPT)
+    agent_said(model, needle) = BA.lock(model.lock) do
+        any(m -> m isa BA.AgentMsg && occursin(needle, m.text), model.msgs_store)
     end
 
-    # Scripted mock: the first user task replies with some text; each Yolo
-    # continue-prompt replies "still working on it" the FIRST time and the sentinel the
-    # SECOND time → the loop runs one extra turn then bails.
-    continue_count = Ref(0)
+    # Scripted mock. `script` is swapped per scenario; every reply is chosen from
+    # the prompt KIND (task / continue / confirm), so each scenario reads as the
+    # conversation it is testing.
+    kind(prompt) = occursin(BA.YOLO_CONFIRM_PROMPT, prompt)  ? :confirm  :
+                   occursin(BA.YOLO_CONTINUE_PROMPT, prompt) ? :continue : :task
+    seen = Dict{Symbol,Int}()
+    script = Ref{Function}((k, n) -> [TK.text("here is the initial result")])
     function agent_fn(prompt)
-        if occursin(BA.YOLO_CONTINUE_PROMPT, prompt)
-            continue_count[] += 1
-            if continue_count[] == 1
-                return [TK.text("still working on it"), TK.end_turn()]
-            else
-                return [TK.text(BA.YOLO_DONE_SENTINEL), TK.end_turn()]
-            end
-        else
-            return [TK.text("here is the initial result"), TK.end_turn()]
-        end
+        k = kind(prompt)
+        n = (seen[k] = get(seen, k, 0) + 1)
+        return script[](k, n)
     end
+    reset_script!(f) = (empty!(seen); script[] = f)
 
     server = TK.dev_server(; agent = agent_fn)
     try
@@ -71,69 +74,132 @@
         end
 
         reminder = "stay focused on the login bug"
-        @testset "yolo auto-continues until the agent bails with `no`" begin
+        @testset "the sentinel asks to stop; the CONFIRM answer stops" begin
+            # task → "…result"                    → continue #1
+            # continue #1 → "still working"       → continue #2
+            # continue #2 → sentinel              → confirm #1  (NOT a stop)
+            # confirm #1 → sentinel               → loop ends
+            reset_script!() do k, n
+                k === :task && return [TK.text("here is the initial result")]
+                k === :continue && n == 1 && return [TK.text("still working on it")]
+                return [TK.text(BA.YOLO_DONE_SENTINEL)]
+            end
+
             # Arm Yolo through the shared source of truth, with reminders that
             # must ride along on every auto-continue.
             BA.shared(model).yolo[] = true
             BA.shared(model).yolo_reminders[] = reminder
-
-            # Send the user's real task. The task turn finalizes → 1st continue
-            # prompt fires; the agent says "still working" → 2nd continue prompt
-            # fires; the agent emits the sentinel → bail (no 3rd prompt).
             BA.send_message!(model, BA.UserMsg(model, "do the thing"))
 
-            # (a) At least one continue prompt appeared (auto-continue fired) and
-            # (b) eventually EXACTLY two (task→#1, "still working"→#2), then it
-            # STOPS growing because the sentinel reply bails.
+            # (a) The loop ran, (b) the sentinel on turn 2 bought a CONFIRM
+            # question rather than an exit, and (c) it all settles there.
             @test poll_until(() -> yolo_prompts(model) >= 1; timeout = 30)
             @test poll_until(() -> yolo_prompts(model) == 2; timeout = 30)
+            @test poll_until(() -> confirm_prompts(model) == 1; timeout = 30)
+            @test agent_said(model, "still working")
 
-            # The agent's "still working" reply landed (proves prompt #2 was a
-            # real continuation, not a stale re-fire).
-            @test poll_until(timeout = 30) do
-                BA.lock(model.lock) do
-                    any(m -> m isa BA.AgentMsg && occursin("still working", m.text),
-                        model.msgs_store)
-                end
-            end
-
-            # (c) The agent emitted the sentinel → bail. Give the loop ample time to
-            # (not) fire a third prompt, then assert the count is frozen at 2.
-            @test poll_until(timeout = 30) do
-                BA.lock(model.lock) do
-                    any(m -> m isa BA.AgentMsg && BA.yolo_bail(m.text),
-                        model.msgs_store)
-                end
-            end
             sleep(3.0)   # a stray auto-continue would fire within this window
             @test yolo_prompts(model) == 2
-            @test continue_count[] == 2
-            @test !model.busy_active[]   # settled, not stuck in a turn
+            @test confirm_prompts(model) == 1
+            @test seen[:continue] == 2 && seen[:confirm] == 1
+            @test !model.busy_active[]        # settled, not stuck in a turn
+            @test BA.shared(model).yolo[]     # a clean finish leaves Yolo armed
+            @test BA.shared(model).yolo_state.phase === :work   # state reset
 
-            # The auto-continue bubbles are marked `auto` (dim/system styling)
-            # AND carry the user's reminder text appended to the base prompt.
+            # Both prompt kinds are marked `auto` (dim/system styling) AND carry
+            # the user's reminders — "done" is measured against the same
+            # reminders in the confirm round as in the work rounds.
             @test BA.lock(model.lock) do
                 autos = filter(m -> m isa BA.UserMsg &&
-                                    occursin(BA.YOLO_CONTINUE_PROMPT, m.text),
+                                    (occursin(BA.YOLO_CONTINUE_PROMPT, m.text) ||
+                                     occursin(BA.YOLO_CONFIRM_PROMPT, m.text)),
                     model.msgs_store)
-                !isempty(autos) &&
-                    all(m -> m.auto, autos) &&
+                length(autos) == 3 && all(m -> m.auto, autos) &&
                     all(m -> occursin(reminder, m.text), autos)
             end
         end
 
+        @testset "the sentinel is not a way out of work" begin
+            # The live failure this protects against: an agent mid-investigation
+            # writes the sentinel to end its turn. Answering the confirm question
+            # by RUNNING A TOOL is "no, there was more" — whatever the turn's
+            # closing line says.
+            #
+            # task → "…result"        → continue #1
+            # continue #1 → sentinel  → confirm #1
+            # confirm #1 → tool + sentinel  → NOT a stop → continue #2
+            # continue #2 → sentinel  → confirm #2
+            # confirm #2 → sentinel (nothing else) → loop ends
+            reset_script!() do k, n
+                k === :task && return [TK.text("here is the initial result")]
+                k === :confirm && n == 1 &&
+                    return [TK.tool(; kind = "edit", title = "one more fix"),
+                            TK.text(BA.YOLO_DONE_SENTINEL)]
+                return [TK.text(BA.YOLO_DONE_SENTINEL)]
+            end
+            base_c, base_k = yolo_prompts(model), confirm_prompts(model)
+            BA.send_message!(model, BA.UserMsg(model, "do more things"))
+
+            # The tool-answer turn must be followed by a further CONTINUE prompt:
+            # that is the loop refusing the escape.
+            @test poll_until(() -> confirm_prompts(model) == base_k + 1; timeout = 30)
+            @test poll_until(() -> yolo_prompts(model) == base_c + 2; timeout = 30)
+            @test poll_until(() -> confirm_prompts(model) == base_k + 2; timeout = 30)
+            sleep(3.0)
+            @test yolo_prompts(model) == base_c + 2
+            @test confirm_prompts(model) == base_k + 2
+            @test seen[:confirm] == 2 && seen[:continue] == 2
+            @test BA.shared(model).yolo[]
+        end
+
+        @testset "a repeating agent that never works stops the loop" begin
+            # The live runaway: the provider answered every prompt with
+            # "You've hit your weekly limit · resets …" and the loop re-sent for
+            # hours. Three identical replies with no tool call in between ends it
+            # — and switches Yolo OFF, so the user's next message doesn't walk
+            # straight back in.
+            limit = "You've hit your weekly limit · resets Sep 13, 1pm"
+            reset_script!((k, n) -> [TK.text(limit)])
+            base_c, base_k = yolo_prompts(model), confirm_prompts(model)
+            BA.send_message!(model, BA.UserMsg(model, "keep going please"))
+
+            @test poll_until(timeout = 60) do
+                agent_said(model, "Yolo stopped") && !BA.shared(model).yolo[]
+            end
+            @test agent_said(model, "same answer 3 times")
+            @test agent_said(model, "Yolo switched off")
+            @test yolo_prompts(model) == base_c + 2   # bounded, not endless
+            @test confirm_prompts(model) == base_k    # never claimed to be done
+            sleep(3.0)
+            @test yolo_prompts(model) == base_c + 2
+            @test !BA.shared(model).yolo[]
+        end
+
+        @testset "a refused turn stops the loop and disarms" begin
+            reset_script!() do k, n
+                k === :task && return [TK.text("here is the initial result")]
+                return [TK.text("I won't do that"), TK.end_turn(; stopReason = "refusal")]
+            end
+            BA.shared(model).yolo[] = true
+            base_c = yolo_prompts(model)
+            BA.send_message!(model, BA.UserMsg(model, "try again"))
+
+            @test poll_until(timeout = 60) do
+                agent_said(model, "the agent refused the turn")
+            end
+            @test poll_until(() -> !BA.shared(model).yolo[]; timeout = 10)
+            @test yolo_prompts(model) == base_c + 1   # one nudge, then stop
+            sleep(3.0)
+            @test yolo_prompts(model) == base_c + 1
+        end
+
         @testset "toggling Yolo off stops the loop" begin
-            # It's off already once the agent bailed (toggle stays on but no
-            # re-prompt); flip it off explicitly and confirm a fresh user turn
-            # does NOT auto-continue.
+            reset_script!((k, n) -> [TK.text("here is the initial result")])
             BA.shared(model).yolo[] = false
             before = yolo_prompts(model)
             BA.send_message!(model, BA.UserMsg(model, "another task"))
             @test poll_until(timeout = 30) do
-                BA.lock(model.lock) do
-                    any(m -> m isa BA.AgentMsg && occursin("initial result", m.text),
-                        model.msgs_store)
-                end
+                agent_said(model, "initial result")
             end
             sleep(2.0)
             @test yolo_prompts(model) == before   # no new continue prompts
@@ -233,6 +299,35 @@
             @test TK.eval_js(server, "!!document.querySelector('.bt-header-yolo-reminders')") == false
 
             @test isempty(TK.js_errors(server))
+        end
+
+        # LAST: this one kills the mock agent's session on purpose.
+        @testset "a turn that FAILS stops the loop and disarms" begin
+            # Out of credits, transport gone, model unavailable: the turn throws
+            # instead of ending. The loop used to return silently and stay armed;
+            # now it says why and switches itself off, because the next nudge
+            # would hit exactly the same wall.
+            reset_script!() do k, n
+                k === :task && return [TK.text("here is the initial result")]
+                return [TK.crash()]
+            end
+            BA.shared(model).yolo[] = true
+            base_c = yolo_prompts(model)
+            BA.send_message!(model, BA.UserMsg(model, "one more time"))
+
+            @test poll_until(timeout = 60) do
+                agent_said(model, "the turn failed")
+            end
+            @test agent_said(model, "Yolo switched off")
+            @test poll_until(() -> !BA.shared(model).yolo[]; timeout = 10)
+            # The browser is still open from the DOM testset: switching off is
+            # something the USER sees, not just server state.
+            @test TK.wait_for(server, "yolo bar disarmed by the failed turn",
+                "!document.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')";
+                timeout = 10) == true
+            @test yolo_prompts(model) == base_c + 1   # the nudge that died, no more
+            sleep(3.0)
+            @test yolo_prompts(model) == base_c + 1
         end
     finally
         close(server)

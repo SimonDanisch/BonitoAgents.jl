@@ -20,6 +20,36 @@ struct UserMessage
 end
 UserMessage(text::AbstractString) = UserMessage(String(text), AgentClientProtocol.ImageAttachment[])
 
+# Per-chat state of the Yolo auto-continue loop. One object, not a handful of
+# Refs, because the loop is a small state machine and the fields only make sense
+# together — see `yolo_decide` for the rules that read them.
+#
+#   `streak`  how many auto-continues have run since the last real user message.
+#             0 means nobody has asked the agent anything yet.
+#   `last`    the previous turn's reply, normalised (`yolo_norm`).
+#   `repeats` consecutive turns that repeated `last` while running no tools.
+#   `idle`    consecutive turns that ran no tool at all.
+#   `phase`   `:work` (ordinary auto-continue) or `:confirm` (we asked "are you
+#             really done?" and the next reply answers THAT).
+mutable struct YoloState
+    streak::Int
+    last::String
+    repeats::Int
+    idle::Int
+    phase::Symbol
+end
+YoloState() = YoloState(0, "", 0, 0, :work)
+
+# Back to square one: a real user message, or a loop that just ended.
+function reset!(y::YoloState)
+    y.streak = 0
+    y.last = ""
+    y.repeats = 0
+    y.idle = 0
+    y.phase = :work
+    return y
+end
+
 # ── ChatModel ──────────────────────────────────────────────────────────────
 # Shared per project, lifetime = project's lifetime. One instance lives in
 # `state.chat_models[project_id]`; every browser tab viewing the project gets
@@ -158,17 +188,11 @@ mutable struct ChatModel
     # is the source of truth.
     yolo_reminders::Observable{String}
 
-    # Stuck-loop guards for the Yolo auto-continue, reset by every real user
-    # message. Fields, not a module registry keyed by chat: this is per-chat
-    # state and must die with the chat.
-    #
-    # `yolo_streak` counts consecutive auto-continues; `yolo_last` is the
-    # previous turn's reply, normalised. The sentinel makes "am I done" exact,
-    # but an agent that never emits it would otherwise loop forever — these
-    # bound it without guessing at prose: a repeat means it is spinning, and the
-    # cap means it cannot run away even if every turn looks superficially new.
-    yolo_streak::Ref{Int}
-    yolo_last::Ref{String}
+    # State of the Yolo auto-continue loop, reset by every real user message. A
+    # field, not a module registry keyed by chat: this is per-chat state and
+    # must die with the chat. Mutable and SHARED with every per-tab copy — the
+    # loop runs on the parent.
+    yolo_state::YoloState
 
     # Session metadata for the chat header: a heterogeneous list of TYPED
     # items rendered by `header_pill` dispatch. Today: the agent's
@@ -347,7 +371,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         busy_active,
         Observable(false),          # yolo (auto-continue mode; off by default)
         Observable(""),             # yolo_reminders (appended to each continue-prompt)
-        Ref(0), Ref(""),            # yolo_streak / yolo_last (stuck-loop guards)
+        YoloState(),                # yolo_state (auto-continue loop state)
         Observable(Any[]),          # session_meta
         Observable{Any}(nothing),   # usage (context/cost telemetry)
         Observable(AgentClientProtocol.CommandInfo[]),  # available_commands
@@ -450,7 +474,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.busy_active),
             map(identity, session, m.yolo),
             map(identity, session, m.yolo_reminders),
-            m.yolo_streak, m.yolo_last,   # shared: the loop runs on the parent
+            m.yolo_state,              # shared: the loop runs on the parent
             map(identity, session, m.session_meta),
             any_bridge(session, m.usage),   # Any-typed: nothing → NamedTuple
             map(identity, session, m.available_commands),
@@ -5580,8 +5604,10 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage)
 end
 
 # ── Yolo mode (autonomous auto-continue) ────────────────────────────────────
-# The nudge sent after each turn while Yolo is on. The agent bails by replying
-# just `no`; anything else is treated as "still working" and re-continues.
+# The nudge sent after each turn while Yolo is on. Anything but the sentinel is
+# treated as "still working" and re-continues — and the sentinel itself only
+# ASKS to stop: it is answered with `YOLO_CONFIRM_PROMPT`, and the loop ends on
+# the answer to THAT (see `yolo_decide`).
 # Ask for a SENTINEL, not a word. Inferring intent from prose cannot work here:
 # "No, everything is done." must stop the loop and "no, here's more" must not,
 # and both begin with `no` — so any leading-word rule gets one of them wrong
@@ -5604,9 +5630,59 @@ $(YOLO_DONE_SENTINEL)
 "No" means finished, or blocked on something only I can give, or going in \
 circles. Any other reply keeps the loop running."""
 
-# Appended to the next nudge when the agent just repeated itself. Not a warning
-# about a limit — there isn't one — but a correction: an agent that restates its
-# last answer is usually finished and reaching for a way to say so in prose.
+# Asked when the agent answers the continue-prompt with the sentinel. The loop
+# does NOT end there: the sentinel ends the loop only as the answer to THIS
+# question, so "done" always costs the agent a second, explicit assertion.
+#
+# Why a second round at all: agents reach for the sentinel as a way to end a
+# turn, not as a claim to be finished — observed in a live chat, where one wrote
+# it mid-investigation of a bug it was actively debugging and, when asked,
+# explained it as "the literal exit token", not a judgement about the work. One
+# question can be answered on autopilot at the bottom of a long turn; being
+# asked again, with nothing else in the turn, is a question the agent has to
+# actually answer.
+const YOLO_CONFIRM_PROMPT = """
+Are you really done?
+
+You just answered $(YOLO_DONE_SENTINEL), which means exactly one thing: there is \
+nothing left that you could do on your own. It is not a way to end a turn, and \
+nobody reads an explanation here.
+
+Check before you answer. Anything you started and did not finish, anything you \
+changed and did not test, anything you called "next" or "future work", any \
+error you worked around instead of fixing — that is work you could do right \
+now.
+
+  - Anything left → do it. Don't answer this question; just carry on.
+  - Nothing left → reply with exactly this line and nothing else:
+
+$(YOLO_DONE_SENTINEL)
+
+Doing work in this turn counts as "anything left", whatever you write at the \
+end of it: run a tool here and the loop keeps going."""
+
+# How many times the agent may repeat its previous reply WITHOUT running a tool
+# before the loop gives up. 2 = the same answer three turns running.
+#
+# This is the runaway guard. A provider that answers every prompt identically —
+# "You've hit your weekly limit · resets Sep 13, 1pm" was the live one — is not
+# working, and the loop re-sent that forever. Tool calls reset the count: an
+# agent that repeats a closing line between real turns of work has a writing
+# habit, not a spin.
+const YOLO_REPEAT_LIMIT = 2
+
+# How many turns in a row the agent may run NO tool at all before the loop gives
+# up. The repeat guard above only catches a provider that says the same thing
+# every time; Codex's rate-limit message carries a countdown, so every copy of it
+# is "new" text. Four consecutive tool-free turns is the same situation seen from
+# the other side: the nudge asks for the next concrete thing, and nothing is
+# being done.
+const YOLO_IDLE_LIMIT = 4
+
+# Appended to the next nudge when the agent just repeated itself. A correction
+# first: an agent that restates its last answer is usually finished and reaching
+# for a way to say so in prose. It is also the only warning the agent gets before
+# `YOLO_REPEAT_LIMIT` ends the loop, which is why the nudge names the sentinel.
 const YOLO_REPEAT_NUDGE = """
 That was the same answer as last time. Repeating it does not end the loop — \
 nothing here reads prose. If you are finished, reply with exactly \
@@ -5643,37 +5719,109 @@ yolo_bail(text::AbstractString) = occursin(YOLO_BAIL_RX, strip(text))
 yolo_norm(text::AbstractString) =
     lowercase(strip(replace(String(text), r"\s+" => " ")))
 
+# What a finished turn looked like, reduced to the facts the loop decides on.
+# `reply` is the turn's LAST agent message ("" when it ended on a tool call),
+# `worked` whether it ran any tool at all, `stop_reason` the agent's own word
+# for how it ended (ACP: end_turn / max_tokens / refusal / …).
+struct YoloTurn
+    reply::String
+    produced::Bool
+    worked::Bool
+    errored::Bool
+    stop_reason::String
+end
+
+# What to do next. `reason` is shown to the user on `:stop` — empty means stop
+# silently (the agent's own answer already said it). `disarm` additionally
+# switches Yolo OFF, for the stops that must not resume unattended.
+# `repeated`/`repeats`/`idle` are carried out of the decision so the caller
+# stores the same numbers the rules were applied to.
+struct YoloDecision
+    action::Symbol      # :continue | :confirm | :stop
+    reason::String
+    disarm::Bool
+    repeated::Bool
+    repeats::Int
+    idle::Int
+end
+
 """
-    yolo_stop_reason(reply, produced, streak, last) -> Union{String,Nothing}
+    yolo_decide(state, turn) -> YoloDecision
 
-Why the Yolo loop should stop after this turn, or `nothing` to keep going.
-An empty string means stop without saying anything (the agent already did).
+What the Yolo loop does after this turn: continue, ask the agent to confirm it
+is really done, or stop.
 
-Pure on purpose — state in, decision out — so the whole rule is testable without
-standing up a chat. `streak` is how many auto-continues have already run since
-the last real user message; `last` is the previous reply, normalised.
-
-Every branch is a FACT about the turn rather than a reading of the agent's
-prose. That ambiguity is exactly what the sentinel replaced.
+Pure on purpose — state in, decision out — so the whole protocol is testable
+without standing up a chat. Every branch is a FACT about the turn rather than a
+reading of the agent's prose. That ambiguity is what the sentinel replaced, and
+the two-step confirm is what keeps the sentinel from becoming an exit hatch.
 """
-function yolo_stop_reason(reply::AbstractString, produced::Bool,
-                          streak::Integer)
-    # The sentinel is an ANSWER, never a way to end your own turn.
+function yolo_decide(y::YoloState, t::YoloTurn)
+    # Repeating counts toward the runaway guard only when the turn ran NO tools:
+    # that combination is an agent that cannot work, not one with a habit.
     #
-    # The shape is always: the turn ends, we ask "is there more you could do?",
-    # and only THEN does the keyword finish the loop. Honouring it on any reply
-    # let the agent leave by writing it at the bottom of its own message — which
-    # it did, ending a report of open work with `YOLO-COMPLETE` and stopping a
-    # loop that had more to do.
-    #
-    # `streak` is how many times we have asked: 0 on the turn that started the
-    # loop, incremented once per auto-continue. So `streak > 0` is exactly "this
-    # reply answers a question we asked". In Yolo the composer is the reminders
-    # editor and no user message can slip through, so every turn past the first
-    # IS an answer to our nudge.
-    streak > 0 && yolo_bail(reply) && return "the agent signalled it was finished"
-    produced || return "the turn ended without any output"
-    return nothing
+    # The sentinel is never a repeat. Asking to stop and then confirming it is
+    # the SAME answer twice by design — that is the protocol working, and
+    # counting it would end the loop with "it said the same thing three times"
+    # exactly when the agent did the right thing.
+    repeated = !yolo_bail(t.reply) && yolo_repeating(t.reply, y.last)
+    repeats = (repeated && !t.worked) ? y.repeats + 1 : 0
+    idle = t.worked ? 0 : y.idle + 1
+    dec(action, reason = "", disarm = false) =
+        YoloDecision(action, reason, disarm, repeated, repeats, idle)
+
+    # Failures end the loop AND switch Yolo off. Whatever broke — transport,
+    # credits, a model the account cannot use — the next nudge hits the same
+    # wall, and an unattended loop retrying a hard failure is the one shape that
+    # spins for hours without anyone seeing it. Switching off is the part that
+    # makes it stay stopped: leaving it armed means the user's next message
+    # walks straight back into the same loop.
+    t.errored && return dec(:stop, "the turn failed", true)
+    # The agent's own "I will not do this". Re-asking is not going to change it.
+    t.stop_reason == "refusal" && return dec(:stop, "the agent refused the turn", true)
+    t.produced || return dec(:stop, "the turn ended without any output")
+
+    # The sentinel is the PROTOCOL, in either phase, and it outranks the health
+    # guards below — those exist to end a loop the agent cannot end itself, and
+    # this is the agent ending it. Letting a guard preempt the sentinel would
+    # report "it gave up" for a turn where the agent did exactly the right thing.
+    if yolo_bail(t.reply)
+        # The ONLY place the sentinel ends anything, and only as a clean answer:
+        # a confirm turn that ran tools answered "no" by doing more work,
+        # whatever its closing line says, so it falls through and continues.
+        y.phase === :confirm && !t.worked && return dec(:stop)
+        # Work phase: the sentinel REQUESTS the stop, it does not perform it —
+        # including after a turn full of work, which is the shape that made this
+        # whole round-trip necessary.
+        #
+        # `streak` is how many times we have asked: 0 on the turn that started
+        # the loop, incremented once per auto-continue. So `streak > 0` is
+        # exactly "this reply answers a question we asked". In Yolo the composer
+        # is the reminders editor and no user message can slip through, so every
+        # turn past the first IS an answer to our nudge.
+        y.phase === :work && y.streak > 0 && return dec(:confirm)
+    end
+
+    repeats >= YOLO_REPEAT_LIMIT && return dec(:stop,
+        "the agent gave the same answer $(repeats + 1) times without doing anything", true)
+    idle >= YOLO_IDLE_LIMIT && return dec(:stop,
+        "the agent went $(idle) turns without running a single tool", true)
+    return dec(:continue)
+end
+
+# Fold the decision back into the state. Stopping resets everything — the next
+# thing to happen is either a user message or nothing at all.
+function yolo_apply!(y::YoloState, d::YoloDecision, t::YoloTurn)
+    if d.action === :stop
+        reset!(y)
+    else
+        y.streak += 1
+        y.last = yolo_norm(t.reply)
+        y.repeats = d.repeats
+        y.idle = d.idle
+        y.phase = d.action === :confirm ? :confirm : :work
+    end
+    return y
 end
 
 """
@@ -5682,10 +5830,12 @@ end
 Whether this reply is the previous one again — restating rather than
 progressing.
 
-NOT a stop. Going in circles is something to TELL the agent about, not a reason
-to end its work: the loop exists to run unattended, and an agent repeating
-itself is usually one that has finished and does not realise the sentinel is how
-it says so. The next nudge points that out (see `yolo_user_msg`).
+Not a stop on its own. Going in circles is something to TELL the agent about
+first: the loop exists to run unattended, and an agent repeating itself is
+usually one that has finished and does not realise the sentinel is how it says
+so. The next nudge points that out (see `yolo_user_msg`). Only when it keeps
+repeating with no tool calls in between does `yolo_decide` end the loop —
+`YOLO_REPEAT_LIMIT`.
 
 Only meaningful for a non-empty reply — a turn ending on a tool call has none,
 and two of those in a row is ordinary work.
@@ -5695,16 +5845,20 @@ function yolo_repeating(reply::AbstractString, last::AbstractString)
     return !isempty(norm) && norm == last
 end
 
-# The visible (dim/system-styled) auto-continue bubble the Yolo loop enqueues.
-# Appends the chat's user-editable reminders (if any) so the agent doesn't drift
-# over many autonomous turns.
-function yolo_user_msg(chat::ChatModel; repeated::Bool = false)
-    reminders = strip(shared(chat).yolo_reminders[])
-    text = YOLO_CONTINUE_PROMPT
-    # Said the same thing twice. There is no turn limit — the loop runs until the
-    # agent says it is done — so the useful response to going in circles is to
-    # point out that repeating is not how you leave, and that the sentinel is.
+# The visible (dim/system-styled) auto-continue bubble the Yolo loop enqueues:
+# the ordinary nudge (`:continue`) or the "are you really done?" question
+# (`:confirm`). Appends the chat's user-editable reminders (if any) so the agent
+# doesn't drift over many autonomous turns — and so that "done" is measured
+# against the same reminders every time, including in the confirm round.
+function yolo_user_msg(chat::ChatModel, action::Symbol; repeated::Bool = false)
+    text = action === :confirm ? YOLO_CONFIRM_PROMPT : YOLO_CONTINUE_PROMPT
+    # Said the same thing twice. There is no limit on PRODUCTIVE turns — the loop
+    # runs until the agent says it is done — so the useful response to going in
+    # circles is to point out that repeating is not how you leave, and that the
+    # sentinel is. (The runaway guards in `yolo_decide` only bound turns that
+    # achieve nothing.)
     repeated && (text *= "\n\n" * YOLO_REPEAT_NUDGE)
+    reminders = strip(shared(chat).yolo_reminders[])
     isempty(reminders) ||
         (text *= "\n\nKeep these in mind as you continue:\n" * reminders)
     return UserMsg(String(text), false, 0, true, nothing)
@@ -5824,35 +5978,48 @@ function report_silent_turn!(chat::ChatModel, o::TurnOutcome)
     return nothing
 end
 
-# Yolo mode: keep the agent going autonomously until it answers the sentinel.
+# Yolo mode: keep the agent going autonomously until it confirms it is done.
+#
+# A cancelled turn is the user taking over by hand, so it neither continues the
+# loop nor counts against it. Everything else — including a turn that FAILED —
+# goes through `yolo_decide`: the loop ending on a broken provider is a decision
+# with a visible reason, not a silent return.
 function continue_yolo!(chat::ChatModel, o::TurnOutcome)
     s = shared(chat)
-    (s.yolo[] && !o.errored && !was_cancelled(o)) || return nothing
-    # This turn's messages are msgs_store[nstore0+1:end]. The LAST AgentMsg among
-    # them is the agent's final reply.
-    reply = lock(s.lock) do
-        idx = findlast(m -> m isa AgentMsg, @view s.msgs_store[(o.nstore0+1):end])
-        idx === nothing ? "" : s.msgs_store[o.nstore0+idx].text
-    end
+    (s.yolo[] && !was_cancelled(o)) || return nothing
+    y = s.yolo_state
+    # This turn's messages are msgs_store[nstore0+1:end]: the LAST AgentMsg among
+    # them is the agent's final reply, and any ToolMsg at all means it did real
+    # work rather than just answering.
+    #
     # A missing reply is NOT a bail: a turn ending on a tool call has no closing
     # text, which used to stop Yolo silently.
-    reason = yolo_stop_reason(reply, said_something(chat, o), s.yolo_streak[])
-    if reason !== nothing
+    reply, worked = lock(s.lock) do
+        turn = @view s.msgs_store[(o.nstore0+1):end]
+        i = findlast(m -> m isa AgentMsg, turn)
+        (i === nothing ? "" : turn[i].text), any(m -> m isa ToolMsg, turn)
+    end
+    t = YoloTurn(reply, said_something(chat, o), worked, o.errored, o.stop_reason)
+    d = yolo_decide(y, t)
+    yolo_apply!(y, d, t)
+    if d.action === :stop
+        # Off means off: a disarming stop must not be undone by the next
+        # message, so the toggle itself flips (every tab sees it).
+        d.disarm && (s.yolo[] = false)
         # Every stop is VISIBLE. A loop that just goes quiet reads as a hang;
         # saying why is the difference between "it finished" and "it gave up".
-        # Declining via the sentinel is the one silent case — the agent's own last
+        # Confirming the sentinel is the one silent case — the agent's own last
         # message already says it.
-        isempty(reason) ||
-            close(send!(chat, AgentMsg(chat, "_Yolo stopped: $(reason)._")))
-        s.yolo_streak[] = 0
-        s.yolo_last[] = ""
+        isempty(d.reason) || close(send!(chat, AgentMsg(chat,
+            "_Yolo stopped: $(d.reason)$(d.disarm ? " — Yolo switched off" : "")._")))
+        # Logged too: the loop runs unattended for hours, and "why did it stop"
+        # is asked long after the bubble has scrolled away.
+        @info "yolo loop stopped" project_id = chat.project_id disarmed = d.disarm reason =
+            isempty(d.reason) ? "the agent confirmed it was finished" : d.reason
         return nothing
     end
-    repeated = yolo_repeating(reply, s.yolo_last[])
-    s.yolo_streak[] += 1
-    s.yolo_last[] = yolo_norm(reply)
     Base.errormonitor(@async try
-        send_message!(chat, yolo_user_msg(chat; repeated))
+        send_message!(chat, yolo_user_msg(chat, d.action; repeated = d.repeated))
     catch e
         @warn "yolo auto-continue send failed" project_id = chat.project_id exception = (e, catch_backtrace())
     end)
@@ -6358,10 +6525,7 @@ function send_message!(model::ChatModel, msg::UserMsg;
     # A REAL user message clears the stuck-loop guards: the streak and the
     # repeat check are about the agent going round on its own, and anything you
     # type is new input that deserves a fresh budget.
-    if !msg.auto
-        s.yolo_streak[] = 0
-        s.yolo_last[] = ""
-    end
+    msg.auto || reset!(s.yolo_state)
     # Queue state + position + enqueue in ONE critical section, and counted off
     # `pending_sends` — the bubbles whose prompt hasn't reached the agent yet,
     # i.e. the queue itself. Counting `msgs_store` in a separate lock let two

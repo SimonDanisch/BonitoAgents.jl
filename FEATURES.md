@@ -64,8 +64,9 @@ enumerates.
 - Session **resume**: continue an existing Claude Code session from the
   dashboard, history included.
 - **Permission prompts** (ACP elicitations) render as inline forms. **Yolo
-  mode** auto-continues "shall I go on?" pauses and tells the agent how to
-  bail out deliberately.
+  mode** auto-continues "shall I go on?" pauses; the agent leaves only by
+  answering a separate "are you really done?" confirmation, and a failing or
+  repeating agent stops the loop instead of spinning it.
 - Reliable **stop**: cancel escalates (cancel, re-cancel, force-close) so even
   a hung agent yields.
 - **Compact** button: agent-side conversation summarization with clean

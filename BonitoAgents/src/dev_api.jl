@@ -339,6 +339,12 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "session_alive"  => sh.session_alive[],
         "last_error"     => sh.last_error[],
         "yolo"           => sh.yolo[],
+        # The loop's own state, so "why is it still going / why did it stop"
+        # is answerable from outside the process.
+        "yolo_phase"     => String(sh.yolo_state.phase),
+        "yolo_streak"    => sh.yolo_state.streak,
+        "yolo_repeats"   => sh.yolo_state.repeats,
+        "yolo_idle"      => sh.yolo_state.idle,
         "provider"       => string(sh.provider[]),
         "agent_provider" => provider_name(agent),
         "session_activity" => string(nameof(typeof(session_activity(sh)))),
