@@ -232,7 +232,7 @@
         @test Int(r["after"]) > div(Int(r["before"]), 2)   # pre-fix: 0 (first message)
         # ...and the reading row comes back: the queued refresh un-parks it and
         # the next pin is exact again, at the offset it was captured at.
-        idx = Int(r["idx"]); off = Int(r["off"])
+        idx = Int(r["idx"]); off = Float64(r["off"])   # px, fractional and often negative
         @test TK.wait_for(s, "parked reading row re-materialised at its offset",
             """(() => {
                 const ch = $CH;

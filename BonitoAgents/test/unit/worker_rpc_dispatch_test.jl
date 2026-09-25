@@ -1,6 +1,6 @@
 # Every worker reply type has an arm in the server's control-WS dispatch.
 #
-# `handle_worker_control` is an ALLOW-LIST: a reply type with no arm is dropped,
+# `serve_worker_control` is an ALLOW-LIST: a reply type with no arm is dropped,
 # the `deliver_rpc_response!` never happens, and the caller sits out its full
 # timeout before falling into whatever its error path is. Which means a new RPC
 # looks like a slow or unreachable worker rather than like a missing line, and
@@ -33,15 +33,20 @@
     # would pass vacuously.
     @test length(sent) >= 8
 
-    # Types the dispatch has an arm for: `t == "<type>"`.
+    # Types the dispatch routes: every string literal in `serve_worker_control`
+    # (its arms are `t == "…"` and `t in ("…", …)`).
+    body = let i = findfirst("function serve_worker_control(", dispatch)
+        @test i !== nothing
+        dispatch[first(i):first(findnext("\nend\n", dispatch, last(i)))]
+    end
     routed = Set{String}()
-    for m in eachmatch(r"t\s*==\s*\"([a-z0-9_]+)\"", dispatch)
+    for m in eachmatch(r"\"([a-z0-9_]+)\"", body)
         push!(routed, m.captures[1])
     end
 
     missing_arms = sort(collect(setdiff(sent, routed)))
     @test isempty(missing_arms)
-    isempty(missing_arms) || @info "add an arm in handle_worker_control" missing_arms
+    isempty(missing_arms) || @info "add an arm in serve_worker_control" missing_arms
 
     # And the one that started this, by name — so the regexes above drifting
     # can't quietly retire the case that was actually broken.
@@ -55,5 +60,5 @@
     # reassembler. The regexes above can't see either of these.
     @test occursin(r"git_diff_chunk", worker_src)
     @test "git_diff_chunk" in routed
-    @test occursin(r"deliver_chunk!\(state, cmd\)", dispatch)
+    @test occursin(r"deliver_chunk!\(state, cmd\)", body)
 end

@@ -2,8 +2,8 @@
 # pending RPCs, etc.) lives in `state.jl::ServerState`; every public function
 # in this file takes a `state::ServerState` argument as its first parameter.
 # Worker registration is handled in worker_client.jl when the worker dials
-# the server's /worker-ws endpoint. Liveness comes from the WS itself; no
-# periodic probing or heartbeat task.
+# the server's /w endpoint. Liveness comes from the worker's link; no
+# periodic probing here.
 
 # Project lock
 """
@@ -38,7 +38,7 @@ function release_project!(state::ServerState, p::ProjectInfo)
 end
 
 # Release every project claim held by `worker_id` (called from
-# handle_worker_control's finally branch when the WS drops). Snapshot the
+# `teardown_worker!` when the worker's link dies). Snapshot the
 # matching projects under the lock so we don't iterate `state.projects[]`
 # while a concurrent writer is mutating it; `release_project!` re-takes the
 # lock per project (reentrant, harmless).

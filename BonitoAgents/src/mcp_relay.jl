@@ -53,15 +53,16 @@ function close_mcp_channel!(ch::WorkerMCPChannel; notify_worker::Bool = true)
 end
 Base.close(ch::WorkerMCPChannel) = close_mcp_channel!(ch)
 
-function handle_worker_mcp!(state::ServerState, worker_id::String, ws,
+function handle_worker_mcp!(state::ServerState, worker_id::String, link,
                             channels::AbstractDict, cmd::AbstractDict)
     id = String(get(cmd, "channel", ""))
     isempty(id) && error("MCP relay frame is missing its channel")
     kind = get(cmd, "type", "")
+    ws = WorkerLink.control_channel(link)
     if kind == "mcp_open"
         haskey(channels, id) && error("duplicate MCP relay channel")
-        get(state.worker_control_ws, worker_id, nothing) === ws ||
-            error("MCP relay arrived on a replaced worker connection")
+        worker_link(state, worker_id) === link ||
+            error("MCP relay arrived on a replaced worker link")
         pid = String(get(cmd, "project_id", ""))
         p = get(state.projects[], pid, nothing)
         host = get(cmd, "host", false) === true

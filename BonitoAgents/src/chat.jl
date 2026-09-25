@@ -3393,7 +3393,7 @@ function save_editor!(fe::FileEditor, content::AbstractString)
     proj = get(fe.state.projects[], fe.project_id, nothing)
     proj === nothing &&
         error("no project bound to this view — can't push $(basename(fe.worker_path)) to a worker")
-    haskey(fe.state.worker_control_ws, proj.worker_id) &&
+    worker_connected(fe.state, proj.worker_id) &&
         return (send_file_to_worker!(fe.state, proj.worker_id, fe.server_path, fe.worker_path;
                                      handoff_timeout = 15.0); true)
     error("worker '$(proj.worker_id)' is not connected — $(basename(fe.worker_path)) was NOT saved")
@@ -8228,7 +8228,7 @@ function push_attachment_to_worker(model::ChatModel, rel_path::AbstractString)
     isempty(pid) && return
     proj = get(model.state.projects[], pid, nothing)
     proj === nothing && return
-    haskey(model.state.worker_control_ws, proj.worker_id) || return
+    worker_connected(model.state, proj.worker_id) || return
     src = joinpath(model.cwd, rel_path)
     dst = joinpath(proj.worker_path, rel_path)
     try

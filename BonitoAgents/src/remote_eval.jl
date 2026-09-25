@@ -208,7 +208,7 @@ function close_eval_hosts!(state::ServerState, project_id::AbstractString)
             lk = get(state.eval_host_locks, key, nothing)
             lk === nothing || islocked(lk) || delete!(state.eval_host_locks, key)
         end
-        haskey(state.worker_control_ws, wid) || continue
+        worker_connected(state, wid) || continue
         try
             close_eval_host_on_worker(state, wid; project_id)
         catch e

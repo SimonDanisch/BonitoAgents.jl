@@ -61,7 +61,7 @@ function select_chat_icon!(state, p, candidates::Vector{Tuple{Bool,String}}; for
                 if worker
                     # Snapshot directly from the worker. The normal bt_show
                     # route no longer populates a server mirror as a side effect.
-                    if haskey(state.worker_control_ws, p.worker_id)
+                    if worker_connected(state, p.worker_id)
                         fetch_file_from_worker(state, p.worker_id, source, tmp)
                     else
                         local_path = show_server_path(ShowTool(state, p.id, p.server_path, source))
@@ -114,7 +114,7 @@ function request_chat_icon!(state::ServerState, p::ProjectInfo)
         icon.path !== nothing && return
         history = joinpath(state.state_dir, "chats", p.id, "chat.md")
         info = stat(history)
-        stamp = (info.mtime, info.size, haskey(state.worker_control_ws, p.worker_id))
+        stamp = (info.mtime, info.size, worker_connected(state, p.worker_id))
         icon.stamp == stamp && return
         icon.stamp = stamp
         icon.task = @async begin

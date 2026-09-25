@@ -8,7 +8,7 @@ const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 # `SPECS`; keep the two in step). The "Debug BonitoAgents" chat develops these
 # same packages from a clone of this repo on the worker (`ensure_debug_project!`).
 const WORKER_REPO_URL = "https://github.com/SimonDanisch/BonitoAgents.jl"
-const WORKER_REPO_PACKAGES = ["RemoteSync", "BonitoWorker", "BonitoMCP", "AgentProviders"]
+const WORKER_REPO_PACKAGES = ["RemoteSync", "WorkerLink", "BonitoWorker", "BonitoMCP", "AgentProviders"]
 
 # The worker installer is a cross-platform Julia script (`curl … | julia -`).
 # It Pkg.add's BonitoWorker + BonitoMCP from the public GitHub repo into a
@@ -41,10 +41,9 @@ Routes:
   /install.sh             — bash wrapper (Linux / macOS)
   /install.ps1            — PowerShell wrapper (Windows)
   /install.jl             — cross-platform worker installer (used by the wrappers)
-  /worker-ws    (WS)      — control channel each worker holds open after install
-  /worker-acp   (WS)      — per-session ACP relay; one connection per project session
-  /transfer-ws  (WS)      — librsync directional transfer; dialed on demand by a
-                            worker in response to an `open_transfer` command
+  /w            (WS)      — the ONE connection each worker holds open: a WorkerLink
+                            carrying its control channel, its agents' ACP sessions
+                            and its file transfers (see worker_client.jl)
 
 `worker_secret` is the shared secret used by every worker. `public_url` is the
 base URL workers see (and what the install script tells them to dial back).
@@ -64,6 +63,8 @@ function serve(; host::String        = "0.0.0.0",
                  working_dir::Union{String,Nothing} = nothing,
                  heartbeat_interval::Real = 15.0,
                  heartbeat_deadline::Real = 45.0,
+                 worker_link_grace::Real = 300.0,
+                 scan_on_connect::Bool = true,
                  log_file::Union{String,Nothing} = nothing)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
@@ -99,7 +100,9 @@ function serve(; host::String        = "0.0.0.0",
 
     state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret,
                           heartbeat_interval = heartbeat_interval,
-                          heartbeat_deadline = heartbeat_deadline)
+                          heartbeat_deadline = heartbeat_deadline,
+                          worker_link_grace = worker_link_grace,
+                          scan_on_connect = scan_on_connect)
 
     # Mark all loaded workers offline; they'll flip online when they re-dial.
     for w in values(state.workers[])
@@ -778,12 +781,10 @@ end
 # `state` so the route handler picks up the same instance the dashboard reads
 # from / the chat writes into.
 function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
-    Bonito.HTTPServer.websocket_route!(srv, "/worker-ws"   => (_ctx, ws) ->
-        handle_worker_control(state, ws))
-    Bonito.HTTPServer.websocket_route!(srv, "/worker-acp"  => (_ctx, ws) ->
-        handle_worker_acp(state, ws))
-    Bonito.HTTPServer.websocket_route!(srv, "/transfer-ws" => (_ctx, ws) ->
-        handle_transfer_ws(state, ws))
+    # A worker's ONE connection: control, its agents' ACP streams and file
+    # transfers are all channels on this link (worker_client.jl).
+    Bonito.HTTPServer.websocket_route!(srv, "/w" => (_ctx, ws) ->
+        handle_worker_link(state, ws))
     # Eval workers (BonitoMCP) dial here to be driven for interactive app proxying.
     Bonito.HTTPServer.websocket_route!(srv, "/eval-ws" => (_ctx, ws) ->
         handle_eval_ws(state, ws))

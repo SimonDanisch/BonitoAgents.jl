@@ -113,7 +113,7 @@
         @testset "a failed switch rolls the provider back" begin
             st    = fresh_state()
             p     = project!(st, "pp6")
-            agent = BT.WorkerAgent(st, "w1", p.worker_path)
+            agent = BT.WorkerAgent(st, "w1", p.worker_path; project_id = "pp6")
             model = BT.ChatModel(st, mktempdir(); project_id = "pp6", agent = agent)
 
             cur   = BT.shared(model).provider[]

@@ -487,7 +487,7 @@ function scrub_mock_env!()
     for k in ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
               "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
               "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_CANCEL_DELAY_MS",
-              "BT_MOCK_ACP_STRICT_LOAD")
+              "BT_MOCK_ACP_STRICT_LOAD", "BT_MOCK_ACP_MANY_CHOICES")
         delete!(ENV, k)
     end
     get(ENV, "BT_DEFAULT_PROVIDER", "") in ("MockCode", "MockCode2") &&
@@ -533,6 +533,12 @@ returned `TestServer` is the handle every helper takes as its first arg.
 `claude-agent-acp` from PATH / `CLAUDE_AGENT_ACP`) while still returning a
 `TestServer` with all the browser/eval helpers — used to seed genuine agent
 sessions (e.g. the docs-walkthrough rig); `agent` is then ignored.
+
+`scan_on_connect = false` (the default here): the server does not scan the
+worker's agent sessions when it connects. That scan reads the machine's real
+agent history into the dashboard and starts every installed agent to list its
+sessions, so a test would render whatever the box running it happens to have.
+Tests that need a discover tree seed `state.discovered` instead.
 """
 # The long-lived `SharedServer` stack, if some item in this process started one.
 #
@@ -570,6 +576,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       mock::Bool = true,
                       many_choices::Bool = false,
                       strict_load::Bool = false,
+                      scan_on_connect::Bool = false,
                       kwargs...)
     ensure_display!()
     # One stack at a time in this process — see `RELEASE_SHARED` above. A
@@ -610,12 +617,15 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     ) : Dict{String,String}()
     # `BT.dev_server` copies `agent_env` into the PROCESS ENV (so the worker
     # subprocess inherits it) — which means a prior mock dev_server in this
-    # same Julia process left all of the above behind. A later `mock = false`
-    # server must not inherit that: its chats would default to MockCode and
-    # the spawned MockACP would dial the DEAD dispatcher port of the closed
-    # mock server ("ACP connection closed" on every bind, no agent stderr
-    # anywhere near the failure). Scrub the mock leftovers before starting.
-    mock || scrub_mock_env!()
+    # same Julia process left all of the above behind, and its opt-in knobs
+    # below too. Nothing may inherit that. A `mock = false` server's chats would
+    # default to MockCode and dial the DEAD dispatcher port of the closed mock
+    # server ("ACP connection closed" on every bind). A mock server inherited
+    # the knobs it did not ask for: after `worker_move` (strict load) every
+    # later server's resume failed with "Session not found", and after
+    # `cancel_escalation` (ignore cancel) the rebuilt shared server's agent
+    # ignored every cancel. Scrub before starting, always.
+    scrub_mock_env!()
     # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
@@ -639,7 +649,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # is loaded in. What "continue this chat on another worker" has to satisfy.
     strict_load && (agent_env["BT_MOCK_ACP_STRICT_LOAD"] = "1")
 
-    h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
+    h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Now publish the server URL + secret to the dispatcher so that
     # `bt_eval` invocations can route the eval worker's dial-back to the

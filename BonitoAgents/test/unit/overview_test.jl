@@ -163,6 +163,6 @@
         @test image !== nothing
         @test read(image.local_path, String) == bytes
         @test isempty(state.chat_models)
-        @test isempty(state.worker_control_ws)
+        @test isempty(state.worker_links)
     end
 end

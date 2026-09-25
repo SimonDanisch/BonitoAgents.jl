@@ -4,7 +4,7 @@
 @testitem "e2e:todo_worker_death" tags = [:e2e] begin
     include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
     include(joinpath(@__DIR__, "todo_worker_death.jl"))
-    server = TestKit.dev_server(agent = agent_script)
+    server = TestKit.dev_server(agent = agent_script, worker_link_grace = GRACE)
     try
         TestKit.open_browser(server)
         run_suite(server)

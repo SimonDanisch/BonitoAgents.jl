@@ -1,35 +1,41 @@
-@testitem "unit:mcp_relay" tags = [:unit] begin
+@testitem "unit:mcp_relay" tags = [:unit] setup = [LinkPair] begin
     using Test, Dates, JSON, HTTP
-    import BonitoAgents as BT, BonitoWorker as BW
+    import BonitoAgents as BT, BonitoWorker as BW, WorkerLink
 
-    # In-memory stand-ins for the ONE worker/server wire. The localhost socket
-    # and MCP subprocess are real. The browser suite additionally exercises the
-    # real worker daemon, ACP launch, and a second worker's eval subprocess.
-    struct RelayTestWire
-        receive::Function
-    end
-    HTTP.WebSockets.send(w::RelayTestWire, frame) = w.receive(BW.decode_control(frame))
-
+    # The ONE worker/server connection is a real link over an in-memory
+    # transport; the localhost socket and MCP subprocess are real too. The
+    # browser suite additionally exercises the real worker daemon, ACP launch,
+    # and a second worker's eval subprocess.
     state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "unused")
     p = BT.ProjectInfo("relay-chat", "relay", "worker-a", mktempdir(), mktempdir(), now(UTC))
     p.dev_mode = true
     state.projects[][p.id] = p
     channels = Dict{String,Any}()
-    relay_ref = Ref{Any}(nothing)
     hold_requests = Ref(false)
     held = Channel{Nothing}(1)
-    server_wire = RelayTestWire(cmd -> BW.handle_mcp_relay_frame!(relay_ref[], cmd))
-    worker_wire = RelayTestWire() do cmd
+    server_link, worker_link = link_pair()
+    state.worker_links["worker-a"] = server_link
+    relay = BW.start_mcp_relay(WorkerLink.control_channel(worker_link))
+    # What `serve_worker_control` (server) and `serve_control` (worker) do with
+    # the MCP frames on their control channels, with a hook to hold one request.
+    function read_control(handle, link)
+        try
+            for frame in WorkerLink.control_channel(link)
+                handle(BW.decode_control(frame))
+            end
+        catch e
+            e isa HTTP.WebSockets.WebSocketError || rethrow()   # the link ended
+        end
+    end
+    Base.errormonitor(@async read_control(server_link) do cmd
         if hold_requests[] && get(cmd, "type", "") == "mcp_frame" &&
                 get(JSON.parse(cmd["frame"]), "op", "") == "remote_workers"
             put!(held, nothing)
         else
-            BT.handle_worker_mcp!(state, "worker-a", server_wire, channels, cmd)
+            BT.handle_worker_mcp!(state, "worker-a", server_link, channels, cmd)
         end
-    end
-    state.worker_control_ws["worker-a"] = server_wire
-    relay = BW.start_mcp_relay(worker_wire)
-    relay_ref[] = relay
+    end)
+    Base.errormonitor(@async read_control(cmd -> BW.handle_mcp_relay_frame!(relay, cmd), worker_link))
     proc = Ref{Any}(nothing)
     function request(id, method, params)
         println(proc[], JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params)))
@@ -101,7 +107,7 @@
             @test take!(pending) isa Exception
             @test isempty(old.pending)
             @test BT.mcp_ctrl_for(state, p.id) === nothing
-            BT.handle_worker_mcp!(state, "worker-a", server_wire, channels,
+            BT.handle_worker_mcp!(state, "worker-a", server_link, channels,
                 Dict("type" => "mcp_open", "channel" => "replacement", "project_id" => p.id))
             new = BT.mcp_ctrl_for(state, p.id)
             @test new !== old
@@ -113,11 +119,11 @@
             other = BT.ProjectInfo("other-chat", "other", "worker-a", p.server_path,
                                    p.worker_path, now(UTC))
             state.projects[][other.id] = other
-            BT.handle_worker_mcp!(state, "worker-a", server_wire, channels,
+            BT.handle_worker_mcp!(state, "worker-a", server_link, channels,
                 Dict("type" => "mcp_open", "channel" => "other-channel", "project_id" => other.id))
             rid2, waiting = BT.register_rpc!(state)
             push!(new.pending, rid2)
-            BT.handle_worker_mcp!(state, "worker-a", server_wire, channels,
+            BT.handle_worker_mcp!(state, "worker-a", server_link, channels,
                 Dict("type" => "mcp_frame", "channel" => "other-channel",
                      "frame" => JSON.json(Dict("request_id" => rid2, "result" => "wrong"))))
             @test !isready(waiting)
@@ -160,6 +166,7 @@
         proc[] === nothing || (BW.kill_proc!(proc[]); wait(proc[]))
         close(relay)
         foreach(ch -> BT.close_mcp_channel!(ch; notify_worker = false), values(channels))
+        foreach(l -> WorkerLink.kill!(l, "done"), (server_link, worker_link))
         rm(state.state_dir; recursive = true, force = true)
         rm(state.working_dir; recursive = true, force = true)
     end

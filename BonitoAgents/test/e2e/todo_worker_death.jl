@@ -18,6 +18,12 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
+# How long the server waits for a vanished worker. A killed worker looks like a
+# dropped connection, and a dropped connection is kept for the worker's return:
+# only once this runs out is the worker dead and its streams ended. Production
+# waits minutes; the contract is the same at a few seconds.
+const GRACE = 3.0
+
 const PLAN = [(content = "write the thing", status = "in_progress"),
               (content = "check it",        status = "pending")]
 
@@ -55,8 +61,9 @@ function run_suite(server)
         @testset "killing the worker retires it" begin
             # SIGKILL, not SIGTERM: a machine going offline is abrupt and gets no
             # chance to say anything. That is the whole difficulty — there is no
-            # frame to react to, so the seal has to come from the stream ending.
-            kill(server.h.worker_proc, Base.SIGKILL)
+            # frame to react to, so the seal has to come from the stream ending,
+            # which it does once the worker's link outlives its grace period.
+            TK.kill_worker!(server)
 
             @test TK.wait_for(server, "pin dropped",
                 "document.querySelector('.bt-taskbar-todo') === null"; timeout = 30) == true
@@ -91,7 +98,7 @@ function run_suite(server)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    server = TK.dev_server(agent = agent_script)
+    server = TK.dev_server(agent = agent_script, worker_link_grace = GRACE)
     try
         TK.open_browser(server)
         run_suite(server)

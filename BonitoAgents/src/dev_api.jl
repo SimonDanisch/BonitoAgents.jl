@@ -258,14 +258,16 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
 end
 
 function dev_section(state::ServerState, ::Val{:workers}, ::String)
-    connected = lock(() -> Set(keys(state.worker_control_ws)), state.lock)
+    links     = lock(() -> copy(state.worker_links), state.lock)
     last_scan = lock(() -> copy(state.last_scan), state.lock)
     return [Dict{String,Any}(
         "worker_id"     => w.worker_id,
         "name"          => w.name,
         "initials"      => jsonable(w.initials),
         "online"        => isopen(w),
-        "control_ws"    => w.worker_id in connected,
+        # connected / detached (waiting for the worker to come back) / none
+        "link"          => haskey(links, w.worker_id) ?
+            String(WorkerLink.state(links[w.worker_id])) : "none",
         "hostname"      => w.hostname,
         "home"          => w.home,
         "projects_root" => w.projects_root,
@@ -596,7 +598,7 @@ function registry_counts(state::ServerState)
         "mcp_channels"         => lock(() -> length(state.mcp_ctrl), state.lock),
         "pending_rpcs"         => lock(() -> length(state.pending_rpcs), state.lock),
         "pending_chunks"       => lock(() -> length(state.pending_chunks), state.lock),
-        "worker_control_ws"    => lock(() -> length(state.worker_control_ws), state.lock),
+        "worker_links"         => lock(() -> length(state.worker_links), state.lock),
         "session_inflight"     => lock(() -> length(state.session_inflight), state.lock),
         "show_fetch_locks"     => lock(() -> length(state.show_fetch_inflight), state.lock),
         "show_mirror_stamps"   => lock(() -> length(state.show_mirror_stamps), state.lock),

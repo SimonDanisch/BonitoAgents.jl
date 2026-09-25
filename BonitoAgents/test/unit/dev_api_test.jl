@@ -115,7 +115,7 @@ end
             w = only(ws)
             @test w["worker_id"] == wid
             @test w["online"] === true
-            @test w["control_ws"] === true      # the actual socket, not the flag
+            @test w["link"] == "connected"      # the actual link, not the flag
             @test !isempty(w["projects_root"])
             @test w["update_state"] == "current"
             @test haskey(w, "update_message")
@@ -244,11 +244,11 @@ end
             # The registries that have historically grown without bound are all
             # present — that list IS the point of the tool.
             for k in ("chat_models", "messages_total", "eval_bridges", "eval_parked_bytes",
-                      "pending_rpcs", "worker_control_ws", "show_mirror_stamps",
+                      "pending_rpcs", "worker_links", "show_mirror_stamps",
                       "bound_lru", "log_records")
                 @test haskey(r, k)
             end
-            @test r["worker_control_ws"] == 1
+            @test r["worker_links"] == 1
             @test BonitoAgents.JSON.json(m) isa String
 
             deep = BT.dev_request(st, "memory", Dict("deep" => true))

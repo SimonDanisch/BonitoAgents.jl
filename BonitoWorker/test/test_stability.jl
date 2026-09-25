@@ -1,25 +1,11 @@
 # Regression tests for the BonitoWorker stability findings (M1, M8, M12, M13).
 # No network, no claude-agent-acp, no real git: we exercise the pure pieces that
 # were extracted for exactly this (clone_repo_response with an injected clone
-# stub, the removed idle watchdog, report_open_session_failed framing).
+# stub, the removed idle watchdog, a refused session over an in-memory link).
 
 using Test
 using BonitoWorker
 const BW = BonitoWorker
-
-# A capturing stand-in WS so we can assert report_open_session_failed's frame
-# without a real socket. Defined at top level (no world-age dance). The method
-# is added to the same generic BonitoWorker calls internally.
-# Captures what actually goes on the wire: BYTES. The control wire is MsgPack in
-# a binary frame, so a `Vector{String}` sink would have to pick an encoding to
-# hold it in — and `String(::Vector{UInt8})` STEALS the buffer it is handed,
-# which is a fine way to lose the very frame you meant to inspect.
-struct CapturingWS
-    sink::Vector{Vector{UInt8}}
-end
-ws_bytes(msg::AbstractVector{UInt8}) = collect(UInt8, msg)
-ws_bytes(msg::AbstractString)        = collect(UInt8, codeunits(msg))
-BonitoWorker.WebSockets.send(w::CapturingWS, msg) = (push!(w.sink, ws_bytes(msg)); nothing)
 
 # ── M1: clone onto an existing dir REFUSES and leaves the tree intact ──────────
 @testset "M1: clone_repo never deletes a pre-existing dst_path" begin
@@ -106,20 +92,37 @@ end
     @test !isdefined(BW, :CONTROL_WS_IDLE_TIMEOUT)
 end
 
-# ── M13: open_session failures are reported to the server, not swallowed ───────
-@testset "M13: report_open_session_failed sends a frame" begin
-    # report_open_session_failed must emit an `open_session_failed` control frame
-    # so the server stops waiting for a dial that will never come.
-    sent = Vector{UInt8}[]
-    ws = CapturingWS(sent)
-    BW.report_open_session_failed(ws, "sid-123", "boom")
-    @test length(sent) == 1
-    # Decoded the way the SERVER decodes it. `JSON.parse` here used to pass; it
-    # now throws on the MsgPack bytes, which is the hard cut doing its job — a
-    # test that kept parsing the old format would have gone on being green while
-    # the wire underneath it had moved.
-    payload = BW.decode_control(sent[1])
-    @test payload["type"] == "open_session_failed"
-    @test payload["sid"] == "sid-123"
-    @test occursin("boom", payload["error"])
+# ── M13: a session the worker can't start is refused WITH the reason ──────────
+# The server asks for an agent session by opening an `acp` channel. A worker
+# that can't run the agent aborts that channel with why, and the server's first
+# receive reports it — instead of waiting out a timeout for an answer that will
+# never come.
+@testset "M13: a failed agent start aborts its channel with the reason" begin
+    WL = BW.WorkerLink
+    w = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:1", secret = "s",
+        worker_id = "m13", name = "m13", mcp_command = "julia", mcp_arguments = String[],
+        projects_root = mktempdir(), agent_bin = ""))
+    ct, st = WL.memory_pair()
+    server_task = Threads.@spawn begin
+        h = WL.read_hello(st)
+        server = WL.Link(:server; id = h.link_id)
+        WL.welcome!(server, st, h, UInt8[]; resumed = false)
+        server
+    end
+    WL.connect!(w.link, ct, UInt8[])
+    server = fetch(server_task)
+    ch = WL.open_channel(server, BW.MsgPack.pack(Dict(
+        "kind" => "acp", "project_id" => "p", "cwd" => mktempdir(),
+        "mcpServers" => Any[], "provider" => "NoSuchAgent")))
+    err = try
+        BW.WebSockets.receive(ch)
+        nothing
+    catch e
+        e
+    end
+    @test err isa BW.WebSockets.WebSocketError
+    @test occursin("unknown provider 'NoSuchAgent'", err.message.reason)
+    @test BW.worker_idle(w)                 # nothing was left registered
+    close(w)
+    WL.kill!(server, "done")
 end

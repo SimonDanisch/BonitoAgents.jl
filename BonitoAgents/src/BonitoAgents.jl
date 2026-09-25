@@ -19,6 +19,7 @@ using Dates
 using TOML
 using Base64
 using SHA
+import WorkerLink      # one multiplexed, resumable connection per worker (always qualified)
 # Used by `current_bonito_install_spec()` to parse `[sources]` out of the
 # active project file so the install.jl template ships workers the exact
 # Bonito url+rev the server is itself running. Stdlib — zero cost.

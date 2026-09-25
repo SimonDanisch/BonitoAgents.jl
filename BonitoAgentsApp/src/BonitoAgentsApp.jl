@@ -160,6 +160,7 @@ function Base.close(h::AppHandle)
     # deadlock that drain — the worker only disconnects when the server goes
     # away), and its reconnect loop stops retrying against the closing server.
     stop_worker_proc!(h.worker_proc)
+    BonitoAgents.close_worker_links!(h.state)
     close_task = Base.errormonitor(@async close(h.state.srv))
     for _ in 1:200
         istaskdone(close_task) && break
@@ -372,35 +373,34 @@ end
                 port          = 0,
                 worker_secret = "precompile-secret",
                 state_dir     = mkpath(joinpath(dir, "state")),
-                working_dir   = mkpath(joinpath(dir, "working")))
+                working_dir   = mkpath(joinpath(dir, "working")),
+                # The scan would start every installed agent to list its
+                # sessions, and precompilation then waits on those processes.
+                scan_on_connect = false)
             url = "http://127.0.0.1:$(state.srv.port)"
-            # Bake the WORKER control-session handshake. The desktop app spawns a
-            # second Julia process (`-m BonitoAgentsApp worker`) whose entry,
-            # `run_control_session` (client WS open + hello/ack + the command
-            # loop), JIT-compiles on every launch — the dominant cold-start cost
-            # to a usable dashboard, and the one path the old workload missed.
-            # Connect a worker IN-PROCESS against our own server; it registers,
-            # then `close(state.srv)` below drops its WS and the session returns.
-            # The client WS uses HTTP's IO poller, which `cleanup_globals()` (at
-            # the end) shuts down — the same teardown Bonito's own workload relies
-            # on — so there is no lingering handle in the precompile image.
-            worker_task = Threads.@spawn try
-                BonitoWorker.run_control_session(;
-                    server_url    = url,
-                    secret        = "precompile-secret",
-                    worker_id     = "precompile-worker",
-                    name          = "precompile",
-                    mcp_command   = first(Base.julia_cmd().exec),
-                    mcp_arguments = String[],
-                    projects_root = mkpath(joinpath(dir, "projects")),
-                    agent_bin     = "")
-            catch e
-                @debug "precompile workload: worker session ended" exception = e
-            end
-            # Wait (bounded) for the hello/ack handshake to register the worker so
-            # the dashboard fetch below renders the worker-present path too.
+            # Bake the WORKER handshake. The desktop app spawns a second Julia
+            # process (`-m BonitoAgentsApp worker`) whose connection (dial, link
+            # handshake, control channel) JIT-compiles on every launch — the
+            # dominant cold-start cost to a usable dashboard. Connect a worker
+            # IN-PROCESS against our own server; it registers, and `close(worker)`
+            # below ends it. The client WS uses HTTP's IO poller, which
+            # `cleanup_globals()` (at the end) shuts down — the same teardown
+            # Bonito's own workload relies on — so there is no lingering handle
+            # in the precompile image.
+            worker = BonitoWorker.Worker(BonitoWorker.WorkerConfig(;
+                server_url    = url,
+                secret        = "precompile-secret",
+                worker_id     = "precompile-worker",
+                name          = "precompile",
+                mcp_command   = first(Base.julia_cmd().exec),
+                mcp_arguments = String[],
+                projects_root = mkpath(joinpath(dir, "projects")),
+                agent_bin     = ""))
+            worker_task = Threads.@spawn BonitoWorker.serve(worker; retry_delay = 0.1)
+            # Wait (bounded) for the handshake to register the worker so the
+            # dashboard fetch below renders the worker-present path too.
             for _ in 1:300
-                isempty(state.worker_control_ws) || break
+                BonitoAgents.worker_connected(state, "precompile-worker") && break
                 sleep(0.01)
             end
             # Fetch the dashboard via Downloads (libcurl), NOT HTTP/Reseau: the
@@ -432,22 +432,20 @@ end
             catch e
                 @debug "precompile workload: serve_workload failed" exception = e
             end
-            # Close the sessions the render created (compiles teardown paths too),
-            # then the server — which stops its accept loop AND its 1-Hz cleanup
-            # task (whose `sleep(1)` would otherwise be a lingering timer).
-            # Disconnect the worker BEFORE closing the server: a still-connected
-            # worker DEADLOCKS the server's WS-handler drain (the worker only
-            # leaves once the server goes away, and `close` waits on its handler —
-            # see `close(::AppHandle)`, which kills the worker first for this very
-            # reason). Drop its server-side control WS so the worker's
-            # `for frame in ws` ends and `run_control_session` returns.
-            let cws = get(state.worker_control_ws, "precompile-worker", nothing)
-                cws === nothing || close(cws)
-            end
+            # End the worker BEFORE closing the server: a connected worker
+            # DEADLOCKS the server's WS-handler drain (the worker only leaves
+            # once the server goes away, and `close` waits on its handler). Then
+            # end the server's side of the link, whose tasks would otherwise
+            # outlive the server for the link's grace period.
+            close(worker)
             for _ in 1:500
                 istaskdone(worker_task) && break
                 sleep(0.01)
             end
+            BonitoAgents.close_worker_links!(state)
+            # Close the sessions the render created (compiles teardown paths too),
+            # then the server — which stops its accept loop AND its 1-Hz cleanup
+            # task (whose `sleep(1)` would otherwise be a lingering timer).
             for (_, v) in state.srv.routes.table
                 v isa Bonito.App && !isnothing(v.session[]) && close(v.session[])
             end

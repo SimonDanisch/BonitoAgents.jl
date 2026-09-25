@@ -26,12 +26,22 @@
         end
     end
 
-    @testset "a git checkout resolves to the checked-out branch" begin
+    @testset "a git checkout resolves to what origin can serve" begin
         # This test runs from the monorepo checkout, so the git path applies:
-        # the templated rev must be exactly what `git` reports for HEAD.
+        # the checked-out branch when origin publishes it, else the exact
+        # commit when origin has that, else the version's default. A branch
+        # that exists only here (unpushed, or deleted on the remote) must never
+        # be templated: every worker install would fail on it.
         repo = abspath(pkgdir(BonitoAgents), "..")
-        expected = strip(read(`git -C $repo rev-parse --abbrev-ref HEAD`, String))
-        expected == "HEAD" && (expected = strip(read(`git -C $repo rev-parse HEAD`, String)))
+        branch = strip(read(`git -C $repo rev-parse --abbrev-ref HEAD`, String))
+        sha = strip(read(`git -C $repo rev-parse HEAD`, String))
+        expected = if branch != "HEAD" && BonitoAgents._branch_on_origin(repo, branch)
+            branch
+        elseif BonitoAgents._sha_on_origin(repo, sha)
+            sha
+        else
+            BonitoAgents.install_rev_for(pkgversion(BonitoAgents))
+        end
         @test BonitoAgents.current_repo_rev() == expected
     end
 end

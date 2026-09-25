@@ -66,7 +66,7 @@ mutable struct ProjectInfo
     # FK into `ServerState.workers` — stores the worker's stable UUID, NOT
     # its (mutable) display name. Old projects.json entries that still carry
     # a display name string in the `worker_name` field get migrated lazily
-    # on the next worker connect (see handle_worker_control).
+    # on the next worker connect (see `register_worker!`).
     worker_id::String
     server_path::String                # canonical copy on server (= state.working_dir/name)
     worker_path::String                # mirrored copy on worker (= worker.projects_root/name)
@@ -196,7 +196,8 @@ handlers. Five things deserve a paragraph each:
   current Dict by value, so adding a worker doesn't redraw the project
   list and vice versa. There's no separate version-int sentinel: the
   data IS the change signal.
-- `worker_control_ws` keys workers by name (the same key as `workers`).
+- `worker_links` keys each connected worker's `WorkerLink.Link` by worker id
+  (the same key as `workers`).
 - `srv` is filled in after `Bonito.Server` is constructed (chicken-and-egg:
   the dashboard app captures the state, but the server constructor takes
   the dashboard).
@@ -243,14 +244,19 @@ mutable struct ServerState
     working_dir :: String
     # Auth
     worker_secret :: String
-    # Worker-link liveness (seconds). The server pings every worker control WS
-    # every `heartbeat_interval`; a pong-capable worker that hasn't ponged for
-    # `heartbeat_deadline` is a ZOMBIE (half-open TCP after a suspend / wifi
-    # drop — the socket stays ESTABLISHED but nothing flows) and its socket is
-    # closed, which runs the normal disconnect teardown. Configurable so tests
-    # can use sub-second values.
+    # Worker-link liveness (seconds): each link pings every `heartbeat_interval`
+    # and drops a connection that has been silent for `heartbeat_deadline` — a
+    # half-open TCP link after a suspend or a wifi drop, ESTABLISHED on both
+    # ends with nothing flowing. Dropping it DETACHES the link (the worker's
+    # chats wait for it); only `worker_link_grace` without a reconnect ends it.
+    # Configurable so tests can use sub-second values.
     heartbeat_interval :: Float64
     heartbeat_deadline :: Float64
+    worker_link_grace  :: Float64
+    # Scan a worker's agent sessions (the discover tree) the first time it
+    # connects. Off for test servers: the scan reads the machine's real agent
+    # history and starts every installed agent to list its sessions.
+    scan_on_connect    :: Bool
     # Live Bonito server (set by serve() after construction)
     srv :: Union{Bonito.Server,Nothing}
 
@@ -304,8 +310,9 @@ mutable struct ServerState
     # here instead and update without rebuilding the chat list.
     turn_signal :: Observable{Int}
 
-    # Live worker connections (name → HTTP.WebSocket)
-    worker_control_ws :: Dict{String,Any}
+    # One link per worker (worker id → link), connected or waiting out its grace
+    # period for a reconnect. Everything to and from a worker is a channel on it.
+    worker_links :: Dict{String,WorkerLink.Link}
 
     # Pending request_id → channel handoffs for every RPC type. Channel{Any}
     # because the answer shape varies (WS for handoff, Dict for rpc result).
@@ -399,12 +406,15 @@ function ServerState(; state_dir::String,
                        working_dir::String,
                        worker_secret::String,
                        heartbeat_interval::Real = 15.0,
-                       heartbeat_deadline::Real = 45.0)
+                       heartbeat_deadline::Real = 45.0,
+                       worker_link_grace::Real = 300.0,
+                       scan_on_connect::Bool = true)
     mkpath(working_dir)
     s = ServerState(
         ReentrantLock(),
         state_dir, working_dir, worker_secret,
-        Float64(heartbeat_interval), Float64(heartbeat_deadline),
+        Float64(heartbeat_interval), Float64(heartbeat_deadline), Float64(worker_link_grace),
+        scan_on_connect,
         nothing,
         Observable(Dict{String,WorkerInfo}()),    # workers
         Observable(Dict{String,ProjectInfo}()),   # projects
@@ -412,7 +422,7 @@ function ServerState(; state_dir::String,
         Dict{String,Any}(),                       # review_states
         Observable(0),                            # chat_signal
         Observable(0),                            # turn_signal
-        Dict{String,Any}(),                       # worker_control_ws
+        Dict{String,WorkerLink.Link}(),           # worker_links
         Dict{String,Channel{Any}}(),              # pending_rpcs
         Dict{String,ChunkAccumulator}(),          # pending_chunks
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
@@ -453,7 +463,8 @@ function Base.copy(s::ServerState, session::Bonito.Session)
         ServerState(
             s.lock,
             s.state_dir, s.working_dir, s.worker_secret,
-            s.heartbeat_interval, s.heartbeat_deadline,
+            s.heartbeat_interval, s.heartbeat_deadline, s.worker_link_grace,
+            s.scan_on_connect,
             s.srv,
             map(identity, session, s.workers),
             map(identity, session, s.projects),
@@ -461,7 +472,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.review_states,           # shared: the point is surviving a session
             map(identity, session, s.chat_signal),
             map(identity, session, s.turn_signal),
-            s.worker_control_ws,
+            s.worker_links,
             s.pending_rpcs,
             s.pending_chunks,              # shared: one registry per server
             map(identity, session, s.discovered),

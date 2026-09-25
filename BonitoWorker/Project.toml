@@ -14,10 +14,12 @@ Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
 Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+WorkerLink = "03840273-e5e6-4e74-9050-e95881fcd827"
 
 [sources]
 AgentProviders = {path = "../AgentProviders"}
 RemoteSync = {path = "../RemoteSync"}
+WorkerLink = {path = "../WorkerLink"}
 
 [compat]
 Dates = "1.11.0"

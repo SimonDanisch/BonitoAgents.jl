@@ -54,12 +54,12 @@ end
 
 # Transport surface: receive the next frame (returns `nothing` on close),
 # send one frame, and report whether the underlying transport is closed.
-# Generic stubs for non-HTTP transports; HTTP.WebSocket impls follow.
-function recv_frame end
-function send_frame! end
-function is_closed end
-
-function recv_frame(ws::HTTP.WebSockets.WebSocket)
+#
+# The methods below are the fallback for anything websocket-shaped — anything
+# that implements `HTTP.WebSockets.send/receive/isclosed` and `close` with
+# websocket semantics: an `HTTP.WebSocket`, or a WorkerLink channel. A transport
+# with a different surface adds its own, more specific methods.
+function recv_frame(ws)
     try
         HTTP.WebSockets.isclosed(ws) && return nothing
         frame = HTTP.WebSockets.receive(ws)
@@ -74,7 +74,7 @@ function recv_frame(ws::HTTP.WebSockets.WebSocket)
     end
 end
 
-function send_frame!(ws::HTTP.WebSockets.WebSocket, bytes::AbstractVector{UInt8})
+function send_frame!(ws, bytes::AbstractVector{UInt8})
     HTTP.WebSockets.send(ws, bytes)
     return nothing
 end
@@ -98,7 +98,7 @@ function send_chunked!(ws, bytes::Vector{UInt8})
     return nothing
 end
 
-is_closed(ws::HTTP.WebSockets.WebSocket) = HTTP.WebSockets.isclosed(ws)
+is_closed(ws) = HTTP.WebSockets.isclosed(ws)
 
 # ── IO interface ───────────────────────────────────────────────────────────
 function _refill!(io::WebSocketIO)
@@ -172,10 +172,8 @@ function wait_peer_close(io::WebSocketIO)
     return nothing
 end
 
-# Close the underlying transport. Generic stub for non-HTTP transports; the
-# HTTP.WebSocket impl follows.
-function close_ws! end
-close_ws!(ws::HTTP.WebSockets.WebSocket) = close(ws)
+# Close the underlying transport (same fallback as `recv_frame`).
+close_ws!(ws) = close(ws)
 
 Base.read(io::WebSocketIO, ::Type{UInt8}) = with_read_guard(io) do
     while io.inpos > length(io.inbuf)

@@ -1,44 +1,56 @@
-# Server-side handlers for inbound worker connections. Workers dial the
-# server; the server tracks each worker's "control" WS and pairs per-session
-# ACP WSs with the right project.
+# Server side of the worker connection. Every worker dials ONE websocket, `/w`,
+# and runs a WorkerLink over it (`handle_worker_link`):
 #
-# Endpoints (registered as Bonito websocket_route!s):
-#   /worker-ws    → control channel. Worker sends a hello frame; we register
-#                   it in state.workers, mark online, and keep the WS for
-#                   sending commands like "open_session" / "open_transfer".
-#   /worker-acp   → per-session WS. Worker dials this in response to an
-#                   "open_session" command and identifies the WS by sid; we
-#                   pair it with a Channel that `start!(::WorkerAgent)` is
-#                   blocked on.
-#   /transfer-ws  → directional librsync transfer; worker dials this in
-#                   response to an "open_transfer" command; pairs the WS
-#                   with whichever sync_dir_*_worker! call is waiting.
+#   control channel  MsgPack commands to the worker and its replies; a reply
+#                    finds its caller through `request_id`.
+#   other channels   one per agent session and one per file transfer, opened
+#                    by the SERVER with the request as the channel's header
+#                    (`open_worker_channel`).
+#
+# A dropped connection DETACHES the link instead of ending it: the worker shows
+# offline, its agents keep running, and a reconnect within
+# `state.worker_link_grace` resumes every channel where it stopped. Only a dead
+# link tears the worker's registration down (`teardown_worker!`).
 
 using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol, RemoteSync
 
 # All worker-related state lives on `state::ServerState`:
-#   state.worker_control_ws — name → live HTTP.WebSocket
-#   state.pending_rpcs      — request_id/sync_id/sid → Channel{Any}
-#                              one dict for every RPC type (list_dir, scan_sessions,
-#                              clone_repo, /transfer-ws handoff, /worker-acp handoff).
-#                              The keys are uuids so collisions across types can't
-#                              happen, and the unified shape is simpler than the
-#                              previous five typed dicts.
+#   state.worker_links      — worker id → its WorkerLink.Link
+#   state.pending_rpcs      — request_id → Channel{Any}, one dict for every RPC
+#                              type (list_dir, scan_sessions, clone_repo, …). The
+#                              keys are uuids, so types can't collide.
 #   state.pending_chunks    — request_id → ChunkAccumulator for replies that span
 #                              MULTIPLE frames (git_diff's patch); `deliver_chunk!`
 #                              reassembles per frame and resolves once complete.
 
-# Send a JSON command to a worker over its control WS. Throws if the worker
-# isn't currently connected.
-function send_command(state::ServerState, worker_name::String, payload::AbstractDict)
-    # Snapshot the socket under the lock (T14): `haskey` then index unlocked
-    # raced `teardown_worker_control!`/`remove_worker!` deleting the entry — a
-    # raw KeyError in the middle of a UI handler. One locked lookup decides.
-    ws = lock(state.lock) do
-        get(state.worker_control_ws, worker_name, nothing)
-    end
-    ws === nothing && error("Worker '$worker_name' is not connected")
-    send_control(ws, payload)
+"The worker's link, or `nothing` when it has none."
+worker_link(state::ServerState, worker_id::AbstractString) =
+    lock(() -> get(state.worker_links, worker_id, nothing), state.lock)
+
+"""
+    worker_connected(state, worker_id) -> Bool
+
+Whether the worker can be reached right now: it has a link, and the link has a
+connection. A detached link, waiting for the worker to come back, has none.
+"""
+function worker_connected(state::ServerState, worker_id::AbstractString)
+    link = worker_link(state, worker_id)
+    return link !== nothing && WorkerLink.state(link) === :connected
+end
+
+# The link of a worker that can be reached right now; throws otherwise. A
+# command queued on a detached link would only make its caller sit out a
+# timeout, so nothing is sent to a worker that isn't there.
+function connected_link(state::ServerState, worker_id::AbstractString)
+    link = worker_link(state, worker_id)
+    (link === nothing || WorkerLink.state(link) !== :connected) &&
+        error("Worker '$worker_id' is not connected")
+    return link
+end
+
+# Send a command to a worker over its control channel.
+function send_command(state::ServerState, worker_id::String, payload::AbstractDict)
+    send_control(WorkerLink.control_channel(connected_link(state, worker_id)), payload)
     return nothing
 end
 
@@ -51,8 +63,6 @@ end
 # the same command. A binary frame is never validated, so a bad byte is data to
 # handle rather than a severed connection.
 #
-# NOT applied to the handoff / transfer sockets: those are separate handshakes
-# with their own peers, and `send_ws_error` below still serves them.
 send_control(ws, payload::AbstractDict) = WebSockets.send(ws, MsgPack.pack(payload))
 
 """
@@ -85,70 +95,11 @@ normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire
 normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
 normalize_wire(x)                 = x
 
-# A rejection on the CONTROL WS. Same tolerance as `send_ws_error` — the peer we
-# just refused may already be gone — but on the binary wire, because the worker
-# is waiting on `decode_control` and a text frame there would surface as "your
-# server speaks JSON" instead of the "unauthorized" we are trying to report.
-function send_control_error(ws, payload::AbstractDict)
-    try
-        send_control(ws, payload)
-    catch e
-        is_peer_gone(e) || rethrow()
-    end
-    return nothing
-end
-
-# Push a JSON error frame to a peer whose request we just rejected
-# (unauthorized / missing id / unknown id). The peer may have hung up
-# before reading the response — that's the state we were going to leave
-# them in anyway, so an IOError / WebSocketError during the send is
-# expected and silently ignored. Anything else propagates.
-function send_ws_error(ws, payload::AbstractDict)
-    try
-        WebSockets.send(ws, JSON.json(payload))
-    catch e
-        is_peer_gone(e) || rethrow()
-    end
-    return nothing
-end
-
-# Close a worker-side WebSocket that may have been torn down concurrently
-# by the peer (worker reboot, network drop, normal end-of-transfer cleanup).
-# A closed-WS exception during the close means the resource is already in
-# the state we wanted — silently ignored. Anything else propagates.
-function close_ws_safe(ws)
-    HTTP.WebSockets.isclosed(ws) && return nothing
-    try
-        close(ws)
-    catch e
-        is_peer_gone(e) || rethrow()
-    end
-    return nothing
-end
-
-# Kill the underlying transport, deliberately NOT `close(ws)`: the polite close
-# writes a CLOSE frame under `ws.sendlock` — and on the zombie socket this is
-# for, a wedged send is typically already BLOCKED holding that very lock (the
-# production incident's backtrace: `relay_proc_to_ws → _flush_ws_output_locked!
-# → waitwrite`), so `close(ws)` would deadlock behind it and the teardown would
-# never run. Closing the transport needs no locks and wakes every blocked
-# reader AND writer (Reseau `evict!` wakes all waiters) into their normal
-# error paths — which is exactly the recovery chain we want.
-function force_close_ws!(ws)
-    try
-        ws.close_transport!()
-    catch e
-        is_peer_gone(e) || rethrow()
-    end
-    return nothing
-end
-
 """
     WorkerUnreachableError(op, detail)
 
-A worker RPC failed because the worker cannot be reached: the control socket is
-gone ("not connected") or the RPC hit its deadline ("timed out" — the zombie
-link case: the socket LOOKS open but nothing flows). Callers that gate a user
+A worker RPC failed because the worker cannot be reached: it has no connection
+("not connected") or the RPC hit its deadline ("timed out"). Callers that gate a user
 action on worker liveness (the editor open-guard) match on this TYPE to fail
 closed immediately, instead of parsing message strings.
 """
@@ -159,10 +110,9 @@ end
 Base.showerror(io::IO, e::WorkerUnreachableError) = print(io, e.op, " ", e.detail)
 
 # Register a pending RPC: returns (request_id, channel). Caller sends the
-# command (with `request_id`/`sync_id`/`sid` set to the returned id) and waits
-# on the channel via `take_pending!`. The matching control-frame handler /
-# WS upgrade pops the id out of `pending_rpcs` and puts the response on the
-# channel.
+# command (with `request_id` set to the returned id) and waits on the channel
+# via `take_pending!`. The matching control-frame handler pops the id out of
+# `pending_rpcs` and puts the response on the channel.
 function register_rpc!(state::ServerState)
     rid = string(uuid4())
     ch  = Channel{Any}(1)
@@ -249,8 +199,8 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
     end
     val === nothing && throw(WorkerUnreachableError(String(op_name),
         "timed out after $(timeout)s — worker may be offline or stuck"))
-    # M9/M13: the worker can report a definitive failure (e.g. open_session_failed)
-    # by delivering an Exception, so we fail fast instead of waiting out the timeout.
+    # A definitive failure arrives as an Exception (`deliver_rpc_error!`), so
+    # the caller fails fast instead of waiting out the timeout.
     val isa Exception && throw(val)
     return val
 end
@@ -281,9 +231,8 @@ function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
     return
 end
 
-# Fail a pending RPC: deliver an Exception so `take_pending!` rethrows it (M9).
-# Used when the worker reports a definitive failure for a registered operation
-# (e.g. `open_session_failed`) instead of dialing back.
+# Fail a pending RPC: deliver an Exception so `take_pending!` rethrows it (M9),
+# e.g. an MCP request whose relay channel went away.
 function deliver_rpc_error!(state::ServerState, rid::AbstractString, message::AbstractString)
     deliver_rpc_response!(state, rid, ErrorException(message))
     return
@@ -372,362 +321,270 @@ function worker_update_state(hello::AbstractDict, update_spec::AbstractDict)
         "A worker update is available. Auto-update is off here: Update now installs it right away and restarts this worker's chats, or reinstall.")
 end
 
-# Handler for /worker-ws — runs once per worker, for the worker's lifetime.
-function handle_worker_control(state::ServerState, ws)
+"""
+    handle_worker_link(state, ws)
+
+One connection to `/w`. Reads the worker's hello, checks its secret, and either
+resumes the worker's link (the hello names it and it is still alive) or starts
+a new one, which kills and tears down whatever link the worker had before.
+Returns once this connection ends; the link can outlive it.
+"""
+function handle_worker_link(state::ServerState, ws)
+    t = WorkerLink.WebSocketTransport(ws)
     worker_id = "?"
-    mcp_channels = Dict{String,Any}()
     try
-        hello_raw = WebSockets.receive(ws)
-        hello = decode_control(hello_raw)
-        if get(hello, "secret", "") != state.worker_secret
-            send_control_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
+        hello = WorkerLink.read_hello(t; timeout = 10)
+        info = decode_control(hello.app)
+        if get(info, "secret", "") != state.worker_secret
+            WorkerLink.refuse(t, "unauthorized")
             return
         end
-        # Worker identity. Newer workers send `worker_id` (stable UUID); old
-        # ones (and the migration pass for an existing install) only have
-        # `name`. Fall back so legacy workers keep working — the dict key
-        # is just a string either way.
-        name      = String(get(hello, "name", get(hello, "hostname", "anon")))
-        worker_id = String(get(hello, "worker_id", name))
-
-        # If the user previously renamed this worker via the UI, preserve
-        # that name across reconnects instead of overwriting it with the
-        # worker's hello-frame default.
-        existing_name = haskey(state.workers[], worker_id) ?
-                        state.workers[][worker_id].name : nothing
-        display_name  = existing_name === nothing ? name : existing_name
-
-        # `heartbeat_interval` advertises the server→worker ping cadence so the
-        # worker can arm its own receive-watchdog (no frame for several
-        # intervals ⇒ half-open link ⇒ close + re-dial). Workers predating the
-        # field simply ignore it.
-        update_spec = current_worker_update_spec()
-        update_state, update_message = worker_update_state(hello, update_spec)
-        send_control(ws, Dict("ok" => true,
-                              "registered_as" => display_name,
-                              "worker_id"     => worker_id,
-                              "heartbeat_interval" => state.heartbeat_interval,
-                              "mcp_relay" => 1,
-                              # Optional to old workers, authoritative to new ones:
-                              # this is the same spec /install.jl would serve, but
-                              # travels over the already authenticated control WS.
-                              "update_spec" => update_spec))
-
-        # Build / refresh the WorkerInfo from the hello frame. Preserve a
-        # user-set `initials` override across reconnects (the worker doesn't
-        # know about it; it lives entirely on the server side), and REUSE the
-        # existing `online` Observable so chats bound to it (the shared liveness
-        # signal) see this reconnect flip true — the WorkerInfo object is
-        # rebuilt each connect, but the observable's identity must survive.
-        prev_initials, online_obs = let existing = get(state.workers[], worker_id, nothing)
-            existing === nothing ? (nothing, Observable(true)) :
-                (existing.initials, existing.online)
+        name      = String(get(info, "name", get(info, "hostname", "anon")))
+        worker_id = String(get(info, "worker_id", name))
+        # A rename in the UI survives reconnects: the worker knows nothing of it.
+        existing  = get(state.workers[], worker_id, nothing)
+        shown_as  = existing === nothing ? name : existing.name
+        link, resumed = claim_worker_link!(state, worker_id, hello.link_id)
+        WorkerLink.welcome!(link, t, hello, MsgPack.pack(Dict(
+            "ok"            => true,
+            "registered_as" => shown_as,
+            "worker_id"     => worker_id,
+            # The same spec /install.jl serves, over the authenticated link.
+            "update_spec"   => current_worker_update_spec())); resumed)
+        # A resumed link is the same worker process as before, so its record
+        # stands; a new link may be a new install, a renamed host, a new build.
+        # Link and record are stored only now, together, with the link
+        # connected: whoever sees the worker can reach it, and the other way
+        # round.
+        if !resumed
+            register_worker!(state, worker_id, shown_as, info, link)
+            # One reader per link: a resume keeps the control channel, and so
+            # the reader that already serves it.
+            Base.errormonitor(@async serve_worker_control(state, worker_id, link))
+            worker_came_online!(state, worker_id)
         end
-        online_obs[] = true
-        w = WorkerInfo(
-            worker_id,
-            display_name,
-            prev_initials,
-            "<inbound-ws>",          # we no longer dial the worker; URL is moot
-            state.worker_secret,
-            nothing,                 # ssh_target reserved for future rsync-over-ssh
-            String(get(hello, "hostname", "")),
-            String(get(hello, "home", "")),
-            String(get(hello, "mcp_path", "")),
-            Vector{String}(get(hello, "mcp_args", String[])),
-            String(get(hello, "projects_root", "")),
-            online_obs,
-            now(UTC),
-            update_state,
-            update_message,
-        )
-        # All shared-state writes for this worker's registration go in one
-        # critical section so the workers/worker_control_ws/projects tables
-        # are mutually consistent across concurrent observers (other RPC
-        # handlers, App-body re-renders).
-        lock(state.lock) do
-            state.workers[][worker_id] = w
-            state.worker_control_ws[worker_id] = ws
-            migrate_legacy_worker_refs!(state, w)
-            save_workers!(state)
-        end
-        # Worker added → fan out to worker-cards consumers. If any
-        # legacy projects had their worker_id rewritten by
-        # migrate_legacy_worker_refs!, the project list also needs to
-        # know (the project card shows the worker name and that lookup
-        # was previously broken).
-        notify_workers!(state)
-        notify_projects!(state)
-        @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
+        # Returning closes the websocket, so stay until the connection ends.
+        wait(t)
+    catch e
+        # Anything escaping here would vanish into the websocket layer, which
+        # closes the socket without a word: the worker redials and loops forever
+        # with nothing in our log.
+        is_peer_gone(e) ||
+            @error "Worker connection handler failed" worker_id exception = (e, catch_backtrace())
+        WorkerLink.close_transport(t)
+    end
+    return nothing
+end
 
-        # Reconcile this worker's projects against its filesystem: drop any whose
-        # `worker_path` is gone (scratch dirs cleared on reboot). Async so the
-        # inspect round-trips never block registration.
+# The link this connection continues: the worker's current one when the hello
+# names it and it is still alive, otherwise a new one (stored by
+# `register_worker!`). A link replaced here is killed first, so its `:dead`
+# handler tears the old registration down (its agents and chats' sessions are
+# gone with the worker process that ran them) before the new one exists.
+function claim_worker_link!(state::ServerState, worker_id::String, link_id::Vector{UInt8})
+    old = worker_link(state, worker_id)
+    if old !== nothing && WorkerLink.link_id(old) == link_id && WorkerLink.state(old) !== :dead
+        return old, true
+    end
+    old === nothing || WorkerLink.kill!(old, "the worker connected with a new link")
+    link = WorkerLink.Link(:server; id = link_id,
+                           grace         = state.worker_link_grace,
+                           ping_interval = state.heartbeat_interval,
+                           ping_deadline = state.heartbeat_deadline,
+                           on_state      = (l, st) -> worker_link_changed!(state, worker_id, l, st))
+    return link, false
+end
+
+# Record the worker a hello describes and the link it is reachable over, and
+# return its record. The user's initials survive (the worker knows nothing of
+# them), and so does the `online` observable: chats hold on to it, so it must
+# stay the same object.
+function register_worker!(state::ServerState, worker_id::String, name::String,
+                          hello::AbstractDict, link::WorkerLink.Link)
+    existing = get(state.workers[], worker_id, nothing)
+    update_state, update_message = worker_update_state(hello, current_worker_update_spec())
+    online = existing === nothing ? Observable(false) : existing.online
+    w = WorkerInfo(
+        worker_id,
+        name,
+        existing === nothing ? nothing : existing.initials,
+        "<inbound-ws>",          # we never dial the worker; the URL is moot
+        state.worker_secret,
+        nothing,                 # ssh_target reserved for future rsync-over-ssh
+        String(get(hello, "hostname", "")),
+        String(get(hello, "home", "")),
+        String(get(hello, "mcp_path", "")),
+        Vector{String}(get(hello, "mcp_args", String[])),
+        String(get(hello, "projects_root", "")),
+        online,
+        now(UTC),
+        update_state,
+        update_message,
+    )
+    lock(state.lock) do
+        state.worker_links[worker_id] = link
+        state.workers[][worker_id] = w
+        migrate_legacy_worker_refs!(state, w)
+        save_workers!(state)
+    end
+    # From here on the link keeps it current (`worker_link_changed!`); what it
+    # did before it was stored went unseen, so catch up once.
+    link_state = WorkerLink.state(link)
+    link_state === :dead && (teardown_worker!(state, worker_id, link); return w)
+    connected = link_state === :connected
+    online[] == connected || (online[] = connected)
+    # `migrate_legacy_worker_refs!` may have rewritten project rows, and the
+    # project cards show the worker's name.
+    notify_workers!(state)
+    notify_projects!(state)
+    @info "Worker registered" worker_id name hostname = w.hostname
+    return w
+end
+
+# First contact of a new link: reconcile the worker's projects with its disk.
+# Async, so the round trips never hold up the connection.
+function worker_came_online!(state::ServerState, worker_id::String)
+    # Drop projects whose folder is gone (scratch dirs cleared on reboot).
+    Base.errormonitor(@async try
+        prune_missing_projects!(state, worker_id)
+    catch e
+        @warn "prune_missing_projects! failed" worker = worker_id exception = e
+    end)
+    # Chats start lazily, when the user opens one; only the folder→threads
+    # browser is filled, and only the first time (later: the Rescan button).
+    if state.scan_on_connect && !haskey(state.discovered[], worker_id)
         Base.errormonitor(@async try
-            prune_missing_projects!(state, worker_id)
+            scan_and_store!(state, worker_id)
         catch e
-            @warn "prune_missing_projects! failed" worker = worker_id exception = e
+            @warn "auto-scan on connect failed" worker_id exception = e
         end)
+    end
+    return nothing
+end
 
-        # Bring-up is LAZY: we no longer spawn a chat (claude process) for every
-        # project the moment a worker connects. A chat starts only when the user
-        # opens one of its threads (ensure_project_session! via the loading view
-        # / dashboard), at which point it appears in the active-chats sidebar.
-        # Eager bring-up meant N claude processes per worker on every reconnect
-        # and made "active" meaningless.
+# The link's state is the worker's: connected is online, detached is offline
+# with everything kept for the reconnect, dead is gone.
+function worker_link_changed!(state::ServerState, worker_id::String,
+                              link::WorkerLink.Link, st::Symbol)
+    worker_link(state, worker_id) === link || return nothing   # replaced or removed
+    st === :dead && return teardown_worker!(state, worker_id, link)
+    w = get(state.workers[], worker_id, nothing)
+    w === nothing && return nothing
+    online = st === :connected
+    w.online[] == online || (w.online[] = online)
+    notify_workers!(state)
+    if online
+        @info "Worker connected" worker_id name = w.name
+    else
+        @info "Worker connection lost; its agents keep running until it reconnects" worker_id grace = state.worker_link_grace
+    end
+    return nothing
+end
 
-        # Populate the persistent folder→threads browser on FIRST connect only
-        # (if we have no cached scan for this worker yet). Subsequent refreshes
-        # are explicit via the Rescan button — so "no need to click Discover
-        # again" after the first time, and reconnects don't re-scan every time.
-        if !haskey(state.discovered[], worker_id)
-            @async try
-                scan_and_store!(state, worker_id)
-            catch e
-                @warn "auto-scan on connect failed" worker_id=worker_id exception=e
-            end
-        end
-
-        # Zombie-link watchdog (#33). A suspend / wifi drop can leave this
-        # socket half-open: ESTABLISHED on both ends, nothing flowing. The
-        # frame loop below then blocks in `receive` FOREVER, the worker stays
-        # registered, and every RPC against it burns its full timeout (the
-        # production incident: 20+ minutes of 5s stats / 60s fetches / 30s
-        # binds that read as "the server crashed"). We ping every
-        # `heartbeat_interval`; a worker that has EVER ponged and then goes
-        # `heartbeat_deadline` without one is dead — close its socket, which
-        # unblocks the frame loop into the normal disconnect teardown AND
-        # (via RST) unwedges the worker's blocked sends so it re-dials.
-        #
-        # Two tasks, not one: `send` on a wedged socket can itself block
-        # forever, so the task that SENDS pings must not be the task that
-        # decides death. The reaper does no socket I/O except `close`.
-        # Pong-gating keeps ancient workers without the pong branch on the
-        # old no-liveness behavior instead of reaping every idle one.
-        last_pong    = Threads.Atomic{Float64}(time())
-        pong_seen    = Threads.Atomic{Bool}(false)
-        last_ping_ok = Threads.Atomic{Float64}(time())
-        hb_alive     = Threads.Atomic{Bool}(true)
-        Base.errormonitor(@async while hb_alive[]
-            sleep(state.heartbeat_interval)
-            hb_alive[] || break
+# The worker's replies (and MCP relay traffic) on its control channel, for as
+# long as `link` lives.
+function serve_worker_control(state::ServerState, worker_id::String, link::WorkerLink.Link)
+    ctrl = WorkerLink.control_channel(link)
+    mcp_channels = Dict{String,Any}()
+    try
+        # Every typed reply maps back to a pending RPC by request_id;
+        # deliver_rpc_response! is a no-op if the caller already timed out.
+        for frame in ctrl
             try
-                send_control(ws, Dict("type" => "ping"))
-                last_ping_ok[] = time()
-            catch e
-                # `is_peer_gone`, not a local whitelist: the Reseau transport
-                # throws `NetClosingError`, which matched none of the three
-                # types listed here before and so escaped as an UNHANDLED TASK
-                # ERROR — killing the pinger and freezing `last_ping_ok`.
-                is_peer_gone(e) || rethrow()
-                break   # socket is gone — the frame loop is already tearing down
-            end
-        end)
-        Base.errormonitor(@async while hb_alive[]
-            sleep(state.heartbeat_interval)
-            hb_alive[] || break
-            # Two independent death signals: a pong-capable worker went silent,
-            # or our OWN ping send is stuck (kernel send buffer full — the
-            # interface-switch wedge fills it with retransmit-limbo bytes).
-            # The stuck-send signal needs no pong capability at all.
-            pong_lost  = pong_seen[] && time() - last_pong[]    > state.heartbeat_deadline
-            send_stuck = time() - last_ping_ok[] > state.heartbeat_deadline + state.heartbeat_interval
-            if pong_lost || send_stuck
-                @warn "Worker heartbeat lost — killing zombie control socket" worker_id pong_lost send_stuck
-                force_close_ws!(ws)
-                break
-            end
-        end)
-
-        # Process inbound frames from the worker. Every typed reply maps
-        # back to a pending RPC by request_id; deliver_rpc_response! is a
-        # no-op if the id is unknown (caller already timed out).
-        #
-        # The `for frame in ws` iteration calls `receive(ws)` under the hood,
-        # which THROWS (EOFError / IOError / WebSocketError) when the socket
-        # drops abruptly — a worker kill, crash, or any ungraceful disconnect,
-        # i.e. the common case. That throw escapes the per-frame try below (it
-        # happens in the iterator, not the body), so without this guard every
-        # worker disconnect dumps a stacktrace to the server console. Swallow
-        # the benign close errors; the `finally` runs teardown either way.
-        try
-            for frame in ws
-                try
-                    cmd = decode_control(frame)
-                    t   = get(cmd, "type", "")
-                    rid = String(get(cmd, "request_id", ""))
-                    if t in ("mcp_open", "mcp_frame", "mcp_close")
-                        handle_worker_mcp!(state, worker_id, ws, mcp_channels, cmd)
-                    elseif t == "pong"
-                        last_pong[] = time()
-                        pong_seen[] = true
-                    elseif t == "update_status"
-                        apply_update_status!(state, worker_id, cmd)
-                    elseif t == "list_dir_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "make_dir_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "ensure_dir_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "stat_path_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "read_file_range_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "list_project_files_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "scan_sessions_result"
-                        sessions = [Dict{String,Any}(s)
-                                    for s in get(cmd, "sessions", Any[])]
-                        deliver_rpc_response!(state, rid, sessions)
-                    elseif t == "clone_repo_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "inspect_path_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "tail_file_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "kill_file_writers_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "git_diff_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "git_diff_chunk"
-                        deliver_chunk!(state, cmd)
-                    elseif t == "find_repos_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "worker_state_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "read_log_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "debug_checkout_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "stage_session_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "install_session_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "discard_staging_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "open_eval_host_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "close_eval_host_response"
-                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                    elseif t == "open_session_failed"
-                        # M9/M13: worker couldn't spawn/dial the ACP session; fail the
-                        # pending open_session (keyed by `sid`) now instead of waiting
-                        # out the 30s timeout in transport.jl.
-                        sid = String(get(cmd, "sid", ""))
-                        deliver_rpc_error!(state, sid,
-                            String(get(cmd, "error", "worker failed to open ACP session")))
-                    else
-                        # This dispatch is an allow-list, so a NEW worker RPC whose
-                        # reply type isn't added above lands here — and its caller
-                        # would otherwise just sit out its full timeout with no
-                        # clue why. Say it out loud instead. (A newer worker
-                        # talking to an older server hits this too, which is
-                        # exactly the same thing worth knowing.)
-                        @warn "Worker control: unhandled reply type — the caller will time out" *
-                              " (add an arm for it in handle_worker_control)" type=t worker_id=worker_id maxlog=5
-                    end
-                catch e
-                    @warn "Worker control frame error" exception=e
+                cmd = decode_control(frame)
+                t   = get(cmd, "type", "")
+                rid = String(get(cmd, "request_id", ""))
+                if t in ("mcp_open", "mcp_frame", "mcp_close")
+                    handle_worker_mcp!(state, worker_id, link, mcp_channels, cmd)
+                elseif t == "update_status"
+                    apply_update_status!(state, worker_id, cmd)
+                elseif t in ("list_dir_response", "make_dir_response", "ensure_dir_response",
+                             "stat_path_response", "read_file_range_response",
+                             "list_project_files_response", "clone_repo_response",
+                             "inspect_path_response", "tail_file_response",
+                             "kill_file_writers_response", "git_diff_response",
+                             "find_repos_response", "worker_state_response",
+                             "read_log_response", "debug_checkout_response",
+                             "stage_session_response", "install_session_response",
+                             "discard_staging_response", "open_eval_host_response",
+                             "close_eval_host_response")
+                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                elseif t == "scan_sessions_result"
+                    sessions = [Dict{String,Any}(s) for s in get(cmd, "sessions", Any[])]
+                    deliver_rpc_response!(state, rid, sessions)
+                elseif t == "git_diff_chunk"
+                    deliver_chunk!(state, cmd)
+                else
+                    # An allow-list: a NEW worker RPC whose reply type isn't
+                    # listed above lands here, and its caller would otherwise
+                    # sit out its full timeout with no clue why.
+                    @warn "Worker control: unhandled reply type — the caller will time out" *
+                          " (add it in serve_worker_control)" type = t worker_id maxlog = 5
                 end
+            catch e
+                e isa InterruptException && rethrow()
+                @warn "Worker control frame error" worker_id exception = (e, catch_backtrace())
             end
-        catch e
-            # Benign socket drop (worker killed/crashed/disconnected) — the
-            # iterator raises these on EOF. A real error still surfaces.
-            is_stale_session_error(e) ||
-                @warn "Worker control loop ended" worker_id=worker_id exception=(e, catch_backtrace())
         end
     catch e
-        # Anything escaping the registration path (between the hello and the
-        # frame loop) would otherwise vanish into the websocket layer, which
-        # closes the socket without a word: the worker sees "closed by server",
-        # redials, and loops forever with nothing in our log.
-        is_peer_gone(e) ||
-            @error "Worker control handler failed" worker_id exception=(e, catch_backtrace())
+        # The control channel ends only with its link (aborted when it dies).
+        e isa WebSockets.WebSocketError || rethrow()
     finally
-        # `hb_alive` only exists once registration reached the watchdog block —
-        # a rejected/failed hello lands here without it.
-        @isdefined(hb_alive) && (hb_alive[] = false)
         foreach(ch -> close_mcp_channel!(ch; notify_worker = false), values(mcp_channels))
-        empty!(mcp_channels)
-        try
-            teardown_worker_control!(state, worker_id, ws)
-        catch e
-            @error "Worker teardown failed" worker_id exception=(e, catch_backtrace())
-        end
     end
+    return nothing
 end
 
 """
-    teardown_worker_control!(state, worker_id, ws) -> Bool
+    teardown_worker!(state, worker_id, link) -> Bool
 
-Tear down a worker's registration when its control socket closes — but ONLY if
-`ws` is still the registered socket for `worker_id`. Returns `true` if it ran
-the teardown, `false` if the connection was superseded.
+Tear a worker's registration down once its link is dead, but ONLY if `link` is
+still the worker's link. Returns `true` if it ran.
 
-Two connections can share a `worker_id`: a duplicate worker process, or a
-reconnect that re-registered before this old socket's `finally` ran. The
-registration map is last-writer-wins (`worker_control_ws[id] = ws` at connect),
-so a stale connection dying must NOT delete the entry, flip the worker offline,
-or evict its chat models — that would destroy the LIVE connection that replaced
-it (the bug that made duplicate workers mutually destructive). The `=== ws`
-identity check is the guard.
+The chats are KEPT: their models, messages and panes stay, and the worker's
+shared `online` observable shows them offline. Their agent sessions are stopped
+(the agents died with the link), and a new link rebinds them on the next
+message.
 """
-function teardown_worker_control!(state::ServerState, worker_id::AbstractString, ws)
+function teardown_worker!(state::ServerState, worker_id::AbstractString, link::WorkerLink.Link)
     affected = String[]
     kept     = ChatModel[]
     is_current = lock(state.lock) do
-        current = get(state.worker_control_ws, worker_id, nothing)
-        current === ws || return false           # superseded — leave the live one alone
-        delete!(state.worker_control_ws, worker_id)
+        get(state.worker_links, worker_id, nothing) === link || return false
+        delete!(state.worker_links, worker_id)
         for p in values(state.projects[])
             if p.worker_id == worker_id
                 m = get(state.chat_models, p.id, nothing)
                 m === nothing || push!(kept, m)
                 push!(affected, p.id)
-                # #28: chat_models[p.id] is DELIBERATELY KEPT (it used to be
-                # evicted here). The model, its msgs_store and its pane stay
-                # live; only the dead agent session is torn down below. The
-                # worker's shared `online` observable drives the offline banner
-                # + send-gating, and a reconnect rebinds on the next message —
-                # no re-click, and no chat vanishes from the sidebar.
             end
         end
         return true
     end
-    if is_current
-        # Liveness + per-chat offline flips OUTSIDE the lock (observable writes /
-        # JS bridge). The worker's `online` observable is SHARED into every one
-        # of its ChatModels, so this single flip pauses their background pollers
-        # and (via `session_alive`) shows the banner + disables send everywhere.
-        haskey(state.workers[], worker_id) && (state.workers[][worker_id].online[] = false)
-        for m in kept
-            # Tear down the DEAD ACP session (frees the worker-side agent
-            # subprocess), but KEEP the model: begin_turn rebinds a fresh
-            # session on the next message after reconnect.
-            try; stop!(m.agent); catch e
-                @warn "stopping agent on worker disconnect" project_id = m.project_id exception = e
-            end
-            shared(m).session_alive[] = false
+    is_current || return false
+    # Observable writes and agent teardown OUTSIDE the lock. The `online`
+    # observable is shared into every one of the worker's ChatModels, so this
+    # one flip pauses their pollers and shows the banner everywhere.
+    haskey(state.workers[], worker_id) && (state.workers[][worker_id].online[] = false)
+    for m in kept
+        try; stop!(m.agent); catch e
+            @warn "stopping agent on worker disconnect" project_id = m.project_id exception = e
         end
-        # The worker host is gone → its eval workers (and their bridges) are gone.
-        # So are its chats' agent sessions, and with them the eval hosts those
-        # chats had running on OTHER workers: nobody is left to talk to them, and
-        # a host outlives its chat only to hold a Julia process open (its own
-        # orphan timer never fires — the SERVER is still up, it is the chat that
-        # died). Same reasoning as `stop_session!`.
-        for pid in affected
-            teardown_eval_bridge!(state, pid)
-            close_eval_hosts!(state, pid)
-        end
-        notify_workers!(state)
-        # NOT notify_chats!: the chats are kept, so the active-chats list is
-        # unchanged — they just render offline until the worker returns.
-        release_projects_for_worker!(state, worker_id)
-        @info "Worker disconnected (chats kept for reconnect)" worker_id=worker_id
-    else
-        @info "Worker control socket closed but superseded; keeping live registration" worker_id=worker_id
+        shared(m).session_alive[] = false
     end
-    return is_current
+    # The worker's eval workers (and their bridges) are gone with it. So are its
+    # chats' agent sessions, and with them the eval hosts those chats had on
+    # OTHER workers: nobody is left to talk to them. Same as `stop_session!`.
+    for pid in affected
+        teardown_eval_bridge!(state, pid)
+        close_eval_hosts!(state, pid)
+    end
+    notify_workers!(state)
+    # NOT notify_chats!: the chats are kept, so the active-chats list is
+    # unchanged; they render offline until the worker returns.
+    release_projects_for_worker!(state, worker_id)
+    @info "Worker gone (chats kept for its return)" worker_id
+    return true
 end
 
 """
@@ -804,22 +661,23 @@ end
 """
     remove_worker!(state, worker_id; remove_projects=true)
 
-Forget a worker: drop it from `state.workers`, close and discard its
-control WebSocket, and evict any cached `ChatModel`s for its projects. By
-default its projects are also removed from the list (their server-side
-chat history under `state_dir/chats/<id>/` is left on disk, so a later
-re-import can still find it).
+Forget a worker: drop it from `state.workers`, kill its link, and evict any
+cached `ChatModel`s for its projects. By default its projects are also removed
+from the list (their server-side chat history under `state_dir/chats/<id>/` is
+left on disk, so a later re-import can still find it).
 
-A worker whose process is still running will dial `/worker-ws` again and
-re-register itself, so removal primarily targets decommissioned (offline)
-workers; closing the control WS here just hangs up the current link.
+A worker whose process is still running dials again and re-registers itself
+(on a new link: the old one is dead), so removal primarily targets
+decommissioned (offline) workers.
 """
 function remove_worker!(state::ServerState, worker_id::AbstractString;
                          remove_projects::Bool = true)
     wid = String(worker_id)
-    ws, dropped, evicted, affected = lock(state.lock) do
-        sock = get(state.worker_control_ws, wid, nothing)
-        delete!(state.worker_control_ws, wid)
+    link, dropped, evicted, affected = lock(state.lock) do
+        # Out of the table BEFORE the kill below, so its `:dead` handler finds
+        # it replaced and leaves the teardown to this function.
+        l = get(state.worker_links, wid, nothing)
+        delete!(state.worker_links, wid)
         delete!(state.workers[], wid)
         dropped  = String[]
         evicted  = ChatModel[]
@@ -843,10 +701,10 @@ function remove_worker!(state::ServerState, worker_id::AbstractString;
         end
         save_workers!(state)
         remove_projects && save_projects!(state)
-        (sock, dropped, evicted, affected)
+        (l, dropped, evicted, affected)
     end
     # Close evicted models so their consumer + background poller don't leak (see
-    # teardown_worker_control!). Outside the lock — close()/stop! signal tasks.
+    # teardown_worker!). Outside the lock — close()/stop! signal tasks.
     for m in evicted
         try; close(m); stop!(m.agent); catch e
             @warn "evicting chat model on worker removal" exception=e
@@ -859,16 +717,7 @@ function remove_worker!(state::ServerState, worker_id::AbstractString;
     for pid in affected
         teardown_eval_bridge!(state, pid)
     end
-    # Close the control WS outside the lock — it's network I/O, and closing it
-    # ends the worker's `handle_worker_control` receive loop (its `finally`
-    # teardown is idempotent against the eviction we just did).
-    if ws !== nothing
-        try
-            close(ws)
-        catch e
-            @debug "remove_worker!: closing control WS failed" exception=e
-        end
-    end
+    link === nothing || WorkerLink.kill!(link, "worker removed")
     notify_workers!(state)
     remove_projects && notify_projects!(state)
     notify_chats!(state)        # evicted chats drop out of the active-chats sidebar
@@ -876,85 +725,65 @@ function remove_worker!(state::ServerState, worker_id::AbstractString;
     return nothing
 end
 
-# Handler for /transfer-ws — one invocation per directional RemoteSync transfer.
-# Worker (from inside its Malt subprocess) dials this in response to an
-# `open_transfer` command on the control WS. We hand the live WS to the
-# orchestrator task that called sync_dir_to_worker!/sync_dir_from_worker!.
-function handle_transfer_ws(state::ServerState, ws)
-    handle_handoff_ws(state, ws, "sync_id"; close_on_exit = false)
+"""
+    close_worker_links!(state)
+
+End every worker link, for a server that is shutting down. A link's tasks run
+until it dies, and a detached one would otherwise wait out its grace period.
+"""
+function close_worker_links!(state::ServerState)
+    links = lock(() -> collect(values(state.worker_links)), state.lock)
+    foreach(link -> WorkerLink.kill!(link, "server shutting down"), links)
+    return nothing
 end
 
-# Handler for /worker-acp — one invocation per ACP session.
-function handle_worker_acp(state::ServerState, ws)
-    handle_handoff_ws(state, ws, "sid"; close_on_exit = false)
-end
+"""
+    open_worker_channel(state, worker_id, header; priority, timeout = 30) -> LinkChannel
 
-# Shared handoff: auth on the first frame (`{secret, <id_field>}`), look up
-# the matching pending RPC channel by the id, ack with `{ok:true}`, hand the
-# live WS to the waiting orchestrator task, then block until close so Bonito
-# doesn't tear the connection down underneath us.
-function handle_handoff_ws(state::ServerState, ws, id_field::AbstractString;
-                            close_on_exit::Bool = false)
-    auth_raw = WebSockets.receive(ws)
-    auth = JSON.parse(String(auth_raw))
-    if get(auth, "secret", "") != state.worker_secret
-        send_ws_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
-        return
+A channel to the worker for one agent session or one file transfer. `header` is
+the request; its `kind` says which. The worker answers `{ok: true}` once it is
+ready, or aborts the channel with the reason it can't, which is thrown here.
+Lower `priority` goes first on the shared connection; the control channel is 0.
+"""
+function open_worker_channel(state::ServerState, worker_id::AbstractString,
+                             header::AbstractDict; priority::Int, timeout::Real = 30.0)
+    what = "$(header["kind"]) on '$(worker_id)'"
+    ch = WorkerLink.open_channel(connected_link(state, worker_id), MsgPack.pack(header); priority)
+    timed_out = Threads.Atomic{Bool}(false)
+    timer = Timer(timeout) do _
+        timed_out[] = true
+        WorkerLink.abort(ch, "no answer within $(timeout)s")
     end
-    id = String(get(auth, id_field, ""))
-    if isempty(id)
-        send_ws_error(ws, Dict("ok"=>false, "error"=>"missing $id_field"))
-        return
-    end
-    # Atomic take-if-present under `state.lock` (T3). `haskey` then `pop!`
-    # unlocked raced the timeout task in `take_pending!` (which deletes the same
-    # key under the lock): the bare `pop!` could KeyError mid-handshake, or two
-    # paths could both think they own the channel. One locked pop decides the
-    # winner.
-    ch = lock(state.lock) do
-        haskey(state.pending_rpcs, id) ? pop!(state.pending_rpcs, id) : nothing
-    end
-    if ch === nothing
-        send_ws_error(ws, Dict("ok"=>false,
-                               "error"=>"unknown or expired $id_field"))
-        return
-    end
-    # Ack first (the worker waits for `{ok:true}` before it starts streaming),
-    # then hand the live WS to the waiting orchestrator. The caller may have
-    # already given up (closed the channel) between our pop and this put! — same
-    # race `take_pending!` handles. If nobody consumed the WS, close it so we
-    # don't leak a socket + this handler task parked in the sleep loop forever.
-    WebSockets.send(ws, JSON.json(Dict("ok" => true)))
-    delivered = try
-        put!(ch, ws)
-        true
+    unreachable() = WorkerUnreachableError(what,
+        "timed out after $(timeout)s — worker may be offline or stuck")
+    reply = try
+        WebSockets.receive(ch)
     catch e
-        e isa InvalidStateException || rethrow()
-        false
+        e isa WebSockets.WebSocketError || rethrow()
+        timed_out[] && throw(unreachable())
+        reason = e.message.reason
+        error("$(what) failed: $(isempty(reason) ? "the worker closed the channel" : reason)")
+    finally
+        close(timer)
     end
-    if !delivered
-        close_ws_safe(ws)
-        return
+    timed_out[] && throw(unreachable())      # the answer and the timer crossed
+    if get(decode_control(reply), "ok", false) !== true
+        WorkerLink.abort(ch, "unexpected answer")
+        error("$(what): unexpected answer from the worker")
     end
-
-    while !WebSockets.isclosed(ws)
-        sleep(1)
-    end
-    close_on_exit && close_ws_safe(ws)
+    return ch
 end
 
-# File transport over WS
+# A RemoteSync transfer's channel. Bulk data: the lowest priority, so control
+# traffic and agent sessions never wait behind it.
+transfer_channel(state::ServerState, worker_id::AbstractString, header::AbstractDict;
+                 timeout::Real) =
+    open_worker_channel(state, worker_id, merge(Dict{String,Any}("kind" => "transfer"), header);
+                        priority = 3, timeout)
 
-# RemoteSync transfer (librsync-based, IO-streamed over /transfer-ws).
-# Both directions share the same orchestration: we generate a sync_id, tell
-# the worker to dial in (the worker side spawns its own Malt subprocess so
-# the librsync work doesn't pin the worker's ACP relay loop), wait for the
-# WS handoff, then run the matching RemoteSync side here in a Task.
-#
-# The server side runs in-process (Task) rather than its own subprocess: the
-# work is interleaved with WS reads/writes (which yield) and per-file IO
-# (which yields), so the main task's heartbeat loop stays responsive even on
-# multi-GB transfers.
+# File transport: RemoteSync (librsync) over a transfer channel. The worker
+# runs its side in its own task; the server's runs here in the caller's task,
+# interleaved with channel reads/writes and file IO that both yield.
 
 """
     sync_dir_to_worker!(worker_name, src, dst; on_progress=nothing, quick_check=true)
@@ -975,35 +804,17 @@ function sync_dir_to_worker!(state::ServerState, worker_name::String,
                               on_progress = nothing,
                               quick_check::Bool = true)
     isdir(src) || error("Source path is not a directory: $src")
-    haskey(state.worker_control_ws, worker_name) ||
-        error("Worker '$worker_name' is not connected")
-
-    sync_id, ch = register_rpc!(state)
-
-    # try/finally so a throw in `send_command` (worker hung up between the
-    # haskey check and the send) doesn't leak the pending registration (T10).
-    # On the success path the handoff already popped the key, so this is a no-op.
-    ws = try
-        notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
-        send_command(state, worker_name, Dict(
-            "type"        => "open_transfer",
-            "sync_id"     => sync_id,
-            "direction"   => "to_worker",
-            "dst_path"    => dst,
-            "quick_check" => quick_check,
-        ))
-        take_pending!(state, ch, sync_id, handoff_timeout,
-                      "sync to '$worker_name'")
-    finally
-        unregister_rpc!(state, sync_id)
-    end
+    notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
+    ch = transfer_channel(state, worker_name, Dict(
+        "direction"   => "to_worker",
+        "dst_path"    => dst,
+        "quick_check" => quick_check); timeout = handoff_timeout)
     try
         notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
-        wsio = RemoteSync.WebSocketIO(ws)
-        RemoteSync.send_directory(src, wsio; on_progress = on_progress)
+        RemoteSync.send_directory(src, RemoteSync.WebSocketIO(ch); on_progress = on_progress)
         notify_progress(on_progress, :phase, (msg = "Done",))
     finally
-        close_ws_safe(ws)
+        close(ch)
     end
     return nothing
 end
@@ -1020,38 +831,22 @@ function sync_dir_from_worker!(state::ServerState, worker_name::String,
                                 handoff_timeout::Real = 30.0,
                                 on_progress = nothing,
                                 quick_check::Bool = true)
-    haskey(state.worker_control_ws, worker_name) ||
-        error("Worker '$worker_name' is not connected")
     mkpath(dst)
-
-    sync_id, ch = register_rpc!(state)
-
-    # try/finally to avoid leaking the pending registration on a send failure (T10).
-    ws = try
-        notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
-        send_command(state, worker_name, Dict(
-            "type"      => "open_transfer",
-            "sync_id"   => sync_id,
-            "direction" => "from_worker",
-            "src_path"  => src,
-        ))
-        take_pending!(state, ch, sync_id, handoff_timeout,
-                      "sync from '$worker_name'")
-    finally
-        unregister_rpc!(state, sync_id)
-    end
+    notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
+    ch = transfer_channel(state, worker_name, Dict(
+        "direction" => "from_worker",
+        "src_path"  => src); timeout = handoff_timeout)
     try
         notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
-        wsio = RemoteSync.WebSocketIO(ws)
         # The server's mirror tracks the worker, deletions included: this is the
         # ONE receiver that mirrors, and the folder is the server's own. The
         # receiver still refuses to empty a populated mirror for an empty worker
         # folder.
-        RemoteSync.receive_directory(dst, wsio; on_progress = on_progress,
+        RemoteSync.receive_directory(dst, RemoteSync.WebSocketIO(ch); on_progress = on_progress,
                                      quick_check = quick_check, delete_extraneous = true)
         notify_progress(on_progress, :phase, (msg = "Done",))
     finally
-        close_ws_safe(ws)
+        close(ch)
     end
     return nothing
 end
@@ -1074,7 +869,7 @@ entries is a Vector of NamedTuple (name, dir).
 """
 function list_worker_dir(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1106,7 +901,7 @@ exist yet. The worker rejects anything but a single path segment.
 function make_worker_dir(state::ServerState, worker_name::String,
                           parent::AbstractString, name::AbstractString;
                           timeout::Real = 5.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1137,7 +932,7 @@ exists as a non-directory (the worker refuses).
 """
 function ensure_worker_dir(state::ServerState, worker_name::String,
                            path::AbstractString; timeout::Real = 5.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1167,7 +962,7 @@ or the RPC errors.
 """
 function stat_worker_path(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         throw(WorkerUnreachableError("stat_path on '$worker_name'", "worker is not connected"))
 
     rid, ch = register_rpc!(state)
@@ -1220,7 +1015,7 @@ file index. `timeout` is generous: a first scan of a large tree can take seconds
 """
 function list_worker_project_files(state::ServerState, worker_name::String,
                                    root::AbstractString; timeout::Real = 20.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1316,7 +1111,7 @@ Returned dict shape:
 function inspect_worker_path(state::ServerState, worker_name::String,
                               path::AbstractString;
                               timeout::Real = 30.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1343,7 +1138,7 @@ end
 function tail_worker_file(state::ServerState, worker_id::AbstractString,
                            path::AbstractString; offset::Int = 0,
                            max_bytes::Int = 65536, timeout::Real = 15.0)
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         error("Worker '$worker_id' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1371,7 +1166,7 @@ end
 # returned, not thrown, so the caller can still finalize the UI.
 function kill_worker_file_writers(state::ServerState, worker_id::AbstractString,
                                    path::AbstractString; timeout::Real = 10.0)
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         error("Worker '$worker_id' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1393,7 +1188,7 @@ end
 # that would delete a perfectly valid project.
 function worker_path_missing(state::ServerState, worker_id::AbstractString,
                               path::AbstractString)::Bool
-    haskey(state.worker_control_ws, worker_id) || return false
+    worker_connected(state, worker_id) || return false
     try
         inspect_worker_path(state, worker_id, path; timeout = 10.0)
         return false                       # path exists
@@ -1443,7 +1238,7 @@ replies or `timeout` seconds elapse.
 """
 function scan_worker_sessions(state::ServerState, worker_name::String;
                                 timeout::Real = 15.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1567,7 +1362,7 @@ function clone_repo_on_worker(state::ServerState, worker_name::String,
                                 url::AbstractString, dst_path::AbstractString;
                                 pr_number::Union{Integer,Nothing} = nothing,
                                 timeout::Real = 120.0)
-    haskey(state.worker_control_ws, worker_name) ||
+    worker_connected(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
 
@@ -1600,7 +1395,7 @@ picture — the server knows what it *asked* the worker to do, this is what the
 worker actually has.
 """
 function worker_state(state::ServerState, worker_id::AbstractString; timeout::Real = 15.0)
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         throw(WorkerUnreachableError("worker_state on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1632,7 +1427,7 @@ end
 # arrives, so the button's feedback is the worker's real state, not a banner.
 function force_worker_update!(state::ServerState, worker_id::AbstractString)
     wid = String(worker_id)
-    haskey(state.worker_control_ws, wid) ||
+    worker_connected(state, wid) ||
         throw(WorkerUnreachableError("force update", "worker is not connected"))
     worker_turn_in_flight(state, wid) &&
         throw(ArgumentError("a chat on this worker is mid-turn; let it finish or stop it, then update"))
@@ -1692,7 +1487,7 @@ function worker_log(state::ServerState, worker_id::AbstractString;
                         lines::Integer = 200, since::AbstractString = "",
                         until::AbstractString = "", grep::AbstractString = "",
                         timeout::Real = 45.0)
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         throw(WorkerUnreachableError("worker_log on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1724,7 +1519,7 @@ a repeat call finds the checkout in place and returns in seconds.
 function debug_checkout_on_worker(state::ServerState, worker_id::AbstractString;
                                   repo::AbstractString, rev::AbstractString,
                                   packages::Vector{String}, timeout::Real = 900.0)
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         throw(WorkerUnreachableError("debug_checkout on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1751,7 +1546,7 @@ end
 function worker_rpc(state::ServerState, worker_id::AbstractString, kind::AbstractString,
                     fields::AbstractDict; timeout::Real)
     what = "$(kind) on '$(worker_id)'"
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         throw(WorkerUnreachableError(what, "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1866,7 +1661,7 @@ can take a while.
 function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
                             path::AbstractString; base::AbstractString = "",
                             timeout::Real = 60.0)
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         throw(WorkerUnreachableError("git_diff on '$worker_id'", "worker is not connected"))
     # Chunked reply, not one-frame: the patch runs to tens of MB on a busy
     # repo, and a single giant frame stalls BOTH sides (the worker's send holds
@@ -1911,7 +1706,7 @@ thing the user asked for against the thing they can already do.
 function find_repos_on_worker(state::ServerState, worker_id::AbstractString,
                               path::AbstractString; max_depth::Int = 4,
                               timeout::Real = 15.0)
-    haskey(state.worker_control_ws, worker_id) ||
+    worker_connected(state, worker_id) ||
         throw(WorkerUnreachableError("find_repos on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1935,8 +1730,8 @@ end
                             handoff_timeout = 15.0, on_progress = nothing)
 
 Stream a single file from the named worker into `dst_path` on the server.
-Reuses the `/transfer-ws` handoff already used by directory sync, but with
-direction `"file_from_worker"` and `RemoteSync.send_file`/`receive_file` for
+A transfer channel like directory sync's, but with direction
+`"file_from_worker"` and `RemoteSync.send_file`/`receive_file` for
 chunked, memory-bounded transfer. No size cap.
 
 Used by the chat UI's bt_show preview renderer when the file isn't in
@@ -1948,28 +1743,13 @@ function fetch_file_from_worker(state::ServerState, worker_name::String,
                                   dst_path::AbstractString;
                                   handoff_timeout::Real = 15.0,
                                   on_progress = nothing)
-    haskey(state.worker_control_ws, worker_name) ||
-        error("Worker '$worker_name' is not connected")
-
-    sync_id, ch = register_rpc!(state)
-
-    ws = try
-        send_command(state, worker_name, Dict(
-            "type"      => "open_transfer",
-            "sync_id"   => sync_id,
-            "direction" => "file_from_worker",
-            "src_path"  => String(src_path),
-        ))
-        take_pending!(state, ch, sync_id, handoff_timeout,
-                      "fetch_file from '$worker_name'")
-    finally
-        unregister_rpc!(state, sync_id)   # T10
-    end
+    ch = transfer_channel(state, worker_name, Dict(
+        "direction" => "file_from_worker",
+        "src_path"  => String(src_path)); timeout = handoff_timeout)
     try
-        wsio = RemoteSync.WebSocketIO(ws)
-        RemoteSync.receive_file(String(dst_path), wsio; on_progress)
+        RemoteSync.receive_file(String(dst_path), RemoteSync.WebSocketIO(ch); on_progress)
     finally
-        close_ws_safe(ws)
+        close(ch)
     end
     return String(dst_path)
 end
@@ -1994,31 +1774,17 @@ function send_file_to_worker!(state::ServerState, worker_name::String,
                                 handoff_timeout::Real = 15.0,
                                 on_progress = nothing)
     isfile(src_path) || error("Source path is not a file: $src_path")
-    haskey(state.worker_control_ws, worker_name) ||
-        error("Worker '$worker_name' is not connected")
-
-    sync_id, ch = register_rpc!(state)
-
-    ws = try
-        send_command(state, worker_name, Dict(
-            "type"      => "open_transfer",
-            "sync_id"   => sync_id,
-            "direction" => "file_to_worker",
-            "dst_path"  => String(dst_path),
-        ))
-        take_pending!(state, ch, sync_id, handoff_timeout,
-                      "send_file to '$worker_name'")
-    finally
-        unregister_rpc!(state, sync_id)   # T10
-    end
+    ch = transfer_channel(state, worker_name, Dict(
+        "direction" => "file_to_worker",
+        "dst_path"  => String(dst_path)); timeout = handoff_timeout)
     try
-        wsio = RemoteSync.WebSocketIO(ws)
+        wsio = RemoteSync.WebSocketIO(ch)
         RemoteSync.send_file(String(src_path), wsio; on_progress)
-        # Wait for the worker (receiver) to drain + close first — closing before
-        # it has the tail truncates the last frame(s) and EOFs its receive_file.
+        # The worker closes once the file is on its disk: returning after that
+        # means the file is there.
         RemoteSync.wait_peer_close(wsio)
     finally
-        close_ws_safe(ws)
+        close(ch)
     end
     return String(dst_path)
 end

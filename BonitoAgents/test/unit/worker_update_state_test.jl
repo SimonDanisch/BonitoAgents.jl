@@ -3,7 +3,7 @@
 # old rule `auto_update && spec differs` showed exactly that worker as current
 # and green (the Laptop worker, 2026-09-15). The decision is a pure function of
 # the hello frame so it can be pinned here without a websocket.
-@testitem "unit:worker_update_state" tags = [:unit] begin
+@testitem "unit:worker_update_state" tags = [:unit] setup = [LinkPair] begin
     import BonitoAgents
     const BT = BonitoAgents
     using Test
@@ -57,7 +57,8 @@
     model = BT.ChatModel(state, cwd; project_id = "proj", agent = BT.WorkerAgent(state, "w1", "/p"))
     state.chat_models["proj"] = model
     @test_throws BT.WorkerUnreachableError BT.force_worker_update!(state, "w1")  # not connected
-    state.worker_control_ws["w1"] = nothing
+    server_link, worker_link = link_pair()
+    state.worker_links["w1"] = server_link
     @test !BT.worker_turn_in_flight(state, "w1")
     model.busy_active[] = true
     @test BT.worker_turn_in_flight(state, "w1")
@@ -84,4 +85,6 @@
     @test_logs (:warn, r"unknown status") match_mode=:any (@test !BT.apply_update_status!(state, "w1", Dict{String,Any}("status" => "dancing")))
     @test w.update_state === :reinstall              # unknown status changes nothing
     @test !BT.apply_update_status!(state, "nobody", Dict{String,Any}("status" => "installing"))
+    BT.close_worker_links!(state)
+    BT.WorkerLink.kill!(worker_link, "done")
 end

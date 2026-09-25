@@ -26,6 +26,7 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 StringDistances = "88034a9c-02f8-509d-84a9-84ec65e18404"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+WorkerLink = "03840273-e5e6-4e74-9050-e95881fcd827"
 
 [sources]
 AgentClientProtocol = {path = "../AgentClientProtocol"}
@@ -36,6 +37,7 @@ BonitoMCP = {path = "../BonitoMCP"}
 BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
 BonitoWorker = {path = "../BonitoWorker"}
 RemoteSync = {path = "../RemoteSync"}
+WorkerLink = {path = "../WorkerLink"}
 
 [compat]
 HTTP = "2"

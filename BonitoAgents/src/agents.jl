@@ -5,7 +5,7 @@
 # `find_provider` live in the AgentProviders package — the single source of truth,
 # shared with the worker. This file defines the live agent the SERVER drives:
 # `WorkerAgent`, which asks a registered worker to spawn the chosen provider's
-# binary and drives ACP over the dialed-back WebSocket.
+# binary and drives ACP over a channel of the worker's link.
 #
 # Public surface (the verbs):
 #
@@ -28,11 +28,11 @@ import AgentProviders: AgentProvider, BinAgent,
 replay(::AgentProvider) = ACP.Message[]
 
 # ── WorkerAgent — the worker path as a first-class agent ──────────────────────
-# Instead of spawning a local subprocess, a WorkerAgent asks a registered worker
-# (over its control WS) to spawn the chosen provider's binary and dial back the
-# ACP frames on `/worker-acp`. The `provider` field is the singleton descriptor
-# (a `BinAgent`) the worker should run; `provider_name(provider)` is the string
-# sent over the wire. `client`/`ws`/`replay` are populated by `start!`.
+# Instead of spawning a local subprocess, a WorkerAgent opens a channel to a
+# registered worker, and the worker runs the chosen provider's binary on it: one
+# ACP line per message, both ways. The `provider` field is the singleton
+# descriptor (a `BinAgent`) the worker should run; `provider_name(provider)` is
+# the string sent over the wire. `client`/`ws`/`replay` are populated by `start!`.
 mutable struct WorkerAgent <: AgentProvider
     state              :: ServerState
     worker_id          :: String
@@ -45,7 +45,7 @@ mutable struct WorkerAgent <: AgentProvider
     resume_session_id  :: Union{String,Nothing}
     provider           :: BinAgent                  # which provider the worker spawns
     handler            :: ACP.Handler
-    ws                 :: Ref{Any}                  # the dialed-back ACP WebSocket
+    ws                 :: Ref{Any}                  # the ACP channel (a WorkerLink.LinkChannel)
     client             :: Union{ACP.Client,Nothing}
     replay             :: Vector{ACP.Message}
     # Serialises start!/stop! for THIS agent: a ✕-close (stop_session! → stop!)
@@ -107,14 +107,14 @@ icon(a::WorkerAgent)          = icon(a.provider)
 loads_sessions(::AgentProvider) = false
 loads_sessions(a::WorkerAgent)  = a.loads_sessions
 
-# Share the agent's `ws` Ref so a single socket is the one truth on teardown.
+# Share the agent's `ws` Ref so a single channel is the one truth on teardown.
 # Typed on `WorkerAgent` so it does NOT collide with `ACP.WorkerTransport`'s
 # default `WorkerTransport(::Any)` (the collision broke precompilation).
 ACP.WorkerTransport(a::WorkerAgent) = ACP.WorkerTransport(a.ws)
 
-# The worker's I/O is an `ACP.WorkerTransport` (the dialed-back WS) so the generic
-# ACP `Connection` can drive line-level frames over it. The WorkerAgent owns one;
-# `start!` wires its `ws` Ref to the agent's.
+# The worker's I/O is an `ACP.WorkerTransport` over the session's channel, so the
+# generic ACP `Connection` can drive line-level frames over it. The WorkerAgent
+# owns one; `start!` wires its `ws` Ref to the agent's.
 function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     a.client === nothing || return a       # fast idempotent path
     lock(a.bind_lock)
@@ -122,9 +122,6 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     a.client === nothing || return a       # re-check under the lock
     a.closed && return a                    # stop! already ran: dead agent (a turn buffered
                                             # past close); don't re-bind — a reopen makes a fresh one
-    haskey(a.state.worker_control_ws, a.worker_id) ||
-        error("Worker '$(a.worker_id)' is not connected")
-
     # The chat this session belongs to. NOT cosmetic: the MCP environment (and
     # with it which chat's "Remote julia" / "Dev mode" switches its tools obey)
     # and the system-prompt appendix below are derived from it. This used to be
@@ -134,6 +131,8 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     project_id = a.project_id
     isempty(project_id) &&
         error("agent for $(a.worker_path) on '$(a.worker_id)' was built without its chat's project id")
+    worker_connected(a.state, a.worker_id) ||
+        error("Worker '$(a.worker_id)' is not connected")
 
     # Re-derived on every bring-up, NOT taken from what `a.mcp` was built with.
     # `eval_dialback_env` reads the project's live `dev_mode`, and the appendix
@@ -151,22 +150,16 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     prompt_meta = a.provider isa ClaudeCodeAgent ?
         system_prompt_meta(agents_prompt_appendix(a.state, project_id)) : Dict{String,Any}()
 
-    sid, ch = register_rpc!(a.state)
-    send_command(a.state, a.worker_id, Dict(
-        "type"       => "open_session",
-        "sid"        => sid,
+    # The worker spawns the agent when the channel opens and answers once it
+    # runs; a spawn failure comes back as the reason. The transport shares the
+    # agent's `ws` Ref, so this is also what `stop!` closes.
+    transport = ACP.WorkerTransport(a)
+    a.ws[] = open_worker_channel(a.state, a.worker_id, Dict(
+        "kind"       => "acp",
         "project_id" => project_id,
         "cwd"        => a.worker_path,
-        "env"        => Dict{String,String}(),
         "mcpServers" => mcp_list,
-        "provider"   => pname,
-    ))
-
-    # Bounded wait for the worker's /worker-acp upgrade. The transport shares the
-    # agent's `ws` Ref, so this populates `a.ws[]` too (one socket, one truth).
-    transport = ACP.WorkerTransport(a)
-    a.ws[] = take_pending!(a.state, ch, sid, 30.0,
-                           "open_session on '$(a.worker_id)'")
+        "provider"   => pname); priority = 1)
 
     conn = ACP.Connection(transport, a.handler; on_frame)
     init = ACP.send_request(conn, "initialize", Dict(
@@ -238,20 +231,6 @@ function stop!(a::WorkerAgent; permanent::Bool = false)
         a.client = nothing
         a.replay = ACP.Message[]
         a.ws[] = nothing
-    end
-    # Belt-and-suspenders reap (permanent close only): the acp-ws teardown above
-    # SHOULD make the worker's relay exit and kill the agent subprocess, but a
-    # bind that raced with this close can leave the dial-back ws half-open — the
-    # worker blocks in `receive` and never reaps, orphaning the subprocess. Tell
-    # the worker to kill it explicitly over the reliable control ws (idempotent
-    # with the relay's own kill). Keyed by worker_path = the worker-side cwd.
-    if permanent && haskey(a.state.worker_control_ws, a.worker_id)
-        try
-            send_command(a.state, a.worker_id,
-                         Dict("type" => "close_session", "cwd" => a.worker_path))
-        catch e
-            @debug "WorkerAgent.stop!: close_session send failed" exception = e
-        end
     end
     return a
 end

@@ -7,6 +7,7 @@ BonitoAgents = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
+WorkerLink = "03840273-e5e6-4e74-9050-e95881fcd827"
 
 [sources]
 AgentClientProtocol = {path = "AgentClientProtocol"}
@@ -16,4 +17,5 @@ BonitoMCP = {path = "BonitoMCP"}
 BonitoAgents = {path = "BonitoAgents"}
 BonitoWorker = {path = "BonitoWorker"}
 RemoteSync = {path = "RemoteSync"}
+WorkerLink = {path = "WorkerLink"}
 MsgPack = {url = "https://github.com/JuliaIO/MsgPack.jl", rev = "master"}

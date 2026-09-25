@@ -39,9 +39,9 @@ process. All state lives in `mktempdir()`-allocated directories and is
 removed when you call `close(handle)` (or when the Julia process exits
 — an atexit hook is registered).
 
-The worker is an in-process `BonitoWorker.connect_and_serve` task: it
-dials the server's `/worker-ws` over loopback with a freshly-generated
-secret. No systemd, no install script.
+The worker is a separate `BonitoWorker.start()` process: it dials the
+server's `/w` over loopback with a freshly-generated secret. No systemd, no
+install script.
 
 If `claude-agent-acp` isn't on PATH the dashboard still works (worker
 registration, sidebar, project import, file pickers); only opening a
@@ -68,6 +68,8 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                       agent_env::Dict{String,String}       = Dict{String,String}(),
                       heartbeat_interval::Real             = 15.0,
                       heartbeat_deadline::Real             = 45.0,
+                      worker_link_grace::Real              = 300.0,
+                      scan_on_connect::Bool                = true,
                       dir::Union{String,Nothing}           = nothing)
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
     # writes the real port back to srv.port after start.
@@ -110,7 +112,9 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                     state_dir     = state_dir,
                     working_dir   = working_dir,
                     heartbeat_interval = heartbeat_interval,
-                    heartbeat_deadline = heartbeat_deadline)
+                    heartbeat_deadline = heartbeat_deadline,
+                    worker_link_grace  = worker_link_grace,
+                    scan_on_connect    = scan_on_connect)
     server_url = "http://127.0.0.1:$(state.srv.port)"
 
     # Stand the worker up exactly like a real install: write the SAME
@@ -291,6 +295,7 @@ function Base.close(h::DevHandle)
     # write landed, the dir would reappear holding that one file. The drain
     # completes in well under a second normally; the generous bound only guards
     # a genuinely wedged handler (logged, then we rm anyway).
+    close_worker_links!(h.state)
     close_task = Base.errormonitor(@async close(h.state.srv))
     for _ in 1:200
         istaskdone(close_task) && break

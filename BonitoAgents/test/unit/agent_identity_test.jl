@@ -18,8 +18,7 @@
     @test a.project_id == "new-thread"
 
     # An agent built without its chat cannot start; guessing from the folder is
-    # exactly the bug. The check comes before any dial.
-    state.worker_control_ws["w1"] = nothing
+    # exactly the bug. The check comes first, before the worker is even asked.
     nameless = BT.WorkerAgent(state, "w1", path)
     err = try BT.start!(nameless); nothing catch e; e end
     @test err isa ErrorException
