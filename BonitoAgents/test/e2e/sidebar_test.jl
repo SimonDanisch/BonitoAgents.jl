@@ -266,6 +266,60 @@
             end
         end
 
+        @testset "the rail is resizable, and remembers it" begin
+            # Reported as "one cant even resize the sidebar to get some more
+            # space". The handle is a sibling of the aside (the aside is the
+            # scroll container), writes `--bt-side-w`, and persists it.
+            @test TK.eval_js(server, "!!document.querySelector('.bt-side-resize')") == true
+            w0 = TK.eval_js(server,
+                "Math.round(document.querySelector('.bt-sidebar').getBoundingClientRect().width)")
+            # A real pointer drag: down on the strip, move right, up.
+            TK.eval_js(server, """(() => {
+                const el = document.querySelector('.bt-side-resize');
+                const r = el.getBoundingClientRect();
+                const opt = (x) => ({bubbles: true, cancelable: true, pointerId: 1,
+                                     pointerType: 'mouse', clientX: x,
+                                     clientY: Math.round(r.top + r.height / 2)});
+                el.dispatchEvent(new PointerEvent('pointerdown', opt(Math.round(r.left + 2))));
+                el.dispatchEvent(new PointerEvent('pointermove', opt(Math.round(r.left + 120))));
+                el.dispatchEvent(new PointerEvent('pointerup',   opt(Math.round(r.left + 120))));
+            })()""")
+            @test TK.wait_for(server, "the rail got wider",
+                "document.querySelector('.bt-sidebar').getBoundingClientRect().width > $(w0) + 60";
+                timeout = 10) == true
+            stored = TK.eval_js(server, "localStorage.getItem('bt-sidebar-width')")
+            @test stored !== nothing
+            @test parse(Float64, String(stored)) > w0 + 60
+            # Clamped, not unbounded: a drag past the cap stops at 560.
+            TK.eval_js(server, """(() => {
+                const el = document.querySelector('.bt-side-resize');
+                const r = el.getBoundingClientRect();
+                const opt = (x) => ({bubbles: true, cancelable: true, pointerId: 1,
+                                     pointerType: 'mouse', clientX: x,
+                                     clientY: Math.round(r.top + r.height / 2)});
+                el.dispatchEvent(new PointerEvent('pointerdown', opt(Math.round(r.left + 2))));
+                el.dispatchEvent(new PointerEvent('pointermove', opt(4000)));
+                el.dispatchEvent(new PointerEvent('pointerup',   opt(4000)));
+            })()""")
+            @test TK.wait_for(server, "width clamps at the cap",
+                "document.querySelector('.bt-sidebar').style.getPropertyValue('--bt-side-w') === '560px'";
+                timeout = 10) == true
+            # Double-click resets to the breakpoint default.
+            TK.eval_js(server, "document.querySelector('.bt-side-resize').dispatchEvent(new MouseEvent('dblclick', {bubbles: true})); true")
+            @test TK.wait_for(server, "reset to the default width",
+                "!document.querySelector('.bt-sidebar').style.getPropertyValue('--bt-side-w') && " *
+                "Math.abs(document.querySelector('.bt-sidebar').getBoundingClientRect().width - $(w0)) <= 2";
+                timeout = 10) == true
+            @test TK.eval_js(server, "localStorage.getItem('bt-sidebar-width')") === nothing
+            # The collapsed rail has nothing to resize — the handle goes away.
+            TK.eval_js(server, "document.querySelector('.bt-side-collapse').click(); true")
+            @test TK.wait_for(server, "handle hidden in the icon rail",
+                "document.querySelector('.bt-side-resize').offsetParent === null"; timeout = 10) == true
+            TK.eval_js(server, "document.querySelector('.bt-side-collapse').click(); true")
+            @test TK.wait_for(server, "handle back",
+                "document.querySelector('.bt-side-resize').offsetParent !== null"; timeout = 10) == true
+        end
+
         @testset "✕ closes a chat" begin
             before = TK.eval_js(server, "document.querySelectorAll($(repr(ITEMS))).length")
             TK.eval_js(server, "document.querySelector($(repr(ITEMS)) + ' .bt-side-close').click(); true")

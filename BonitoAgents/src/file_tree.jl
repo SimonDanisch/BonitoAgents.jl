@@ -142,10 +142,23 @@ function tree_file_row(path, name, depth)
         dataPath = path, dataDir = "false")
 end
 
+# The containing dir as a search hit shows it: the LAST two segments, with a
+# leading `…/` when anything was dropped.
+#
+# The head of the path is the part every hit shares — it is the tail that tells
+# them apart — and in a 200px rail the head is also what eats the row. The full
+# relative path is still on the row's `title`.
+function search_dir_label(dir::AbstractString)
+    isempty(dir) && return ""
+    parts = splitpath(String(dir))
+    length(parts) <= 2 && return dir
+    return "…/" * join(parts[(end - 1):end], "/")
+end
+
 # A search hit: basename prominent, the containing dir muted after it.
 function tree_search_row(worker_root, rel)
     full = joinpath(worker_root, rel)
-    dir  = dirname(rel)
+    dir  = search_dir_label(dirname(rel))
     DOM.div(
         DOM.span(basename(rel); class = "bt-tree-label"),
         isempty(dir) ? DOM.span("") : DOM.span(dir; class = "bt-tree-relpath"),

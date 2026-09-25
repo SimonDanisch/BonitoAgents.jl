@@ -547,6 +547,12 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         });
         // Restore the collapsed/expanded sidebar state from a previous visit.
         try { if ((localStorage.getItem('bt-sidebar-collapsed') || '0') === '1') el.classList.add('bt-collapsed'); } catch (_) {}
+        // ...and the width the user dragged it to (see `.bt-side-resize`). Out
+        // of range or unparseable ⇒ leave the per-breakpoint default alone.
+        try {
+            const w = parseFloat(localStorage.getItem('bt-sidebar-width') || '');
+            if (w >= 150 && w <= 560) el.style.setProperty('--bt-side-w', Math.round(w) + 'px');
+        } catch (_) {}
         // Restore last route on fresh sessions (when soft_close didn't catch us).
         const saved = localStorage.getItem(LAST_PID_KEY) || '';
         const sep = saved.indexOf('|');
@@ -611,7 +617,11 @@ const SidebarStyles = Bonito.Styles(
         # monitors the sidebar pinned to viewport-left while the centered
         # main panel floated far away — visually disconnecting them. Inside
         # the shell flexbox, it sits flush against the main column.
-        "width" => "200px", "flex-shrink" => "0",
+        # `--bt-side-w` is written by the drag handle (`.bt-side-resize`) and
+        # restored from localStorage on load; unset, each breakpoint keeps its
+        # own default. A custom property, not an inline `width`, so the
+        # collapsed and mobile rules below still win outright.
+        "width" => "var(--bt-side-w, 200px)", "flex-shrink" => "0",
         "background" => "var(--bt-surface)",
         "border-right" => "1px solid var(--bt-border)",
         "overflow-y" => "auto", "overflow-x" => "hidden",
@@ -624,9 +634,9 @@ const SidebarStyles = Bonito.Styles(
     # where the space is free. Widen in two steps; the collapsed rail and the
     # narrow-screen rules below still win (they come later in the sheet).
     CSS("@media (min-width: 1600px)",
-        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "260px")),
+        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "var(--bt-side-w, 260px)")),
     CSS("@media (min-width: 2000px)",
-        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "320px")),
+        CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "var(--bt-side-w, 320px)")),
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
     # Header rail: holds the VSCode-style sidebar toggle. Right-aligned when
@@ -645,6 +655,16 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-collapse:hover",
         "background" => "var(--bt-surface-2)", "color" => "var(--bt-text)"),
     CSS(".bt-sidebar.bt-collapsed", "width" => "56px"),
+    # Drag handle, a flex child of `.bt-shell` between the sidebar and the
+    # stage. NOT a child of the aside: the aside is the scroll container, so
+    # anything inside it scrolls away from the edge it is supposed to grab.
+    CSS(".bt-side-resize",
+        "flex" => "0 0 5px", "align-self" => "stretch", "cursor" => "col-resize",
+        "background" => "transparent", "transition" => "background 100ms"),
+    CSS(".bt-side-resize:hover, .bt-side-resize.bt-side-resize-active",
+        "background" => "var(--bt-accent)"),
+    # Nothing to resize in the icon rail.
+    CSS(".bt-sidebar.bt-collapsed + .bt-side-resize", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-name", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-item", "justify-content" => "center"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-section", "display" => "none"),
@@ -849,9 +869,18 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-tree-arrow",
         "flex" => "0 0 auto", "width" => "10px", "font-size" => "8px",
         "color" => "var(--bt-text-muted)", "text-align" => "center"),
-    CSS(".bt-tree-label", "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    # Shrink weights, and they are the whole fix for "search hits are
+    # unreadable". Flexbox shrinks items in PROPORTION to their content width,
+    # so a 40-char directory kept most of the row while the 9-char filename next
+    # to it collapsed to "z…" — backwards, since the filename is what you
+    # searched for. A shrink factor of 1 against 9999 means the path gives up
+    # all of its width before the name gives up any.
+    CSS(".bt-tree-label",
+        "flex" => "0 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis"),
     CSS(".bt-tree-dir > .bt-tree-label", "font-weight" => "500"),
     CSS(".bt-tree-relpath",
+        "flex" => "0 9999 auto", "min-width" => "0",
         "margin-left" => "6px", "font-size" => "11px", "color" => "var(--bt-text-muted)",
         "overflow" => "hidden", "text-overflow" => "ellipsis"),
     # ⤓ download affordance: right-anchored, revealed on row hover.
@@ -871,6 +900,7 @@ const SidebarStyles = Bonito.Styles(
     # Mobile: collapse to icon-only sidebar.
     CSS("@media (max-width: 640px)",
         CSS(".bt-sidebar",  "width" => "56px"),
+        CSS(".bt-side-resize", "display" => "none"),
         CSS(".bt-side-name", "display" => "none"),
         CSS(".bt-side-item", "justify-content" => "center"),
         # `RUNNING ON WORKER` is ~68px wide at the chosen font/letter-spacing
@@ -1445,6 +1475,65 @@ function favicon_onload(session::Bonito.Session, node)
 end
 
 """
+    side_resizer(session) → DOM
+
+The sidebar's drag handle: a 5px column between the sidebar and the stage that
+sets `--bt-side-w` on the aside while you drag, and remembers it. Double-click
+resets to the breakpoint default.
+
+It is a sibling of the aside, not a child, because the aside is the scroll
+container — a handle inside it scrolls away from the edge it exists to grab.
+Pure JS + one custom property: resizing a rail must not cost a server round-trip
+per pointermove.
+"""
+function side_resizer(session::Bonito.Session)
+    el = DOM.div(""; class = "bt-side-resize",
+                 title = "Drag to resize · double-click to reset")
+    Bonito.onload(session, el, js"""(el) => {
+        const aside = el.closest('.bt-shell')?.querySelector('.bt-sidebar');
+        if (!aside) return;
+        const MIN = 150, MAX = 560;
+        let dragging = false;
+        const apply = (w) => aside.style.setProperty('--bt-side-w', Math.round(w) + 'px');
+        el.addEventListener('pointerdown', (e) => {
+            if (aside.classList.contains('bt-collapsed')) return;
+            dragging = true;
+            // Capture so the drag survives the pointer leaving the 5px strip —
+            // which it does immediately, since the strip moves with the edge.
+            try { el.setPointerCapture(e.pointerId); } catch (_) {}
+            el.classList.add('bt-side-resize-active');
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        });
+        el.addEventListener('pointermove', (e) => {
+            if (!dragging) return;
+            const left = aside.getBoundingClientRect().left;
+            apply(Math.min(MAX, Math.max(MIN, e.clientX - left)));
+        });
+        const end = (e) => {
+            if (!dragging) return;
+            dragging = false;
+            try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+            el.classList.remove('bt-side-resize-active');
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            const w = parseFloat(aside.style.getPropertyValue('--bt-side-w'));
+            try {
+                if (w >= MIN && w <= MAX) localStorage.setItem('bt-sidebar-width', String(Math.round(w)));
+            } catch (_) {}
+        };
+        el.addEventListener('pointerup', end);
+        el.addEventListener('pointercancel', end);
+        el.addEventListener('dblclick', () => {
+            aside.style.removeProperty('--bt-side-w');
+            try { localStorage.removeItem('bt-sidebar-width'); } catch (_) {}
+        });
+    }""")
+    return el
+end
+
+"""
     unified_app(state) → Bonito.App
 
 Single-page app: sidebar on the left, dashboard or chat in the main area
@@ -1494,6 +1583,9 @@ function unified_app(state::ServerState)
             WorkspaceStageStyles,
             connection_guard(session),
             sidebar,
+            # Adjacent sibling on purpose: `.bt-sidebar.bt-collapsed + .bt-side-resize`
+            # hides the handle for the icon rail.
+            side_resizer(session),
             stage,
             # The window's ONE progress card (position:fixed, top-centered).
             # Every long-running operation and every outcome in this window

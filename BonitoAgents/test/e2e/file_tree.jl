@@ -34,6 +34,10 @@ write(joinpath(CWD, "huge.txt"),              repeat("a", 3_000_000))  # > the 2
 # query only matches as a scattered subsequence — the exact one must rank first.
 mkpath(joinpath(CWD, "pkg"));        write(joinpath(CWD, "pkg", "zebra.jl"),          "module Zebra end\n")
 mkpath(joinpath(CWD, "z", "e", "b")); write(joinpath(CWD, "z", "e", "b", "rare_animal.jl"), "# z-e-b-r-a subsequence noise\n")
+# Readability fixture: a hit whose containing directory is far longer than its
+# filename — reported as rows rendering "z…" next to a full-width path.
+const DEEPDIR = joinpath("dev", "JuliaVision", ".venv-rocm", "lib", "python3.11", "site-packages")
+mkpath(joinpath(CWD, DEEPDIR)); write(joinpath(CWD, DEEPDIR, "demos.zip"), "PK\x03\x04 not really a zip")
 
 labels(sel) = "[...document.querySelectorAll('$(sel)')].map(e => e.textContent)"
 row_for(name) = "[...document.querySelectorAll('.bt-tree-row')].find(r => r.querySelector('.bt-tree-label')?.textContent === $(TK.json(name)))"
@@ -69,13 +73,45 @@ function run_suite(server)
             # Dirs first (alpha), then files (case-insensitive alpha):
             # pkg/src/test/z, then blob.bin/huge.txt/Project.toml.
             @test TK.eval_js(server, labels(".bt-side-tree-wrap .bt-tree-row .bt-tree-label")) ==
-                  ["pkg", "src", "test", "z", "blob.bin", "huge.txt", "Project.toml"]
+                  ["dev", "pkg", "src", "test", "z", "blob.bin", "huge.txt", "Project.toml"]
         end
 
         @testset "expanding a directory lazy-loads its children" begin
             TK.eval_js(server, "$(row_for("src"))?.click(); true")
             @test TK.wait_for(server, "src expanded shows main.jl",
                 "[...document.querySelectorAll('.bt-tree-label')].some(e => e.textContent === 'main.jl')"; timeout = 24) == true
+        end
+
+        @testset "a deep hit keeps its FILENAME readable" begin
+            # Flexbox shrinks items in proportion to their content, so the long
+            # directory used to keep the row and the filename you searched for
+            # collapsed to an ellipsis. The name must never be the clipped one,
+            # and the path is trimmed to its tail (`…/python3.11/site-packages`)
+            # server-side so the head can't eat the rail either.
+            TK.eval_js(server, """(() => { const s = document.querySelector('.bt-tree-search');
+                s.value = 'demos.zip'; s.dispatchEvent(new Event('input', {bubbles: true})); })()""")
+            @test TK.wait_for(server, "search finds demos.zip",
+                "[...document.querySelectorAll('.bt-tree-label')].some(e => e.textContent === 'demos.zip')";
+                timeout = 24) == true
+            probe = TK.eval_js(server, """(() => {
+                const row = [...document.querySelectorAll('.bt-tree-row')]
+                    .find(r => r.querySelector('.bt-tree-label')?.textContent === 'demos.zip');
+                if (!row) return null;
+                const name = row.querySelector('.bt-tree-label');
+                const path = row.querySelector('.bt-tree-relpath');
+                return { name: name.textContent,
+                         path: path ? path.textContent : '',
+                         nameClipped: name.scrollWidth > name.clientWidth + 1,
+                         nameWidth:   Math.round(name.getBoundingClientRect().width),
+                         title:       row.getAttribute('title') || '' };
+            })()""")
+            @test probe !== nothing
+            @test probe["nameClipped"] == false            # the filename is whole
+            @test Int(probe["nameWidth"]) > 40             # ...and actually laid out
+            @test startswith(probe["path"], "…/")          # head dropped
+            @test endswith(probe["path"], "site-packages") # tail kept
+            @test occursin("demos.zip", probe["title"])    # full path still on hover
+            TK.screenshot(server, joinpath(tempdir(), "file_tree_deep_hit.png"))
         end
 
         @testset "search fuzzy-filters the project file index" begin
