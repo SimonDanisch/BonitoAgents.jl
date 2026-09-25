@@ -1,0 +1,11 @@
+name = "WorkerLink"
+uuid = "03840273-e5e6-4e74-9050-e95881fcd827"
+version = "0.1.0"
+authors = ["Simon Danisch <sdanisch@gmail.com>"]
+
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+
+[compat]
+HTTP = "2"
+julia = "1.10"
