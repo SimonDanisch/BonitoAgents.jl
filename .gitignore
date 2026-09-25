@@ -11,3 +11,7 @@ Manifest.toml
 
 # AppBundler local build output (CI uploads it as an artifact)
 build/
+
+# bt_julia_eval rich-output files (PNG/SVG) land in the eval cwd; test runs
+# write them into the committed test envs.
+.bonitoAgents/

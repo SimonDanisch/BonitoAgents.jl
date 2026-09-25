@@ -435,7 +435,9 @@ Output:
     need a value, return it explicitly as the last expression).
   - Output is auto-truncated at `max_response_bytes` (default 10000).
     Large arrays / dicts are summarised.
-  - 2-D color arrays render as PNG when PNGFiles is loaded in the env.
+  - A 2-D color array (any colorspace: RGB, Gray, RGBA, HSV, …) also comes back
+    as a `shown: <path>.png` reference — open that file to look at the image.
+    Nothing needs to be installed in the eval env for this.
   - Backtraces are trimmed to user-relevant frames.
 
 Running on ANOTHER worker (machine):

@@ -93,6 +93,18 @@ const CASES = [
                       p_result("ty-multiline", "secondLINEMARK_B")),
     # ── rich MIME (markdown / image / svg / latex / table / dom / raw html) ───
     ("ty-markdown",   "using Markdown; md\"# MDHEADMARK\n\nbody text\"",                         p_result_both("ty-markdown", "h1", "MDHEADMARK")),
+    # A plain colour matrix goes to the agent as a PNG FILE reference, not as
+    # markup. It used to be inlined by `summary_html` as Colors' swatch SVG —
+    # one `<rect>` per pixel, 155KB for a small image, and unreadable to an
+    # agent — because a Colorant matrix has no `image/png` show method unless
+    # the worker has ImageShow loaded, which a user's project normally does not.
+    # The routing is now unconditional (BonitoMCP `bridge_result`), so this case
+    # holds whether or not ImageShow happens to be loaded in the shared worker;
+    # `unit:eval_png` covers the dependency-free encoder that produces the bytes
+    # when nothing else can.
+    ("ty-image-noshow",
+     "using Colors; fill(RGB{Float64}(0.0, 0.0, 1.0), 6, 6)",
+     p_output("ty-image-noshow", ".png (image/png")),
     ("ty-image",      "using Colors, ImageShow; fill(RGB{Colors.N0f8}(1.0, 0.0, 0.0), 8, 8)",    p_img_loaded("ty-image")),
     ("ty-gray",       "using Colors, ImageShow; Gray{Colors.N0f8}.(reshape(range(0,1,length=64), 8, 8))", p_img_loaded("ty-gray")),
     ("ty-svg",        "struct SvgT_ end; " *

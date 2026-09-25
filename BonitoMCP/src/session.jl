@@ -662,7 +662,8 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
             ((; blocks = Dict{String,Any}[], html = nothing, errored = true,
                echo = interrupt_echo(e)), true)
         end
-        value_blocks = result.blocks
+        # Pixel blocks become PNG files here, where PNGFiles loads (eval_image.jl).
+        value_blocks = materialize_images(result.blocks)
         html         = result.html
         # `wants_display` (from format_value): the value would have rendered live
         # but there was no bridge — the handler pairs it with a Bonito-version

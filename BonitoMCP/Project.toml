@@ -5,16 +5,22 @@ authors = ["Simon Danisch <sdanisch@gmail.com>"]
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+ColorTypes = "3da002f7-5984-5a60-b8a6-cbb66c0b333f"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+FixedPointNumbers = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 Malt = "36869731-bdee-424d-aa32-cab38c994e3b"
+PNGFiles = "f57f5aa1-a3ce-4bc8-8ab9-96f992907883"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 
 [compat]
+ColorTypes = "0.11, 0.12"
+FixedPointNumbers = "0.8"
 HTTP = "2"
 JSON = "0.21, 1"
 Malt = "1.4.1"
+PNGFiles = "0.4"
 
 # `test/runtests.jl` existed without these, so `Pkg.test("BonitoMCP")` could not
 # resolve `Test` and the whole suite errored before running a line.

@@ -10,6 +10,10 @@ module BonitoMCP
 #   julia --project=@bonito-agents -e 'using BonitoMCP; BonitoMCP.run_stdio()'
 
 using JSON
+# Encoding eval results that are images (eval_image.jl).
+import PNGFiles
+using ColorTypes: RGBA, color
+using FixedPointNumbers: N0f8
 
 const PROTOCOL_VERSION = "2025-06-18"
 const SERVER_NAME = "BonitoMCP"
@@ -47,6 +51,7 @@ available_tools() = [t for t in TOOLS if t.available()]
 
 include("server.jl")
 include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)
+include("eval_image.jl")       # colour-matrix results → PNG files (PNGFiles, in OUR env)
 include("ctrl_ws.jl")          # control dial-back to BonitoAgents (per-tool interrupt)
 include("context.jl")          # the one MCPServer value (SERVER) owning all process state
 include("eval_host.jl")        # run_eval_host — serve another worker's chat over /mcp-ws

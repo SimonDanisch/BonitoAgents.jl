@@ -125,8 +125,8 @@ Turn a Julia value into the eval result payload. In a chat context the value
 is PARKED in a page-invisible holder session (`RemoteProxy.remote_ref`) — no
 render at eval time; the descriptor identifies it and the chat's `RemoteRef`
 mounts it serialize-on-mount over the bridge. The agent reads the value from
-the output echo. 2-D color arrays additionally render to an on-disk PNG when
-PNGFiles is loaded in the env; large container reprs are summarised.
+the output echo. 2-D color arrays additionally become an on-disk PNG (encoded by
+the host — see `pixel_block`); large container reprs are summarised.
 """
 function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output::Bool)
     val === nothing &&
@@ -145,7 +145,7 @@ function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output:
     # degrades to the no-bridge text path below.
     if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
         result = try
-            bridge_result(val, repr, max_bytes, full_output)
+            bridge_result(val, repr, max_bytes, full_output, out_dir)
         catch e
             @warn "format_value: bridge path failed; falling back to text/file preview" exception = (e, catch_backtrace())
             nothing
@@ -175,8 +175,26 @@ end
 # stdout) while the MCP-level `errored` stays FALSE — the eval succeeded, only
 # the display failed. A plain value keeps its short text repr. Any throw here
 # propagates to `format_value`, which degrades to the no-bridge text path.
-function bridge_result(val, repr::AbstractString, max_bytes::Int, full_output::Bool)
+function bridge_result(val, repr::AbstractString, max_bytes::Int, full_output::Bool,
+                       out_dir::AbstractString)
     RP = Main.RemoteProxy
+    # An image is a FILE, not a summary. `summary_html` renders the value's
+    # richest mime inline for the agent, and a Colorant matrix's richest mime —
+    # absent ImageShow, which an eval worker normally does not have — is Colors'
+    # swatch SVG: one `<rect>` per pixel, 155KB for a small image, inlined into
+    # the response as markup that no agent can look at. The PNG on disk is the
+    # route that actually shows an image: the agent opens the path and the chat
+    # previews it. The value is still parked, so the live embed is unchanged.
+    if looks_like_image(val)
+        blocks = Dict{String,Any}[]
+        block = try_save_rich(val, out_dir, max_bytes)
+        block === nothing || push!(blocks, block)
+        ref = RP.remote_ref(val)
+        return (; blocks = blocks,
+                  html = result_descriptor(ref, false,
+                           truncate_text(repr, max_bytes, full_output, "result")),
+                  errored = false, echo = nothing)
+    end
     if is_display_type(val)
         sm = RP.summary_html(val)
         if sm isa CapturedException
@@ -248,10 +266,11 @@ function json_escape_string(s::AbstractString)
     return String(take!(io))
 end
 
-# Walk the IMAGE MIME chain (PNG → SVG, plus PNGFiles for Colorant matrices)
-# and write the first match to disk. Returns a `shown: <relpath>
-# (<mime>, <size>)` text block that the chat-side render_tool_body
-# detects and previews inline. nothing if no rich MIME was renderable.
+# Walk the IMAGE MIME chain (PNG → SVG) and write the first match to disk.
+# Returns a `shown: <relpath> (<mime>, <size>)` text block that the chat-side
+# render_tool_body detects and previews inline. nothing if no rich MIME was
+# renderable. A colour matrix skips the chain: it goes to the host as pixels
+# (`pixel_block`) and comes back as the same `shown:` block, encoded there.
 # `max_bytes` is accepted for call-site compatibility but the file-size gate uses
 # the generous RICH_FILE_CAP_BYTES — the bytes go to disk, not the response (M14).
 #
@@ -264,6 +283,9 @@ end
 # values, i.e. images.
 function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
     val === nothing && return nothing
+    # One path for every colour matrix, whatever the user's env could otherwise
+    # render it as: the same PNG either way, and never the per-pixel SVG below.
+    looks_like_image(val) && return pixel_block(val, out_dir)
     mkpath(out_dir)
     base = string(time_ns(), base = 16) * "-" * string(rand(UInt32), base = 16)
     cap = RICH_FILE_CAP_BYTES
@@ -272,18 +294,6 @@ function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
         png = sprint_mime(val, MIME"image/png"())
         if !isempty(png) && length(png) <= cap
             return write_show_file(out_dir, base, ".png", "image/png", png, val)
-        end
-    end
-
-    if looks_like_image(val)
-        try
-            png = value_to_png(val)
-            if length(png) <= cap
-                return write_show_file(out_dir, base, ".png", "image/png", png, val)
-            end
-        catch e
-            e isa InterruptException && rethrow()
-            @debug "try_save_rich: PNG encode failed (falling through to next MIME)" exception = e
         end
     end
 
@@ -449,22 +459,88 @@ function summarize_container(value)
                   sprint(show, "text/plain", head))
 end
 
-function looks_like_image(value)
-    value isa AbstractArray || return false
-    ndims(value) == 2       || return false
-    name = string(eltype(value))
-    return occursin("RGB", name) || occursin("RGBA", name) ||
-           occursin("Gray", name) || occursin("Colorant", name)
+# The module a LOADED package resolves to, or nothing. Not the same question as
+# `isdefined(Main, :ColorTypes)`: that is only true when the user typed `using
+# ColorTypes` at the top level, while a value whose type comes from the package
+# proves the package is loaded either way.
+function loaded_module(name::AbstractString)
+    for (pkg, m) in Base.loaded_modules
+        pkg.name == name && return m
+    end
+    return nothing
 end
 
-# Best-effort: only renders if the user has PNGFiles loaded in the env.
-function value_to_png(value)
-    if Base.isbindingresolved(Main, :PNGFiles) && isdefined(Main, :PNGFiles)
-        io = IOBuffer()
-        Base.invokelatest(Main.PNGFiles.save, io, value)
-        return take!(io)
+# A 2-D array of colors, by TYPE. This used to match on the eltype's printed
+# NAME ("RGB" / "Gray" / "Colorant"), which missed every other colorspace (HSV,
+# Lab, …) and would have matched a user struct called `RGBHistogram`.
+function looks_like_image(value)
+    value isa AbstractArray && ndims(value) == 2 || return false
+    ct = loaded_module("ColorTypes")
+    ct === nothing && return false      # no Colorant can exist in this worker
+    return eltype(value) <: ct.Colorant
+end
+
+# 0-255 from a color component. Out-of-gamut values clamp (an HDR render is
+# still worth looking at) and non-finite ones go black rather than throwing.
+component8(v) = round(UInt8, 255 * (isfinite(v) ? clamp(float(v), 0.0, 1.0) : 0.0))
+
+# (4, width, height) of 8-bit RGBA. Images index [row, column], so the matrix's
+# FIRST dimension is the image's height — same convention as PNGFiles/ImageShow.
+# `T` (RGBA{Float64}) comes in as a type parameter so the conversion inside the
+# loop is a typed call rather than a dynamic dispatch per pixel; `convert` is
+# what makes every colorspace work (Gray, HSV, Lab, N0f8, …).
+function rgba8_pixels(m::AbstractMatrix, ::Type{T}) where {T}
+    h, w = size(m, 1), size(m, 2)
+    out = Array{UInt8,3}(undef, 4, w, h)
+    for (yi, i) in enumerate(axes(m, 1)), (xi, j) in enumerate(axes(m, 2))
+        p = convert(T, m[i, j])
+        out[1, xi, yi] = component8(p.r)
+        out[2, xi, yi] = component8(p.g)
+        out[3, xi, yi] = component8(p.b)
+        out[4, xi, yi] = component8(p.alpha)
     end
-    error("PNG encoding requires PNGFiles in the env")
+    return out
+end
+
+"""
+    pixel_block(m, out_dir) -> Union{Dict{String,Any},Nothing}
+
+A colour matrix, handed to the BonitoMCP host to encode as a PNG: 8-bit RGBA
+bytes, row by row. `nothing` for an image too large to ship (the file cap) or an
+empty one.
+
+Encoding is not done here because this file runs inside the eval worker, i.e. in
+the USER's project, where PNGFiles is normally not loadable — and without it a
+colour matrix has no `image/png` show method at all, only Colors' swatch SVG
+(one `<rect>` per pixel, unreadable to an agent). The host runs in our own
+environment and encodes with PNGFiles; see `write_eval_image` in eval_image.jl.
+Only the colour conversion stays here, because only this process has the
+user's colour types.
+"""
+function pixel_block(m::AbstractMatrix, out_dir::AbstractString)
+    h, w = size(m, 1), size(m, 2)
+    (w == 0 || h == 0 || 4 * w * h > RICH_FILE_CAP_BYTES) && return nothing
+    ct = loaded_module("ColorTypes")   # loaded: `looks_like_image` said so
+    px = try
+        rgba8_pixels(m, ct.RGBA{Float64})
+    catch e
+        # The one expected failure: a colorspace whose conversion to RGB is not
+        # loaded (HSV/Lab with only ColorTypes, no Colors). The eval itself
+        # succeeded, so say why there is no image and keep the text repr —
+        # anything else is a real error.
+        (e isa MethodError && e.f === convert) || rethrow()
+        @warn "bt_julia_eval: no conversion from $(eltype(m)) to RGBA is loaded; not rendered as an image"
+        return nothing
+    end
+    base = string(time_ns(), base = 16) * "-" * string(rand(UInt32), base = 16)
+    return Dict{String,Any}(
+        "type"   => "bt_pixels",          # BonitoMCP.PIXEL_BLOCK
+        "path"   => abspath(joinpath(out_dir, base * ".png")),
+        "width"  => w,
+        "height" => h,
+        "opaque" => all(==(0xff), @view px[4, :, :]),
+        "pixels" => vec(px),              # channel fastest, then x, then y
+        "typeof" => typeof_short(m))
 end
 
 end # module BonitoMCPHelper
