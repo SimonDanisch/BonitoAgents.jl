@@ -7,8 +7,8 @@
 # is provably behaviour-preserving rather than a hopeful refactor of untested UI.
 #
 # Asserted purely on the rendered DOM: open, filter, select.
-@testitem "e2e:model_search" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:model_search" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     using Test

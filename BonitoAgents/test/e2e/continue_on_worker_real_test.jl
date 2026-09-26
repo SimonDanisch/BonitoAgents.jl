@@ -10,8 +10,8 @@
 # Opt-in (`BT_REAL_AGENT=1`): it needs `claude-agent-acp` on PATH, an
 # authenticated Claude account, and it spends real tokens. Skipped otherwise,
 # loudly, so a green run never silently means "not run".
-@testitem "e2e:continue_on_worker_real" tags = [:e2e, :real] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:continue_on_worker_real" setup = [SharedServer] tags = [:e2e, :real] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     import BonitoAgents as BT

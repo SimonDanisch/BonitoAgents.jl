@@ -1,5 +1,5 @@
-@testitem "e2e:copy_project" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:copy_project" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     const ECT = TK.ECT   # ElectronCall.Testing — real trusted mouse/keyboard events

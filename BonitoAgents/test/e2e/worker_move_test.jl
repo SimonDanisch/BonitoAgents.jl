@@ -25,8 +25,8 @@
 # ISOLATED, like cross_worker_test.jl: it spawns a SECOND worker and mutates
 # worker assignment, so it gets its own throwaway `dev_server` + browser rather
 # than polluting the shared soak server's worker set.
-@testitem "e2e:worker_move" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:worker_move" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     import BonitoAgents as BT

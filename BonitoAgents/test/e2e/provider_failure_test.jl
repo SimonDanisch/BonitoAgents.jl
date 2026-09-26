@@ -1,8 +1,8 @@
 # Full propagation regression for a provider that cannot be spawned:
 # worker open_session_failed frame -> pending server RPC -> restart last_error ->
 # provider-switch failure detail -> rendered, copyable progress card.
-@testitem "e2e:provider_failure" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:provider_failure" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     import BonitoAgents as BT
     const TK = TestKit
 

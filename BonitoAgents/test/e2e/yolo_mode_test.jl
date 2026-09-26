@@ -12,8 +12,8 @@
 # `state.chat_models[pid]`, and assert on `msgs_store`. The mock `agent_fn` is a
 # scripted closure that replies per prompt KIND, which is what makes the two-step
 # protocol observable from outside.
-@testitem "e2e:yolo_mode" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:yolo_mode" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     TK = TestKit
     BA = TestKit.BT
 

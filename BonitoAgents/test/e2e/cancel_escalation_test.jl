@@ -7,8 +7,8 @@
 # graceful cancel is swallowed and the turn stays live. Drives the SERVER path
 # (no browser): `handle_command!` twice, with `conn.cancel_at` backdated past the
 # 20 s escalate window so the test doesn't actually wait 20 s.
-@testitem "e2e:cancel_escalation" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:cancel_escalation" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     TK = TestKit
     BA = TestKit.BT
 

@@ -88,7 +88,7 @@ function reset_dialback_or_warn(reset!::Function, what::AbstractString)
     return nothing
 end
 
-export TestServer, dev_server, add_worker!,
+export TestServer, dev_server, add_worker!, drop_worker_connection!,
        text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update,
        kimi_tool, codex_mcp_tool, codex_shell, codex_image, REPLAY_FN,
        post_turn,
@@ -543,6 +543,21 @@ function kill_worker!(proc::Base.Process)
 end
 
 """
+    drop_worker_connection!(s::TestServer) -> link
+
+Drop the dev worker's connection the way a network blip does: the server's end
+of the socket closes and both sides see the connection end, while the worker
+process, its agents and the link stay. The worker reconnects after its retry
+delay (5 s), and the link must RESUME, replaying whatever was in flight. Returns
+the server's link, so a test can check it was resumed rather than replaced.
+"""
+function drop_worker_connection!(s::TestServer)
+    link = lock(() -> only(values(s.h.state.worker_links)), s.h.state.lock)
+    BT.WorkerLink.disconnect!(link)
+    return link
+end
+
+"""
     dev_server(; agent = msg -> end_turn(), port = nothing, kwargs...) -> TestServer
 
 Start a real BonitoAgents dev server, swap the worker's `claude-agent-acp`
@@ -572,7 +587,10 @@ Tests that need a discover tree seed `state.discovered` instead.
 #
 # `SharedServer` registers a releaser here; `dev_server` calls it before building
 # a new stack, and the shared one restarts lazily the next time an item asks for
-# it.
+# it. That only works within ONE TestKit module: an own-server item takes it from
+# SharedServer (`setup = [SharedServer]`, `const TestKit = SharedServer.TestKit`).
+# An item that includes its own copy gets its own, empty `RELEASE_SHARED`, and its
+# server runs next to the shared one.
 const RELEASE_SHARED = Ref{Any}(nothing)
 
 "Register how to tear the shared stack down (called by the SharedServer setup)."

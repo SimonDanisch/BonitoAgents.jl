@@ -15,8 +15,8 @@
 # Two real worker processes (TestKit's `add_worker!`), the real dev_server, the
 # mock agent only where the agent's decisions would be. ISOLATED: it spawns a
 # second worker, so it gets its own throwaway dev_server + browser.
-@testitem "e2e:remote_eval" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:remote_eval" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     real_eval(code; kw...) = TK.bt_eval(code; real_process = true, kw...)

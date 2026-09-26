@@ -2,8 +2,8 @@
 # cannot be told apart by `querySelector` (it answers about the first) nor by
 # "which one is visible" (an inactive workspace panel still has an
 # `offsetParent`). See review_scope.jl's header.
-@testitem "e2e:review_scope" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:review_scope" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     include(joinpath(@__DIR__, "review_scope.jl"))
     server = TestKit.dev_server(agent = scope_agent)
     try

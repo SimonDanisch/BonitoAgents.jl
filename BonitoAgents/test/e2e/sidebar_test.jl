@@ -19,9 +19,9 @@
 # the rebuild unnecessary in the first place: navigation toggles
 # `.bt-side-active` from JS on `data-project-id`, the status LED is rewritten
 # by `status_obs`, and ✕ is a delegated handler on the aside.
-@testitem "e2e:sidebar" tags = [:e2e] begin
+@testitem "e2e:sidebar" setup = [SharedServer] tags = [:e2e] begin
     import BonitoAgents as BT
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
 

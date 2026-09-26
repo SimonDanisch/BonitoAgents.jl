@@ -15,9 +15,9 @@
 # ISOLATED (own dev_server, not the shared soak server): resume/discovery mutate
 # worker session state, and the assertion is a clean-render invariant that
 # shared-server neighbor noise would muddy.
-@testitem "e2e:resume_no_jserrors" tags = [:e2e] begin
+@testitem "e2e:resume_no_jserrors" setup = [SharedServer] tags = [:e2e] begin
     using Test
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+    const TestKit = SharedServer.TestKit
     import .TestKit
     const TK = TestKit
 

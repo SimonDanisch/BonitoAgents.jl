@@ -2,8 +2,8 @@
 # dev_server: the suite backdates a live TaskToolMsg's `last_activity_at`
 # server-side and holds a ~27 s turn open — too stateful for the shared soak
 # server.
-@testitem "e2e:subagent_feed" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:subagent_feed" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     include(joinpath(@__DIR__, "subagent_feed.jl"))
     server = TestKit.dev_server(agent = agent_script)
     try
