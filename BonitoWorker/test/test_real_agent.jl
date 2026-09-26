@@ -30,6 +30,34 @@ using BonitoWorker
 const BW = BonitoWorker
 const WL = BW.WorkerLink
 
+# Every live process below `root`, read from /proc (Linux).
+function proc_descendants(root::Integer)
+    parent = Dict{Int,Int}()
+    for entry in readdir("/proc")
+        pid = tryparse(Int, entry)
+        pid === nothing && continue
+        stat = try
+            read("/proc/$pid/stat", String)
+        catch e
+            e isa SystemError || rethrow()   # gone between readdir and read
+            continue
+        end
+        # "pid (comm) state ppid …": comm may hold spaces and parentheses.
+        parent[pid] = parse(Int, split(stat[findlast(')', stat) + 1:end])[2])
+    end
+    found = Int[]
+    frontier = [Int(root)]
+    while !isempty(frontier)
+        p = pop!(frontier)
+        for (child, pp) in parent
+            pp == p || continue
+            push!(found, child)
+            push!(frontier, child)
+        end
+    end
+    return found
+end
+
 # Bounded receive — fail loudly instead of hanging the suite forever.
 function take_or_timeout(ch::Channel, timeout_s::Real, what::AbstractString)
     result = Ref{Any}(nothing)
@@ -206,6 +234,26 @@ end
         # the exact value, just confirm the field's present and shaped right.
         if haskey(result, "protocolVersion")
             @test result["protocolVersion"] isa Number
+        end
+
+        # ── Step 4: the agent did not inherit the worker's credentials ───────
+        # This worker runs env-driven, so its own ENV holds the secret and the
+        # server's URL; the agent (and with it its MCP and eval workers) must not.
+        # Everything below the worker process: the agent and what it spawned.
+        # (Not by the owner mark: this worker runs with the machine's default
+        # worker id, which an installed worker's agents carry too.)
+        if Sys.islinux()
+            environs = String[]
+            for pid in proc_descendants(getpid(worker_proc))
+                try
+                    push!(environs, read("/proc/$pid/environ", String))
+                catch e
+                    e isa SystemError || rethrow()   # gone meanwhile
+                end
+            end
+            @test !isempty(environs)
+            @test !any(e -> occursin(secret, e), environs)
+            @test !any(e -> occursin("BONITOAGENTS_SERVER_URL=", e), environs)
         end
 
     finally

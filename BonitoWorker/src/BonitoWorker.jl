@@ -1183,8 +1183,8 @@ end
 # ── Eval hosts: Julia for ANOTHER worker's chat, run here ────────────────────
 # "Run this on the MacBook" from a chat whose agent lives on the desktop: the
 # server asks THIS worker to spawn a BonitoMCP eval host for that chat
-# (`BonitoMCP.run_eval_host`), which dials the server's /mcp-ws and serves the
-# relayed evals with the same session manager the chat's own MCP uses. One host
+# (`BonitoMCP.run_eval_host`), which connects through this worker's relay and
+# serves the relayed evals with the same session manager the chat's own MCP uses. One host
 # per chat per worker; the process is the same julia + project the MCP itself is
 # launched with (`mcp_command`/`mcp_arguments`, only the entry point differs),
 # so it runs on the pinned julia and sees the same packages.
@@ -1222,22 +1222,19 @@ function open_eval_host!(w::Worker, project_id::AbstractString, env::AbstractDic
         end
         relay = w.relay
         owner = "host:" * project_id
-        host_env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
+        revoke_mcp_grants!(relay, owner)
+        host_env = merge(inherited_env(),
                          Dict{String,String}(String(k) => String(v) for (k, v) in env),
-                         Dict("BONITOAGENTS_SERVER_URL" => c.server_url,
-                              "BONITOAGENTS_EVAL_HOST_WORKER" => c.worker_id,
-                              AGENT_OWNER_ENV => c.worker_id))
-        if relay !== nothing
-            revoke_mcp_grants!(relay, owner)
-            merge!(host_env, mcp_relay_env(relay, project_id; host = true, owner))
-        end
+                         Dict("BONITOAGENTS_EVAL_HOST_WORKER" => c.worker_id,
+                              AGENT_OWNER_ENV => c.worker_id),
+                         mcp_relay_env(relay, project_id; host = true, owner))
         args = eval_host_arguments(c.mcp_arguments)
         # `detach`: the host leads its own process group, so killing it reaches
         # the eval workers it spawned — same as an agent (see run_agent_session).
         proc = try
             open(detach(Cmd(`$(c.mcp_command) $args`; env = host_env)), "r")
         catch
-            relay === nothing || revoke_mcp_grants!(relay, owner)
+            revoke_mcp_grants!(relay, owner)
             rethrow()
         end
         w.eval_hosts[project_id] = proc
@@ -1267,8 +1264,7 @@ end
 
 function handle_close_eval_host(w::Worker, ws, cmd::AbstractDict)
     project_id = String(get(cmd, "project_id", ""))
-    relay = w.relay
-    relay === nothing || revoke_mcp_grants!(relay, "host:" * project_id)
+    revoke_mcp_grants!(lock(() -> w.relay, w.lock), "host:" * project_id)
     reply = Dict{String,Any}("type" => "close_eval_host_response",
                              "request_id" => String(get(cmd, "request_id", "")))
     reply_with(ws, reply) do
@@ -1280,10 +1276,21 @@ end
 # worker that owns it. See `provider_env` and `reap_stray_agents!`.
 const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
 
+# The environment an agent-side child (agent, session scan, eval host, git in a
+# project) inherits:
+# the worker's own, minus its credentials. A worker started env-driven
+# (`worker_standalone.jl`, or as a child of a server whose env holds them) has the
+# secret and the server's URL in ENV; nothing it spawns may. An MCP process
+# reaches the server through the worker's relay with a per-chat grant instead.
+function inherited_env(; credentials = ("BONITOAGENTS_WORKER_SECRET", "BONITOAGENTS_SERVER_URL",
+                                        "BONITOAGENTS_PUBLIC_URL"))
+    return Dict{String,String}(k => v for (k, v) in ENV if k ∉ credentials)
+end
+
 # The environment for EVERY provider process we spawn — the chat session and the
-# `session/list` scan alike. Live ENV is the base so the agent inherits PATH etc.;
-# the descriptor's provider-specific vars (Claude's `CLAUDE_*`, …) win over it,
-# and `extra` (server url, per-session overrides) wins over those.
+# `session/list` scan alike. The inherited ENV is the base so the agent gets PATH
+# etc.; the descriptor's provider-specific vars (Claude's `CLAUDE_*`, …) win over
+# it, and `extra` (per-session overrides) wins over those.
 #
 # `AGENT_OWNER_ENV` is the part that must not be skipped. It is our own mark on
 # the process and everything it spawns, and `reap_agents_owned_by` reads it back
@@ -1294,7 +1301,7 @@ const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
 # a Julia agent still precompiling outlives the SIGTERM that ends the scan — were
 # invisible to both halves of the reaper, at ~500 MB each.
 function provider_env(provider, extra::AbstractDict = Dict{String,String}())
-    return merge(Dict(string(k) => string(v) for (k, v) in ENV),
+    return merge(inherited_env(),
                  provider.env,
                  Dict(AGENT_OWNER_ENV => load_or_generate_worker_id()),
                  extra)
@@ -2157,9 +2164,6 @@ function develop_checkout!(dest::AbstractString, packages::Vector{String},
     # instead — minutes inside claude-agent-acp's MCP start-up timeout.
     code = "import Pkg; Pkg.develop([Pkg.PackageSpec(path = p) for p in ARGS]); Pkg.precompile()"
     cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $(code) $(paths)`
-    # `@stdlib` has to be on the load path for `import Pkg`; a parent that pruned
-    # its own load path (`Pkg.test` sets `@:<testdir>`) must not take that away.
-    cmd = addenv(cmd, "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'))
     mkpath(dirname(logfile))
     ok = open(logfile, "w") do io
         success(pipeline(cmd; stdout = io, stderr = io))
@@ -2430,13 +2434,12 @@ function handle_discard_staging(ws, cmd::AbstractDict)
 end
 
 
-# Complete our MCP launch environment at the worker, which knows the reachable
-# server URL. In particular, Codex does not inherit arbitrary parent env vars.
-# Only touch our injected stdio entry; other MCP servers and ACP traffic retain
-# their original configuration. Apply on both new and resumed sessions.
-function inject_mcp_server_url(line::String, server_url::AbstractString;
-                               mcp_relay = nothing, owner::AbstractString = "")
-    isempty(server_url) && mcp_relay === nothing && return line
+# Hand our MCP server (the injected `btworker` entry) a grant to this worker's
+# relay, for the chat the server named in it. It goes into the launch
+# configuration explicitly: Codex, for one, does not pass arbitrary parent
+# environment on to MCP servers. Other MCP servers and all other ACP traffic
+# pass unchanged; applied to new and resumed sessions alike.
+function inject_mcp_grant(line::String, relay::MCPRelay, owner::AbstractString)
     msg = JSON.parse(line)
     msg isa AbstractDict || return line
     get(msg, "method", nothing) in ("session/new", "session/load", "session/fork", "session/resume") || return line
@@ -2451,28 +2454,22 @@ function inject_mcp_server_url(line::String, server_url::AbstractString;
         get(mcp, "type", "stdio") == "stdio" || continue
         env = get!(mcp, "env", Any[])
         values = Dict(String(e["name"]) => String(e["value"]) for e in env)
-        # The URL remains available to the separate rich-display bridge. Control
-        # requests use only the local grant; they need no server address/secret.
-        isempty(server_url) || (values["BONITOAGENTS_SERVER_URL"] = String(server_url))
-        if mcp_relay !== nothing
-            project_id = get(values, "BONITOAGENTS_PROJECT_ID", "")
-            isempty(project_id) && error("injected MCP is missing its chat identity")
-            merge!(values, mcp_relay_env(mcp_relay, project_id; owner))
-        end
+        project_id = get(values, "BONITOAGENTS_PROJECT_ID", "")
+        isempty(project_id) && error("injected MCP is missing its chat identity")
+        merge!(values, mcp_relay_env(relay, project_id; owner))
         mcp["env"] = [Dict("name" => k, "value" => v) for (k, v) in sort!(collect(values); by = first)]
         changed = true
     end
     return changed ? JSON.json(msg) : line
 end
 
-# Line shuttle between the session's channel and the agent's stdio, with the
-# worker's URL supplied explicitly in our MCP launch configuration.
-function relay_ws_to_proc(ws, proc; server_url::AbstractString = "",
-                          mcp_relay = nothing, owner::AbstractString = "")
+# Line shuttle from the session's channel to the agent's stdin, granting our
+# MCP server its relay access on the way (`inject_mcp_grant`).
+function relay_ws_to_proc(ws, proc, relay::MCPRelay, owner::AbstractString)
     try
         while !WebSockets.isclosed(ws)
             frame = WebSockets.receive(ws)
-            line  = inject_mcp_server_url(String(frame), server_url; mcp_relay, owner)
+            line  = inject_mcp_grant(String(frame), relay, owner)
             endswith(line, '\n') || (line *= "\n")
             write(proc.in, line)
             flush(proc.in)
@@ -3064,10 +3061,11 @@ function git_capture(dir::AbstractString, args::Cmd)
     out = IOBuffer()
     ok = try
         # LC_ALL/GIT_* pinned so we parse a stable, un-localised, un-paged,
-        # un-coloured output no matter how the user's git is configured.
+        # un-coloured output no matter how the user's git is configured. The
+        # repo is the agent's to write (hooks, fsmonitor): no worker credentials.
         cmd = setenv(`git -C $dir $args`,
-                     merge(ENV, Dict("LC_ALL" => "C", "GIT_PAGER" => "cat",
-                                     "GIT_OPTIONAL_LOCKS" => "0", "GIT_CONFIG_NOSYSTEM" => "1")))
+                     merge(inherited_env(), Dict("LC_ALL" => "C", "GIT_PAGER" => "cat",
+                                                 "GIT_OPTIONAL_LOCKS" => "0", "GIT_CONFIG_NOSYSTEM" => "1")))
         success(pipeline(cmd; stdout = out, stderr = devnull))
     catch e
         e isa InterruptException && rethrow()

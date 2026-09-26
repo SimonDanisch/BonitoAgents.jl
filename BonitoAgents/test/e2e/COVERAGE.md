@@ -42,9 +42,9 @@ one landed, plus the few that can't be reproduced in a headless window.
   process that meant the SECOND chat to eval in a given env inherited the first
   chat's dial: no bridge was ever registered for it, so its live embeds rendered
   from their snapshot but had no browser↔worker route — they looked right and
-  were dead. `new_chat` now re-points the dial-back when the project id changes
-  (the worker stays warm), which is what production gets for free by giving each
-  chat its own MCP process. Symptom if this regresses: an eval-embed suite
+  were dead. TestKit's `with_mcp_env` now re-arms the in-process MCP whenever a
+  call carries another chat's relay grant (the worker stays warm), which is what
+  production gets for free by giving each chat its own MCP process. Symptom if this regresses: an eval-embed suite
   passes ALONE and fails when another eval suite ran first, its liveness
   assertions timing out while the embed's DOM is present. Reproducer:
   `test_args=["e2e:app_reload", "e2e:app_scroll"]`.
@@ -57,10 +57,10 @@ one landed, plus the few that can't be reproduced in a headless window.
   soft-scope transform failed to resolve and fell back to `identity`; a
   top-level `for` assigning a global then died with "UndefVarError: acc not
   defined in local scope", which reads as a bug in the test's own code.
-  Fixed at the source in `BonitoMCP.worker_env()` (a spawned worker gets Julia's
-  DEFAULT load path when one was inherited) plus `Base.require` for REPL, and
-  `TestKit.__init__` clears the variable so the whole spawned tree is clean.
-  `unit:eval_worker_env` pins all of it headlessly. Symptom if this regresses:
+  Nothing in production sets the variable, so the fix is on the test side:
+  `TestKit.__init__` (and BonitoMCP's and BonitoWorker's runtests) delete it, so
+  the whole spawned tree is clean; plus `Base.require` for REPL in the helper.
+  `unit:eval_worker_env` pins the worker side headlessly. Symptom if this regresses:
   an eval case fails on `using <any stdlib>`, or a REPL-semantics case fails,
   under `Pkg.test` while the same env works from a shell.
 - **Eval projects are COMMITTED, never built at runtime** (`test/evalenv`,

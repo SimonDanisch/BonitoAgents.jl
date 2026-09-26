@@ -5,7 +5,9 @@
 #                    finds its caller through `request_id`.
 #   other channels   one per agent session and one per file transfer, opened
 #                    by the SERVER with the request as the channel's header
-#                    (`open_worker_channel`).
+#                    (`open_worker_channel`); and one per MCP process and eval
+#                    worker bridge, opened by the WORKER's local relay
+#                    (`accept_worker_channel`).
 #
 # A dropped connection DETACHES the link instead of ending it: the worker shows
 # offline, its agents keep running, and a reconnect within
@@ -391,8 +393,39 @@ function claim_worker_link!(state::ServerState, worker_id::String, link_id::Vect
                            grace         = state.worker_link_grace,
                            ping_interval = state.heartbeat_interval,
                            ping_deadline = state.heartbeat_deadline,
+                           on_open       = ch -> accept_worker_channel(state, worker_id, ch),
                            on_state      = (l, st) -> worker_link_changed!(state, worker_id, l, st))
     return link, false
+end
+
+# A channel the worker opened: its relay's connection for a chat's MCP process
+# (`"mcp"`) or for an eval worker's live-render bridge (`"eval"`), see
+# BonitoWorker's mcp_relay.jl. A worker speaks for the chats it runs, and, as an
+# eval host (`host`), for the chats that let it run their Julia. Answered the way
+# the worker answers ours: `{ok: true}` (`accept_channel`) as the first frame
+# once it is served, or an abort with the reason; the relay passes either on to
+# the local process that asked.
+accept_channel(ch::WorkerLink.LinkChannel) = send_control(ch, Dict("ok" => true))
+
+function accept_worker_channel(state::ServerState, worker_id::String, ch::WorkerLink.LinkChannel)
+    header = decode_control(WorkerLink.header(ch))
+    project_id = String(get(header, "project_id", ""))
+    host = get(header, "host", false) === true
+    p = get(state.projects[], project_id, nothing)
+    if p === nothing || (host ? !p.remote_eval : p.worker_id != worker_id)
+        WorkerLink.abort(ch, "no chat '$(project_id)' this worker may speak for")
+        return nothing
+    end
+    kind = get(header, "kind", "")
+    if kind == "mcp"
+        accept_channel(ch)
+        serve_mcp_channel(state, MCPChannel(state, ch, project_id, host ? worker_id : ""))
+    elseif kind == "eval"
+        serve_eval_bridge(state, ch, project_id, String(get(header, "prefix", "")))
+    else
+        WorkerLink.abort(ch, "unknown channel kind '$(kind)'")
+    end
+    return nothing
 end
 
 # Record the worker a hello describes and the link it is reachable over, and
@@ -481,11 +514,9 @@ function worker_link_changed!(state::ServerState, worker_id::String,
     return nothing
 end
 
-# The worker's replies (and MCP relay traffic) on its control channel, for as
-# long as `link` lives.
+# The worker's replies on its control channel, for as long as `link` lives.
 function serve_worker_control(state::ServerState, worker_id::String, link::WorkerLink.Link)
     ctrl = WorkerLink.control_channel(link)
-    mcp_channels = Dict{String,Any}()
     try
         # Every typed reply maps back to a pending RPC by request_id;
         # deliver_rpc_response! is a no-op if the caller already timed out.
@@ -494,9 +525,7 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
                 cmd = decode_control(frame)
                 t   = get(cmd, "type", "")
                 rid = String(get(cmd, "request_id", ""))
-                if t in ("mcp_open", "mcp_frame", "mcp_close")
-                    handle_worker_mcp!(state, worker_id, link, mcp_channels, cmd)
-                elseif t == "update_status"
+                if t == "update_status"
                     apply_update_status!(state, worker_id, cmd)
                 elseif t in ("list_dir_response", "make_dir_response", "ensure_dir_response",
                              "stat_path_response", "read_file_range_response",
@@ -529,8 +558,6 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
     catch e
         # The control channel ends only with its link (aborted when it dies).
         e isa WebSockets.WebSocketError || rethrow()
-    finally
-        foreach(ch -> close_mcp_channel!(ch; notify_worker = false), values(mcp_channels))
     end
     return nothing
 end
@@ -1617,8 +1644,8 @@ end
     open_eval_host_on_worker(state, worker_id; project_id, env) -> (pid, existed)
 
 Ask the worker to spawn (or confirm) the BonitoMCP eval host serving
-`project_id`'s chat from that machine, with `env` (the server's secret and the
-project id) in the process environment. The host dials `/mcp-ws` on its own;
+`project_id`'s chat from that machine, with `env` (the project id) in the
+process environment. The host connects through that worker's relay on its own;
 `ensure_eval_host!` (remote_eval.jl) waits for that.
 """
 function open_eval_host_on_worker(state::ServerState, worker_id::AbstractString;

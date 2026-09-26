@@ -8,6 +8,12 @@ using BonitoWorker
 import AgentProviders
 const BW = BonitoWorker
 
+# `Pkg.test` runs this process with `JULIA_LOAD_PATH="@:<testdir>"` (no
+# `@stdlib`), and every julia the tests start (the worker, the debug checkout's
+# `Pkg.develop`) would inherit it. Nothing sets it in production; removing it
+# restores those conditions. Our own `LOAD_PATH` was read at startup and stays.
+delete!(ENV, "JULIA_LOAD_PATH")
+
 # A WebSocket stand-in that drops sends — handle_* helpers write their JSON
 # response to the WS, which the unit tests don't need to read. Reach the
 # exact `send` the worker calls (`HTTP.WebSockets.send`) through the module

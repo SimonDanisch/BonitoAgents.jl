@@ -70,10 +70,9 @@ across launches:
 # it as `--project`, on its own command line, because `Base.julia_cmd()` does not
 # carry one. This used to be done by exporting `JULIA_LOAD_PATH`/`JULIA_DEPOT_PATH`
 # into the process env — which every descendant then inherited, including the Malt
-# eval workers that are supposed to resolve against the USER'S project. BonitoMCP
-# grew a `worker_env()` whose only job was to undo that, and a test to pin the
-# undoing. A flag on one command replaces all of it: we never touch the ambient
-# environment, so nothing downstream has to repair it.
+# eval workers that are supposed to resolve against the USER'S project. A flag on
+# one command replaces it: we never touch the ambient environment, so nothing
+# downstream has to repair it.
 function worker_command(; server_url, secret, worker_id, projects_root, data_dir)
     jl = Base.julia_cmd()
     # Opt-in tracing for the precompile harness: when BONITOAGENTS_TRACE_DIR is

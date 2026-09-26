@@ -824,7 +824,7 @@ end
 # ── the "Debug BonitoAgents" chat ───────────────────────────────────────────
 # A normal project, pointed at a BonitoAgents source checkout ON THE WORKER it
 # runs on, with `dev_mode` set. `dev_mode` is what attaches the `bt_dev_*` tools
-# (via `eval_dialback_env`) and the briefing in the system prompt (via
+# (via `mcp_env`) and the briefing in the system prompt (via
 # `agents_prompt_appendix`); the cwd is what lets the agent read, edit and `git`
 # the code. Nothing else is special about it — it uses the same bring-up, the
 # same worker, the same everything.
@@ -899,7 +899,7 @@ Writes only on an actual change, so a toggle can be clicked repeatedly without
 rewriting `projects.json` each time.
 
 The caller is responsible for RESTARTING the chat afterwards. `dev_mode` is read
-at session bring-up and nowhere else: `eval_dialback_env` bakes
+at session bring-up and nowhere else: `mcp_env` bakes
 `BONITOAGENTS_DEV_TOOLS` into the MCP process's environment when it is spawned,
 and `agents_prompt_appendix` composes the briefing into the system prompt at
 `open_session`. A live session keeps whatever it started with, so flipping the

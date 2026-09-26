@@ -4568,7 +4568,7 @@ end
 bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
 
 # ── Live stdout tail for a RUNNING bt_julia_eval ─────────────────────────────
-# The MCP forwards the eval worker's stdout/stderr live over /mcp-ws (no on-disk
+# The MCP forwards the eval worker's stdout/stderr live over its channel (no on-disk
 # log, no polling — see BonitoMCP.stream_forward_loop!). Each chunk lands in a
 # per-eval sink channel (registered here, drained below) and we write it into the
 # card's `stream_text` Observable, which the Output section is bound to. A fresh
@@ -4588,7 +4588,7 @@ eval_route_key(m::JuliaEvalCall) =
     isempty(m.env_path) ? BonitoMCP.TEMP_KEY : abspath(m.env_path)
 
 # An eval on ANOTHER worker streams through that worker's eval host, whose
-# chunks the server keys under the worker id (`handle_mcp_ctrl_ws`), so a local
+# chunks the server keys under the worker id (`accept_worker_channel`), so a local
 # session on the same env_path can't be confused with it. The tool names the
 # worker as the user does (display name, or id); resolve it the same way the
 # server does.

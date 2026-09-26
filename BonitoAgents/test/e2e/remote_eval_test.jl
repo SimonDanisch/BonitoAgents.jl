@@ -162,8 +162,8 @@
             @test TK.wait_for(server, "the eval ran on worker B",
                 card_shows("re-on", "host=" * worker_b.worker_id); timeout = 420) == true
             @test TK.eval_js(server, card_badge("re-on")) == "⇢ worker-b"
-            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
-            @test all(last(pair) isa BT.WorkerMCPChannel for pair in BT.eval_hosts_of(state, pid))
+            @test BT.mcp_ctrl_for(state, pid) isa BT.MCPChannel
+            @test all(last(pair) isa BT.MCPChannel for pair in BT.eval_hosts_of(state, pid))
             @test length(BT.eval_hosts_of(state, pid)) == 1
             @test first(BT.eval_hosts_of(state, pid))[1] == worker_b.worker_id
 
@@ -229,7 +229,7 @@
             TK.send_message(server, "remote eval after resuming the agent")
             @test TK.wait_for(server, "resumed agent launches a working MCP",
                 card_shows("re-resumed", "42"); timeout = 120) == true
-            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
+            @test BT.mcp_ctrl_for(state, pid) isa BT.MCPChannel
             @test BT.mcp_ctrl_for(state, pid) !== old_channel
 
             # ── 5. off again: the host goes, the refusal is back ─────────────

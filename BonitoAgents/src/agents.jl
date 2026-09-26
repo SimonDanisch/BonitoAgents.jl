@@ -135,7 +135,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
         error("Worker '$(a.worker_id)' is not connected")
 
     # Re-derived on every bring-up, NOT taken from what `a.mcp` was built with.
-    # `eval_dialback_env` reads the project's live `dev_mode`, and the appendix
+    # `mcp_env` reads the project's live `dev_mode`, and the appendix
     # three lines down already reads live state — caching one while deriving the
     # other is what made the "Dev mode" toggle half-work: it composed the
     # briefing into the system prompt (live) while the `bt_dev_*` tools never

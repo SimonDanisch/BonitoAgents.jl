@@ -44,8 +44,10 @@ for the server's answer, and attach. Returns the server's application reply.
 
 If the server does not know this link — it restarted, or the grace period ran
 out — the link is RESET first: every channel, the control channel included, is
-aborted with "link reset", and the link starts again from nothing. Fetch the new
-control channel with [`control_channel`](@ref).
+aborted with "link reset", and the link starts again from nothing. `on_state`
+sees `:reset` then, before the new connection delivers anything, so the
+application can drop what it ran on the old link before a channel of the new one
+arrives. Fetch the new control channel with [`control_channel`](@ref).
 
 Throws [`LinkRefused`](@ref) when the server says no.
 """
@@ -68,7 +70,10 @@ function connect!(link::Link, t::Transport, hello::Vector{UInt8}; timeout::Real 
     end
     resumed = reply[6] == 0x01
     # A link that never had a connection has nothing the server could have lost.
-    (resumed || fresh) || reset!(link, "link reset")
+    if !(resumed || fresh)
+        reset!(link, "link reset")
+        notify_state(link, :reset)    # before attach! starts reading the new connection
+    end
     attach!(link, t, resumed ? read_u64(reply, 7) : UInt64(0))
     return reply[23:end]
 end

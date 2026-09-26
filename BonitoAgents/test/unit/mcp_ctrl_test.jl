@@ -1,16 +1,17 @@
-@testitem "unit:mcp_ctrl" tags = [:unit] begin
+@testitem "unit:mcp_ctrl" tags = [:unit] setup = [LinkPair] begin
 
-# Legacy MCP control channel (/mcp-ws), retained for older workers, plus the
-# AGENTS.md → system-prompt `_meta` plumbing. Current worker relay coverage is
-# in mcp_relay_test.jl and e2e/remote_eval_test.jl.
+# The MCP control channel, plus the AGENTS.md → system-prompt `_meta` plumbing.
+# More relay coverage (a real MCP subprocess, grants, replacement) is in
+# mcp_relay_test.jl and e2e/remote_eval_test.jl.
 #
-#   1. Real WS round-trip: a BonitoMCP `start_ctrl_dialback!` (driven by the
-#      same env vars production uses) dials a live BonitoAgents server;
-#      `interrupt_project_eval!` sends `interrupt_eval` and gets the
-#      `interrupt_result` reply (0 interrupted — no eval in flight, but the
-#      whole path server → MCP process → reply → pending_rpcs is exercised).
-#      The SAME socket also carries the debug chat's `bt_dev_*` requests in the
-#      opposite direction (MCP → server → reply), which is exercised here too.
+#   1. Real round-trip: a BonitoMCP `start_ctrl_dialback!` in THIS process,
+#      armed with a worker relay's grant the way production arms it, reaches
+#      the server over a real link; `interrupt_project_eval!` sends
+#      `interrupt_eval` and gets the `interrupt_result` reply (0 interrupted —
+#      no eval in flight, but the whole path server → MCP process → reply →
+#      pending_rpcs is exercised). The SAME channel also carries the debug
+#      chat's `bt_dev_*` requests in the opposite direction (MCP → server →
+#      reply), which is exercised here too.
 #   2. `system_prompt_meta`: empty text ⇒ no `_meta` (params byte-identical
 #      to before); non-empty ⇒ the claude_code preset with `append`.
 #   3. `global_agents_md` round-trip through the state dir.
@@ -18,7 +19,7 @@
 using Test
 using Bonito
 using BonitoAgents
-import BonitoMCP
+import BonitoMCP, BonitoWorker, WorkerLink
 const BT = BonitoAgents
 
 @testset "MCP control channel + AGENTS.md" begin
@@ -72,29 +73,27 @@ const BT = BonitoAgents
         @test m["_meta"]["systemPrompt"]["append"] == appendix
     end
 
-    @testset "ctrl dial-back + interrupt round-trip" begin
+    @testset "control channel + interrupt round-trip" begin
         state = BT.ServerState(; state_dir = mktempdir(),
                                  working_dir = mktempdir(),
-                                 worker_secret = "ctrl-secret")
-        # A minimal live server carrying just the WS routes.
-        srv = Bonito.Server(Bonito.App(() -> Bonito.DOM.div("x")),
-                            "127.0.0.1", 0)
+                                 worker_secret = "unused")
+        state.projects[]["ctrl-proj"] = BT.ProjectInfo("ctrl-proj", "ctrl", "ctrl-worker",
+                                                       mktempdir(), mktempdir(), BT.now(BT.UTC))
+        # A live server for the requests that report on it.
+        srv = Bonito.Server(Bonito.App(() -> Bonito.DOM.div("x")), "127.0.0.1", 0)
+        state.srv = srv
+        server_link, worker_link = link_pair(; on_open = ch -> BT.accept_worker_channel(state, "ctrl-worker", ch))
+        state.worker_links["ctrl-worker"] = server_link
+        relay = BonitoWorker.start_mcp_relay(worker_link)
         try
-            state.srv = srv
-            BT.add_worker_ws_routes!(srv, state)
-            url = "http://127.0.0.1:$(srv.port)"
-
-            # Drive the REAL BonitoMCP dial loop with the env production uses.
-            withenv("BONITOAGENTS_SERVER_URL" => url,
-                    "BONITOAGENTS_SECRET"     => "ctrl-secret",
-                    "BONITOAGENTS_PROJECT_ID" => "ctrl-proj") do
-                # The control channel is once-per-process; reset for test
-                # isolation (other test files don't arm it — env is unset
-                # there). `reset_ctrl_dialback!` stops any prior loop, waits
-                # it out, and clears task/ws/stop so this arm starts fresh.
-                BonitoMCP.reset_ctrl_dialback!()
-                BonitoMCP.start_ctrl_dialback!()
-            end
+            # The REAL BonitoMCP control loop, armed with a grant the way the
+            # worker arms a chat's MCP process.
+            # The control channel is once-per-process; reset for test isolation.
+            # `reset_ctrl_dialback!` stops any prior loop, waits it out, and
+            # clears grant/task/ws/stop so this arm starts fresh.
+            BonitoMCP.reset_ctrl_dialback!()
+            BonitoMCP.take_relay_grant!(BonitoWorker.mcp_relay_env(relay, "ctrl-proj"))
+            BonitoMCP.start_ctrl_dialback!()
             @test timedwait(5.0) do
                 BT.mcp_ctrl_for(state, "ctrl-proj") !== nothing
             end === :ok
@@ -112,7 +111,7 @@ const BT = BonitoAgents
             @test_throws ErrorException BT.interrupt_project_eval!(state, "nope")
 
             # ── the OTHER direction: the debug chat's dev tools ──────────────
-            # Same socket, MCP → server. This is the only place the request
+            # Same channel, MCP → server. This is the only place the request
             # framing on both sides is exercised against a real wire; every
             # other dev-API test calls `dev_request` directly and would pass
             # even if the two halves disagreed about the frame shape.
@@ -156,23 +155,11 @@ const BT = BonitoAgents
                 end
             end
         finally
-            # Teardown order matters: stop the dial loop (so it doesn't
-            # reconnect against the closing server), then close the live
-            # ctrl WS — `close(srv)` BLOCKS until its websocket handlers
-            # drain, and the handler sits in `for msg in ws` until the
-            # socket actually closes. Bounded close as a backstop.
+            # Stop the loop first, so it doesn't reconnect into the closing relay.
             BonitoMCP.reset_ctrl_dialback!()
-            ws = BT.mcp_ctrl_for(state, "ctrl-proj")
-            if ws !== nothing
-                try
-                    close(ws)
-                catch e
-                    @warn "test_mcp_ctrl: ctrl ws close failed" exception = e
-                end
-            end
-            close_task = @async close(srv)
-            timedwait(() -> istaskdone(close_task), 15.0) === :ok ||
-                @warn "test_mcp_ctrl: server close didn't drain in time"
+            close(relay)
+            foreach(l -> WorkerLink.kill!(l, "done"), (server_link, worker_link))
+            close(srv)
         end
     end
 end

@@ -781,15 +781,9 @@ end
 # `state` so the route handler picks up the same instance the dashboard reads
 # from / the chat writes into.
 function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
-    # A worker's ONE connection: control, its agents' ACP streams and file
-    # transfers are all channels on this link (worker_client.jl).
+    # A worker's ONE connection: control, its agents' ACP streams, file
+    # transfers, and the channels its local relay opens for MCP processes and
+    # eval workers are all channels on this link (worker_client.jl).
     Bonito.HTTPServer.websocket_route!(srv, "/w" => (_ctx, ws) ->
         handle_worker_link(state, ws))
-    # Eval workers (BonitoMCP) dial here to be driven for interactive app proxying.
-    Bonito.HTTPServer.websocket_route!(srv, "/eval-ws" => (_ctx, ws) ->
-        handle_eval_ws(state, ws))
-    # The BonitoMCP stdio process itself dials here — the control channel the
-    # per-tool eval interrupt rides on (see remote_app.jl `MCP_CTRL`).
-    Bonito.HTTPServer.websocket_route!(srv, "/mcp-ws" => (_ctx, ws) ->
-        handle_mcp_ctrl_ws(state, ws))
 end

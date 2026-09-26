@@ -33,6 +33,10 @@ The worker's shared dev server + open electron window, started on first use and
 reused for the rest of the worker's life.
 """
 function server()
+    # Each item starts here (once). An eval the previous item left running
+    # would make this item's first eval on the same env fail "already in flight";
+    # own-server items get the same from `close` (see `TK.settle_mcp_evals!`).
+    TK.settle_mcp_evals!()
     if SERVER[] === nothing
         # An own-server item may have released ours; it is rebuilt here.
         TK.register_shared_release!() do

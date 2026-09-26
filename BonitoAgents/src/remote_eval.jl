@@ -3,21 +3,21 @@
 # desktop. The chat's own MCP forwards the call over its control channel
 # (`dev_request` op `remote_eval`); this file answers it: it checks the chat's
 # switch, resolves the worker, spawns a BonitoMCP EVAL HOST on that worker for
-# this chat if none is up (the worker command `open_eval_host`; the host dials
-# `/mcp-ws` back with a host handshake, see `handle_mcp_ctrl_ws`), relays the
-# call to it and hands the host's tool result back verbatim. The host's live
-# stdout streams into the chat like a local eval's, and its eval workers dial the
-# eval-ws bridge for this project, so a plot returned on the MacBook renders in
-# the chat on the desktop.
+# this chat if none is up (the worker command `open_eval_host`; the host connects
+# through that worker's relay with a host grant, see `accept_worker_channel`),
+# relays the call to it and hands the host's tool result back verbatim. The
+# host's live stdout streams into the chat like a local eval's, and its eval
+# workers open the live-render bridge for this project, so a plot returned on the
+# MacBook renders in the chat on the desktop.
 #
 # ⚠ ONE LIVE BRIDGE PER CHAT. `state.eval_workers` is keyed by project, so a
 # remote eval that returns a LIVE value displaces the chat's local bridge, and
 # the next local one displaces it back (each displacement retires the other's
-# host-side wiring — see `handle_eval_ws`). Text output, stdout streaming and
+# host-side wiring — see `serve_eval_bridge`). Text output, stdout streaming and
 # every non-live result are unaffected; it is only interleaved LIVE embeds from
 # two machines in one chat that lose their older half. This is the same
 # limitation the file's note there already records for two `env_path`s in one
-# chat, and it has the same fix: the eval-ws handshake has to carry which
+# chat, and it has the same fix: the bridge's channel header has to carry which
 # session dialed (worker + env), so bridges can coexist per session instead of
 # per project.
 #
@@ -134,7 +134,7 @@ end
 
 The live control socket of the eval host serving chat `p` on worker `w`,
 spawning the host through the worker if there is none. Single-flight per host:
-concurrent first calls share one spawn. Waits for the host's dial-back (a julia
+concurrent first calls share one spawn. Waits for the host's channel (a julia
 start plus `using BonitoMCP`; bounded by `EVAL_HOST_SPAWN_TIMEOUT_S`).
 """
 function ensure_eval_host!(state::ServerState, p::ProjectInfo, w::WorkerInfo)
@@ -147,8 +147,7 @@ function ensure_eval_host!(state::ServerState, p::ProjectInfo, w::WorkerInfo)
     lock(lk) do
         ws = eval_host_ws(state, p.id, w.worker_id)
         ws === nothing || return ws
-        env = Dict{String,String}("BONITOAGENTS_SECRET" => state.worker_secret,
-                                  "BONITOAGENTS_PROJECT_ID" => p.id)
+        env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => p.id)
         r = open_eval_host_on_worker(state, w.worker_id; project_id = p.id, env)
         @info "eval host spawned" project = p.name worker = w.name pid = r.pid existed = r.existed
         deadline = time() + EVAL_HOST_SPAWN_TIMEOUT_S
@@ -197,10 +196,10 @@ function close_eval_hosts!(state::ServerState, project_id::AbstractString)
             e isa InterruptException && rethrow()
             @warn "eval host did not acknowledge its shutdown" project_id worker_id = wid exception = e
         end
+        close(ws)   # leaves the registry, and ends the channel of a host still alive
         lock(state.lock) do
             key = eval_host_key(project_id, wid)
-            get(state.eval_hosts, key, nothing) === ws && delete!(state.eval_hosts, key)
-            # The spawn lock goes with it, so one entry per (chat, worker) that
+            # The spawn lock goes with the host, so one entry per (chat, worker) that
             # ever ran a remote eval doesn't stay for the server's life — unless
             # a spawn is holding it right now, in which case dropping it would
             # let the next caller mint a second lock for the same key and defeat

@@ -87,7 +87,8 @@ end
 
 A link endpoint. `role` is `:client` (the worker, which dials) or `:server`.
 `on_open(ch)` runs (in its own task) for every channel the PEER opens;
-`on_state(link, state)` for every `:connected` / `:detached` / `:dead` change.
+`on_state(link, state)` for every `:connected` / `:detached` / `:dead` change,
+and with `:reset` when a client's link restarts from nothing (see [`connect!`](@ref)).
 Channel 0 exists from the start on both sides: see [`control_channel`](@ref).
 """
 function Link(role::Symbol;

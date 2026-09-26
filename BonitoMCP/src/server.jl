@@ -228,8 +228,10 @@ function run_stdio(; in::IO = stdin, out::IO = stdout)
                  (length(avail) == length(TOOLS) ? "" :
                   " ($(length(TOOLS) - length(avail)) gated off)"))
     end
-    # BonitoAgents-hosted runs get a control dial-back so the chat UI can
+    # BonitoAgents-hosted runs get a control channel so the chat UI can
     # interrupt in-flight evals per tool (no-op standalone; see ctrl_ws.jl).
+    # Taken first: nothing this process starts may inherit the grant.
+    take_relay_grant!()
     start_ctrl_dialback!()
     for line in eachline(in)
         s = strip(line)

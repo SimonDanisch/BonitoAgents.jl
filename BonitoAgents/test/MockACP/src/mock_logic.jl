@@ -490,7 +490,13 @@ function run_dispatcher_prompt(prompt_id)
     # test process keys its agent fn on whatever the user typed; carry
     # the last seen prompt text in this Ref. Set by the dispatcher loop.
     prompt_text = LAST_PROMPT[]
-    println(sock, JSON.json(Dict("prompt" => prompt_text)))
+    # The environment our MCP server's launch entry carries (the worker relay's
+    # grant for this chat): the test process runs the MCP tools in-process, as
+    # this chat's MCP server would.
+    cfg = MCP_CONFIG[]
+    mcp_env = cfg === nothing ? nothing :
+        Dict(String(e["name"]) => String(e["value"]) for e in cfg["env"])
+    println(sock, JSON.json(Dict("prompt" => prompt_text, "mcp_env" => mcp_env)))
     flush(sock)
 
     stop_reason = "end_turn"

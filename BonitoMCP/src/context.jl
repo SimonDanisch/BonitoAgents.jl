@@ -3,7 +3,7 @@
 # these), so its WHOLE mutable runtime lives in one value instead of a scatter of
 # module-level Refs/Dicts/Locks:
 #   • the eval-session manager (subprocess-per-env_path),
-#   • the /mcp-ws control channel (per-tool interrupt + live stdout stream),
+#   • the control channel to the server (per-tool interrupt + live stdout stream),
 #   • the in-flight JSON-RPC bookkeeping (cancel routing + stdout write lock).
 # Eagerly built — every part is a cheap empty container.
 #
@@ -11,7 +11,7 @@
 # different process; and TOOLS is a load-time tool registry, not runtime state.
 mutable struct MCPServer
     manager::SessionManager                     # eval sessions, keyed by env_path
-    control::ControlChannel                     # /mcp-ws dial-back: interrupt + stdout stream
+    control::ControlChannel                     # to the server, via the worker relay: interrupt + stdout stream
     inflight::Dict{Any,Union{String,Nothing}}   # in-flight JSON-RPC id → env_path (cancel routing)
     # Evals this chat has running on OTHER workers (tools/eval.jl remote branch):
     # (worker, env_path) while the relayed call is in flight, so a cancel can
@@ -23,7 +23,7 @@ end
 
 const SERVER = MCPServer(
     SessionManager(),
-    ControlChannel(nothing, false, nothing),
+    ControlChannel(),
     Dict{Any,Union{String,Nothing}}(),
     Set{Tuple{String,Union{String,Nothing}}}(),
     ReentrantLock(),

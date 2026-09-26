@@ -347,16 +347,16 @@ mutable struct ServerState
     # is scoped to ONE server (a second server in the same process must not share
     # it) and dies with the server. All guarded by `lock` (the first field), the
     # same mutex their old globals were already taken under.
-    eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (eval-result dial-back)
-    mcp_ctrl           :: Dict{String,Any}              # project_id => live MCP control WS
+    eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (an eval worker's bridge channel)
+    mcp_ctrl           :: Dict{String,Any}              # project_id => the chat MCP's MCPChannel
     # Eval hosts: BonitoMCP processes serving a chat's evals from ANOTHER worker
-    # (remote_eval.jl). "project_id\0worker_id" => that host's live control WS.
+    # (remote_eval.jl). "project_id\0worker_id" => that host's MCPChannel.
     eval_hosts         :: Dict{String,Any}
     # Single-flight per host key while one is being spawned + waited for.
     eval_host_locks    :: Dict{String,ReentrantLock}
     # Live stdout/stderr stream sinks for RUNNING evals: "project_id\0route" =>
     # Channel the MCP pushes chunks into (drained by `eval_stream_loop!`). The MCP
-    # forwards worker IO over /mcp-ws (no on-disk log, no polling); the sink exists
+    # forwards worker IO over its channel (no on-disk log, no polling); the sink exists
     # only while an eval's tail loop runs. Guarded by `lock`.
     eval_stream_sinks  :: Dict{String,Channel{String}}
     session_inflight   :: Dict{String,Task}             # project_id => in-flight ensure_project_session! task

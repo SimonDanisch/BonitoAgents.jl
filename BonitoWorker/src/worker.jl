@@ -5,7 +5,8 @@
 # The link is the worker's ONE connection (`/w`). Its control channel carries
 # the server's commands and our replies; the server opens one more channel per
 # agent session and per file transfer, with the request as the channel's header
-# (`serve_channel`). A dropped connection only DETACHES the link: the agents keep
+# (`serve_channel`), and the worker opens one per local MCP or eval-worker
+# connection to its relay (mcp_relay.jl). A dropped connection only DETACHES the link: the agents keep
 # running, and the next connection resumes it where it stopped. When the server
 # no longer knows the link (it restarted, or we were away longer than its grace
 # period) the link resets, every channel on it aborts, and everything from
@@ -59,21 +60,47 @@ mutable struct Worker
     const sessions::Dict{WorkerLink.LinkChannel,AgentSession}   # by the channel it runs on
     const eval_hosts::Dict{String,Base.Process}                 # by project id
     control::Union{WorkerLink.LinkChannel,Nothing}   # the control channel being served
-    relay::Union{MCPRelay,Nothing}
     closed::Bool
-    link::WorkerLink.Link                            # last: its handlers need the worker
+    # Last: the link's handlers need the worker. The relay opens its channels on
+    # `link`, and is replaced with it (see `swap_relay!`).
+    link::WorkerLink.Link
+    relay::MCPRelay
     function Worker(config::WorkerConfig)
         w = new(config, ReentrantLock(), UpdateState(nothing, false, 0),
                 Dict{WorkerLink.LinkChannel,AgentSession}(), Dict{String,Base.Process}(),
-                nothing, nothing, false)
+                nothing, false)
         w.link = new_link(w)
+        w.relay = start_mcp_relay(w.link)
         return w
     end
 end
 
 new_link(w::Worker) = WorkerLink.Link(:client;
     on_open  = ch -> serve_channel(w, ch),
-    on_state = (_, st) -> st === :dead && reap!(w, "the link to the server died"))
+    on_state = (link, st) -> link_state!(w, link, st))
+
+# Every channel a link delivers must find the relay of that same link. A new link
+# gets its relay before it connects, and a reset (`:reset` comes before the new
+# connection delivers anything) swaps it, so neither ever races a channel.
+function swap_relay!(w::Worker, relay::MCPRelay)
+    old = lock(w.lock) do
+        prev = w.relay
+        w.relay = relay
+        prev
+    end
+    close(old)
+    return nothing
+end
+
+function link_state!(w::Worker, link::WorkerLink.Link, st::Symbol)
+    if st === :dead
+        reap!(w, "the link to the server died")
+    elseif st === :reset
+        reap!(w, "the server started a new link")
+        swap_relay!(w, start_mcp_relay(link))
+    end
+    return nothing
+end
 
 updating(w::Worker) = lock(() -> w.update.pending, w.lock)
 
@@ -107,7 +134,10 @@ end
 
 # One connection: dial, handshake, and hold it until it ends.
 function connect_once!(w::Worker)
-    WorkerLink.state(w.link) === :dead && (w.link = new_link(w))
+    if WorkerLink.state(w.link) === :dead
+        w.link = new_link(w)
+        swap_relay!(w, start_mcp_relay(w.link))
+    end
     url = ws_url(w.config.server_url, "/w")
     @info "BonitoWorker: connecting" url worker_id = w.config.worker_id name = w.config.name
     t = WorkerLink.WebSocketTransport(WebSockets.open(url))
@@ -137,21 +167,13 @@ end
 
 # After a handshake. The control channel we already serve means the link
 # resumed and everything carries on. Another one means the link is new or was
-# reset: the server has no use for anything from before.
+# reset; what ran on the old one is reaped already (`link_state!`).
 function connected!(w::Worker, ack::AbstractDict)
     ctrl = WorkerLink.control_channel(w.link)
     if ctrl === w.control
         @info "BonitoWorker: link resumed"
     else
-        reap!(w, "the server started a new link")
-        relay = start_mcp_relay(ctrl)
-        old = lock(w.lock) do
-            prev = w.relay
-            w.control = ctrl
-            w.relay = relay
-            prev
-        end
-        old === nothing || close(old)
+        lock(() -> (w.control = ctrl), w.lock)
         Base.errormonitor(@async serve_control(w, ctrl))
         @info "BonitoWorker: registered with server" name = get(ack, "registered_as", w.config.name)
     end
@@ -184,15 +206,9 @@ function reap!(w::Worker, reason::AbstractString)
 end
 
 function Base.close(w::Worker)
-    lock(() -> (w.closed = true), w.lock)
-    WorkerLink.kill!(w.link, "worker closed")          # reaps, see `new_link`
-    relay = lock(w.lock) do
-        r = w.relay
-        w.relay = nothing
-        w.control = nothing
-        r
-    end
-    relay === nothing || close(relay)
+    lock(() -> (w.closed = true; w.control = nothing), w.lock)
+    WorkerLink.kill!(w.link, "worker closed")          # reaps, see `link_state!`
+    close(lock(() -> w.relay, w.lock))
     return nothing
 end
 
@@ -219,9 +235,7 @@ end
 function dispatch_command(w::Worker, ws, cmd::AbstractDict)
     c = w.config
     t = get(cmd, "type", "")
-    if t in ("mcp_frame", "mcp_close")
-        handle_mcp_relay_frame!(w.relay, cmd)
-    elseif t == "list_dir"
+    if t == "list_dir"
         @async handle_list_dir(ws, cmd)
     elseif t == "make_dir"
         @async handle_make_dir(ws, cmd)
@@ -340,12 +354,13 @@ function run_agent_session(w::Worker, ch::WorkerLink.LinkChannel, header::Abstra
         end
     end
 
-    # The server URL goes to the agent, and explicitly into our MCP entry in the
-    # relay below: some agents filter the environment their MCP children inherit.
-    env = provider_env(provider, merge(Dict("BONITOAGENTS_SERVER_URL" => c.server_url), c.agent_env))
+    env = provider_env(provider, c.agent_env)
     # `provider.args` carries any required subcommand (`["acp"]` for
     # mimo/opencode/kimi, whose ACP server lives under that subcommand).
     agent_args = provider.args
+    relay = lock(() -> w.relay, w.lock)   # the relay of the link `ch` came on
+    # Names this session's MCP grants, so they are revoked with it.
+    owner = "acp:" * bytes2hex(rand(Random.RandomDevice(), UInt8, 8))
     proc = try
         # `detach` = `setsid()` in the child: the agent leads its OWN process
         # group, so everything it spawns (the MCP servers, and the Julia eval
@@ -358,14 +373,11 @@ function run_agent_session(w::Worker, ch::WorkerLink.LinkChannel, header::Abstra
         return refuse_channel(ch,
             "failed to spawn agent ($agent_bin $(join(agent_args, ' '))): $(Base.struverror(e.code))")
     end
-    relay = w.relay
-    # Names this session's MCP grants, so they are revoked with it.
-    owner = "acp:" * bytes2hex(rand(Random.RandomDevice(), UInt8, 8))
     lock(() -> (w.sessions[ch] = AgentSession(proc, project_id, cwd)), w.lock)
     @info "BonitoWorker: ACP session started" project_id cwd provider = provider_str pid = getpid(proc)
     try
         channel_ready(ch)
-        to_agent   = @async relay_ws_to_proc(ch, proc; server_url = c.server_url, mcp_relay = relay, owner)
+        to_agent   = @async relay_ws_to_proc(ch, proc, relay, owner)
         from_agent = @async relay_proc_to_ws(proc, ch)
         try
             wait(to_agent)
@@ -378,7 +390,7 @@ function run_agent_session(w::Worker, ch::WorkerLink.LinkChannel, header::Abstra
         # The server gave up on the session before we could answer.
         e isa WebSockets.WebSocketError || rethrow()
     finally
-        relay === nothing || revoke_mcp_grants!(relay, owner)
+        revoke_mcp_grants!(relay, owner)
         lock(() -> delete!(w.sessions, ch), w.lock)
         kill_proc!(proc)
         close(ch)

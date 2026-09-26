@@ -27,9 +27,15 @@ App() do
     fig
 end"""
 
+# A cold eval worker spends well over the default 30 s soft timeout in
+# `using WGLMakie`; the eval must return, not yield "still running", for its
+# error to reach the card.
+const COLD_WGLMAKIE_S = 300
+
 function render_err_agent(prompt::AbstractString)
     occursin("plot", lowercase(prompt)) || return [TK.text("Echo: $(prompt)")]
-    return Any[TK.text("plotting:"), TK.bt_eval(BADAPP; env_path = RENDER_ENV, id = "bad-app")]
+    return Any[TK.text("plotting:"),
+               TK.bt_eval(BADAPP; env_path = RENDER_ENV, id = "bad-app", timeout = COLD_WGLMAKIE_S)]
 end
 
 const CARD = ".bt-tool-msg[data-msg-id*=\"bad-app\"]"
@@ -46,9 +52,14 @@ function run_suite(server)
         # The render error surfaces in the card — `summary_html` returned the
         # CapturedException, so the red error is echoed into the Output stream and
         # the exception is parked as the embed. Either way the marker is visible.
+        # Only there: the Code section shows the marker too, from the first frame,
+        # so a whole-card check passed even while the eval had not returned.
         @test TK.wait_for(server, "render error shown",
-            "(() => { const e = document.querySelector('$CARD'); return !!(e && (e.innerText||'').includes('notanattr_zqx')); })()";
-            timeout = 30) == true
+            """(() => {
+                const e = document.querySelector('$CARD');
+                return !!e && [...e.querySelectorAll('.bt-eval-output, .bt-eval-result')]
+                    .some(s => (s.innerText||'').includes('notanattr_zqx'));
+            })()"""; timeout = COLD_WGLMAKIE_S) == true
     end
     return server
 end

@@ -248,6 +248,10 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
         try
             Bonito.HTTP.WebSockets.open(wsurl) do ws
                 Bonito.HTTP.WebSockets.send(ws, handshake)
+                # "ok" once the server took the bridge; a refusal closes the
+                # socket with the server's reason instead.
+                verdict = Bonito.HTTP.WebSockets.receive(ws)
+                verdict == "ok" || error("the worker relay answered $(repr(verdict)) instead of ok")
                 connected = true
                 serve_bridge(ws)
             end
@@ -255,7 +259,7 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
             @warn "RemoteProxy: dial failed; will retry" wsurl backoff exception = e
         end
         # `connected` is the right signal — `serve_bridge` returning is normal
-        # (peer EOF); never getting past `open` is a real failure → grow backoff.
+        # (peer EOF); never getting the relay's "ok" is a real failure → grow backoff.
         backoff = connected ? min_backoff : min(backoff * 2, max_backoff)
         sleep(backoff)
     end
@@ -275,7 +279,7 @@ function start_dial!(wsurl::AbstractString, handshake::AbstractString)
     DIAL_TASK[] = @async try
         dial_loop(wsurl, handshake)
     catch e
-        @warn "BonitoMCP eval-ws dial loop crashed" exception = (e, catch_backtrace())
+        @warn "BonitoMCP live-render bridge dial loop crashed" exception = (e, catch_backtrace())
     end
     return nothing
 end

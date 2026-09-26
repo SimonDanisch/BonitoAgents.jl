@@ -52,9 +52,9 @@ available_tools() = [t for t in TOOLS if t.available()]
 include("server.jl")
 include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)
 include("eval_image.jl")       # colour-matrix results → PNG files (PNGFiles, in OUR env)
-include("ctrl_ws.jl")          # control dial-back to BonitoAgents (per-tool interrupt)
+include("ctrl_ws.jl")          # control channel to BonitoAgents via the worker relay
 include("context.jl")          # the one MCPServer value (SERVER) owning all process state
-include("eval_host.jl")        # run_eval_host — serve another worker's chat over /mcp-ws
+include("eval_host.jl")        # run_eval_host — serve another worker's chat through its relay
 include("tools/eval.jl")
 include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
 include("tools/dev.jl")        # bt_dev_* — server introspection; only in a debug chat

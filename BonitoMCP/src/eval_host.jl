@@ -4,25 +4,27 @@
 # server (`call_server("remote_eval", …)`, tools/eval.jl), the server spawns one
 # of these on the MacBook's worker for that chat, and relays the eval to it over
 # the worker daemon's existing connection. A local relay grant binds the host
-# to its chat; older workers use the legacy /mcp-ws handshake instead.
+# to its chat.
 #
 # Everything below the wire is shared with the stdio server: the same session
 # manager (one Malt worker per env_path), the same tool handlers, the same live
 # stdout streaming (`eval_stream_chunk` frames the server routes to the chat's
-# eval card), the same eval-ws live-render bridge (the host's eval workers dial
-# the server for the chat's project, so a plot returned on the MacBook renders
+# eval card), the same live-render bridge (the host's eval workers connect it
+# for the chat's project through this worker's relay, so a plot returned on the MacBook renders
 # into the chat on the desktop).
 #
 # Wire, on top of ctrl_ws.jl's:
-#   legacy handshake: "secret project_id eval_host worker_id"
 #   server → host:  {"op": "eval"|"continue"|"interrupt"|"restart"|"sessions",
 #                    "request_id", "args": {…the tool's own arguments…}}
 #                   {"op": "shutdown", "request_id"}
 #   host → server:  {"type": "eval_host_result", "request_id", "result": <tool result>}
 #
 # Lifetime: the process exits on `shutdown` (the chat's session ended, or the
-# user switched remote Julia off), or when the server has been unreachable for
-# `HOST_ORPHAN_S` — a host nobody can reach serves nobody. Both paths shut the
+# user switched remote Julia off), or when it has had no control channel the
+# server accepted for `HOST_ORPHAN_S` (the server is gone, or refuses this host,
+# e.g. remote Julia was switched off meanwhile) — a host nobody can reach serves
+# nobody. The relay only answers "ok" once the server took the channel, so a
+# refusal never counts as connected (ctrl_ws.jl). Both paths shut the
 # session manager down, which kills the eval workers and what they spawned.
 
 const HOST_ORPHAN_S   = 600.0
@@ -41,32 +43,17 @@ Serve evals for one chat from THIS worker until told to shut down. Reads the sam
 spawned it). Blocks; returns after the shutdown.
 """
 function run_eval_host()
-    if !isempty(get(ENV, "BONITOAGENTS_CONTROL_URL", ""))
-        isempty(host_worker_id()) && error("eval host has no worker identity")
-        start_ctrl_dialback!()
-        try
-            watch_host_orphaned()
-        finally
-            shutdown!(manager())
-            reset_ctrl_dialback!()
-        end
-        return nothing
+    isempty(host_worker_id()) && error("run_eval_host: $(HOST_ENV_WORKER) is not set")
+    take_relay_grant!() === nothing && error("run_eval_host: no local worker relay (BONITOAGENTS_CONTROL_URL is not set)")
+    SERVER.control.task === nothing || error("run_eval_host: this process already has a control channel")
+    log_info("eval host on worker $(host_worker_id())")
+    start_ctrl_dialback!()
+    try
+        watch_host_orphaned()
+    finally
+        shutdown!(manager())
+        reset_ctrl_dialback!()
     end
-    server_url = get(ENV, "BONITOAGENTS_SERVER_URL", "")
-    secret     = get(ENV, "BONITOAGENTS_SECRET", "")
-    project_id = get(ENV, "BONITOAGENTS_PROJECT_ID", "")
-    worker_id  = host_worker_id()
-    for (k, v) in (("BONITOAGENTS_SERVER_URL", server_url), ("BONITOAGENTS_SECRET", secret),
-                   ("BONITOAGENTS_PROJECT_ID", project_id), (HOST_ENV_WORKER, worker_id))
-        isempty(v) && error("run_eval_host: $(k) is not set")
-    end
-    SERVER.control.task === nothing || error("run_eval_host: this process already dials a control channel")
-    wsurl = replace(rstrip(server_url, '/'), r"^http" => "ws") * "/mcp-ws"
-    log_info("eval host for chat $(project_id) on worker $(worker_id) → $(wsurl)")
-    SERVER.control.task = Base.errormonitor(@async ctrl_dial_loop(
-        wsurl, "$secret $project_id eval_host $worker_id"))
-    watch_host_orphaned()
-    shutdown!(manager())
     log_info("eval host exiting")
     return nothing
 end

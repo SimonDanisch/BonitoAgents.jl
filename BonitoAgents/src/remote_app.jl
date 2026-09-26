@@ -1,13 +1,15 @@
 # Embed an interactive Bonito App that lives in a worker eval process into a host
-# browser Session by piping the Bonito protocol RAW over the worker's dial-back
-# websocket. The worker renders + owns the observables; the BonitoAgents server is a
-# byte relay between that socket and the browser, plus the one server-side asset
-# mirror (the browser fetches assets over HTTP). There is NO Malt on the frame
-# path — every Bonito frame is just bytes on the websocket, both directions. Malt
-# (via BonitoMCP's own link to its workers) is used ONLY to bootstrap the worker:
-# include RemoteProxy, build the bridge, start the dial. See BonitoMCP/RemoteProxy.jl.
+# browser Session by piping the Bonito protocol RAW over a channel of the
+# worker's link: the eval worker connects to its worker's local relay, which
+# opens the channel for the chat (`accept_worker_channel`). The eval worker
+# renders + owns the observables; the BonitoAgents server is a byte relay
+# between that channel and the browser, plus the one server-side asset mirror
+# (the browser fetches assets over HTTP). There is NO Malt on the frame path —
+# every Bonito frame is just bytes, both directions. Malt (via BonitoMCP's own
+# link to its workers) is used ONLY to bootstrap the worker: include
+# RemoteProxy, build the bridge, start the dial. See BonitoMCP/RemoteProxy.jl.
 #
-# Wire format on the dial-back WS: `[tag][payload]`.
+# Wire format on the channel: `[tag][payload]`.
 #   * `D` (data)    — a Bonito frame, piped verbatim (worker→browser and back).
 #   * `C` (control) — a small msgpack dict for the few request/response ops:
 #                     `asset_read` (lazy range fetch), `asset_url` (expose a
@@ -19,7 +21,7 @@ const Malt = BonitoMCP.Malt   # only the BonitoMCP-side bootstrap touches Malt
 const TAG_DATA = UInt8('D')
 const TAG_CTRL = UInt8('C')
 
-# One per worker process (keyed by project). Owns the dial-back socket, the stable
+# One per worker process (keyed by project). Owns the bridge's channel, the stable
 # per-worker asset registry (a `ChildAssetServer` of the dashboard's one
 # `HTTPAssetServer`, so proxied assets outlive any transient render session), the
 # pending control-request table, and the current browser root connection that
@@ -29,9 +31,9 @@ mutable struct EvalBridge
     # The owning chat. Nothing reads it today — the registry is keyed by project,
     # so the key IS this value — but it is what lets a bridge be found by
     # anything other than that key, which the env_path fix noted in
-    # `handle_eval_ws` needs. Kept deliberately rather than re-derived later.
+    # `serve_eval_bridge` needs. Kept deliberately rather than re-derived later.
     project_id::String
-    ws::Any                              # dial-back websocket; swapped on reconnect under wlock
+    ws::Any                              # the bridge's channel; swapped on reconnect under wlock
     wlock::ReentrantLock                 # serialize frame sends to the worker AND ws-swap
     asset_host::Bonito.ChildAssetServer
     pending::Dict{Int, Channel{Any}}     # control req-id → reply channel
@@ -47,7 +49,7 @@ mutable struct EvalBridge
     pc_lock::ReentrantLock
     open_lock::ReentrantLock             # serialize per-tab open_root round-trips
     # Worker→browser frames that arrived while a page-root had NO browser
-    # connection (dial-back → first-mount window, tab-switch, reconnect). Dropping
+    # connection (bridge connect → first-mount window, tab-switch, reconnect). Dropping
     # them silently was the root cause of the "plot spinner never finishes" hang.
     # Bucketed PER page-root prefix; flushed in order on that tab's next
     # attach/reconnect (`flush_parked!`); the byte-cap drops OLDEST first (warn).
@@ -113,7 +115,7 @@ function flush_parked!(eb::EvalBridge, prefix::AbstractString, rc)
 end
 
 # Read an eval bridge for `project_id` under `state.lock` (T11). Writers
-# (`handle_eval_ws`, `teardown_eval_bridge!`) mutate `state.eval_workers` under the
+# (`serve_eval_bridge`, `teardown_eval_bridge!`) mutate `state.eval_workers` under the
 # same lock, so UI tasks that just `get(state.eval_workers, …)` raced a concurrent
 # insert/delete (Dict rehash). All reads go through here.
 eval_bridge_for(state::ServerState, project_id::AbstractString) =
@@ -136,7 +138,7 @@ function send_tagged(eb::EvalBridge, tag::UInt8, payload::AbstractVector{UInt8})
         try
             HTTP.WebSockets.send(ws, buf)
         catch e
-            # The expected failure here is a send racing the dial-back socket
+            # The expected failure here is a send racing the bridge's channel
             # dropping/swapping. Anything else is real signal — `@debug` would
             # silently hide it (default log level Info), so `@warn` so the
             # actual exception type/message is visible during diagnosis.
@@ -189,7 +191,7 @@ Bonito.proxy_fetch(eb::EvalBridge, key, start, stop) =
 worker_asset_url(eb::EvalBridge, path::AbstractString) =
     String(call_ctrl(eb, "asset_url"; path = String(path)))
 
-# A control request that expects a reply (asset_read / asset_url). The dial-back
+# A control request that expects a reply (asset_read / asset_url). The bridge
 # relay loop resolves it via `pending`; this runs on a DIFFERENT task (a chat
 # command or an HTTP asset handler), so the wait can't deadlock the relay.
 function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, redial_grace = 10.0, kw...)
@@ -286,9 +288,6 @@ function fail_pending!(eb::EvalBridge, why::AbstractString)
     return nothing
 end
 
-# `/eval-ws` handler. Handshake is "secret project_id prefix"; after that the
-# socket is a raw Bonito frame pipe. This task IS the worker→browser relay (and
-# the worker→host control reader) for the bridge's whole lifetime.
 # Process one inbound frame from the worker: DATA → queue for the browser (so a
 # slow browser can't block the relay loop); CTRL → handle inline (reply routing +
 # asset register, all fast). Extracted so the decoupling is unit-testable.
@@ -348,38 +347,27 @@ function relay_writer(eb::EvalBridge, outbound::Channel{Vector{UInt8}})
     return nothing
 end
 
-# A short, non-reversible fingerprint of a secret — lets two log lines be
-# compared ("worker sent <x>, server expects <y>") without ever printing the
-# secret itself. Matches the sha8 form the diagnosing agent expected.
-secret_fingerprint(s::AbstractString) = isempty(s) ? "<empty>" : bytes2hex(SHA.sha256(s))[1:8]
-
-function handle_eval_ws(state::ServerState, ws)
-    line = try; String(HTTP.WebSockets.receive(ws)); catch e
-        @warn "eval dial-back rejected: handshake never arrived" exception=e; return
-    end
-    parts = split(strip(line), ' '; limit = 3)
-    # Self-diagnosing: split the lumped "bad handshake" into the real reason so a
-    # rejection is one log line, not a detective hunt. Expected: "secret project_id prefix".
-    if length(parts) != 3
-        @warn "eval dial-back rejected: malformed handshake (expected 3 fields 'secret project_id prefix')" got_fields=length(parts) project_id=(length(parts) ≥ 2 ? String(parts[2]) : "") has_prefix=(length(parts) ≥ 3 && !isempty(parts[3]))
-        return
-    end
-    if parts[1] != state.worker_secret
-        @warn "eval dial-back rejected: secret MISMATCH — worker dialed with a different secret than the server expects (stale env / server restarted with a new secret / port reused)" worker_secret=secret_fingerprint(parts[1]) server_secret=secret_fingerprint(state.worker_secret) project_id=String(parts[2])
-        return
-    end
-    project_id = String(parts[2]); prefix = String(parts[3])
+# The bridge of an eval worker, on the channel its relay opened for `project_id`,
+# with `prefix` naming its bridge (`BRIDGE[].parent.id` on the worker). This task
+# IS the worker→browser relay (and the worker→host control reader) for as long
+# as the channel lives.
+function serve_eval_bridge(state::ServerState, ws::WorkerLink.LinkChannel, project_id::String, prefix::String)
     if isempty(prefix)
-        @warn "eval dial-back rejected: empty bridge prefix (worker RemoteProxy bridge setup failed)" project_id
+        @warn "eval bridge rejected: empty bridge prefix (worker RemoteProxy bridge setup failed)" project_id
+        WorkerLink.abort(ws, "empty bridge prefix")
         return
     end
     if state.srv === nothing
-        @warn "eval dial-back with no live server — cannot proxy assets"; return
+        @warn "eval bridge with no live server — cannot proxy assets" project_id
+        WorkerLink.abort(ws, "no live server")
+        return
     end
+    # Before the bridge is installed: nothing else may be the channel's first frame.
+    accept_channel(ws)
 
-    # Existing dial for this project? Decide reconnect vs. replace by comparing
+    # Existing bridge for this project? Decide reconnect vs. replace by comparing
     # `prefix` against `BRIDGE[].parent.id` on the worker side. Same prefix ⇒
-    # same `BRIDGE[]` (routes intact) ⇒ swap WS into the existing EvalBridge.
+    # same `BRIDGE[]` (routes intact) ⇒ swap the channel into the existing EvalBridge.
     # Different prefix ⇒ stale routes ⇒ hard-replace.
     #
     # ⚠ KNOWN LIMITATION — a different prefix does NOT always mean the worker
@@ -400,7 +388,7 @@ function handle_eval_ws(state::ServerState, ws)
     # was NOT established (the runs meant to show it never executed), so treat
     # that as an open question, not a known-good design.
     #
-    # Doing this properly needs the dial handshake to carry `env_path`, so "same
+    # Doing this properly needs the channel header to carry `env_path`, so "same
     # project + same env, new prefix" (a restart ⇒ retire) can be told from
     # "different env" (⇒ coexist), and the retire path kept for the former.
     # Until then one bridge per project stands, and the two-env case is the
@@ -421,7 +409,7 @@ function handle_eval_ws(state::ServerState, ws)
         else
             fresh = make_eval_bridge(prefix, project_id, ws, Bonito.HTTPAssetServer(state.srv))
             state.eval_workers[project_id] = fresh
-            @info "eval worker dialed back (ws) — raw bridge installed" project_id prefix
+            @info "eval bridge connected — raw bridge installed" project_id prefix
             (fresh, nothing, existing)             # retire the old (different-prefix) bridge below
         end
     end
@@ -460,23 +448,23 @@ function handle_eval_ws(state::ServerState, ws)
                 data = msg isa AbstractVector{UInt8} ? msg : Vector{UInt8}(codeunits(String(msg)))
                 relay_frame!(eb, outbound, data)
             catch e
-                @warn "eval dial-back: dropping bad frame" exception = (e, catch_backtrace())
+                @warn "eval bridge: dropping bad frame" exception = (e, catch_backtrace())
             end
         end
     catch e
         is_peer_gone(e) ||
-            @warn "eval dial-back relay loop ended" exception = (e, catch_backtrace())
+            @warn "eval bridge relay loop ended" exception = (e, catch_backtrace())
     finally
         close(outbound)   # stop the writer task
-        # WS dropped. Fail in-flight requests (no reply can arrive over a dead
-        # socket) and mark the bridge disconnected so `call_ctrl` fails fast
-        # instead of hanging the full timeout. We DON'T tear the bridge down here:
-        # its lifetime is the eval worker's Julia session, not this socket. The
+        # Channel gone. Fail in-flight requests (no reply can arrive over it) and
+        # mark the bridge disconnected so `call_ctrl` fails fast instead of
+        # hanging the full timeout. We DON'T tear the bridge down here: its
+        # lifetime is the eval worker's Julia session, not this channel. The
         # worker's `dial_loop` redials (same prefix → the reconnect branch swaps
-        # the WS back in, routes + registered apps intact). Teardown happens only
-        # with the worker session — see `teardown_eval_bridge!`. The identity
-        # guard avoids clobbering a WS a concurrent reconnect already swapped in.
-        fail_pending!(eb, "eval bridge WS dropped; awaiting redial")
+        # the channel back in, routes + registered apps intact). Teardown happens
+        # only with the worker session — see `teardown_eval_bridge!`. The identity
+        # guard avoids clobbering a channel a concurrent reconnect swapped in.
+        fail_pending!(eb, "eval bridge channel dropped; awaiting redial")
         lock(eb.wlock) do
             eb.ws === ws && (eb.ws = nothing)
         end
@@ -501,7 +489,7 @@ function clear_bridge_wiring!(eb::EvalBridge)
 end
 
 # Tear an eval bridge down — tied to the eval worker's Julia SESSION lifecycle,
-# NOT to its dial-back socket (a WS drop just awaits redial; see handle_eval_ws's
+# NOT to its channel (a drop just awaits redial; see serve_eval_bridge's
 # finally). Called from the normal project/worker teardown (`stop_session!`,
 # worker disconnect): releases the proxied asset host, fails in-flight control
 # requests, drops host-side wiring, and evicts from state.eval_workers. Idempotent.
@@ -526,14 +514,15 @@ function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
     return nothing
 end
 
-# ── MCP-process control channel (/mcp-ws) ───────────────────────────────────
-# The BonitoMCP stdio server (NOT its Malt eval worker) dials this back so the
-# chat can interrupt an in-flight bt_julia_eval per tool — without cancelling
-# the whole agent turn. Distinct from /eval-ws on purpose: the eval worker
-# runs user code and can be too busy to service a control frame; the MCP
-# process never runs user code and owns the reliable `Malt.interrupt` lever.
+# ── MCP-process control channel ─────────────────────────────────────────────
+# The BonitoMCP stdio server (NOT its Malt eval worker) connects this through
+# its worker's relay (`MCPChannel`, mcp_relay.jl) so the chat can interrupt an
+# in-flight bt_julia_eval per tool — without cancelling the whole agent turn.
+# Distinct from the eval bridge on purpose: the eval worker runs user code and
+# can be too busy to service a control frame; the MCP process never runs user
+# code and owns the reliable `Malt.interrupt` lever.
 #
-# Wire (JSON per WS message):
+# Wire (JSON per message):
 #   server → mcp:  {"op": "interrupt_eval", "request_id", "env_path"?}
 #   mcp → server:  {"type": "interrupt_result", "request_id", "interrupted": n}
 # Replies route through the same `pending_rpcs` machinery as worker RPCs.
@@ -542,61 +531,6 @@ mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
     lock(state.lock) do
         get(state.mcp_ctrl, String(project_id), nothing)
     end
-
-# Two kinds of process dial this route, told apart by the handshake:
-#   "secret project_id"                      — a chat's own MCP server;
-#   "secret project_id eval_host worker_id"  — an EVAL HOST: the same BonitoMCP
-#     serving that chat's evals from ANOTHER worker (remote_eval.jl). Its frames
-#     are the same (live stdout, RPC replies), keyed under `state.eval_hosts`;
-#     its stdout routes carry the worker id so two sessions on the same
-#     env_path on different machines can't collide in one chat.
-function handle_mcp_ctrl_ws(state::ServerState, ws)
-    line = try; String(HTTP.WebSockets.receive(ws)); catch e
-        @warn "mcp ctrl dial-back rejected: handshake never arrived" exception=e; return
-    end
-    parts = split(strip(line), ' ')
-    is_host = length(parts) == 4 && parts[3] == "eval_host"
-    if !(length(parts) == 2 || is_host)
-        @warn "mcp ctrl dial-back rejected: malformed handshake (expected 'secret project_id' or 'secret project_id eval_host worker_id')" got_fields=length(parts)
-        return
-    end
-    if parts[1] != state.worker_secret
-        @warn "mcp ctrl dial-back rejected: secret MISMATCH" worker_secret=secret_fingerprint(parts[1]) server_secret=secret_fingerprint(state.worker_secret) project_id=String(parts[2])
-        return
-    end
-    project_id = String(parts[2])
-    host_worker = is_host ? String(parts[4]) : ""
-    registry, key = is_host ? (state.eval_hosts, eval_host_key(project_id, host_worker)) :
-                              (state.mcp_ctrl, project_id)
-    lock(state.lock) do
-        registry[key] = ws
-    end
-    is_host ? (@info "eval host connected" project_id worker_id = host_worker) :
-              (@info "MCP control channel connected" project_id)
-    try
-        for msg in ws
-            # Per-frame guard — one malformed reply must not drop the channel.
-            try
-                d = JSON.parse(String(msg))
-                handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
-            catch e
-                @warn "mcp ctrl frame error" exception = e
-            end
-        end
-    catch e
-        is_stale_session_error(e) ||
-            @warn "mcp ctrl loop ended" project_id exception = (e, catch_backtrace())
-    finally
-        # Identity-guarded eviction: a reconnect may have swapped a fresh WS
-        # in before this stale handler's finally ran.
-        lock(state.lock) do
-            get(registry, key, nothing) === ws && delete!(registry, key)
-        end
-        is_host ? (@info "eval host channel closed" project_id worker_id = host_worker) :
-                  (@info "MCP control channel closed" project_id)
-    end
-    return
-end
 
 function handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
     if get(d, "type", "") == "eval_stream_chunk"
@@ -663,7 +597,7 @@ eval_sink_key(project_id::AbstractString, route::AbstractString) = "$project_id\
 """
     route_eval_chunk!(state, project_id, route, chunk)
 
-Deliver a live stdout/stderr chunk (pushed by the MCP over /mcp-ws) to the
+Deliver a live stdout/stderr chunk (pushed by the MCP over its channel) to the
 matching running eval's tail loop. Drops silently if no tail is listening — the
 live stream is a best-effort display side-channel; the agent's copy of the
 output rides the MCP tool response separately.
@@ -692,8 +626,7 @@ chat-side half of the per-tool ⊗ stop button. `env_path` scopes the
 interrupt to one eval session; `nothing` interrupts every in-flight eval of
 that chat's MCP process (it serves exactly one chat, so that's safe).
 Returns how many evals were interrupted. Throws when the project has no
-live control channel (agent not started, or a worker install that predates
-the feature).
+live control channel (the agent or its MCP server is not up yet).
 """
 function interrupt_project_eval!(state::ServerState, project_id::AbstractString;
                                  env_path::Union{AbstractString,Nothing} = nothing,
@@ -701,7 +634,7 @@ function interrupt_project_eval!(state::ServerState, project_id::AbstractString;
     ws = mcp_ctrl_for(state, project_id)
     ws === nothing && error(
         "no MCP control channel for this chat — the agent's MCP server " *
-        "hasn't dialed back (not started yet, or an old worker install)")
+        "has no channel through its worker (not started yet)")
     n = interrupt_over_channel!(state, ws, env_path, timeout, "interrupt_eval")
     # The chat's evals on OTHER workers (remote_eval.jl) are stopped the same
     # way, through their hosts' channels.
@@ -731,24 +664,19 @@ function interrupt_over_channel!(state::ServerState, ws, env_path, timeout::Real
     return Int(get(resp, "interrupted", 0))
 end
 
-# Env the server injects into the BonitoMCP MCP server so its eval worker can
-# dial `/eval-ws` back. The dial-back URL itself is NOT set here — the
-# BonitoWorker daemon supplies `BONITOAGENTS_SERVER_URL` explicitly in the ACP
-# MCP launch entry (the URL it dialed in on), and BonitoMCP derives the eval-ws
-# path from it. That keeps both dial-backs keyed off the same proven URL
-# and avoids the server having to guess its own outward-facing address.
 # The name of the ONE MCP server we inject into every chat (see
 # `bring_up_project_session!`). Named in a const because two places need to agree
 # on it: the one that builds the server, and `refresh_injected_env` — which must
-# re-point OURS and leave any other entry alone rather than handing a stranger
-# `BONITOAGENTS_SECRET`.
+# re-point OURS and leave any other entry alone.
 const INJECTED_MCP_NAME = "btworker"
 
-function eval_dialback_env(state::ServerState, project_id::AbstractString)
-    env = Dict{String,String}(
-        "BONITOAGENTS_SECRET"     => state.worker_secret,
-        "BONITOAGENTS_PROJECT_ID" => String(project_id),
-    )
+# The environment the server gives our MCP server: which chat it serves, and
+# whether it offers the dev tools. How it reaches the server is the worker's
+# business: the worker adds a grant to its local relay to the launch entry
+# (BonitoWorker's `inject_mcp_grant`), so neither a server address nor a secret
+# is handed to the MCP process or anything it spawns.
+function mcp_env(state::ServerState, project_id::AbstractString)
+    env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => String(project_id))
     # The ONE thing that turns on the `bt_dev_*` server-introspection tools in
     # that chat's MCP process. Keyed on the project's persisted `dev_mode` flag,
     # so a normal chat can never see them — not even one whose cwd happens to be
@@ -772,13 +700,13 @@ one entry rather than mutating it.
 
 An empty `project_id` (no project matched the agent's worker + path) means there
 is nothing to derive from, so the existing environment is kept — overwriting it
-with `eval_dialback_env(state, "")` would blank the project id the MCP needs to
-dial back with.
+with `mcp_env(state, "")` would blank the project id the MCP needs to
+speak for its chat.
 """
 function refresh_injected_env(mcp::AbstractVector{ACP.MCPServer}, state::ServerState,
                               project_id::AbstractString)
     (isempty(mcp) || isempty(project_id)) && return mcp
-    env = eval_dialback_env(state, project_id)
+    env = mcp_env(state, project_id)
     return ACP.MCPServer[s.name == INJECTED_MCP_NAME ?
                          ACP.MCPServer(s.name, s.command; args = s.args, env = env) : s
                          for s in mcp]
@@ -982,7 +910,7 @@ function remote_result(state::ServerState, payload::AbstractString, project_id::
     # returns `Bonito.Session(parent).id`, and Bonito mints child ids as bare
     # uuids — so there is nothing here to bind the ref to the worker that minted
     # it. With one bridge per project that is fine; see the two-env limitation
-    # noted at `handle_eval_ws`.
+    # noted at `serve_eval_bridge`.
     #
     # The snapshot is deliberately EMPTY here, even though the descriptor
     # carries the worker's `repr` and the "Static-first" note above describes

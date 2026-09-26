@@ -342,6 +342,32 @@ end
     kill!(client, "done"); kill!(server, "done"); kill!(server2, "done")
 end
 
+@testset "a reset is reported before the new connection delivers anything" begin
+    reg = Dict{Vector{UInt8},Link}()
+    seen = Any[]
+    seen_lock = ReentrantLock()
+    note(x) = lock(() -> push!(seen, x), seen_lock)
+    client = Link(:client; on_state = (_, st) -> note(st),
+                  on_open = ch -> note(String(copy(WL.header(ch)))))
+    server, _, _ = dial!(client, reg)
+    empty!(reg)                                  # the server restarted
+    disconnect!(client)
+    # The restarted server opens a channel the moment it has welcomed the
+    # client, which can arrive before the client's `connect!` has returned.
+    ct, st = memory_pair()
+    server2 = errormonitor(Threads.@spawn begin
+        link = serve!(reg, st)
+        open_channel(link, Vector{UInt8}("early"))
+        link
+    end)
+    connect!(client, ct, UInt8[])
+    @test eventually(() -> "early" in lock(() -> copy(seen), seen_lock))
+    got = lock(() -> copy(seen), seen_lock)
+    @test :reset in got
+    @test findfirst(==(:reset), got) < findfirst(==("early"), got)
+    kill!(client, "done"); kill!(server, "done"); kill!(fetch(server2), "done")
+end
+
 @testset "no reconnect within the grace period kills the link" begin
     reg = Dict{Vector{UInt8},Link}()
     acc = Acceptor()

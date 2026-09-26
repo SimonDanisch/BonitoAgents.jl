@@ -1,41 +1,25 @@
 @testitem "unit:mcp_relay" tags = [:unit] setup = [LinkPair] begin
     using Test, Dates, JSON, HTTP
-    import BonitoAgents as BT, BonitoWorker as BW, WorkerLink
+    import BonitoAgents as BT, BonitoWorker as BW, WorkerLink, Bonito
 
     # The ONE worker/server connection is a real link over an in-memory
-    # transport; the localhost socket and MCP subprocess are real too. The
-    # browser suite additionally exercises the real worker daemon, ACP launch,
-    # and a second worker's eval subprocess.
+    # transport; the worker's relay, its localhost socket and the MCP subprocess
+    # are real too. The browser suite additionally exercises the real worker
+    # daemon, ACP launch, and a second worker's eval subprocess.
     state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "unused")
     p = BT.ProjectInfo("relay-chat", "relay", "worker-a", mktempdir(), mktempdir(), now(UTC))
     p.dev_mode = true
     state.projects[][p.id] = p
-    channels = Dict{String,Any}()
-    hold_requests = Ref(false)
-    held = Channel{Nothing}(1)
-    server_link, worker_link = link_pair()
+    # The eval bridge proxies assets through the dashboard's server.
+    state.srv = Bonito.Server(Bonito.App(() -> Bonito.DOM.div("x")), "127.0.0.1", 0)
+    # While `hold[]`, a channel the worker opens is accepted and then parked
+    # here instead of served: a server that takes the call and never answers.
+    hold = Ref(false)
+    held = Channel{WorkerLink.LinkChannel}(Inf)
+    server_link, worker_link = link_pair(; on_open = ch -> hold[] ? (BT.accept_channel(ch); put!(held, ch)) :
+                                                     BT.accept_worker_channel(state, "worker-a", ch))
     state.worker_links["worker-a"] = server_link
-    relay = BW.start_mcp_relay(WorkerLink.control_channel(worker_link))
-    # What `serve_worker_control` (server) and `serve_control` (worker) do with
-    # the MCP frames on their control channels, with a hook to hold one request.
-    function read_control(handle, link)
-        try
-            for frame in WorkerLink.control_channel(link)
-                handle(BW.decode_control(frame))
-            end
-        catch e
-            e isa HTTP.WebSockets.WebSocketError || rethrow()   # the link ended
-        end
-    end
-    Base.errormonitor(@async read_control(server_link) do cmd
-        if hold_requests[] && get(cmd, "type", "") == "mcp_frame" &&
-                get(JSON.parse(cmd["frame"]), "op", "") == "remote_workers"
-            put!(held, nothing)
-        else
-            BT.handle_worker_mcp!(state, "worker-a", server_link, channels, cmd)
-        end
-    end)
-    Base.errormonitor(@async read_control(cmd -> BW.handle_mcp_relay_frame!(relay, cmd), worker_link))
+    relay = BW.start_mcp_relay(worker_link)
     proc = Ref{Any}(nothing)
     function request(id, method, params)
         println(proc[], JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params)))
@@ -48,28 +32,32 @@
         @test reply["id"] == id
         return reply["result"]
     end
+    # A channel as the relay opens it, for a chat, straight from the worker's end.
+    open_mcp(project_id) = WorkerLink.open_channel(worker_link, BW.MsgPack.pack(Dict(
+        "kind" => "mcp", "project_id" => project_id, "host" => false)))
     try
-        @testset "filtered MCP subprocess needs no server coordinates" begin
+        @testset "the MCP process needs no server coordinates" begin
             cfg = Dict("name" => "btworker", "command" => first(Base.julia_cmd().exec),
                 "args" => ["--startup-file=no", "--project=$(dirname(Base.active_project()))", "-e",
                            "using BonitoMCP; BonitoMCP.run_stdio()"],
                 "env" => [Dict("name" => "BONITOAGENTS_PROJECT_ID", "value" => p.id),
                           Dict("name" => "BONITOAGENTS_DEV_TOOLS", "value" => "1")])
-            # No SERVER_URL and no server secret, even in the explicit config.
             launch = JSON.json(Dict("method" => "session/new", "params" => Dict("mcpServers" => [cfg])))
-            configured = JSON.parse(BW.inject_mcp_server_url(launch, ""; mcp_relay = relay, owner = "agent-1"))
+            configured = JSON.parse(BW.inject_mcp_grant(launch, relay, "agent-1"))
             entry = only(configured["params"]["mcpServers"])
             env = Dict(k => v for (k, v) in ENV if !startswith(k, "BONITOAGENTS_"))
             merge!(env, Dict(e["name"] => e["value"] for e in entry["env"]))
-            @test !haskey(env, "BONITOAGENTS_SERVER_URL")
-            @test !haskey(env, "BONITOAGENTS_SECRET")
+            # Only the relay's address and a grant: no server URL, no secret.
+            @test sort([k for k in keys(env) if startswith(k, "BONITOAGENTS_")]) ==
+                  ["BONITOAGENTS_CONTROL_TOKEN", "BONITOAGENTS_CONTROL_URL",
+                   "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN", "BONITOAGENTS_PROJECT_ID"]
             proc[] = open(detach(Cmd(Cmd(String[entry["command"]; entry["args"]]); env)), "r+")
             request(1, "initialize", Dict("protocolVersion" => "2025-06-18", "capabilities" => Dict(),
                 "clientInfo" => Dict("name" => "relay-regression", "version" => "1")))
             listing = request(2, "tools/call", Dict("name" => "bt_julia_list_sessions", "arguments" => Dict()))
             text = join(get(c, "text", "") for c in listing["content"])
             @test occursin("remote julia is OFF", text)
-            @test BT.mcp_ctrl_for(state, p.id) isa BT.WorkerMCPChannel
+            @test BT.mcp_ctrl_for(state, p.id) isa BT.MCPChannel
             result = request(3, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict(
                 "code" => "6 * 7", "worker" => "worker-b")))
             @test result["isError"] === true
@@ -83,90 +71,127 @@
             @test occursin("InterruptException", join(get(c, "text", "") for c in stopped["content"]))
             again = request(6, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict("code" => "21 * 2")))
             @test occursin("42", join(get(c, "text", "") for c in again["content"]))
+            # The eval worker runs user code: its environment holds no grant
+            # (the MCP process took it out of its own before starting it).
+            seen = request(9, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict(
+                "code" => "sort([k for k in keys(ENV) if occursin(r\"CONTROL|EVAL_TOKEN\", k)])")))
+            @test occursin("String[]", join(get(c, "text", "") for c in seen["content"]))
+            # The eval worker's live-render bridge came up through the relay too.
+            @test timedwait(() -> BT.eval_bridge_for(state, p.id) !== nothing, 30.0) === :ok
             inspected = request(8, "tools/call", Dict("name" => "bt_dev_inspect",
                 "arguments" => Dict("section" => "projects", "project_id" => p.id)))
             @test inspected["isError"] === false
             @test occursin(p.id, only(inspected["content"])["text"])
-            # Only this grant can authenticate; an unrelated local process
-            # cannot claim a project by putting its id in a frame.
-            @test length(channels) == 1
+            # Revoking an owner's grants leaves everyone else's.
+            BW.mcp_relay_env(relay, p.id; owner = "agent-2")
+            @test length(relay.grants) == 4          # a control and an eval token each
+            BW.revoke_mcp_grants!(relay, "agent-2")
+            @test sort([(g.owner, g.kind) for g in values(relay.grants)]) ==
+                  [("agent-1", "eval"), ("agent-1", "mcp")]
+            # Only a token we handed out gets a channel: an unrelated local
+            # process cannot claim a chat. The relay hangs up on it, and the
+            # server still knows exactly the one MCP channel.
             HTTP.WebSockets.open(env["BONITOAGENTS_CONTROL_URL"]) do ws
                 HTTP.WebSockets.send(ws, "incorrect-token")
-                try HTTP.WebSockets.receive(ws) catch end
+                @test_throws HTTP.WebSockets.WebSocketError HTTP.WebSockets.receive(ws)
             end
-            @test length(channels) == 1
+            # The eval workers' token (their process runs user code) cannot
+            # open the control channel either.
+            HTTP.WebSockets.open(env["BONITOAGENTS_CONTROL_URL"]) do ws
+                HTTP.WebSockets.send(ws, env["BONITOAGENTS_EVAL_TOKEN"])
+                @test_throws HTTP.WebSockets.WebSocketError HTTP.WebSockets.receive(ws)
+            end
+            @test collect(keys(state.mcp_ctrl)) == [p.id]
         end
 
-        @testset "disconnect and replacement do not strand or misroute RPCs" begin
-            old = BT.mcp_ctrl_for(state, p.id)
-            rid, pending = BT.register_rpc!(state)
-            push!(old.pending, rid)
-            # Closing fails this channel's waiter immediately.
-            BT.close_mcp_channel!(old; notify_worker = false)
-            @test isready(pending)
-            @test take!(pending) isa Exception
-            @test isempty(old.pending)
-            @test BT.mcp_ctrl_for(state, p.id) === nothing
-            BT.handle_worker_mcp!(state, "worker-a", server_link, channels,
-                Dict("type" => "mcp_open", "channel" => "replacement", "project_id" => p.id))
-            new = BT.mcp_ctrl_for(state, p.id)
-            @test new !== old
-            @test_throws BT.WorkerUnreachableError BT.host_rpc(state, new, "sessions", Dict(); timeout = 0.1)
-            @test isempty(new.pending)
-            BT.close_mcp_channel!(old; notify_worker = false)
-            @test BT.mcp_ctrl_for(state, p.id) === new
-            # A reply on another channel cannot resolve new's pending request.
-            other = BT.ProjectInfo("other-chat", "other", "worker-a", p.server_path,
-                                   p.worker_path, now(UTC))
-            state.projects[][other.id] = other
-            BT.handle_worker_mcp!(state, "worker-a", server_link, channels,
-                Dict("type" => "mcp_open", "channel" => "other-channel", "project_id" => other.id))
-            rid2, waiting = BT.register_rpc!(state)
-            push!(new.pending, rid2)
-            BT.handle_worker_mcp!(state, "worker-a", server_link, channels,
-                Dict("type" => "mcp_frame", "channel" => "other-channel",
-                     "frame" => JSON.json(Dict("request_id" => rid2, "result" => "wrong"))))
-            @test !isready(waiting)
-            BT.close_mcp_channel!(channels["other-channel"]; notify_worker = false)
-            BT.close_mcp_channel!(new; notify_worker = false)
-            @test isready(waiting)
-            @test take!(waiting) isa Exception
-            BT.unregister_rpc!(state, rid)
-            BT.unregister_rpc!(state, rid2)
+        @testset "a refused channel reaches its local client with the server's reason" begin
+            # A grant the worker minted for a chat the server does not give it.
+            stray = BW.mcp_relay_env(relay, "no-such-chat"; owner = "stray")
+            err = HTTP.WebSockets.open(stray["BONITOAGENTS_CONTROL_URL"]) do ws
+                HTTP.WebSockets.send(ws, stray["BONITOAGENTS_CONTROL_TOKEN"])
+                try
+                    HTTP.WebSockets.receive(ws)
+                    nothing
+                catch e
+                    e
+                end
+            end
+            # Never an "ok": the client does not count this as connected.
+            @test err isa HTTP.WebSockets.WebSocketError
+            @test occursin("may speak for", err.message.reason)
+            @test !haskey(state.mcp_ctrl, "no-such-chat")
+            BW.revoke_mcp_grants!(relay, "stray")
         end
+
+        @testset "a worker only speaks for its own chats" begin
+            stranger = open_mcp("no-such-chat")
+            err = try WorkerLink.WebSockets.receive(stranger); nothing catch e; e end
+            @test err isa HTTP.WebSockets.WebSocketError && occursin("may speak for", err.message.reason)
+        end
+
         @testset "MCP caller is released when its worker connection disappears" begin
-            hold_requests[] = true
+            # The server stops answering: the MCP process's next channel is
+            # accepted but never served.
+            hold[] = true
+            close(BT.mcp_ctrl_for(state, p.id))
             result = Channel{Any}(1)
             @async put!(result, try request(7, "tools/call",
                 Dict("name" => "bt_julia_list_sessions", "arguments" => Dict())) catch e; e end)
-            @test timedwait(() -> isready(held), 10.0) === :ok
+            @test timedwait(() -> isready(held), 30.0) === :ok
             close(relay)
-            @test timedwait(() -> isready(result), 5.0) === :ok
+            @test timedwait(() -> isready(result), 10.0) === :ok
             isready(result) || error("disconnected MCP call did not finish")
             reply = take!(result)
             reply isa Exception && throw(reply)
             @test occursin("connection closed", join(get(c, "text", "") for c in reply["content"]))
         end
-        BW.revoke_mcp_grants!(relay, "agent-1")
-        @test isempty(relay.grants)
 
-        @testset "slow local readers have a bounded queue" begin
-            peer = BW.MCPRelayPeer(nothing, "slow", Union{String,Nothing}[], 0, Threads.Condition(), false)
-            relay.peers["slow"] = peer
-            for _ in 1:128
-                BW.handle_mcp_relay_frame!(relay, Dict("type" => "mcp_frame", "channel" => "slow", "frame" => "x"))
-            end
-            @test !peer.closed
-            BW.handle_mcp_relay_frame!(relay, Dict("type" => "mcp_frame", "channel" => "slow", "frame" => "x"))
-            @test peer.closed
-            @test isempty(peer.queue)
-            @test peer.bytes == 0
+        @testset "disconnect and replacement do not strand or misroute RPCs" begin
+            # The relay is closed by now, so the MCP process can't redial and
+            # replace the channels this test opens itself.
+            hold[] = false
+            first_channel = open_mcp(p.id)
+            @test timedwait(() -> BT.mcp_ctrl_for(state, p.id) !== nothing, 10.0) === :ok
+            old = BT.mcp_ctrl_for(state, p.id)
+            rid, pending = BT.register_rpc!(state)
+            push!(old.pending, rid)
+            # Closing fails this channel's waiter immediately.
+            close(old)
+            @test isready(pending)
+            @test take!(pending) isa Exception
+            @test isempty(old.pending)
+            @test BT.mcp_ctrl_for(state, p.id) === nothing
+            replacement = open_mcp(p.id)
+            @test timedwait(() -> (c = BT.mcp_ctrl_for(state, p.id); c !== nothing &&
+                                   WorkerLink.channel_id(c.channel) == WorkerLink.channel_id(replacement)), 10.0) === :ok
+            new = BT.mcp_ctrl_for(state, p.id)
+            @test_throws BT.WorkerUnreachableError BT.host_rpc(state, new, "sessions", Dict(); timeout = 0.1)
+            @test isempty(new.pending)
+            # A reply on another chat's channel cannot resolve new's request.
+            other = BT.ProjectInfo("other-chat", "other", "worker-a", p.server_path, p.worker_path, now(UTC))
+            state.projects[][other.id] = other
+            other_channel = open_mcp(other.id)
+            @test timedwait(() -> BT.mcp_ctrl_for(state, other.id) !== nothing, 10.0) === :ok
+            rid2, waiting = BT.register_rpc!(state)
+            push!(new.pending, rid2)
+            WorkerLink.WebSockets.send(other_channel, JSON.json(Dict("request_id" => rid2, "result" => "wrong")))
+            sleep(0.5)
+            @test !isready(waiting)
+            close(BT.mcp_ctrl_for(state, other.id))
+            close(new)
+            @test isready(waiting)
+            @test take!(waiting) isa Exception
+            BT.unregister_rpc!(state, rid)
+            BT.unregister_rpc!(state, rid2)
         end
+
     finally
         proc[] === nothing || (BW.kill_proc!(proc[]); wait(proc[]))
         close(relay)
-        foreach(ch -> BT.close_mcp_channel!(ch; notify_worker = false), values(channels))
+        foreach(close, collect(values(state.mcp_ctrl)))
         foreach(l -> WorkerLink.kill!(l, "done"), (server_link, worker_link))
+        BT.teardown_eval_bridge!(state, p.id)
+        close(state.srv)
         rm(state.state_dir; recursive = true, force = true)
         rm(state.working_dir; recursive = true, force = true)
     end

@@ -466,13 +466,33 @@ mutable struct TestServer
     browser_size::Tuple{Int,Int}
 end
 
-# The dispatcher's TCP server starts BEFORE `dev_server` returns so the
-# worker can connect back the moment it spawns a mock agent. But
-# `bt_eval` needs the server URL + worker-secret to point the eval
-# bridge at — these are known only after `dev_server` returns. Stash
-# them in a Ref the dispatcher reads each time it invokes a real
-# BonitoMCP handler. `nothing` until `TestServer` finishes wiring up.
-const SERVER_CONTEXT = Ref{Union{Nothing, NamedTuple{(:url, :secret, :project_id), Tuple{String, String, Ref{String}}}}}(nothing)
+# The worker relay grant this process's in-process MCP channels (control, and
+# the eval workers' live-render bridges) are armed with; see `with_mcp_env`.
+const ARMED_GRANT = Ref("")
+
+# Tear the in-process MCP's channels down, so the next MCP call re-arms them.
+function disarm_mcp!(why::AbstractString)
+    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl ($why)")
+    reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval ($why)")
+    ARMED_GRANT[] = ""
+    return nothing
+end
+
+# A chat's MCP process dies with its server, and its running evals with it. The
+# in-process MCP stands in for all of them and outlives the server, so an eval a
+# test left running (it timed out into `:running` and nobody continued) would
+# make the next item's eval on the same env fail with "already in flight".
+function settle_mcp_evals!(; timeout::Real = 60.0)
+    BonitoMCP.interrupt_in_flight!(nothing) == 0 && return nothing
+    @warn "TestKit: an eval was still in flight at server teardown; interrupted it"
+    m = BonitoMCP.manager()
+    settled() = lock(m.lock) do
+        all(s -> s.in_flight === nothing, values(m.sessions))
+    end
+    timedwait(settled, timeout) === :ok ||
+        error("TestKit: in-flight evals did not settle within $(timeout)s of the interrupt")
+    return nothing
+end
 
 """
     scrub_mock_env!()
@@ -651,28 +671,25 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
 
     h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
-    # Now publish the server URL + secret to the dispatcher so that
-    # `bt_eval` invocations can route the eval worker's dial-back to the
-    # right BonitoAgents instance.
-    SERVER_CONTEXT[] = (url = h.url, secret = h.secret, project_id = Ref(""))
-    # Clean slate for the MCP control dial-back (armed lazily on the first eval,
+    # Clean slate for the in-process MCP (armed lazily on the first MCP call,
     # see invoke_mcp) in case a prior test tore down without close().
-    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server bring-up)")
+    disarm_mcp!("server bring-up")
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
                        Ref{Any}(nothing), Ref(false),
                        (browser_width, browser_height))
 end
 
-# Dispatcher loop per mock-agent connection. Reads one `{"prompt": "..."}`
-# per session/prompt, invokes the agent function, streams the resulting
-# events back as line-delimited JSON. For high-level events that need
+# Dispatcher loop per mock-agent connection. Reads one `{"prompt": "...",
+# "mcp_env": {...}}` per session/prompt, invokes the agent function, streams the
+# resulting events back as line-delimited JSON. For high-level events that need
 # real MCP execution (`bt_eval`), the dispatcher runs the corresponding
-# BonitoMCP handler IN THIS PROCESS, then forwards the result blocks to
-# the mock as a `bt_eval_result` event the mock knows how to wrap as ACP
-# tool_call frames. This keeps the bt_* execution real (same Malt worker,
-# same env_path, same package resolution) without making the mock binary
-# itself an MCP client.
+# BonitoMCP handler IN THIS PROCESS, in the environment the chat's MCP launch
+# entry carries (`mcp_env`), then forwards the result blocks to the mock as a
+# `bt_eval_result` event the mock knows how to wrap as ACP tool_call frames.
+# This keeps the bt_* execution real (same Malt worker, same env_path, same
+# package resolution, the worker relay's real grant) without making the mock
+# binary itself an MCP client.
 function handle_client(client, agent_ref::Ref{Function})
     try
         while !eof(client)
@@ -695,6 +712,7 @@ function handle_client(client, agent_ref::Ref{Function})
                 continue
             end
             prompt = String(get(msg, "prompt", ""))
+            mcp_env = get(msg, "mcp_env", nothing)
             # On a resumed session the server prepends a transcript of the prior
             # conversation, with the user's real new message after a "My new
             # message:" divider. A real agent reads the transcript and replies to
@@ -715,7 +733,7 @@ function handle_client(client, agent_ref::Ref{Function})
                 [text("agent fn threw: $(sprint(showerror, e))"), end_turn()]
             end
             for ev in response
-                forward_event(client, ev)
+                forward_event(client, ev, mcp_env)
             end
         end
     catch e
@@ -728,10 +746,10 @@ end
 # Per-event dispatch — high-level events get rewritten into the lower-level
 # `bt_eval_result` event the mock knows how to map to ACP frames; everything
 # else is forwarded verbatim.
-function forward_event(client, ev::AbstractDict)
+function forward_event(client, ev::AbstractDict, mcp_env)
     t = String(get(ev, "type", ""))
     if t == "mcp_call"
-        invoke_mcp(client, ev)
+        invoke_mcp(client, ev, mcp_env)
     else
         println(client, JSON.json(ev)); flush(client)
     end
@@ -743,31 +761,37 @@ end
 # isError. We forward those to the mock as a structured event the mock
 # turns into ACP `tool_call` + `tool_call_update` frames carrying the
 # same content.
-# Point the eval worker's dial-back at OUR dev_server (url / secret / project_id)
-# for the duration of `f`, then restore. `bt_eval` needs this:
-# the worker inherits these env vars when `get_or_create!` spawns it, and
-# `ensure_eval_dialed!` uses them to (a) load `RemoteProxy` + build the bridge —
-# which is what makes `render_eval_html` available so the result renders to a LIVE
-# fragment instead of the text fallback — and (b) land the bridge in
-# `EVAL_WORKERS[project_id]`, the dict the chat looks up when mounting. Without
-# `BONITOAGENTS_SERVER_URL` the dial bails early (session.jl) and RemoteProxy
-# never loads. The project_id MUST match the chat's pid (the EVAL_WORKERS key).
-function with_bridge_env(ctx, f)
-    keys = ("BONITOAGENTS_SERVER_URL", "BONITOAGENTS_SECRET", "BONITOAGENTS_PROJECT_ID")
-    prev = map(k -> get(ENV, k, nothing), keys)
-    ENV["BONITOAGENTS_SERVER_URL"] = ctx.url
-    ENV["BONITOAGENTS_SECRET"]     = ctx.secret
-    isempty(ctx.project_id[]) || (ENV["BONITOAGENTS_PROJECT_ID"] = ctx.project_id[])
+#
+# Run `f` as the chat's MCP process would: in the environment its launch entry
+# carries, i.e. the worker relay's grant for that chat. With it the eval
+# worker's live-render bridge lands in `state.eval_workers[project_id]` (what the
+# chat looks up when mounting) and live stdout streams over the control channel.
+# In production each chat has its own MCP process; here one process stands in
+# for all of them, so a different grant than last time (another chat, a
+# restarted session, another server) re-arms its channels. The eval workers
+# stay warm; only their bridges re-dial.
+function with_mcp_env(f, env::AbstractDict)
+    rest = Dict{String,String}(String(k) => String(v) for (k, v) in env)
+    token = get(rest, "BONITOAGENTS_CONTROL_TOKEN", "")
+    token == ARMED_GRANT[] || (disarm_mcp!("new grant"); ARMED_GRANT[] = token)
+    # The grant goes to the MCP the way a real one keeps it, never into ENV:
+    # the eval workers this process starts must not inherit it.
+    BonitoMCP.take_relay_grant!(rest)
+    prev = Dict(k => get(ENV, k, nothing) for k in keys(rest))
+    for (k, v) in rest
+        ENV[k] = v
+    end
     try
+        BonitoMCP.start_ctrl_dialback!()   # idempotent while armed
         return f()
     finally
-        for (k, v) in zip(keys, prev)
+        for (k, v) in prev
             v === nothing ? delete!(ENV, k) : (ENV[k] = v)
         end
     end
 end
 
-function invoke_mcp(client, ev::AbstractDict)
+function invoke_mcp(client, ev::AbstractDict, mcp_env)
     tool = String(get(ev, "tool", "bt_julia_eval"))
     # Everything besides the event bookkeeping IS the tool's argument dict —
     # `mcp_call` sugar (bt_eval / bt_continue) puts args at the top level.
@@ -788,7 +812,6 @@ function invoke_mcp(client, ev::AbstractDict)
     haskey(ev, "worker")  && (open_ev["worker"]  = ev["worker"])
     println(client, JSON.json(open_ev)); flush(client)
 
-    ctx = SERVER_CONTEXT[]
     # Dispatch by NAME through the registry, the way a real MCP process does.
     # This used to hardcode the two eval handlers and fall through to
     # `julia_eval_handler` for everything else — so `mcp_call("bt_wait")` ran the
@@ -803,17 +826,12 @@ function invoke_mcp(client, ev::AbstractDict)
                       join((t.name for t in reg), ", ") * ")")],
             "isError" => true) :
         reg[hit].handler(args)
-    # Faithful MCP-process behaviour: arm the /mcp-ws control dial-back (idempotent)
-    # so the eval's live stdout streams over the REAL wire to the chat's tail, same
-    # as production. Env vars (incl. project_id) are set by with_bridge_env, which
-    # start_ctrl_dialback! reads synchronously; the async dial connects well before
-    # the worker's first print. reset_ctrl_dialback! (dev_server/close) re-points it.
-    armed() = (BonitoMCP.start_ctrl_dialback!(); runner())
     result = try
-        # `ctx === nothing` is the standalone case (no live bridge → text fallback,
-        # still a valid result). With a server context, wire the dial-back so the
-        # result renders to a LIVE Bonito fragment over the eval bridge.
-        ctx === nothing ? runner() : with_bridge_env(ctx, armed)
+        # No launch env is the standalone case (no live bridge → text fallback,
+        # still a valid result). With one, the eval's live stdout streams over
+        # the REAL control channel to the chat's tail and the result renders to
+        # a LIVE Bonito fragment over the eval bridge, same as production.
+        mcp_env === nothing ? runner() : with_mcp_env(runner, mcp_env)
     catch e
         Dict{String,Any}(
             "content" => Any[Dict("type" => "text",
@@ -860,20 +878,20 @@ end
 function Base.close(s::TestServer)
     s.closed[] && return s
     s.closed[] = true
-    # Tear down the MCP dial-backs this process armed for `s` (see invoke_mcp):
-    # the test process stands in for one MCP server per dev_server, so both its
-    # /mcp-ws control dial AND every eval worker's /eval-ws render dial must be
-    # re-pointed, not left dangling on this dead server. `reset_eval_dialback!`
-    # keeps the warm eval workers alive (just drops their bridge) so the NEXT
-    # dev_server re-dials fresh — this replaces the old `refresh_eval_session!`
-    # test hack, tying eval-session lifecycle to the dev_server like production
-    # ties it to the agent's MCP child.
-    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server teardown)")
-    reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server teardown)")
+    # Tear down the in-process MCP's channels armed for `s` (see with_mcp_env),
+    # rather than leave them retrying against this dead server's worker.
+    # `reset_eval_dialback!` keeps the warm eval workers alive (just drops their
+    # bridge) so the NEXT dev_server re-dials fresh.
+    disarm_mcp!("server teardown")
     ctx = s.browser[]
     ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
     close(s.h)
+    # The mock knobs `BT.dev_server` wrote into ENV stay: another TestServer may
+    # still be up in this process (an item that includes its own TestKit cannot
+    # release the shared one), and without `BT_DEFAULT_PROVIDER` its next chat
+    # would start the REAL default agent. `dev_server` scrubs them on bring-up.
+    settle_mcp_evals!()   # last: if it throws, the stack is already down
     return s
 end
 
@@ -1416,43 +1434,6 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
              timeout = 90)
     sleep(0.5)
     pid = current_chat_id(s)
-    # `SERVER_CONTEXT` is a single global, set by whichever `dev_server` ran
-    # LAST — but a suite can drive a server that isn't that one. `e2e:bt_eval`
-    # stands up (and closes) eight of its own servers; every later SharedServer
-    # item then hands the eval worker the URL of a server that no longer exists,
-    # and the dial dies with `connect: Connection refused` on `/eval-ws`. The
-    # embed still renders its snapshot, so the symptom is a live app that never
-    # updates — which is what took `e2e:eval_embed_park` down (13 failures) in a
-    # full-suite run while it passed alone. Point the context at the server we
-    # are actually driving, and drop the stale bridge so the next eval re-dials.
-    ctx = SERVER_CONTEXT[]
-    if ctx === nothing || ctx.url != s.h.url
-        SERVER_CONTEXT[] = (url = s.h.url, secret = s.h.secret, project_id = Ref(""))
-        ctx = SERVER_CONTEXT[]
-        reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server changed)")
-    end
-    if ctx !== nothing
-        # Re-point the eval dial-back whenever the PROJECT changes — the same
-        # reason `Base.close(::TestServer)` re-points it when the SERVER changes.
-        #
-        # The server registers one eval bridge per PROJECT
-        # (`state.eval_workers[project_id]`, set when the worker's eval dials
-        # `/eval-ws` carrying that id). The MCP eval-session pool, though, is
-        # keyed by env_path and process-global, and `ensure_eval_dialed!`
-        # short-circuits on `s.dialed_back` — it never dials a second time. So a
-        # second chat that evals in the SAME env inherits the first chat's
-        # already-dialed session, no bridge is ever registered for the new
-        # project, and its live embeds render from their snapshot but have no
-        # browser↔worker route: they look right and are dead.
-        #
-        # In production each chat gets its own MCP process, so each dials once
-        # for its own project. Dropping the bridge here (the worker stays warm,
-        # so no compile cost) reproduces that per-chat dial in one test process.
-        if ctx.project_id[] != pid
-            ctx.project_id[] = pid
-            reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (new chat)")
-        end
-    end
     return pid
 end
 
