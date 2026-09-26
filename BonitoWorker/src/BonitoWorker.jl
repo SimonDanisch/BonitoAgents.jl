@@ -273,104 +273,20 @@ end
 # cross-platform: a `.sh`/`.cmd` wrapper would need an OS-specific variant,
 # but `julia` + an argv array runs identically on Linux/macOS/Windows.
 #
-# `julia_launcher()` resolves WHICH julia — see there; it is deliberately not the
-# version-specific binary this process happens to run from. `Base.active_project()`
-# is whatever env this worker itself runs in (the shared `@bonito-agents` after a
-# normal install, or the monorepo project in dev) — BonitoMCP is co-installed
-# there, so the MCP process resolves it without any extra setup.
+# The julia THIS process runs on, as a path. Only its identity: the pidfile
+# records it, so a reinstall under another julia knows to replace the worker
+# (`replace_reason`). Never a launch command — see `mcp_args`.
 julia_bin() = joinpath(Sys.BINDIR::String, Base.julia_exename())
 
-# The Julia channel this process belongs to, e.g. "1.12". A CHANNEL and not the
-# patch version: juliaup registers `1.12`, not `1.12.7`, so `+1.12.7` is rejected
-# with "not installed" while `+1.12` follows the channel forward.
-julia_channel() = "$(VERSION.major).$(VERSION.minor)"
-
-# Stable launcher candidates, in the order we trust them. juliaup's own install
-# puts one at `~/.juliaup/bin/julia`; a distro package may instead put
-# `julialauncher` behind plain `julia` on PATH (openSUSE does). Neither path
-# moves when a version is added or removed.
-function juliaup_launcher_candidates()
-    exe  = Sys.iswindows() ? "julia.exe" : "julia"
-    outs = String[joinpath(homedir(), ".juliaup", "bin", exe)]
-    onpath = Sys.which("julia")
-    onpath === nothing || push!(outs, String(onpath))
-    return outs
-end
-
-# Does `exe +channel` actually land on the Julia we are running from?
-#
-# Probed rather than assumed, because everything about this is guesswork
-# otherwise: `exe` may not be a launcher at all (a plain julia treats `+1.12` as
-# a script name and exits non-zero, which is the answer we want), the channel may
-# not be registered, or the launcher may be for a different depot. Writing a
-# launch command we have not run is precisely the mistake this whole function
-# exists to undo — it stays invisible until the next restart.
-function launcher_resolves_here(exe::AbstractString, channel::AbstractString)
-    isfile(exe) || return false
-    out = IOBuffer()
-    ok = try
-        success(pipeline(`$exe +$channel --startup-file=no -e 'print(Sys.BINDIR)'`;
-                         stdout = out, stderr = devnull))
-    catch e
-        # ENOENT/EACCES on something that looked like a file a moment ago, or is
-        # not executable. An ordinary "no, not this candidate" — anything else is
-        # a real bug and belongs on the surface.
-        e isa Base.IOError || rethrow()
-        return false
-    end
-    return ok && strip(String(take!(out))) == Sys.BINDIR::String
-end
-
-"""
-    julia_launcher() -> Cmd
-
-The `julia` every process this worker launches on its own behalf runs on: the
-systemd unit's ExecStart, a respawned background worker, and the BonitoMCP
-server claude-agent-acp starts for each chat. The `Cmd` is the executable plus
-whatever argument pins it, so `\$(julia_launcher()) --project=… -e …` composes
-and `.exec` splits into the command + argv the MCP config wants.
-
-NOT `julia_bin()`. That is `Sys.BINDIR`, and under juliaup BINDIR is a
-VERSION-specific directory which the next `juliaup update` DELETES. A unit that
-bakes it execs a julia that no longer exists and systemd restart-loops on it
-forever — measured here as 41 failed EXECs in the 2.5 minutes before someone
-happened to re-run the installer, with the worker simply absent throughout. An
-MCP config that bakes it is the same failure one level down: every new chat's
-`bt_*` tools fail to start until the worker is restarted.
-
-So prefer juliaup's launcher, which lives at a stable path, and pin the CHANNEL
-on it. That combination is what gets both properties at once:
-
-  * `juliaup update` within the channel keeps working — the launcher re-resolves
-    to the new patch release, and nothing has to be rewritten;
-  * `juliaup default <other>` does NOT quietly move the worker onto a different
-    Julia, which a bare launcher (or `/usr/bin/env julia`) would. Moving is what
-    re-running the installer under the new default is for — it restarts the
-    worker on the Julia it ran under (see `spawn_worker` / `install_service!`).
-
-Only removing the channel outright breaks it, and that is a deliberate act rather
-than a side effect of routine maintenance.
-
-Falls back to `julia_bin()` when no launcher checks out — a plain install has no
-launcher and does not have the problem either, since nothing deletes its bindir
-out from under it.
-"""
-function julia_launcher()
-    channel = julia_channel()
-    for exe in juliaup_launcher_candidates()
-        launcher_resolves_here(exe, channel) && return `$exe +$channel`
-    end
-    return `$(julia_bin())`
-end
-
-# The (command, argv) pair claude-agent-acp launches BonitoMCP with. Split from
-# one `julia_launcher()` so the channel pin (`+1.12`) rides in the argv.
-mcp_exe(launcher::Cmd = julia_launcher()) = String(first(launcher.exec))
-
-function mcp_args(launcher::Cmd = julia_launcher())
+# How BonitoMCP is launched for each chat (claude-agent-acp execs `julia` with
+# these), and every other julia this worker starts on its own behalf: plain
+# `julia`, looked up on PATH when the process starts. The user's choice of
+# julia, whatever juliaup or a package manager put there; never a baked path or
+# version, so an update, a new default channel or a reinstall is picked up by the
+# next start and nothing has to be rewritten.
+function mcp_args()
     project = something(Base.active_project(), "@bonito-agents")
     return String[
-        launcher.exec[2:end]...,
         "--project=$(project)",
         "--startup-file=no",
         "--threads=auto",
@@ -404,20 +320,19 @@ end
 
 # The unit text. PURE (no side effects) so install can diff it against the
 # on-disk unit and only rewrite+reload when it actually changed (template bump,
-# new server, a juliaup update moving `julia`, a different PATH). `path_env` is
-# baked in because systemd --user services do NOT inherit the interactive
-# shell's PATH — without it the worker can't find `claude-agent-acp`/`node`/`git`
-# at runtime. We capture the install-time PATH, which has them resolved.
+# new server, a different PATH). `path_env` is baked in because systemd --user
+# services do NOT inherit the interactive shell's PATH — without it the worker
+# can't find `julia`/`claude-agent-acp`/`node`/`git` at runtime. We capture the
+# install-time PATH, which has them resolved.
 #
-# The ExecStart command prefix: `julia_launcher()` as unit text (`exe +channel`).
-service_julia_cmd() = join(julia_launcher().exec, ' ')
-
-function render_service_unit(; julia::AbstractString = service_julia_cmd(),
-                               project::AbstractString = "@bonito-agents",
+# ExecStart must name an absolute executable and systemd does not search that
+# PATH for it, so `/usr/bin/env` does the lookup: the worker runs on the `julia`
+# the PATH holds when it starts, like everything it launches.
+function render_service_unit(; project::AbstractString = "@bonito-agents",
                                projects_root::AbstractString = pwd(),
                                memory_max::AbstractString = "85%",
                                path_env::AbstractString = get(ENV, "PATH", ""))
-    exec = "$(julia) --project=$(project) --startup-file=no " *
+    exec = "/usr/bin/env julia --project=$(project) --startup-file=no " *
            "-e 'using BonitoWorker; BonitoWorker.start()'"
     return """
     [Unit]
@@ -829,7 +744,7 @@ function spawn_worker(; force_restart::Bool = false)
     # points at without losing every line written afterwards.
     rotate_spawn_log!(logfile)
     project = something(Base.active_project(), "@bonito-agents")
-    cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
+    cmd = `julia --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
     # Tell the child that fd 1/2 ARE the log, so it does not redirect a second
     # time (that would split the log and rotate the file out from under our
     # descriptor). Every other way a worker starts — the installer's systemd
@@ -947,12 +862,8 @@ function connect_and_serve(; server_url::String,
                             secret::String,
                             worker_id::String     = load_or_generate_worker_id(),
                             name::String          = default_worker_name(worker_id),
-                            # Probed ONCE here (it spawns a julia per candidate),
-                            # then split into the command + argv the hello
-                            # carries.
-                            launcher::Cmd         = julia_launcher(),
-                            mcp_command::String   = mcp_exe(launcher),
-                            mcp_arguments::Vector{String} = mcp_args(launcher),
+                            mcp_command::String   = "julia",
+                            mcp_arguments::Vector{String} = mcp_args(),
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             agent_bin::String     = find_agent_bin(),
                             # `nothing` is the standalone/dev default. Only a real
@@ -1038,7 +949,7 @@ end
 
 function spawn_updated_worker!()
     project = something(Base.active_project(), "@bonito-agents")
-    cmd = `$(julia_launcher()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start(force=true)")`
+    cmd = `julia --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start(force=true)")`
     logfile = joinpath(config_dir(), "worker.log")
     run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true); wait = false)
     return nothing
@@ -2163,7 +2074,7 @@ function develop_checkout!(dest::AbstractString, packages::Vector{String},
     # precompiled here gets precompiled by the FIRST chat's BonitoMCP spawn
     # instead — minutes inside claude-agent-acp's MCP start-up timeout.
     code = "import Pkg; Pkg.develop([Pkg.PackageSpec(path = p) for p in ARGS]); Pkg.precompile()"
-    cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $(code) $(paths)`
+    cmd = `julia --project=$(project) --startup-file=no -e $(code) $(paths)`
     mkpath(dirname(logfile))
     ok = open(logfile, "w") do io
         success(pipeline(cmd; stdout = io, stderr = io))

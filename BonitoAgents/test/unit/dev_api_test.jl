@@ -206,16 +206,14 @@ end
             @test occursin(wname, err) && occursin("server", err)
         end
 
-        @testset "the MCP launch command is the stable launcher, not a versioned binary" begin
+        @testset "the MCP launch command is `julia` from PATH" begin
             # The hello frame carries what claude-agent-acp execs for every
-            # chat's `bt_*` tools. It used to be `Sys.BINDIR`'s julia — a path
-            # `juliaup update` deletes, and the one thing a re-install under a
-            # different default Julia never refreshed while the old worker lived.
+            # chat's `bt_*` tools. A baked path (it once was `Sys.BINDIR`'s
+            # julia, then a probed launcher) breaks when juliaup or a package
+            # manager moves it, and stays broken until the worker restarts.
             w = st.workers[][wid]
-            @test isfile(w.mcp_path)
-            launcher = BonitoWorker.julia_launcher()
-            @test w.mcp_path == BonitoWorker.mcp_exe(launcher)
-            @test w.mcp_args == BonitoWorker.mcp_args(launcher)
+            @test w.mcp_path == "julia"
+            @test w.mcp_args == BonitoWorker.mcp_args()
             # The worker reports the same pair about itself — what it SAID, so
             # the two can be compared, not a fresh probe.
             me = BT.dev_request(st, "inspect", Dict("section" => "worker", "worker_id" => wid))

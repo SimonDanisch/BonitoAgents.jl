@@ -318,12 +318,12 @@ end
 # touch the real user systemd). render_service_unit is a pure string builder;
 # decide_run_mode is the pure answer→mode map factored out of the tty IO.
 @testset "service unit rendering" begin
-    u = BW.render_service_unit(; julia = "/opt/julia/bin/julia",
-                                 projects_root = "/home/u/projs",
+    u = BW.render_service_unit(; projects_root = "/home/u/projs",
                                  memory_max = "80%",
                                  path_env = "/usr/bin:/home/u/.local/bin")
-    # ExecStart launches start() in the shared env.
-    @test occursin("ExecStart=/opt/julia/bin/julia --project=@bonito-agents", u)
+    # ExecStart launches start() in the shared env, on the `julia` the unit's
+    # PATH holds (systemd itself does not search that PATH, `env` does).
+    @test occursin("ExecStart=/usr/bin/env julia --project=@bonito-agents", u)
     @test occursin("BonitoWorker.start()", u)
     # PATH is baked in (systemd --user doesn't inherit the shell PATH; without
     # this the worker can't find claude-agent-acp/node/git at runtime).
@@ -335,77 +335,29 @@ end
     @test occursin("WorkingDirectory=/home/u/projs", u)
     # Pure: identical inputs → byte-identical output (so install can diff for
     # idempotency — only rewrite+reload when the unit actually changed).
-    @test u == BW.render_service_unit(; julia = "/opt/julia/bin/julia",
-                                        projects_root = "/home/u/projs",
+    @test u == BW.render_service_unit(; projects_root = "/home/u/projs",
                                         memory_max = "80%",
                                         path_env = "/usr/bin:/home/u/.local/bin")
 end
 
-# Which julia the worker launches its own processes with — the systemd unit, a
-# respawn, and the BonitoMCP server claude-agent-acp starts per chat. All three
-# used to bake `Sys.BINDIR`, which under juliaup is a VERSION-specific directory
-# the next `juliaup update` deletes — systemd then restart-loops on a missing
-# binary until someone re-runs the installer, with the worker absent throughout
-# (41 failed EXECs in 2.5 minutes, observed), and every new chat's `bt_*` tools
-# fail to start until the worker is restarted.
-@testset "julia launcher" begin
-    channel = BW.julia_channel()
-    # A CHANNEL, not a patch version: juliaup registers `1.12`, so `+1.12.7` is
-    # rejected with "not installed" while `+1.12` follows the channel forward.
-    @test occursin(r"^\d+\.\d+$", channel)
-    @test channel == "$(VERSION.major).$(VERSION.minor)"
-
-    # The probe is the whole safety of this: writing a launch command we never
-    # ran is the mistake being undone here, and a wrong one stays invisible until
-    # the next restart.
-    @test BW.launcher_resolves_here("/nonexistent/julia-xyz", channel) === false
-    # Exists and is executable, but is not a launcher — exits 0 and prints the
-    # wrong thing, so the BINDIR comparison is what rejects it, not the status.
-    Sys.isunix() && @test BW.launcher_resolves_here("/bin/echo", channel) === false
-    # The version-pinned binary we are RUNNING is not a launcher either: a plain
-    # julia reads `+1.12` as a script name and exits non-zero. Important, or the
-    # fallback would dress the old pinned path up as a fixed one.
-    @test BW.launcher_resolves_here(BW.julia_bin(), channel) === false
-    # A launcher asked for a channel that isn't registered must not pass.
-    for exe in BW.juliaup_launcher_candidates()
-        isfile(exe) && @test BW.launcher_resolves_here(exe, "0.1") === false
-    end
-
-    launcher = BW.julia_launcher()
-    exe  = BW.mcp_exe(launcher)
-    args = BW.mcp_args(launcher)
-    @test isfile(exe)
-    if launcher.exec == [BW.julia_bin()]
-        # No launcher on this machine (a plain install). That is the documented
-        # fallback and it does not have the problem either — nothing deletes a
-        # plain install's bindir out from under it.
-        @test startswith(args[1], "--project=")
-    else
-        # A launcher was found AND probed. It must be pinned to the channel,
-        # otherwise `juliaup default <other>` silently moves the worker onto a
-        # different Julia — the failure mode a bare launcher trades for.
-        @test launcher.exec == [exe, "+" * channel]
-        # And it must NOT be the version-specific path, which is the whole point.
-        @test exe != BW.julia_bin()
-        @test !occursin(string(VERSION), exe)
-        # The pin rides FIRST in the MCP argv — julialauncher only reads it there.
-        @test args[1] == "+" * channel
-        @test startswith(args[2], "--project=")
-    end
+# Which julia the worker launches its own processes with: the systemd unit, a
+# respawn, the debug checkout's `Pkg.develop` and the BonitoMCP server
+# claude-agent-acp starts per chat. Always the `julia` on PATH, looked up when the
+# process starts. A baked path or version breaks the day a package manager or
+# juliaup moves it: a system update removed `/usr/bin/julia`, the unit
+# restart-looped on it and no new chat got its `bt_*` tools.
+@testset "julia comes from PATH, never a baked path or version" begin
+    args = BW.mcp_args()
+    @test startswith(args[1], "--project=")
     @test args[end-1:end] == ["-e", "using BonitoMCP; BonitoMCP.run_stdio()"]
-
-    # The composed command — command + argv exactly as the MCP config carries
-    # them, minus the `-e` payload — has to land on THIS julia. The probe checked
-    # `exe +channel` alone; this checks what actually gets exec'd.
-    bindir = read(`$(exe) $(args[1:end-2]) -e $("print(Sys.BINDIR)")`, String)
-    @test strip(bindir) == Sys.BINDIR
-
-    # The unit execs the same thing, as text.
-    cmd = BW.service_julia_cmd()
-    @test cmd == join(launcher.exec, ' ')
-    @test occursin("ExecStart=$(cmd) --project=@bonito-agents",
-                   BW.render_service_unit(; projects_root = "/tmp", memory_max = "80%",
-                                            path_env = "/usr/bin"))
+    @test !any(a -> startswith(a, "+"), args)            # no channel pin
+    @test !any(a -> occursin(Sys.BINDIR, a), args)       # no version-specific path
+    unit = BW.render_service_unit(; projects_root = "/tmp", memory_max = "80%", path_env = "/usr/bin")
+    @test !occursin(Sys.BINDIR, unit)
+    # What the MCP config carries runs: `julia` from PATH with exactly these args.
+    if Sys.which("julia") !== nothing
+        @test success(`julia $(args[1:end-2]) -e 'exit(0)'`)
+    end
 end
 
 # ── the debug checkout: BonitoAgents' source, on this worker ─────────────────
