@@ -10,7 +10,6 @@ import Bonito
 using BonitoAgents
 using BonitoWorker
 import Downloads
-using Random: randstring
 using PrecompileTools: @setup_workload, @compile_workload
 
 export desktop
@@ -73,7 +72,7 @@ across launches:
 # eval workers that are supposed to resolve against the USER'S project. A flag on
 # one command replaces it: we never touch the ambient environment, so nothing
 # downstream has to repair it.
-function worker_command(; server_url, secret, worker_id, projects_root, data_dir)
+function worker_command(; server_url, worker_id, projects_root, data_dir)
     jl = Base.julia_cmd()
     # Opt-in tracing for the precompile harness: when BONITOAGENTS_TRACE_DIR is
     # set (precompile/capture.sh), the worker self-traces method compilation to a
@@ -85,7 +84,7 @@ function worker_command(; server_url, secret, worker_id, projects_root, data_dir
             `--trace-compile=$(joinpath(tracedir, "worker-$(worker_id).jl"))`
     return `$jl $trace --startup-file=no --project=$(Base.active_project())
             -m BonitoAgentsApp worker
-            --server-url=$server_url --secret=$secret --worker-id=$worker_id
+            --server-url=$server_url --worker-id=$worker_id
             --projects-root=$projects_root --data-dir=$data_dir`
 end
 
@@ -116,12 +115,9 @@ function start_app(; port::Union{Int,Nothing} = nothing)
     worker_cfg  = mkpath(joinpath(root, "worker-config"))
     projects    = mkpath(joinpath(root, "projects"))
 
-    # Fresh secret per run: server and worker live in the same process, nobody
-    # else ever needs to know it.
-    secret = randstring(64)
     state  = BonitoAgents.serve(; host = "127.0.0.1",
                                   port = something(port, 0),
-                                  worker_secret = secret,
+                                  manage_harnesses = true,
                                   state_dir     = state_dir,
                                   working_dir   = working_dir)
     url = "http://127.0.0.1:$(state.srv.port)"
@@ -138,7 +134,7 @@ function start_app(; port::Union{Int,Nothing} = nothing)
     # Worker output → its own log under the data root (not interleaved with the
     # desktop's stdout), mirroring the production install's worker.log.
     worker_log = joinpath(worker_cfg, "worker.log")
-    worker_cmd = worker_command(; server_url = url, secret = secret,
+    worker_cmd = worker_command(; server_url = url,
                                   worker_id = worker_id,
                                   projects_root = projects, data_dir = root)
     worker_proc = run(pipeline(worker_cmd; stdout = worker_log, stderr = worker_log,
@@ -236,9 +232,9 @@ Desktop options:
 
 Server options:
   --port=N                listen port (default: 8038)
-  --host=HOST             bind host (default: 0.0.0.0)
+  --host=HOST             bind host (default: 127.0.0.1; localhost only, the
+                          login proxy from install_server.sh reaches it)
   --public-url=URL        base URL workers dial back to (default: auto)
-  --secret=HEX            shared worker secret (default: persisted/generated)
   --state-dir=PATH        workers.json / projects.json / chats
   --log-file=PATH         server log (default: <state-dir>/logs/server.log)
   --working-dir=PATH      canonical project copies
@@ -246,7 +242,8 @@ Server options:
 
 Worker options:
   --server-url=URL        dashboard server to connect to (required)
-  --secret=HEX            shared worker secret (required)
+  --credential=NAME:PASS  the worker credential from "Add worker" (behind the proxy);
+                          BONITOAGENTS_WORKER_CREDENTIAL keeps it off the command line
   --worker-id=ID          stable worker id (default: persisted/generated)
   --projects-root=PATH    where project checkouts live
   --data-dir=PATH         store all worker state under PATH
@@ -306,7 +303,7 @@ end
 function run_worker(args)
     opts = parse_opts(args)
     haskey(opts, "data-dir") && (ENV["USER_DATA"] = opts["data-dir"])
-    for req in ("server-url", "secret")
+    for req in ("server-url",)
         haskey(opts, req) && !isempty(opts[req]) && continue
         println(stderr, "worker: --$req is required\n")
         print(stderr, USAGE)
@@ -324,7 +321,7 @@ function run_worker(args)
     isempty(worker_id) && (worker_id = BonitoWorker.load_or_generate_worker_id())
     BonitoWorker.connect_and_serve(;
         server_url    = opts["server-url"],
-        secret        = opts["secret"],
+        credential    = get(opts, "credential", get(ENV, "BONITOAGENTS_WORKER_CREDENTIAL", "")),
         worker_id     = worker_id,
         projects_root = projects)
     return 0
@@ -370,7 +367,6 @@ end
             state = BonitoAgents.serve(;
                 host          = "127.0.0.1",
                 port          = 0,
-                worker_secret = "precompile-secret",
                 state_dir     = mkpath(joinpath(dir, "state")),
                 working_dir   = mkpath(joinpath(dir, "working")),
                 # The scan would start every installed agent to list its
@@ -388,13 +384,11 @@ end
             # in the precompile image.
             worker = BonitoWorker.Worker(BonitoWorker.WorkerConfig(;
                 server_url    = url,
-                secret        = "precompile-secret",
                 worker_id     = "precompile-worker",
                 name          = "precompile",
                 mcp_command   = first(Base.julia_cmd().exec),
                 mcp_arguments = String[],
-                projects_root = mkpath(joinpath(dir, "projects")),
-                agent_bin     = ""))
+                projects_root = mkpath(joinpath(dir, "projects"))))
             worker_task = Threads.@spawn BonitoWorker.serve(worker; retry_delay = 0.1)
             # Wait (bounded) for the handshake to register the worker so the
             # dashboard fetch below renders the worker-present path too.

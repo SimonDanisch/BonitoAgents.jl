@@ -51,7 +51,7 @@
     # "Update now" means now: the worker cuts idle agent processes, so the one
     # thing the server refuses is a turn in flight, which only the server can
     # see. An open but idle chat is not "active work".
-    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     cwd = mktempdir()
     state.projects[]["proj"] = BT.ProjectInfo("proj", "name", "w1", cwd, cwd, BT.now(BT.UTC))
     model = BT.ChatModel(state, cwd; project_id = "proj", agent = BT.WorkerAgent(state, "w1", "/p"))
@@ -68,7 +68,7 @@
     # The card shows the worker's own account of a requested update: installing,
     # waiting for idle, or failed with the error. A failure returns the worker
     # to `:available`, so the button comes back instead of "Updating" for ever.
-    state.workers[]["w1"] = BT.WorkerInfo("w1", "Desktop", "ws://x", "x", nothing, "host", "/home/u",
+    state.workers[]["w1"] = BT.WorkerInfo("w1", "Desktop", nothing, "host", "/home/u",
                                           "julia", String[], "/home/u/projects", :online, BT.now(BT.UTC))
     w = state.workers[]["w1"]
     @test BT.apply_update_status!(state, "w1", Dict{String,Any}("status" => "installing"))

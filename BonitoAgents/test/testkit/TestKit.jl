@@ -48,6 +48,7 @@ chat inside an e2e test. Eval packages → a committed test env (e.g. `test/eval
 module TestKit
 
 using JSON, Sockets, Base64
+import SHA
 import BonitoAgents as BT
 import BonitoMCP
 import BonitoWorker
@@ -448,6 +449,13 @@ end
 
 # ── TestServer ────────────────────────────────────────────────────────────
 
+"An account's way in through Authelia: password and authenticator secret (base32)."
+struct Login
+    user::String
+    password::String
+    secret::String
+end
+
 mutable struct TestServer
     h::BT.DevHandle
     agent_fn::Ref{Function}            # mutable so tests can swap mid-run
@@ -464,6 +472,12 @@ mutable struct TestServer
     # viewport got 1280px and every layout assertion in it passed for the wrong
     # reason.
     browser_size::Tuple{Int,Int}
+    # `dev_server(proxy = true)`: the admin's login through Authelia; `nothing`
+    # for a server without the proxy.
+    admin::Union{Login,Nothing}
+    # The time step of the last one-time code each account used: Authelia takes a
+    # code once, so a second login within the same 30 s waits for the next one.
+    otp_used::Dict{String,Int}
 end
 
 # The worker relay grant this process's in-process MCP channels (control, and
@@ -615,6 +629,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       many_choices::Bool = false,
                       strict_load::Bool = false,
                       scan_on_connect::Bool = false,
+                      proxy::Bool = false,
                       kwargs...)
     ensure_display!()
     # One stack at a time in this process — see `RELEASE_SHARED` above. A
@@ -687,7 +702,14 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # is loaded in. What "continue this chat on another worker" has to satisfy.
     strict_load && (agent_env["BT_MOCK_ACP_STRICT_LOAD"] = "1")
 
-    h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, kwargs...)
+    # Behind the real login proxy: Caddy and Authelia in front, the admin with a
+    # fresh password and authenticator secret, the worker through Caddy.
+    admin = proxy ? Login("admin", bytes2hex(rand(UInt8, 12)), base32(rand(UInt8, 20))) : nothing
+    bins = proxy ? proxy_binaries() : nothing
+    proxy_kw = proxy ? (; proxy = BT.DevProxy(; caddy_bin = bins.caddy, authelia_bin = bins.authelia,
+                                              admin = admin.user, password = admin.password,
+                                              totp_secret = admin.secret)) : (;)
+    h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, proxy_kw..., kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Clean slate for the in-process MCP (armed lazily on the first MCP call,
     # see invoke_mcp) in case a prior test tore down without close().
@@ -695,7 +717,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
                        Ref{Any}(nothing), Ref(false),
-                       (browser_width, browser_height))
+                       (browser_width, browser_height), admin, Dict{String,Int}())
 end
 
 # Dispatcher loop per mock-agent connection. Reads one `{"prompt": "...",
@@ -886,7 +908,7 @@ function add_worker!(s::TestServer; name::AbstractString = "worker-extra")
     ENV["BONITOAGENTS_CONFIG_DIR"] = cfg
     # A distinct, pinned worker id so it registers as a separate worker.
     write(joinpath(cfg, "worker_id"), "test-" * String(name) * "-" * string(rand(UInt32); base = 16))
-    BonitoWorker.write_config!(; server_url = s.h.url, secret = s.h.secret,
+    BonitoWorker.write_config!(; server_url = s.h.url,
                                  projects_root = root, name = String(name))
     proc, _ = BonitoWorker.spawn_worker()
     prev === nothing ? delete!(ENV, "BONITOAGENTS_CONFIG_DIR") : (ENV["BONITOAGENTS_CONFIG_DIR"] = prev)
@@ -968,7 +990,9 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     ensure_display!()
     old = s.browser[]
     old === nothing || close(old)
-    url = "http://127.0.0.1:$(s.h.state.srv.port)$(route)"
+    url = s.h.url * route
+    # Behind the proxy the pages come with a certificate from Caddy's own CA.
+    electron_args = s.admin === nothing ? String[] : ["--ignore-certificate-errors"]
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
     # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
     # capturePage on the headless (show=false) window stays fresh.
@@ -979,8 +1003,8 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     # ElectronCall that predates `offscreen`, so the default path must call the
     # old signature. OSR is opt-in and only resolves against the dev checkout.
     ctx = offscreen ?
-        ECT.open_window(url; width = width, height = height, show = false, offscreen = true) :
-        ECT.open_window(url; width = width, height = height, show = false)
+        ECT.open_window(url; width = width, height = height, show = false, offscreen = true, electron_args) :
+        ECT.open_window(url; width = width, height = height, show = false, electron_args)
     s.browser[] = ctx
     ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
     sleep(3.0)                     # let the dashboard mount + the chat session boot
@@ -1201,7 +1225,7 @@ For routes that aren't direct URLs, prefer the high-level helpers
 (`new_chat`, `open_project`) below.
 """
 function navigate(s::TestServer, route::AbstractString)
-    base = "http://127.0.0.1:$(s.h.state.srv.port)"
+    base = s.h.url
     eval_js(s, "window.__btNavigationPending = true; location.href = $(json(base * String(route)))")
     wait_for(s, "new document loaded",
         "window.__btNavigationPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-app')";
@@ -1210,6 +1234,96 @@ function navigate(s::TestServer, route::AbstractString)
     # reinstalling these, the next suite can read a hidden chat's message
     # count instead of the active chat after a reload test.
     install_pane_scope!(s)
+    return s
+end
+
+# ── The login proxy ────────────────────────────────────────────────────────
+# `dev_server(proxy = true)` puts the real Caddy and Authelia in front, so a test
+# logs in the way a person does: Authelia's form, then a one-time code from an
+# authenticator app, which `totp` computes from the account's secret.
+
+"Caddy and Authelia for `dev_server(proxy = true)`, downloaded once and checksum-verified."
+proxy_binaries() = BT.fetch_proxy_binaries(joinpath(get(ENV, "XDG_CACHE_HOME", joinpath(homedir(), ".cache")),
+                                                    "bonitoagents-test", "proxy-bin"))
+
+const BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+function base32(bytes::AbstractVector{UInt8})
+    bits = join(string(b; base = 2, pad = 8) for b in bytes)
+    bits *= "0"^((5 - length(bits) % 5) % 5)
+    return join(BASE32[parse(Int, bits[i:i+4]; base = 2) + 1] for i in 1:5:length(bits))
+end
+
+function unbase32(text::AbstractString)
+    bits = join(string(findfirst(==(c), BASE32) - 1; base = 2, pad = 5) for c in text)
+    return [parse(UInt8, bits[i:i+7]; base = 2) for i in 1:8:(length(bits) - 7)]
+end
+
+"The RFC 6238 one-time code for `secret` in time step `step` (30 s steps, 6 digits, SHA-1)."
+function totp(secret::AbstractString, step::Integer)
+    h = SHA.hmac_sha1(unbase32(secret), reverse(reinterpret(UInt8, [UInt64(step)])))
+    o = h[end] & 0x0f
+    code = (UInt32(h[o+1] & 0x7f) << 24) | (UInt32(h[o+2]) << 16) | (UInt32(h[o+3]) << 8) | UInt32(h[o+4])
+    return lpad(string(code % UInt32(1_000_000)), 6, '0')
+end
+
+"""
+    seed_totp!(s, user) -> secret
+
+Register an authenticator for `user` with Authelia, as they would by scanning its
+QR code, and return its secret.
+"""
+function seed_totp!(s::TestServer, user::AbstractString)
+    cfg = s.h.state.auth.config
+    secret = base32(rand(UInt8, 20))
+    run(pipeline(`$(cfg.authelia_bin) storage user totp generate $(user) --secret $(secret) --force
+                  --config $(BT.authelia_config_file(cfg))`; stdout = devnull))
+    return secret
+end
+
+"The page's host: the dashboard's, or Authelia's portal (`auth.…`)."
+page_host(s::TestServer) = String(eval_js(s, "location.host"))
+
+"""
+    login!(s, login = s.admin)
+
+Log in through Authelia from its portal, where `open_browser` lands behind the
+proxy: the form, then the one-time code. Returns once the dashboard is up.
+"""
+function login!(s::TestServer, login::Login = s.admin)
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
+    set_input(s, "#username-textfield", login.user)
+    set_input(s, "#password-textfield", login.password)
+    click(s, "#sign-in-button")
+    wait_for(s, "the one-time code form", "document.querySelectorAll('input[autocomplete=off]').length >= 5";
+             timeout = 30)
+    # Authelia takes a code once: after a login in this 30 s step, wait for the next.
+    step = floor(Int, time() / 30)
+    if get(s.otp_used, login.user, -1) >= step
+        sleep(30 * (step + 1) - time() + 0.5)
+        step = floor(Int, time() / 30)
+    end
+    s.otp_used[login.user] = step
+    code = totp(login.secret, step)
+    # One digit per box, as typing does; the component gathers them and submits.
+    eval_js(s, """(() => {
+        const boxes = [...document.querySelectorAll('input[autocomplete=one-time-code], input[autocomplete=off]')]
+            .filter(e => !e.id.endsWith('hidden-input'));
+        const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        $(json(code)).split('').forEach((d, i) => {
+            boxes[i].focus(); set.call(boxes[i], d);
+            boxes[i].dispatchEvent(new Event('input', {bubbles: true})); });
+        return true; })()""")
+    wait_for(s, "the dashboard after the login", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    install_pane_scope!(s)
+    return s
+end
+
+"Log out through the account card's link; returns once Authelia's form is back."
+function logout!(s::TestServer)
+    eval_js(s, """(() => { const a = [...document.querySelectorAll('a')]
+        .find(a => (a.innerText||'').trim() === 'Log out'); a.click(); return true; })()""")
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
     return s
 end
 

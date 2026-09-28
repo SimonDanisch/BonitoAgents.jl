@@ -40,8 +40,7 @@ function show_kind(node)
 end
 
 newstate() = BT.ServerState(; state_dir = mktempdir(),
-                              working_dir = mktempdir(),
-                              worker_secret = "x")
+                              working_dir = mktempdir())
 
 @testset "bt_show / ShowTool" begin
 

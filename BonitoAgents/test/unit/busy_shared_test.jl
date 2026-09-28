@@ -8,7 +8,7 @@
     using Bonito
     const BT = BonitoAgents
 
-    state = BT.serve(; host = "127.0.0.1", port = 0, worker_secret = "x",
+    state = BT.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mktempdir(), working_dir = mktempdir())
     parent = BT.ChatModel(state, mktempdir(); project_id = "proj",
                           agent = BT.WorkerAgent(state, "w1", "/p"))

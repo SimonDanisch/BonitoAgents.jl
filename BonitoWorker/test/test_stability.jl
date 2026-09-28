@@ -99,9 +99,9 @@ end
 # never come.
 @testset "M13: a failed agent start aborts its channel with the reason" begin
     WL = BW.WorkerLink
-    w = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:1", secret = "s",
+    w = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:1",
         worker_id = "m13", name = "m13", mcp_command = "julia", mcp_arguments = String[],
-        projects_root = mktempdir(), agent_bin = ""))
+        projects_root = mktempdir()))
     ct, st = WL.memory_pair()
     server_task = Threads.@spawn begin
         h = WL.read_hello(st)

@@ -15,11 +15,10 @@
     const BT = BonitoAgents
 
     reload(root) = BT.ServerState(; state_dir = root.state_dir,
-                                    working_dir = root.working_dir, worker_secret = "x")
+                                    working_dir = root.working_dir)
 
-    root = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                            worker_secret = "x")
-    root.workers[]["wid-a"] = BT.WorkerInfo("wid-a", "Desktop", "ws://x", "x", nothing,
+    root = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
+    root.workers[]["wid-a"] = BT.WorkerInfo("wid-a", "Desktop", nothing,
                                             "Desktop-host", "/home/u", "julia", String[],
                                             "/home/u/projects/Desktop", :online, now())
     p = BT.ProjectInfo("p1", "HOTS", "wid-a", joinpath(root.working_dir, "HOTS"),

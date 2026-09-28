@@ -15,6 +15,7 @@ module AgentProviders
 export AgentProvider, BinAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, CodexAgent, MockAgent, MockAgent2
 export provider_name, label, icon
+export npm_package, npm_bin, bin_override, managed_packages
 export current_providers, find_provider, refresh_providers!
 export strip_injected_context, meaningful_prompt, reports_autonomous_origin
 
@@ -198,6 +199,28 @@ icon(::KimiAgent)       = "bt-provider-kimi"
 icon(::CodexAgent)      = "bt-provider-codex"
 icon(::MockAgent)       = "bt-provider-mock"
 icon(::MockAgent2)      = "bt-provider-mock"
+
+# ── Managed adapters ─────────────────────────────────────────────────────────
+# The ACP adapters that ship as npm packages. A worker installs and updates them
+# itself, into its own prefix and at the versions the server declares (see
+# BonitoWorker's harnesses.jl); every other agent stays whatever its owner
+# installed on PATH.
+npm_package(::AgentProvider)   = nothing
+npm_package(::ClaudeCodeAgent) = "@agentclientprotocol/claude-agent-acp"
+npm_package(::CodexAgent)      = "@agentclientprotocol/codex-acp"
+# The executable a managed package puts in `node_modules/.bin`.
+npm_bin(::ClaudeCodeAgent) = "claude-agent-acp"
+npm_bin(::CodexAgent)      = "codex-acp"
+# A binary pinned through the environment; it wins over a managed install.
+bin_override(::AgentProvider)   = ""
+bin_override(::ClaudeCodeAgent) = get(ENV, "CLAUDE_AGENT_ACP", "")
+bin_override(::CodexAgent)      = get(ENV, "CODEX_AGENT_ACP", "")
+bin_override(::MiMoAgent)       = get(ENV, "MIMO_AGENT_ACP", "")
+bin_override(::OpenCodeAgent)   = get(ENV, "OPENCODE_AGENT_ACP", "")
+bin_override(::KimiAgent)       = get(ENV, "KIMI_AGENT_ACP", "")
+
+"The npm packages a worker manages: those of the providers that ship as one."
+managed_packages() = String[pkg for pkg in npm_package.(current_providers()) if pkg !== nothing]
 
 # ── Where a provider keeps its sessions on disk ──────────────────────────────
 # "Continue this chat on another worker" carries the agent's OWN record of the

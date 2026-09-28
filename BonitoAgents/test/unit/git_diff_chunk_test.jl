@@ -19,8 +19,7 @@
 
     mktempdir() do dir
         st = BT.ServerState(; state_dir = dir,
-                              working_dir = joinpath(dir, "work"),
-                              worker_secret = "s")
+                              working_dir = joinpath(dir, "work"))
 
         # A multi-MB patch full of multi-byte codepoints: cuts that land inside a
         # UTF-8 sequence would corrupt the reassembled patch, so the splitter and

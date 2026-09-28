@@ -8,9 +8,9 @@
     using HTTP: WebSockets
     const BW = BonitoWorker
 
-    new_worker() = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:1", secret = "s",
+    new_worker() = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:1",
         worker_id = "reap-test", name = "reap-test", mcp_command = "julia",
-        mcp_arguments = String[], projects_root = mktempdir(), agent_bin = ""))
+        mcp_arguments = String[], projects_root = mktempdir()))
 
     # A session as `run_agent_session` registers it; the channel is opened on
     # the (never connected) link, which is all reaping needs of it.

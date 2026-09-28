@@ -35,7 +35,7 @@ const BT = BonitoAgents
 
     @testset "global_agents_md round-trip" begin
         state = BT.ServerState(; state_dir = mktempdir(),
-                                 working_dir = mktempdir(), worker_secret = "x")
+                                 working_dir = mktempdir())
         @test BT.global_agents_md(state) == ""
         BT.set_global_agents_md!(state, "## House rules\nBe pedantic.\n")
         @test BT.global_agents_md(state) == "## House rules\nBe pedantic."
@@ -46,7 +46,7 @@ const BT = BonitoAgents
 
     @testset "agents_prompt_appendix: built-in rules always ride along" begin
         state = BT.ServerState(; state_dir = mktempdir(),
-                                 working_dir = mktempdir(), worker_secret = "x")
+                                 working_dir = mktempdir())
         # No user AGENTS.md → the appendix IS the built-in rules (never empty,
         # so every Claude session gets the house rules).
         @test BT.agents_prompt_appendix(state) == BT.BUILTIN_AGENT_RULES
@@ -75,8 +75,7 @@ const BT = BonitoAgents
 
     @testset "control channel + interrupt round-trip" begin
         state = BT.ServerState(; state_dir = mktempdir(),
-                                 working_dir = mktempdir(),
-                                 worker_secret = "unused")
+                                 working_dir = mktempdir())
         state.projects[]["ctrl-proj"] = BT.ProjectInfo("ctrl-proj", "ctrl", "ctrl-worker",
                                                        mktempdir(), mktempdir(), BT.now(BT.UTC))
         # A live server for the requests that report on it.

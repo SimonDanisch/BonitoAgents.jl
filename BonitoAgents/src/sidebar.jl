@@ -318,7 +318,7 @@ a title, a fresh thread was otherwise reachable only through the dashboard.
 """
 function open_chat_projects(state::ServerState,
                             projects::AbstractDict{<:AbstractString,ProjectInfo})
-    out  = open_chat_projects(projects)
+    out  = filter!(p -> visible(state, p), open_chat_projects(projects))
     have = Set(p.id for p in out)
     live = lock(state.lock) do
         collect(keys(state.chat_models))
@@ -329,7 +329,7 @@ function open_chat_projects(state::ServerState,
         # A dismissed chat that still has a live model (the ✕ tears the model
         # down, so this is only a brief race) must not be re-added by the
         # live-model path — honour the close.
-        (p === nothing || p.dismissed) && continue
+        (p === nothing || p.dismissed || !visible(state, p)) && continue
         push!(out, p)
     end
     return out
@@ -1352,8 +1352,13 @@ function unified_main(session::Bonito.Session, state::ServerState,
     # display:none here, exposing ~1s of bare background before the
     # now-removed per-chat curtain painted.)
     overlay = map(session, current_view, ls.settled) do pid, _
+        p = get(state.projects[], pid, nothing)
         if isempty(pid)
             DOM.div(; style = Styles("display" => "none"))
+        elseif p !== nothing && !visible(state, p)
+            # Someone else's chat: a member sees their own only.
+            DOM.div("Unknown project: $pid"; class = "bt-empty",
+                    style = Styles("padding" => "40px"))
         elseif haskey(state.chat_models, pid)
             # The wrapper div keeps this branch a Node (like the others) so
             # Bonito renders it directly; height:100% hands the overlay's
@@ -1540,13 +1545,21 @@ Single-page app: sidebar on the left, dashboard or chat in the main area
 depending on `current_view`. Replaces the old per-project `/p/<id>` routes.
 """
 function unified_app(state::ServerState)
-    App(; title = "BonitoAgents") do session
-        # Per-session view of the shared state. `copy(state, session)` shares
-        # the workers/projects/chat_models tables and the lock, but gives this
-        # session its OWN connected child of each version Observable (via
+    App(; title = "BonitoAgents") do session, request
+        # Who this tab serves (identity.jl): the local user, or whoever the proxy
+        # authenticated. Behind the proxy a request without an identity did not
+        # come through Authelia, and gets nothing.
+        user = request_user(state.auth, request)
+        user === nothing && return DOM.div(
+            "This server answers only through its login proxy. Open it at its public address.";
+            style = "padding: 2em; font-family: sans-serif")
+        register_user_session!(state, session, user)
+        # Per-session view of the shared state. `copy(state, session, user)`
+        # shares the workers/projects/chat_models tables and the lock, but gives
+        # this session its OWN connected child of each version Observable (via
         # `map(identity, session, ...)` — auto-deregisters on tab close).
         # `current_view` is per-session (transient navigation state).
-        view = copy(state, session)
+        view = copy(state, session, user)
         current_view = Observable("")
         # Per-session bring-up bookkeeping for the loading view (see
         # LoadingState / project_loading_view). The retry handler clears the

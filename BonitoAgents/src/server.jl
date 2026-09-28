@@ -29,10 +29,13 @@ const INSTALL_SH     = read(joinpath(ASSETS_DIR, "install.sh"),  String)
 const INSTALL_PS1    = read(joinpath(ASSETS_DIR, "install.ps1"), String)
 
 """
-    serve(; host, port, public_url, worker_secret, state_dir, working_dir) → Bonito.Server
+    serve(; host, port, public_url, auth, state_dir, working_dir) → Bonito.Server
 
-Start the BonitoAgents dashboard server. Workers dial back to this server, so
-only port `port` (default 8038) needs to be open in the server's firewall.
+Start the BonitoAgents dashboard server. It listens on localhost only and does no
+authentication itself (identity.jl): behind the proxy the installer sets up
+(`auth = ProxyAuth(...)`, from `<state_dir>/proxy.json`), Caddy + Authelia
+authenticate every request and say who it is from; without it (`LocalAuth`),
+only this machine can reach the server and its user is the one account.
 
 Routes:
   /                       — dashboard (workers + projects)
@@ -45,8 +48,12 @@ Routes:
                             carrying its control channel, its agents' ACP sessions
                             and its file transfers (see worker_client.jl)
 
-`worker_secret` is the shared secret used by every worker. `public_url` is the
-base URL workers see (and what the install script tells them to dial back).
+`public_url` is the base URL workers see (and what the install script tells
+them to dial back); behind the proxy it defaults to `https://<domain>`.
+`manage_harnesses` sends workers the agent adapters to keep installed
+(`harness_spec`). Off by default, so a test or dev server never has its workers
+download Node and npm packages; the server processes (`start_server`, the
+desktop app) turn it on.
 
 `state_dir`   overrides where workers.json / projects.json are persisted
               (default: `~/.local/share/bonitoagents-server`).
@@ -55,10 +62,11 @@ base URL workers see (and what the install script tells them to dial back).
               onto the worker at `<worker.projects_root>/<name>`.
               (default: `~/bonitoagents-server`)
 """
-function serve(; host::String        = "0.0.0.0",
+function serve(; host::String        = "127.0.0.1",
                  port::Int           = 8038,
                  public_url::Union{String,Nothing}   = nothing,
-                 worker_secret::String,
+                 auth::AuthMode      = LocalAuth(),
+                 manage_harnesses::Bool = false,
                  state_dir::Union{String,Nothing}   = nothing,
                  working_dir::Union{String,Nothing} = nothing,
                  heartbeat_interval::Real = 15.0,
@@ -66,6 +74,12 @@ function serve(; host::String        = "0.0.0.0",
                  worker_link_grace::Real = 300.0,
                  scan_on_connect::Bool = true,
                  log_file::Union{String,Nothing} = nothing)
+    # Nothing but the proxy, or this machine, may reach the server: it takes the
+    # proxy's word for who a request is from, and without the proxy everyone who
+    # connects is the local admin.
+    is_loopback(host) ||
+        error("BonitoAgents only listens on localhost (got --host $(host)): put the proxy " *
+              "in front to reach it from elsewhere (BonitoAgents/assets/install_server.sh).")
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
     isvalid(s) = s !== nothing && !isempty(String(s))
@@ -98,7 +112,7 @@ function serve(; host::String        = "0.0.0.0",
     install_log_ring!()
     SERVER_STARTED[] == 0.0 && (SERVER_STARTED[] = time())
 
-    state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret,
+    state = ServerState(; state_dir = sd, working_dir = wd, auth, manage_harnesses,
                           heartbeat_interval = heartbeat_interval,
                           heartbeat_deadline = heartbeat_deadline,
                           worker_link_grace = worker_link_grace,
@@ -127,13 +141,14 @@ function serve(; host::String        = "0.0.0.0",
     # when --public-url was omitted; `something("", …)` would have kept the
     # empty string and templated install scripts with a blank SERVER_URL).
     base_url = (public_url === nothing || isempty(public_url)) ?
-        Bonito.online_url(srv, "") : public_url
+        default_public_url(auth, srv) : public_url
     # The dashboard's install snippet renders the SAME url the install routes
     # are templated with — never a "<your-server>" placeholder.
     state.base_url[] = rstrip(base_url, '/')
-    add_install_routes!(srv, base_url, worker_secret)
+    add_install_routes!(srv, base_url)
     add_acp_log_routes!(srv, state)
     add_download_routes!(srv, state)
+    add_invite_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
 
     # The background-output poller is no longer a server-wide loop — it's
@@ -146,24 +161,32 @@ function serve(; host::String        = "0.0.0.0",
     # = the configured --public-url, or the detected address) — not the bind-based
     # `online_url(srv)` (0.0.0.0/localhost), which mismatched the dashboard's
     # "add worker" url whenever --public-url was set.
-    @info "BonitoAgents dashboard running" url=base_url state=sd
-    @info "Worker install — run on each agent machine" *
-          "\n    Linux / macOS  : curl -fsSL $base_url/install.sh | sh" *
-          "\n    Windows (PS)   : irm $base_url/install.ps1 | iex"
+    # Behind the proxy the server owns Caddy's and Authelia's config (worker
+    # credentials, accounts): bring both in line with what it has on record.
+    apply_proxy!(state)
+    @info "BonitoAgents dashboard running" url=base_url state=sd auth=nameof(typeof(auth))
+    @info "Workers: \"Add worker\" on the dashboard gives the install command for a machine."
     return state
 end
 
+# Where workers and browsers reach the server when no --public-url says so.
+default_public_url(auth::ProxyAuth, srv) = public_origin(auth.config, auth.config.domain)
+default_public_url(::LocalAuth, srv) = Bonito.online_url(srv, "")
+
+# Behind the proxy, the port is the one Caddy forwards to.
+listen_port(auth::ProxyAuth, opts::AbstractDict) = auth.config.port
+listen_port(::LocalAuth, opts::AbstractDict) = parse(Int, get(opts, "port", "8038"))
+
 # ── Package entry point ──────────────────────────────────────────────────────
 # `julia --project=<monorepo root> -m BonitoAgents [flags]` starts the server and
-# blocks. No env vars: defaults are baked in (port 8038, host 0.0.0.0) and the
-# worker secret is generated + persisted in the state dir on first run, so
-# workers keep authenticating across restarts. Override any default with a flag:
+# blocks. No env vars: defaults are baked in (port 8038, localhost), and a
+# `proxy.json` in the state dir (written by install_server.sh) puts it behind
+# Caddy + Authelia. Override any default with a flag:
 #
 #   julia --project=. -m BonitoAgents
 #   julia --project=. -m BonitoAgents --port 8080
-#   julia --project=. -m BonitoAgents --public-url https://team.example.com --secret <hex>
 #
-# Flags: --port --host --public-url --secret --state-dir --working-dir
+# Flags: --port --host --public-url --state-dir --working-dir --log-file
 """
     start_server(opts; state_dir, working_dir) -> Bonito.Server
 
@@ -191,13 +214,13 @@ function start_server(opts::AbstractDict;
                       working_dir::AbstractString = "")
     sd = let v = get(opts, "state-dir", ""); isempty(v) ? state_dir : v end
     wd = let v = get(opts, "working-dir", ""); isempty(v) ? working_dir : v end
-    secret = get(opts, "secret", "")
-    isempty(secret) && (secret = persisted_worker_secret(sd))
+    auth = auth_mode(sd)
     return serve(;
-        worker_secret = secret,
-        host          = get(opts, "host", "0.0.0.0"),
-        port          = parse(Int, get(opts, "port", "8038")),
+        auth,
+        host          = get(opts, "host", "127.0.0.1"),
+        port          = listen_port(auth, opts),
         public_url    = get(opts, "public-url", ""),
+        manage_harnesses = true,
         state_dir     = sd,
         working_dir   = wd,
         log_file      = get(opts, "log-file", ""),
@@ -231,20 +254,6 @@ function parse_server_args(args::Vector{String})
     return opts
 end
 
-# Read the persisted worker secret, generating + storing one (mode 600) on first
-# run so workers keep authenticating across restarts with no env vars to manage.
-function persisted_worker_secret(state_dir::AbstractString)
-    mkpath(state_dir)
-    f = joinpath(state_dir, "worker_secret")
-    if isfile(f)
-        s = strip(read(f, String)); isempty(s) || return String(s)
-    end
-    s = bytes2hex(rand(UInt8, 32))
-    write(f, s); chmod(f, 0o600)
-    @info "BonitoAgents: generated a new worker secret" file = f
-    return s
-end
-
 # HTTP routes
 #
 # /install        — sniffs `User-Agent` and serves either the bash or PS1
@@ -255,24 +264,25 @@ end
 #                   wrong, or when fetched from a browser to inspect.
 # /install.ps1    — always PowerShell wrapper. Same.
 # /install.jl     — the cross-platform Julia installer the wrappers fetch.
-function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secret::String)
+# None of them carries a secret: the proxy serves them to anyone, since a new
+# machine fetches them before it has a credential (it gets one from "Add worker").
+function add_install_routes!(srv::Bonito.Server, public_url::String)
     Bonito.route!(srv, "/install.jl" => function(context)
-        script = render_install_script(INSTALL_SCRIPT, public_url, worker_secret)
+        script = render_install_script(INSTALL_SCRIPT, public_url)
         HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=script)
     end)
     Bonito.route!(srv, "/install.sh" => function(context)
-        body = render_install_script(INSTALL_SH, public_url, worker_secret)
+        body = render_install_script(INSTALL_SH, public_url)
         HTTP.Response(200, ["Content-Type" => "text/x-shellscript; charset=utf-8"], body=body)
     end)
     Bonito.route!(srv, "/install.ps1" => function(context)
-        body = render_install_script(INSTALL_PS1, public_url, worker_secret)
+        body = render_install_script(INSTALL_PS1, public_url)
         HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=body)
     end)
     Bonito.route!(srv, "/install" => function(context)
         ua   = String(HTTP.header(context.request, "User-Agent", ""))
         is_ps = occursin("PowerShell", ua)
-        body = render_install_script(is_ps ? INSTALL_PS1 : INSTALL_SH,
-                                     public_url, worker_secret)
+        body = render_install_script(is_ps ? INSTALL_PS1 : INSTALL_SH, public_url)
         ctype = is_ps ? "text/plain; charset=utf-8" :
                         "text/x-shellscript; charset=utf-8"
         HTTP.Response(200, ["Content-Type" => ctype], body=body)
@@ -293,7 +303,8 @@ function add_acp_log_routes!(srv::Bonito.Server, state::ServerState)
     index_handler = function(context)
         chats_root = joinpath(state.state_dir, "chats")
         ids = isdir(chats_root) ?
-            filter(id -> isfile(joinpath(chats_root, id, "acp.jsonl")),
+            filter(id -> isfile(joinpath(chats_root, id, "acp.jsonl")) &&
+                         request_sees_chat(state, context.request, id),
                    sort!(readdir(chats_root))) :
             String[]
         items = map(ids) do id
@@ -314,9 +325,25 @@ function add_acp_log_routes!(srv::Bonito.Server, state::ServerState)
     Bonito.route!(srv, "/acp-log"  => index_handler)
     Bonito.route!(srv, "/acp-log/" => index_handler)
     Bonito.route!(srv, ACP_LOG_ROUTE_RE => function(context)
-        acp_log_response(state, String(context.match.captures[1]))
+        pid = String(context.match.captures[1])
+        request_sees_chat(state, context.request, pid) || return unknown_chat(pid)
+        acp_log_response(state, pid)
     end)
 end
+
+# Every route keyed by a chat answers only who may see that chat (a member: their
+# own; an admin: all, including logs of chats no longer on record), and answers
+# everyone else as if the chat did not exist.
+function request_sees_chat(state::ServerState, request, project_id::AbstractString)
+    user = request_user(state.auth, request)
+    user === nothing && return false
+    p = get(state.projects[], String(project_id), nothing)
+    return p === nothing ? is_admin(user) : visible(user, p)
+end
+
+unknown_chat(project_id::AbstractString) =
+    HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                  body = "unknown project '$(project_id)'\n")
 
 # `request.target` includes the query string, hence the `($|\?)` arm; the
 # `/?` tolerates a trailing slash after the id. The charset (no `.`, no `/`)
@@ -358,22 +385,23 @@ function add_download_routes!(srv::Bonito.Server, state::ServerState)
     end)
     Bonito.route!(srv, DOWNLOAD_ROUTE_RE => function(context)
         pid    = String(context.match.captures[1])
+        request_sees_chat(state, context.request, pid) || return unknown_chat(pid)
         params = HTTP.queryparams(HTTP.URI(context.request.target))
         download_response(state, pid, String(get(params, "path", "")))
     end)
     Bonito.route!(srv, ATTACHMENT_ROUTE_RE => function(context)
         pid    = String(context.match.captures[1])
+        request_sees_chat(state, context.request, pid) || return unknown_chat(pid)
         params = HTTP.queryparams(HTTP.URI(context.request.target))
         attachment_response(state, pid, String(get(params, "file", "")))
     end)
 end
 
-# These URLs depend only on persisted worker identity, path, and server secret.
-# Signing limits access to files exposed by the UI, including bt_show files
-# outside the project tree. No browser/eval session owns or unregisters them.
+# These URLs depend only on persisted worker identity, path, and the server's
+# URL key. Signing limits access to files exposed by the UI, including bt_show
+# files outside the project tree. No browser/eval session owns or unregisters them.
 worker_file_token(state::ServerState, worker_id::String, path::String) =
-    bytes2hex(SHA.hmac_sha256(Vector{UInt8}(codeunits(state.worker_secret)),
-        codeunits(JSON.json([worker_id, path]))))
+    bytes2hex(SHA.hmac_sha256(state.url_key, codeunits(JSON.json([worker_id, path]))))
 
 function worker_file_url(state::ServerState, worker_id::String, path::String)
     token = worker_file_token(state, worker_id, path)
@@ -537,15 +565,13 @@ end
 esc_html(s::AbstractString) = replace(s,
     "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\"" => "&quot;")
 
-# Substitute the server URL + shared secret + git rev into a templated install
-# script. install.jl guards against being run with the `{{ }}` placeholders
-# intact, so a raw fetch of any asset (bypassing these routes) fails loudly.
-function render_install_script(template::AbstractString,
-                                 public_url::String, worker_secret::String)
+# Substitute the server URL + git rev into a templated install script.
+# install.jl guards against being run with the `{{ }}` placeholders intact, so a
+# raw fetch of any asset (bypassing these routes) fails loudly.
+function render_install_script(template::AbstractString, public_url::String)
     bonito_url, bonito_rev = current_bonito_install_spec()
     replace(template,
         "{{SERVER_URL}}"    => public_url,
-        "{{WORKER_SECRET}}" => worker_secret,
         "{{REV}}"           => current_repo_rev(),
         "{{SOURCE_ID}}"     => current_repo_source_id(),
         "{{BONITO_URL}}"    => bonito_url,
@@ -784,6 +810,6 @@ function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
     # A worker's ONE connection: control, its agents' ACP streams, file
     # transfers, and the channels its local relay opens for MCP processes and
     # eval workers are all channels on this link (worker_client.jl).
-    Bonito.HTTPServer.websocket_route!(srv, "/w" => (_ctx, ws) ->
-        handle_worker_link(state, ws))
+    Bonito.HTTPServer.websocket_route!(srv, "/w" => (ctx, ws) ->
+        handle_worker_link(state, ws, ctx.request))
 end

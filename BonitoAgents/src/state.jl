@@ -19,8 +19,16 @@ mutable struct WorkerInfo
     # so the user can tell at a glance which machine a chat lives on.
     # `nothing` → derive from `name` via `derive_initials`.
     initials::Union{String,Nothing}
-    url::String                        # ws://host:port
-    secret::String
+    # Who added the worker (whoever issued its credential); on a server without
+    # the proxy, the local user. Nothing filters on it for admins; a member sees
+    # only the workers they own.
+    owner::String
+    # The credential it connects with (a name in `worker_credentials`), or "" on
+    # a server without the proxy. Revoking the credential disconnects it.
+    credential::String
+    # Groups whose members see it and start chats on it besides its owner
+    # (`share_worker!`); their chats stay their own.
+    shared_with::Vector{String}
     ssh_target::Union{String,Nothing}  # for ssh-based rsync: "user@host". nothing → local rsync
     # discovered via probe
     hostname::String
@@ -38,6 +46,10 @@ mutable struct WorkerInfo
     last_check::DateTime
     update_state::Symbol               # :current | :available | :reinstall (too old to self-update) | :updating
     update_message::String
+    # The managed agent adapters it reports (the worker's harnesses.jl): Node and
+    # each npm package, by version; and why the last attempt to install them failed.
+    harnesses::Dict{String,String}
+    harness_error::String
 end
 
 # A worker is "open" while its control WS is connected. Point read; bind to
@@ -71,6 +83,8 @@ mutable struct ProjectInfo
     server_path::String                # canonical copy on server (= state.working_dir/name)
     worker_path::String                # mirrored copy on worker (= worker.projects_root/name)
     created::DateTime
+    # Who started the chat. Admins see every chat; a member sees their own.
+    owner::String
     # At most one active ACP session per project. Acquired when
     # ensure_project_session! brings up the ChatModel; released automatically
     # when the bound worker's control WS drops (the claude process is gone
@@ -149,8 +163,10 @@ mutable struct ProjectInfo
     file_index::ProjectFileIndex
 end
 
+# `owner` is left empty for `track_project!` to fill in: the acting user.
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
+                "",                      # owner
                 nothing,                 # locked_by
                 nothing,                 # locked_at
                 :unsynced,               # backup_status
@@ -165,19 +181,17 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
                 false,                   # remote_eval
                 ProjectFileIndex())      # file_index
 
-# Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
-# call shape working for tests / fixtures that build a WorkerInfo by hand.
-# New code that wants a custom tag uses the full 13-arg form (or sets
-# `.initials` directly).
-WorkerInfo(worker_id, name, url, secret, ssh_target, hostname, home,
+# Short positional form for tests and fixtures that build a WorkerInfo by hand:
+# no initials, owner or credential, nothing reported yet.
+WorkerInfo(worker_id, name, ssh_target, hostname, home,
            mcp_path, mcp_args, projects_root, status, last_check) =
-    WorkerInfo(worker_id, name, nothing, url, secret, ssh_target, hostname, home,
+    WorkerInfo(worker_id, name, nothing, "", "", String[], ssh_target, hostname, home,
                mcp_path, mcp_args, projects_root,
                # Accept the legacy `status::Symbol` (tests / fixtures pass
                # `:online`/`:offline`/`:unknown`) or a ready Observable/Bool.
                status isa Observable ? status :
                    Observable(status === :online || status === true),
-               last_check, :current, "")
+               last_check, :current, "", Dict{String,String}(), "")
 
 """
     ServerState
@@ -201,8 +215,9 @@ handlers. Five things deserve a paragraph each:
 - `srv` is filled in after `Bonito.Server` is constructed (chicken-and-egg:
   the dashboard app captures the state, but the server constructor takes
   the dashboard).
-- `worker_secret` is the auth token every worker presents on its hello
-  frame; same secret across all workers, baked into the install script.
+- `auth` says who is on the other end (identity.jl): the local user on a server
+  without the proxy, whoever Caddy + Authelia authenticated behind it. `user`
+  is that person on a per-session view, `nothing` on the root.
 """
 # Accumulator for a MULTI-FRAME (chunked) worker RPC reply, keyed in
 # `pending_chunks` by the same uuid an ordinary `pending_rpcs` entry uses.
@@ -242,8 +257,12 @@ mutable struct ServerState
     # Disk paths (immutable after construction)
     state_dir   :: String
     working_dir :: String
-    # Auth
-    worker_secret :: String
+    # Who may connect, and how the server learns who they are (identity.jl).
+    auth :: AuthMode
+    # Signs the file URLs the UI hands the browser (`worker_file_url`).
+    url_key :: Vector{UInt8}
+    # The person a per-session view serves; `nothing` on the root.
+    user :: Union{User,Nothing}
     # Worker-link liveness (seconds): each link pings every `heartbeat_interval`
     # and drops a connection that has been silent for `heartbeat_deadline` — a
     # half-open TCP link after a suspend or a wifi drop, ESTABLISHED on both
@@ -383,6 +402,23 @@ mutable struct ServerState
     # before a chat is open. Empty until the first session reports.
     last_config_options :: Observable{Vector{Any}}
 
+    # Behind the proxy: the credentials workers connect with (name =>
+    # WorkerCredential) and the accounts people log in with (name => Account),
+    # both owned by the server and rendered into Caddy's and Authelia's config
+    # (accounts.jl). Persisted; empty on a server without the proxy.
+    worker_credentials :: Observable{Dict{String,WorkerCredential}}
+    accounts           :: Observable{Dict{String,Account}}
+    # Open invite links by their token's hash (name => Invite); persisted.
+    invites            :: Observable{Dict{String,Invite}}
+    # Live browser sessions by user name, so disabling an account closes them: an
+    # open websocket is not re-checked by Authelia.
+    user_sessions      :: Dict{String,Vector{Bonito.Session}}
+    # The agent adapters workers keep installed (the worker's harnesses.jl):
+    # `Dict("node" => "lts", "packages" => Dict(pkg => "latest"|version))`, sent
+    # with every hello acknowledgement. `nothing`: workers manage none (dev and
+    # test servers, which must not download anything). Persisted in settings.json.
+    harness_spec       :: Observable{Union{Nothing,Dict{String,Any}}}
+
     # The parent state a per-session `copy(state, session)` was derived from;
     # `nothing` on the root itself. The Observable bridges above are ONE-WAY
     # (root → session child), so GLOBAL notifications must be raised on the
@@ -396,15 +432,26 @@ end
 "The root ServerState `s` derives from (identity for the root itself)."
 root_state(s::ServerState) = s.root === nothing ? s : s.root
 
+# A saved record's owner. Records from before owners existed, or saved without
+# one, belong to the default owner (the admin).
+function record_owner(s::ServerState, d::AbstractDict)
+    o = String(get(d, "owner", ""))
+    return isempty(o) ? default_owner(s.auth) : o
+end
+
+"Who acts through `s`: its session's user, or the default owner for server-side work."
+acting_owner(s::ServerState) = s.user === nothing ? default_owner(s.auth) : s.user.name
+
 """
-    ServerState(; state_dir, working_dir, worker_secret) → ServerState
+    ServerState(; state_dir, working_dir, auth = LocalAuth(), manage_harnesses = false) → ServerState
 
 Construct a fresh state, loading workers + projects from `state_dir`
 (`workers.json`, `projects.json`). `working_dir` is created if missing.
 """
 function ServerState(; state_dir::String,
                        working_dir::String,
-                       worker_secret::String,
+                       auth::AuthMode = LocalAuth(),
+                       manage_harnesses::Bool = false,
                        heartbeat_interval::Real = 15.0,
                        heartbeat_deadline::Real = 45.0,
                        worker_link_grace::Real = 300.0,
@@ -412,7 +459,8 @@ function ServerState(; state_dir::String,
     mkpath(working_dir)
     s = ServerState(
         ReentrantLock(),
-        state_dir, working_dir, worker_secret,
+        state_dir, working_dir,
+        auth, load_or_create_secret(state_dir, "url_key"), nothing,
         Float64(heartbeat_interval), Float64(heartbeat_deadline), Float64(worker_link_grace),
         scan_on_connect,
         nothing,
@@ -440,12 +488,20 @@ function ServerState(; state_dir::String,
         String[],                                 # bound_lru
         Observable(Dict{String,String}()),        # default_session_config (load_settings! below)
         Observable(Any[]),                        # last_config_options
+        Observable(Dict{String,WorkerCredential}()),  # worker_credentials
+        Observable(Dict{String,Account}()),       # accounts
+        Observable(Dict{String,Invite}()),        # invites
+        Dict{String,Vector{Bonito.Session}}(),    # user_sessions
+        Observable{Union{Nothing,Dict{String,Any}}}(nothing),  # harness_spec (load_settings! below)
         nothing,                                  # root (this IS the root)
     )
     load_workers!(s)
     load_projects!(s)
     load_discovered!(s)
-    load_settings!(s)
+    load_worker_credentials!(s)
+    load_accounts!(s)
+    load_invites!(s)
+    load_settings!(s; manage_harnesses)
     return s
 end
 
@@ -458,11 +514,12 @@ end
 # `copy(obs)` would leak the callback on the parent forever.)
 #
 # Use `view = copy(state, session)` at the top of every `App() do session ... end` body.
-function Base.copy(s::ServerState, session::Bonito.Session)
+function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Nothing} = s.user)
     lock(s.lock) do
         ServerState(
             s.lock,
-            s.state_dir, s.working_dir, s.worker_secret,
+            s.state_dir, s.working_dir,
+            s.auth, s.url_key, user,
             s.heartbeat_interval, s.heartbeat_deadline, s.worker_link_grace,
             s.scan_on_connect,
             s.srv,
@@ -494,6 +551,11 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             # via `map(session, …)`, which tears its callback down on tab close.
             s.default_session_config,
             s.last_config_options,
+            s.worker_credentials,      # shared, like the settings above
+            s.accounts,
+            s.invites,
+            s.user_sessions,
+            s.harness_spec,
             root_state(s),             # copies of copies still point at the true root
         )
     end
@@ -509,7 +571,10 @@ settings_file(s::ServerState)   = joinpath(s.state_dir, "settings.json")
 # the lock, atomic write — same shape as `save_projects!`.
 function save_settings!(s::ServerState)
     data = lock(s.lock) do
-        Dict{String,Any}("default_session_config" => copy(s.default_session_config[]))
+        d = Dict{String,Any}("default_session_config" => copy(s.default_session_config[]))
+        spec = s.harness_spec[]
+        spec === nothing || (d["harnesses"] = spec)
+        d
     end
     atomic_write_json(settings_file(s), data)
     return nothing
@@ -518,8 +583,9 @@ end
 # Load settings.json into `default_session_config` on construct. Tolerant: a
 # missing/corrupt file just leaves the defaults empty (fall back to the hardcoded
 # DEFAULT_* — see `effective_session_config`). Never throws.
-function load_settings!(s::ServerState)
+function load_settings!(s::ServerState; manage_harnesses::Bool = false)
     d = load_json_tolerant(settings_file(s), "settings.json")
+    manage_harnesses && (s.harness_spec[] = harness_spec_from_settings(d isa AbstractDict ? d : nothing))
     d isa AbstractDict || return nothing
     dc = get(d, "default_session_config", nothing)
     if dc isa AbstractDict
@@ -530,6 +596,32 @@ function load_settings!(s::ServerState)
         s.default_session_config[] = cfg
     end
     return nothing
+end
+
+"""
+    default_harness_spec() -> Dict
+
+Every managed adapter at its newest release, on the current Node LTS.
+"""
+default_harness_spec() = Dict{String,Any}(
+    "node" => "lts",
+    "packages" => Dict{String,Any}(pkg => "latest" for pkg in managed_packages()))
+
+# The adapter spec settings.json pins, completed by the default: a package a
+# newer server manages that the file predates starts at "latest".
+function harness_spec_from_settings(d::Union{AbstractDict,Nothing})
+    spec = default_harness_spec()
+    saved = d === nothing ? nothing : get(d, "harnesses", nothing)
+    saved isa AbstractDict || return spec
+    node = get(saved, "node", nothing)
+    node isa AbstractString && !isempty(node) && (spec["node"] = String(node))
+    pkgs = get(saved, "packages", nothing)
+    if pkgs isa AbstractDict
+        for (k, v) in pkgs
+            v isa AbstractString && !isempty(v) && (spec["packages"][String(k)] = String(v))
+        end
+    end
+    return spec
 end
 
 """
@@ -939,6 +1031,7 @@ notify_workers!(s::ServerState)  = safe_notify!(root_state(s).workers)
 # notifies every tab by itself. Saves nothing on entry: creation paths save the
 # new record themselves, and the loader has nothing new to write.
 function track_project!(s::ServerState, p::ProjectInfo)
+    isempty(p.owner) && (p.owner = acting_owner(s))
     lock(s.lock) do
         s.projects[][p.id] = p
     end
@@ -975,25 +1068,27 @@ end
 # tmp per writer keeps each save's bytes disjoint; the final `mv` is still atomic
 # last-writer-wins. The savers also serialise under `state.lock` (below), so in
 # practice concurrent same-target writes don't happen — this is belt-and-braces.
-function atomic_write_json(path::String, data)
+function atomic_write(write_to::Function, path::AbstractString; mode::Union{Integer,Nothing} = nothing)
     dir = dirname(path)
     mkpath(dir)
     tmp = tempname(dir; cleanup = false)
     try
-        open(tmp, "w") do io
-            JSON.print(io, data, 2)
-        end
+        open(write_to, tmp, "w")
+        mode === nothing || chmod(tmp, mode)
         mv(tmp, path; force = true)
     catch
         # Don't leave a stray temp file behind if the write or rename failed.
         try
             rm(tmp; force = true)
         catch cleanup_err
-            @debug "atomic_write_json: could not remove temp file" tmp exception = cleanup_err
+            @debug "atomic_write: could not remove temp file" tmp exception = cleanup_err
         end
         rethrow()
     end
 end
+
+atomic_write_json(path::AbstractString, data; mode::Union{Integer,Nothing} = nothing) =
+    atomic_write(io -> JSON.print(io, data, 2), path; mode)
 
 # Read JSON with corruption tolerance: if the file is truncated/garbled (e.g.
 # from a crash before atomic_write_json existed, or a manual edit gone wrong),
@@ -1030,7 +1125,8 @@ function save_workers!(s::ServerState)
     lock(s.lock) do
         data = [Dict("worker_id" => w.worker_id,
                      "name" => w.name, "initials" => w.initials,
-                     "url" => w.url, "secret" => w.secret,
+                     "owner" => w.owner, "credential" => w.credential,
+                     "shared_with" => w.shared_with,
                      "ssh_target" => w.ssh_target,
                      "hostname" => w.hostname, "home" => w.home,
                      "mcp_path" => w.mcp_path, "mcp_args" => w.mcp_args,
@@ -1054,8 +1150,9 @@ function load_workers!(s::ServerState)
             init_raw = get(d, "initials", nothing)
             initials = (init_raw === nothing || (init_raw isa AbstractString && isempty(init_raw))) ?
                        nothing : String(init_raw)
-            w = WorkerInfo(wid, d["name"], initials,
-                           d["url"], d["secret"],
+            w = WorkerInfo(wid, d["name"], initials, record_owner(s, d),
+                           String(get(d, "credential", "")),
+                           Vector{String}(get(d, "shared_with", String[])),
                            get(d, "ssh_target", nothing),
                            get(d, "hostname", ""), get(d, "home", ""),
                            get(d, "mcp_path", ""),
@@ -1067,7 +1164,8 @@ function load_workers!(s::ServerState)
                            # the 12-arg shim's coercion and silently DROPPED
                            # every persisted worker here once `online` became
                            # an Observable ("skipping malformed worker entry").
-                           Observable(false), now(UTC), :current, "")
+                           Observable(false), now(UTC), :current, "",
+                           Dict{String,String}(), "")
             s.workers[][wid] = w
         catch e
             @warn "skipping malformed worker entry" entry=d exception=e
@@ -1086,6 +1184,7 @@ function save_projects!(s::ServerState)
         data = [Dict("id" => p.id, "name" => p.name, "worker_id" => p.worker_id,
                      "server_path" => p.server_path, "worker_path" => p.worker_path,
                      "created" => string(p.created),
+                     "owner" => p.owner,
                      # `:syncing` is a runtime state — persist as `:stale` so a
                      # crash mid-sync doesn't leave the next start-up reporting
                      # "synced" for a half-transferred mirror.
@@ -1117,6 +1216,7 @@ function load_projects!(s::ServerState)
             p = ProjectInfo(d["id"], d["name"], wid,
                             d["server_path"], d["worker_path"],
                             DateTime(d["created"]))
+            p.owner = record_owner(s, d)
             status_str = String(get(d, "backup_status", "unsynced"))
             p.backup_status = Symbol(status_str)
             last = get(d, "last_sync_at", nothing)

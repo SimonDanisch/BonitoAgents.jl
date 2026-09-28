@@ -34,8 +34,7 @@
     end
 
     @testset "attachment_response route guards + happy path" begin
-        state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                               worker_secret = "x")
+        state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
         pid = "attroute1"
         root = mktempdir()
         p = BT.ProjectInfo(pid, "AttRoute", "w1", root, root, BT.now(BT.UTC))
@@ -64,8 +63,7 @@
     end
 
     @testset "msg_to_dict(::UserMsg) splits the wire form only" begin
-        state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                               worker_secret = "x")
+        state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
         cwd = mktempdir()
         pid = "attwire01"
         state.projects[][pid] = BT.ProjectInfo(pid, "AttWire", "w1", cwd, cwd,
@@ -110,8 +108,7 @@
         # the inline gallery — a mere page reload never hit this because the
         # live msgs_store kept the original chat-ref'd instances. The ChatModel
         # constructor now re-parents history-loaded UserMsgs.
-        state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                               worker_secret = "x")
+        state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
         cwd = mktempdir()
         pid = "attboot01"
         state.projects[][pid] = BT.ProjectInfo(pid, "AttBoot", "w1", cwd, cwd,

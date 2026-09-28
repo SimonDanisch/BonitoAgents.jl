@@ -115,7 +115,7 @@ end
 
 @testset "save_settings! / load_settings! round-trip + tolerant load" begin
     dir = mktempdir()
-    st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), worker_secret = "x")
+    st = BT.ServerState(; state_dir = dir, working_dir = mktempdir())
     @test st.default_session_config[] == Dict{String,String}()       # empty on a fresh server
     lock(st.lock) do
         st.default_session_config[] = Dict("mode" => "bypassPermissions",
@@ -124,17 +124,17 @@ end
     BT.save_settings!(st)
     @test isfile(BT.settings_file(st))
     # A fresh state over the SAME dir reloads the persisted defaults.
-    st2 = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), worker_secret = "x")
+    st2 = BT.ServerState(; state_dir = dir, working_dir = mktempdir())
     @test st2.default_session_config[] ==
           Dict("mode" => "bypassPermissions", "model" => "sonnet", "effort" => "high")
     # Corrupt settings.json → treated as "no defaults set", never throws.
     write(BT.settings_file(st), "{ this is not valid json")
-    st3 = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), worker_secret = "x")
+    st3 = BT.ServerState(; state_dir = dir, working_dir = mktempdir())
     @test st3.default_session_config[] == Dict{String,String}()
 end
 
 @testset "effective_session_config: hardcoded < global default < per-chat" begin
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     m0 = BT.ChatModel(st, mktempdir(); agent = BT.WorkerAgent(st, "w1", "/p"))   # no project
     # No defaults, no project → the hardcoded base only.
     @test BT.effective_session_config(m0) ==
@@ -159,7 +159,7 @@ end
 end
 
 @testset "cache_config_options! stores only ConfigOptions, keeps the last good set" begin
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     m = BT.ChatModel(st, mktempdir(); agent = BT.WorkerAgent(st, "w1", "/p"))
     @test st.last_config_options[] == Any[]
     BT.cache_config_options!(m, Any[real_model(), real_mode(), "non-config-kind"])
@@ -265,7 +265,7 @@ end
 end
 
 @testset "apply_config_pick! is a safe no-op without a live client" begin
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     chat = BT.ChatModel(st, mktempdir(); agent = BT.WorkerAgent(st, "w1", "/p"))
     chat.session_meta[] = Any[ACP.parse_config_options(session_result())...]
     # No live client on the (never-started) agent → no-op, session_meta untouched.

@@ -58,28 +58,49 @@ julia --project=BonitoAgentsApp -m BonitoAgentsApp
 
 ## One server, many machines
 
-Run the server somewhere always reachable, like a home server or a VPS. After
-the installer above, this is the `server` mode of the same command:
+Run the server somewhere always reachable, like a home server or a VPS, with a
+domain name pointing at it. The setup script
+[`BonitoAgents/assets/install_server.sh`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/BonitoAgents/assets/install_server.sh)
+installs it on Linux:
 
 ```bash
-bonito-agents server --host=0.0.0.0 --port=8038
+bash BonitoAgents/assets/install_server.sh --domain team.example.com
 ```
 
-(from a source checkout, use
-`julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038`.)
-For a permanent install there is a systemd setup script,
-[`BonitoAgents/assets/install_server.sh`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/BonitoAgents/assets/install_server.sh),
-which installs the server as a service, generates the worker secret, and
-prints the worker one-liner.
+The server only listens on localhost. The script sets up Caddy in front of it
+for HTTPS (a Let's Encrypt certificate) and Authelia for the login (a password
+plus a second factor: an authenticator app or a security key), and runs all
+three as systemd services. Before it asks for a certificate it checks that
+`team.example.com` and `auth.team.example.com` resolve to the machine and that
+port 80 reaches it, and stops with a message saying what is missing. At the end
+it prints the admin account's password.
 
-Then, on each machine that should run agents, paste the one-liner from the
-dashboard's home screen:
+To try an install out first, `--acme-staging` takes certificates from Let's
+Encrypt's staging CA (no rate limits; browsers warn about them), and
+`BonitoAgents/test/deploy/smoke.sh https://team.example.com --staging` checks
+the result from any machine: the certificate, the login redirect, the public
+installer, and that `/w` refuses workers without a credential. On a LAN without
+a public domain, `--tls internal` uses Caddy's own certificate authority
+instead; every browser and worker machine then has to trust its root
+certificate, whose path the installer prints.
+
+Admins manage people from the dashboard: an invite link lets one person create
+their own account (they get their password on the page it opens), and the
+Accounts section adds accounts directly, puts them in groups and disables them.
+Members see only their own chats and workers, plus the workers an owner shared
+with one of their groups. Everyone can get a new password from their account
+card; there is no email-based reset. Without mail settings, the one-time code
+that confirms a new second factor shows up for admins under "Login codes".
+
+Then, for each machine that should run agents, click **Add worker** on the
+dashboard and run the command it shows on that machine:
 
 ```bash
-curl -fsSL http://<your-server>:8038/install.sh | sh
+curl -fsSL https://team.example.com/install.sh | BONITOAGENTS_WORKER_CREDENTIAL='w-...' sh
 ```
 
-It installs the worker packages into a shared `@bonito-agents` Julia
+Each worker has its own credential; revoking it on the dashboard disconnects
+that machine. The installer puts the worker packages into a shared `@bonito-agents` Julia
 environment, registers the machine under a stable identity, and (on Linux)
 sets up a systemd user service so the worker survives reboots. The machine
 appears in the dashboard seconds later. Re-run the same one-liner to update;

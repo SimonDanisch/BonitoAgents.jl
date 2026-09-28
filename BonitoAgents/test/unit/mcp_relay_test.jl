@@ -6,7 +6,7 @@
     # transport; the worker's relay, its localhost socket and the MCP subprocess
     # are real too. The browser suite additionally exercises the real worker
     # daemon, ACP launch, and a second worker's eval subprocess.
-    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "unused")
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     p = BT.ProjectInfo("relay-chat", "relay", "worker-a", mktempdir(), mktempdir(), now(UTC))
     p.dev_mode = true
     state.projects[][p.id] = p

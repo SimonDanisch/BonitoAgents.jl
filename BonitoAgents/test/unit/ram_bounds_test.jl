@@ -10,8 +10,7 @@ using Test
 import BonitoAgents
 const BT = BonitoAgents
 
-newstate() = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                            worker_secret = "x")
+newstate() = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
 
 @testset "tool_content_cache is LRU-bounded" begin
     cap = BT.TOOL_CONTENT_CACHE_CAP

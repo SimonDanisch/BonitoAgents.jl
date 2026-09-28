@@ -53,8 +53,7 @@
     @testset "project creation refuses a mangled worker path" begin
         dir = mktempdir()
         state = BonitoAgents.ServerState(; state_dir = joinpath(dir, "state"),
-                                           working_dir = joinpath(dir, "work"),
-                                           worker_secret = "test-secret")
+                                           working_dir = joinpath(dir, "work"))
         # Fails on the PATH, not on "unknown worker" — the guard runs first, so
         # the operator gets an actionable message instead of a broken project.
         err = try

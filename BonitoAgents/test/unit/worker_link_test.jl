@@ -33,13 +33,13 @@ end
     using Test
 
     dir = mktempdir()
-    state = BA.serve(; host = "127.0.0.1", port = 0, worker_secret = "link-test",
+    state = BA.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mkpath(joinpath(dir, "state")),
                      working_dir = mkpath(joinpath(dir, "working")))
     worker = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:$(state.srv.port)",
-        secret = "link-test", worker_id = "link-test", name = "link-test",
+        worker_id = "link-test", name = "link-test",
         mcp_command = first(Base.julia_cmd().exec), mcp_arguments = String[],
-        projects_root = mkpath(joinpath(dir, "projects")), agent_bin = ""))
+        projects_root = mkpath(joinpath(dir, "projects"))))
     task = Threads.@spawn BW.serve(worker; retry_delay = 0.2)
     try
         @test timedwait(() -> BA.worker_connected(state, "link-test"), 30.0) === :ok

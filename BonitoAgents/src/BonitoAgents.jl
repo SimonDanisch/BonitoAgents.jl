@@ -2,7 +2,7 @@ module BonitoAgents
 
 # Server-side dashboard package. Public API:
 #
-#   BonitoAgents.serve(; worker_secret, port=8038, public_url=nothing, ...)
+#   BonitoAgents.serve(; auth, port=8038, public_url=nothing, ...)
 #
 # Glues together: Bonito UI + AgentClientProtocol + BonitoMCP (for the bundle
 # endpoint) + BonitoWorker (the relay package the workers run).
@@ -19,6 +19,7 @@ using Dates
 using TOML
 using Base64
 using SHA
+import Random
 import WorkerLink      # one multiplexed, resumable connection per worker (always qualified)
 # Used by `current_bonito_install_spec()` to parse `[sources]` out of the
 # active project file so the install.jl template ships workers the exact
@@ -42,6 +43,7 @@ using BonitoWidgets     # Workspace / Panel / FloatingWindow — the VSCode-styl
 bonito_asset(parts::AbstractString...) =
     Bonito.Asset(joinpath(pkgdir(@__MODULE__)::String, "assets", parts...))
 
+include("identity.jl")         # User, LocalAuth/ProxyAuth: who is on the other end (the proxy authenticates)
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("progress.jl")         # notify_progress + the window's ONE progress card (BusyState)
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
@@ -63,6 +65,7 @@ include("chat_icons.jl")        # durable, user-controlled chat image identities
 include("overview.jl")         # recent-chats overview cards (dashboard header)
 include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)
+include("accounts.jl")         # worker credentials, accounts, adapter versions: the admin's controls
 include("session_widget.jl")   # SessionRow widget (one row per discovered Claude Code session)
 include("chat_title.jl")       # chat_title_input — the one editor over ProjectInfo.title
 include("file_tree.jl")        # WorkerFileTree — lazy, searchable project file tree (sidebar)

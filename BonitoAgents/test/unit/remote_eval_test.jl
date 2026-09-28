@@ -11,8 +11,8 @@
     import BonitoAgents as BT
 
     state_dir = mktempdir()
-    st = BT.ServerState(; state_dir, working_dir = mktempdir(), worker_secret = "x")
-    mkworker(id, name) = BT.WorkerInfo(id, name, "ws://x", "x", nothing, name * "-host",
+    st = BT.ServerState(; state_dir, working_dir = mktempdir())
+    mkworker(id, name) = BT.WorkerInfo(id, name, nothing, name * "-host",
                                        "/home/u", "julia", String[], "/home/u/projects/" * name,
                                        :online, now())
     wa = mkworker("wid-a", "Desktop"); wb = mkworker("wid-b", "MacBook")
@@ -90,7 +90,7 @@
         BT.set_remote_eval!(st, "p1", true)
         # A fresh server over the same state dir reads the flag back; the
         # persisted form never assumes it.
-        st2 = BT.ServerState(; state_dir, working_dir = st.working_dir, worker_secret = "x")
+        st2 = BT.ServerState(; state_dir, working_dir = st.working_dir)
         BT.load_projects!(st2)
         @test st2.projects[]["p1"].remote_eval === true
         # `eval_hosts_of` / `close_eval_hosts!` are no-ops for a chat without hosts.

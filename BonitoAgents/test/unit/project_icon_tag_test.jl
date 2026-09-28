@@ -36,8 +36,8 @@
 
     # The label comes from the worker record; a worker the server does not know
     # is named by its id, never by the folder.
-    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
-    state.workers[]["w-lap"] = BT.WorkerInfo("w-lap", "Laptop", "ws://x", "x", nothing, "host", "/home/u",
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
+    state.workers[]["w-lap"] = BT.WorkerInfo("w-lap", "Laptop", nothing, "host", "/home/u",
                                              "julia", String[], "/sim", :online, BT.now(BT.UTC))
     state.workers[]["w-lap"].initials = "L"
     p = BT.ProjectInfo("p1", "VulkanDev", "w-lap", joinpath(state.working_dir, "p1"), "/sim/VulkanDev", BT.now(BT.UTC))

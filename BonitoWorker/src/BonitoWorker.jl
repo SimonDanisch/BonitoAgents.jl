@@ -12,6 +12,7 @@ using MsgPack
 import Random
 import WorkerLink
 include("mcp_relay.jl")
+include("harnesses.jl")
 include("worker.jl")
 import Pkg
 
@@ -587,7 +588,8 @@ end
 # and `dev_server`, so the two stay in lock-step. `name` defaults to the derived
 # per-install label; callers can override it.
 function write_config!(; server_url::AbstractString,
-                          secret::AbstractString,
+                          # `name:password` from "Add worker"; "" for a server on this machine.
+                          credential::AbstractString = "",
                           projects_root::AbstractString = pwd(),
                           name::AbstractString = default_worker_name(load_or_generate_worker_id()),
                           # The installer records the spec it installed. The server sends
@@ -600,7 +602,7 @@ function write_config!(; server_url::AbstractString,
                           auto_update::Bool = false)
     config = Dict(
         "server_url"    => String(server_url),
-        "secret"        => String(secret),
+        "credential"    => String(credential),
         "name"          => String(name),
         "projects_root" => abspath(projects_root),
         "auto_update"   => auto_update,
@@ -609,12 +611,14 @@ function write_config!(; server_url::AbstractString,
         String(k) => String(v) for (k, v) in update_spec))
     cfg = config_path()
     write(cfg, JSON.json(config))
+    # It holds the credential: this user's only.
+    chmod(cfg, 0o600)
     @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
     return cfg
 end
 
 """
-    BonitoWorker.install!(; server_url, secret, projects_root = pwd(), run_mode = :prompt)
+    BonitoWorker.install!(; server_url, credential = "", projects_root = pwd(), run_mode = :prompt)
 
 Persist the worker config into the Scratch config space and bring the worker up
 in the chosen run mode. Called at the end of `install.jl`; also the entry point
@@ -626,7 +630,7 @@ for re-pointing an existing install at a different server (just re-run it).
   * `:background` — bare detached process (current default elsewhere)
 """
 function install!(; server_url::String,
-                    secret::String,
+                    credential::String = "",
                     projects_root::String = pwd(),
                     run_mode::Symbol = :prompt,
                     update_spec::Union{AbstractDict,Nothing} = nothing,
@@ -637,7 +641,7 @@ function install!(; server_url::String,
                     # code is actually loaded — otherwise the user only sees
                     # the new package version after a manual kill.
                     code_changed::Bool = true)
-    cfg = write_config!(; server_url, secret, projects_root, update_spec, auto_update)
+    cfg = write_config!(; server_url, credential, projects_root, update_spec, auto_update)
 
     mode = run_mode == :prompt ? choose_run_mode() : run_mode
     result = apply_run_mode!(mode; projects_root = abspath(projects_root),
@@ -673,7 +677,7 @@ function install!(; server_url::String,
         println("    server         : ", server_url)
         println()
         println("    Code is already up to date; the running worker picks up the new")
-        println("    server/secret on its next reconnect. If you need a hard restart")
+        println("    server/credential on its next reconnect. If you need a hard restart")
         println("    anyway:")
         println()
         println("      julia --project=@bonito-agents -e \"using BonitoWorker; BonitoWorker.stop_running_worker!(); BonitoWorker.start()\"")
@@ -841,7 +845,7 @@ function start(; force::Bool = false)
     worker_id = load_or_generate_worker_id()
     connect_and_serve(;
         server_url    = String(config["server_url"]),
-        secret        = String(config["secret"]),
+        credential    = String(get(config, "credential", "")),
         worker_id     = worker_id,
         name          = String(get(config, "name", default_worker_name(worker_id))),
         projects_root = String(get(config, "projects_root", pwd())),
@@ -851,21 +855,19 @@ end
 
 # Public entry
 """
-    BonitoWorker.connect_and_serve(; server_url, secret, name, projects_root,
-                                   mcp_command, mcp_args, agent_bin,
-                                   retry_delay = 5.0)
+    BonitoWorker.connect_and_serve(; server_url, credential = "", name, projects_root,
+                                   mcp_command, mcp_args, retry_delay = 5.0)
 
 Run a worker: connect to `server_url`, serve it, reconnect whenever the
 connection drops. Blocks forever.
 """
 function connect_and_serve(; server_url::String,
-                            secret::String,
+                            credential::String    = "",
                             worker_id::String     = load_or_generate_worker_id(),
                             name::String          = default_worker_name(worker_id),
                             mcp_command::String   = "julia",
                             mcp_arguments::Vector{String} = mcp_args(),
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
-                            agent_bin::String     = find_agent_bin(),
                             # `nothing` is the standalone/dev default. Only a real
                             # installer writes an auto-update-enabled config.
                             update_config::Union{Dict{String,Any},Nothing} = nothing,
@@ -879,8 +881,8 @@ function connect_and_serve(; server_url::String,
     # Stamped once, for the debug chat's uptime readout (`worker_state`). Not a
     # `const` computed at load: that bakes the precompiling machine's clock.
     WORKER_STARTED[] == 0.0 && (WORKER_STARTED[] = time())
-    w = Worker(WorkerConfig(; server_url, secret, worker_id, name, mcp_command, mcp_arguments,
-                            projects_root, agent_bin, update_config))
+    w = Worker(WorkerConfig(; server_url, credential, worker_id, name, mcp_command, mcp_arguments,
+                            projects_root, update_config))
     serve(w; retry_delay)
     return nothing
 end
@@ -1193,7 +1195,7 @@ const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
 # (`worker_standalone.jl`, or as a child of a server whose env holds them) has the
 # secret and the server's URL in ENV; nothing it spawns may. An MCP process
 # reaches the server through the worker's relay with a per-chat grant instead.
-function inherited_env(; credentials = ("BONITOAGENTS_WORKER_SECRET", "BONITOAGENTS_SERVER_URL",
+function inherited_env(; credentials = ("BONITOAGENTS_WORKER_CREDENTIAL", "BONITOAGENTS_SERVER_URL",
                                         "BONITOAGENTS_PUBLIC_URL"))
     return Dict{String,String}(k => v for (k, v) in ENV if k ∉ credentials)
 end
@@ -3551,7 +3553,7 @@ function worker_state_response(w::Worker, request_id::AbstractString)
                     "hostname" => gethostname(),
                     "project" => something(Base.active_project(), ""),
                     "worker_package" => something(pkgdir(@__MODULE__), ""),
-                    "agent_bin" => something(find_agent_bin(), ""),
+                    "harnesses" => installed_harnesses(harness_root(), AgentProviders.managed_packages()),
                     # What the hello frame told the server, not a fresh probe:
                     # the point of reporting it is to compare the two.
                     "mcp_command" => w.config.mcp_command,

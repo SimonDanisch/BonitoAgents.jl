@@ -324,21 +324,23 @@ function worker_update_state(hello::AbstractDict, update_spec::AbstractDict)
 end
 
 """
-    handle_worker_link(state, ws)
+    handle_worker_link(state, ws, request)
 
-One connection to `/w`. Reads the worker's hello, checks its secret, and either
-resumes the worker's link (the hello names it and it is still alive) or starts
-a new one, which kills and tears down whatever link the worker had before.
-Returns once this connection ends; the link can outlive it.
+One connection to `/w`. Reads the worker's hello, admits it by the credential the
+proxy checked on `request` (identity.jl; a local server admits it outright), and
+either resumes the worker's link (the hello names it and it is still alive) or
+starts a new one, which kills and tears down whatever link the worker had
+before. Returns once this connection ends; the link can outlive it.
 """
-function handle_worker_link(state::ServerState, ws)
+function handle_worker_link(state::ServerState, ws, request)
     t = WorkerLink.WebSocketTransport(ws)
     worker_id = "?"
     try
         hello = WorkerLink.read_hello(t; timeout = 10)
         info = decode_control(hello.app)
-        if get(info, "secret", "") != state.worker_secret
-            WorkerLink.refuse(t, "unauthorized")
+        credential = worker_credential(state.auth, request, state.worker_credentials[])
+        if credential === nothing
+            WorkerLink.refuse(t, "unauthorized: no valid worker credential (revoked, or not through the proxy)")
             return
         end
         name      = String(get(info, "name", get(info, "hostname", "anon")))
@@ -347,19 +349,23 @@ function handle_worker_link(state::ServerState, ws)
         existing  = get(state.workers[], worker_id, nothing)
         shown_as  = existing === nothing ? name : existing.name
         link, resumed = claim_worker_link!(state, worker_id, hello.link_id)
-        WorkerLink.welcome!(link, t, hello, MsgPack.pack(Dict(
+        ack = Dict{String,Any}(
             "ok"            => true,
             "registered_as" => shown_as,
             "worker_id"     => worker_id,
             # The same spec /install.jl serves, over the authenticated link.
-            "update_spec"   => current_worker_update_spec())); resumed)
+            "update_spec"   => current_worker_update_spec())
+        # The agent adapters to keep installed (the worker's harnesses.jl).
+        spec = state.harness_spec[]
+        spec === nothing || (ack["harnesses"] = spec)
+        WorkerLink.welcome!(link, t, hello, MsgPack.pack(ack); resumed)
         # A resumed link is the same worker process as before, so its record
         # stands; a new link may be a new install, a renamed host, a new build.
         # Link and record are stored only now, together, with the link
         # connected: whoever sees the worker can reach it, and the other way
         # round.
         if !resumed
-            register_worker!(state, worker_id, shown_as, info, link)
+            register_worker!(state, worker_id, shown_as, info, link, credential)
             # One reader per link: a resume keeps the control channel, and so
             # the reader that already serves it.
             Base.errormonitor(@async serve_worker_control(state, worker_id, link))
@@ -433,16 +439,20 @@ end
 # them), and so does the `online` observable: chats hold on to it, so it must
 # stay the same object.
 function register_worker!(state::ServerState, worker_id::String, name::String,
-                          hello::AbstractDict, link::WorkerLink.Link)
+                          hello::AbstractDict, link::WorkerLink.Link,
+                          credential::AbstractString = "")
     existing = get(state.workers[], worker_id, nothing)
     update_state, update_message = worker_update_state(hello, current_worker_update_spec())
     online = existing === nothing ? Observable(false) : existing.online
+    # The worker belongs to whoever issued its credential.
+    cred = get(state.worker_credentials[], credential, nothing)
     w = WorkerInfo(
         worker_id,
         name,
         existing === nothing ? nothing : existing.initials,
-        "<inbound-ws>",          # we never dial the worker; the URL is moot
-        state.worker_secret,
+        cred === nothing ? default_owner(state.auth) : cred.owner,
+        String(credential),
+        existing === nothing ? String[] : existing.shared_with,
         nothing,                 # ssh_target reserved for future rsync-over-ssh
         String(get(hello, "hostname", "")),
         String(get(hello, "home", "")),
@@ -453,6 +463,8 @@ function register_worker!(state::ServerState, worker_id::String, name::String,
         now(UTC),
         update_state,
         update_message,
+        reported_harnesses(get(hello, "harnesses", nothing)),
+        "",
     )
     lock(state.lock) do
         state.worker_links[worker_id] = link
@@ -527,6 +539,8 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
                 rid = String(get(cmd, "request_id", ""))
                 if t == "update_status"
                     apply_update_status!(state, worker_id, cmd)
+                elseif t == "harness_status"
+                    apply_harness_status!(state, worker_id, cmd)
                 elseif t in ("list_dir_response", "make_dir_response", "ensure_dir_response",
                              "stat_path_response", "read_file_range_response",
                              "list_project_files_response", "clone_repo_response",
@@ -1477,6 +1491,26 @@ function set_worker_update!(state::ServerState, worker_id::AbstractString, st::S
     end
     found && notify_workers!(state)
     return found
+end
+
+# What a worker says its managed agent adapters are at (its harnesses.jl).
+reported_harnesses(x::AbstractDict) =
+    Dict{String,String}(String(k) => String(v) for (k, v) in x if v isa AbstractString)
+reported_harnesses(::Nothing) = Dict{String,String}()
+
+# A worker finished (or failed) bringing its adapters to the spec: its card shows it.
+function apply_harness_status!(state::ServerState, worker_id::AbstractString, cmd::AbstractDict)
+    w = lock(() -> get(state.workers[], String(worker_id), nothing), state.lock)
+    w === nothing && return false
+    installed = get(cmd, "installed", nothing)
+    installed isa AbstractDict ||
+        (@warn "Worker harness_status carries no versions" worker_id; return false)
+    lock(state.lock) do
+        w.harnesses = reported_harnesses(installed)
+        w.harness_error = String(get(cmd, "error", ""))
+    end
+    notify_workers!(state)
+    return true
 end
 
 # The worker's account of a requested update (`update_status` frame): what the

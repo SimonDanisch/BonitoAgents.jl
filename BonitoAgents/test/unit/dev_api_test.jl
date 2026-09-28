@@ -53,8 +53,7 @@ end
     @info marker answer = 42 who = "tester"
     @warn "$(marker)-warning"
 
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                          worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     got = BT.dev_request(st, "logs", Dict("limit" => 500, "contains" => marker))
     @test got["matched"] >= 2
     recs = got["records"]
@@ -426,7 +425,7 @@ end
             # has to persist — and must default to OFF for entries that predate it.
             BT.save_projects!(st)
             fresh = BT.ServerState(; state_dir = st.state_dir,
-                                     working_dir = mktempdir(), worker_secret = "x")
+                                     working_dir = mktempdir())
             devs = [p for p in values(fresh.projects[]) if p.dev_mode]
             plain = [p for p in values(fresh.projects[]) if !p.dev_mode]
             @test BT.bonitoagents_repo_root() === nothing || length(devs) == 1
@@ -443,7 +442,7 @@ end
               "created": "2026-01-01T00:00:00"}]
             """)
             legacy = BT.ServerState(; state_dir = old_dir,
-                                      working_dir = mktempdir(), worker_secret = "x")
+                                      working_dir = mktempdir())
             lp = get(legacy.projects[], "legacy01", nothing)
             @test lp !== nothing            # the entry loaded at all
             @test lp.dev_mode === false     # …and defaulted OFF, not to a throw

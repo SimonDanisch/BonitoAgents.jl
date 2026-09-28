@@ -150,8 +150,7 @@ const BT = BonitoAgents
             try
                 write(special, "new bytes")
                 @test String(getfile().body) == "new bytes"
-                restored = BT.ServerState(state_dir=mktempdir(), working_dir=mktempdir(),
-                                          worker_secret=st.worker_secret)
+                restored = BT.ServerState(state_dir=st.state_dir, working_dir=mktempdir())
                 @test BT.worker_file_url(restored, wid, special) == url
             finally
                 st.projects[][pid] = saved

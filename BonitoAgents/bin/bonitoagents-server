@@ -3,12 +3,12 @@
 #
 # Thin wrapper around `julia --project=<monorepo root> -m BonitoAgents`. All flags
 # are passed straight through; everything has a baked-in default (port 8038,
-# host 0.0.0.0) and the worker secret is generated + persisted in the state dir
-# on first run, so no env vars are required:
+# localhost only), so no env vars are required. A `proxy.json` in the state dir,
+# written by install_server.sh, puts it behind Caddy + Authelia:
 #
 #   bonitoagents-server                         # defaults
 #   bonitoagents-server --port 8080
-#   bonitoagents-server --public-url https://team.example.com --state-dir /var/lib/bonitoagents/state
+#   bonitoagents-server --state-dir /var/lib/bonitoagents/state
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"

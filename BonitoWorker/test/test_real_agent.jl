@@ -84,7 +84,7 @@ end
     end
 
     port          = free_port()
-    secret        = "test-" * string(rand(UInt64), base = 16, pad = 16)
+    credential    = "w-test:" * string(rand(UInt64), base = 16, pad = 16)
     projects_root = mktempdir(prefix = "bw_test_")
     server_url    = "http://127.0.0.1:$port"
 
@@ -94,11 +94,13 @@ end
     # then waits for the connection to end.
     hello_ch = Channel{Dict{String,Any}}(1)
     link_ch  = Channel{Any}(1)
+    auth_ch  = Channel{String}(1)
 
     function ws_handler(ws::HTTP.WebSockets.WebSocket)
         # `handshake_request`, not `request`: HTTP v2 renamed the field.
         path = ws.handshake_request.target
         path == "/w" || (@warn "unknown WS path requested" path; return)
+        put!(auth_ch, HTTP.header(ws.handshake_request, "Authorization", ""))
         t = WL.WebSocketTransport(ws)
         h = WL.read_hello(t)
         put!(hello_ch, Dict{String,Any}(BW.decode_control(h.app)))
@@ -130,7 +132,7 @@ end
     # real instantiated env that contains BonitoWorker, so use that.
     worker_env  = dirname(Base.active_project())
     env         = copy(ENV)
-    env["BONITOAGENTS_WORKER_SECRET"] = secret
+    env["BONITOAGENTS_WORKER_CREDENTIAL"] = credential
     env["BONITOAGENTS_SERVER_URL"]    = server_url
     env["BONITOAGENTS_PROJECTS_ROOT"] = projects_root
 
@@ -138,7 +140,7 @@ end
     # teardown doesn't: `connect_and_serve` arms PR_SET_PDEATHSIG with this pid,
     # so a worker still alive when THIS process exits is reaped by the kernel.
     # A worker that outlives the suite is ~500 MB, and nothing else reaps it —
-    # it carries a test secret and a temp projects root nobody looks at again.
+    # it carries a test credential and a temp projects root nobody looks at again.
     env["BONITOAGENTS_DIE_WITH_PARENT"] = string(getpid())
 
     worker_log  = tempname() * ".log"
@@ -169,7 +171,9 @@ end
         end
         println("[real-agent] got hello: name=", get(hello, "name", "?"),
                 "  worker_id=", get(hello, "worker_id", "?"))
-        @test get(hello, "secret", "") == secret
+        # The credential travels as Basic auth (what Caddy checks), never in the hello.
+        @test startswith(take_or_timeout(auth_ch, 1.0, "the handshake's Authorization"), "Basic ")
+        @test !any(v -> v == credential, values(hello))
         @test !isempty(get(hello, "worker_id", ""))
         link = take_or_timeout(link_ch, 10.0, "the worker link")
 
@@ -237,7 +241,7 @@ end
         end
 
         # ── Step 4: the agent did not inherit the worker's credentials ───────
-        # This worker runs env-driven, so its own ENV holds the secret and the
+        # This worker runs env-driven, so its own ENV holds the credential and the
         # server's URL; the agent (and with it its MCP and eval workers) must not.
         # Everything below the worker process: the agent and what it spawned.
         # (Not by the owner mark: this worker runs with the machine's default
@@ -252,7 +256,7 @@ end
                 end
             end
             @test !isempty(environs)
-            @test !any(e -> occursin(secret, e), environs)
+            @test !any(e -> occursin(credential, e), environs)
             @test !any(e -> occursin("BONITOAGENTS_SERVER_URL=", e), environs)
         end
 

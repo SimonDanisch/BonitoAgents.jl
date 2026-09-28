@@ -8,7 +8,7 @@
     const BT = BonitoAgents
     using Test
 
-    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     path = "/sim/VulkanDev"
     for pid in ("old-thread", "new-thread")
         state.projects[][pid] = BT.ProjectInfo(pid, "VulkanDev", "w1", joinpath(state.working_dir, pid),

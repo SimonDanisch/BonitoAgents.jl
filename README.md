@@ -180,27 +180,37 @@ installer: dashboard server + local worker + UI in your browser.
 
 ### One server, many machines
 
-Run the server somewhere always reachable. With the installer above it is just
-the `server` mode of the same command:
+Run the server on an always-on Linux machine with a domain name, using
+[`BonitoAgents/assets/install_server.sh`](BonitoAgents/assets/install_server.sh):
 
 ```bash
-bonito-agents server --host=0.0.0.0 --port=8038
+bash BonitoAgents/assets/install_server.sh --domain team.example.com
 ```
 
-(from a source checkout:
-`julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038`)
-or install it as a systemd service with
-[`BonitoAgents/assets/install_server.sh`](BonitoAgents/assets/install_server.sh).
-Then, on each machine that should run agents, paste the one-liner from the
-dashboard's home screen:
+The server itself only listens on localhost. The installer puts Caddy (HTTPS,
+Let's Encrypt) and Authelia (login with password and second factor) in front of
+it and runs all three as systemd services. It needs DNS records for
+`team.example.com` and `auth.team.example.com` pointing at the machine, and
+ports 80 and 443 reachable; it checks both before asking for a certificate, and
+prints the admin password at the end. Admins invite people with a link (or add
+accounts directly) and put them in groups; members see their own chats and
+workers, plus the workers shared with one of their groups.
+
+Then, for each machine that should run agents, click **Add worker** on the
+dashboard and run the command it shows on that machine:
 
 ```bash
-curl -fsSL http://<your-server>:8038/install.sh | sh
+curl -fsSL https://team.example.com/install.sh | BONITOAGENTS_WORKER_CREDENTIAL='w-...' sh
 ```
 
-It installs the worker pinned to the server's code revision, registers the
-machine under a stable identity, and sets up a systemd user service on
-Linux. Re-run it any time to update.
+Every worker gets its own credential, and revoking it disconnects that machine.
+The installer pins the worker to the server's code revision, registers the
+machine under a stable identity, and sets up a systemd user service on Linux.
+Re-run it any time to update. The server keeps each worker's agent adapters
+(Claude Code, Codex) up to date, in a private Node install on the worker.
+
+On a single machine, `bonito-agents server` runs the server without the proxy:
+it listens on localhost only, and whoever reaches it is the local admin.
 
 ## Tour
 

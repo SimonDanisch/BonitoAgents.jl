@@ -71,13 +71,13 @@ end
 
 @testset "no agent-side child inherits the worker's credentials" begin
     # An env-driven worker (worker_standalone.jl) holds both in its own ENV.
-    withenv("BONITOAGENTS_WORKER_SECRET" => "not-for-agents",
+    withenv("BONITOAGENTS_WORKER_CREDENTIAL" => "not-for-agents",
             "BONITOAGENTS_SERVER_URL" => "http://server.example:8038",
             "BONITOAGENTS_PUBLIC_URL" => "https://agents.example",
             "BT_INHERITED_PROBE" => "kept") do
         env = BonitoWorker.provider_env(BonitoWorker.AgentProviders.find_provider("ClaudeCode"),
                                         Dict("BONITOAGENTS_PROJECT_ID" => "chat-1"))
-        for k in ("BONITOAGENTS_WORKER_SECRET", "BONITOAGENTS_SERVER_URL", "BONITOAGENTS_PUBLIC_URL")
+        for k in ("BONITOAGENTS_WORKER_CREDENTIAL", "BONITOAGENTS_SERVER_URL", "BONITOAGENTS_PUBLIC_URL")
             @test !haskey(env, k)
         end
         @test !any(v -> occursin("not-for-agents", v), values(env))

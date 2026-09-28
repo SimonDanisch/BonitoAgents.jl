@@ -37,8 +37,7 @@ function fresh_state()
     state_dir   = mktempdir()
     working_dir = mktempdir()
     BT.ServerState(; state_dir = state_dir,
-                     working_dir = working_dir,
-                     worker_secret = "x")
+                     working_dir = working_dir)
 end
 
 # Synthesize a project with a known-broken title + write chat.md with a
@@ -169,8 +168,7 @@ end
 
         # Re-load state from disk → title still clean.
         state2 = BT.ServerState(; state_dir = state.state_dir,
-                                  working_dir = state.working_dir,
-                                  worker_secret = "x")
+                                  working_dir = state.working_dir)
         BT.load_projects!(state2)
         @test state2.projects[]["p-persist-1"].title[] == "survived restart"
     end

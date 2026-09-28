@@ -17,7 +17,7 @@
     const BT = BonitoAgents
 
     fresh_state() = BT.ServerState(; state_dir = mktempdir(),
-                                   working_dir = mktempdir(), worker_secret = "x")
+                                   working_dir = mktempdir())
 
     project!(st, id) = begin
         root = mktempdir()
@@ -38,7 +38,7 @@
             # A second ServerState over the same state dir IS the restart: the
             # constructor loads projects.json.
             st2 = BT.ServerState(; state_dir = st.state_dir,
-                                 working_dir = mktempdir(), worker_secret = "x")
+                                 working_dir = mktempdir())
             @test st2.projects[]["pp1"].provider          == "KimiCode"
             # The pair travels together or not at all — a resume id without the
             # agent that issued it is the bug this whole field exists to prevent.
@@ -56,7 +56,7 @@
             write(f, BT.JSON.json(rows))
 
             st2 = BT.ServerState(; state_dir = st.state_dir,
-                                 working_dir = mktempdir(), worker_secret = "x")
+                                 working_dir = mktempdir())
             loaded = st2.projects[]["pp2"]
             @test loaded.provider === nothing
             @test BT.project_provider(loaded) === BT.default_provider()
@@ -99,7 +99,7 @@
 
             # It reached disk, not just the struct.
             st2 = BT.ServerState(; state_dir = st.state_dir,
-                                 working_dir = mktempdir(), worker_secret = "x")
+                                 working_dir = mktempdir())
             @test st2.projects[]["pp5"].provider == BT.provider_name(prov)
 
             # Re-selecting the current agent must not rewrite the file — the
@@ -145,7 +145,7 @@
             # matters if the failed target bound an id before a later startup
             # step failed and had already persisted that transient id.
             st2 = BT.ServerState(; state_dir = st.state_dir,
-                                 working_dir = mktempdir(), worker_secret = "x")
+                                 working_dir = mktempdir())
             p2 = st2.projects[]["pp6"]
             @test p2.provider === nothing
             @test p2.resume_session_id == "old-session"

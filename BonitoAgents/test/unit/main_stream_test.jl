@@ -38,7 +38,7 @@ Base.close(t::IdleTransport) = (isopen(t.gate) && close(t.gate); nothing)
 # A chat with a live ACP session: a real `Client` (hence a real main stream and
 # coalescer) bound to a never-started WorkerAgent, plus the chat's own renderer.
 function live_model()
-    state = BT.serve(; host = "127.0.0.1", port = 0, worker_secret = "x",
+    state = BT.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mktempdir(), working_dir = mktempdir())
     agent = BT.WorkerAgent(state, "w1", "/p")
     model = BT.ChatModel(state, mktempdir(); project_id = "proj", agent = agent)
@@ -54,7 +54,7 @@ end
 # the stream either — a marker put on it can only come back if someone bounds
 # the wait. Returns the gate that releases the fake renderer.
 function stalled_model()
-    state = BT.serve(; host = "127.0.0.1", port = 0, worker_secret = "x",
+    state = BT.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mktempdir(), working_dir = mktempdir())
     agent = BT.WorkerAgent(state, "w1", "/p")
     model = BT.ChatModel(state, mktempdir(); project_id = "proj", agent = agent)

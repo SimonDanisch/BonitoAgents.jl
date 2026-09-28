@@ -94,6 +94,12 @@ end
 
 function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     state, wid = c.state, c.worker_id
+    # A worker shared with someone's group (`share_worker!`) shows them its name
+    # and lets them start chats on it; renaming, updating, sharing, removing it
+    # and importing its machine's sessions stay with whoever manages it.
+    manage = let w = get(state.workers[], wid, nothing)
+        w === nothing || can_manage(state, w)
+    end
 
     status_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
@@ -225,6 +231,19 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
                  class = quiet ? "bt-worker-update-note bt-hidden" :
                                  "bt-worker-update-note")
     end
+    # The managed agent adapters the worker reports (its harnesses.jl), and why
+    # the last install failed. Always a node, for the same reason as above.
+    adapters_note = map(session, state.workers) do workers
+        w = get(workers, wid, nothing)
+        installed = w === nothing ? Dict{String,String}() : w.harnesses
+        err = w === nothing ? "" : w.harness_error
+        text = isempty(installed) ? "" :
+            "adapters: " * join(("$(last(split(k, '/'))) $(v)" for (k, v) in sort!(collect(installed))), " · ")
+        isempty(err) || (text = isempty(text) ? "adapter install failed: " * err :
+                                text * "; adapter install failed: " * err)
+        DOM.span(text; class = isempty(text) ? "bt-worker-update-note bt-hidden" : "bt-worker-update-note",
+                 title = err)
+    end
     # `force_worker_update!` flips the worker to `:updating`, which hides this
     # button and changes the note and badge. The replacement worker's hello
     # flips it back to `:current`, leaving the compact success badge visible.
@@ -270,9 +289,13 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     online_class  = map(o -> o ? "bt-card-actions"            : "bt-card-actions bt-hidden", is_online_obs)
     offline_class = map(o -> o ? "bt-card-actions bt-hidden"  : "bt-card-actions",            is_online_obs)
     actions_block = DOM.div(
-        DOM.div(new_proj_btn, gh_btn, DOM.div(update_btn; class = update_btn_class); class = online_class),
+        DOM.div(new_proj_btn, gh_btn, manage ? DOM.div(update_btn; class = update_btn_class) : DOM.div();
+                class = online_class),
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
+    manage || (initials_input = DOM.span(c.initials_obs; class = "bt-card-initials",
+                                         style = "border:1.5px solid $(worker_color(wid))");
+               name_input = DOM.span(c.name_obs; class = "bt-card-name"))
     card_body = DOM.div(
         DOM.div(status_dot_obs, initials_input, name_input, update_badge;
                 class = "bt-card-title"),
@@ -284,7 +307,8 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # title row). The discover details lives inside the SAME pill (below this
     # row), so a worker with a collapsed project list takes the same space as a
     # bare card — no separate pill underneath.
-    card_row = DOM.div(card_body, actions_block, remove_btn; class = "bt-card-row")
+    card_row = manage ? DOM.div(card_body, actions_block, remove_btn; class = "bt-card-row") :
+                        DOM.div(card_body, actions_block; class = "bt-card-row")
 
     is_picking_obs = map(s -> s == wid, c.picker_state)
     picker_form    = render_remote_picker_form(session, c, wid)
@@ -300,7 +324,9 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # just a thin "▸ projects (N)" toggle row — no separate pill chrome. Fed
     # from state.discovered (no scan needed on first paint); the per-card Rescan
     # button refreshes it.
-    card = DOM.div(card_row, update_notice, render_discover_panel(session, c, wid); class = "bt-card")
+    card = DOM.div(card_row, update_notice, adapters_note,
+                   worker_sharing_row(state.auth, session, state, wid),
+                   manage ? render_discover_panel(session, c, wid) : DOM.div(); class = "bt-card")
 
     return Bonito.jsrender(session,
         DOM.div(card, picker_block, gh_block; class = "bt-worker-cell"))

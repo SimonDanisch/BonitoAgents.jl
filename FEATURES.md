@@ -179,13 +179,20 @@ enumerates.
 - **Desktop**: `julia -m BonitoAgentsApp` runs the server and a local worker in
   one process with a persistent platform data dir; AppBundler bundles (snap,
   dmg, msix) are built by CI for every push and `v*` tag.
-- **Server**: `bonitoagents server` mode or the systemd installer
-  (`install_server.sh`), with persisted worker secret and public-URL handling.
+- **Server**: `bonitoagents server` mode (localhost only) or the systemd
+  installer (`install_server.sh`), which puts Caddy (HTTPS) and Authelia (login
+  with a second factor) in front and checks DNS and ports before Let's Encrypt.
 - Worker installs always match the server's running code revision (branch,
   sha, or the version's `v` tag for git-less release deployments);
   `BONITOAGENTS_INSTALL_REV` overrides for ops.
-- Shared-secret worker auth; the dashboard is designed to sit on localhost, a
-  VPN, or behind reverse-proxy auth.
+- Accounts, owners and per-worker credentials: the server binds localhost and
+  takes identities from the proxy (with a key only Caddy and the server share);
+  admins invite people by link, manage accounts and groups, and issue or revoke
+  worker credentials on the dashboard; members see what they own plus workers
+  shared with their groups.
+- Managed agent adapters: the server declares the ACP adapter versions (latest
+  or pinned), workers install them into a private Node + npm prefix when idle
+  and report their versions on the worker card.
 
 ## Development & QA
 

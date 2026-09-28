@@ -9,8 +9,8 @@
     const BT = BonitoAgents
     using Test
 
-    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
-    mk(id, name, root, online) = BT.WorkerInfo(id, name, "ws://x", "x", nothing, name, "/home/u",
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
+    mk(id, name, root, online) = BT.WorkerInfo(id, name, nothing, name, "/home/u",
                                               "julia", String[], root, online, BT.now(BT.UTC))
     state.workers[]["linux"]   = mk("linux",   "Laptop", "/sim/Programmieren", :offline)
     state.workers[]["windows"] = mk("windows", "LapWin", "C:/Users/sdani/Programmieren", :online)

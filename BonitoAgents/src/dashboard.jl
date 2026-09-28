@@ -1988,7 +1988,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # When source worker changes, auto-select the first project on that worker.
     on(session, cp_src_worker) do wid
         isempty(wid) && return
-        wid_projs = sort([p for p in values(state.projects[]) if p.worker_id == wid];
+        wid_projs = sort([p for p in values(state.projects[]) if p.worker_id == wid && visible(state, p)];
                          by = p -> p.name)
         cp_src_project[] = isempty(wid_projs) ? "" : first(wid_projs).id
     end
@@ -2126,18 +2126,19 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     cp_btn = Bonito.Button("Copy project…"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, cp_btn.value) do clicked
         clicked || return
-        if isempty(state.workers[]) || isempty(state.projects[])
-            error_obs[] = isempty(state.workers[]) ?
+        mine = [w.worker_id for w in values(state.workers[]) if visible(state, w)]
+        workers_with_projs = unique(p.worker_id for p in values(state.projects[]) if visible(state, p))
+        if isempty(mine) || isempty(workers_with_projs)
+            error_obs[] = isempty(mine) ?
                 "Register a worker before copying projects." :
                 "No projects to copy yet."
             return
         end
         # Prefer a source worker that actually has projects; fall back to first.
-        workers_with_projs = unique(p.worker_id for p in values(state.projects[]))
         src_wid = isempty(workers_with_projs) ?
-            first(keys(state.workers[])) : first(workers_with_projs)
+            first(mine) : first(workers_with_projs)
         # Default target to a DIFFERENT worker than source when one exists.
-        other_wids = [w for w in keys(state.workers[]) if w != src_wid]
+        other_wids = [w for w in mine if w != src_wid]
         tgt_wid = isempty(other_wids) ? src_wid : first(other_wids)
         cp_src_worker[] = ""          # force on(cp_src_worker) to fire even if same value
         cp_src_worker[] = src_wid
@@ -2284,7 +2285,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
 
     worker_select(id_obs::Observable, cls::String) = DOM.select(
         (DOM.option(w.name; value=w.worker_id,
-                    selected=w.worker_id==id_obs[]) for w in values(state.workers[]))...;
+                    selected=w.worker_id==id_obs[]) for w in values(state.workers[]) if visible(state, w))...;
         class = cls,
         value = id_obs,
         onchange = js"event => $(id_obs).notify(event.target.value)")
@@ -2294,7 +2295,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         worker_select(cp_src_worker, "bt-cp-src-worker"),
         DOM.label("Source project"),
         map(session, state.projects, cp_src_worker) do projects, wid
-            wid_projs = sort([p for p in values(projects) if p.worker_id == wid];
+            wid_projs = sort([p for p in values(projects) if p.worker_id == wid && visible(state, p)];
                              by = p -> lowercase(p.title[]))
             isempty(wid_projs) ?
                 DOM.div("No projects on this worker";
@@ -2328,10 +2329,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # ── Stats strip ──────────────────────────────────────────────────────────
     # Stats touch both worker counts and project counts → listen to both.
     stats_strip = map(state.workers, state.projects) do workers, projects
-        online   = count(isopen, values(workers))
-        total    = length(workers)
-        n_proj   = length(projects)
-        n_active = count(p -> p.locked_by !== nothing, values(projects))
+        mine     = [w for w in values(workers) if visible(state, w)]
+        online   = count(isopen, mine)
+        total    = length(mine)
+        n_proj   = count(p -> visible(state, p), values(projects))
+        n_active = count(p -> p.locked_by !== nothing && visible(state, p), values(projects))
         sep()    = DOM.span("·"; class = "bt-stat-sep")
         DOM.div(
             DOM.div(
@@ -2374,76 +2376,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 trigger_scan     = trigger_scan!)
         end
     end
-    # The "no workers" install-instructions block lives as a sibling that
-    # toggles visibility based on workers-empty. Keeps the install snippet
-    # out of every render's hot path.
-    #
-    # OS-explicit routes — we already know the platform per row, so we hit
-    # /install.sh and /install.ps1 directly instead of relying on /install's
-    # User-Agent sniff to guess. Both wrappers verify `julia` is on PATH and
-    # then run the cross-platform install.jl. This snippet matches the
-    # worker-install hint the server banner + install_server.sh print verbatim.
-    base         = install_base_url(state)
-    install_unix = "curl -fsSL $base/install.sh | sh"
-    install_win  = "irm $base/install.ps1 | iex"
-    # Copy MUST work on plain-http origins too: `navigator.clipboard` is
-    # undefined outside secure contexts (https / localhost), which is exactly
-    # how a LAN-hosted BonitoAgents is reached — that's why the button "did
-    # nothing". Fall back to the hidden-textarea + execCommand path there.
-    install_row(label, cmd) = DOM.div(
-        DOM.div(label; class = "bt-install-os"),
-        DOM.div(
-            DOM.code(cmd),
-            DOM.span("Copy";
-                class   = "bt-install-copy",
-                onclick = js"""event => {
-                    const btn  = event.target;
-                    const done = () => {
-                        btn.textContent = 'Copied';
-                        setTimeout(() => btn.textContent = 'Copy', 1200);
-                    };
-                    const fallback = () => {
-                        const ta = document.createElement('textarea');
-                        ta.value = $cmd;
-                        ta.style.position = 'fixed';
-                        ta.style.opacity = '0';
-                        document.body.appendChild(ta);
-                        ta.select();
-                        try { document.execCommand('copy'); done(); }
-                        finally { ta.remove(); }
-                    };
-                    if (navigator.clipboard && window.isSecureContext) {
-                        navigator.clipboard.writeText($cmd).then(done, fallback);
-                    } else {
-                        fallback();
-                    }
-                }"""),
-            class = "bt-install-cmd"))
-    # Headline text reflects whether any workers have connected yet — but the
-    # install snippet itself is always visible, so adding more workers later
-    # doesn't require digging through docs.
-    install_headline = map(state.workers) do workers
-        isempty(workers) ? "No workers connected yet. Run on each agent machine:" :
-                           "Add another worker — run on the agent machine:"
-    end
-    # The install snippets are secondary once a worker is connected, so they
-    # live behind a disclosure (collapsed by default) and stop dominating the
-    # Workers card. During onboarding (no workers yet) it starts open so the
-    # commands are right there.
-    install_body = DOM.div(
-        DOM.div(install_headline;
-                style = Styles("color" => "var(--bt-text-muted)",
-                                "font-size" => "13px",
-                                "margin-bottom" => "4px")),
-        install_row("Linux / macOS", install_unix),
-        install_row("Windows (PowerShell)", install_win);
-        class = "bt-install-block")
-    install_summary = DOM.summary(
-        DOM.span("Add another worker"; class = "bt-discover-title");
-        class = "bt-discover-header")
-    install_block = isempty(state.workers[]) ?
-        DOM.details(install_summary, install_body; class = "bt-card bt-install-details", open = true) :
-        DOM.details(install_summary, install_body; class = "bt-card bt-install-details")
+    install_block = worker_install_block(state.auth, session, state)
     # ── Global agent instructions (AGENTS.md) ────────────────────────────────
     # A server-wide system-prompt appendix every agent session gets, across
     # all workers (state_dir/AGENTS.md; see `system_prompt_meta`). Read at
@@ -2491,7 +2424,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # vector of WorkerCard instances (same widget objects across renders →
     # same hash → no spurious unmount/remount).
     worker_widgets_obs = map(state.workers) do workers
-        WorkerCard[get_worker_card(w.worker_id) for w in values(workers)]
+        WorkerCard[get_worker_card(w.worker_id) for w in values(workers) if visible(state, w)]
     end
     worker_keyed_list = KeyedList(worker_widgets_obs;
                                     key = c -> c.worker_id)
@@ -2588,6 +2521,10 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         DOM.div(DOM.h2("Agents"); class = "bt-section"),
         agents_block,
 
+        # Your account behind the proxy; accounts, invites and agent adapter
+        # versions for admins.
+        account_sections(session, state),
+
         # Everything that is neither a worker nor a chat lives in ONE card of
         # uniform rows, so the tail of the dashboard reads as one place rather
         # than a stack of differently shaped sections.
@@ -2607,6 +2544,86 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         form_block;
 
         class = "bt-dash")
+end
+
+# One install command with its Copy button. Copy MUST work on plain-http origins
+# too: `navigator.clipboard` is undefined outside secure contexts (https /
+# localhost), so it falls back to the hidden-textarea + execCommand path there.
+# The command is copied from its own element, never interpolated into the script:
+# a credential command carries quotes, which a JS string literal would break on.
+install_command_row(label::AbstractString, cmd::AbstractString) = DOM.div(
+    DOM.div(label; class = "bt-install-os"),
+    DOM.div(
+        DOM.code(cmd),
+        DOM.span("Copy";
+            class   = "bt-install-copy",
+            onclick = js"""event => {
+                const btn  = event.target;
+                const cmd  = btn.parentNode.querySelector('code').textContent;
+                const done = () => {
+                    btn.textContent = 'Copied';
+                    setTimeout(() => btn.textContent = 'Copy', 1200);
+                };
+                const fallback = () => {
+                    const ta = document.createElement('textarea');
+                    ta.value = cmd;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    try { document.execCommand('copy'); done(); }
+                    finally { ta.remove(); }
+                };
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(cmd).then(done, fallback);
+                } else {
+                    fallback();
+                }
+            }"""),
+        class = "bt-install-cmd"))
+
+# The "add a worker" block of the Workers section. On a server without the proxy
+# only this machine reaches the server, so the plain install one-liner is the
+# whole story; behind the proxy each worker needs a credential first
+# (`worker_install_block(::ProxyAuth, …)` in accounts.jl).
+function worker_install_block(::LocalAuth, session::Bonito.Session, state::ServerState)
+    # The "no workers" install-instructions block lives as a sibling that
+    # toggles visibility based on workers-empty. Keeps the install snippet
+    # out of every render's hot path.
+    #
+    # OS-explicit routes — we already know the platform per row, so we hit
+    # /install.sh and /install.ps1 directly instead of relying on /install's
+    # User-Agent sniff to guess. Both wrappers verify `julia` is on PATH and
+    # then run the cross-platform install.jl. This snippet matches the
+    # worker-install hint the server banner + install_server.sh print verbatim.
+    base         = install_base_url(state)
+    install_unix = "curl -fsSL $base/install.sh | sh"
+    install_win  = "irm $base/install.ps1 | iex"
+    # Headline text reflects whether any workers have connected yet — but the
+    # install snippet itself is always visible, so adding more workers later
+    # doesn't require digging through docs.
+    install_headline = map(state.workers) do workers
+        isempty(workers) ? "No workers connected yet. Run on each agent machine:" :
+                           "Add another worker — run on the agent machine:"
+    end
+    # The install snippets are secondary once a worker is connected, so they
+    # live behind a disclosure (collapsed by default) and stop dominating the
+    # Workers card. During onboarding (no workers yet) it starts open so the
+    # commands are right there.
+    install_body = DOM.div(
+        DOM.div(install_headline;
+                style = Styles("color" => "var(--bt-text-muted)",
+                                "font-size" => "13px",
+                                "margin-bottom" => "4px")),
+        install_command_row("Linux / macOS", install_unix),
+        install_command_row("Windows (PowerShell)", install_win);
+        class = "bt-install-block")
+    install_summary = DOM.summary(
+        DOM.span("Add another worker"; class = "bt-discover-title");
+        class = "bt-discover-header")
+    return isempty(state.workers[]) ?
+        DOM.details(install_summary, install_body; class = "bt-card bt-install-details", open = true) :
+        DOM.details(install_summary, install_body; class = "bt-card bt-install-details")
 end
 
 # One row of the Settings card: what it is (and why) on the left, the control
@@ -2635,7 +2652,8 @@ end
 # restart afterwards loads.
 function debug_section(session::Bonito.Session, state::ServerState,
                        current_view::Union{Observable{String},Nothing})
-    current_view === nothing && return nothing
+    # Its tools read and drive the whole server: admins only.
+    (current_view === nothing || !is_admin(state)) && return nothing
     chosen = Observable("")
     status = Observable("")
     # The picker follows the worker list: a worker that goes away is dropped and

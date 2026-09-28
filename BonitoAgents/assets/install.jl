@@ -1,19 +1,25 @@
 #!/usr/bin/env julia
 # BonitoAgents worker installer — cross-platform (Linux / macOS / Windows).
 #
-#   curl -fsSL {{SERVER_URL}}/install.jl | julia -
+#   curl -fsSL {{SERVER_URL}}/install.jl | BONITOAGENTS_WORKER_CREDENTIAL='<from Add worker>' julia -
 #
 # Windows 10 1803+ ships curl.exe, so the same one-liner works everywhere.
-# The server templates {{SERVER_URL}} / {{WORKER_SECRET}} into this file
-# before serving it from the /install.jl route.
+# The server templates {{SERVER_URL}} and its git revision into this file
+# before serving it from the /install.jl route. The file holds no secret: the
+# worker's credential ("Add worker" on the dashboard issues one per machine)
+# arrives in BONITOAGENTS_WORKER_CREDENTIAL, and a server without the login
+# proxy (localhost only) needs none.
 #
 # What it does:
-#   1. Verifies the Claude Code prerequisites are on PATH.
-#   2. Installs BonitoWorker + BonitoMCP from the public repo into the
+#   1. Installs BonitoWorker + BonitoMCP from the public repo into the
 #      SHARED `@bonito-agents` environment (Pkg url+subdir — no tar bundle,
 #      no per-package source trees, cross-platform by construction).
-#   3. Hands off to `BonitoWorker.install!` which records the config in a
+#   2. Hands off to `BonitoWorker.install!` which records the config in a
 #      Scratch space and starts the worker process.
+#
+# Node and the agent adapters (claude-agent-acp, codex-acp) are the worker's to
+# install and update, at the versions the server declares; only logging in to
+# the agents (`claude login`, …) stays with the machine's user.
 #
 # No OS service — it just launches the Julia worker process (per request).
 import Pkg
@@ -26,7 +32,7 @@ const REPO   = "https://github.com/SimonDanisch/BonitoAgents.jl"
 const REV    = "{{REV}}"
 const SOURCE_ID = "{{SOURCE_ID}}"
 const SERVER = "{{SERVER_URL}}"
-const SECRET = "{{WORKER_SECRET}}"
+const CREDENTIAL = get(ENV, "BONITOAGENTS_WORKER_CREDENTIAL", "")
 # Bonito (the UI / proxy library) is pinned to the SERVER's version so
 # remote-app frames / dial-back / id_prefix all match across the wire.
 # Templated from the server's `[sources]` Bonito = {url, rev} entry —
@@ -36,7 +42,7 @@ const BONITO_REV = "{{BONITO_REV}}"
 
 # Guard against running the raw template (the `{{ }}` are intact only if this
 # file wasn't fetched through the server's rendering route).
-if startswith(SERVER, "{{") || startswith(SECRET, "{{") ||
+if startswith(SERVER, "{{") ||
         startswith(REV, "{{") || startswith(SOURCE_ID, "{{") || startswith(BONITO_URL, "{{") ||
         startswith(BONITO_REV, "{{")
     error("install.jl must be fetched from a running BonitoAgents server: " *
@@ -47,47 +53,13 @@ println("==> BonitoAgents worker installer")
 println("    server : ", SERVER)
 println("    repo   : ", REPO, " @ ", REV)
 println("    workdir: ", pwd())
-
-# ── Prerequisites ────────────────────────────────────────────────────────────
-# Claude Code itself is user-managed (install + `claude login` once). The
-# installer only checks they're reachable. npm and claude-agent-acp are
-# installed by npm as `.cmd` shims on Windows; `Sys.which` only walks the
-# raw name + .exe there, so we fall back to .cmd/.bat explicitly.
-@static if Sys.iswindows()
-    which_executable(name) = something(Sys.which(name),
-                                       Sys.which(name * ".cmd"),
-                                       Sys.which(name * ".bat"),
-                                       Some(nothing))
-else
-    which_executable(name) = Sys.which(name)
-end
-let missing = filter(b -> which_executable(b) === nothing, ["node", "npm", "claude", "claude-agent-acp"])
-    if !isempty(missing)
-        error("missing prerequisite(s) on PATH: $(join(missing, ", ")).\n" *
-              "    Install Node.js 20+ and Claude Code first:\n" *
-              "      Node 22 LTS: https://nodejs.org/  (or `winget install OpenJS.NodeJS.LTS`)\n" *
-              "      npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp\n" *
-              "      claude login")
-    end
-end
-# claude-agent-acp uses `import attributes` syntax which lands in Node 20.10+
-# (or the Node 18.20 backport). On older Node the agent dies on first spawn
-# with `SyntaxError: Unexpected token 'with'`, which surfaces in the dashboard
-# as the opaque "ACP connection closed". Catch it here instead.
-let ver = try
-        strip(read(`$(which_executable("node")) --version`, String))  # e.g. "v18.17.1"
-    catch; "" end
-    m = match(r"^v(\d+)\.(\d+)", ver)
-    if m === nothing
-        error("could not determine node version (got: $(repr(ver)))")
-    end
-    major, minor = parse(Int, m.captures[1]), parse(Int, m.captures[2])
-    too_old = major < 18 || (major == 18 && minor < 20)
-    too_old && error("Node $ver is too old; claude-agent-acp needs Node 20+ " *
-                     "(or 18.20+). Install Node 22 LTS:\n" *
-                     "      https://nodejs.org/  (or `winget install OpenJS.NodeJS.LTS`)")
-    println("    prereqs: node $(ver), npm, claude, claude-agent-acp ok")
-end
+println("    login  : ", isempty(CREDENTIAL) ? "none (a server on this machine)" :
+                        "worker credential " * first(split(CREDENTIAL, ':')))
+# The agents log in as this machine's user; the worker installs them but cannot
+# log in for anyone.
+isdir(joinpath(homedir(), ".claude")) ||
+    println("    note   : Claude Code was never used here. Chats with it need its login: install it and " *
+            "run `claude` once (https://claude.com/claude-code).")
 
 # ── Shared @bonito-agents environment ──────────────────────────────────────────
 # RemoteSync is an unregistered package and a dependency of BonitoWorker.
@@ -150,7 +122,7 @@ end
 # ── Configure + launch ───────────────────────────────────────────────────────
 import BonitoWorker
 BonitoWorker.install!(; server_url    = SERVER,
-                         secret        = SECRET,
+                         credential    = CREDENTIAL,
                          projects_root = pwd(),
                          update_spec   = Dict("repo"       => REPO,
                                               "rev"        => REV,

@@ -74,6 +74,7 @@ past work, and opening a dismissed chat un-dismisses it.
 function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
     candidates = Tuple{Float64,ProjectInfo}[]
     for (_, p) in state.projects[]
+        visible(state, p) || continue
         # New-style storage only (state_dir/chats/<pid>); computed directly so
         # listing the dashboard never mkpaths a dir for chat-less projects.
         f = joinpath(state.state_dir, "chats", p.id, "chat.md")

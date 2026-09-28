@@ -7701,6 +7701,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 "Restarts the session.")
     devmode_item = dev.item
     devmode_on   = dev.is_on
+    # Both reach past this chat (other workers; the whole server): admins only.
+    is_admin(state) || (remote_item = DOM.div(); devmode_item = DOM.div())
 
     menu_trigger_class = map(session, devmode_on) do on
         on ? "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger bt-menu-trigger-danger" :

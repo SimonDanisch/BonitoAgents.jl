@@ -16,11 +16,10 @@ import JSON
 @testset "remove_worker!" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
 
     wid = "worker-uuid-1"
-    st.workers[][wid] = BT.WorkerInfo(wid, "Laptop", "<inbound-ws>", "s", nothing,
+    st.workers[][wid] = BT.WorkerInfo(wid, "Laptop", nothing,
                                       "host", "/home/u", "julia", String[],
                                       "/home/u/projects", :offline, now(UTC))
     mk(id, name, w) = BT.ProjectInfo(id, name, w,
@@ -67,7 +66,7 @@ import JSON
     # remove_projects=false keeps the project rows (just evicts the worker +
     # its live ChatModels).
     wid2 = "worker-uuid-2"
-    st.workers[][wid2] = BT.WorkerInfo(wid2, "Box", "<inbound-ws>", "s", nothing,
+    st.workers[][wid2] = BT.WorkerInfo(wid2, "Box", nothing,
                                        "h2", "/home/v", "julia", String[],
                                        "/home/v/projects", :offline, now(UTC))
     p4 = mk("p4", "Keep", wid2)
@@ -84,9 +83,8 @@ end
 @testset "thread identity (folder hosts multiple threads)" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
-    st.workers[]["wX"] = BT.WorkerInfo("wX", "Box", "<ws>", "s", nothing,
+                          working_dir = joinpath(dir, "work"))
+    st.workers[]["wX"] = BT.WorkerInfo("wX", "Box", nothing,
                                        "h", "/home", ".", String[],
                                        "/home/u/projects", :online, now(UTC))
     imp(path; sess = nothing) = BT.create_project_from_worker!(
@@ -118,8 +116,7 @@ end
 @testset "dedup keeps sibling threads, collapses true dupes" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     folder = "/home/u/projects/Repo"
     mk(id) = BT.ProjectInfo(id, "Repo", "wY",
                             joinpath(dir, "work", "wY-Repo"), folder, now(UTC))
@@ -141,8 +138,7 @@ end
 @testset "discovered scan persistence" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     st.discovered[]["wA"] = [Dict{String,Any}(
         "session_id" => "s1", "path" => "/p/App",
         "first_prompt" => "fix the bug", "last_used" => 1.7e9, "kind" => "session")]
@@ -151,8 +147,7 @@ end
 
     # A fresh state over the same dir reloads the cache (survives restart).
     st2 = BT.ServerState(; state_dir = dir,
-                           working_dir = joinpath(dir, "work"),
-                           worker_secret = "s")
+                           working_dir = joinpath(dir, "work"))
     @test haskey(st2.discovered[], "wA")
     @test st2.discovered[]["wA"][1]["first_prompt"] == "fix the bug"
 
@@ -172,10 +167,9 @@ end
     # is torn down), never evicted.
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     wid = "dup-worker"
-    st.workers[][wid] = BT.WorkerInfo(wid, "Box", "<inbound-ws>", "s", nothing,
+    st.workers[][wid] = BT.WorkerInfo(wid, "Box", nothing,
                                       "h", "/home/u", "julia", String[],
                                       "/home/u/projects", :online, now(UTC))
     st.projects[][ "pp" ] = BT.ProjectInfo("pp", "Proj", wid,
@@ -217,17 +211,15 @@ end
     # worker happened to re-register.
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     wid = "worker-roundtrip-1"
-    st.workers[][wid] = BT.WorkerInfo(wid, "Studio", "<inbound-ws>", "s", nothing,
+    st.workers[][wid] = BT.WorkerInfo(wid, "Studio", nothing,
                                       "host", "/home/u", "julia", String["--project"],
                                       "/home/u/projects", :online, now(UTC))
     BT.save_workers!(st)
 
     st2 = BT.ServerState(; state_dir = dir,
-                           working_dir = joinpath(dir, "work"),
-                           worker_secret = "s")
+                           working_dir = joinpath(dir, "work"))
     @test haskey(st2.workers[], wid)              # NOT dropped as malformed
     w = st2.workers[][wid]
     @test w.name == "Studio"

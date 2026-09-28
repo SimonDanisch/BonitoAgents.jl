@@ -16,8 +16,7 @@
     overview_snippets(msgs; kw...) =
         BT.overview_snippets(msgs; provider = AgentProviders.ClaudeCodeAgent(), kw...)
 
-    newstate() = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                                worker_secret = "x")
+    newstate() = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
 
     # A persisted chat for project `pid`: write user messages through the real
     # writer (append_user → the exact chat.md form load_history parses).
@@ -114,7 +113,7 @@
         write(joinpath(att, "red.svg"), "overwritten")
         rm(joinpath(att, "red.svg"))
         restarted = BT.ServerState(; state_dir=state.state_dir,
-            working_dir=state.working_dir, worker_secret="x")
+            working_dir=state.working_dir)
         @test BT.chat_icon_image(restarted, p).local_path == selected
         @test read(selected, String) == red
 
@@ -127,7 +126,7 @@
         @test readdir(BT.chat_icon_dir(restarted, p)) == sort([basename(chosen), "selected"])
         rm(joinpath(att, "blue.svg"))
         again = BT.ServerState(; state_dir=state.state_dir,
-            working_dir=state.working_dir, worker_secret="x")
+            working_dir=state.working_dir)
         @test BT.chat_icon_image(again, p).local_path == chosen
         @test read(chosen, String) == blue
         @test BT.select_chat_icon!(again, p, msgs, chat_dir) == chosen
