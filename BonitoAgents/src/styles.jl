@@ -1848,6 +1848,12 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-fv-rendered, .bt-fv-source",
         "flex" => "1 1 auto", "min-height" => "0", "min-width" => "0",
         "display" => "flex", "flex-direction" => "column", "overflow" => "auto"),
+    # The source half holds only Monaco, which scrolls itself. A scrolling parent
+    # makes a resize loop: at a fractional pane size (1201.81px) Monaco lays out
+    # at the rounded 1202px, the 0.19px overflow brings in scrollbars, Monaco
+    # shrinks by their 15px, they go away, and so on every frame. The editor
+    # flickered and lost every click and selection.
+    CSS(".bt-fv-source", "overflow" => "hidden"),
     # The Monaco wrapper chain must pass full height down to the editor div —
     # EVERY link of it. BonitoBook's editor component brings its own unclassed
     # wrapper between `.bt-fv-editor` and `.monaco-editor-div`, and that div was

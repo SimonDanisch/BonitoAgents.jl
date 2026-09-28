@@ -8889,13 +8889,16 @@ file_panel_content(state::ServerState, project_id::AbstractString,
 open_guard_reject_reason(model::ChatModel, path::AbstractString) =
     open_guard_reject_reason(model.state, model.project_id, path)
 
-function open_guard_reject_reason(state::ServerState, project_id::AbstractString,
-                                  path::AbstractString)
-    name = basename(String(path))
+open_guard_reject_reason(state::ServerState, project_id::AbstractString, path::AbstractString) =
+    open_guard_reject_reason(open_guard_stat(state, project_id, path), path)
+
+# The worker's stat of `path`, or what to do without one: `nothing` lets the fetch
+# try, a String is already the refusal.
+function open_guard_stat(state::ServerState, project_id::AbstractString, path::AbstractString)
     proj = get(state.projects[], project_id, nothing)
     proj === nothing && return nothing      # no worker to stat → let the fetch try
     worker_src = isabspath(path) ? String(path) : joinpath(proj.worker_path, path)
-    info = try
+    return try
         stat_worker_path(state, proj.worker_id, worker_src)
     catch e
         # Fail CLOSED when the worker itself is unreachable (not connected, or
@@ -8905,10 +8908,17 @@ function open_guard_reject_reason(state::ServerState, project_id::AbstractString
         # Any other stat error is a genuine worker-side hiccup → keep the old
         # fail-open behavior and let the fetch report.
         e isa WorkerUnreachableError &&
-            return "Can't open $name — worker not responding"
+            return "Can't open $(basename(String(path))) — worker not responding"
         @warn "open-guard stat failed; allowing the fetch to try" path exception = e
-        return nothing                      # worker hiccup → don't block; fetch reports
+        nothing                             # worker hiccup → don't block; fetch reports
     end
+end
+
+open_guard_reject_reason(::Nothing, path::AbstractString) = nothing
+open_guard_reject_reason(reason::String, path::AbstractString) = reason
+
+function open_guard_reject_reason(info::NamedTuple, path::AbstractString)
+    name = basename(String(path))
     info.exists || return "Can't open $name — not found on the worker"
     info.isdir  && return "Can't open $name — it's a folder"
     info.isfile || return "Can't open $name — not a regular file"
@@ -8972,25 +8982,9 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
     # ONE file — you edit in one, save, and the other quietly holds the old text.
     # Worse, tab disambiguation then dresses the pair up as `uxprobe/notes.md`
     # and `notes.md`, which reads as two genuinely different files.
-    path = show_worker_path(ShowTool(state, String(project_id), String(server_cwd), String(path)))
-    id = file_tab_id(path)
-    existing = findfirst(p -> p.id == id, ws.panels[])
-    if existing !== nothing
-        BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
-        # The content was loaded when the panel first opened; the agent may have
-        # edited the file on the worker since (#34). Async — the activation must
-        # not wait on a worker round-trip.
-        panel = ws.panels[][existing].content
-        panel isa FilePanel && Base.errormonitor(@async try
-            # Same worker-liveness gate as a fresh open; an unreachable /
-            # invalid target just keeps showing what we already have.
-            open_guard_reject_reason(state, project_id, path) === nothing &&
-                refresh_file_panel!(panel)
-        catch e
-            @warn "file panel refresh-on-activate failed" path exception = e
-        end)
-        return nothing
-    end
+    given = String(path)
+    path = show_worker_path(ShowTool(state, String(project_id), String(server_cwd), given))
+    activate_file_tab!(ws, state, project_id, path) && return nothing
     # Fetch (worker transfer — can take seconds) off the event task, then add the
     # panel as the workspace panel's DIRECT content. NOT via a placeholder +
     # reactive `DOM.div(Observable)` swap: that inserts auto-height
@@ -9002,21 +8996,30 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         # window's progress card and opens NO panel, instead of streaming bytes
         # into an empty view (the worker stat is the gate — see
         # open_guard_reject_reason).
-        reason = open_guard_reject_reason(state, project_id, path)
+        target = path
+        info = open_guard_stat(state, project_id, target)
+        found = info isa NamedTuple && !info.exists && !isabspath(given) ?
+                project_file_ending_in(state, project_id, given) : nothing
+        if found !== nothing
+            target = found
+            activate_file_tab!(ws, state, project_id, target) && return
+            info = open_guard_stat(state, project_id, target)
+        end
+        reason = open_guard_reject_reason(info, target)
         if reason !== nothing
             show_problem!(pane, reason)
             return
         end
         elem = try
-            file_panel_content(state, project_id, server_cwd, path)
+            file_panel_content(state, project_id, server_cwd, target)
         catch e
-            @warn "file open failed" path exception = e
-            show_problem!(pane, "Can't open $(basename(String(path))) — $(open_error_brief(e))",
+            @warn "file open failed" path = target exception = e
+            show_problem!(pane, "Can't open $(basename(target)) — $(open_error_brief(e))",
                           error_detail(e))
             return
         end
-        BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
-            label = basename(path), closable = true))
+        BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(file_tab_id(target), elem;
+            label = basename(target), closable = true))
         relabel_file_tabs!(ws)
         # Mark the tab while the buffer differs from what was last saved. Closing
         # a tab discards it WITHOUT asking, so this dot is the only warning you
@@ -9027,6 +9030,46 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         end
     end)
     return nothing
+end
+
+# Focus the tab already showing worker file `path`; `false` when there is none.
+function activate_file_tab!(ws, state::ServerState, project_id::AbstractString,
+                            path::AbstractString)
+    id = file_tab_id(path)
+    existing = findfirst(p -> p.id == id, ws.panels[])
+    existing === nothing && return false
+    BonitoWidgets.activate_panel!(ws, id)
+    # The content was loaded when the panel first opened; the agent may have
+    # edited the file on the worker since (#34). Async — the activation must
+    # not wait on a worker round-trip.
+    panel = ws.panels[][existing].content
+    panel isa FilePanel && Base.errormonitor(@async try
+        # Same worker-liveness gate as a fresh open; an unreachable /
+        # invalid target just keeps showing what we already have.
+        open_guard_reject_reason(state, project_id, path) === nothing &&
+            refresh_file_panel!(panel)
+    catch e
+        @warn "file panel refresh-on-activate failed" path exception = e
+    end)
+    return true
+end
+
+# The agent's relative paths are relative to the project root, but not always: it
+# wrote `Mantle/docs/examples.jl` for `dev/Mantle/docs/examples.jl`. When the
+# path isn't there, the one project file whose path ends in it is what was meant.
+# `nothing` for no match or several (the caller then reports "not found").
+function project_file_ending_in(state::ServerState, project_id::AbstractString,
+                                given::AbstractString)
+    proj = get(state.projects[], project_id, nothing)
+    (proj === nothing || !worker_connected(state, proj.worker_id)) && return nothing
+    task = ensure_project_file_index!(state, proj)
+    task === nothing || wait(task)
+    # A Windows worker lists its files with backslashes.
+    slashed(p) = replace(p, '\\' => '/')
+    suffix = "/" * slashed(normpath(given))
+    matches = filter(f -> endswith("/" * slashed(f), suffix), project_index_files(proj))
+    length(matches) == 1 || return nothing
+    return joinpath(proj.worker_path, only(matches))
 end
 
 # Is this panel's editor holding unsaved edits right now?

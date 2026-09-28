@@ -35,6 +35,10 @@ write(joinpath(CWD, "logo.png"),
 # A directory: still un-openable, so it must TOAST rather than silently do
 # nothing (the #35 bug) — that's what's left of the open-guard's refusals.
 mkpath(joinpath(CWD, "subdir"))
+# The VideoEditor chat's agent wrote `Mantle/docs/examples.jl` for this file.
+const NESTED = joinpath(CWD, "dev", "Mantle", "docs", "examples.jl")
+mkpath(dirname(NESTED))
+write(NESTED, "const MANTLE_EXAMPLES = 1\n")
 
 # The browser command a `.bt-path-link` click fires (same EditFileCommand path).
 open_file(path) = """(() => { document.querySelector('.bt-messages').__bt_chat.comm.notify(
@@ -53,7 +57,7 @@ agent_script(prompt) = [TK.tool(kind = "read", title = joinpath(CWD, "hello.jl")
                                  content = [TK.text_block("```julia\nprintln(\"hi from hello\")\n```")]),
                         TK.text("Video: [absolute clip]($(joinpath(CWD, "clip.mp4"))) " *
                                 "or [relative clip](clip.mp4). External: " *
-                                "[Julia](https://julialang.org).")]
+                                "[Julia](https://julialang.org). I wrote `Mantle/docs/examples.jl`.")]
 
 function run_suite(server)
     server.agent_fn[] = agent_script
@@ -92,6 +96,28 @@ function run_suite(server)
                     // the editor fills the body, rather than merely sitting in it
                     return bh > 200 && eh > 200 && eh >= bh - 40;
                 })()"""; timeout = 30) == true
+        end
+
+        @testset "the editor holds still at a fractional pane width" begin
+            # The VideoEditor chat's flicker: at 1201.81px Monaco laid out at the
+            # rounded 1202px, the 0.19px overflow brought in the source view's
+            # scrollbars, Monaco shrank by their width, they went away, and so on
+            # every frame. Nothing could be selected or typed.
+            TK.eval_js(server, """(() => {
+                const p = document.querySelector('$(panel_sel("hello.jl"))');
+                p.querySelector('.bt-file-editor-body').style.width = '700.6px';
+                return true; })()""")
+            sleep(0.5)   # the one relayout the new width asks for
+            TK.eval_js(server, """(() => {
+                const ed = document.querySelector('$(panel_sel("hello.jl")) .monaco-editor');
+                window.__btRelayouts = 0;
+                new MutationObserver(ms => { window.__btRelayouts += ms.length; })
+                    .observe(ed, {attributes: true, attributeFilter: ['style']});
+                return true; })()""")
+            sleep(2.5)
+            @test TK.eval_js(server, "window.__btRelayouts") <= 1
+            TK.eval_js(server,
+                "document.querySelector('$(panel_sel("hello.jl")) .bt-file-editor-body').style.width = ''")
         end
 
         @testset "rapid repeated opens of one path make exactly ONE panel" begin
@@ -232,6 +258,17 @@ function run_suite(server)
             @test TK.eval_js(server,
                 "document.querySelector('.bt-agent-msg a[href=\"clip.mp4\"]').dataset.path") ==
                   "clip.mp4"
+        end
+
+        @testset "a relative path that isn't there opens the one file ending in it" begin
+            # It used to say "not found on the worker": relative paths resolve
+            # against the project root, and the file is under dev/.
+            link = "document.querySelector('.bt-agent-msg code.bt-path-link[data-path=\"Mantle/docs/examples.jl\"]')"
+            @test TK.wait_for(server, "code-span path link", "!!$(link)"; timeout = 15) == true
+            TK.eval_js(server, "$(link).click()")
+            @test TK.wait_for(server, "the file under dev/ opened",
+                "(document.querySelector('$(panel_sel(NESTED)) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('MANTLE_EXAMPLES')";
+                timeout = 36) == true
         end
 
         @testset "clicking Home activates + relabels the chat tab" begin
