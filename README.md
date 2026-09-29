@@ -162,9 +162,9 @@ Useful flags: `bonito-agents --port=8038`, `--no-window`, `--data-dir=PATH`;
 (the raw bundles are also attached to
 [releases](https://github.com/SimonDanisch/BonitoAgents.jl/releases)).
 
-For Claude Code agents you also need Node 20+,
-`npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp`,
-and a logged-in `claude`.
+Node and the agent adapters (Claude Code's and Codex's) are installed for you,
+in a private Node install. What stays yours is logging in to the agents: for
+Claude Code, run `claude` once and authenticate.
 
 ### From source
 
@@ -207,10 +207,18 @@ Every worker gets its own credential, and revoking it disconnects that machine.
 The installer pins the worker to the server's code revision, registers the
 machine under a stable identity, and sets up a systemd user service on Linux.
 Re-run it any time to update. The server keeps each worker's agent adapters
-(Claude Code, Codex) up to date, in a private Node install on the worker.
+(Claude Code, Codex) up to date, in a private Node install on the worker (set
+`BONITOAGENTS_NODE_DIST` on a worker that cannot reach nodejs.org to a mirror of
+its `dist` tree).
 
-On a single machine, `bonito-agents server` runs the server without the proxy:
-it listens on localhost only, and whoever reaches it is the local admin.
+Without the proxy there are two simpler ways to run the server:
+
+- `bonito-agents server`: this machine only. It listens on localhost, whoever
+  reaches it is the local admin, and so is its worker.
+- `bonito-agents server --host 0.0.0.0`: a network you trust, e.g. to try things
+  out or for a team of one. Still no login (whoever reaches it is the admin) and
+  plain HTTP; workers join with the command from **Add worker**, each with its
+  own credential that the server checks itself.
 
 ## Tour
 

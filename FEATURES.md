@@ -10,10 +10,10 @@ enumerates.
 - Stable worker identity across reinstalls, reboots, and IP/hostname changes;
   UI renames persist server-side.
 - Copy-paste **worker install one-liner** (Linux/macOS `install.sh`, Windows
-  `install.ps1`) served by the dashboard itself: prereq checks (node, npm,
-  claude, claude-agent-acp), a shared `@bonito-agents` Julia env pinned to the
-  server's code revision, and a systemd user service on Linux. Re-run to
-  update.
+  `install.ps1`) served by the dashboard itself: a shared `@bonito-agents` Julia
+  env pinned to the server's code revision, and a systemd user service on
+  Linux. Re-run to update. Node and the agent adapters are the worker's to
+  install (see Managed agent adapters).
 - **Link liveness**: a server-to-worker heartbeat kills half-open "zombie"
   sockets (suspend, a Wi-Fi to LAN switch) and flips the worker offline within
   a minute; the worker watches for the server's pings, re-dials over the
@@ -185,6 +185,9 @@ enumerates.
 - Worker installs always match the server's running code revision (branch,
   sha, or the version's `v` tag for git-less release deployments);
   `BONITOAGENTS_INSTALL_REV` overrides for ops.
+- Three ways to run a server: one machine (localhost, no login), a trusted
+  network (`--host 0.0.0.0`, no login, per-worker credentials the server checks
+  itself), or behind the login proxy (below).
 - Accounts, owners and per-worker credentials: the server binds localhost and
   takes identities from the proxy (with a key only Caddy and the server share);
   admins invite people by link, manage accounts and groups, and issue or revoke

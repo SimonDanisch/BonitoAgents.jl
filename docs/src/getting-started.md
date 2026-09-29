@@ -35,13 +35,9 @@ restarts and updates under the platform data directory
 Support/BonitoAgents` on macOS, `%LOCALAPPDATA%\BonitoAgents` on Windows) and
 are never touched by install/update/uninstall.
 
-For Claude Code agents you also need Node 20+, the two npm packages
-
-```bash
-npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
-```
-
-and a logged-in `claude` CLI (run `claude` once and authenticate).
+Node and the agent adapters (Claude Code's and Codex's) are installed for you,
+in a private Node install, and kept up to date. What stays yours is logging in
+to the agents: for Claude Code, run `claude` once and authenticate.
 
 ## From source
 
