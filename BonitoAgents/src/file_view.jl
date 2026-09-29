@@ -77,7 +77,7 @@ view_size_limit(::HTMLFile)    = FILE_EDITOR_MAX_BYTES
 # notebook's JSON is decoded whole.
 view_size_limit(::TableFile)   = 16 * 1024 * 1024
 view_size_limit(::NotebookFile)= 32 * 1024 * 1024
-view_size_limit(::MeshFile)    = 512 * 1024 * 1024
+view_size_limit(::MeshFile)    = 512 * 1024 * 1024     # the browser holds it whole, and so does the response
 view_size_limit(::BinaryFile)  = 64 * 1024 * 1024      # we only hexdump the head, but we mirror it
 
 # Does this kind's file also make sense as editable SOURCE? A markdown file, an
@@ -181,18 +181,21 @@ file_error_node(path::AbstractString, e) =
 # round-trip. `missing` means "go and stat".
 function view_bytes(fv::FileView; stamp = missing)
     kind = view_kind(fv)
-    limit = view_size_limit(kind)
     st = fv.file
     s = stamp === missing ? worker_file_stamp(st, show_worker_path(st)) : stamp
-    too_big(n) = throw(ErrorException(
-        "$(format_bytes(n)) is too large to open as $(kind_label(kind)) " *
-        "(limit $(format_bytes(limit)))"))
-    s !== nothing && s.size > limit && too_big(s.size)
+    s === nothing || check_view_size(kind, s.size)
     local_path = fetch_show_file(st; stamp = s)
     # A second check on what actually landed: the pre-check is skipped entirely
     # when the worker couldn't be stat'd, and the file may have grown since.
-    filesize(local_path) <= limit || too_big(filesize(local_path))
+    check_view_size(kind, filesize(local_path))
     return (local_path, read(local_path))
+end
+
+function check_view_size(kind::FileKind, n::Integer)
+    limit = view_size_limit(kind)
+    n <= limit || error("$(format_bytes(n)) is too large to open as $(kind_label(kind)) " *
+                        "(limit $(format_bytes(limit)))")
+    return n
 end
 
 # A NUL in the first 8 KB means binary no matter what the extension claimed —
@@ -437,6 +440,7 @@ end
 # appear, however they were delivered — inline in a chat bubble, in a panel, or
 # moved between the two by the workspace.
 const FileViewLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "fileview.js"))
+# The 3D viewer is three.js, most of a megabyte: loaded once a model is on screen.
 const MeshLib     = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "meshview.js"))
 
 """
@@ -449,7 +453,7 @@ for it too, and the second request is a no-op.
 function file_view_driver(session::Bonito.Session)
     node = DOM.span(""; class = "bt-fv-driver", style = "display:none")
     Bonito.onload(session, node, js"""(el) => {
-        Promise.all([$(FileViewLib), $(MeshLib)]).then(([fv, mesh]) => fv.install(mesh));
+        $(FileViewLib).then(fv => fv.install(() => $(MeshLib)));
     }""")
     return node
 end
@@ -457,36 +461,73 @@ file_view_driver(::Nothing) = DOM.span("")   # headless render: no browser to dr
 
 # ── 3D geometry ─────────────────────────────────────────────────────────────
 
-# Where the converted BTMESH1 blobs live: next to the project's other mirrored
-# artifacts, so they're cleaned up with the working dir.
-mesh_blob_dir(fv::FileView) = joinpath(fv.file.cwd, ".bt-show-cache", "mesh")
+# The viewers' toolbar. Icons are drawn, not typed: a symbol like ⌗ needs a font
+# that has it, and without one the button paints empty.
+mesh_icon(shapes...) = Bonito.SVG.svg(shapes...;
+    viewBox = "0 0 16 16", fill = "none", stroke = "currentColor",
+    var"stroke-width" = "1.4", var"stroke-linecap" = "round", var"stroke-linejoin" = "round",
+    var"aria-hidden" = "true")
+mesh_icon(::Val{:reset}) = mesh_icon(Bonito.SVG.path(d = "M2.5 7.5 8 3l5.5 4.5"),
+                                     Bonito.SVG.path(d = "M4 6.5V13h8V6.5"))
+# A triangle split into four: the edges the overlay draws.
+mesh_icon(::Val{:wire}) = mesh_icon(Bonito.SVG.path(d = "M8 2.5 13.5 13h-11z"),
+                                    Bonito.SVG.path(d = "M5.25 7.75h5.5L8 13z"))
+# One facet lit, one in shade.
+mesh_icon(::Val{:flat}) = mesh_icon(Bonito.SVG.path(d = "M8 2.5 13.5 13h-11z"),
+                                    Bonito.SVG.path(d = "M8 2.5V13h5.5z"; fill = "currentColor"))
 
+mesh_button(action::Symbol, title) = DOM.button(mesh_icon(Val(action)); class = "bt-mesh-btn",
+    type = "button", title = title, dataMeshAction = string(action), dataOn = "0")
+
+# The folder a model's relative references (a glTF's buffers and textures, an
+# OBJ's .mtl) resolve in: its project, so `../textures/` reaches, or its own
+# folder for a model outside any project.
+mesh_folder(proj::ProjectInfo, path::String) =
+    Bonito.is_path_contained(proj.worker_path, path) ? proj.worker_path : dirname(path)
+
+# Where the browser reads a model from: the worker's file, through a signed URL
+# for its folder, so whatever the model names next to it is fetched the same way
+# when the loader asks. With no worker to ask, the server's copy of the model
+# alone (what it names is then out of reach).
+function mesh_src(st::ShowTool, session)
+    proj = get(st.state.projects[], st.project_id, nothing)
+    if proj !== nothing
+        info = try
+            stat_worker_path(st.state, proj.worker_id, show_worker_path(st))
+        catch e
+            e isa WorkerUnreachableError || rethrow()
+            nothing
+        end
+        if info !== nothing
+            info.isfile || error("no such file on the worker: $(info.path)")
+            check_view_size(MeshFile(), info.size)
+            folder = mesh_folder(proj, info.path)
+            return worker_folder_url(st.state, proj.worker_id, folder, relpath(info.path, folder))
+        end
+    end
+    src = mirror_src(st, session)
+    check_view_size(MeshFile(), filesize(show_server_path(st)))
+    return src
+end
+
+# The browser reads the model itself, with three.js's loader for its format
+# (assets/meshview.js).
 function render_file(::MeshFile, mode::ViewMode, fv::FileView, session)
     st = fv.file
-    local_path, _ = view_bytes(fv)
-    # A `.gltf` can reference sibling `.bin` buffers by relative path. Those live
-    # on the WORKER next to the .gltf, so resolve them as worker files (same
-    # mirror + freshness path) rather than reading the server's disk — which for
-    # a remote worker holds nothing but the one file we fetched.
-    sibling(name) = read(fetch_show_file(
-        ShowTool(st.state, st.project_id, st.cwd, joinpath(dirname(st.path), name))))
-    mesh = parse_mesh(local_path; read_sibling = sibling)
-    blob = mesh_blob_path(mesh_blob_dir(fv), st.path, mesh)
-    url  = asset_src(session, blob)
+    url = mesh_src(st, session)
 
-    btn(action, glyph, title) = DOM.button(glyph; class = "bt-mesh-btn", type = "button",
-        title = title, dataMeshAction = action, dataOn = "0")
-    # The blob url rides on the node as a data attribute; the window's file-view
+    # The url rides on the node as a data attribute; the window's file-view
     # driver mounts the viewer when the node appears (see `file_view_driver`).
     return DOM.div(
         DOM.canvas(; class = "bt-mesh-canvas"),
         DOM.div(
-            btn("reset", "⌂", "Reset the view"),
-            btn("wire", "⌗", "Wireframe overlay"),
-            btn("flat", "◭", "Flat shading");
+            mesh_button(:reset, "Reset the view"),
+            mesh_button(:wire, "Wireframe overlay"),
+            mesh_button(:flat, "Flat shading");
             class = "bt-mesh-toolbar"),
         DOM.div(""; class = "bt-mesh-status");
         class = "bt-mesh-view", dataMeshUrl = url,
+        dataMeshFormat = lstrip(lowercase(splitext(st.path)[2]), '.'),
         dataMode = mode isa InlineView ? "inline" : "panel")
 end
 

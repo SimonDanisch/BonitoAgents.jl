@@ -165,9 +165,10 @@ instead of one per eight seconds.
 `bt_show(path)` renders a worker-side file into the transcript, as whatever the
 file is: images and video inline (click for a lightbox), audio with a player,
 markdown rendered, CSV as a sortable table, notebooks with their outputs, 3D
-geometry (`.obj`/`.stl`/`.ply`/`.glb`/`.gltf`) in an interactive view, PDF in the
-browser's own viewer, HTML in a sandboxed frame, source as syntax-highlighted
-code, and opaque bytes as a hex dump. These are the same renderers you get when
+models (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in an interactive view
+(glTF and OBJ with their textures and materials), PDF in the browser's own viewer, HTML in
+a sandboxed frame, source as syntax-highlighted code, and opaque bytes as a hex
+dump. These are the same renderers you get when
 you open the file as a tab, so a file looks the same whichever way you reached
 it.
 

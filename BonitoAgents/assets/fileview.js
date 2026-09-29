@@ -14,7 +14,7 @@
 //   .bt-fv-image-stage           → report the decoded pixel size into the header
 //   .bt-fv-table-wrap            → click-to-sort + filter
 //   .bt-fv-frame[data-frame-src] → point the pdf/html frame at its file
-//   .bt-mesh-view[data-mesh-url] → mount the WebGL geometry viewer
+//   .bt-mesh-view[data-mesh-url] → mount the 3D viewer (three.js, loaded on first use)
 //
 // Each node is marked once (`data-fv-ready`), so re-scans are idempotent and a
 // node that gets MOVED (the workspace relocates panel content by identity) keeps
@@ -114,12 +114,12 @@ function initFrame(el) {
  * state — the observer watches `document.body` and `scan` takes its root as an
  * argument — so this is a straight swap.
  *
- * `meshLib` is `assets/meshview.js`, passed in rather than imported so the two
- * modules stay independently bundleable.
+ * `loadMeshLib` loads `assets/meshview.js` (three.js, most of a megabyte) the
+ * first time a 3D file is shown, not with every page.
  */
 let driver = null;
 
-export function install(meshLib) {
+export function install(loadMeshLib) {
     if (driver) return driver;
 
     const initOne = (el) => {
@@ -130,7 +130,11 @@ export function install(meshLib) {
             else if (el.classList.contains("bt-fv-table-wrap")) initTable(el);
             else if (el.classList.contains("bt-fv-frame")) initFrame(el);
             else if (el.classList.contains("bt-mesh-view")) {
-                meshLib.mount(el, el.dataset.meshUrl);
+                loadMeshLib().then(lib => lib.mount(el, el.dataset.meshUrl, el.dataset.meshFormat)).catch(err => {
+                    console.error("bt-fileview: 3D viewer failed to load", err);
+                    const status = el.querySelector(".bt-mesh-status");
+                    if (status) status.textContent = "3D viewer failed to load: " + (err && err.message || err);
+                });
             }
         } catch (err) {
             // A failure here is a dead viewer; make it say so rather than

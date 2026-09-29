@@ -119,9 +119,12 @@ enumerates.
   as what it is — images on a transparency checkerboard with their pixel size,
   range-streamed video and audio, rendered markdown, CSV/TSV as a sortable and
   filterable table with a sticky header, Jupyter notebooks with their outputs,
-  3D geometry (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in an interactive
-  WebGL view, PDF and HTML in a sandboxed frame, source in Monaco, and opaque
-  bytes as a hex dump. Anything text-backed (markdown, HTML, CSV, SVG) has a
+  3D models (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in one interactive
+  three.js view reading the original files: glTF with its textures, PBR
+  materials and animations, OBJ with its `.mtl` materials, PLY point clouds
+  (files a model names next to it are fetched from the worker), PDF and HTML
+  in a sandboxed frame, source in Monaco, and opaque bytes as a hex dump.
+  Anything text-backed (markdown, HTML, CSV, SVG) has a
   Preview/Source toggle over the same editor. Images and video sit centred on a
   stage and are fitted to it, so a portrait clip keeps its controls on screen.
 - Tabs are named to be **told apart**: a file is its basename until another open

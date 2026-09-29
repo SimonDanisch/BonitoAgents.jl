@@ -3143,6 +3143,13 @@ function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = n
             return worker_file_url(st.state, proj.worker_id, info.path)
         end
     end
+    return mirror_src(st, session)
+end
+
+# With no worker to ask (none attached, or it's offline): the server's copy,
+# fetched if it can be, else the last one mirrored. The `?v=` busts the
+# browser's cache when a later fetch replaces it.
+function mirror_src(st::ShowTool, session::Union{Bonito.Session,Nothing})
     local_path = fetch_show_file(st)
     asset = Bonito.Asset(local_path)
     session === nothing && return asset

@@ -87,7 +87,8 @@ file in a tab:
   • md                                              → RENDERED markdown
   • csv · tsv                                       → a sortable, filterable table
   • ipynb                                           → notebook cells with their outputs
-  • obj · stl · ply · off · glb · gltf              → an interactive 3D view of the geometry
+  • obj · stl · ply · off · glb · gltf              → an interactive 3D view, with a glTF's or
+                                                      OBJ's textures and materials
   • pdf · html                                      → the rendered document (sandboxed)
   • source / text / unknown / extensionless         → Monaco, syntax-highlighted
   • binary                                          → a hex + ASCII dump of the head

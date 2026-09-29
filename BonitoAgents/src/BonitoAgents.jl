@@ -54,7 +54,6 @@ include("agents.jl")           # WorkerAgent (server-side live agent over the wo
 include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
-include("mesh_view.jl")        # geometry-file parsers (.obj/.stl/.ply/.off/.glb/.gltf) → BTMESH1 blob
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("file_view.jl")        # FileView / FilePanel — the one rich file renderer (bt_show + file tabs)
 include("review.jl")           # change-review tab: git diff + per-line ask / batched feedback

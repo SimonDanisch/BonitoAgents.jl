@@ -421,6 +421,11 @@ function add_download_routes!(srv::Bonito.Server, state::ServerState)
         worker_file_response(state, context.request, wid,
             String(get(params, "path", "")), String(get(params, "token", "")))
     end)
+    Bonito.route!(srv, WORKER_FOLDER_ROUTE_RE => function(context)
+        wid, folder, token, path = context.match.captures
+        worker_folder_response(state, context.request, String(wid), String(folder),
+                               String(token), String(path))
+    end)
     Bonito.route!(srv, DOWNLOAD_ROUTE_RE => function(context)
         pid    = String(context.match.captures[1])
         request_sees_chat(state, context.request, pid) || return unknown_chat(pid)
@@ -482,6 +487,43 @@ function worker_file_response(state::ServerState, request, worker_id::String,
     isempty(path) && return HTTP.Response(400, "missing path")
     token == worker_file_token(state, worker_id, path) ||
         return HTTP.Response(403, "invalid file token")
+    return serve_worker_file(state, request, worker_id, path)
+end
+
+# /worker-folder/<wid>/<folder>/<token>/<path>: any file under a signed worker
+# folder, by its path relative to that folder. It's what a file with relative
+# references needs (a glTF's buffers and textures, an OBJ's .mtl): the browser
+# resolves them against the URL it loaded the file from, so they arrive here as
+# more paths under the same folder. `<folder>` is the worker path in hex, one URL
+# segment whatever it contains; the token signs it like `worker_file_token`
+# signs a file, tagged so that neither passes for the other.
+const WORKER_FOLDER_ROUTE_RE = r"^/worker-folder/([A-Za-z0-9_-]+)/((?:[0-9a-f]{2})+)/([0-9a-f]{64})/([^?#]+)"
+
+worker_folder_token(state::ServerState, worker_id::String, folder::String) =
+    bytes2hex(SHA.hmac_sha256(state.url_key, codeunits(JSON.json(["folder", worker_id, folder]))))
+
+"The URL of `path` (relative to the worker `folder`) under a signed folder grant."
+function worker_folder_url(state::ServerState, worker_id::String, folder::String, path::AbstractString)
+    segments = join(HTTP.escapeuri.(splitpath(path)), "/")
+    return "/worker-folder/$(HTTP.escapeuri(worker_id))/$(bytes2hex(codeunits(folder)))/" *
+           "$(worker_folder_token(state, worker_id, folder))/$(segments)"
+end
+
+function worker_folder_response(state::ServerState, request, worker_id::String,
+                                folder_hex::String, token::String, path::String)
+    folder = String(hex2bytes(folder_hex))
+    token == worker_folder_token(state, worker_id, folder) ||
+        return HTTP.Response(403, "invalid folder token")
+    # Decoded before normalising, so an escaped `..` is caught like a plain one.
+    file = normpath(joinpath(folder, HTTP.unescapeuri(path)))
+    Bonito.is_path_contained(folder, file) ||
+        return HTTP.Response(403, "outside the shared folder")
+    return serve_worker_file(state, request, worker_id, file)
+end
+
+# The bytes of a worker file (or the requested range of them), read through the
+# worker's control connection on every request, so they are always current.
+function serve_worker_file(state::ServerState, request, worker_id::String, path::String)
     try
         info = stat_worker_path(state, worker_id, path)
         info.isfile || return HTTP.Response(404, ["Cache-Control" => "no-store"],

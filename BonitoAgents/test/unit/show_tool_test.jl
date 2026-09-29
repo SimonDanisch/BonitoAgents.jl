@@ -118,7 +118,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test k("data.tsv") == :TableFile
         @test k("nb.ipynb") == :NotebookFile
         @test k("m.obj") == :MeshFile
-        @test k("m.glb") == :MeshFile
+        @test k("m.glb") == :MeshFile && k("m.gltf") == :MeshFile
         @test k("doc.pdf") == :PDFFile
         @test k("page.html") == :HTMLFile
         @test k("a.jl") == :TextFile

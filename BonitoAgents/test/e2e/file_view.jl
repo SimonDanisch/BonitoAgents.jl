@@ -12,8 +12,10 @@
 #                Source really is an editable Monaco holding the file's text.
 #   • csv      — becomes a sortable table with the right shape, not a wall of
 #                commas.
-#   • obj      — reaches the WebGL viewer and reports the geometry it parsed
-#                (server-side parse → BTMESH1 blob → canvas).
+#   • 3D       — the browser's three.js loaders read the worker's files through
+#                a signed folder URL: obj (its counts), glTF (.glb, and .gltf
+#                naming sibling files) and OBJ+.mtl with the texture on screen,
+#                a PLY point cloud, OFF, the wireframe overlay, context loss.
 #   • bin      — a hex dump, and no attempt to feed Monaco binary.
 #   • header   — every kind shows the WORKER path, not the server mirror path,
 #                and shows it in reading order (the `direction: rtl` bidi trap).
@@ -64,6 +66,28 @@ write(joinpath(VIEW_CWD, "table.csv"), "name,score\nada,42\ngrace,7\nalan,13\n")
 write(joinpath(VIEW_CWD, "square.obj"),
       "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n")
 write(joinpath(VIEW_CWD, "blob.bin"), UInt8[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03])
+# A square covered by a solid red texture: as one .glb, as a .gltf in a
+# subfolder naming its .bin and .png siblings, and as an OBJ whose .mtl names a
+# texture in ../textures (all fetched by the browser relative to the model).
+include(joinpath(@__DIR__, "..", "fixtures", "textured_models.jl"))
+write_textured_glb(joinpath(VIEW_CWD, "red.glb"))
+write_textured_gltf(mkpath(joinpath(VIEW_CWD, "model")))
+write_textured_obj(VIEW_CWD)
+# A point cloud (a PLY without faces) and a square as OFF, the one format
+# three.js has no loader for.
+write(joinpath(VIEW_CWD, "cloud.ply"), """
+    ply
+    format ascii 1.0
+    element vertex 3
+    property float x
+    property float y
+    property float z
+    end_header
+    0 0 0
+    1 0 0
+    0 1 0
+    """)
+write(joinpath(VIEW_CWD, "square.off"), "OFF\n# a comment\n4 1 0\n0 0 0\n1 0 0\n1 1 0\n0 1 0\n4 0 1 2 3\n")
 write(joinpath(VIEW_CWD, "plain.jl"), "const X = 1\n")
 
 open_file(path) = """(() => { document.querySelector('.bt-messages').__bt_chat.comm.notify(
@@ -76,8 +100,8 @@ view_sel(path)  = "$(panel_sel(path)) .bt-file-view"
 
 # Poll the mesh viewer's status line and, when it never says what we expect,
 # report what it DOES say. `mount` (assets/meshview.js) writes its own failures
-# there — "3D viewer failed: <err>", "WebGL is not available in this window" —
-# so the text separates a slow decode from a dead GL context. A bare `wait_for`
+# there ("3D viewer failed: <err>", "could not load this model: <err>"), so
+# the text separates a slow load from a dead GL context. A bare `wait_for`
 # timeout says only "timed out", which is the same message for both and sends
 # you looking in the wrong place.
 function mesh_status_reaches(server, path, pred; timeout = 40)
@@ -228,11 +252,89 @@ function run_suite(server)
             @test TK.wait_for(server, "mesh canvas mounted",
                 "!!document.querySelector('$(view_sel("square.obj")) canvas.bt-mesh-canvas')";
                 timeout = 40) == true
-            # The status line is written by the JS AFTER it fetched and decoded the
-            # BTMESH1 blob — so this asserts the whole server-parse → blob →
-            # browser-decode path, with the exact triangle count of the fixture.
+            # The status line is written by the JS AFTER three.js loaded the OBJ
+            # through its signed URL, so this asserts the whole path from the
+            # worker to the browser, with the fixture's exact counts.
             @test mesh_status_reaches(server, "square.obj",
                 t -> occursin("2 triangles", t) && occursin("4 vertices", t))
+        end
+
+        # The colour at the middle of a 3D view's canvas, as [r, g, b].
+        center_rgb(path) = TK.eval_js(server, """(() => {
+            const c = document.querySelector('$(view_sel(path)) canvas.bt-mesh-canvas');
+            const t = document.createElement('canvas'); t.width = c.width; t.height = c.height;
+            const x = t.getContext('2d'); x.drawImage(c, 0, 0);
+            const p = x.getImageData(c.width >> 1, c.height >> 1, 1, 1).data;
+            return [p[0], p[1], p[2]]; })()""")
+        red(rgb) = rgb[1] > 120 && rgb[1] > 2 * rgb[2] && rgb[1] > 2 * rgb[3]
+
+        @testset "a glTF opens with its texture: .glb, and .gltf with sibling files" begin
+            for path in ("red.glb", joinpath("model", "quad.gltf"))
+                TK.eval_js(server, open_file(path))
+                # Written by the viewer once three.js loaded the scene: the texture
+                # arrived with it (the old viewer dropped every texture).
+                @test mesh_status_reaches(server, path,
+                    t -> occursin("2 triangles", t) && occursin("1 texture", t); timeout = 90)
+                # And it is drawn: the square is the texture's red, not a plain grey.
+                rgb = nothing
+                ok = timedwait(() -> (rgb = center_rgb(path); red(rgb)), 20.0; pollint = 0.5) === :ok
+                ok || @info "the middle of the glTF view is not red" path rgb
+                @test ok
+            end
+        end
+
+        @testset "an OBJ opens with its .mtl material, texture from ../textures" begin
+            # The texture sits outside the model's folder: the browser resolves
+            # it against the OBJ's URL and fetches it through the project's grant.
+            path = joinpath("models", "quad.obj")
+            TK.eval_js(server, open_file(path))
+            @test mesh_status_reaches(server, path,
+                t -> occursin("2 triangles", t) && occursin("1 texture", t); timeout = 90)
+            rgb = nothing
+            ok = timedwait(() -> (rgb = center_rgb(path); red(rgb)), 20.0; pollint = 0.5) === :ok
+            ok || @info "the middle of the OBJ view is not red" path rgb
+            @test ok
+        end
+
+        @testset "a PLY without faces is a point cloud, an OFF a mesh" begin
+            TK.eval_js(server, open_file("cloud.ply"))
+            @test mesh_status_reaches(server, "cloud.ply", t -> occursin("3 points", t))
+            TK.eval_js(server, open_file("square.off"))
+            @test mesh_status_reaches(server, "square.off",
+                t -> occursin("2 triangles", t) && occursin("4 vertices", t))
+        end
+
+        @testset "the wireframe overlay draws the edges over the surface" begin
+            # The quad's diagonal edge crosses the middle row of the view: dark
+            # pixels there are the overlay, and red ones the textured surface
+            # still drawn underneath it.
+            middle_row() = TK.eval_js(server, """(() => {
+                const c = document.querySelector('$(view_sel("red.glb")) canvas.bt-mesh-canvas');
+                const t = document.createElement('canvas'); t.width = c.width; t.height = c.height;
+                const x = t.getContext('2d'); x.drawImage(c, 0, 0);
+                const row = x.getImageData(0, c.height >> 1, c.width, 1).data;
+                let dark = 0, red = 0;
+                for (let i = 0; i < row.length; i += 4) {
+                    const [r, g, b] = [row[i], row[i+1], row[i+2]];
+                    if (r < 90 && g < 90 && b < 90) dark++;
+                    else if (r > 120 && r > 2 * g && r > 2 * b) red++;
+                }
+                return [dark, red]; })()""")
+            wire_button = "document.querySelector('$(view_sel("red.glb")) [data-mesh-action=wire]')"
+            # Opening it again re-renders the body: a new viewer loads the model,
+            # so wait for its first frame.
+            TK.eval_js(server, open_file("red.glb"))
+            @test mesh_status_reaches(server, "red.glb", t -> occursin("1 texture", t))
+            before = nothing
+            @test timedwait(() -> (before = middle_row(); before[1] == 0 && before[2] > 0), 20.0;
+                            pollint = 0.25) === :ok
+            TK.eval_js(server, "$(wire_button).click(); true")
+            on = nothing
+            @test timedwait(() -> (on = middle_row(); on[1] > 0), 10.0; pollint = 0.25) === :ok
+            @test on[2] > 0
+            @test TK.eval_js(server, "$(wire_button).dataset.on") == "1"
+            TK.eval_js(server, "$(wire_button).click(); true")
+            @test timedwait(() -> middle_row()[1] == 0, 10.0; pollint = 0.25) === :ok
         end
 
         @testset "the 3D viewer survives losing its graphics context" begin
@@ -253,7 +355,7 @@ function run_suite(server)
             # return a boolean, and keep the handle across the loss.
             @test TK.eval_js(server, """(() => {
                 const c = document.querySelector('$(view_sel("square.obj")) canvas.bt-mesh-canvas');
-                const gl = c && c.getContext('webgl');
+                const gl = c && c.getContext('webgl2');   // three.js's context
                 c.__btLoseExt = gl && gl.getExtension('WEBGL_lose_context');
                 return !!c.__btLoseExt;
             })()""") === true
