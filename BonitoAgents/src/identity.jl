@@ -589,9 +589,23 @@ function render_authelia_config(auth::LoginAuth, secrets, smtp::Union{AbstractDi
           level: 'info'
         totp:
           issuer: $(q(cfg.domain))
+        # Passkeys (a password manager's, a security key) sign in on their own: one
+        # that verifies its user (a PIN, a fingerprint, an unlocked vault) counts
+        # as both factors. A passkey is made in the browser, on Authelia's settings
+        # page, by someone signed in already.
         webauthn:
           display_name: 'BonitoAgents'
+          enable_passkey_login: true
+          experimental_enable_passkey_uv_two_factors: true
+          selection_criteria:
+            discoverability: 'preferred'
+            user_verification: 'preferred'
         identity_validation:
+          # Adding a device asks nothing more of whoever signed in with a second
+          # factor: otherwise Authelia mails a code first. The server registers
+          # everyone's first one itself (`register_authenticator!`).
+          elevated_session:
+            skip_second_factor: true
           reset_password:
             jwt_secret: $(q(secrets.jwt))
         authentication_backend:

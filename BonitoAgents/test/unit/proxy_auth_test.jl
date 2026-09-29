@@ -148,7 +148,7 @@ end
         # arrived on stdin (and never on a command line).
         bin = mktempdir()
         write(joinpath(bin, "authelia"),
-              "#!/bin/sh\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
+              "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
         # `adapt` (the check before a Caddyfile is swapped in) rejects a file that
         # contains REJECT.
         write(joinpath(bin, "caddy"), """
@@ -166,11 +166,31 @@ end
             "caddy_bin" => joinpath(bin, "caddy"), "authelia_bin" => joinpath(bin, "authelia"))))
         begin
             st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.auth_mode(dir))
-            @test BT.add_account!(st, "bob"; groups = ["admins"]) == "pw-123"
+            bob = BT.add_account!(st, "bob"; groups = ["admins"])
+            # A password and an authenticator, registered by the server: nobody
+            # has to confirm who they are by mail to set one up.
+            @test bob.password == "pw-123"
+            @test startswith(bob.authenticator.uri, "otpauth://totp/team.example.com:bob?")
+            @test bob.authenticator.qr[1:4] == UInt8[0x89, 0x50, 0x4e, 0x47]
             @test isfile(joinpath(dir, "Caddyfile")) && !isfile(joinpath(dir, "Caddyfile.new"))
-            @test BT.add_account!(st, "alice"; display_name = "Alice", email = "a@x") == "pw-123"
+            @test BT.add_account!(st, "alice"; display_name = "Alice", email = "a@x").password == "pw-123"
             @test_throws ErrorException BT.add_account!(st, "alice")
             @test_throws ErrorException BT.add_account!(st, "../evil")
+            # An account whose authenticator could not be registered does not stay:
+            # nobody could log in with it.
+            broken = joinpath(bin, "authelia-broken")
+            write(broken, "#!/bin/sh\n[ \"\$1\" = storage ] && { echo 'database is locked' >&2; exit 1; }\n" *
+                          "echo 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
+            chmod(broken, 0o755)
+            bdir = mktempdir()
+            write(joinpath(bdir, "proxy.json"), JSON.json(Dict(
+                "domain" => "team.example.com", "auth_domain" => "auth.team.example.com", "admin" => "bob",
+                "caddyfile" => joinpath(bdir, "Caddyfile"), "users_file" => joinpath(bdir, "users.yml"),
+                "caddy_bin" => joinpath(bin, "caddy"), "authelia_bin" => broken)))
+            bst = BT.ServerState(; state_dir = bdir, working_dir = mktempdir(), auth = BT.auth_mode(bdir))
+            failed = try BT.add_account!(bst, "zed"); nothing catch e; e end
+            @test failed isa ErrorException && occursin("database is locked", failed.msg)   # Authelia's own word
+            @test !haskey(bst.accounts[], "zed") && !occursin("zed", read(joinpath(bdir, "users.yml"), String))
             users = read(joinpath(dir, "users.yml"), String)
             @test occursin("'alice':", users) && occursin("'bob':", users)
             @test occursin("password: '\$argon2id\$fake'", users)
@@ -356,7 +376,7 @@ end
     sections = html(s1, BT.account_sections(s1, admin))
     @test occursin("Your account", sections) && occursin("Invites", sections)
     @test occursin("Accounts", sections) && occursin("carol", sections) && occursin("disabled", sections)
-    @test occursin("Login codes", sections)   # no mail: admins read Authelia's codes here
+    @test occursin("this server sends no mail", sections)   # admins read what Authelia would have mailed
     @test occursin("Agent adapters", sections) && occursin("claude-agent-acp", sections)
     row = html(s1, BT.install_command_row("Linux / macOS", "curl -fsSL https://team.example.com/install.sh | sh"))
     @test occursin("install.sh", row)
@@ -448,7 +468,7 @@ end
     Sys.isunix() || return
     bin = mktempdir()
     write(joinpath(bin, "authelia"),
-          "#!/bin/sh\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
+          "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
     write(joinpath(bin, "caddy"), "#!/bin/sh\nexit 0\n")   # `adapt`: every Caddyfile is fine
     chmod(joinpath(bin, "authelia"), 0o755); chmod(joinpath(bin, "caddy"), 0o755)
     dir = mktempdir()
@@ -476,7 +496,7 @@ end
     @test BT.open_invite(st, "0"^64) === nothing
     @test_throws ErrorException BT.redeem_invite!(st, token, "bob")   # name taken …
     @test BT.open_invite(st, token) !== nothing                        # … the link stays good
-    @test BT.redeem_invite!(st, token, "dave"; display_name = "Dave") == "pw-123"
+    @test BT.redeem_invite!(st, token, "dave"; display_name = "Dave").password == "pw-123"
     @test st.accounts[]["dave"].groups == ["lab"]
     @test BT.open_invite(st, token) === nothing
     @test_throws ErrorException BT.redeem_invite!(st, token, "eve")    # used up
@@ -640,7 +660,7 @@ end
     bin = mktempdir()
     # As slow as a real argon2 hash, so two requests overlap while it runs.
     write(joinpath(bin, "authelia"),
-          "#!/bin/sh\nsleep 0.3\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
+          "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\nsleep 0.3\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
     write(joinpath(bin, "caddy"), "#!/bin/sh\nexit 0\n")
     chmod(joinpath(bin, "authelia"), 0o755); chmod(joinpath(bin, "caddy"), 0o755)
     dir = mktempdir()
@@ -655,13 +675,13 @@ end
     # One invite link submitted twice at once makes one account.
     token = last(split(BT.create_invite!(st, ["lab"]), '/'))
     both = asyncmap(name -> outcome(() -> BT.redeem_invite!(st, token, name)), ["carol", "dave"])
-    @test count(r -> r isa String, both) == 1
+    @test count(r -> r isa NamedTuple, both) == 1
     @test count(r -> r isa ErrorException && occursin("used already", r.msg), both) == 1
     @test length(st.accounts[]) == 2
     member = only(n for n in keys(st.accounts[]) if n != "bob")
     # Two admins adding one name at once make one account.
     both = asyncmap(_ -> outcome(() -> BT.add_account!(st, "erin")), 1:2)
-    @test count(r -> r isa String, both) == 1
+    @test count(r -> r isa NamedTuple, both) == 1
     @test count(r -> r isa ErrorException && occursin("already", r.msg), both) == 1
 
     # What someone types into the invite form comes back escaped, never as markup.
@@ -673,6 +693,12 @@ end
     @test !occursin("<script>", page) && !occursin("<img", page)
     @test occursin("&lt;script&gt;alert(1)&lt;/script&gt;", page) && occursin("&lt;img src=x", page)
     @test BT.open_invite(st, link) !== nothing   # the link stays good for another try
+    # The account, then: its password and its authenticator, shown once.
+    r = post("name=frank&display_name=Frank+F")
+    page = String(r.body)
+    @test r.status == 200 && occursin("<code class=\"pw\">", page)
+    @test occursin("<img class=\"qr\" src=\"data:image/png;base64,", page)
+    @test occursin("otpauth://totp/team.example.com:frank?", page)
 
     # A damaged record on disk is skipped with a warning; the rest load.
     dir2 = mktempdir()
@@ -783,7 +809,7 @@ end
 
     bin = mktempdir()
     write(joinpath(bin, "authelia"),
-          "#!/bin/sh\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
+          "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
     write(joinpath(bin, "caddy"), """
         #!/bin/sh
         case "\$1" in hash-password) read pw; echo "\\\$2a\\\$14\\\$\$pw" ;; esac

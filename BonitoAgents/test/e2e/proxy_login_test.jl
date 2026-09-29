@@ -100,21 +100,18 @@ end
         TK.set_input(b, "input[name=name]", "carol")
         TK.set_input(b, "input[name=display_name]", "Carol C")
         TK.click(b, "form button[type=submit]")
-        password = TK.wait_for(b, "the new password", "(document.querySelector('.pw') || {}).textContent || false";
-                               timeout = 30)
-        @test length(password) >= 16
-        # This server sends no mail: the page says who has the code.
-        @test TK.eval_js(b, "document.body.textContent.includes('this server sends no mail, so ask an admin for it')") == true
+        carol = TK.invite_login(b, "carol")
+        @test length(carol.password) >= 16
         # The same link again: used up.
         TK.eval_js(b, "location.href = $(repr(link)); true")
         @test TK.wait_for(b, "the used-up invite", "document.body.textContent.includes('This invite is not valid')";
                           timeout = 30) == true
 
-        # Her first login: she registers her authenticator app, with the code the
-        # admin reads her from the dashboard's "Login codes" card. Then she sees
-        # her own account only: no admin sections, none of the admin's workers.
+        # Her first login, with the password and the authenticator her invite page
+        # showed: no mail, no code to pass on. She sees her own account only: no
+        # admin sections, none of the admin's workers.
         TK.eval_js(b, "location.href = $(repr(z.h.url * "/")); true")
-        carol = TK.register_authenticator!(z, b, "carol", password)
+        TK.login!(b, carol)
         @test TK.signed_in_as(b) == "Signed in as Carol C (carol); groups: lab."
         @test TK.wait_for(b, "the stats strip", "document.body.textContent.includes('/0 workers online')"; timeout = 30) == true
         @test !any(in(("Accounts", "Invites", "Agent adapters")), TK.headings(b))

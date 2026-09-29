@@ -4,19 +4,20 @@
 #
 #   bash BonitoAgents/assets/install_server.sh
 #
-# It asks for what it needs (how the server is reached, its domain, the admin,
-# optional mail) and saves the answers right away, before anything can fail: a
+# It asks for what it needs (how the server is reached, its domain, the admin)
+# and saves the answers right away, before anything can fail: a
 # second run offers them again ("Use these settings?"), and --reconfigure asks
 # anew. Every answer can also be given as an option; `--no-prompt` makes a
 # missing required one an error instead of a question.
 #
-# People log in through Authelia: a password plus a second factor (an
-# authenticator app or a security key), with brute-force lockout. BonitoAgents
+# People log in through Authelia: a password plus an authenticator (one-time
+# codes; the server registers it and shows it once, so no mail is involved), or a
+# passkey added once signed in, with brute-force lockout. BonitoAgents
 # listens on 127.0.0.1 and owns the login's configuration: Authelia's users
 # database (accounts, and their passwords: Authelia's own password reset is off)
 # and Authelia's configuration with its secrets, which it renders whenever it
 # starts. This script only writes what they are rendered from: proxy.json, the
-# first admin, mail settings. Three ways to reach it (`--tls`):
+# first admin, optional mail settings. Three ways to reach it (`--tls`):
 #
 #   * tunnel (the default): something in front of this machine brings HTTPS,
 #     e.g. a Cloudflare Tunnel, and forwards https://<domain> to
@@ -57,11 +58,11 @@
 #   --https-port PORT      acme/internal: Caddy's HTTPS port (default: 443)
 #   --http-port PORT       acme/internal: Caddy's HTTP port (default: 80; Let's Encrypt checks port 80)
 #   --authelia-port PORT   Authelia's port on 127.0.0.1 (default: 9091)
-#   --smtp-host HOST       lets Authelia send mail, so the one-time code that
-#   --smtp-port PORT       confirms a new second factor reaches people directly
-#   --smtp-user USER       (default port 587). Without it Authelia writes that code
-#   --smtp-password PASS   to a file on this machine, which admins read on the
-#   --smtp-sender ADDR     dashboard and pass on.
+#   --smtp-host HOST       lets Authelia send mail: notices about new devices. Not
+#   --smtp-port PORT       needed to log in (default port 587); without it Authelia
+#   --smtp-user USER       writes them to a file on this machine, which admins read
+#   --smtp-password PASS   on the dashboard.
+#   --smtp-sender ADDR
 #   --no-smtp              drop mail settings kept from a previous install
 #   --caddy-version V      default: the latest release
 #   --authelia-version V   default: the latest release
@@ -201,13 +202,6 @@ ask() {   # ask VAR "question" [default]
         printf -v "$var" '%s' "$reply"
     fi
 }
-ask_secret() {   # ask_secret VAR "question"
-    local var="$1" question="$2" reply
-    [[ $PROMPT -eq 1 && -z "${!var}" ]] || return 0
-    read -r -s -p "    $question: " reply < /dev/tty
-    echo
-    printf -v "$var" '%s' "$reply"
-}
 yes_no() {   # yes_no "question" default(y|n) -> status
     local reply
     read -r -p "    $1 [$([[ $2 == y ]] && echo Y/n || echo y/N)]: " reply < /dev/tty
@@ -234,7 +228,6 @@ if [[ $PROMPT -eq 1 && $RECONFIGURE -eq 0 && $GIVEN -eq 0 ]] && sudo test -f "$S
         internal) echo "directly, with Caddy's own CA" ;;
         *)        echo "directly, on ports 80 and 443 (Let's Encrypt)" ;; esac)"
     echo "    Admin     : $(previous admin)"
-    echo "    Mail      : $([[ "$PREV_SMTP" == true ]] && echo "kept" || echo "none")"
     yes_no "Use these settings" y && USE_SAVED=1
     echo
 fi
@@ -268,20 +261,6 @@ if [[ $PROMPT -eq 1 && $USE_SAVED -eq 0 ]]; then
     ask ADMIN_EMAIL "Admin email (optional)" "$(previous admin_email)"
     [[ "$TLS" == acme ]] &&
         ask ACME_EMAIL "Email for Let's Encrypt notices (optional)" "${ADMIN_EMAIL:-$(previous acme_email)}"
-    if [[ -z "$SMTP_HOST" && $NO_SMTP -eq 0 ]]; then
-        if [[ "$PREV_SMTP" == true ]]; then
-            yes_no "Keep the current mail settings" y || NO_SMTP=1
-        fi
-        if [[ "$PREV_SMTP" != true || $NO_SMTP -eq 1 ]] &&
-           yes_no "Send mail through an SMTP server (for second-factor codes)" n; then
-            NO_SMTP=0
-            ask SMTP_HOST "SMTP host"
-            ask SMTP_PORT "SMTP port" 587
-            ask SMTP_USER "SMTP user"
-            ask_secret SMTP_PASSWORD "SMTP password"
-            ask SMTP_SENDER "Sender address" "$ADMIN_EMAIL"
-        fi
-    fi
 fi
 default TLS tls tunnel
 default DOMAIN domain ""
@@ -336,7 +315,6 @@ elif [[ "$PREV_SMTP" == true && $NO_SMTP -eq 0 ]]; then
 else
     SMTP_MODE=none
 fi
-SMTP_ON=$([[ $SMTP_MODE == none ]] && echo false || echo true)
 ORIGIN="https://$DOMAIN$([[ $HTTPS_PORT == 443 ]] || echo ":$HTTPS_PORT")"
 if [[ "$TLS" == tunnel ]]; then
     PORTAL="$ORIGIN/authelia"
@@ -387,7 +365,7 @@ case "$TLS" in
     internal) echo "    HTTPS        : Caddy, with its own CA" ;;
     acme)     echo "    HTTPS        : Caddy, with Let's Encrypt${ACME_CA:+ (staging)}" ;;
 esac
-echo "    Mail         : $([[ $SMTP_MODE == none ]] && echo "none (codes go to a file admins read)" || echo "$SMTP_MODE")"
+[[ $SMTP_MODE == none ]] || echo "    Mail         : $SMTP_MODE"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 step "Sanity checks"
@@ -735,6 +713,26 @@ for svc in "${UNITS[@]:1}"; do
 done
 ok "active"
 
+# ── The admin's authenticator ─────────────────────────────────────────────────
+# Registered here, so the first login needs no mail: Authelia's own way to add
+# one confirms who you are with a code it mails. Only if the admin has none yet;
+# "New authenticator" on the dashboard replaces it later.
+step "Authenticator for $ADMIN"
+authelia_cli() { sudo -u "$SERVICE_USER" "$BIN_DIR/authelia" "$@" --config "$AUTHELIA_DIR/configuration.yml"; }
+# Up to date already is an error to Authelia, and fine here.
+out="$(authelia_cli storage migrate up 2>&1)" || [[ "$out" == *"schema already up to date"* ]] ||
+    fail "Authelia's database could not be brought up to date: $out"
+ADMIN_TOTP=""
+if out="$(authelia_cli storage user totp generate "$ADMIN" 2>&1)"; then
+    ADMIN_TOTP="$(printf '%s\n' "$out" | sed -n "s/.*with URI '\(otpauth:[^']*\)'.*/\1/p")"
+    [[ -n "$ADMIN_TOTP" ]] || fail "authelia registered an authenticator but printed no URI: $out"
+    ok "registered (shown at the end, once)"
+elif [[ "$out" == *"already has a TOTP configuration"* ]]; then
+    ok "$ADMIN has one already"
+else
+    fail "could not register an authenticator for $ADMIN: $out"
+fi
+
 # ── The dashboard answers, through the login ──────────────────────────────────
 wants_login() { [[ "$1" =~ ^(302|303|401)$ ]]; }
 if [[ "$TLS" == tunnel ]]; then
@@ -798,13 +796,20 @@ if [[ "$TLS" == tunnel ]]; then
     echo "  $PORTAL, under the same name. Nothing else needs to be exposed."
     echo ""
 fi
-echo "  The first login sets up a second factor (an authenticator app or a security"
-echo "  key), confirmed with a one-time code from Authelia."
-if [[ "$SMTP_ON" != true ]]; then
-    echo "  Without mail that code is written to $AUTHELIA_DIR/notifications.txt"
-    echo "  (for your own first login: sudo cat it); afterwards admins find the latest"
-    echo "  one under \"Login codes\" on the dashboard."
+if [[ -n "$ADMIN_TOTP" ]]; then
+    echo "  Authenticator : add it to an authenticator app or your password manager"
+    echo "                  (shown only now; \"New authenticator\" on the dashboard replaces it):"
+    echo "    $ADMIN_TOTP"
+    if command -v qrencode > /dev/null; then
+        qrencode -t ansiutf8 "$ADMIN_TOTP"
+    else
+        echo "                  (install qrencode to see it as a QR code here, or paste the link)"
+    fi
+    echo ""
 fi
+echo "  Log in with the password and a code from the authenticator. Then \"Add a"
+echo "  passkey\" under Your account (Proton Pass, a security key, ...): from then on"
+echo "  the passkey alone signs you in."
 if [[ $TLS == internal ]]; then
     echo ""
     echo "  Certificates come from Caddy's own CA. Browsers and workers must trust its"

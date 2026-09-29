@@ -58,8 +58,8 @@
         @test TK.wait_for(z, "the second worker online",
             "document.querySelectorAll('.bt-worker-cell .bt-dot-online').length === 2"; timeout = 120) == true
 
-        # Someone invited: the invite page, their account, their first login with
-        # an authenticator app confirmed by the code the admin reads them.
+        # Someone invited: the invite page shows their password and authenticator
+        # once, and they log in with both, no mail and no code passed on by hand.
         TK.set_input(z, "input[type=text]", "lab"; placeholder = "groups (\"admins\" for an admin)")
         TK.click_text(z, "Create invite link")
         link = TK.wait_for(z, "the invite link",
@@ -71,16 +71,24 @@
         TK.set_input(b, "input[name=name]", "carol")
         TK.set_input(b, "input[name=display_name]", "Carol C")
         TK.click(b, "form button[type=submit]")
-        password = TK.wait_for(b, "the new password", "(document.querySelector('.pw') || {}).textContent || false";
-                               timeout = 30)
+        carol = TK.invite_login(b, "carol")
+        @test length(carol.password) >= 16
+        @test TK.eval_js(b, "!!document.querySelector('img.qr[src^=\"data:image/png;base64,\"]')") == true
         TK.eval_js(b, "location.href = $(repr(z.h.url * "/")); true")
-        TK.register_authenticator!(z, b, "carol", password)
+        TK.login!(b, carol)
         @test TK.signed_in_as(b) == "Signed in as Carol C (carol); groups: lab."
         @test !any(in(("Accounts", "Invites")), TK.headings(b))
 
-        # Logged out, it is the login page again.
+        # A passkey (Proton Pass, a security key): added once signed in, with no
+        # code by mail, and from then on it alone signs in.
+        device = TK.add_passkey_device!(z)
+        TK.add_passkey!(z)
+        @test TK.passkeys(z, device) == [(host, "admin")]
         TK.logout!(z)
         @test TK.eval_js(z, "location.pathname.startsWith('/authelia')") == true
+        TK.passkey_login!(z)
+        @test TK.wait_for(z, "the account card",
+            "document.body.textContent.includes('Signed in as admin (admin)')"; timeout = 30) == true
     finally
         b === nothing || TK.close_browser!(b)
         close(z)

@@ -1281,20 +1281,6 @@ function totp(secret::AbstractString, step::Integer)
     return lpad(string(code % UInt32(1_000_000)), 6, '0')
 end
 
-"""
-    seed_totp!(s, user) -> secret
-
-Register an authenticator for `user` with Authelia, as they would by scanning its
-QR code, and return its secret.
-"""
-function seed_totp!(s::TestServer, user::AbstractString)
-    cfg = s.h.state.auth.config
-    secret = base32(rand(UInt8, 20))
-    run(pipeline(`$(cfg.authelia_bin) storage user totp generate $(user) --secret $(secret) --force
-                  --config $(BT.authelia_config_file(cfg))`; stdout = devnull))
-    return secret
-end
-
 "The page's host: the dashboard's, or Authelia's portal (`auth.…`)."
 page_host(s::TestServer) = String(eval_js(s, "location.host"))
 
@@ -1362,58 +1348,91 @@ function enter_code!(s::TestServer, login::Login)
 end
 
 """
-    register_authenticator!(admin, s, user, password) -> Login
+    invite_login(s, user) -> Login
 
-A new account's first login on a server without mail, as it happens: `user`
-signs in with `password` in browser `s`, Authelia asks them to register a
-second factor and first to confirm who they are with a one-time code it would
-have mailed, an admin reads that code on the dashboard's "Login codes" card
-(browser `admin`) and passes it on, and `user` registers an authenticator app
-with the secret Authelia shows. Returns once `user` is on the dashboard.
+What a new account's invite page shows once, in browser `s`: its password and
+its authenticator (the `otpauth://` link a password manager takes), as the
+`Login` that signs in with them.
 """
-function register_authenticator!(admin::TestServer, s::TestServer, user::AbstractString, password::AbstractString)
-    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
-    set_input(s, "#username-textfield", user)
-    set_input(s, "#password-textfield", password)
-    click(s, "#sign-in-button")
-    wait_for(s, "the offer to register a device", "!!document.querySelector('#register-link')"; timeout = 30)
-    click(s, "#register-link")
-    wait_for(s, "the second factor settings", "!!document.querySelector('#one-time-password-add')"; timeout = 30)
-    # The admin's side: the code Authelia writes instead of mailing it, shown on
-    # the "Login codes" card. "Show the latest" reads the file when pressed, so
-    # it is pressed until a code is there that was not there before (pressing
-    # changes nothing). The mail greets by display name.
-    card = """[...document.querySelectorAll('details')].find(d => d.querySelector('summary')?.textContent.includes('Login codes'))"""
-    latest_code = """(() => { const d = $(card); d.open = true;
-        [...d.querySelectorAll('button')].find(b => b.textContent.trim() === 'Show the latest').click();
-        const m = (d.querySelector('pre').innerText || '').match(/Hi [^\\n,]*,[\\s\\S]*?-{20,}\\s+([A-Z0-9]{6,})\\s+-{20,}/);
-        return m ? m[1] : ''; })()"""
-    eval_js(admin, latest_code); sleep(1.0)
-    before = String(eval_js(admin, latest_code))
-    click(s, "#one-time-password-add")
-    wait_for(s, "the identity check", "!!document.querySelector('#one-time-code')"; timeout = 30)
-    code = String(wait_for(admin, "$(user)'s code on the Login codes card",
-        "(() => { const c = $(latest_code); return c !== '' && c !== $(json(before)) && c; })()";
-        timeout = 30, interval = 1.0))
-    set_input(s, "#one-time-code", code)
-    click(s, "#dialog-verify")
-    # Registering the app: start, the secret (as its QR code encodes it), confirm.
-    wait_for(s, "the registration dialog", "!!document.querySelector('#dialog-next')"; timeout = 30)
+function invite_login(s::TestServer, user::AbstractString)
+    password = String(wait_for(s, "the new password", "(document.querySelector('.pw') || {}).textContent || false";
+                               timeout = 30))
+    uri = String(wait_for(s, "the authenticator", "(document.querySelector('.uri') || {}).textContent || false";
+                          timeout = 30))
+    return Login(String(user), password, match(r"[?&]secret=([A-Z2-7]+)", uri)[1])
+end
+
+"""
+    add_passkey_device!(s) -> String
+
+Give browser `s` what keeps passkeys, as a password manager (Proton Pass) or a
+security key does: Chrome's virtual authenticator, which holds discoverable
+credentials and verifies its user. A passkey needs a page without certificate
+errors, so this browser also trusts the test CA's names (`*.localhost`,
+127.0.0.1), as a machine that installed the CA would. Returns the device's id.
+"""
+function add_passkey_device!(s::TestServer)
+    ctx = s.browser[]
+    return String(run(ctx.app, """(async () => {
+        const w = BrowserWindow.fromId($(ctx.window.id));
+        w.webContents.session.setCertificateVerifyProc((req, cb) =>
+            cb(/(^|\\.)localhost\$|^127\\.0\\.0\\.1\$/.test(req.hostname) ? 0 : -3));
+        await w.webContents.session.closeAllConnections();
+        const d = w.webContents.debugger;
+        if (!d.isAttached()) d.attach('1.3');
+        await d.sendCommand('WebAuthn.enable', {enableUI: false});
+        const r = await d.sendCommand('WebAuthn.addVirtualAuthenticator', {options: {
+            protocol: 'ctap2', transport: 'internal', hasResidentKey: true,
+            hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true}});
+        return r.authenticatorId; })()"""))
+end
+
+"The passkeys `device` (`add_passkey_device!`) of browser `s` holds, as `(rp, user)`."
+function passkeys(s::TestServer, device::AbstractString)
+    ctx = s.browser[]
+    creds = run(ctx.app, """(async () => {
+        const d = BrowserWindow.fromId($(ctx.window.id)).webContents.debugger;
+        const r = await d.sendCommand('WebAuthn.getCredentials', {authenticatorId: $(json(device))});
+        return r.credentials.filter(c => c.isResidentCredential).map(c => [c.rpId, c.userName]); })()""")
+    return [(String(c[1]), String(c[2])) for c in creds]
+end
+
+"""
+    add_passkey!(s; description = "Proton Pass")
+
+Add a passkey for whoever is signed in in browser `s`, as they would: "Add a
+passkey" on their account card leads to Authelia's settings, where they name it
+and the browser's device makes it (`add_passkey_device!` first). Returns to the
+dashboard.
+"""
+function add_passkey!(s::TestServer; description::AbstractString = "Proton Pass")
+    eval_js(s, """(() => { [...document.querySelectorAll('a')].find(a => a.innerText.trim() === 'Add a passkey').click();
+                          return true; })()""")
+    wait_for(s, "Authelia's settings", "!!document.querySelector('#webauthn-credential-add')"; timeout = 30)
+    click(s, "#webauthn-credential-add")
+    wait_for(s, "the passkey dialog", "!!document.querySelector('#webauthn-credential-description')"; timeout = 30)
+    set_input(s, "#webauthn-credential-description", description)
     click(s, "#dialog-next")
-    uri = String(wait_for(s, "the secret", "(document.querySelector('#secret-url') || {}).value || false"; timeout = 30))
-    login = Login(String(user), String(password), match(r"secret=([A-Z2-7]+)", uri)[1])
-    click(s, "#dialog-next")
-    wait_for(s, "the code boxes", "document.querySelectorAll('input[autocomplete=off]').length >= 5"; timeout = 30)
-    enter_code!(s, login)
-    wait_for(s, "the app registered", "document.body.innerText.includes('Successfully added the One-Time Password')";
+    wait_for(s, "the passkey added", "document.body.innerText.includes('Successfully added the WebAuthn Credential')";
              timeout = 30)
-    # Now the login proper: the second factor from the app.
     eval_js(s, "location.href = $(json(s.h.url * "/")); true")
-    wait_for(s, "the code boxes", "document.querySelectorAll('input[autocomplete=off]').length >= 5"; timeout = 30)
-    enter_code!(s, login)
-    wait_for(s, "the dashboard after the login", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    wait_for(s, "the dashboard", "!!document.querySelector('.bt-dash')"; timeout = 60)
     install_pane_scope!(s)
-    return login
+    return s
+end
+
+"""
+    passkey_login!(s)
+
+Sign in with a passkey alone: "Sign in with a passkey" on Authelia's login page,
+answered by the browser's device. Returns once the dashboard is up.
+"""
+function passkey_login!(s::TestServer)
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#passkey-sign-in-button')"; timeout = 30)
+    click(s, "#passkey-sign-in-button")
+    wait_for(s, "the dashboard after the passkey", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    install_pane_scope!(s)
+    return s
 end
 
 """
@@ -1477,10 +1496,11 @@ account_status(s::TestServer, text::AbstractString; timeout::Real = 30) =
                     "sec.querySelector('.bt-admin-status').textContent"); timeout)
 
 """
-    add_account_ui!(s, name; display_name = name, groups = "") -> password
+    add_account_ui!(s, name; display_name = name, groups = "") -> Login
 
 Add an account with the Accounts section's form, as an admin does, and return
-the password it shows once.
+what it shows once, the password and the authenticator, as the `Login` the admin
+passes on.
 """
 function add_account_ui!(s::TestServer, name::AbstractString; display_name::AbstractString = name,
                          groups::AbstractString = "")
@@ -1494,12 +1514,16 @@ function add_account_ui!(s::TestServer, name::AbstractString; display_name::Abst
     sleep(0.3)   # the inputs reach the server before the click that reads them
     eval_js(s, accounts_js("[...sec.querySelectorAll('button')].find(b => b.textContent.trim() === 'Add account').click() || true"))
     account_status(s, "account $(name) added")
-    return shown_password(s, name)
+    uri = String(wait_for(s, "the authenticator for $(name)",
+        accounts_js("(sec.querySelector('.bt-admin-secret .bt-admin-uri') || {}).textContent || false"); timeout = 30))
+    return Login(String(name), shown_password(s, name), match(r"[?&]secret=([A-Z2-7]+)", uri)[1])
 end
 
+# (`innerText`: the lines of what is shown stay apart, and the password ends
+# where its line does.)
 "The password the Accounts section shows for `name`, once."
 shown_password(s::TestServer, name::AbstractString) = String(wait_for(s, "the password for $(name)",
-    accounts_js("(sec.querySelector('.bt-admin-secret').textContent.match(/Password for $(name), shown only now: (\\S+)/) || [false, false])[1]");
+    accounts_js("(sec.querySelector('.bt-admin-secret').innerText.match(/Password for $(name), shown only now: (\\S+)/) || [false, false])[1]");
     timeout = 30))
 
 "Press `label` (\"Disable\", \"Make admin\", …) on `name`'s row of the Accounts table."

@@ -189,10 +189,13 @@ bash BonitoAgents/assets/install_server.sh
 
 It asks how people reach the server, its domain and the admin, saves the
 answers before anything can fail (a second run just offers them again;
-`--reconfigure` asks anew), and prints the admin password at the end. People
-log in through Authelia (a password and a second factor), which runs next to
-the server as a systemd service; the server itself only listens on localhost.
-Two ways in:
+`--reconfigure` asks anew), and prints the admin's password and authenticator
+(an `otpauth://` link, or a QR code with `qrencode` installed) at the end.
+People log in through Authelia, which runs next to the server as a systemd
+service, with a password and a one-time code, or with a passkey (Proton Pass, a
+security key, ...) they add once signed in. No mail is involved: the server
+registers everyone's authenticator and shows it once, next to the password. The
+server itself only listens on localhost. Two ways in:
 
 - **A tunnel** (the default), e.g. a Cloudflare Tunnel that forwards
   `https://team.example.com` to `http://localhost:8038`. That is all it has to

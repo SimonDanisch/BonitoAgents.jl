@@ -63,6 +63,7 @@ log1="$(mktemp)"
 if ! install 2>&1 | tee "$log1"; then echo "  FAIL  the install itself"; failures=$((failures + 1)); fi
 checks
 check "the first install prints the admin's password" grep -q "Password      :" "$log1"
+check "…and the admin's authenticator, no mail involved" grep -q "otpauth://totp/$DOMAIN:roundtrip?" "$log1"
 before="$(secrets_digest)"
 
 echo "==> 2. install again (an update)"
@@ -71,6 +72,7 @@ if ! install 2>&1 | tee "$log2"; then echo "  FAIL  the second install"; failure
 checks
 check "secrets and accounts are kept" test "$(secrets_digest)" = "$before"
 check "no new admin password" bash -c "! grep -q 'Password      :' $log2"
+check "the admin keeps their authenticator" grep -q "roundtrip has one already" "$log2"
 
 removed() {
     for unit in server authelia caddy; do

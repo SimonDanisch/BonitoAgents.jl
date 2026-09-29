@@ -10,11 +10,14 @@
     using Test, HTTP, JSON, Dates, SHA
     Sys.islinux() || return
 
-    # An authenticator app's one-time code (RFC 6238: 30 s steps, 6 digits, SHA-1).
+    # An authenticator app's one-time code (RFC 6238: 30 s steps, 6 digits, SHA-1),
+    # from the secret in the `otpauth://` link the server hands out.
     B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-    base32(bytes) = (bits = join(string(b; base = 2, pad = 8) for b in bytes);
-                     bits *= "0"^((5 - length(bits) % 5) % 5);
-                     join(B32[parse(Int, bits[i:i+4]; base = 2) + 1] for i in 1:5:length(bits)))
+    function unbase32(text)
+        bits = join(string(findfirst(==(c), B32) - 1; base = 2, pad = 5) for c in text)
+        return [parse(UInt8, bits[i:i+7]; base = 2) for i in 1:8:(length(bits) - 7)]
+    end
+    secret_of(a) = unbase32(match(r"[?&]secret=([A-Z2-7]+)", a.uri)[1])
     function totp(secret::Vector{UInt8}, step::Integer)
         h = SHA.hmac_sha1(secret, reverse(reinterpret(UInt8, [UInt64(step)])))
         o = h[end] & 0x0f
@@ -36,13 +39,15 @@
     pw = BT.authelia_random_password(auth.config)
     BT.atomic_write_json(joinpath(dir, "accounts.json"),
                          [Dict(BT.Account("bob", "Bob B", "bob@example.com", ["admins"], false, pw.hash))])
-    secret = rand(UInt8, 20)
 
     state = BT.serve(; port, auth, state_dir = dir, working_dir = mktempdir(), scan_on_connect = false)
     config = BT.authelia_config_file(auth.config)
-    run(pipeline(`$(bins.authelia) storage migrate up --config $(config)`; stdout = devnull))
-    run(pipeline(`$(bins.authelia) storage user totp generate bob --secret $(base32(secret)) --force --config $(config)`;
-                 stdout = devnull))
+    # The server registers bob's authenticator, as the installer has it do for the
+    # first admin: before Authelia ever ran.
+    bobs = BT.register_authenticator!(state, "bob")
+    @test startswith(bobs.uri, "otpauth://totp/team.example.com:bob?") && occursin("issuer=team.example.com", bobs.uri)
+    @test bobs.qr[1:4] == UInt8[0x89, 0x50, 0x4e, 0x47]     # a PNG
+    secret = secret_of(bobs)
     log = joinpath(dir, "authelia.log")
     authelia = run(pipeline(`$(bins.authelia) --config $(config)`; stdout = log, stderr = log); wait = false)
     url = "http://127.0.0.1:$(port)"
@@ -143,6 +148,19 @@
                                 "targetURL" => "https://team.example.com/"), cookie)
             @test second.status == 200
             cookie = something(let c = session_cookie(second); isempty(c) ? nothing : c end, cookie)
+            # Signed in with the authenticator the server registered, adding a
+            # passkey needs nothing more: no code by mail first.
+            json_(r) = JSON.parse(String(copy(r.body)))["data"]
+            elevation = HTTP.get(url * "/authelia/api/user/session/elevation", ["Cookie" => cookie];
+                                 status_exception = false, retry = false, cookies = false)
+            @test elevation.status == 200 && json_(elevation)["skip_second_factor"] == true
+            passkey = HTTP.request("PUT", url * "/authelia/api/secondfactor/webauthn/credential/register",
+                                   ["Cookie" => cookie, "Content-Type" => "application/json"],
+                                   JSON.json(Dict("description" => "Proton Pass"));
+                                   status_exception = false, retry = false, cookies = false)
+            @test passkey.status == 200
+            options = json_(passkey)["publicKey"]
+            @test options["rp"]["id"] == "team.example.com" && options["user"]["name"] == "bob"
 
             page = get_("/", ["Cookie" => cookie])
             html = String(page.body)
@@ -170,6 +188,27 @@
             # Logged out, it is the login first again.
             @test post_("/authelia/api/logout", Dict{String,Any}(), cookie).status == 200
             @test login_first(get_("/", ["Cookie" => cookie]))
+        end
+
+        @testset "an account made while Authelia runs, and a new authenticator" begin
+            code_login(name, password, a) = begin
+                first_ = post_("/authelia/api/firstfactor", Dict("username" => name, "password" => password,
+                                                               "keepMeLoggedIn" => false))
+                first_.status == 200 || return first_.status
+                post_("/authelia/api/secondfactor/totp", Dict("token" => totp(secret_of(a), floor(Int, time() / 30))),
+                      session_cookie(first_)).status
+            end
+            dave = BT.add_account!(state, "dave")
+            # Authelia rereads its users database when it changes; give it that moment.
+            @test timedwait(() -> code_login("dave", dave.password, dave.authenticator) == 200, 10.0; pollint = 1.0) === :ok
+            # "New authenticator": the old one's codes stop working. (Authelia takes
+            # one code per account and 30 s step, so this is an account that has
+            # not logged in yet.)
+            erin = BT.add_account!(state, "erin")
+            renewed = BT.register_authenticator!(state, "erin")
+            @test secret_of(renewed) != secret_of(erin.authenticator)
+            @test timedwait(() -> code_login("erin", erin.password, erin.authenticator) == 403, 10.0; pollint = 1.0) === :ok
+            @test code_login("erin", erin.password, renewed) == 200
         end
 
         @testset "without Authelia nothing behind the login answers" begin

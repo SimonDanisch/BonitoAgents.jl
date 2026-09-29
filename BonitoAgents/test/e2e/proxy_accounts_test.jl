@@ -14,14 +14,13 @@
         TK.open_browser(z)
         TK.login!(z)
 
-        # An admin adds an account; its password is shown once.
-        password = TK.add_account_ui!(z, "dave"; display_name = "Dave D", groups = "lab")
-        @test length(password) >= 16
+        # An admin adds an account; its password and authenticator are shown once.
+        dave = TK.add_account_ui!(z, "dave"; display_name = "Dave D", groups = "lab")
+        @test length(dave.password) >= 16
         @test TK.eval_js(z, TK.accounts_js("""[...sec.querySelectorAll('.bt-admin-table tr')].some(r =>
             r.cells[0]?.textContent.trim() === 'dave' && r.textContent.includes('member') && r.textContent.includes('active'))""")) == true
 
-        # Dave logs in, in a browser of his own, while the admin stays logged in.
-        dave = TK.Login("dave", password, TK.seed_totp!(z, "dave"))
+        # Dave logs in with them, in a browser of his own, while the admin stays logged in.
         b = TK.another_browser(z)
         TK.login!(b, dave)
         @test TK.signed_in_as(b) == "Signed in as Dave D (dave); groups: lab."
@@ -46,7 +45,7 @@
         TK.account_action!(z, "dave", "New password")
         TK.account_status(z, "new password for dave")
         renewed = String(TK.wait_for(z, "dave's new password",
-            TK.accounts_js("(sec.querySelector('.bt-admin-secret').textContent.match(/Password for dave, shown only now: (\\S+)/) || [])[1] !== $(TK.json(password)) && " *
+            TK.accounts_js("(sec.querySelector('.bt-admin-secret').textContent.match(/Password for dave, shown only now: (\\S+)/) || [])[1] !== $(TK.json(dave.password)) && " *
                            "sec.querySelector('.bt-admin-secret').textContent.match(/Password for dave, shown only now: (\\S+)/)[1]");
             timeout = 30))
         TK.logout!(b)
@@ -124,8 +123,7 @@ end
         @test TK.eval_js(z, "!!document.querySelector('.bt-header-devmode') && !!document.querySelector('.bt-header-remote')") == true
 
         TK.to_dashboard(z)
-        password = TK.add_account_ui!(z, "erin"; groups = "lab")
-        erin = TK.Login("erin", password, TK.seed_totp!(z, "erin"))
+        erin = TK.add_account_ui!(z, "erin"; groups = "lab")
         b = TK.another_browser(z)
         TK.login!(b, erin)
         @test TK.signed_in_as(b) == "Signed in as erin (erin); groups: lab."

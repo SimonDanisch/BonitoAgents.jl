@@ -436,7 +436,7 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
     config = authelia_config_file(cfg)
     # The admin's second factor, as if they had registered an authenticator app
     # (into a database brought to Authelia's schema first).
-    run(pipeline(`$(p.authelia_bin) storage migrate up --config $(config)`; stdout = devnull))
+    migrate_authelia_storage(cfg)
     run(pipeline(`$(p.authelia_bin) storage user totp generate $(p.admin) --secret $(p.totp_secret) --force --config $(config)`;
                  stdout = devnull))
     log(name) = joinpath(dir, name * ".log")
