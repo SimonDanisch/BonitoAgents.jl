@@ -180,16 +180,22 @@ enumerates.
   one process with a persistent platform data dir; AppBundler bundles (snap,
   dmg, msix) are built by CI for every push and `v*` tag.
 - **Server**: `bonitoagents server` mode (localhost only) or the systemd
-  installer (`install_server.sh`), which puts Caddy (HTTPS) and Authelia (login
-  with a second factor) in front and checks DNS and ports before Let's Encrypt.
+  installer (`install_server.sh`), which sets up Authelia (login with a second
+  factor) behind a tunnel that brings HTTPS (Cloudflare's, say: one host name,
+  one port, the server checks every request itself), or with Caddy in front
+  (HTTPS, checking DNS and ports before Let's Encrypt). It saves its answers
+  before any step can fail and offers them again on the next run.
 - Worker installs always match the server's running code revision (branch,
   sha, or the version's `v` tag for git-less release deployments);
   `BONITOAGENTS_INSTALL_REV` overrides for ops.
-- Three ways to run a server: one machine (localhost, no login), a trusted
+- Four ways to run a server: one machine (localhost, no login), a trusted
   network (`--host 0.0.0.0`, no login, per-worker credentials the server checks
-  itself), or behind the login proxy (below).
+  itself), behind a tunnel (login, the server's own gate before every route asks
+  Authelia; responses marked private so a CDN's cache keeps nothing), or behind
+  the login proxy (Caddy asks Authelia).
 - Accounts, owners and per-worker credentials: the server binds localhost and
-  takes identities from the proxy (with a key only Caddy and the server share);
+  takes identities from Authelia (through Caddy, with a key only Caddy and the
+  server share, or its own gate);
   admins invite people by link, manage accounts and groups, and issue or revoke
   worker credentials on the dashboard; members see what they own plus workers
   shared with their groups.

@@ -184,17 +184,29 @@ Run the server on an always-on Linux machine with a domain name, using
 [`BonitoAgents/assets/install_server.sh`](BonitoAgents/assets/install_server.sh):
 
 ```bash
-bash BonitoAgents/assets/install_server.sh --domain team.example.com
+bash BonitoAgents/assets/install_server.sh
 ```
 
-The server itself only listens on localhost. The installer puts Caddy (HTTPS,
-Let's Encrypt) and Authelia (login with password and second factor) in front of
-it and runs all three as systemd services. It needs DNS records for
-`team.example.com` and `auth.team.example.com` pointing at the machine, and
-ports 80 and 443 reachable; it checks both before asking for a certificate, and
-prints the admin password at the end. Admins invite people with a link (or add
-accounts directly) and put them in groups; members see their own chats and
-workers, plus the workers shared with one of their groups.
+It asks how people reach the server, its domain and the admin, saves the
+answers before anything can fail (a second run just offers them again;
+`--reconfigure` asks anew), and prints the admin password at the end. People
+log in through Authelia (a password and a second factor), which runs next to
+the server as a systemd service; the server itself only listens on localhost.
+Two ways in:
+
+- **A tunnel** (the default), e.g. a Cloudflare Tunnel that forwards
+  `https://team.example.com` to `http://localhost:8038`. That is all it has to
+  do: the server asks Authelia about every request itself and serves the login
+  page under the same name (`/authelia`). No certificates, DNS records or open
+  ports on the machine.
+- **Directly** (`--tls acme`): Caddy answers on ports 80 and 443 with a Let's
+  Encrypt certificate and puts the login on `auth.team.example.com`. The
+  installer checks that both names point at the machine and port 80 reaches it
+  before it asks for a certificate.
+
+Admins invite people with a link (or add accounts directly) and put them in
+groups; members see their own chats and workers, plus the workers shared with
+one of their groups.
 
 Then, for each machine that should run agents, click **Add worker** on the
 dashboard and run the command it shows on that machine:
@@ -211,7 +223,7 @@ Re-run it any time to update. The server keeps each worker's agent adapters
 `BONITOAGENTS_NODE_DIST` on a worker that cannot reach nodejs.org to a mirror of
 its `dist` tree).
 
-Without the proxy there are two simpler ways to run the server:
+Without a login there are two simpler ways to run the server:
 
 - `bonito-agents server`: this machine only. It listens on localhost, whoever
   reaches it is the local admin, and so is its worker.

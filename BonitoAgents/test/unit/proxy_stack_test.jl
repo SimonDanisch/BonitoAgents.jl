@@ -43,16 +43,20 @@
     secrets = BT.authelia_secrets(dir)
     write(base.users_file, BT.render_users_yaml([BT.Account("bob", "Bob", "b@example.com", ["admins"], false, pw.hash)]))
     config = joinpath(dir, "authelia", "configuration.yml")
-    function authelia_accepts(cfg, smtp)
-        write(config, BT.render_authelia_config(cfg, secrets, smtp))
+    function authelia_accepts(auth, smtp)
+        write(config, BT.render_authelia_config(auth, secrets, smtp))
         out = IOBuffer()
         ok = success(pipeline(`$(bins.authelia) validate-config --config $config`; stdout = out, stderr = out))
         ok || @error "authelia rejects" out = String(take!(out))
         return ok
     end
     smtp = Dict("host" => "127.0.0.1", "port" => 1, "username" => "u", "password" => "it's", "sender" => "bot@example.com")
-    @test authelia_accepts(BT.ProxyConfig(; base...), nothing)
-    @test authelia_accepts(BT.ProxyConfig(; base...), smtp)
+    proxied(cfg) = BT.ProxyAuth(cfg, "k"^64)
+    @test authelia_accepts(proxied(BT.ProxyConfig(; base...)), nothing)
+    @test authelia_accepts(proxied(BT.ProxyConfig(; base...)), smtp)
+    # Behind a tunnel: the portal under the dashboard's own name.
+    @test authelia_accepts(BT.TunnelAuth(BT.ProxyConfig(; domain = base.domain, admin = "bob", tls = "tunnel",
+                                                        users_file = base.users_file)), nothing)
 
     # With mail configured, Authelia starts even while the mail server is out
     # (here: nothing listens on its port). It used to exit instead, which left
@@ -60,7 +64,7 @@
     sock = listen(Sockets.IPv4(0x7f000001), 0)
     port = Int(Sockets.getsockname(sock)[2])
     close(sock)
-    write(config, BT.render_authelia_config(BT.ProxyConfig(; base..., authelia_port = port), secrets, smtp))
+    write(config, BT.render_authelia_config(proxied(BT.ProxyConfig(; base..., authelia_port = port)), secrets, smtp))
     log = joinpath(dir, "authelia.log")
     proc = run(pipeline(`$(bins.authelia) --config $config`; stdout = log, stderr = log); wait = false)
     try

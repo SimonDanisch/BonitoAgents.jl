@@ -1,13 +1,17 @@
 # ── Who is on the other end ──────────────────────────────────────────────────
-# Three ways to run a server, from least to most set up:
+# Four ways to run a server, from least to most set up:
 #   * one machine (`LocalAuth`: the desktop app, `bonito-agents server`): it
 #     listens on localhost, and whoever reaches it is the local user, the one
 #     account, an admin; so is every worker (they run on this machine too);
 #   * a network it trusts (`NetworkAuth`: `bonito-agents server --host 0.0.0.0`):
 #     still no login, whoever reaches it is that one admin, but a worker comes
 #     in with a credential "Add worker" issued, which the server checks itself;
-#   * behind the login proxy (`ProxyAuth`, install_server.sh): HTTPS, logins,
-#     accounts and groups.
+#   * behind a tunnel (`TunnelAuth`, install_server.sh): something else brings
+#     HTTPS to 127.0.0.1 (cloudflared for one), and people log in through
+#     Authelia, which the server asks about every request itself (tunnel.jl);
+#   * behind the login proxy (`ProxyAuth`, install_server.sh): Caddy brings
+#     HTTPS and asks Authelia.
+# The last two are a `LoginAuth`: logins, accounts and groups.
 #
 # Behind the proxy BonitoAgents does no authentication itself. The installer
 # sets up Caddy + Authelia, the server listens on 127.0.0.1 and every request
@@ -70,29 +74,35 @@ NetworkAuth() = NetworkAuth(local_user())
     ProxyConfig
 
 What the installer set up in front of the server (`<state_dir>/proxy.json`). The
-server owns the proxy's configuration: the Caddyfile, where it adds and revokes
-worker credentials; Authelia's users database, which the accounts page edits;
-and Authelia's own configuration, with the secrets it keeps in its state dir
-(`apply_proxy!`). Authelia's files live together in `dirname(users_file)`.
+server owns the login's configuration: Authelia's users database, which the
+accounts page edits; Authelia's own configuration, with the secrets it keeps in
+its state dir; and behind the proxy the Caddyfile, where it adds and revokes
+worker credentials (`apply_proxy!`). Authelia's files live together in
+`dirname(users_file)`.
 """
 Base.@kwdef struct ProxyConfig
     domain::String                          # the dashboard, e.g. team.example.com
-    auth_domain::String                     # Authelia's login portal, e.g. auth.team.example.com
+    # Authelia's login portal behind the proxy, e.g. auth.team.example.com;
+    # behind a tunnel it is under the dashboard's own name (`PORTAL_PATH`).
+    auth_domain::String = ""
     admin::String                           # the installer's account: owns what predates owners
-    port::Int = 8038                        # where the server listens on 127.0.0.1
+    # Where the server listens on 127.0.0.1: what Caddy, or the tunnel, forwards to.
+    port::Int = 8038
     authelia_port::Int = 9091
     caddy_bin::String = "caddy"
     authelia_bin::String = "authelia"
-    caddyfile::String
+    caddyfile::String = ""                  # behind the proxy only
     users_file::String
     acme_email::String = ""
-    # Certificates: "acme" (Let's Encrypt, what a public server wants) or
-    # "internal" (Caddy's own certificate authority: a LAN, or a test on one
-    # machine; browsers and workers must be told to trust it).
+    # Where HTTPS comes from: "acme" (Caddy, with Let's Encrypt: what a public
+    # server wants), "internal" (Caddy's own certificate authority: a LAN, or a
+    # test on one machine; browsers and workers must be told to trust it), or
+    # "tunnel" (something in front of this machine, e.g. cloudflared; no Caddy).
     tls::String = "acme"
     # Another ACME directory, e.g. Let's Encrypt's staging one while trying an
     # install out, so repeated attempts don't run into its rate limits.
     acme_ca::String = ""
+    # The port browsers use for HTTPS: Caddy's, or behind a tunnel the tunnel's.
     https_port::Int = 443
     http_port::Int = 80
     # Where workers reach the proxy when not under `domain`, e.g. an address on
@@ -106,7 +116,8 @@ Base.@kwdef struct ProxyConfig
     function ProxyConfig(domain, auth_domain, admin, port, authelia_port, caddy_bin, authelia_bin,
                          caddyfile, users_file, acme_email, tls, acme_ca, https_port, http_port,
                          worker_address, smtp)
-        tls in ("acme", "internal") || error("proxy.json: tls is \"acme\" or \"internal\" (got \"$(tls)\")")
+        tls in ("acme", "internal", "tunnel") ||
+            error("proxy.json: tls is \"acme\", \"internal\" or \"tunnel\" (got \"$(tls)\")")
         return new(domain, auth_domain, admin, port, authelia_port, caddy_bin, authelia_bin,
                    caddyfile, users_file, acme_email, tls, acme_ca, https_port, http_port,
                    worker_address, smtp)
@@ -142,16 +153,59 @@ end
 
 ProxyWriter(; spacing::Real = 1.0) = ProxyWriter(ReentrantLock(), Float64(spacing), 0.0)
 
+"People log in through Authelia (`config`): accounts, groups, invites."
+abstract type LoginAuth <: AuthMode end
+
 "A server behind the Caddy + Authelia proxy the installer set up."
-struct ProxyAuth <: AuthMode
+struct ProxyAuth <: LoginAuth
     config::ProxyConfig
     # What Caddy adds to every request it forwards: the proof it came through Caddy.
     key::String
     function ProxyAuth(config::ProxyConfig, key::AbstractString)
         isempty(key) && error("a proxy key is required: without it anyone on this machine could claim any identity")
+        config.tls == "tunnel" && error("proxy.json: behind a tunnel there is no Caddy (tls \"tunnel\")")
+        (isempty(config.auth_domain) || isempty(config.caddyfile)) &&
+            error("proxy.json: behind the proxy auth_domain and caddyfile are required")
         return new(config, String(key))
     end
 end
+
+"""
+A server behind a tunnel, which brings HTTPS to it on 127.0.0.1 (cloudflared, or
+anything that forwards `https://<domain>` there): no Caddy. The server asks
+Authelia about every request itself, and serves Authelia's login page under
+its own name (`PORTAL_PATH`), so the tunnel needs one host name and one port.
+Workers come in with a credential "Add worker" issued, which the server checks
+itself, as on a trusted network. See tunnel.jl.
+"""
+struct TunnelAuth <: LoginAuth
+    config::ProxyConfig
+    function TunnelAuth(config::ProxyConfig)
+        config.tls == "tunnel" || error("proxy.json: a tunnel is tls \"tunnel\" (got \"$(config.tls)\")")
+        isempty(config.worker_address) ||
+            error("proxy.json: worker_address is for Caddy; behind a tunnel workers come through it")
+        return new(config)
+    end
+end
+
+# Where Authelia's login page is behind a tunnel: under the dashboard's own name.
+const PORTAL_PATH = "/authelia"
+
+"The dashboard's address, as browsers and workers reach it."
+dashboard_url(auth::LoginAuth) = public_origin(auth.config, auth.config.domain)
+
+"Authelia's login page."
+portal_url(auth::ProxyAuth) = public_origin(auth.config, auth.config.auth_domain)
+portal_url(auth::TunnelAuth) = dashboard_url(auth) * PORTAL_PATH
+
+# The login cookie has to cover the dashboard and the portal: behind the proxy
+# the portal's parent domain, behind a tunnel the one name both share.
+cookie_domain(auth::ProxyAuth) = String(split(auth.config.auth_domain, '.'; limit = 2)[end])
+cookie_domain(auth::TunnelAuth) = auth.config.domain
+
+# Where Authelia listens, and under which path it serves.
+authelia_address(auth::ProxyAuth) = "tcp://127.0.0.1:$(auth.config.authelia_port)/"
+authelia_address(auth::TunnelAuth) = "tcp://127.0.0.1:$(auth.config.authelia_port)$(PORTAL_PATH)"
 
 const PROXY_KEY_HEADER = "X-BonitoAgents-Proxy"
 
@@ -174,7 +228,9 @@ function auth_mode(state_dir::AbstractString; host::AbstractString = "127.0.0.1"
     isfile(f) || return LocalAuth()
     d = JSON.parsefile(f)
     d["smtp"] = isfile(smtp_file(state_dir))
-    return ProxyAuth(ProxyConfig(d), bytes2hex(load_or_create_secret(state_dir, "proxy_key")))
+    cfg = ProxyConfig(d)
+    cfg.tls == "tunnel" && return TunnelAuth(cfg)
+    return ProxyAuth(cfg, bytes2hex(load_or_create_secret(state_dir, "proxy_key")))
 end
 
 # Authelia's mail settings, written by the installer (mode 600): address, username,
@@ -186,19 +242,27 @@ from_proxy(auth::ProxyAuth, request) = HTTP.header(request, PROXY_KEY_HEADER, ""
 
 "The one the records from before owners existed belong to."
 default_owner(auth::OpenAuth) = auth.user.name
-default_owner(auth::ProxyAuth) = auth.config.admin
+default_owner(auth::LoginAuth) = auth.config.admin
+
+# What Authelia says about who someone is, as Caddy (or the tunnel's gate) passes it on.
+const IDENTITY_HEADERS = ("Remote-User", "Remote-Groups", "Remote-Email", "Remote-Name")
 
 """
     request_user(auth, request) -> Union{User,Nothing}
 
-Who sent `request`: the local user, or whoever the proxy says it is. `nothing`
-behind the proxy when the request carries no identity, i.e. it did not come
-through Authelia.
+Who sent `request`: the local user, or whoever Authelia says it is. `nothing`
+behind the proxy or a tunnel when the request carries no identity, i.e. it did
+not come through Authelia.
 """
 request_user(auth::OpenAuth, request) = auth.user
 
-function request_user(auth::ProxyAuth, request)
-    from_proxy(auth, request) || return nothing
+request_user(auth::ProxyAuth, request) = from_proxy(auth, request) ? identity_of(request) : nothing
+
+# Behind a tunnel the gate in front of every route (tunnel.jl) drops whatever a
+# client sent under these names and sets them from Authelia's answer alone.
+request_user(::TunnelAuth, request) = identity_of(request)
+
+function identity_of(request)
     name = String(strip(HTTP.header(request, "Remote-User", "")))
     isempty(name) && return nothing
     display = String(strip(HTTP.header(request, "Remote-Name", "")))
@@ -214,7 +278,7 @@ end
 A worker's admission to `/w` ("Add worker"), and who issued it. `hash` is what
 Caddy's `basic_auth` checks behind the proxy (bcrypt; `""` when issued without
 the proxy, where there is no Caddy to make one); `digest` is what the server
-checks itself on a trusted network (SHA-256 of the password: a random 24 bytes,
+checks itself on a trusted network or behind a tunnel (SHA-256 of the password: a random 24 bytes,
 so no slow hash is needed; `""` on credentials from before it existed).
 """
 struct WorkerCredential
@@ -241,12 +305,14 @@ credential_digest(password::AbstractString) = bytes2hex(SHA.sha256(String(passwo
 
 The credential a worker connection was admitted with: `""` on a local server
 (nothing but this machine reaches it), the name the server checked itself on a
-trusted network, the name Caddy checked behind the proxy, or `nothing` when the
-connection names none the server still knows.
+trusted network or behind a tunnel, the name Caddy checked behind the proxy, or
+`nothing` when the connection names none the server still knows.
 """
 worker_credential(::LocalAuth, request, credentials) = ""
 
-function worker_credential(::NetworkAuth, request, credentials::AbstractDict)
+# On a trusted network and behind a tunnel nothing checks a worker before the
+# server does.
+function worker_credential(::Union{NetworkAuth,TunnelAuth}, request, credentials::AbstractDict)
     given = basic_credential(request)
     given === nothing && return nothing
     c = get(credentials, given.name, nothing)
@@ -441,7 +507,7 @@ end
 function site_preamble(io::IO, cfg::ProxyConfig)
     cfg.tls == "internal" && println(io, "\ttls internal")
     println(io, "\t# Who a request is from: only Caddy may say.")
-    for h in ("Remote-User", "Remote-Groups", "Remote-Email", "Remote-Name")
+    for h in IDENTITY_HEADERS
         println(io, "\trequest_header -", h)
     end
     println(io)
@@ -482,20 +548,18 @@ function worker_routes(io::IO, auth::ProxyAuth, creds)
 end
 
 """
-    render_authelia_config(cfg, secrets, smtp) -> String
+    render_authelia_config(auth, secrets, smtp) -> String
 
-Authelia's `configuration.yml`: the login for `cfg.domain` (a password and a
-second factor), its users database in `cfg.users_file`, and nothing it could
+Authelia's `configuration.yml`: the login for the dashboard's domain (a password
+and a second factor), its users database in `users_file`, and nothing it could
 change behind the server's back (its own password reset and change are off; the
 server hands passwords out). `secrets` holds `jwt`, `session` and `storage`
 (`authelia_secrets`); `smtp` is the mail settings, or `nothing` for none.
 """
-function render_authelia_config(cfg::ProxyConfig, secrets, smtp::Union{AbstractDict,Nothing})
+function render_authelia_config(auth::LoginAuth, secrets, smtp::Union{AbstractDict,Nothing})
+    cfg = auth.config
     q = yaml_quote
     dir = dirname(cfg.users_file)
-    # The login cookie has to cover the dashboard and the portal: the portal's
-    # parent domain.
-    cookie_domain = split(cfg.auth_domain, '.'; limit = 2)[end]
     notifier = if smtp === nothing
         """
         notifier:
@@ -520,7 +584,7 @@ function render_authelia_config(cfg::ProxyConfig, secrets, smtp::Union{AbstractD
     return """
         # Rendered by BonitoAgents from proxy.json; edits here are overwritten.
         server:
-          address: $(q("tcp://127.0.0.1:$(cfg.authelia_port)/"))
+          address: $(q(authelia_address(auth)))
         log:
           level: 'info'
         totp:
@@ -555,9 +619,9 @@ function render_authelia_config(cfg::ProxyConfig, secrets, smtp::Union{AbstractD
         session:
           secret: $(q(secrets.session))
           cookies:
-            - domain: $(q(cookie_domain))
-              authelia_url: $(q(public_origin(cfg, cfg.auth_domain)))
-              default_redirection_url: $(q(public_origin(cfg, cfg.domain)))
+            - domain: $(q(cookie_domain(auth)))
+              authelia_url: $(q(portal_url(auth)))
+              default_redirection_url: $(q(dashboard_url(auth)))
         storage:
           encryption_key: $(q(secrets.storage))
           local:

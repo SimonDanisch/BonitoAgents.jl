@@ -2,13 +2,15 @@
 # The server installer, for real, on this machine: install, check, install again
 # (an update), check nothing was lost; uninstall, check the data stayed, install
 # once more over it; then uninstall with --purge, check nothing was left behind.
+# Then the same server behind a tunnel: a first run that stops halfway still
+# keeps its answers, a second run needs none, Caddy comes and goes with the mode.
 #
 #   bash BonitoAgents/test/deploy/install_roundtrip.sh
 #
 # It runs `install_server.sh` as a separate instance (its own services, data,
 # binaries and ports: nothing of an install already on this machine is touched)
-# with Caddy's own CA, so it needs no domain and no open ports. It uses sudo, and
-# the first start of the server precompiles, which takes minutes.
+# with Caddy's own CA or a tunnel, so it needs no domain and no open ports. It
+# uses sudo, and the first start of the server precompiles, which takes minutes.
 #
 # The login itself (Authelia's form, second factor, what each account sees) is
 # the e2e items' job (`e2e:proxy_*`): they run the same rendered configuration.
@@ -91,6 +93,56 @@ check "secrets and accounts are the same" test "$(secrets_digest)" = "$before"
 check "no new admin password" bash -c "! grep -q 'Password      :' $log3"
 
 echo "==> 5. uninstall --purge: nothing is left"
+bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --purge --yes
+removed
+check "its data is gone" test ! -e "/var/lib/$NAME"
+
+# ── Behind a tunnel ───────────────────────────────────────────────────────────
+# What a tunnel sees: the server's plain port on 127.0.0.1, one host name.
+local_status() { curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$@" 2> /dev/null; }
+tunnel_checks() {
+    for unit in server authelia; do
+        check "$NAME-$unit is running" sudo systemctl is-active --quiet "$NAME-$unit"
+    done
+    check "no Caddy behind a tunnel" bash -c "! systemctl cat $NAME-caddy > /dev/null 2>&1"
+    check "the dashboard wants a login" test "$(local_status "http://127.0.0.1:$PORT/")" = 302
+    check "…on the login page under the same name" grep -q "Location: https://$DOMAIN/authelia/" \
+        <(curl -sS -D - -o /dev/null --max-time 10 "http://127.0.0.1:$PORT/")
+    check "the login page answers" test "$(local_status "http://127.0.0.1:$PORT/authelia/")" = 200
+    check "a forged identity changes nothing" test \
+        "$(local_status -H "Remote-User: roundtrip" -H "Remote-Groups: admins" "http://127.0.0.1:$PORT/")" = 302
+    check "the worker installer is public, and points at the tunnel" \
+        grep -q "https://$DOMAIN" <(curl -sS --max-time 10 "http://127.0.0.1:$PORT/install.sh")
+    check "the answers are saved" sudo grep -q '"tls": "tunnel"' "$STATE/proxy.json"
+}
+tunnel_install() {
+    bash "$ASSETS/install_server.sh" --instance "$INSTANCE" "$@" --no-update --no-prompt
+}
+
+echo "==> 6. behind a tunnel: a first run that stops halfway keeps its answers"
+python3 -m http.server "$PORT" --bind 127.0.0.1 > /dev/null 2>&1 &
+squatter=$!
+sleep 1
+log4="$(mktemp)"
+tunnel_install --tls tunnel --domain "$DOMAIN" --admin roundtrip --port "$PORT" \
+    --authelia-port "$AUTHELIA_PORT" > "$log4" 2>&1
+check "it stops: the tunnel's port is taken" grep -q "port $PORT is already in use" "$log4"
+kill "$squatter"; wait "$squatter" 2> /dev/null
+check "its answers are saved all the same" sudo grep -q "\"domain\": \"$DOMAIN\"" "$STATE/proxy.json"
+
+echo "==> 7. the next run needs no answers"
+log5="$(mktemp)"
+if ! tunnel_install 2>&1 | tee "$log5"; then echo "  FAIL  the tunnel install"; failures=$((failures + 1)); fi
+tunnel_checks
+check "the first install prints the admin's password" grep -q "Password      :" "$log5"
+
+echo "==> 8. to Caddy and back: Caddy comes and goes with the mode"
+if ! install > /dev/null 2>&1; then echo "  FAIL  the switch to Caddy"; failures=$((failures + 1)); fi
+checks
+if ! tunnel_install --tls tunnel > /dev/null 2>&1; then echo "  FAIL  the switch back"; failures=$((failures + 1)); fi
+tunnel_checks
+
+echo "==> 9. uninstall --purge"
 bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --purge --yes
 removed
 check "its data is gone" test ! -e "/var/lib/$NAME"

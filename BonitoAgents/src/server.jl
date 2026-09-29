@@ -129,7 +129,8 @@ function serve(; host::String        = "127.0.0.1",
     Bonito.set_cleanup_time!(1.0)   # hours
 
     # Single-page app: sidebar + dashboard/chat swap. No per-project routes.
-    srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".")
+    # Behind a tunnel every request passes the login gate first (tunnel.jl).
+    srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".", gate = server_gate(auth))
     state.srv = srv
 
     # online_url uses the post-start srv.port — handles port=0 → ephemeral
@@ -172,6 +173,9 @@ end
 check_host(::ProxyAuth, host::AbstractString) = is_loopback(host) ||
     error("behind the login proxy the server listens on localhost only (got --host $(host)): " *
           "Caddy forwards to it")
+check_host(::TunnelAuth, host::AbstractString) = is_loopback(host) ||
+    error("behind a tunnel the server listens on localhost only (got --host $(host)): " *
+          "the tunnel forwards to it")
 check_host(::LocalAuth, host::AbstractString) = is_loopback(host) ||
     error("a server for this machine lets every worker in, so it listens on localhost only " *
           "(got --host $(host)); on a network, workers need credentials: `auth = NetworkAuth()` " *
@@ -182,6 +186,9 @@ announce(::AuthMode, url::AbstractString) =
     @info "Workers: \"Add worker\" on the dashboard gives the install command for a machine."
 announce(::LocalAuth, url::AbstractString) =
     @info "Workers: only this machine reaches this server (localhost); `--host 0.0.0.0` lets other machines in."
+announce(auth::TunnelAuth, url::AbstractString) =
+    @info "Behind a tunnel: point it at http://127.0.0.1:$(auth.config.port) for $(url); people log in " *
+          "at $(portal_url(auth)). Workers: \"Add worker\" on the dashboard gives the install command."
 announce(::NetworkAuth, url::AbstractString) =
     @warn "No login: anyone who reaches $(url) uses the dashboard, and through it the workers' " *
           "machines; nothing is encrypted. Workers join with a credential from \"Add worker\". " *
@@ -189,7 +196,7 @@ announce(::NetworkAuth, url::AbstractString) =
           "(BonitoAgents/assets/install_server.sh)."
 
 # Where workers and browsers reach the server when no --public-url says so.
-default_public_url(auth::ProxyAuth, srv, host) = public_origin(auth.config, auth.config.domain)
+default_public_url(auth::LoginAuth, srv, host) = dashboard_url(auth)
 default_public_url(::LocalAuth, srv, host) = Bonito.online_url(srv, "")
 # Other machines dial it: at the address it listens on, or on a wildcard bind at
 # this machine's own (`--public-url` says otherwise, e.g. for a host name).
@@ -198,8 +205,8 @@ function default_public_url(::NetworkAuth, srv, host)
     return "http://$(occursin(':', addr) ? "[$(addr)]" : addr):$(srv.port)"
 end
 
-# Behind the proxy, the port is the one Caddy forwards to.
-listen_port(auth::ProxyAuth, opts::AbstractDict) = auth.config.port
+# Behind the proxy or a tunnel, the port is the one it forwards to.
+listen_port(auth::LoginAuth, opts::AbstractDict) = auth.config.port
 listen_port(::OpenAuth, opts::AbstractDict) = parse(Int, get(opts, "port", "8038"))
 
 # ── Package entry point ──────────────────────────────────────────────────────

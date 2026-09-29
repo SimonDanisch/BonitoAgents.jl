@@ -55,23 +55,35 @@ julia --project=BonitoAgentsApp -m BonitoAgentsApp
 ## One server, many machines
 
 Run the server somewhere always reachable, like a home server or a VPS, with a
-domain name pointing at it. The setup script
+domain name. The setup script
 [`BonitoAgents/assets/install_server.sh`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/BonitoAgents/assets/install_server.sh)
 installs it on Linux:
 
 ```bash
-bash BonitoAgents/assets/install_server.sh --domain team.example.com
+bash BonitoAgents/assets/install_server.sh
 ```
 
-The server only listens on localhost. The script sets up Caddy in front of it
-for HTTPS (a Let's Encrypt certificate) and Authelia for the login (a password
-plus a second factor: an authenticator app or a security key), and runs all
-three as systemd services. Before it asks for a certificate it checks that
-`team.example.com` and `auth.team.example.com` resolve to the machine and that
-port 80 reaches it, and stops with a message saying what is missing. At the end
-it prints the admin account's password.
+It asks how people reach the server, its domain and the admin account, and
+saves the answers before anything can go wrong: a second run offers them again
+(`--reconfigure` asks anew). The server only listens on localhost; people log in
+through Authelia (a password plus a second factor: an authenticator app or a
+security key), which runs next to it as a systemd service. At the end the script
+prints the admin account's password.
 
-To try an install out first, `--acme-staging` takes certificates from Let's
+**Behind a tunnel** (the default): something in front of the machine brings
+HTTPS, e.g. a Cloudflare Tunnel with the public hostname `team.example.com`
+pointing at `http://localhost:8038`. Nothing else is needed from the tunnel: the
+server asks Authelia about every request itself, serves the login page under the
+same name (`https://team.example.com/authelia`), and marks its responses private
+so the tunnel's cache keeps nothing. No certificates, DNS records or open ports
+on the machine.
+
+**Directly** (`--tls acme`): the script sets up Caddy in front for HTTPS (a
+Let's Encrypt certificate), with the login on `auth.team.example.com`. Before it
+asks for a certificate it checks that both names resolve to the machine and that
+port 80 reaches it, and stops with a message saying what is missing.
+
+To try a direct install out first, `--acme-staging` takes certificates from Let's
 Encrypt's staging CA (no rate limits; browsers warn about them), and
 `BonitoAgents/test/deploy/smoke.sh https://team.example.com --staging` checks
 the result from any machine: the certificate, the login redirect, the public

@@ -1,11 +1,11 @@
 # ── Accounts, invites, worker credentials ────────────────────────────────────
-# Behind the proxy the server owns what Caddy and Authelia know about machines
-# and people (identity.jl): the worker credentials, rendered into the Caddyfile,
-# and the accounts, rendered into Authelia's users database. It also decides
-# which agent adapters workers keep installed. This file keeps those records,
-# pushes them into the proxy's config, serves the invite pages, and draws the
-# account controls on the dashboard. Nothing here checks a password: Caddy and
-# Authelia do.
+# Behind the proxy or a tunnel the server owns what Authelia (and Caddy) know
+# about machines and people (identity.jl): the accounts, rendered into Authelia's
+# users database, and the worker credentials, rendered into the Caddyfile behind
+# the proxy. It also decides which agent adapters workers keep installed. This
+# file keeps those records, pushes them into the login's config, serves the
+# invite pages, and draws the account controls on the dashboard. Nothing here
+# checks a password: Authelia does (and Caddy, a worker's, behind the proxy).
 #
 # Passwords are the server's alone. Authelia's own "reset password" and "change
 # password" would write the users database behind the server's back, so the
@@ -50,15 +50,15 @@ save_invites!(s::ServerState) = lock(s.lock) do
     atomic_write_json(invites_file(s), [Dict(i) for i in values(s.invites[])]; mode = 0o600)
 end
 
-proxy_config(auth::ProxyAuth) = auth.config
+proxy_config(auth::LoginAuth) = auth.config
 proxy_config(::OpenAuth) =
     error("this server has no login proxy in front (no proxy.json): there are no accounts to manage")
 
 # The hash Caddy checks a worker's password against: behind the proxy only. On a
-# trusted network the server checks the credential's digest itself; on one
-# machine no worker needs a credential.
+# trusted network and behind a tunnel the server checks the credential's digest
+# itself; on one machine no worker needs a credential.
 caddy_password_hash(auth::ProxyAuth, password::AbstractString) = caddy_hash(auth.config, password)
-caddy_password_hash(::NetworkAuth, password::AbstractString) = ""
+caddy_password_hash(::Union{NetworkAuth,TunnelAuth}, password::AbstractString) = ""
 caddy_password_hash(::LocalAuth, password::AbstractString) =
     error("only this machine reaches this server (it listens on localhost), and its workers need " *
           "no credential. To add other machines, listen on the network (--host 0.0.0.0) or put " *
@@ -83,36 +83,25 @@ smtp_settings(state_dir::AbstractString) =
 """
     apply_proxy!(state)
 
-Behind the proxy: write the Caddyfile, Authelia's users database and Authelia's
-configuration from the server's records. Caddy (running with `--watch`) and
-Authelia (watching its users file) reread the first two when they change; the
-configuration only changes with `proxy.json`, which the installer follows with
-a restart. A Caddyfile Caddy would reject is not written: it keeps serving the
-last good one, and the error reaches whoever changed it. Without the proxy there
-is nothing to do.
+Behind the proxy or a tunnel: write Authelia's users database and configuration,
+and behind the proxy the Caddyfile, from the server's records. Caddy (running
+with `--watch`) and Authelia (watching its users file) reread the Caddyfile and
+the users database when they change; the configuration only changes with
+`proxy.json`, which the installer follows with a restart. A Caddyfile Caddy
+would reject is not written: it keeps serving the last good one, and the error
+reaches whoever changed it. Without a login there is nothing to do.
 """
 apply_proxy!(state::ServerState) = apply_proxy!(state.auth, root_state(state))
 apply_proxy!(::OpenAuth, ::ServerState) = nothing
 
-function apply_proxy!(auth::ProxyAuth, root::ServerState)
+function apply_proxy!(auth::LoginAuth, root::ServerState)
     cfg = auth.config
     writer = root.proxy_writer
     # Rendered and written as one step, one writer at a time: two changes at
     # once must not leave the earlier state on disk.
     lock(writer.lock) do
-        caddyfile, users = lock(root.lock) do
-            (render_caddyfile(auth, values(root.worker_credentials[])),
-             render_users_yaml(values(root.accounts[])))
-        end
-        candidate = cfg.caddyfile * ".new"
-        atomic_write(io -> write(io, caddyfile), candidate; mode = 0o600)
-        try
-            check_caddyfile(cfg, candidate)
-        catch
-            rm(candidate; force = true)
-            rethrow()
-        end
-        mv(candidate, cfg.caddyfile; force = true)
+        write_front!(auth, root)
+        users = lock(() -> render_users_yaml(values(root.accounts[])), root.lock)
         # Authelia rereads its users database when the file changes, but a
         # change within half a second of its last reread is dropped, not
         # deferred: Authelia would keep the state before it (a disabled account
@@ -125,11 +114,29 @@ function apply_proxy!(auth::ProxyAuth, root::ServerState)
             atomic_write(io -> write(io, users), cfg.users_file; mode = 0o600)
             writer.users_written = time()
         end
-        authelia = render_authelia_config(cfg, authelia_secrets(root.state_dir), smtp_settings(root.state_dir))
+        authelia = render_authelia_config(auth, authelia_secrets(root.state_dir), smtp_settings(root.state_dir))
         atomic_write(io -> write(io, authelia), authelia_config_file(cfg); mode = 0o600)
     end
     return nothing
 end
+
+# What stands in front of the server: behind the proxy Caddy, whose Caddyfile
+# carries the worker credentials; behind a tunnel nothing of ours.
+function write_front!(auth::ProxyAuth, root::ServerState)
+    cfg = auth.config
+    caddyfile = lock(() -> render_caddyfile(auth, values(root.worker_credentials[])), root.lock)
+    candidate = cfg.caddyfile * ".new"
+    atomic_write(io -> write(io, caddyfile), candidate; mode = 0o600)
+    try
+        check_caddyfile(cfg, candidate)
+    catch
+        rm(candidate; force = true)
+        rethrow()
+    end
+    mv(candidate, cfg.caddyfile; force = true)
+    return nothing
+end
+write_front!(::TunnelAuth, ::ServerState) = nothing
 
 # ── Worker credentials ───────────────────────────────────────────────────────
 
@@ -380,7 +387,7 @@ end
 invite_response(::OpenAuth, state::ServerState, request, token::AbstractString) =
     invite_page(404, "Not found", "<p>This server has no accounts to invite anyone to.</p>")
 
-function invite_response(auth::ProxyAuth, state::ServerState, request, token::AbstractString)
+function invite_response(auth::LoginAuth, state::ServerState, request, token::AbstractString)
     open_invite(state, token) === nothing && return invite_page(404, "This invite is not valid",
         "<p>The link was used already, revoked, or has expired. Ask for a new one.</p>")
     request.method == "POST" ||
@@ -403,7 +410,7 @@ function invite_response(auth::ProxyAuth, state::ServerState, request, token::Ab
     return invite_page(200, "Your account is ready", """
         <p>Account <b>$(esc_html(name))</b>. Your password, shown only now:</p>
         <p><code class="pw">$(esc_html(password))</code></p>
-        <p>Store it in your password manager, then <a href="$(esc_html(public_origin(cfg, cfg.domain)))">log in</a>.
+        <p>Store it in your password manager, then <a href="$(esc_html(dashboard_url(auth)))">log in</a>.
         At the first login you set up a second factor (an authenticator app or a security key).
         $(second_factor)</p>""")
 end
@@ -603,7 +610,7 @@ network): an admin issues a credential and gets the install command that carries
 it (shown once); the credentials issued so far can be revoked. A member is told
 to ask an admin. (One machine's server has no credentials: dashboard.jl.)
 """
-function worker_install_block(::Union{ProxyAuth,NetworkAuth}, session::Bonito.Session, state::ServerState)
+function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Session, state::ServerState)
     summary = DOM.summary(DOM.span("Add a worker"; class = "bt-discover-title");
                           class = "bt-discover-header")
     if !is_admin(state)
@@ -682,9 +689,8 @@ end
 
 own_account_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.div()
 
-function own_account_section(auth::ProxyAuth, session::Bonito.Session, state::ServerState)
+function own_account_section(auth::LoginAuth, session::Bonito.Session, state::ServerState)
     user = state.user
-    cfg = auth.config
     status = Observable("")
     secret = Observable("")
     renew = Observable(false)
@@ -695,7 +701,7 @@ function own_account_section(auth::ProxyAuth, session::Bonito.Session, state::Se
         end)
     end
     groups = isempty(user.groups) ? "no groups" : "groups: " * join(user.groups, ", ")
-    logout = public_origin(cfg, cfg.auth_domain) * "/logout?rd=" * HTTP.escapeuri(public_origin(cfg, cfg.domain))
+    logout = portal_url(auth) * "/logout?rd=" * HTTP.escapeuri(dashboard_url(auth))
     return DOM.div(
         DOM.div(DOM.h2("Your account"); class = "bt-section"),
         DOM.div(
@@ -715,7 +721,7 @@ end
 
 accounts_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.div()
 
-function accounts_section(auth::ProxyAuth, session::Bonito.Session, state::ServerState)
+function accounts_section(auth::LoginAuth, session::Bonito.Session, state::ServerState)
     status = Observable("")
     secret = Observable("")
     # [verb, account, argument] from a row's buttons and group field.
@@ -833,7 +839,7 @@ end
 
 invites_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.div()
 
-function invites_section(::ProxyAuth, session::Bonito.Session, state::ServerState)
+function invites_section(::LoginAuth, session::Bonito.Session, state::ServerState)
     status = Observable("")
     link = Observable("")
     groups = Observable("")
@@ -933,7 +939,7 @@ whoever manages it.
 """
 worker_sharing_row(::OpenAuth, session::Bonito.Session, state::ServerState, worker_id::String) = DOM.div()
 
-function worker_sharing_row(::ProxyAuth, session::Bonito.Session, state::ServerState, worker_id::String)
+function worker_sharing_row(::LoginAuth, session::Bonito.Session, state::ServerState, worker_id::String)
     w = get(state.workers[], worker_id, nothing)
     (w === nothing || !can_manage(state, w)) && return DOM.div()
     status = Observable("")

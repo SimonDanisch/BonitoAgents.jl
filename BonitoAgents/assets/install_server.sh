@@ -4,51 +4,58 @@
 #
 #   bash BonitoAgents/assets/install_server.sh
 #
-# It asks for what it needs (the domain, the admin, optional mail); every answer
-# can also be given as an option, and `--no-prompt` makes a missing required one
-# an error instead of a question.
+# It asks for what it needs (how the server is reached, its domain, the admin,
+# optional mail) and saves the answers right away, before anything can fail: a
+# second run offers them again ("Use these settings?"), and --reconfigure asks
+# anew. Every answer can also be given as an option; `--no-prompt` makes a
+# missing required one an error instead of a question.
 #
-# Sets the server up behind a login proxy, so nothing of BonitoAgents itself is
-# reachable from the network:
-#   * Caddy terminates HTTPS (Let's Encrypt, renewed by itself) and routes the
-#     dashboard through Authelia's login, `/w` through the per-worker credentials
-#     ("Add worker" on the dashboard issues one per machine), and the worker
-#     installer and invite links to anyone (they carry their own proof).
-#   * Authelia is the login: a password plus a second factor (an authenticator
-#     app or a security key), with brute-force lockout.
-#   * BonitoAgents listens on 127.0.0.1 and takes the proxy's word for who a
-#     request is from. It owns the proxy's configuration: the Caddyfile (worker
-#     credentials), Authelia's users database (accounts, and their passwords:
-#     Authelia's own password reset is off) and Authelia's configuration with
-#     its secrets, and renders them whenever it starts. This script only writes
-#     what they are rendered from: proxy.json, the first admin, mail settings.
+# People log in through Authelia: a password plus a second factor (an
+# authenticator app or a security key), with brute-force lockout. BonitoAgents
+# listens on 127.0.0.1 and owns the login's configuration: Authelia's users
+# database (accounts, and their passwords: Authelia's own password reset is off)
+# and Authelia's configuration with its secrets, which it renders whenever it
+# starts. This script only writes what they are rendered from: proxy.json, the
+# first admin, mail settings. Three ways to reach it (`--tls`):
 #
-# The one thing no script can do is make this machine reachable on ports 80 and
-# 443 under its DNS name (a public IP, DNS records, the router forwarding both
-# ports). The installer checks that before Let's Encrypt is asked for a
-# certificate, and stops with a clear message if it is not so.
+#   * tunnel (the default): something in front of this machine brings HTTPS,
+#     e.g. a Cloudflare Tunnel, and forwards https://<domain> to
+#     http://localhost:8038. That is all it has to do: the server itself asks
+#     Authelia about every request and serves the login page under its own name
+#     (https://<domain>/authelia). No certificates, DNS records or open ports
+#     here; nothing but the server and Authelia runs.
+#   * acme: this machine answers on ports 80 and 443 itself. Caddy terminates
+#     HTTPS (Let's Encrypt, renewed by itself) and routes the dashboard through
+#     Authelia's login, which lives on its own name (auth.<domain>). The
+#     machine has to be reachable on both ports under its DNS names (a public
+#     IP, DNS records, the router forwarding both ports); the installer checks
+#     that before Let's Encrypt is asked for a certificate.
+#   * internal: like acme, with certificates from Caddy's own CA: a LAN, or a
+#     test on one machine; every browser and worker has to trust its root.
+#
+# Workers join with a credential "Add worker" on the dashboard issues, one per
+# machine: checked by the server behind a tunnel, by Caddy otherwise.
 #
 # Re-run it to update: services are stopped first; secrets, accounts and the
-# mail settings are kept, the previous answers are the defaults, and binaries
-# are only replaced when their version changed.
+# mail settings are kept, and binaries are only replaced when their version
+# changed.
 #
 # Options:
+#   --tls MODE             tunnel (default), acme or internal: see above
 #   --domain NAME          the dashboard's host name, e.g. team.example.com
-#   --auth-domain NAME     the login portal's host name (default: auth.<--domain>); it must
-#                          sit under --domain's parent, which the login cookie covers
+#   --auth-domain NAME     acme/internal: the login portal's host name (default:
+#                          auth.<--domain>); it must sit under --domain's parent,
+#                          which the login cookie covers
 #   --admin NAME           the first admin account (default: the installing user)
 #   --admin-email ADDR     its email address
-#   --acme-email ADDR      contact for Let's Encrypt (optional: certificate notices)
-#   --acme-staging         certificates from Let's Encrypt's staging CA: for trying an
-#                          install out without running into its rate limits (browsers
-#                          warn about them)
-#   --tls internal         certificates from Caddy's own CA instead of Let's Encrypt:
-#                          no public domain or open ports needed (a LAN, or a test on
-#                          one machine), but every browser and worker has to trust
-#                          Caddy's root certificate (printed at the end)
-#   --port PORT            BonitoAgents' port on 127.0.0.1 (default: 8038)
-#   --https-port PORT      Caddy's HTTPS port (default: 443)
-#   --http-port PORT       Caddy's HTTP port (default: 80; Let's Encrypt checks port 80)
+#   --acme-email ADDR      acme: contact for Let's Encrypt (optional: certificate notices)
+#   --acme-staging         acme: certificates from Let's Encrypt's staging CA, for
+#                          trying an install out without running into its rate
+#                          limits (browsers warn about them)
+#   --port PORT            BonitoAgents' port on 127.0.0.1 (default: 8038): what the
+#                          tunnel forwards to
+#   --https-port PORT      acme/internal: Caddy's HTTPS port (default: 443)
+#   --http-port PORT       acme/internal: Caddy's HTTP port (default: 80; Let's Encrypt checks port 80)
 #   --authelia-port PORT   Authelia's port on 127.0.0.1 (default: 9091)
 #   --smtp-host HOST       lets Authelia send mail, so the one-time code that
 #   --smtp-port PORT       confirms a new second factor reaches people directly
@@ -58,12 +65,13 @@
 #   --no-smtp              drop mail settings kept from a previous install
 #   --caddy-version V      default: the latest release
 #   --authelia-version V   default: the latest release
-#   --skip-port-check      for networks where this machine cannot reach its own
+#   --skip-port-check      acme: for networks where this machine cannot reach its own
 #                          public address (no NAT hairpinning); Let's Encrypt then
 #                          reports a closed port itself.
 #   --instance NAME        a separate install next to the default one: its own
 #                          services (bonitoagents-NAME-*), data and binaries. Give it
 #                          its own ports too.
+#   --reconfigure          ask everything again (the saved answers are the defaults)
 #   --no-update            leave the monorepo's Julia environment as it is
 #   --no-prompt            ask nothing (for scripted installs)
 set -euo pipefail
@@ -90,32 +98,35 @@ CADDY_VERSION=""
 AUTHELIA_VERSION=""
 SKIP_PORT_CHECK=0
 INSTANCE=""
+RECONFIGURE=0
 UPDATE=1
 PROMPT=1
+GIVEN=0     # answers given as options: no "use the saved settings?" then
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --domain)            DOMAIN="$2";            shift 2 ;;
-        --auth-domain)       AUTH_DOMAIN="$2";       shift 2 ;;
-        --admin)             ADMIN="$2";             shift 2 ;;
-        --admin-email)       ADMIN_EMAIL="$2";       shift 2 ;;
-        --acme-email)        ACME_EMAIL="$2";        shift 2 ;;
-        --acme-staging)      ACME_STAGING=1;         shift ;;
-        --tls)               TLS="$2";               shift 2 ;;
-        --port)              PORT="$2";              shift 2 ;;
-        --https-port)        HTTPS_PORT="$2";        shift 2 ;;
-        --http-port)         HTTP_PORT="$2";         shift 2 ;;
-        --authelia-port)     AUTHELIA_PORT="$2";     shift 2 ;;
-        --smtp-host)         SMTP_HOST="$2";         shift 2 ;;
-        --smtp-port)         SMTP_PORT="$2";         shift 2 ;;
-        --smtp-user)         SMTP_USER="$2";         shift 2 ;;
-        --smtp-password)     SMTP_PASSWORD="$2";     shift 2 ;;
-        --smtp-sender)       SMTP_SENDER="$2";       shift 2 ;;
-        --no-smtp)           NO_SMTP=1;              shift ;;
+        --domain)            DOMAIN="$2";            GIVEN=1; shift 2 ;;
+        --auth-domain)       AUTH_DOMAIN="$2";       GIVEN=1; shift 2 ;;
+        --admin)             ADMIN="$2";             GIVEN=1; shift 2 ;;
+        --admin-email)       ADMIN_EMAIL="$2";       GIVEN=1; shift 2 ;;
+        --acme-email)        ACME_EMAIL="$2";        GIVEN=1; shift 2 ;;
+        --acme-staging)      ACME_STAGING=1;         GIVEN=1; shift ;;
+        --tls)               TLS="$2";               GIVEN=1; shift 2 ;;
+        --port)              PORT="$2";              GIVEN=1; shift 2 ;;
+        --https-port)        HTTPS_PORT="$2";        GIVEN=1; shift 2 ;;
+        --http-port)         HTTP_PORT="$2";         GIVEN=1; shift 2 ;;
+        --authelia-port)     AUTHELIA_PORT="$2";     GIVEN=1; shift 2 ;;
+        --smtp-host)         SMTP_HOST="$2";         GIVEN=1; shift 2 ;;
+        --smtp-port)         SMTP_PORT="$2";         GIVEN=1; shift 2 ;;
+        --smtp-user)         SMTP_USER="$2";         GIVEN=1; shift 2 ;;
+        --smtp-password)     SMTP_PASSWORD="$2";     GIVEN=1; shift 2 ;;
+        --smtp-sender)       SMTP_SENDER="$2";       GIVEN=1; shift 2 ;;
+        --no-smtp)           NO_SMTP=1;              GIVEN=1; shift ;;
         --caddy-version)     CADDY_VERSION="$2";     shift 2 ;;
         --authelia-version)  AUTHELIA_VERSION="$2";  shift 2 ;;
         --skip-port-check)   SKIP_PORT_CHECK=1;      shift ;;
         --instance)          INSTANCE="$2";          shift 2 ;;
+        --reconfigure)       RECONFIGURE=1;          shift ;;
         --no-update)         UPDATE=0;               shift ;;
         --no-prompt)         PROMPT=0;               shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -163,15 +174,16 @@ fi
 case "$(uname -m)" in
     x86_64|amd64)  ARCH=amd64 ;;
     aarch64|arm64) ARCH=arm64 ;;
-    *) fail "no Caddy/Authelia builds for this CPU: $(uname -m)" ;;
+    *) fail "no Authelia/Caddy builds for this CPU: $(uname -m)" ;;
 esac
 
 # ── Answers ───────────────────────────────────────────────────────────────────
-# A previous install's answers are the defaults (proxy.json is written below, one
-# `"key": value` per line).
+# The saved answers (proxy.json, written below as soon as the answers are
+# complete, one `"key": value` per line).
+SAVED="$STATE_DIR/proxy.json"
 previous() {
-    sudo test -f "$STATE_DIR/proxy.json" || return 0
-    sudo sed -n "s/^  \"$1\": \"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}\$/\1/p" "$STATE_DIR/proxy.json"
+    sudo test -f "$SAVED" || return 0
+    sudo sed -n "s/^  \"$1\": \"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}\$/\1/p" "$SAVED"
 }
 PREV_SMTP=false
 sudo test -f "$STATE_DIR/smtp.json" && PREV_SMTP=true
@@ -202,22 +214,60 @@ yes_no() {   # yes_no "question" default(y|n) -> status
     reply="${reply:-$2}"
     [[ "$reply" =~ ^[Yy] ]]
 }
+# What was not given takes the saved value, else the default.
+default() {   # default VAR key fallback
+    local var="$1" key="$2" fallback="$3" prev
+    [[ -n "${!var}" ]] && return 0
+    prev="$(previous "$key")"
+    printf -v "$var" '%s' "${prev:-$fallback}"
+}
 
-if [[ $PROMPT -eq 1 ]]; then
-    echo "==> BonitoAgents server setup (Enter takes the value in brackets)"
-    ask DOMAIN "Dashboard domain, e.g. team.example.com" "$(previous domain)"
+# A run after one that got as far as saving its answers: take them as they are.
+USE_SAVED=0
+if [[ $PROMPT -eq 1 && $RECONFIGURE -eq 0 && $GIVEN -eq 0 ]] && sudo test -f "$SAVED" &&
+   [[ -n "$(previous domain)" ]]; then
+    saved_tls="$(previous tls)"
+    echo "==> BonitoAgents server setup: the settings from last time ($SAVED)"
+    echo "    Dashboard : https://$(previous domain)"
+    echo "    Reached   : $(case "$saved_tls" in
+        tunnel)   echo "through a tunnel, to http://localhost:$(previous port)" ;;
+        internal) echo "directly, with Caddy's own CA" ;;
+        *)        echo "directly, on ports 80 and 443 (Let's Encrypt)" ;; esac)"
+    echo "    Admin     : $(previous admin)"
+    echo "    Mail      : $([[ "$PREV_SMTP" == true ]] && echo "kept" || echo "none")"
+    yes_no "Use these settings" y && USE_SAVED=1
+    echo
 fi
-[[ -n "$DOMAIN" ]] || fail "the dashboard's domain is required: --domain team.example.com"
-if [[ $PROMPT -eq 1 ]]; then
-    # auth.<domain> by default: the login cookie then covers exactly the
-    # dashboard, and it works for any domain, including a dynamic-DNS name.
-    prev_auth="$(previous auth_domain)"
-    [[ "$(previous domain)" == "$DOMAIN" && -n "$prev_auth" ]] || prev_auth="auth.$DOMAIN"
-    ask AUTH_DOMAIN "Login portal domain" "$prev_auth"
+
+if [[ $PROMPT -eq 1 && $USE_SAVED -eq 0 ]]; then
+    echo "==> BonitoAgents server setup (Enter takes the value in brackets)"
+    if [[ -z "$TLS" ]]; then
+        prev_tls="$(previous tls)"
+        echo "    How do people reach this server?"
+        echo "      1) through a tunnel (Cloudflare Tunnel or similar) that forwards to http://localhost:${PORT:-8038}"
+        echo "      2) directly: this machine answers on ports 80 and 443 (Let's Encrypt)"
+        echo "      3) directly, inside a LAN (Caddy's own certificate authority)"
+        case "${prev_tls:-tunnel}" in acme) prev_choice=2 ;; internal) prev_choice=3 ;; *) prev_choice=1 ;; esac
+        choice=""
+        ask choice "Choose 1, 2 or 3" "$prev_choice"
+        case "$choice" in
+            1) TLS=tunnel ;; 2) TLS=acme ;; 3) TLS=internal ;;
+            *) fail "choose 1, 2 or 3 (got '$choice')" ;;
+        esac
+    fi
+    ask DOMAIN "Dashboard domain, e.g. team.example.com" "$(previous domain)"
+    if [[ "$TLS" != tunnel ]]; then
+        # auth.<domain> by default: the login cookie then covers exactly the
+        # dashboard, and it works for any domain, including a dynamic-DNS name.
+        prev_auth="$(previous auth_domain)"
+        [[ "$(previous domain)" == "$DOMAIN" && -n "$prev_auth" ]] || prev_auth="auth.$DOMAIN"
+        ask AUTH_DOMAIN "Login portal domain" "$prev_auth"
+    fi
     prev_admin="$(previous admin)"
     ask ADMIN "Admin account" "${prev_admin:-$SERVICE_USER}"
-    ask ADMIN_EMAIL "Admin email (optional)"
-    ask ACME_EMAIL "Email for Let's Encrypt notices (optional)" "${ADMIN_EMAIL:-$(previous acme_email)}"
+    ask ADMIN_EMAIL "Admin email (optional)" "$(previous admin_email)"
+    [[ "$TLS" == acme ]] &&
+        ask ACME_EMAIL "Email for Let's Encrypt notices (optional)" "${ADMIN_EMAIL:-$(previous acme_email)}"
     if [[ -z "$SMTP_HOST" && $NO_SMTP -eq 0 ]]; then
         if [[ "$PREV_SMTP" == true ]]; then
             yes_no "Keep the current mail settings" y || NO_SMTP=1
@@ -233,34 +283,47 @@ if [[ $PROMPT -eq 1 ]]; then
         fi
     fi
 fi
-# What was not given takes the previous install's value, else the default.
-default() {   # default VAR key fallback
-    local var="$1" key="$2" fallback="$3" prev
-    [[ -n "${!var}" ]] && return 0
-    prev="$(previous "$key")"
-    printf -v "$var" '%s' "${prev:-$fallback}"
-}
-[[ -n "$AUTH_DOMAIN" ]] || AUTH_DOMAIN="auth.$DOMAIN"
+default TLS tls tunnel
+default DOMAIN domain ""
+[[ -n "$DOMAIN" ]] || fail "the dashboard's domain is required: --domain team.example.com"
 default ADMIN admin "$SERVICE_USER"
-default ACME_EMAIL acme_email ""
-default TLS tls acme
+default ADMIN_EMAIL admin_email ""
 default PORT port 8038
-default HTTPS_PORT https_port 443
-default HTTP_PORT http_port 80
 default AUTHELIA_PORT authelia_port 9091
+if [[ "$TLS" == tunnel ]]; then
+    # One name: the login page is under it (https://<domain>/authelia).
+    AUTH_DOMAIN=""
+    ACME_EMAIL=""
+    HTTPS_PORT=443
+    HTTP_PORT=80
+else
+    # The saved portal belongs to the saved domain only.
+    if [[ -z "$AUTH_DOMAIN" ]]; then
+        AUTH_DOMAIN="auth.$DOMAIN"
+        [[ "$(previous domain)" == "$DOMAIN" && -n "$(previous auth_domain)" ]] && AUTH_DOMAIN="$(previous auth_domain)"
+    fi
+    default ACME_EMAIL acme_email ""
+    default HTTPS_PORT https_port 443
+    default HTTP_PORT http_port 80
+fi
 [[ -n "$SMTP_PORT" ]] || SMTP_PORT=587
 ACME_CA=""
 [[ $ACME_STAGING -eq 1 ]] && ACME_CA="https://acme-staging-v02.api.letsencrypt.org/directory"
 
-# Authelia's login cookie has to cover both host names.
-COOKIE_DOMAIN="${AUTH_DOMAIN#*.}"
-[[ "$DOMAIN" == "$COOKIE_DOMAIN" || "$DOMAIN" == *".$COOKIE_DOMAIN" ]] ||
-    fail "the dashboard ($DOMAIN) and the login portal ($AUTH_DOMAIN) must share a parent domain ($COOKIE_DOMAIN) for the login cookie"
+[[ "$TLS" == tunnel || "$TLS" == acme || "$TLS" == internal ]] ||
+    fail "--tls is 'tunnel', 'acme' (Let's Encrypt) or 'internal' (got '$TLS')"
+[[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || fail "the domain is a host name, e.g. team.example.com (got '$DOMAIN')"
+if [[ "$TLS" != tunnel ]]; then
+    [[ "$AUTH_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || fail "the login portal's domain is a host name (got '$AUTH_DOMAIN')"
+    # Authelia's login cookie has to cover both host names.
+    COOKIE_DOMAIN="${AUTH_DOMAIN#*.}"
+    [[ "$DOMAIN" == "$COOKIE_DOMAIN" || "$DOMAIN" == *".$COOKIE_DOMAIN" ]] ||
+        fail "the dashboard ($DOMAIN) and the login portal ($AUTH_DOMAIN) must share a parent domain ($COOKIE_DOMAIN) for the login cookie"
+fi
 [[ "$ADMIN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
     fail "the admin account must be letters, digits, '.', '_' and '-' (got '$ADMIN')"
 [[ "$ADMIN_EMAIL$ACME_EMAIL$SMTP_SENDER" != *[\"\\\']* ]] ||
     fail "email addresses must not contain quotes or backslashes"
-[[ "$TLS" == acme || "$TLS" == internal ]] || fail "--tls is 'acme' (Let's Encrypt) or 'internal' (got '$TLS')"
 for p in "$PORT" "$HTTPS_PORT" "$HTTP_PORT" "$AUTHELIA_PORT"; do
     [[ "$p" =~ ^[0-9]+$ ]] || fail "ports are numbers (got '$p')"
 done
@@ -275,15 +338,55 @@ else
 fi
 SMTP_ON=$([[ $SMTP_MODE == none ]] && echo false || echo true)
 ORIGIN="https://$DOMAIN$([[ $HTTPS_PORT == 443 ]] || echo ":$HTTPS_PORT")"
+if [[ "$TLS" == tunnel ]]; then
+    PORTAL="$ORIGIN/authelia"
+else
+    PORTAL="https://$AUTH_DOMAIN$([[ $HTTPS_PORT == 443 ]] || echo ":$HTTPS_PORT")"
+fi
+
+# ── Save the answers ──────────────────────────────────────────────────────────
+# Before anything can go wrong, so a run that stops halfway is not a lost setup:
+# the next one offers the same settings again. This is also what the server
+# renders the login's configuration from.
+step "Data dir: $DATA_DIR"
+sudo mkdir -p "$STATE_DIR" "$DATA_DIR/projects" "$AUTHELIA_DIR"
+[[ "$TLS" == tunnel ]] || sudo mkdir -p "$CADDY_DIR/data" "$CADDY_DIR/config"
+sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
+sudo chmod 750 "$DATA_DIR"
+ok "owned by $SERVICE_USER"
+if [[ "$TLS" == tunnel ]]; then
+    front="$(printf '  "tls": "tunnel",\n')"
+else
+    front="$(printf '  "auth_domain": "%s",\n  "https_port": %s,\n  "http_port": %s,\n  "tls": "%s",\n  "acme_ca": "%s",\n  "acme_email": "%s",\n  "caddy_bin": "%s",\n  "caddyfile": "%s",' \
+        "$AUTH_DOMAIN" "$HTTPS_PORT" "$HTTP_PORT" "$TLS" "$ACME_CA" "$ACME_EMAIL" "$BIN_DIR/caddy" "$CADDY_DIR/Caddyfile")"
+fi
+sudo tee "$SAVED" > /dev/null << EOF
+{
+  "domain": "$DOMAIN",
+  "admin": "$ADMIN",
+  "admin_email": "$ADMIN_EMAIL",
+  "port": $PORT,
+  "authelia_port": $AUTHELIA_PORT,
+$front
+  "authelia_bin": "$BIN_DIR/authelia",
+  "users_file": "$AUTHELIA_DIR/users.yml"
+}
+EOF
+sudo chown "$SERVICE_USER:$SERVICE_USER" "$SAVED"
+ok "settings saved to $SAVED (the next run offers them again)"
 
 echo ""
 echo "==> BonitoAgents server installer${INSTANCE:+ (instance $INSTANCE)}"
 echo "    Monorepo     : $MONOREPO_DIR"
 echo "    Service user : $SERVICE_USER"
 echo "    Dashboard    : $ORIGIN"
-echo "    Login portal : https://$AUTH_DOMAIN$([[ $HTTPS_PORT == 443 ]] || echo ":$HTTPS_PORT")"
+echo "    Login page   : $PORTAL"
 echo "    Admin        : $ADMIN"
-echo "    Certificates : $([[ $TLS == internal ]] && echo "Caddy's own CA" || echo "Let's Encrypt${ACME_CA:+ (staging)}")"
+case "$TLS" in
+    tunnel)   echo "    HTTPS        : a tunnel, forwarding $ORIGIN to http://localhost:$PORT" ;;
+    internal) echo "    HTTPS        : Caddy, with its own CA" ;;
+    acme)     echo "    HTTPS        : Caddy, with Let's Encrypt${ACME_CA:+ (staging)}" ;;
+esac
 echo "    Mail         : $([[ $SMTP_MODE == none ]] && echo "none (codes go to a file admins read)" || echo "$SMTP_MODE")"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
@@ -307,17 +410,29 @@ for svc in "$UNIT_CADDY" "$UNIT_AUTHELIA" "$UNIT_SERVER"; do
         ok "stopped $svc"
     fi
 done
+# Behind a tunnel there is no Caddy: one left from an install that had it goes.
+if [[ "$TLS" == tunnel && -f "/etc/systemd/system/$UNIT_CADDY.service" ]]; then
+    sudo systemctl disable "$UNIT_CADDY" > /dev/null 2>&1 || true
+    sudo rm -f "/etc/systemd/system/$UNIT_CADDY.service"
+    sudo systemctl daemon-reload
+    ok "removed $UNIT_CADDY (a tunnel needs no Caddy)"
+fi
 
 # ── Reachability ──────────────────────────────────────────────────────────────
 step "Reachability"
-for p in "$HTTP_PORT" "$HTTPS_PORT" "$PORT" "$AUTHELIA_PORT"; do
+if [[ "$TLS" == tunnel ]]; then
+    PORTS=("$PORT" "$AUTHELIA_PORT")
+else
+    PORTS=("$HTTP_PORT" "$HTTPS_PORT" "$PORT" "$AUTHELIA_PORT")
+fi
+for p in "${PORTS[@]}"; do
     holder="$(sudo ss -Hltnp "sport = :$p" | head -1 || true)"
     [[ -z "$holder" ]] || fail "port $p is already in use on this machine: $holder"
 done
-ok "ports $HTTP_PORT, $HTTPS_PORT, $PORT and $AUTHELIA_PORT are free here"
+ok "ports ${PORTS[*]} are free here"
 # Before anything asks Let's Encrypt for a certificate: a failed ACME attempt
 # only says "timeout", and repeated failures are rate-limited for an hour.
-# Caddy's own CA needs neither DNS nor open ports.
+# Caddy's own CA needs neither DNS nor open ports, and a tunnel brings its own.
 if [[ $TLS == acme ]]; then
     PUBLIC_IP="$(curl -fsS4 --max-time 10 https://api.ipify.org || true)"
     [[ -n "$PUBLIC_IP" ]] || fail "could not determine this machine's public IPv4 address (https://api.ipify.org)"
@@ -326,36 +441,40 @@ if [[ $TLS == acme ]]; then
         ips="$(getent ahostsv4 "$name" | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
         [[ -n "$ips" ]] || fail "$name does not resolve. Add a DNS A record for it pointing at $PUBLIC_IP."
         [[ " $ips" == *" $PUBLIC_IP "* ]] ||
-            fail "$name resolves to $ips, but this machine's public address is $PUBLIC_IP. Point its A record here (and wait for DNS to catch up)."
+            fail "$name resolves to $ips, but this machine's public address is $PUBLIC_IP. Point its A record here (and wait for DNS to catch up). If a tunnel (e.g. Cloudflare's) brings it here instead, rerun with --tls tunnel."
         ok "$name → $PUBLIC_IP"
     done
-else
+elif [[ $TLS == internal ]]; then
     info "Caddy's own CA: no DNS or open ports needed"
+else
+    info "a tunnel: no DNS, certificates or open ports needed here"
 fi
 
-# ── Caddy + Authelia binaries ─────────────────────────────────────────────────
+# ── Authelia (+ Caddy) binaries ───────────────────────────────────────────────
 latest_tag() {
     curl -fsSL "https://api.github.com/repos/$1/releases/latest" |
         sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1
 }
 
-step "Caddy"
-[[ -n "$CADDY_VERSION" ]] || CADDY_VERSION="$(latest_tag caddyserver/caddy || true)"
-CADDY_VERSION="${CADDY_VERSION#v}"
-[[ -n "$CADDY_VERSION" ]] || fail "could not find Caddy's latest release (GitHub API); pass --caddy-version"
-if [[ -x "$BIN_DIR/caddy" ]] && "$BIN_DIR/caddy" version 2>/dev/null | grep -q "^v$CADDY_VERSION "; then
-    ok "v$CADDY_VERSION already installed"
-else
-    f="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz"
-    base="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
-    curl -fsSL -o "$TMP/$f" "$base/$f"
-    curl -fsSL -o "$TMP/caddy.sums" "$base/caddy_${CADDY_VERSION}_checksums.txt"
-    (cd "$TMP" && grep " $f\$" caddy.sums | sha512sum -c --status) ||
-        fail "Caddy v$CADDY_VERSION: $f does not match its published checksum"
-    tar -xzf "$TMP/$f" -C "$TMP" caddy
-    sudo install -d -m 755 "$BIN_DIR"
-    sudo install -m 755 "$TMP/caddy" "$BIN_DIR/caddy"
-    ok "v$CADDY_VERSION installed (checksum verified)"
+if [[ "$TLS" != tunnel ]]; then
+    step "Caddy"
+    [[ -n "$CADDY_VERSION" ]] || CADDY_VERSION="$(latest_tag caddyserver/caddy || true)"
+    CADDY_VERSION="${CADDY_VERSION#v}"
+    [[ -n "$CADDY_VERSION" ]] || fail "could not find Caddy's latest release (GitHub API); pass --caddy-version"
+    if [[ -x "$BIN_DIR/caddy" ]] && "$BIN_DIR/caddy" version 2>/dev/null | grep -q "^v$CADDY_VERSION "; then
+        ok "v$CADDY_VERSION already installed"
+    else
+        f="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz"
+        base="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+        curl -fsSL -o "$TMP/$f" "$base/$f"
+        curl -fsSL -o "$TMP/caddy.sums" "$base/caddy_${CADDY_VERSION}_checksums.txt"
+        (cd "$TMP" && grep " $f\$" caddy.sums | sha512sum -c --status) ||
+            fail "Caddy v$CADDY_VERSION: $f does not match its published checksum"
+        tar -xzf "$TMP/$f" -C "$TMP" caddy
+        sudo install -d -m 755 "$BIN_DIR"
+        sudo install -m 755 "$TMP/caddy" "$BIN_DIR/caddy"
+        ok "v$CADDY_VERSION installed (checksum verified)"
+    fi
 fi
 
 step "Authelia"
@@ -380,7 +499,7 @@ fi
 # ── Port 80 answers from outside ──────────────────────────────────────────────
 # A throwaway Caddy answers a random token on the HTTP port; fetching it through
 # the domain on port 80 proves DNS, the router and the firewall all lead here.
-if [[ $TLS == internal ]]; then
+if [[ $TLS != acme ]]; then
     :
 elif [[ $SKIP_PORT_CHECK -eq 1 ]]; then
     info "port check skipped (--skip-port-check)"
@@ -407,14 +526,8 @@ EOF
     ok "http://$DOMAIN/ answers from this machine"
 fi
 
-# ── Data dirs ─────────────────────────────────────────────────────────────────
-step "Data dir: $DATA_DIR"
-sudo mkdir -p "$STATE_DIR" "$DATA_DIR/projects" "$CADDY_DIR/data" "$CADDY_DIR/config" "$AUTHELIA_DIR"
-sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
-sudo chmod 750 "$DATA_DIR"
-ok "owned by $SERVICE_USER"
-# An install from before the login proxy had one secret shared by every worker;
-# each worker now has its own credential ("Add worker").
+# An install from before the login had one secret shared by every worker; each
+# worker now has its own credential ("Add worker").
 if sudo test -f "$STATE_DIR/worker_secret"; then
     sudo rm -f "$STATE_DIR/worker_secret"
     info "retired the old shared worker secret: reinstall each worker with \"Add worker\""
@@ -452,29 +565,6 @@ else
     ok "created $ADMIN"
 fi
 
-# ── What the server renders the proxy's configuration from ────────────────────
-step "proxy.json"
-sudo tee "$STATE_DIR/proxy.json" > /dev/null << EOF
-{
-  "domain": "$DOMAIN",
-  "auth_domain": "$AUTH_DOMAIN",
-  "admin": "$ADMIN",
-  "port": $PORT,
-  "authelia_port": $AUTHELIA_PORT,
-  "https_port": $HTTPS_PORT,
-  "http_port": $HTTP_PORT,
-  "tls": "$TLS",
-  "acme_ca": "$ACME_CA",
-  "caddy_bin": "$BIN_DIR/caddy",
-  "authelia_bin": "$BIN_DIR/authelia",
-  "caddyfile": "$CADDY_DIR/Caddyfile",
-  "users_file": "$AUTHELIA_DIR/users.yml",
-  "acme_email": "$ACME_EMAIL"
-}
-EOF
-sudo chown "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR/proxy.json"
-ok "written"
-
 step "Mail"
 json_str() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '"%s"' "$s"; }
 case $SMTP_MODE in
@@ -501,9 +591,14 @@ esac
 
 # ── systemd services ──────────────────────────────────────────────────────────
 step "systemd services"
+if [[ "$TLS" == tunnel ]]; then
+    in_front="the tunnel forwards to it, it asks Authelia"
+else
+    in_front="Caddy + Authelia in front"
+fi
 sudo tee "/etc/systemd/system/$UNIT_SERVER.service" > /dev/null << EOF
 [Unit]
-Description=BonitoAgents dashboard server${INSTANCE:+ ($INSTANCE)} (localhost only; Caddy + Authelia in front)
+Description=BonitoAgents dashboard server${INSTANCE:+ ($INSTANCE)} (localhost only; $in_front)
 After=network-online.target
 Wants=network-online.target
 
@@ -511,7 +606,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Environment=PATH=$(dirname "$JULIA_BIN"):$BIN_DIR:/usr/local/bin:/usr/bin:/bin
-ExecStart=$SERVER_BIN --port $PORT --state-dir $STATE_DIR --working-dir $DATA_DIR/projects
+ExecStart=$SERVER_BIN --state-dir $STATE_DIR --working-dir $DATA_DIR/projects
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
@@ -560,7 +655,10 @@ ReadWritePaths=$AUTHELIA_DIR
 WantedBy=multi-user.target
 EOF
 
-sudo tee "/etc/systemd/system/$UNIT_CADDY.service" > /dev/null << EOF
+UNITS=("$UNIT_SERVER" "$UNIT_AUTHELIA")
+if [[ "$TLS" != tunnel ]]; then
+    UNITS+=("$UNIT_CADDY")
+    sudo tee "/etc/systemd/system/$UNIT_CADDY.service" > /dev/null << EOF
 [Unit]
 Description=BonitoAgents HTTPS proxy${INSTANCE:+ ($INSTANCE)} (Caddy)
 After=network-online.target $UNIT_SERVER.service $UNIT_AUTHELIA.service
@@ -589,19 +687,21 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 sudo systemctl daemon-reload
-sudo systemctl enable "$UNIT_SERVER" "$UNIT_AUTHELIA" "$UNIT_CADDY" > /dev/null 2>&1
-ok "installed + enabled"
+sudo systemctl enable "${UNITS[@]}" > /dev/null 2>&1
+ok "installed + enabled: ${UNITS[*]}"
 
-# ── Start: the server first, it renders the proxy's configuration ─────────────
+# ── Start: the server first, it renders the login's configuration ─────────────
 step "Start $UNIT_SERVER"
-RENDERED=("$CADDY_DIR/Caddyfile" "$AUTHELIA_DIR/users.yml" "$AUTHELIA_DIR/configuration.yml")
+RENDERED=("$AUTHELIA_DIR/users.yml" "$AUTHELIA_DIR/configuration.yml")
+[[ "$TLS" == tunnel ]] || RENDERED+=("$CADDY_DIR/Caddyfile")
 # Set the previous renders aside, so the wait below sees this start's.
 for f in "${RENDERED[@]}"; do
     sudo test -f "$f" && sudo mv "$f" "$f.previous"
 done
 sudo systemctl start "$UNIT_SERVER"
-printf "    wait : the server renders the proxy's configuration (a first start precompiles, minutes)"
+printf "    wait : the server renders the login's configuration (a first start precompiles, minutes)"
 rendered() { for f in "${RENDERED[@]}"; do sudo test -s "$f" || return 1; done; }
 for _ in $(seq 1 600); do
     rendered && break
@@ -611,45 +711,74 @@ for _ in $(seq 1 600); do
     sleep 1
 done
 echo
-rendered || fail "the server did not render the proxy's configuration within 10 minutes: journalctl -u $UNIT_SERVER -e"
+rendered || fail "the server did not render the login's configuration within 10 minutes: journalctl -u $UNIT_SERVER -e"
 sudo rm -f "${RENDERED[@]/%/.previous}"
 ok "active; configuration rendered"
 
-step "Validate the proxy configuration"
+step "Validate the configuration"
 sudo -u "$SERVICE_USER" "$BIN_DIR/authelia" validate-config --config "$AUTHELIA_DIR/configuration.yml" ||
     fail "Authelia rejects $AUTHELIA_DIR/configuration.yml (see above)"
-sudo -u "$SERVICE_USER" env XDG_DATA_HOME="$CADDY_DIR/data" XDG_CONFIG_HOME="$CADDY_DIR/config" \
-    "$BIN_DIR/caddy" validate --config "$CADDY_DIR/Caddyfile" --adapter caddyfile > /dev/null ||
-    fail "Caddy rejects $CADDY_DIR/Caddyfile (see above)"
-ok "Authelia and Caddy accept it"
+if [[ "$TLS" != tunnel ]]; then
+    sudo -u "$SERVICE_USER" env XDG_DATA_HOME="$CADDY_DIR/data" XDG_CONFIG_HOME="$CADDY_DIR/config" \
+        "$BIN_DIR/caddy" validate --config "$CADDY_DIR/Caddyfile" --adapter caddyfile > /dev/null ||
+        fail "Caddy rejects $CADDY_DIR/Caddyfile (see above)"
+    ok "Authelia and Caddy accept it"
+else
+    ok "Authelia accepts it"
+fi
 
-step "Start Authelia and Caddy"
-sudo systemctl start "$UNIT_AUTHELIA" "$UNIT_CADDY"
+step "Start ${UNITS[*]:1}"
+sudo systemctl start "${UNITS[@]:1}"
 sleep 3
-for svc in "$UNIT_AUTHELIA" "$UNIT_CADDY"; do
+for svc in "${UNITS[@]:1}"; do
     sudo systemctl is-active --quiet "$svc" || fail "$svc failed to start: journalctl -u $svc -e"
 done
 ok "active"
 
 # ── The dashboard answers, through the login ──────────────────────────────────
-step "HTTPS"
-if [[ $TLS == internal ]]; then
-    # Straight to this machine, trusting Caddy's CA for this one request.
-    fetch() { curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -k \
-                   --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" "$ORIGIN/" 2> /dev/null || true; }
+wants_login() { [[ "$1" =~ ^(302|303|401)$ ]]; }
+if [[ "$TLS" == tunnel ]]; then
+    step "The server, as the tunnel reaches it"
+    code=""
+    for _ in $(seq 1 60); do
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/" 2> /dev/null || true)"
+        wants_login "$code" && break
+        sleep 2
+    done
+    wants_login "$code" ||
+        fail "http://127.0.0.1:$PORT/ does not ask for a login (last status: ${code:-none}): journalctl -u $UNIT_SERVER -e"
+    ok "http://127.0.0.1:$PORT/ answers, and wants a login first ($code)"
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/authelia/" 2> /dev/null || true)"
+    [[ "$code" == 200 ]] || fail "the login page http://127.0.0.1:$PORT/authelia/ answers ${code:-nothing}: journalctl -u $UNIT_AUTHELIA -e"
+    ok "the login page answers"
+    step "Through the tunnel"
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$ORIGIN/" 2> /dev/null || true)"
+    if wants_login "$code"; then
+        ok "$ORIGIN answers through the tunnel, and wants a login first ($code)"
+    else
+        info "$ORIGIN does not lead here yet (status: ${code:-none}). Point the tunnel's public hostname"
+        info "$DOMAIN at http://localhost:$PORT (cloudflared: \`service: http://localhost:$PORT\`)."
+    fi
 else
-    fetch() { curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$ORIGIN/" 2> /dev/null || true; }
-fi
-code=""
-for _ in $(seq 1 60); do
-    code="$(fetch)"
-    [[ "$code" =~ ^(302|303|401)$ ]] && break
-    sleep 2
-done
-if [[ "$code" =~ ^(302|303|401)$ ]]; then
-    ok "$ORIGIN answers, and wants a login first ($code)"
-else
-    info "$ORIGIN is not answering yet (last status: ${code:-none}); Caddy keeps retrying the certificate: journalctl -u $UNIT_CADDY -f"
+    step "HTTPS"
+    if [[ $TLS == internal ]]; then
+        # Straight to this machine, trusting Caddy's CA for this one request.
+        fetch() { curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -k \
+                       --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" "$ORIGIN/" 2> /dev/null || true; }
+    else
+        fetch() { curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$ORIGIN/" 2> /dev/null || true; }
+    fi
+    code=""
+    for _ in $(seq 1 60); do
+        code="$(fetch)"
+        wants_login "$code" && break
+        sleep 2
+    done
+    if wants_login "$code"; then
+        ok "$ORIGIN answers, and wants a login first ($code)"
+    else
+        info "$ORIGIN is not answering yet (last status: ${code:-none}); Caddy keeps retrying the certificate: journalctl -u $UNIT_CADDY -f"
+    fi
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
@@ -662,6 +791,11 @@ if [[ -n "$ADMIN_PASSWORD" ]]; then
     echo "  Admin account : $ADMIN"
     echo "  Password      : $ADMIN_PASSWORD"
     echo "                  (shown only now; \"New password\" on the dashboard replaces it)"
+    echo ""
+fi
+if [[ "$TLS" == tunnel ]]; then
+    echo "  The tunnel forwards $ORIGIN to http://localhost:$PORT; the login page is"
+    echo "  $PORTAL, under the same name. Nothing else needs to be exposed."
     echo ""
 fi
 echo "  The first login sets up a second factor (an authenticator app or a security"
@@ -681,11 +815,12 @@ echo ""
 echo "  People: \"Invites\" on the dashboard makes a link for one new account."
 echo "  Workers: \"Add worker\" on the dashboard issues a credential and prints the"
 echo "  install command for the new machine. Workers from an install before the"
-echo "  login proxy must be reinstalled that way."
+echo "  login must be reinstalled that way."
 echo ""
 echo "  Logs: journalctl -u $UNIT_SERVER -f"
 echo "        journalctl -u $UNIT_AUTHELIA -f"
-echo "        journalctl -u $UNIT_CADDY -f"
+[[ "$TLS" == tunnel ]] || echo "        journalctl -u $UNIT_CADDY -f"
 echo ""
+echo "  Change the settings: bash $SCRIPT_DIR/install_server.sh --reconfigure${INSTANCE:+ --instance $INSTANCE}"
 echo "  Remove: bash $SCRIPT_DIR/uninstall_server.sh${INSTANCE:+ --instance $INSTANCE}"
 echo "          (keeps projects, chats and accounts; --purge deletes them too)"

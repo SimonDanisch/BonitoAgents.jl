@@ -575,7 +575,7 @@ end
     @test occursin("respond 404", workers)
 
     secrets = (jwt = "j"^64, session = "s"^64, storage = "t"^64)
-    y = BT.render_authelia_config(local_ca, secrets, nothing)
+    y = BT.render_authelia_config(BT.ProxyAuth(local_ca, "k"), secrets, nothing)
     @test occursin("address: 'tcp://127.0.0.1:9091/'", y)
     @test occursin("- domain: 'bonito.localhost'\n      authelia_url: 'https://auth.bonito.localhost:8443'", y)
     @test occursin("default_redirection_url: 'https://bonito.localhost:8443'", y)
@@ -586,12 +586,37 @@ end
     @test occursin("filesystem:\n    filename: '/p/authelia/notifications.txt'", y)
     @test occursin("encryption_key: '$("t"^64)'", y)
     smtp = Dict("host" => "smtp.example.com", "port" => 587, "username" => "u", "password" => "it's", "sender" => "bot@example.com")
-    y = BT.render_authelia_config(acme, secrets, smtp)
+    y = BT.render_authelia_config(BT.ProxyAuth(acme, "k"), secrets, smtp)
     @test occursin("address: 'submission://smtp.example.com:587'", y) && occursin("password: 'it''s'", y)
     @test !occursin("filesystem:", y)
     # A mail outage must not keep Authelia from starting (proxy_stack_test.jl runs it).
     @test occursin("notifier:\n  disable_startup_check: true\n  smtp:", y)
     @test occursin("- domain: 'team.example.com'\n      authelia_url: 'https://auth.team.example.com'", y)
+
+    # Behind a tunnel: no Caddy, and Authelia under the dashboard's own name, so
+    # the tunnel carries one host name (tunnel.jl).
+    tunnel = BT.TunnelAuth(BT.ProxyConfig(; domain = "team.example.com", admin = "bob", tls = "tunnel",
+                                          users_file = "/p/authelia/users.yml"))
+    @test BT.dashboard_url(tunnel) == "https://team.example.com"
+    @test BT.portal_url(tunnel) == "https://team.example.com/authelia"
+    y = BT.render_authelia_config(tunnel, secrets, nothing)
+    @test occursin("address: 'tcp://127.0.0.1:9091/authelia'", y)
+    @test occursin("- domain: 'team.example.com'\n      authelia_url: 'https://team.example.com/authelia'\n" *
+                   "      default_redirection_url: 'https://team.example.com'", y)
+    @test occursin("- domain: 'team.example.com'\n      policy: 'two_factor'", y)
+    # What a tunnel is not: Caddy's settings, or a proxy config said to be one.
+    @test_throws ErrorException BT.TunnelAuth(acme)
+    @test_throws ErrorException BT.ProxyAuth(tunnel.config, "k")
+    @test_throws ErrorException BT.TunnelAuth(BT.ProxyConfig(; tunnel.config.domain, admin = "bob", tls = "tunnel",
+                                                              users_file = "/u", worker_address = "10.0.0.2"))
+    # Behind the proxy the portal and the Caddyfile are required.
+    @test_throws ErrorException BT.ProxyAuth(BT.ProxyConfig(; domain = "d", admin = "a", users_file = "/u"), "k")
+    tdir = mktempdir()
+    write(joinpath(tdir, "proxy.json"), JSON.json(Dict("domain" => "team.example.com", "admin" => "bob",
+                                                       "tls" => "tunnel", "users_file" => "/p/u.yml")))
+    @test BT.auth_mode(tdir) isa BT.TunnelAuth
+    # Listening beyond localhost is still the trusted network's way, tunnel or not.
+    @test BT.auth_mode(tdir; host = "0.0.0.0") isa BT.NetworkAuth
 
     # Mail is on exactly when the installer left settings for it.
     dir = mktempdir()

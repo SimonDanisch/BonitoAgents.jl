@@ -16,7 +16,8 @@
 using Random
 
 """
-    DevProxy(; caddy_bin, authelia_bin, password, totp_secret, admin = "admin", domain = "bonito.localhost")
+    DevProxy(; caddy_bin, authelia_bin, password, totp_secret, admin = "admin",
+               domain = "bonito.localhost", tunnel = false)
 
 Put `dev_server` behind the real login proxy: Caddy with its own certificate
 authority, and Authelia, both on this machine under `domain` and `auth.<domain>`
@@ -24,6 +25,11 @@ authority, and Authelia, both on this machine under `domain` and `auth.<domain>`
 `admin` logs in with `password` and the authenticator secret `totp_secret`
 (base32), which an authenticator app would hold. `fetch_proxy_binaries` gets
 the two binaries.
+
+`tunnel = true` sets the server up behind a tunnel instead (`TunnelAuth`): no
+Caddy of ours, Authelia under `domain` itself. The tunnel is played by a Caddy
+that does nothing but what cloudflared does, bring `https://<domain>:<port>`
+(and `https://127.0.0.1:<port>`, for workers) to the server's plain port.
 """
 Base.@kwdef struct DevProxy
     caddy_bin::String
@@ -32,6 +38,7 @@ Base.@kwdef struct DevProxy
     totp_secret::String
     admin::String = "admin"
     domain::String = "bonito.localhost"
+    tunnel::Bool = false
 end
 
 # The proxy processes of a `dev_server(proxy = …)`, and where Caddy keeps its CA.
@@ -401,13 +408,15 @@ end
 function write_dev_proxy_config!(p::DevProxy, state_dir::AbstractString, server_port::Int)
     dir = mkpath(joinpath(state_dir, "proxy"))
     authelia_dir = mkpath(joinpath(dir, "authelia"))
-    atomic_write_json(joinpath(state_dir, "proxy.json"), Dict(
-        "domain" => p.domain, "auth_domain" => "auth." * p.domain, "admin" => p.admin,
-        "port" => server_port, "authelia_port" => free_port(),
-        "https_port" => free_port(), "http_port" => free_port(),
+    config = Dict{String,Any}(
+        "domain" => p.domain, "admin" => p.admin,
+        "port" => server_port, "authelia_port" => free_port(), "https_port" => free_port(),
+        "authelia_bin" => p.authelia_bin, "users_file" => joinpath(authelia_dir, "users.yml"))
+    p.tunnel ? (config["tls"] = "tunnel") : merge!(config, Dict(
+        "auth_domain" => "auth." * p.domain, "http_port" => free_port(),
         "tls" => "internal", "worker_address" => "127.0.0.1",
-        "caddy_bin" => p.caddy_bin, "authelia_bin" => p.authelia_bin,
-        "caddyfile" => joinpath(dir, "Caddyfile"), "users_file" => joinpath(authelia_dir, "users.yml")))
+        "caddy_bin" => p.caddy_bin, "caddyfile" => joinpath(dir, "Caddyfile")))
+    atomic_write_json(joinpath(state_dir, "proxy.json"), config)
     # The admin's account, unless a persistent rig has its accounts already. A dev
     # rig's password is no secret: it may cross a command line.
     accounts = joinpath(state_dir, "accounts.json")
@@ -438,7 +447,8 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
                             stdout = log("authelia"), stderr = log("authelia")); wait = false)
     caddy_env = merge(ENV, Dict("XDG_DATA_HOME" => mkpath(joinpath(dir, "data")),
                                 "XDG_CONFIG_HOME" => mkpath(joinpath(dir, "config"))))
-    caddy = run(pipeline(setenv(with_parent(`$(p.caddy_bin) run --config $(cfg.caddyfile) --adapter caddyfile --watch`),
+    caddyfile = p.tunnel ? write_dev_tunnel(p, cfg, dir) : cfg.caddyfile
+    caddy = run(pipeline(setenv(with_parent(`$(p.caddy_bin) run --config $(caddyfile) --adapter caddyfile --watch`),
                                 caddy_env); stdout = log("caddy"), stderr = log("caddy")); wait = false)
     root_cert = joinpath(dir, "data", "caddy", "pki", "authorities", "local", "root.crt")
     listening(port) = try
@@ -453,6 +463,28 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
         error("dev_server: the proxy did not come up within 30 s; see $(log("caddy")) and $(log("authelia"))")
     end
     return DevProxyRig(caddy, authelia, dir, root_cert)
+end
+
+# The tunnel's stand-in: HTTPS for the dashboard's name (browsers) and for
+# 127.0.0.1 (workers, which do not resolve `.localhost`), forwarded unchanged to
+# the server's plain port, as cloudflared forwards to `http://localhost:8038`.
+function write_dev_tunnel(p::DevProxy, cfg::ProxyConfig, dir::AbstractString)
+    file = joinpath(dir, "tunnel.caddy")
+    write(file, """
+        {
+        \tadmin off
+        \tskip_install_trust
+        \tdefault_bind 127.0.0.1
+        \thttps_port $(cfg.https_port)
+        \thttp_port $(free_port())
+        }
+
+        $(p.domain), 127.0.0.1 {
+        \ttls internal
+        \treverse_proxy 127.0.0.1:$(cfg.port)
+        }
+        """)
+    return file
 end
 
 """

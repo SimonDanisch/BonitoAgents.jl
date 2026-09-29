@@ -632,6 +632,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       strict_load::Bool = false,
                       scan_on_connect::Bool = false,
                       proxy::Bool = false,
+                      tunnel::Bool = false,
                       kwargs...)
     ensure_display!()
     # One stack at a time in this process — see `RELEASE_SHARED` above. A
@@ -705,12 +706,15 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     strict_load && (agent_env["BT_MOCK_ACP_STRICT_LOAD"] = "1")
 
     # Behind the real login proxy: Caddy and Authelia in front, the admin with a
-    # fresh password and authenticator secret, the worker through Caddy.
-    admin = proxy ? Login("admin", bytes2hex(rand(UInt8, 12)), base32(rand(UInt8, 20))) : nothing
-    bins = proxy ? proxy_binaries() : nothing
-    proxy_kw = proxy ? (; proxy = BT.DevProxy(; caddy_bin = bins.caddy, authelia_bin = bins.authelia,
+    # fresh password and authenticator secret, the worker through Caddy. Behind a
+    # tunnel (`tunnel = true`): the same login, asked by the server itself, and
+    # a stand-in for cloudflared in front.
+    login = proxy || tunnel
+    admin = login ? Login("admin", bytes2hex(rand(UInt8, 12)), base32(rand(UInt8, 20))) : nothing
+    bins = login ? proxy_binaries() : nothing
+    proxy_kw = login ? (; proxy = BT.DevProxy(; caddy_bin = bins.caddy, authelia_bin = bins.authelia,
                                               admin = admin.user, password = admin.password,
-                                              totp_secret = admin.secret)) : (;)
+                                              totp_secret = admin.secret, tunnel)) : (;)
     h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, proxy_kw..., kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Clean slate for the in-process MCP (armed lazily on the first MCP call,
