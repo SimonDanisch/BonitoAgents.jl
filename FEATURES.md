@@ -198,9 +198,11 @@ enumerates.
   server share, or its own gate);
   admins invite people by link, manage accounts and groups, and issue or revoke
   worker credentials on the dashboard; members see what they own plus workers
-  shared with their groups. The server registers every account's authenticator
-  and shows it once with the password (no mail to set one up); passkeys added
-  on Authelia's settings sign in on their own.
+  shared with their groups. Passkeys first: an invite or setup link makes one in
+  a single step, the account card lists, adds and removes them (through
+  Authelia's API, on our own pages); a password and a server-registered
+  authenticator are the fallback. No mail anywhere; logins last a week idle,
+  an open tab keeps itself logged in and says so when its login has ended.
 - Managed agent adapters: the server declares the ACP adapter versions (latest
   or pinned), workers install them into a private Node + npm prefix when idle
   and report their versions on the worker card.

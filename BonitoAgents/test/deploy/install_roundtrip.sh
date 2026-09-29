@@ -62,8 +62,8 @@ echo "==> 1. install"
 log1="$(mktemp)"
 if ! install 2>&1 | tee "$log1"; then echo "  FAIL  the install itself"; failures=$((failures + 1)); fi
 checks
-check "the first install prints the admin's password" grep -q "Password      :" "$log1"
-check "…and the admin's authenticator, no mail involved" grep -q "otpauth://totp/$DOMAIN:roundtrip?" "$log1"
+check "the first install prints the admin's setup link" grep -qE "$ORIGIN/invite/[0-9a-f]{64}" "$log1"
+check "…which the server filed with the invites" sudo test ! -e "$STATE/setup_link.json"
 before="$(secrets_digest)"
 
 echo "==> 2. install again (an update)"
@@ -71,8 +71,7 @@ log2="$(mktemp)"
 if ! install 2>&1 | tee "$log2"; then echo "  FAIL  the second install"; failures=$((failures + 1)); fi
 checks
 check "secrets and accounts are kept" test "$(secrets_digest)" = "$before"
-check "no new admin password" bash -c "! grep -q 'Password      :' $log2"
-check "the admin keeps their authenticator" grep -q "roundtrip has one already" "$log2"
+check "no new setup link" bash -c "! grep -q '/invite/' $log2"
 
 removed() {
     for unit in server authelia caddy; do
@@ -92,7 +91,7 @@ log3="$(mktemp)"
 if ! install 2>&1 | tee "$log3"; then echo "  FAIL  the install over kept data"; failures=$((failures + 1)); fi
 checks
 check "secrets and accounts are the same" test "$(secrets_digest)" = "$before"
-check "no new admin password" bash -c "! grep -q 'Password      :' $log3"
+check "no new setup link" bash -c "! grep -q '/invite/' $log3"
 
 echo "==> 5. uninstall --purge: nothing is left"
 bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --purge --yes
@@ -136,7 +135,7 @@ echo "==> 7. the next run needs no answers"
 log5="$(mktemp)"
 if ! tunnel_install 2>&1 | tee "$log5"; then echo "  FAIL  the tunnel install"; failures=$((failures + 1)); fi
 tunnel_checks
-check "the first install prints the admin's password" grep -q "Password      :" "$log5"
+check "the first install prints the admin's setup link" grep -qE "https://$DOMAIN/invite/[0-9a-f]{64}" "$log5"
 
 echo "==> 8. to Caddy and back: Caddy comes and goes with the mode"
 if ! install > /dev/null 2>&1; then echo "  FAIL  the switch to Caddy"; failures=$((failures + 1)); fi

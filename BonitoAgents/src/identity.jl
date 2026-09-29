@@ -384,8 +384,10 @@ is_admin(a::Account) = "admins" in a.groups
     Invite
 
 A link that lets someone create their own account, once, before `expires`
-(`/invite/<token>`). The server keeps only the token's SHA-256 (`id`), so the
-link exists nowhere but with the admin who made it and the person it was sent to.
+(`/invite/<token>`); or, when `account` names one, set up the login of an account
+that exists (a setup link: the installer's for the first admin). The server keeps
+only the token's SHA-256 (`id`), so the link exists nowhere but with whoever made
+it and the person it was sent to.
 """
 struct Invite
     id::String
@@ -393,13 +395,17 @@ struct Invite
     created_by::String
     created::DateTime
     expires::DateTime
+    account::String             # "" for a new account; else the account it sets up
 end
 
+Invite(id, groups, created_by, created, expires) = Invite(id, groups, created_by, created, expires, "")
+
 Invite(d::AbstractDict) = Invite(String(d["id"]), Vector{String}(d["groups"]), String(d["created_by"]),
-                                 DateTime(d["created"]), DateTime(d["expires"]))
+                                 DateTime(d["created"]), DateTime(d["expires"]), String(get(d, "account", "")))
 
 Base.Dict(i::Invite) = Dict("id" => i.id, "groups" => i.groups, "created_by" => i.created_by,
-                            "created" => string(i.created), "expires" => string(i.expires))
+                            "created" => string(i.created), "expires" => string(i.expires),
+                            "account" => i.account)
 
 invite_id(token::AbstractString) = bytes2hex(SHA.sha256(String(token)))
 
@@ -587,6 +593,9 @@ function render_authelia_config(auth::LoginAuth, secrets, smtp::Union{AbstractDi
           address: $(q(authelia_address(auth)))
         log:
           level: 'info'
+          # Also in a file the server reads back for its debug tools, and bounds.
+          file_path: $(q(authelia_log_file(cfg)))
+          keep_stdout: true
         totp:
           issuer: $(q(cfg.domain))
         # Passkeys (a password manager's, a security key) sign in on their own: one
@@ -632,6 +641,15 @@ function render_authelia_config(auth::LoginAuth, secrets, smtp::Union{AbstractDi
           ban_time: '10 minutes'
         session:
           secret: $(q(secrets.session))
+          # A dashboard tab talks over its websocket and can sit for hours without
+          # an HTTP request; Authelia's defaults (logged out after 5 minutes of
+          # that, and after an hour at most) ended the login under an open tab, and
+          # the next chat it opened could not load. An open tab also checks in
+          # every few minutes (`login_guard`), which keeps it logged in.
+          inactivity: '1w'
+          expiration: '4w'
+          # Without an end that short there is nothing to "remember".
+          remember_me: -1
           cookies:
             - domain: $(q(cookie_domain(auth)))
               authelia_url: $(q(portal_url(auth)))

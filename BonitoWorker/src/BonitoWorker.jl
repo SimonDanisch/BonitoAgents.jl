@@ -3438,9 +3438,10 @@ end
 
 # Our stamps are ISO and fixed-width, so a lexicographic compare IS a time
 # compare, and a shorter bound ("2026-09-11 14:40") compares correctly as a
-# prefix. `T` or space both work on input.
+# prefix. `T` or space both work on input. Authelia's lines (the server reads
+# its log too) start `time="2026-09-11T14:40:05+02:00"`, in local time as ours.
 normalize_stamp(s::AbstractString) = replace(strip(String(s)), ' ' => 'T')
-const STAMP_RE = r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+const STAMP_RE = r"^(?:time=\")?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
 
 """
     read_log_file(; path = log_file_path(), lines = 200, grep = "", since = "", until = "")

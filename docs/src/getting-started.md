@@ -65,13 +65,13 @@ bash BonitoAgents/assets/install_server.sh
 
 It asks how people reach the server, its domain and the admin account, and
 saves the answers before anything can go wrong: a second run offers them again
-(`--reconfigure` asks anew). The server only listens on localhost; people log in
-through Authelia, which runs next to it as a systemd service: with a password
-plus a one-time code from an authenticator (an app, or a password manager), or
-with a passkey. At the end the script prints the admin account's password and
-authenticator (an `otpauth://` link, or a QR code if `qrencode` is installed).
-Once signed in, "Add a passkey" on your account card adds one (Proton Pass, a
-security key, ...); from then on it alone signs you in.
+(`--reconfigure` asks anew). The server only listens on localhost; people sign in
+through Authelia, which runs next to it as a systemd service. At the end the
+script prints a setup link for the admin account: opening it makes your passkey
+(Proton Pass, your phone or computer, a security key), which signs you in from
+then on. A password and an authenticator code are on the same page, folded away,
+for when a passkey is not an option. Lost access? `install_server.sh
+--setup-link` makes a new link.
 
 **Behind a tunnel** (the default): something in front of the machine brings
 HTTPS, e.g. a Cloudflare Tunnel with the public hostname `team.example.com`
@@ -96,12 +96,13 @@ instead; every browser and worker machine then has to trust its root
 certificate, whose path the installer prints.
 
 Admins manage people from the dashboard: an invite link lets one person create
-their own account (they get their password and authenticator on the page it
-opens), and the Accounts section adds accounts directly, puts them in groups and
-disables them. Members see only their own chats and workers, plus the workers an
-owner shared with one of their groups. Everyone can get a new password or a new
-authenticator from their account card, and admins from the Accounts table; no
-mail is involved anywhere.
+their own account and its passkey in one step (behind a tunnel; behind Caddy the
+page shows a password and authenticator instead), and the Accounts section adds
+accounts directly, puts them in groups and disables them. Members see only their
+own chats and workers, plus the workers an owner shared with one of their
+groups. Everyone lists, adds and removes passkeys on their account card, and gets
+a new password or authenticator there; admins can do the latter from the
+Accounts table. No mail is involved anywhere.
 
 Then, for each machine that should run agents, click **Add worker** on the
 dashboard and run the command it shows on that machine:

@@ -69,6 +69,35 @@ caddy_password_hash(::LocalAuth, password::AbstractString) =
 # to the notifications file.
 notifications_file(cfg::ProxyConfig)   = joinpath(dirname(cfg.users_file), "notifications.txt")
 authelia_config_file(cfg::ProxyConfig) = joinpath(dirname(cfg.users_file), "configuration.yml")
+# Authelia's log, which the debug tools read back (`bt_dev_logs source="authelia"`)
+# like the server's own: journald exists on some machines and is readable by few.
+authelia_log_file(cfg::ProxyConfig)    = joinpath(dirname(cfg.users_file), "authelia.log")
+
+"""
+    watch_authelia_log!(state)
+
+Keep Authelia's log to two generations, like the server's own, for as long as
+the server runs. Authelia holds the file open for appending, so the server
+copies it aside and truncates it in place (`rotate_by_copy!`); Authelia goes on
+writing at the new end.
+"""
+watch_authelia_log!(state::ServerState) = watch_authelia_log!(state.auth, state)
+watch_authelia_log!(::OpenAuth, ::ServerState) = nothing
+function watch_authelia_log!(auth::LoginAuth, state::ServerState; every::Real = 600.0,
+                             max_bytes::Integer = BonitoWorker.LOG_MAX_BYTES)
+    path = authelia_log_file(auth.config)
+    return Base.errormonitor(@async while Bonito.HTTPServer.isrunning(state.srv)
+        rotate_by_copy!(path, max_bytes)
+        sleep(every)
+    end)
+end
+
+function rotate_by_copy!(path::AbstractString, max_bytes::Integer)
+    (isfile(path) && filesize(path) > max_bytes) || return false
+    cp(path, path * ".1"; force = true)
+    open(identity, path, "w")          # truncated in place: the writer keeps its descriptor
+    return true
+end
 
 # Authelia's secrets, made once and kept in the state dir: a new session secret
 # would log everyone out, a new storage key would leave its database unreadable.
@@ -444,6 +473,45 @@ function redeem_invite!(state::ServerState, token::AbstractString, name::Abstrac
     return login
 end
 
+"""
+    redeem_setup!(state, token) -> (; password, authenticator)
+
+Use up a setup link (an invite for an existing account): the account gets a new
+password and authenticator, returned for its owner to see once.
+"""
+function redeem_setup!(state::ServerState, token::AbstractString)
+    root = root_state(state)
+    invite = lock(() -> pop!(root.invites[], invite_id(token), nothing), root.lock)
+    invite === nothing && error("this setup link was used already or revoked")
+    save_invites!(root)
+    safe_notify!(root.invites)
+    invite.expires <= now(UTC) && error("this setup link has expired")
+    isempty(invite.account) && error("this is an invite for a new account, not a setup link")
+    password = reset_account_password!(root, invite.account)
+    @info "setup link used" name = invite.account
+    return (password = password, authenticator = register_authenticator!(root, invite.account))
+end
+
+# The installer hands the first admin a setup link rather than codes: it writes
+# the token's hash here, and the server files it with the invites when it starts.
+setup_link_file(state::ServerState) = joinpath(state.state_dir, "setup_link.json")
+
+function import_setup_link!(state::ServerState)
+    f = setup_link_file(state)
+    isfile(f) || return nothing
+    d = JSON.parsefile(f)
+    invite = Invite(String(d["token_sha256"]), String[], "installer", now(UTC),
+                    DateTime(String(d["expires"])), String(d["account"]))
+    lock(state.lock) do
+        state.invites[][invite.id] = invite
+        save_invites!(state)
+    end
+    rm(f)
+    safe_notify!(state.invites)
+    @info "setup link from the installer filed" account = invite.account expires = invite.expires
+    return nothing
+end
+
 # /invite/<token>: open to anyone (the token is the proof), so it is plain HTML
 # with a form, no dashboard session.
 const INVITE_ROUTE_RE = r"^/invite/([0-9a-f]{64})/?(?:$|\?)"
@@ -458,8 +526,10 @@ invite_response(::OpenAuth, state::ServerState, request, token::AbstractString) 
     invite_page(404, "Not found", "<p>This server has no accounts to invite anyone to.</p>")
 
 function invite_response(auth::LoginAuth, state::ServerState, request, token::AbstractString)
-    open_invite(state, token) === nothing && return invite_page(404, "This invite is not valid",
+    invite = open_invite(state, token)
+    invite === nothing && return invite_page(404, "This invite is not valid",
         "<p>The link was used already, revoked, or has expired. Ask for a new one.</p>")
+    isempty(invite.account) || return setup_response(auth, state, request, token, invite.account)
     request.method == "POST" ||
         return invite_page(200, "Create your account", invite_form(Dict{String,String}(), ""))
     form = form_fields(String(request.body))
@@ -473,15 +543,23 @@ function invite_response(auth::LoginAuth, state::ServerState, request, token::Ab
         return invite_page(400, "Create your account",
                            invite_form(form, first(split(sprint(showerror, e), '\n'))))
     end
-    a = login.authenticator
-    return invite_page(200, "Your account is ready", """
-        <p>Account <b>$(esc_html(name))</b>. Your password and your authenticator, shown only now.</p>
-        <p><code class="pw">$(esc_html(login.password))</code></p>
-        <p><img class="qr" src="$(qr_data_uri(a))" alt="authenticator QR code"></p>
-        <p>$(AUTHENTICATOR_HELP)<br><code class="uri">$(esc_html(a.uri))</code></p>
-        <p>Store both in your password manager, then <a href="$(esc_html(dashboard_url(auth)))">log in</a>
-        with the password and a code from the authenticator. Once in, you can add a passkey (Your account,
-        "Add a passkey"), which then signs you in on its own.</p>""")
+    return account_ready_page(auth, name, login)
+end
+
+# A setup link: the account exists; opening it (and confirming) gives it a new
+# password and authenticator, and the page that makes a passkey.
+function setup_response(auth::LoginAuth, state::ServerState, request, token::AbstractString, name::AbstractString)
+    request.method == "POST" || return invite_page(200, "Set up your login", """
+        <p>This sets up how <b>$(esc_html(name))</b> signs in: a passkey, or a password and an authenticator.
+        The link works once.</p>
+        <form method="post"><button type="submit">Set up my login</button></form>""")
+    login = try
+        redeem_setup!(state, token)
+    catch e
+        (e isa ErrorException || e isa ProcessFailedException || e isa Base.IOError) || rethrow()
+        return invite_page(400, "Set up your login", "<p class=\"err\">$(esc_html(first(split(sprint(showerror, e), '\n'))))</p>")
+    end
+    return account_ready_page(auth, name, login)
 end
 
 function invite_form(form::AbstractDict, error_message::AbstractString)
@@ -513,6 +591,8 @@ function invite_page(status::Int, title::AbstractString, body::AbstractString)
         .pw { font-size: 1.2rem; padding: 0.3rem 0.5rem; background: #f5f5f4; user-select: all; }
         .qr { width: 12rem; image-rendering: pixelated; }
         .uri { font-size: 0.8rem; word-break: break-all; user-select: all; }
+        .status { color: #57534e; min-height: 1.2em; }
+        details { margin-top: 1.5rem; } summary { cursor: pointer; color: #57534e; }
         </style></head><body><main><h1>$(esc_html(title))</h1>$(body)</main></body></html>"""
     # The token is in the URL: no Referer carries it anywhere, nothing caches it.
     return HTTP.Response(status, ["Content-Type" => "text/html; charset=utf-8",
@@ -784,11 +864,18 @@ function own_account_section(auth::LoginAuth, session::Bonito.Session, state::Se
     end
     groups = isempty(user.groups) ? "no groups" : "groups: " * join(user.groups, ", ")
     logout = portal_url(auth) * "/logout?rd=" * HTTP.escapeuri(dashboard_url(auth))
+    # Passkeys first: they are how people sign in. The password and authenticator
+    # are what is left for whoever cannot use one.
     return DOM.div(
         DOM.div(DOM.h2("Your account"); class = "bt-section"),
         DOM.div(
-            DOM.div("Signed in as $(user.display_name) ($(user.name)); $(groups)."),
+            PasskeyStyles,
+            DOM.div(DOM.span("Signed in as $(user.display_name) ($(user.name)); $(groups)."),
+                    DOM.a("Log out"; href = logout, class = "bt-btn bt-btn-sm bt-btn-secondary");
+                    class = "bt-account-head"),
+            passkeys_block(auth, session),
             DOM.div(
+                DOM.span("Password and authenticator"; class = "bt-account-sub"),
                 DOM.button("New password"; class = "bt-btn bt-btn-sm bt-btn-secondary",
                            onclick = js"""event => {
                                if (confirm("Replace your password with a new, generated one?"))
@@ -798,12 +885,8 @@ function own_account_section(auth::LoginAuth, session::Bonito.Session, state::Se
                            onclick = js"""event => {
                                if (confirm("Replace your authenticator? The codes of the old one stop working."))
                                    $(reauth).notify(true);
-                           }"""),
-                # Authelia's own page: a passkey is made in the browser, so only it can add one.
-                DOM.a("Add a passkey"; href = portal_url(auth) * "/settings/two-factor-authentication",
-                      class = "bt-btn bt-btn-sm bt-btn-secondary"),
-                DOM.a("Log out"; href = logout, class = "bt-btn bt-btn-sm bt-btn-secondary");
-                class = "bt-admin-form"),
+                           }""");
+                class = "bt-admin-form bt-account-fallback"),
             DOM.div(secret; class = "bt-admin-secret"),
             DOM.div(status; class = "bt-admin-status");
             class = "bt-card"))
@@ -960,7 +1043,8 @@ function invites_section(::LoginAuth, session::Bonito.Session, state::ServerStat
         open = sort!([i for i in values(invites) if i.expires > now(UTC)]; by = i -> i.created)
         isempty(open) && return DOM.div("No open invites."; class = "bt-admin-muted")
         rows = map(open) do i
-            DOM.tr(DOM.td(i.created_by), DOM.td(isempty(i.groups) ? "member" : join(i.groups, ", ")),
+            DOM.tr(DOM.td(i.created_by),
+                   DOM.td(!isempty(i.account) ? "sets up $(i.account)" : isempty(i.groups) ? "member" : join(i.groups, ", ")),
                    DOM.td(Dates.format(i.created, "yyyy-mm-dd HH:MM")),
                    DOM.td(Dates.format(i.expires, "yyyy-mm-dd HH:MM")),
                    DOM.td(DOM.button("Revoke"; class = "bt-btn bt-btn-sm bt-btn-secondary",

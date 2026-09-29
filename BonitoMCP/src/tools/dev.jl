@@ -125,9 +125,11 @@ FILE that the server and every worker write.
   • omitted / "ring" — the SERVER's own `@info`/`@warn`/`@error` ring. In memory,
     bounded, dies with the process.
   • "server"         — the server's log file.
+  • "authelia"       — the login's log (Authelia, on the server's machine): why
+    a login, a second factor or a passkey was refused. Servers with a login only.
   • a worker's name or id ("MacBook", "Bosgame", …) — that worker's log file,
     read on that machine.
-  • "all"            — the server plus every connected worker, in one reply.
+  • "all"            — the server, its login and every connected worker, in one reply.
 
 Reach for the FILE, not the ring, when the ring cannot have the answer — and it
 often cannot. The file is a redirect of the process's stdout and stderr, so it
@@ -163,8 +165,8 @@ register!("bt_dev_logs", DEV_LOGS_DESCRIPTION,
         "properties" => Dict{String,Any}(
             "source"   => Dict("type" => "string",
                                "description" => "\"ring\" (default, the server's in-memory log), " *
-                                                "\"server\" (the server's log file), a worker " *
-                                                "name/id, or \"all\" for every machine."),
+                                                "\"server\" (the server's log file), \"authelia\" " *
+                                                "(the login's), a worker name/id, or \"all\" for every machine."),
             "limit"    => Dict("type" => "integer",
                                "description" => "Max records/lines (ring 100, file 200; cap 2000)."),
             "level"    => Dict("type" => "string", "enum" => ["debug", "info", "warn", "error"],

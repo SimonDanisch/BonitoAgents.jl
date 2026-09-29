@@ -167,6 +167,49 @@ function connection_guard(session::Bonito.Session)
     return root
 end
 
+# Answers only through the login: what `login_guard` asks.
+const LOGIN_CHECK_ROUTE = "/session"
+
+"""
+    login_guard(session, auth)
+
+Behind a login, an open tab checks every few minutes (and when it becomes
+visible again) that its login still lets requests through: that keeps the login
+alive while the tab is open, and when it has ended anyway (its time was up, an
+admin disabled the account) the tab says so, with a way to log in again, instead
+of failing on the next thing it loads. Uses the connection guard's card.
+"""
+login_guard(::Bonito.Session, ::OpenAuth) = DOM.div()
+
+function login_guard(session::Bonito.Session, ::LoginAuth)
+    modal = DOM.div(
+        DOM.div(
+            DOM.div(; class = "bt-conn-glyph"),
+            DOM.div("Your login has ended"; class = "bt-conn-title"),
+            DOM.div("Log in again to go on; the page reloads to the login."; class = "bt-conn-msg"),
+            DOM.button("Log in again"; class = "bt-btn bt-conn-reload", type = "button",
+                       onclick = js"() => window.location.reload()");
+            class = "bt-conn-card", role = "alertdialog", var"aria-live" = "assertive");
+        class = "bt-conn-modal bt-login-ended", dataStatus = "disconnected")
+    Bonito.onload(session, modal, js"""(modal) => {
+        async function check() {
+            let r;
+            try {
+                r = await fetch($(LOGIN_CHECK_ROUTE), {redirect: 'manual', cache: 'no-store', credentials: 'same-origin'});
+            } catch (e) {
+                return;   // the server is out of reach: the connection guard's business
+            }
+            if (r.status === 204) return;
+            if (r.type === 'opaqueredirect' || r.status === 401 || r.status === 403)
+                modal.classList.add('bt-conn-open');
+        }
+        setInterval(check, 5 * 60 * 1000);
+        document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && check());
+    }""")
+    return modal
+end
+
+
 const BASE_CSS = [
     CSS(":root",
         # `color-scheme` is NOT declared here — see the `html:root` rule in the

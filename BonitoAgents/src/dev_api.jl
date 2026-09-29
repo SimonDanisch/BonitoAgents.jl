@@ -471,6 +471,8 @@ log_level_rank(s::AbstractString) = get(LOG_LEVEL_ORDER, lowercase(s), 1)
 
 # Which name means "the server's own log" rather than a worker's.
 const SERVER_LOG_SOURCE = "server"
+# Authelia's log, on the server's machine: the login (behind the proxy or a tunnel).
+const AUTHELIA_LOG_SOURCE = "authelia"
 # Fan out to the server AND every connected worker.
 const ALL_LOG_SOURCES   = "all"
 
@@ -488,7 +490,7 @@ function resolve_log_worker(state::ServerState, source::AbstractString)
     hit = findfirst(w -> lowercase(w.name) == lowercase(source), workers)
     hit === nothing || return hit
     known = sort([w.name for w in values(workers)])
-    error("unknown log source '$source' — expected \"$(SERVER_LOG_SOURCE)\", " *
+    error("unknown log source '$source' — expected \"$(SERVER_LOG_SOURCE)\", \"$(AUTHELIA_LOG_SOURCE)\", " *
           "\"$(ALL_LOG_SOURCES)\", or one of: " * join(known, ", "))
 end
 
@@ -499,6 +501,7 @@ function log_of(state::ServerState, source::AbstractString; lines, since, until,
         r = BonitoWorker.read_log_file(; lines, since, until, grep)
         return merge(Dict{String,Any}("source" => SERVER_LOG_SOURCE, "role" => "server"), r)
     end
+    source == AUTHELIA_LOG_SOURCE && return authelia_log_of(state.auth; lines, since, until, grep)
     wid = resolve_log_worker(state, source)
     name = state.workers[][wid].name
     r = try
@@ -513,6 +516,18 @@ function log_of(state::ServerState, source::AbstractString; lines, since, until,
     return merge(Dict{String,Any}("source" => name, "role" => "worker", "worker_id" => wid), r)
 end
 
+authelia_log_of(auth::LoginAuth; kw...) =
+    merge(Dict{String,Any}("source" => AUTHELIA_LOG_SOURCE, "role" => "login"),
+          BonitoWorker.read_log_file(; path = authelia_log_file(auth.config), kw...))
+authelia_log_of(::OpenAuth; kw...) =
+    Dict{String,Any}("source" => AUTHELIA_LOG_SOURCE, "role" => "login", "ok" => false,
+                     "error" => "this server has no login (no Authelia): it runs without proxy.json")
+
+# Every log there is: the server's, its login's when it has one, each connected worker's.
+all_log_sources(state::ServerState) =
+    vcat([SERVER_LOG_SOURCE], state.auth isa LoginAuth ? [AUTHELIA_LOG_SOURCE] : String[],
+         sort([w.name for w in values(state.workers[]) if isopen(w)]))
+
 function dev_op(state::ServerState, ::Val{:logs}, args::AbstractDict)
     source = String(get(args, "source", ""))
     if !isempty(source) && source != "ring"
@@ -523,12 +538,11 @@ function dev_op(state::ServerState, ::Val{:logs}, args::AbstractDict)
               until = String(get(args, "until", "")),
               grep  = String(get(args, "contains", "")))
         if source == ALL_LOG_SOURCES
-            # Server first, then workers by name: a cross-machine incident is
-            # read in one pass, and a stable order makes two readings comparable.
-            srcs = vcat([SERVER_LOG_SOURCE],
-                        sort([w.name for w in values(state.workers[]) if isopen(w)]))
+            # Server first, then its login, then workers by name: a cross-machine
+            # incident is read in one pass, and a stable order makes two
+            # readings comparable.
             return Dict{String,Any}(
-                "sources" => [log_of(state, x; kw...) for x in srcs])
+                "sources" => [log_of(state, x; kw...) for x in all_log_sources(state)])
         end
         return log_of(state, source; kw...)
     end

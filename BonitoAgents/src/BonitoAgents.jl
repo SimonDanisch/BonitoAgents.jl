@@ -68,6 +68,7 @@ include("overview.jl")         # recent-chats overview cards (dashboard header)
 include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)
 include("accounts.jl")         # worker credentials, accounts, adapter versions: the admin's controls
+include("passkeys.jl")         # passkeys made and kept on our own pages (behind a tunnel)
 include("session_widget.jl")   # SessionRow widget (one row per discovered Claude Code session)
 include("chat_title.jl")       # chat_title_input — the one editor over ProjectInfo.title
 include("file_tree.jl")        # WorkerFileTree — lazy, searchable project file tree (sidebar)

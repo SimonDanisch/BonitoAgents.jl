@@ -508,6 +508,28 @@ end
     again = BT.create_invite!(st, String[])
     id = BT.invite_id(last(split(again, '/')))
     @test BT.revoke_invite!(st, id) && !BT.revoke_invite!(st, id)
+
+    # A setup link, the installer's for the first admin: the server files the
+    # one the installer leaves (only its hash), and it sets up the account's
+    # login once: a new password and authenticator, for the page that shows them.
+    setup_token = bytes2hex(rand(UInt8, 32))
+    write(joinpath(dir, "setup_link.json"), JSON.json(Dict("account" => "bob",
+        "token_sha256" => BT.invite_id(setup_token), "expires" => string(now(UTC) + Day(7)))))
+    BT.import_setup_link!(st)
+    @test !isfile(joinpath(dir, "setup_link.json"))
+    @test st.invites[][BT.invite_id(setup_token)].account == "bob"
+    @test !occursin(setup_token, read(joinpath(dir, "invites.json"), String))
+    setup_page(method) = BT.invite_response(st.auth, st, HTTP.Request(method, "/invite/$(setup_token)", [], ""), setup_token)
+    @test occursin("Set up my login", String(setup_page("GET").body)) && occursin("<b>bob</b>", String(setup_page("GET").body))
+    ready = setup_page("POST")
+    @test ready.status == 200
+    @test occursin("<code class=\"pw\">pw-123</code>", String(ready.body))
+    @test occursin("otpauth://totp/team.example.com:bob?", String(ready.body))
+    @test setup_page("GET").status == 404                       # once
+    @test_throws ErrorException BT.redeem_setup!(st, setup_token)
+    # An invite for a new account is not a setup link.
+    fresh = last(split(BT.create_invite!(st, String[]), '/'))
+    @test_throws ErrorException BT.redeem_setup!(st, fresh)
     reloaded = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
     @test isempty(reloaded.invites[])
 

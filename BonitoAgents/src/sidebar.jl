@@ -1595,6 +1595,7 @@ function unified_app(state::ServerState)
             SidebarStyles,
             WorkspaceStageStyles,
             connection_guard(session),
+            login_guard(session, state.auth),
             sidebar,
             # Adjacent sibling on purpose: `.bt-sidebar.bt-collapsed + .bt-side-resize`
             # hides the handle for the icon rail.

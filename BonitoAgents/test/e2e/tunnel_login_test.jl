@@ -58,37 +58,67 @@
         @test TK.wait_for(z, "the second worker online",
             "document.querySelectorAll('.bt-worker-cell .bt-dot-online').length === 2"; timeout = 120) == true
 
-        # Someone invited: the invite page shows their password and authenticator
-        # once, and they log in with both, no mail and no code passed on by hand.
+        # Someone invited, with a passkey in their password manager: the invite
+        # page makes their account, and one button signs them in and makes the
+        # passkey. No password to copy, no code, no settings page.
         TK.set_input(z, "input[type=text]", "lab"; placeholder = "groups (\"admins\" for an admin)")
         TK.click_text(z, "Create invite link")
         link = TK.wait_for(z, "the invite link",
             "(document.body.textContent.match(/https:\\/\\/\\S+?\\/invite\\/[0-9a-f]{64}/) || [false])[0]"; timeout = 30)
         @test startswith(link, z.h.url * "/invite/")
         b = TK.another_browser(z)
+        carol_device = TK.add_passkey_device!(b)
         TK.eval_js(b, "location.href = $(repr(link)); true")
         TK.wait_for(b, "the invite form", "!!document.querySelector('form input[name=name]')"; timeout = 30)
         TK.set_input(b, "input[name=name]", "carol")
         TK.set_input(b, "input[name=display_name]", "Carol C")
         TK.click(b, "form button[type=submit]")
+        TK.wait_for(b, "the passkey button", "!!document.getElementById('create-passkey')"; timeout = 30)
+        # Whoever cannot use a passkey has the password and authenticator, folded away.
         carol = TK.invite_login(b, "carol")
         @test length(carol.password) >= 16
-        @test TK.eval_js(b, "!!document.querySelector('img.qr[src^=\"data:image/png;base64,\"]')") == true
-        TK.eval_js(b, "location.href = $(repr(z.h.url * "/")); true")
-        TK.login!(b, carol)
+        @test TK.eval_js(b, "!document.querySelector('details').open") == true
+        TK.create_passkey_from_invite!(b)
         @test TK.signed_in_as(b) == "Signed in as Carol C (carol); groups: lab."
         @test !any(in(("Accounts", "Invites")), TK.headings(b))
+        @test TK.passkeys(b, carol_device) == [(host, "carol")]
+        TK.logout!(b)
+        TK.passkey_login!(b)
+        @test TK.signed_in_as(b) == "Signed in as Carol C (carol); groups: lab."
 
-        # A passkey (Proton Pass, a security key): added once signed in, with no
-        # code by mail, and from then on it alone signs in.
+        # The admin adds a passkey on their account card (Proton Pass, a security
+        # key): they stay on the dashboard, and from then on it alone signs in.
         device = TK.add_passkey_device!(z)
-        TK.add_passkey!(z)
+        @test TK.reload!(z) == :dashboard           # the page now trusts this machine's CA
+        @test TK.wait_for(z, "no passkey yet", "document.querySelector('.bt-passkey-list').textContent.includes('No passkey yet')";
+                          timeout = 30) == true
+        TK.add_passkey!(z; name = "Proton Pass")
+        @test TK.wait_for(z, "the passkey listed", "document.querySelectorAll('.bt-passkey-row').length === 1"; timeout = 30) == true
+        @test TK.listed_passkeys(z) == ["Proton Pass"]
         @test TK.passkeys(z, device) == [(host, "admin")]
         TK.logout!(z)
         @test TK.eval_js(z, "location.pathname.startsWith('/authelia')") == true
         TK.passkey_login!(z)
         @test TK.wait_for(z, "the account card",
             "document.body.textContent.includes('Signed in as admin (admin)')"; timeout = 30) == true
+        @test TK.wait_for(z, "the passkey used", "document.querySelector('.bt-passkey-row').textContent.includes('last used')";
+                          timeout = 30) == true
+        # Removed, it is gone from the list.
+        TK.eval_js(z, "window.confirm = () => true; document.querySelector('.bt-passkey-row button').click(); true")
+        @test TK.wait_for(z, "the passkey removed", "document.querySelector('.bt-passkey-list').textContent.includes('No passkey yet')";
+                          timeout = 30) == true
+
+        # The login ends while the tab is open (here: logged out behind its back).
+        # The tab says so when it next checks, instead of failing on the next
+        # thing it loads, and "Log in again" leads to the login.
+        @test TK.eval_js(z, """fetch('/authelia/api/logout', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: '{}'}).then(r => r.status)""") == 200
+        @test TK.eval_js(z, "!document.querySelector('.bt-login-ended.bt-conn-open')") == true
+        TK.eval_js(z, "document.dispatchEvent(new Event('visibilitychange')); true")
+        @test TK.wait_for(z, "the tab saying the login ended",
+            "!!document.querySelector('.bt-login-ended.bt-conn-open')"; timeout = 30) == true
+        TK.click(z, ".bt-login-ended .bt-conn-reload")
+        @test TK.wait_for(z, "the login page", "location.pathname.startsWith('/authelia')"; timeout = 30) == true
     finally
         b === nothing || TK.close_browser!(b)
         close(z)

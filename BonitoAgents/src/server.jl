@@ -148,6 +148,8 @@ function serve(; host::String        = "127.0.0.1",
     add_download_routes!(srv, state)
     add_invite_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
+    # Nothing to say: reaching it is the answer (`login_guard`).
+    Bonito.route!(srv, LOGIN_CHECK_ROUTE => _ -> HTTP.Response(204))
 
     # The background-output poller is no longer a server-wide loop — it's
     # per-ChatModel now, spawned in `start_chat_client!` and torn down
@@ -162,6 +164,8 @@ function serve(; host::String        = "127.0.0.1",
     # Behind the proxy the server owns Caddy's and Authelia's config (worker
     # credentials, accounts): bring both in line with what it has on record.
     apply_proxy!(state)
+    import_setup_link!(state)
+    watch_authelia_log!(state)
     @info "BonitoAgents dashboard running" url=base_url state=sd auth=nameof(typeof(auth))
     announce(auth, base_url)
     return state

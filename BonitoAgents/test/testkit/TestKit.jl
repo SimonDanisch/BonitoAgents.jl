@@ -1398,25 +1398,39 @@ function passkeys(s::TestServer, device::AbstractString)
 end
 
 """
-    add_passkey!(s; description = "Proton Pass")
+    add_passkey!(s; name = "Proton Pass")
 
-Add a passkey for whoever is signed in in browser `s`, as they would: "Add a
-passkey" on their account card leads to Authelia's settings, where they name it
-and the browser's device makes it (`add_passkey_device!` first). Returns to the
-dashboard.
+Add a passkey for whoever is signed in in browser `s`, as they would: the
+Passkeys part of their account card, a name, "Add a passkey", and the browser's
+device makes it (`add_passkey_device!` first). They stay on the dashboard.
 """
-function add_passkey!(s::TestServer; description::AbstractString = "Proton Pass")
-    eval_js(s, """(() => { [...document.querySelectorAll('a')].find(a => a.innerText.trim() === 'Add a passkey').click();
-                          return true; })()""")
-    wait_for(s, "Authelia's settings", "!!document.querySelector('#webauthn-credential-add')"; timeout = 30)
-    click(s, "#webauthn-credential-add")
-    wait_for(s, "the passkey dialog", "!!document.querySelector('#webauthn-credential-description')"; timeout = 30)
-    set_input(s, "#webauthn-credential-description", description)
-    click(s, "#dialog-next")
-    wait_for(s, "the passkey added", "document.body.innerText.includes('Successfully added the WebAuthn Credential')";
+function add_passkey!(s::TestServer; name::AbstractString = "Proton Pass")
+    wait_for(s, "the Passkeys part of the account card", "!!document.querySelector('.bt-passkey-add')"; timeout = 30)
+    set_input(s, ".bt-passkey-name-input", name)
+    click(s, ".bt-passkey-add")
+    wait_for(s, "the passkey added", "document.querySelector('.bt-passkey-status').textContent.startsWith('passkey added')";
              timeout = 30)
-    eval_js(s, "location.href = $(json(s.h.url * "/")); true")
-    wait_for(s, "the dashboard", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    return s
+end
+
+"The passkeys the account card lists, by name (once its list has loaded)."
+listed_passkeys(s::TestServer) = String.(eval_js(s,
+    "[...document.querySelectorAll('.bt-passkey-row .bt-passkey-name')].map(e => e.textContent)"))
+
+"""
+    create_passkey_from_invite!(s)
+
+On a new account's page in browser `s`: "Create my passkey", which signs them in
+and has the browser's device make it (`add_passkey_device!` first). Returns once
+the dashboard is up.
+"""
+function create_passkey_from_invite!(s::TestServer)
+    click(s, "#create-passkey")
+    outcome = wait_for(s, "the dashboard after the passkey", """(() => {
+        if (document.querySelector('.bt-dash')) return true;
+        const t = (document.getElementById('passkey-status') || {}).textContent || '';
+        return t.startsWith('That did not work') ? t : false; })()"""; timeout = 60)
+    outcome === true || error("create_passkey_from_invite!: " * String(outcome))
     install_pane_scope!(s)
     return s
 end

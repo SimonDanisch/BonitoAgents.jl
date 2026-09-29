@@ -67,6 +67,9 @@
         @test !isfile(joinpath(dir, "Caddyfile"))
         cfg_text = read(config, String)
         @test occursin("address: 'tcp://127.0.0.1:$(aport)/authelia'", cfg_text)
+        # A login that outlasts an open tab (Authelia's own default ends it
+        # after 5 idle minutes, under a tab that talks over its websocket).
+        @test occursin("inactivity: '1w'", cfg_text) && occursin("expiration: '4w'", cfg_text)
         @test occursin("- domain: 'team.example.com'", cfg_text)
 
         get_(target, headers = Pair{String,String}[]) =
@@ -162,6 +165,9 @@
             options = json_(passkey)["publicKey"]
             @test options["rp"]["id"] == "team.example.com" && options["user"]["name"] == "bob"
 
+            # What an open tab checks: it answers through the login only.
+            @test get_("/session", ["Cookie" => cookie]).status == 204
+            @test login_first(get_("/session"))
             page = get_("/", ["Cookie" => cookie])
             html = String(page.body)
             @test page.status == 200
@@ -209,6 +215,36 @@
             @test secret_of(renewed) != secret_of(erin.authenticator)
             @test timedwait(() -> code_login("erin", erin.password, erin.authenticator) == 403, 10.0; pollint = 1.0) === :ok
             @test code_login("erin", erin.password, renewed) == 200
+
+            # The page a new account lands on: one button that signs them in and
+            # makes their passkey (the browser half, `PASSKEY_JS`), the password
+            # and authenticator folded away for whoever cannot use one.
+            page = String(BT.account_ready_page(auth, "erin", (password = erin.password, authenticator = renewed)).body)
+            @test occursin("<button id=\"create-passkey\"", page) && occursin("window.btPasskeys", page)
+            @test occursin("'/authelia/api'", page)
+            @test occursin("<details>", page) && occursin("<code class=\"pw\">$(erin.password)</code>", page)
+            @test occursin("const account = \"erin\"", page)
+        end
+
+        @testset "the login's log, for the debug tools" begin
+            logs(args...) = BT.dev_op(state, Val(:logs), Dict{String,Any}(args...))
+            r = logs("source" => "authelia", "contains" => "erin")
+            @test r["ok"] && r["path"] == BT.authelia_log_file(auth.config)
+            @test any(l -> occursin("Unsuccessful TOTP authentication attempt by user 'erin'", l), r["lines"])
+            # Its lines carry Authelia's own stamps, which the time filter reads.
+            today = Dates.format(Dates.now(), "yyyy-mm-dd")
+            @test !isempty(logs("source" => "authelia", "since" => today * " 00:00")["lines"])
+            later = logs("source" => "authelia", "since" => "2999-01-01 00:00")
+            @test isempty(later["lines"]) && !haskey(later, "note")
+            @test "authelia" in [x["source"] for x in logs("source" => "all")["sources"]]
+            # Bounded like the server's own: copied aside, truncated in place, and
+            # Authelia goes on writing at the new start (it appends).
+            path = BT.authelia_log_file(auth.config)
+            @test BT.rotate_by_copy!(path, 0) && filesize(path) == 0 && filesize(path * ".1") > 0
+            get_("/")                                   # Authelia logs the refusal
+            @test timedwait(() -> filesize(path) > 0, 10.0) === :ok
+            @test read(path)[1] != 0x00                 # no hole where the old content was
+            @test !BT.rotate_by_copy!(path, 10^9)
         end
 
         @testset "without Authelia nothing behind the login answers" begin

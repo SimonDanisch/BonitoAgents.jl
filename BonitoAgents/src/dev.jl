@@ -403,10 +403,14 @@ free_port() = let s = Sockets.listen(Sockets.IPv4(0x7f000001), 0)
     p = Int(Sockets.getsockname(s)[2]); close(s); p
 end
 
+# Where a dev rig keeps the proxy's files, logs and Caddy's CA: its own, never
+# the current directory (a tunnel has no Caddyfile to take a directory from).
+dev_proxy_dir(state_dir::AbstractString) = joinpath(state_dir, "proxy")
+
 # proxy.json and the admin's account, as the installer writes them, before the
 # server starts (it renders the proxy's files from them).
 function write_dev_proxy_config!(p::DevProxy, state_dir::AbstractString, server_port::Int)
-    dir = mkpath(joinpath(state_dir, "proxy"))
+    dir = mkpath(dev_proxy_dir(state_dir))
     authelia_dir = mkpath(joinpath(dir, "authelia"))
     config = Dict{String,Any}(
         "domain" => p.domain, "admin" => p.admin,
@@ -432,7 +436,7 @@ end
 # Caddy and Authelia, on the files the server just rendered.
 function start_dev_proxy(p::DevProxy, state::ServerState)
     cfg = state.auth.config
-    dir = dirname(cfg.caddyfile)
+    dir = dev_proxy_dir(state.state_dir)
     config = authelia_config_file(cfg)
     # The admin's second factor, as if they had registered an authenticator app
     # (into a database brought to Authelia's schema first).
