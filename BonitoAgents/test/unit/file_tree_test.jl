@@ -152,6 +152,26 @@ end
             @test BT.ensure_project_file_index!(h.state, proj) === nothing
         end
 
+        # The card's discovered sessions come from the last scan (a scan starts
+        # every agent, so it is not repeated on each connect); a folder deleted
+        # since is dropped when the worker connects, after one stat each.
+        @testset "discovered sessions in deleted folders are pruned" begin
+            kept = mkpath(joinpath(root, "still-here"))
+            deleted = mkpath(joinpath(root, "deleted-since"))
+            row(sid, p) = Dict{String,Any}("path" => p, "name" => basename(p), "session_id" => sid,
+                                           "last_used" => 0.0, "kind" => "session")
+            h.state.discovered[][wid] = [row("a", kept), row("b", deleted), row("c", deleted)]
+            rm(deleted; recursive = true)
+            @test BT.prune_missing_discovered!(h.state, wid) == 1
+            @test [r["session_id"] for r in h.state.discovered[][wid]] == ["a"]
+            @test BT.prune_missing_discovered!(h.state, wid) == 0      # nothing left to drop
+            # A worker that cannot answer: nothing is dropped on doubt.
+            h.state.discovered[]["not-connected"] = [row("x", "/surely/not/here")]
+            @test BT.prune_missing_discovered!(h.state, "not-connected") == 0
+            @test length(h.state.discovered[]["not-connected"]) == 1
+            delete!(h.state.discovered[], "not-connected")
+        end
+
         # The agent wrote `Mantle/docs/examples.jl` for dev/Mantle/docs/examples.jl.
         @testset "a relative path that isn't there: the one file ending in it" begin
             nested = joinpath(root, "dev", "Mantle", "docs", "examples.jl")

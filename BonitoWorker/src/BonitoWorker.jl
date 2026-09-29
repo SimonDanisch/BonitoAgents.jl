@@ -2488,6 +2488,8 @@ by `last_used` descending. Each entry has:
                         real user message in its first `CWD_LINE_LIMIT` lines.
 
 Folders whose jsonls yield no `cwd` field (malformed / empty) are skipped.
+Sessions in folders that no longer exist are listed here; `scan_sessions`
+leaves them out, for every agent alike.
 """
 function scan_claude_sessions(; home::String = homedir())
     results = Dict{String,Any}[]
@@ -2622,11 +2624,6 @@ end
 function entry_from_jsonl(jsonl::AbstractString, pid_map::Dict{String,Int})
     cwd, preview = scan_jsonl_metadata(jsonl)
     cwd === nothing && return nothing
-    # Drop sessions whose project folder no longer exists. Claude keeps the
-    # session jsonl under ~/.claude/projects forever, so deleted folders
-    # (throwaway temp dirs especially) would otherwise linger in the list with
-    # nothing to resume into.
-    isdir(String(cwd)) || return nothing
     sid = first(splitext(basename(jsonl)))
     is_subagent = occursin("/subagents/", replace(jsonl, '\\' => '/'))
     agent_type        = nothing
@@ -2746,16 +2743,30 @@ else
     end
 end
 
-function handle_scan_sessions(ws, cmd::AbstractDict)
-    request_id = String(get(cmd, "request_id", ""))
+"""
+    scan_sessions(; home = homedir(), acp = scan_acp_providers()) -> Vector{Dict}
+
+Every session on this machine, of every agent: Claude's from its files
+(`scan_claude_sessions`), the others' over ACP (`acp`). A session whose folder
+no longer exists is left out, whichever agent it is from: agents keep their
+sessions long after the folder is gone (throwaway temp dirs especially), and
+there is nothing to resume into. The one place that rule lives: the paths are
+this machine's, so only the worker can check them.
+"""
+function scan_sessions(; home::String = homedir(), acp = scan_acp_providers())
     sessions = try
-        scan_claude_sessions()
+        scan_claude_sessions(; home)
     catch e
         @warn "BonitoWorker: scan_claude_sessions failed" exception=e
         Dict{String,Any}[]
     end
-    # …plus every other provider that can list its own sessions over ACP.
-    append!(sessions, scan_acp_providers())
+    append!(sessions, acp)
+    return filter!(r -> isdir(String(r["path"])), sessions)
+end
+
+function handle_scan_sessions(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    sessions = scan_sessions()
     try
         send_control(ws, Dict(
             "type"       => "scan_sessions_result",

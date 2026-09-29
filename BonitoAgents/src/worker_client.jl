@@ -496,7 +496,9 @@ function worker_came_online!(state::ServerState, worker_id::String)
         @warn "prune_missing_projects! failed" worker = worker_id exception = e
     end)
     # Chats start lazily, when the user opens one; only the folder→threads
-    # browser is filled, and only the first time (later: the Rescan button).
+    # browser is filled, and only the first time (later: the Rescan button). A
+    # scan starts every installed agent, so what an earlier one found is kept,
+    # without the folders deleted since.
     if state.scan_on_connect && !haskey(state.discovered[], worker_id)
         Base.errormonitor(@async try
             scan_and_store!(state, worker_id)
@@ -504,10 +506,49 @@ function worker_came_online!(state::ServerState, worker_id::String)
             @warn "auto-scan on connect failed" worker_id exception = e
         end)
     end
+    else
+        Base.errormonitor(@async prune_missing_discovered!(state, worker_id))
     return nothing
 end
 
 # The link's state is the worker's: connected is online, detached is offline
+"""
+    prune_missing_discovered!(state, worker_id) -> Int
+
+Drop the worker's discovered sessions (the folder→threads browser on its card)
+whose folder no longer exists there, and return how many folders went. The list
+comes from the last scan, and a folder deleted since would stay listed until the
+next Rescan. One stat per folder on the worker; a folder it cannot answer for is
+kept.
+"""
+function prune_missing_discovered!(state::ServerState, worker_id::AbstractString)
+    wid = String(worker_id)
+    rows = lock(() -> copy(get(state.discovered[], wid, Dict{String,Any}[])), state.lock)
+    paths = unique(String(r["path"]) for r in rows if haskey(r, "path"))
+    gone = Set(p for p in paths if worker_folder_gone(state, wid, p))
+    isempty(gone) && return 0
+    lock(state.lock) do
+        current = get(state.discovered[], wid, nothing)
+        current === nothing || filter!(r -> !(get(r, "path", "") in gone), current)
+        save_discovered!(state)
+    end
+    safe_notify!(state.discovered)
+    @info "dropped discovered sessions in folders that no longer exist" worker = wid folders = length(gone)
+    return length(gone)
+end
+
+# Does the connected worker say `path` is not there? An unreachable worker or a
+# failed stat says nothing either way: false.
+function worker_folder_gone(state::ServerState, worker_id::String, path::String)
+    info = try
+        stat_worker_path(state, worker_id, path)
+    catch e
+        (e isa WorkerUnreachableError || e isa ErrorException) || rethrow()
+        return false
+    end
+    return !info.exists
+end
+
 # with everything kept for the reconnect, dead is gone.
 function worker_link_changed!(state::ServerState, worker_id::String,
                               link::WorkerLink.Link, st::Symbol)
