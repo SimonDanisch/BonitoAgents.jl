@@ -48,12 +48,14 @@ chat inside an e2e test. Eval packages → a committed test env (e.g. `test/eval
 module TestKit
 
 using JSON, Sockets, Base64
-import SHA
+import SHA, HTTP
 import BonitoAgents as BT
 import BonitoMCP
 import BonitoWorker
 import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
+
+include("fake_node.jl")   # a Node mirror + npm registry for the managed agent adapters
 
 # `Pkg.test` runs the test process with `JULIA_LOAD_PATH="@:<testdir>"` — note
 # the missing `@stdlib`. Every process spawned from here inherits it, including

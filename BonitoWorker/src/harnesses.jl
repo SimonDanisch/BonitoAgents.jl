@@ -16,7 +16,9 @@
 #   node-version                   which of those is current
 #   npm/node_modules/…             the adapters (`npm install --prefix npm`)
 
-const NODE_DIST = "https://nodejs.org/dist"
+# Where Node releases come from: nodejs.org, or a mirror of its `dist` tree
+# (`BONITOAGENTS_NODE_DIST`, e.g. inside a network that cannot reach it).
+node_dist() = get(ENV, "BONITOAGENTS_NODE_DIST", "https://nodejs.org/dist")
 
 # What the server wants installed: Node as `"lts"`, a major (`"22"`) or an exact
 # version, and each npm package as `"latest"` or an exact version.
@@ -40,23 +42,27 @@ end
 
 harness_root() = joinpath(config_dir(), "harnesses")
 
-# The Node release to install for `want`, from nodejs.org's release index
-# (newest first).
-function resolve_node_version(want::AbstractString; index = node_index())
-    version(entry) = lstrip(String(entry["version"]), 'v')
+# The Node release to install for `want`: an exact version as it is, "lts" and a
+# major from the release index (newest first), which only those need.
+function resolve_node_version(want::AbstractString; dist::AbstractString = node_dist(),
+                              index = nothing)
+    exact = match(r"^v?(\d+\.\d+\.\d+)$", want)
+    exact === nothing || return String(exact[1])
+    (want == "lts" || occursin(r"^\d+$", want)) ||
+        error("a Node version is \"lts\", a major (\"22\") or a release (\"22.1.0\"), not \"$(want)\"")
+    releases = index === nothing ? node_index(dist) : index
+    version(entry) = String(lstrip(String(entry["version"]), 'v'))
     if want == "lts"
-        entry = findfirst(e -> e["lts"] !== false, index)
-        entry === nothing && error("nodejs.org lists no LTS release")
-        return version(index[entry])
-    elseif occursin(r"^\d+$", want)
-        entry = findfirst(e -> startswith(String(e["version"]), "v$(want)."), index)
-        entry === nothing && error("nodejs.org lists no Node $(want) release")
-        return version(index[entry])
+        entry = findfirst(e -> e["lts"] !== false, releases)
+        entry === nothing && error("$(dist) lists no LTS release")
+        return version(releases[entry])
     end
-    return String(lstrip(want, 'v'))
+    entry = findfirst(e -> startswith(String(e["version"]), "v$(want)."), releases)
+    entry === nothing && error("$(dist) lists no Node $(want) release")
+    return version(releases[entry])
 end
 
-node_index() = JSON.parse(String(HTTP.get("$(NODE_DIST)/index.json").body))
+node_index(dist::AbstractString) = JSON.parse(String(HTTP.get("$(dist)/index.json").body))
 
 # The published archive for this machine: its directory name and extension.
 function node_asset(version::AbstractString)
@@ -92,16 +98,17 @@ end
 
 # Download, verify against the release's SHASUMS256.txt, and unpack one Node
 # release into `root`. Returns its directory.
-function install_node!(root::AbstractString, version::AbstractString)
+function install_node!(root::AbstractString, version::AbstractString;
+                       dist::AbstractString = node_dist())
     asset = node_asset(version)
     dest = joinpath(root, asset.name)
     if !isdir(dest)
         file = "$(asset.name).$(asset.ext)"
-        sums = String(HTTP.get("$(NODE_DIST)/v$(version)/SHASUMS256.txt").body)
+        sums = String(HTTP.get("$(dist)/v$(version)/SHASUMS256.txt").body)
         m = match(Regex("^([0-9a-f]{64})\\s+\\Q$(file)\\E\$", "m"), sums)
         m === nothing && error("Node $(version) publishes no checksum for $(file)")
         archive = joinpath(root, file)
-        write(archive, HTTP.get("$(NODE_DIST)/v$(version)/$(file)").body)
+        write(archive, HTTP.get("$(dist)/v$(version)/$(file)").body)
         try
             got = file_sha256(archive)
             got == m[1] || error("checksum mismatch for $(file): expected $(m[1]), got $(got)")
@@ -156,16 +163,16 @@ function installed_harnesses(root::AbstractString, packages)
 end
 
 """
-    sync_harnesses!(spec; root = harness_root(), log = devnull) -> Dict{String,String}
+    sync_harnesses!(spec; root = harness_root(), log = devnull, dist = node_dist()) -> Dict{String,String}
 
 Bring `root` to what `spec` asks for: the Node release it names, and each package
 at its version (`"latest"` is resolved against the registry every time). Returns
 what is installed afterwards. Idempotent: what is already current is skipped.
 """
 function sync_harnesses!(spec::HarnessSpec; root::AbstractString = harness_root(),
-                         log = devnull)
+                         log = devnull, dist::AbstractString = node_dist())
     mkpath(root)
-    nodedir = install_node!(root, resolve_node_version(spec.node))
+    nodedir = install_node!(root, resolve_node_version(spec.node; dist); dist)
     prefix = mkpath(joinpath(root, "npm"))
     for (pkg, want) in spec.packages
         target = want == "latest" ?

@@ -644,6 +644,10 @@ include("test_stability.jl")
 # short-lived `sleep`/`bash` children only — no agent, no network.
 include("test_agent_reaping.jl")
 
+# The managed agent adapters, installed for real from nodejs.org and npm into a
+# cache, then started and asked for an ACP initialize. Skipped without a network.
+include("test_managed_adapters.jl")
+
 # Real-agent integration test — separate file because it boots a subprocess
 # and stands up an HTTP+WS server. Skipped automatically when
 # claude-agent-acp isn't on PATH (so unit-only environments stay green).

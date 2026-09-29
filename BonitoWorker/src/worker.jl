@@ -238,11 +238,14 @@ end
 
 # Meets the spec now, then again every `recheck` seconds (so "latest" follows the
 # registry) or as soon as a new spec arrives, and only while no chat runs: an
-# agent must not have its files replaced underneath it.
-function harness_loop(w::Worker; recheck::Real = 6 * 3600.0)
+# agent must not have its files replaced underneath it. A failed install (the
+# network was down, a version does not exist) is tried again after `retry`
+# seconds: a new machine has no adapters at all until one succeeds.
+function harness_loop(w::Worker; recheck::Real = 6 * 3600.0, retry::Real = 300.0,
+                      idle_poll::Real = 30.0)
     while !w.closed
         while !(w.closed || begin_harness_sync!(w))
-            sleep(30.0)
+            sleep(idle_poll)
         end
         w.closed && break
         spec = lock(() -> (w.harness.pending = false; w.harness.spec), w.lock)
@@ -257,7 +260,8 @@ function harness_loop(w::Worker; recheck::Real = 6 * 3600.0)
             lock(() -> (w.harness.syncing = false), w.lock)
         end
         report_harnesses(w, installed, err)
-        timedwait(() -> w.closed || lock(() -> w.harness.pending, w.lock), recheck; pollint = 5.0)
+        timedwait(() -> w.closed || lock(() -> w.harness.pending, w.lock),
+                  isempty(err) ? recheck : retry; pollint = min(5.0, idle_poll))
     end
     return nothing
 end
