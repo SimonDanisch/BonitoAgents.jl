@@ -5,21 +5,22 @@
 #
 # Stops, disables and removes the three systemd units (server, Authelia, Caddy)
 # and the Caddy + Authelia binaries in /usr/local/lib/bonitoagents. The data dir
-# /var/lib/bonitoagents (accounts, worker credentials, workers.json /
-# projects.json, project mirrors, Authelia's secrets and database, Caddy's
-# certificates) is removed by default; pass --keep-state to preserve it, so a
-# reinstall keeps every account, worker and certificate. The legacy config dir
-# /etc/bonitoagents (pre-CLI installs) goes with it. The monorepo checkout is
-# never touched.
+# /var/lib/bonitoagents (projects and chats, workers.json / projects.json,
+# accounts, worker credentials, Authelia's secrets and database, Caddy's
+# certificates) stays: a reinstall, or running the server without the proxy
+# (`bonito-agents server --host 0.0.0.0 --state-dir /var/lib/bonitoagents/state`),
+# picks everything up again. Only --purge deletes it, with the legacy config dir
+# /etc/bonitoagents (pre-CLI installs). The monorepo checkout is never touched.
 #
 # Options:
 #   --instance NAME  remove the install made with `install_server.sh --instance NAME`
 #                    (bonitoagents-NAME-*, /var/lib/bonitoagents-NAME, ...) instead
-#   --keep-state     Preserve the data dir (and the legacy /etc/bonitoagents).
-#   --yes            Skip the confirmation prompt.
+#   --purge          also delete the data dir: every project, chat and account
+#   --keep-state     keep the data dir (the default; accepted for older scripts)
+#   --yes            skip the confirmation prompt
 set -euo pipefail
 
-KEEP_STATE=0
+KEEP_STATE=1
 ASSUME_YES=0
 INSTANCE=""
 
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --instance)   INSTANCE="$2"; shift 2 ;;
         --keep-state) KEEP_STATE=1; shift ;;
+        --purge)      KEEP_STATE=0; shift ;;
         --yes|-y)     ASSUME_YES=1; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -52,8 +54,9 @@ command -v sudo > /dev/null || { echo "ERROR: sudo not found"; exit 1; }
 echo "==> BonitoAgents server uninstaller"
 echo "    Services : ${SERVICES[*]}"
 echo "    Binaries : ${BIN_ROOT}"
-echo "    Data     : ${DATA_DIR}    $([[ $KEEP_STATE -eq 1 ]] && echo '(KEEP)' || echo '(REMOVE)')"
-echo "    Config   : ${CONFIG_DIR}     $([[ $KEEP_STATE -eq 1 ]] && echo '(KEEP)' || echo '(REMOVE)')"
+echo "    Data     : ${DATA_DIR}    $([[ $KEEP_STATE -eq 1 ]] && echo '(kept)' || echo '(DELETED: every project, chat and account)')"
+[[ -z "$CONFIG_DIR" ]] ||
+    echo "    Config   : ${CONFIG_DIR}     $([[ $KEEP_STATE -eq 1 ]] && echo '(kept)' || echo '(DELETED)')"
 
 # ── Confirmation ──────────────────────────────────────────────────────────────
 if [[ $ASSUME_YES -ne 1 ]]; then
@@ -96,9 +99,9 @@ fi
 
 # ── Data + config ─────────────────────────────────────────────────────────────
 if [[ $KEEP_STATE -eq 1 ]]; then
-    step "Preserve state (--keep-state)"
-    info "$DATA_DIR retained"
-    info "$CONFIG_DIR retained"
+    step "Keep the data"
+    info "$DATA_DIR kept (--purge deletes it)"
+    [[ -z "$CONFIG_DIR" ]] || info "$CONFIG_DIR kept"
 else
     step "Remove data dir"
     if [[ -d "$DATA_DIR" ]]; then
@@ -122,7 +125,14 @@ echo "============================================================"
 echo "  BonitoAgents server uninstalled."
 echo "============================================================"
 echo ""
-echo "  The monorepo checkout itself was NOT touched. To remove it:"
-echo "    rm -rf /path/to/your/BonitoAgents-checkout"
+if [[ $KEEP_STATE -eq 1 ]]; then
+    echo "  Projects, chats and accounts are kept in $DATA_DIR. To use them:"
+    echo "    behind the login proxy again:  bash BonitoAgents/assets/install_server.sh${INSTANCE:+ --instance $INSTANCE}"
+    echo "    on a trusted network, no login: BonitoAgents/bin/bonitoagents-server --host 0.0.0.0 \\"
+    echo "        --state-dir $DATA_DIR/state --working-dir $DATA_DIR/projects"
+    echo "  To delete them too: bash BonitoAgents/assets/uninstall_server.sh --purge${INSTANCE:+ --instance $INSTANCE}"
+else
+    echo "  To reinstall:    bash BonitoAgents/assets/install_server.sh${INSTANCE:+ --instance $INSTANCE}"
+fi
 echo ""
-echo "  To reinstall:    bash BonitoAgents/assets/install_server.sh${INSTANCE:+ --instance $INSTANCE}"
+echo "  The monorepo checkout itself was NOT touched."

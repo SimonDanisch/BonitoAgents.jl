@@ -51,8 +51,18 @@ save_invites!(s::ServerState) = lock(s.lock) do
 end
 
 proxy_config(auth::ProxyAuth) = auth.config
-proxy_config(::LocalAuth) =
-    error("this server has no proxy in front (no proxy.json): there are no accounts or worker credentials to manage")
+proxy_config(::OpenAuth) =
+    error("this server has no login proxy in front (no proxy.json): there are no accounts to manage")
+
+# The hash Caddy checks a worker's password against: behind the proxy only. On a
+# trusted network the server checks the credential's digest itself; on one
+# machine no worker needs a credential.
+caddy_password_hash(auth::ProxyAuth, password::AbstractString) = caddy_hash(auth.config, password)
+caddy_password_hash(::NetworkAuth, password::AbstractString) = ""
+caddy_password_hash(::LocalAuth, password::AbstractString) =
+    error("only this machine reaches this server (it listens on localhost), and its workers need " *
+          "no credential. To add other machines, listen on the network (--host 0.0.0.0) or put " *
+          "the login proxy in front (install_server.sh).")
 
 # Authelia's files live together, beside its users database. Without mail it
 # writes what it would send (the one-time code that confirms a new second factor)
@@ -82,7 +92,7 @@ last good one, and the error reaches whoever changed it. Without the proxy there
 is nothing to do.
 """
 apply_proxy!(state::ServerState) = apply_proxy!(state.auth, root_state(state))
-apply_proxy!(::LocalAuth, ::ServerState) = nothing
+apply_proxy!(::OpenAuth, ::ServerState) = nothing
 
 function apply_proxy!(auth::ProxyAuth, root::ServerState)
     cfg = auth.config
@@ -126,16 +136,17 @@ end
 """
     add_worker_credential!(state, owner) -> String
 
-Issue a worker credential for `owner` ("Add worker"): Caddy checks it on `/w`
-from now on. Returns `name:password`, the only time the password exists outside
-its hash; the install command carries it to the new machine.
+Issue a worker credential for `owner` ("Add worker"): checked on `/w` from now
+on, by Caddy behind the proxy and by the server itself on a trusted network.
+Returns `name:password`, the only time the password exists outside its hashes;
+the install command carries it to the new machine.
 """
 function add_worker_credential!(state::ServerState, owner::AbstractString)
     root = root_state(state)
-    cfg = proxy_config(root.auth)
     name = "w-" * bytes2hex(rand(Random.RandomDevice(), UInt8, 4))
     password = bytes2hex(rand(Random.RandomDevice(), UInt8, 24))
-    cred = WorkerCredential(name, caddy_hash(cfg, password), String(owner), now(UTC))
+    cred = WorkerCredential(name, caddy_password_hash(root.auth, password), String(owner), now(UTC),
+                            credential_digest(password))
     lock(root.lock) do
         root.worker_credentials[][name] = cred
         save_worker_credentials!(root)
@@ -149,8 +160,8 @@ end
 """
     revoke_worker_credential!(state, name) -> Bool
 
-Take a worker credential back: Caddy refuses it from now on, and a worker that
-is connected with it is disconnected (its reconnect meets the refusal).
+Take a worker credential back: it is refused from now on, and a worker that is
+connected with it is disconnected (its reconnect meets the refusal).
 """
 function revoke_worker_credential!(state::ServerState, name::AbstractString)
     root = root_state(state)
@@ -366,7 +377,7 @@ function add_invite_routes!(srv::Bonito.Server, state::ServerState)
     end)
 end
 
-invite_response(::LocalAuth, state::ServerState, request, token::AbstractString) =
+invite_response(::OpenAuth, state::ServerState, request, token::AbstractString) =
     invite_page(404, "Not found", "<p>This server has no accounts to invite anyone to.</p>")
 
 function invite_response(auth::ProxyAuth, state::ServerState, request, token::AbstractString)
@@ -585,13 +596,14 @@ text_input(obs::Observable{String}, placeholder::AbstractString) =
               oninput = js"event => $(obs).notify(event.target.value)")
 
 """
-    worker_install_block(::ProxyAuth, session, state)
+    worker_install_block(auth, session, state)
 
-"Add worker" behind the proxy: an admin issues a credential and gets the install
-command that carries it (shown once); the credentials issued so far can be
-revoked. A member is told to ask an admin.
+"Add worker" where other machines connect (behind the proxy, or on a trusted
+network): an admin issues a credential and gets the install command that carries
+it (shown once); the credentials issued so far can be revoked. A member is told
+to ask an admin. (One machine's server has no credentials: dashboard.jl.)
 """
-function worker_install_block(::ProxyAuth, session::Bonito.Session, state::ServerState)
+function worker_install_block(::Union{ProxyAuth,NetworkAuth}, session::Bonito.Session, state::ServerState)
     summary = DOM.summary(DOM.span("Add a worker"; class = "bt-discover-title");
                           class = "bt-discover-header")
     if !is_admin(state)
@@ -668,7 +680,7 @@ function account_sections(session::Bonito.Session, state::ServerState)
                    admin ? adapters_section(session, state) : DOM.div())
 end
 
-own_account_section(::LocalAuth, session::Bonito.Session, state::ServerState) = DOM.div()
+own_account_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.div()
 
 function own_account_section(auth::ProxyAuth, session::Bonito.Session, state::ServerState)
     user = state.user
@@ -701,7 +713,7 @@ function own_account_section(auth::ProxyAuth, session::Bonito.Session, state::Se
             class = "bt-card"))
 end
 
-accounts_section(::LocalAuth, session::Bonito.Session, state::ServerState) = DOM.div()
+accounts_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.div()
 
 function accounts_section(auth::ProxyAuth, session::Bonito.Session, state::ServerState)
     status = Observable("")
@@ -819,7 +831,7 @@ function login_codes_block(file::AbstractString, session::Bonito.Session)
         DOM.pre(shown; class = "bt-admin-pre"))
 end
 
-invites_section(::LocalAuth, session::Bonito.Session, state::ServerState) = DOM.div()
+invites_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.div()
 
 function invites_section(::ProxyAuth, session::Bonito.Session, state::ServerState)
     status = Observable("")
@@ -919,7 +931,7 @@ end
 Behind the proxy, on a worker's card: the groups it is shared with, editable by
 whoever manages it.
 """
-worker_sharing_row(::LocalAuth, session::Bonito.Session, state::ServerState, worker_id::String) = DOM.div()
+worker_sharing_row(::OpenAuth, session::Bonito.Session, state::ServerState, worker_id::String) = DOM.div()
 
 function worker_sharing_row(::ProxyAuth, session::Bonito.Session, state::ServerState, worker_id::String)
     w = get(state.workers[], worker_id, nothing)

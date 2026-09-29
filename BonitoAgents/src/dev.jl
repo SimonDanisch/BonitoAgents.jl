@@ -14,7 +14,6 @@
 #   end
 
 using Random
-import Sockets
 
 """
     DevProxy(; caddy_bin, authelia_bin, password, totp_secret, admin = "admin", domain = "bonito.localhost")
@@ -75,6 +74,13 @@ Caddy (with its own certificate authority) and Authelia, rendered from the same
 code, the worker coming in through Caddy with its credential, and `handle.url`
 Caddy's `https://<domain>:<port>`. The e2e items for the login use it.
 
+`network = true` runs it the way a trusted network's server runs (`NetworkAuth`:
+no login, and the worker comes in with a credential "Add worker" issued, which
+the server checks itself), still on localhost.
+
+`manage_harnesses = true` has the server declare the agent adapters, which the
+worker then installs (off by default, so a dev server's worker downloads no Node).
+
 If `claude-agent-acp` isn't on PATH the dashboard still works (worker
 registration, sidebar, project import, file pickers); only opening a
 chat session against the worker will fail at the agent spawn step.
@@ -103,7 +109,11 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                       worker_link_grace::Real              = 300.0,
                       scan_on_connect::Bool                = true,
                       dir::Union{String,Nothing}           = nothing,
-                      proxy::Union{DevProxy,Nothing}       = nothing)
+                      proxy::Union{DevProxy,Nothing}       = nothing,
+                      network::Bool                        = false,
+                      manage_harnesses::Bool               = false)
+    (network && proxy !== nothing) &&
+        error("dev_server: `network` and `proxy` are two different setups; pick one")
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
     # writes the real port back to srv.port after start. Behind the proxy the
     # port has to be known up front: the Caddyfile forwards to it.
@@ -140,12 +150,14 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     actual_name = name === nothing ? BonitoWorker.default_worker_name(worker_id) : name
 
     # Without `proxy` there is nothing in front (a localhost server: its worker
-    # connects without a credential). No managed agent adapters either (`serve`'s
-    # default): a dev or test worker must never download Node or npm packages.
+    # connects without a credential, or with one on a `network` server). No
+    # managed agent adapters either unless asked (`serve`'s default): a dev or
+    # test worker must never download Node or npm packages by surprise.
     proxy === nothing || write_dev_proxy_config!(proxy, state_dir, chosen_port)
     state = serve(; host          = "127.0.0.1",
                     port          = chosen_port,
-                    auth          = auth_mode(state_dir),
+                    auth          = network ? NetworkAuth() : auth_mode(state_dir),
+                    manage_harnesses,
                     state_dir     = state_dir,
                     working_dir   = working_dir,
                     heartbeat_interval = heartbeat_interval,
@@ -156,9 +168,11 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # credential (issued first, so Caddy starts out knowing it): under 127.0.0.1
     # (the proxy's `worker_address`), since only browsers resolve `.localhost`.
     rig, credential = try
-        proxy === nothing ? (nothing, "") :
+        proxy !== nothing ?
             (credential = add_worker_credential!(state, proxy.admin);
-             (start_dev_proxy(proxy, state), credential))
+             (start_dev_proxy(proxy, state), credential)) :
+        network ? (nothing, add_worker_credential!(state, default_owner(state.auth))) :
+                  (nothing, "")
     catch
         close(state.srv)    # a proxy that did not come up leaves no server behind
         rethrow()

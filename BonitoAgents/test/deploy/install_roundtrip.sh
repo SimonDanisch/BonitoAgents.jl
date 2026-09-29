@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The server installer, for real, on this machine: install, check, install again
-# (an update), check nothing was lost, uninstall, check nothing was left behind.
+# (an update), check nothing was lost; uninstall, check the data stayed, install
+# once more over it; then uninstall with --purge, check nothing was left behind.
 #
 #   bash BonitoAgents/test/deploy/install_roundtrip.sh
 #
@@ -69,14 +70,30 @@ checks
 check "secrets and accounts are kept" test "$(secrets_digest)" = "$before"
 check "no new admin password" bash -c "! grep -q 'Password      :' $log2"
 
-echo "==> 3. uninstall"
+removed() {
+    for unit in server authelia caddy; do
+        check "$NAME-$unit is gone" bash -c "! systemctl cat $NAME-$unit > /dev/null 2>&1"
+    done
+    check "its binaries are gone" test ! -e "/usr/local/lib/$NAME"
+    check "nothing listens on its ports" bash -c "! sudo ss -Hltn | grep -qE ':($PORT|$HTTPS_PORT|$HTTP_PORT|$AUTHELIA_PORT)\b'"
+}
+
+echo "==> 3. uninstall: the services go, the data stays"
 bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --yes
-for unit in server authelia caddy; do
-    check "$NAME-$unit is gone" bash -c "! systemctl cat $NAME-$unit > /dev/null 2>&1"
-done
+removed
+check "projects, accounts and secrets are kept" test "$(secrets_digest)" = "$before"
+
+echo "==> 4. install again over the kept data"
+log3="$(mktemp)"
+if ! install 2>&1 | tee "$log3"; then echo "  FAIL  the install over kept data"; failures=$((failures + 1)); fi
+checks
+check "secrets and accounts are the same" test "$(secrets_digest)" = "$before"
+check "no new admin password" bash -c "! grep -q 'Password      :' $log3"
+
+echo "==> 5. uninstall --purge: nothing is left"
+bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --purge --yes
+removed
 check "its data is gone" test ! -e "/var/lib/$NAME"
-check "its binaries are gone" test ! -e "/usr/local/lib/$NAME"
-check "nothing listens on its ports" bash -c "! sudo ss -Hltn | grep -qE ':($PORT|$HTTPS_PORT|$HTTP_PORT|$AUTHELIA_PORT)\b'"
 
 echo ""
 if [[ $failures -eq 0 ]]; then echo "==> round trip passed"; else echo "==> $failures check(s) failed"; fi

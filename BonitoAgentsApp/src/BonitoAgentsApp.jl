@@ -232,8 +232,10 @@ Desktop options:
 
 Server options:
   --port=N                listen port (default: 8038)
-  --host=HOST             bind host (default: 127.0.0.1; localhost only, the
-                          login proxy from install_server.sh reaches it)
+  --host=HOST             bind host (default: 127.0.0.1, this machine only).
+                          Another address (e.g. 0.0.0.0) serves a trusted network
+                          without the login proxy: no login, and workers join
+                          with a credential from "Add worker"
   --public-url=URL        base URL workers dial back to (default: auto)
   --state-dir=PATH        workers.json / projects.json / chats
   --log-file=PATH         server log (default: <state-dir>/logs/server.log)
@@ -242,7 +244,7 @@ Server options:
 
 Worker options:
   --server-url=URL        dashboard server to connect to (required)
-  --credential=NAME:PASS  the worker credential from "Add worker" (behind the proxy);
+  --credential=NAME:PASS  the worker credential from "Add worker";
                           BONITOAGENTS_WORKER_CREDENTIAL keeps it off the command line
   --worker-id=ID          stable worker id (default: persisted/generated)
   --projects-root=PATH    where project checkouts live

@@ -2582,10 +2582,10 @@ install_command_row(label::AbstractString, cmd::AbstractString) = DOM.div(
             }"""),
         class = "bt-install-cmd"))
 
-# The "add a worker" block of the Workers section. On a server without the proxy
-# only this machine reaches the server, so the plain install one-liner is the
-# whole story; behind the proxy each worker needs a credential first
-# (`worker_install_block(::ProxyAuth, …)` in accounts.jl).
+# The "add a worker" block of the Workers section. On one machine's server only
+# this machine reaches it, so the plain install one-liner is the whole story; on
+# a network or behind the proxy each worker needs a credential first
+# (`worker_install_block(::Union{ProxyAuth,NetworkAuth}, …)` in accounts.jl).
 function worker_install_block(::LocalAuth, session::Bonito.Session, state::ServerState)
     # The "no workers" install-instructions block lives as a sibling that
     # toggles visibility based on workers-empty. Keeps the install snippet

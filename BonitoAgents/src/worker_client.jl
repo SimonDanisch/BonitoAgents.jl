@@ -326,8 +326,9 @@ end
 """
     handle_worker_link(state, ws, request)
 
-One connection to `/w`. Reads the worker's hello, admits it by the credential the
-proxy checked on `request` (identity.jl; a local server admits it outright), and
+One connection to `/w`. Reads the worker's hello, admits it by the credential on
+`request` (identity.jl: checked by the proxy, or by the server itself on a
+trusted network; one machine's server admits it outright), and
 either resumes the worker's link (the hello names it and it is still alive) or
 starts a new one, which kills and tears down whatever link the worker had
 before. Returns once this connection ends; the link can outlive it.
@@ -340,7 +341,7 @@ function handle_worker_link(state::ServerState, ws, request)
         info = decode_control(hello.app)
         credential = worker_credential(state.auth, request, state.worker_credentials[])
         if credential === nothing
-            WorkerLink.refuse(t, "unauthorized: no valid worker credential (revoked, or not through the proxy)")
+            WorkerLink.refuse(t, "unauthorized: no valid worker credential (none given, revoked, or not through the proxy)")
             return
         end
         name      = String(get(info, "name", get(info, "hostname", "anon")))
@@ -505,13 +506,12 @@ function worker_came_online!(state::ServerState, worker_id::String)
         catch e
             @warn "auto-scan on connect failed" worker_id exception = e
         end)
-    end
     else
         Base.errormonitor(@async prune_missing_discovered!(state, worker_id))
+    end
     return nothing
 end
 
-# The link's state is the worker's: connected is online, detached is offline
 """
     prune_missing_discovered!(state, worker_id) -> Int
 
@@ -549,6 +549,7 @@ function worker_folder_gone(state::ServerState, worker_id::String, path::String)
     return !info.exists
 end
 
+# The link's state is the worker's: connected is online, detached is offline
 # with everything kept for the reconnect, dead is gone.
 function worker_link_changed!(state::ServerState, worker_id::String,
                               link::WorkerLink.Link, st::Symbol)

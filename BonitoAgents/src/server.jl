@@ -31,11 +31,13 @@ const INSTALL_PS1    = read(joinpath(ASSETS_DIR, "install.ps1"), String)
 """
     serve(; host, port, public_url, auth, state_dir, working_dir) → Bonito.Server
 
-Start the BonitoAgents dashboard server. It listens on localhost only and does no
-authentication itself (identity.jl): behind the proxy the installer sets up
-(`auth = ProxyAuth(...)`, from `<state_dir>/proxy.json`), Caddy + Authelia
-authenticate every request and say who it is from; without it (`LocalAuth`),
-only this machine can reach the server and its user is the one account.
+Start the BonitoAgents dashboard server, in one of three ways (identity.jl):
+for this machine (`LocalAuth`, the default: localhost only, whoever reaches it is
+the one account, and so is every worker); for a trusted network (`NetworkAuth`:
+any `host`, still no login, workers join with a credential from "Add worker");
+or behind the login proxy the installer sets up (`ProxyAuth(...)`, from
+`<state_dir>/proxy.json`: localhost only, Caddy + Authelia authenticate every
+request and say who it is from).
 
 Routes:
   /                       — dashboard (workers + projects)
@@ -74,12 +76,7 @@ function serve(; host::String        = "127.0.0.1",
                  worker_link_grace::Real = 300.0,
                  scan_on_connect::Bool = true,
                  log_file::Union{String,Nothing} = nothing)
-    # Nothing but the proxy, or this machine, may reach the server: it takes the
-    # proxy's word for who a request is from, and without the proxy everyone who
-    # connects is the local admin.
-    is_loopback(host) ||
-        error("BonitoAgents only listens on localhost (got --host $(host)): put the proxy " *
-              "in front to reach it from elsewhere (BonitoAgents/assets/install_server.sh).")
+    check_host(auth, host)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
     isvalid(s) = s !== nothing && !isempty(String(s))
@@ -141,7 +138,7 @@ function serve(; host::String        = "127.0.0.1",
     # when --public-url was omitted; `something("", …)` would have kept the
     # empty string and templated install scripts with a blank SERVER_URL).
     base_url = (public_url === nothing || isempty(public_url)) ?
-        default_public_url(auth, srv) : public_url
+        default_public_url(auth, srv, host) : public_url
     # The dashboard's install snippet renders the SAME url the install routes
     # are templated with — never a "<your-server>" placeholder.
     state.base_url[] = rstrip(base_url, '/')
@@ -165,17 +162,45 @@ function serve(; host::String        = "127.0.0.1",
     # credentials, accounts): bring both in line with what it has on record.
     apply_proxy!(state)
     @info "BonitoAgents dashboard running" url=base_url state=sd auth=nameof(typeof(auth))
-    @info "Workers: \"Add worker\" on the dashboard gives the install command for a machine."
+    announce(auth, base_url)
     return state
 end
 
+# Where the server may listen. Behind the proxy and on one machine, localhost
+# only: Caddy forwards to it there, and a server that lets every worker in must
+# not be reachable by other machines. A trusted network's, anywhere.
+check_host(::ProxyAuth, host::AbstractString) = is_loopback(host) ||
+    error("behind the login proxy the server listens on localhost only (got --host $(host)): " *
+          "Caddy forwards to it")
+check_host(::LocalAuth, host::AbstractString) = is_loopback(host) ||
+    error("a server for this machine lets every worker in, so it listens on localhost only " *
+          "(got --host $(host)); on a network, workers need credentials: `auth = NetworkAuth()` " *
+          "(`bonito-agents server --host …` picks it)")
+check_host(::NetworkAuth, host::AbstractString) = true
+
+announce(::AuthMode, url::AbstractString) =
+    @info "Workers: \"Add worker\" on the dashboard gives the install command for a machine."
+announce(::LocalAuth, url::AbstractString) =
+    @info "Workers: only this machine reaches this server (localhost); `--host 0.0.0.0` lets other machines in."
+announce(::NetworkAuth, url::AbstractString) =
+    @warn "No login: anyone who reaches $(url) uses the dashboard, and through it the workers' " *
+          "machines; nothing is encrypted. Workers join with a credential from \"Add worker\". " *
+          "For more than a trusted network, put the login proxy in front " *
+          "(BonitoAgents/assets/install_server.sh)."
+
 # Where workers and browsers reach the server when no --public-url says so.
-default_public_url(auth::ProxyAuth, srv) = public_origin(auth.config, auth.config.domain)
-default_public_url(::LocalAuth, srv) = Bonito.online_url(srv, "")
+default_public_url(auth::ProxyAuth, srv, host) = public_origin(auth.config, auth.config.domain)
+default_public_url(::LocalAuth, srv, host) = Bonito.online_url(srv, "")
+# Other machines dial it: at the address it listens on, or on a wildcard bind at
+# this machine's own (`--public-url` says otherwise, e.g. for a host name).
+function default_public_url(::NetworkAuth, srv, host)
+    addr = host in ("0.0.0.0", "::") ? string(Sockets.getipaddr()) : host
+    return "http://$(occursin(':', addr) ? "[$(addr)]" : addr):$(srv.port)"
+end
 
 # Behind the proxy, the port is the one Caddy forwards to.
 listen_port(auth::ProxyAuth, opts::AbstractDict) = auth.config.port
-listen_port(::LocalAuth, opts::AbstractDict) = parse(Int, get(opts, "port", "8038"))
+listen_port(::OpenAuth, opts::AbstractDict) = parse(Int, get(opts, "port", "8038"))
 
 # ── Package entry point ──────────────────────────────────────────────────────
 # `julia --project=<monorepo root> -m BonitoAgents [flags]` starts the server and
@@ -185,6 +210,7 @@ listen_port(::LocalAuth, opts::AbstractDict) = parse(Int, get(opts, "port", "803
 #
 #   julia --project=. -m BonitoAgents
 #   julia --project=. -m BonitoAgents --port 8080
+#   julia --project=. -m BonitoAgents --host 0.0.0.0     # a trusted network, no login
 #
 # Flags: --port --host --public-url --state-dir --working-dir --log-file
 """
@@ -214,10 +240,11 @@ function start_server(opts::AbstractDict;
                       working_dir::AbstractString = "")
     sd = let v = get(opts, "state-dir", ""); isempty(v) ? state_dir : v end
     wd = let v = get(opts, "working-dir", ""); isempty(v) ? working_dir : v end
-    auth = auth_mode(sd)
+    host = get(opts, "host", "127.0.0.1")
+    auth = auth_mode(sd; host)
     return serve(;
         auth,
-        host          = get(opts, "host", "127.0.0.1"),
+        host,
         port          = listen_port(auth, opts),
         public_url    = get(opts, "public-url", ""),
         manage_harnesses = true,

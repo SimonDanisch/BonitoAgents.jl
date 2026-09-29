@@ -1,8 +1,17 @@
 # ── Who is on the other end ──────────────────────────────────────────────────
-# BonitoAgents does no authentication itself. Behind the proxy the installer
-# sets up (Caddy + Authelia, install_server.sh), the server listens on 127.0.0.1
-# and every request reaches it through Caddy, which has already authenticated
-# it:
+# Three ways to run a server, from least to most set up:
+#   * one machine (`LocalAuth`: the desktop app, `bonito-agents server`): it
+#     listens on localhost, and whoever reaches it is the local user, the one
+#     account, an admin; so is every worker (they run on this machine too);
+#   * a network it trusts (`NetworkAuth`: `bonito-agents server --host 0.0.0.0`):
+#     still no login, whoever reaches it is that one admin, but a worker comes
+#     in with a credential "Add worker" issued, which the server checks itself;
+#   * behind the login proxy (`ProxyAuth`, install_server.sh): HTTPS, logins,
+#     accounts and groups.
+#
+# Behind the proxy BonitoAgents does no authentication itself. The installer
+# sets up Caddy + Authelia, the server listens on 127.0.0.1 and every request
+# reaches it through Caddy, which has already authenticated it:
 #   * people through Authelia's login (password + second factor), which
 #     forwards who they are as `Remote-User`/`-Email`/`-Name`/`-Groups`;
 #   * workers through the Basic credential "Add worker" issued them, which Caddy
@@ -14,10 +23,6 @@
 # server's state dir into the Caddyfile, both readable by the service user
 # alone), and a request without it carries no identity, whatever it claims.
 # Caddy's own admin API is off for the same reason: it would hand out the key.
-#
-# Without the proxy (the desktop app, the dev server, one machine) the server
-# also listens on 127.0.0.1 only, and whoever can reach it is the local user:
-# the one account, an admin.
 #
 # The types live here, ahead of state.jl; what acts on a ServerState is in
 # accounts.jl.
@@ -34,15 +39,32 @@ is_admin(u::User) = "admins" in u.groups
 
 abstract type AuthMode end
 
-"A server only this machine can reach: everyone is `user`."
-struct LocalAuth <: AuthMode
+"No login: whoever reaches the server is `user`, the one account, an admin."
+abstract type OpenAuth <: AuthMode end
+
+"A server only this machine can reach (it listens on localhost): everyone is `user`, and every worker is let in."
+struct LocalAuth <: OpenAuth
     user::User
 end
 
-function LocalAuth()
-    name = get(ENV, "USER", get(ENV, "USERNAME", "local"))
-    return LocalAuth(User(name, "", name, ["admins"]))
+"""
+A server on a network it trusts, without the login proxy: everyone who reaches it
+is `user`, as on one machine, and a worker comes in with a credential "Add worker"
+issued, which the server checks itself. Nothing is encrypted (plain HTTP) and
+nobody logs in; for more than a trusted network, the proxy (install_server.sh).
+"""
+struct NetworkAuth <: OpenAuth
+    user::User
 end
+
+"The account of whoever runs the server."
+function local_user()
+    name = get(ENV, "USER", get(ENV, "USERNAME", "local"))
+    return User(name, "", name, ["admins"])
+end
+
+LocalAuth() = LocalAuth(local_user())
+NetworkAuth() = NetworkAuth(local_user())
 
 """
     ProxyConfig
@@ -133,9 +155,22 @@ end
 
 const PROXY_KEY_HEADER = "X-BonitoAgents-Proxy"
 
-"The proxy the installer set up in front of the server at `state_dir`, if any."
-function auth_mode(state_dir::AbstractString)
+"""
+    auth_mode(state_dir; host = "127.0.0.1") -> AuthMode
+
+How the server at `state_dir` runs, decided by how it is started: listening on
+more than localhost, for a trusted network (`NetworkAuth`); otherwise behind the
+proxy the installer set up, if it did (`proxy.json`), or for this machine alone
+(`LocalAuth`). The proxy's settings stay where they are when it is not used, so
+going back to it is starting the server without `--host` again.
+"""
+function auth_mode(state_dir::AbstractString; host::AbstractString = "127.0.0.1")
     f = joinpath(state_dir, "proxy.json")
+    if !is_loopback(host)
+        isfile(f) && @info "Listening on $(host), for a trusted network: the login proxy's settings " *
+                           "($(f)) are not used; start without --host to run behind it again."
+        return NetworkAuth()
+    end
     isfile(f) || return LocalAuth()
     d = JSON.parsefile(f)
     d["smtp"] = isfile(smtp_file(state_dir))
@@ -150,7 +185,7 @@ smtp_file(state_dir::AbstractString) = joinpath(state_dir, "smtp.json")
 from_proxy(auth::ProxyAuth, request) = HTTP.header(request, PROXY_KEY_HEADER, "") == auth.key
 
 "The one the records from before owners existed belong to."
-default_owner(auth::LocalAuth) = auth.user.name
+default_owner(auth::OpenAuth) = auth.user.name
 default_owner(auth::ProxyAuth) = auth.config.admin
 
 """
@@ -160,7 +195,7 @@ Who sent `request`: the local user, or whoever the proxy says it is. `nothing`
 behind the proxy when the request carries no identity, i.e. it did not come
 through Authelia.
 """
-request_user(auth::LocalAuth, request) = auth.user
+request_user(auth::OpenAuth, request) = auth.user
 
 function request_user(auth::ProxyAuth, request)
     from_proxy(auth, request) || return nothing
@@ -173,28 +208,79 @@ function request_user(auth::ProxyAuth, request)
                 isempty(display) ? name : display, groups)
 end
 
-"A worker's admission to `/w`: which credential Caddy checked, and who issued it."
+"""
+    WorkerCredential
+
+A worker's admission to `/w` ("Add worker"), and who issued it. `hash` is what
+Caddy's `basic_auth` checks behind the proxy (bcrypt; `""` when issued without
+the proxy, where there is no Caddy to make one); `digest` is what the server
+checks itself on a trusted network (SHA-256 of the password: a random 24 bytes,
+so no slow hash is needed; `""` on credentials from before it existed).
+"""
 struct WorkerCredential
     name::String
-    hash::String        # bcrypt, the form Caddy's `basic_auth` checks
+    hash::String
     owner::String
     created::DateTime
+    digest::String
 end
 
+WorkerCredential(name, hash, owner, created) = WorkerCredential(name, hash, owner, created, "")
+
 WorkerCredential(d::AbstractDict) =
-    WorkerCredential(String(d["name"]), String(d["hash"]), String(d["owner"]), DateTime(d["created"]))
+    WorkerCredential(String(d["name"]), String(d["hash"]), String(d["owner"]), DateTime(d["created"]),
+                     String(get(d, "digest", "")))
 
 Base.Dict(c::WorkerCredential) = Dict("name" => c.name, "hash" => c.hash, "owner" => c.owner,
-                                     "created" => string(c.created))
+                                     "created" => string(c.created), "digest" => c.digest)
+
+credential_digest(password::AbstractString) = bytes2hex(SHA.sha256(String(password)))
 
 """
     worker_credential(auth, request, credentials) -> Union{String,Nothing}
 
 The credential a worker connection was admitted with: `""` on a local server
-(nothing but this machine reaches it), the name Caddy checked behind the proxy,
-or `nothing` when the connection names none the server still knows.
+(nothing but this machine reaches it), the name the server checked itself on a
+trusted network, the name Caddy checked behind the proxy, or `nothing` when the
+connection names none the server still knows.
 """
 worker_credential(::LocalAuth, request, credentials) = ""
+
+function worker_credential(::NetworkAuth, request, credentials::AbstractDict)
+    given = basic_credential(request)
+    given === nothing && return nothing
+    c = get(credentials, given.name, nothing)
+    (c === nothing || isempty(c.digest)) && return nothing
+    return same_bytes(c.digest, credential_digest(given.password)) ? c.name : nothing
+end
+
+# The `name:password` a client sent as Basic auth (a worker's credential rides as
+# its URL's userinfo), or `nothing`.
+function basic_credential(request)
+    header = HTTP.header(request, "Authorization", "")
+    startswith(header, "Basic ") || return nothing
+    decoded = try
+        String(Base64.base64decode(strip(header[7:end])))
+    catch e
+        e isa ArgumentError || rethrow()   # not base64: no credential
+        return nothing
+    end
+    name, sep, password = partition(decoded, ':')
+    isempty(sep) && return nothing
+    return (name = name, password = password)
+end
+
+# `split` into what is before and after the first `sep`, keeping empty parts.
+function partition(s::AbstractString, sep::Char)
+    i = findfirst(sep, s)
+    i === nothing && return (String(s), "", "")
+    return (String(s[1:prevind(s, i)]), string(sep), String(s[nextind(s, i):end]))
+end
+
+# Compares in time independent of where the two first differ.
+same_bytes(a::AbstractString, b::AbstractString) =
+    ncodeunits(a) == ncodeunits(b) &&
+    reduce(|, (x ⊻ y for (x, y) in zip(codeunits(a), codeunits(b))); init = 0x00) == 0x00
 
 function worker_credential(auth::ProxyAuth, request, credentials::AbstractDict)
     from_proxy(auth, request) || return nothing
@@ -303,7 +389,9 @@ revoked; Caddy rereads it when it changes (`caddy run --watch`).
 """
 function render_caddyfile(auth::ProxyAuth, credentials)
     cfg = auth.config
-    creds = sort!(collect(credentials); by = c -> c.name)
+    # A credential issued without the proxy has no hash Caddy could check: it
+    # has to be issued again behind it.
+    creds = sort!([c for c in credentials if !isempty(c.hash)]; by = c -> c.name)
     io = IOBuffer()
     println(io, "# Rendered by BonitoAgents from proxy.json and the worker credentials;")
     println(io, "# edits here are overwritten.")
