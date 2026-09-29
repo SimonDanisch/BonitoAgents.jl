@@ -589,6 +589,8 @@ end
     y = BT.render_authelia_config(acme, secrets, smtp)
     @test occursin("address: 'submission://smtp.example.com:587'", y) && occursin("password: 'it''s'", y)
     @test !occursin("filesystem:", y)
+    # A mail outage must not keep Authelia from starting (proxy_stack_test.jl runs it).
+    @test occursin("notifier:\n  disable_startup_check: true\n  smtp:", y)
     @test occursin("- domain: 'team.example.com'\n      authelia_url: 'https://auth.team.example.com'", y)
 
     # Mail is on exactly when the installer left settings for it.
@@ -602,4 +604,190 @@ end
     # lose its database.
     s1 = BT.authelia_secrets(dir)
     @test BT.authelia_secrets(dir) == s1 && length(s1.storage) == 64 && s1.jwt != s1.session
+end
+
+@testitem "unit:proxy_auth accounts: races, odd input, your own account, open tabs" tags = [:unit] begin
+    import BonitoAgents
+    const BT = BonitoAgents
+    using Test, HTTP, JSON, Bonito, Logging
+    Sys.isunix() || return
+
+    bin = mktempdir()
+    # As slow as a real argon2 hash, so two requests overlap while it runs.
+    write(joinpath(bin, "authelia"),
+          "#!/bin/sh\nsleep 0.3\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
+    write(joinpath(bin, "caddy"), "#!/bin/sh\nexit 0\n")
+    chmod(joinpath(bin, "authelia"), 0o755); chmod(joinpath(bin, "caddy"), 0o755)
+    dir = mktempdir()
+    cfg = BT.ProxyConfig(; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
+                         caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "users.yml"),
+                         caddy_bin = joinpath(bin, "caddy"), authelia_bin = joinpath(bin, "authelia"))
+    st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
+    st.base_url[] = "https://team.example.com"
+    BT.add_account!(st, "bob"; groups = ["admins"])
+    outcome(f) = try f() catch e; e isa ErrorException || rethrow(); e end
+
+    # One invite link submitted twice at once makes one account.
+    token = last(split(BT.create_invite!(st, ["lab"]), '/'))
+    both = asyncmap(name -> outcome(() -> BT.redeem_invite!(st, token, name)), ["carol", "dave"])
+    @test count(r -> r isa String, both) == 1
+    @test count(r -> r isa ErrorException && occursin("used already", r.msg), both) == 1
+    @test length(st.accounts[]) == 2
+    member = only(n for n in keys(st.accounts[]) if n != "bob")
+    # Two admins adding one name at once make one account.
+    both = asyncmap(_ -> outcome(() -> BT.add_account!(st, "erin")), 1:2)
+    @test count(r -> r isa String, both) == 1
+    @test count(r -> r isa ErrorException && occursin("already", r.msg), both) == 1
+
+    # What someone types into the invite form comes back escaped, never as markup.
+    link = last(split(BT.create_invite!(st, String[]), '/'))
+    post(body) = BT.invite_response(st.auth, st, HTTP.Request("POST", "/invite/$(link)", [], body), link)
+    r = post("name=%3Cscript%3Ealert(1)%3C%2Fscript%3E&display_name=%3Cimg+src%3Dx+onerror%3Dalert(1)%3E")
+    page = String(r.body)
+    @test r.status == 400
+    @test !occursin("<script>", page) && !occursin("<img", page)
+    @test occursin("&lt;script&gt;alert(1)&lt;/script&gt;", page) && occursin("&lt;img src=x", page)
+    @test BT.open_invite(st, link) !== nothing   # the link stays good for another try
+
+    # A damaged record on disk is skipped with a warning; the rest load.
+    dir2 = mktempdir()
+    write(joinpath(dir2, "accounts.json"), JSON.json([
+        Dict("name" => "ok", "display_name" => "Ok", "email" => "", "groups" => ["admins"],
+             "disabled" => false, "password_hash" => "h"),
+        Dict("name" => "broken")]))
+    st2 = @test_logs (:warn, r"skipping malformed entry") match_mode = :any BT.ServerState(;
+        state_dir = dir2, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
+    @test collect(keys(st2.accounts[])) == ["ok"]
+
+    # Nobody locks themselves out, even with another admin around.
+    BT.set_account_admin!(st, member, true)
+    me = copy(st, Bonito.Session(), BT.User("bob", "", "bob", ["admins"]))
+    for f in (() -> BT.set_account_disabled!(me, "bob", true), () -> BT.set_account_admin!(me, "bob", false),
+              () -> BT.remove_account!(me, "bob"))
+        @test occursin("your own account", outcome(f).msg)
+    end
+    @test !st.accounts[]["bob"].disabled && BT.is_admin(st.accounts[]["bob"])
+    BT.set_account_admin!(st, member, false)
+
+    # Open tabs: disabling, regrouping and removing an account close its tabs
+    # (an open websocket is never checked again), and nobody else's.
+    function open_tab(name)
+        s = Bonito.Session()
+        BT.register_user_session!(st, s, BT.User(name, "", name, String[]))
+        return s
+    end
+    closed(s) = s.status == Bonito.CLOSED
+    a, b, bobs = open_tab(member), open_tab(member), open_tab("bob")
+    BT.set_account_disabled!(st, member, true)
+    @test closed(a) && closed(b) && !closed(bobs)
+    c = open_tab(member)
+    BT.set_account_disabled!(st, member, false)
+    @test !closed(c)                                # enabling closes nothing
+    BT.set_account_groups!(st, member, ["lab", "gpu"])
+    @test closed(c)                                 # the new groups come with the next load
+    d = open_tab(member)
+    BT.remove_account!(st, member)
+    @test closed(d) && !closed(bobs)
+    # A tab that closes on its own is forgotten.
+    close(bobs)
+    @test all(s -> s !== bobs, get(st.user_sessions, "bob", Bonito.Session[]))
+end
+
+@testitem "unit:worker retries quietly, and belongs to whoever issued its credential" tags = [:unit] begin
+    import BonitoAgents
+    const BT = BonitoAgents
+    const BW = BT.BonitoWorker
+    using Test, HTTP, Logging, Dates
+
+    # A revoked worker: the proxy turns every attempt away. It keeps trying every
+    # few seconds (so it is back as soon as it may be) but says so once.
+    attempts = Threads.Atomic{Int}(0)
+    srv = HTTP.serve!("127.0.0.1", 0) do _
+        Threads.atomic_add!(attempts, 1)
+        HTTP.Response(403)
+    end
+    w = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:$(HTTP.port(srv))", credential = "w-x:revoked",
+        worker_id = "quiet", name = "quiet", mcp_command = "julia", mcp_arguments = String[],
+        projects_root = mktempdir()))
+    logger = Test.TestLogger(; min_level = Logging.Info)
+    task = with_logger(() -> @async(BW.serve(w; retry_delay = 0.05, repeat_log_interval = 3600.0)), logger)
+    try
+        @test timedwait(() -> attempts[] >= 10, 30.0) === :ok
+    finally
+        close(w)
+        wait(task)
+        close(srv)
+    end
+    errors = [r for r in logger.logs if r.level == Logging.Error]
+    @test length(errors) == 1
+    @test occursin("401 or 403 means this worker's credential is wrong or was revoked", only(errors).message)
+    @test count(r -> startswith(r.message, "BonitoWorker: connecting"), logger.logs) == 1
+    @test count(r -> startswith(r.message, "BonitoWorker: reconnecting every"), logger.logs) == 1
+    @test !any(r -> occursin("revoked'", string(r.message, r.kwargs)) && occursin("w-x:", string(r.message, r.kwargs)),
+               logger.logs)   # the credential itself is never logged
+
+    # The worker belongs to whoever issued the credential it came in with, and
+    # keeps who it is shared with across reconnects.
+    cfg = BT.ProxyConfig(; domain = "d", auth_domain = "auth.d", admin = "root", caddyfile = "/x/C", users_file = "/x/u")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
+    st.worker_credentials[]["w-1"] = BT.WorkerCredential("w-1", "h", "alice", now(UTC))
+    link = BT.WorkerLink.Link(:server)
+    hello = Dict{String,Any}("hostname" => "box", "harnesses" => Dict("node" => "24.9.0", "x" => 1))
+    w1 = BT.register_worker!(st, "wid", "box", hello, link, "w-1")
+    @test (w1.owner, w1.credential) == ("alice", "w-1")
+    @test w1.harnesses == Dict("node" => "24.9.0")   # what the worker reports, versions only
+    BT.share_worker!(st, "wid", ["lab"])
+    w2 = BT.register_worker!(st, "wid", "box", hello, link, "w-1")
+    @test w2.shared_with == ["lab"]
+    # A credential the server no longer knows: the records' default owner.
+    @test BT.register_worker!(st, "wid2", "box2", hello, BT.WorkerLink.Link(:server), "w-gone").owner == "root"
+    # What the worker reports after an install shows on its card.
+    @test BT.apply_harness_status!(st, "wid", Dict("installed" => Dict("node" => "25.1.0"), "error" => "npm failed"))
+    @test st.workers[]["wid"].harnesses == Dict("node" => "25.1.0") && st.workers[]["wid"].harness_error == "npm failed"
+    @test !BT.apply_harness_status!(st, "nope", Dict("installed" => Dict()))
+end
+
+# Authelia ignores a change to its users file within half a second of its last
+# reread (and keeps the state before it). The server keeps its writes apart,
+# does not rewrite an unchanged file, and ends on the latest state.
+@testitem "unit:proxy_auth the users file keeps Authelia's pace" tags = [:unit] begin
+    import BonitoAgents
+    const BT = BonitoAgents
+    using Test
+    Sys.isunix() || return
+
+    bin = mktempdir()
+    write(joinpath(bin, "authelia"),
+          "#!/bin/sh\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
+    write(joinpath(bin, "caddy"), """
+        #!/bin/sh
+        case "\$1" in hash-password) read pw; echo "\\\$2a\\\$14\\\$\$pw" ;; esac
+        """)
+    chmod(joinpath(bin, "authelia"), 0o755); chmod(joinpath(bin, "caddy"), 0o755)
+    dir = mktempdir()
+    cfg = BT.ProxyConfig(; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
+                         caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "users.yml"),
+                         caddy_bin = joinpath(bin, "caddy"), authelia_bin = joinpath(bin, "authelia"))
+    st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
+    writer = st.proxy_writer
+    @test writer.spacing >= 1.0
+
+    BT.add_account!(st, "bob"; groups = ["admins"])
+    written = writer.users_written
+    # A worker credential changes the Caddyfile only: the users file stays as it
+    # is, so Authelia starts no reread (and no half second of ignoring changes).
+    BT.add_worker_credential!(st, "bob")
+    @test writer.users_written == written
+    # Changes one right after the other keep the spacing.
+    BT.add_account!(st, "alice")
+    first = writer.users_written
+    BT.set_account_admin!(st, "alice", true)
+    @test writer.users_written - first >= writer.spacing
+    # Changes at the same time: one writer at a time, and the file ends with all.
+    @sync for name in ("c1", "c2", "c3")
+        @async BT.add_account!(st, name)
+    end
+    users = read(cfg.users_file, String)
+    @test all(n -> occursin("'$(n)':", users), ("bob", "alice", "c1", "c2", "c3"))
+    @test occursin("'alice':\n    disabled: false\n    displayname: 'alice'\n    password: '\$argon2id\$fake'\n    email: ''\n    groups:\n      - 'admins'", users)
 end

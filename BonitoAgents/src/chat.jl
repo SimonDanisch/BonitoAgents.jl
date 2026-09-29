@@ -248,6 +248,13 @@ mutable struct ChatModel
     # PlotPane handle (window-scoped; set per session view, not shared).
     plotpane::Any
 
+    # Whom this view serves (window-scoped, like `plotpane`): the window's own
+    # state, which knows the person behind it. `state` above is the chat's, shared
+    # by every tab, so it acts as the server itself; what one person may see or
+    # do in the chat (the workers it can continue on, the admins' switches) asks
+    # this instead. The shared instance's is its own `state`.
+    viewer::ServerState
+
     # Live todo list for the taskbar (shared via parent).
     live_todo::Ref{Any}
 
@@ -383,6 +390,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         nothing,                    # parent: this is the shared instance itself
         Dict{String,Vector}(),      # tool_content_cache
         nothing,                    # plotpane: window-scoped, set per session view
+        state,                      # viewer: the server itself, until a tab's view
         Ref{Any}(nothing),          # live_todo
         Ref(0),                     # turn_seq
         Ref(false),                 # turn_in_flight
@@ -451,7 +459,7 @@ end
 # user-message queue, etc. with the parent. Observable fields are bridged via
 # `map(identity, session, obs)` so each tab gets its own connected child
 # (auto-GC'd on session close).
-function Base.copy(m::ChatModel, session::Bonito.Session)
+function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = m.viewer)
     lock(m.lock) do
         ChatModel(
             m.lock,
@@ -486,6 +494,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m,    # parent → the shared instance we copied from
             m.tool_content_cache,      # shared Dict; per-tab views see same RAM cache
             nothing,                   # plotpane: per WINDOW — ChatPaneRef sets it
+            viewer,                    # per WINDOW too: whom this tab serves
             m.live_todo,               # shared Ref — one live list per chat
             m.turn_seq,                # shared counter
             m.turn_in_flight,          # shared → one turn at a time per chat
@@ -7279,6 +7288,8 @@ end
 # rewritten to carry a result.
 function chat_header(session::Bonito.Session, model::ChatModel)
     state = model.state
+    # Whom this tab serves: what the menu offers is theirs to use.
+    viewer = model.viewer
     project_id = model.project_id
     cwd = model.cwd
     # The folder shown to the user is the project's path ON THE WORKER — where the
@@ -7465,7 +7476,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     continue_items = map(session, state.workers) do workers
         cur = isempty(project_id) ? nothing : get(state.projects[], project_id, nothing)
         cur === nothing && return DOM.div(; class = "bt-menu-group bt-hidden")
-        others = sort([w for w in values(workers) if isopen(w) && w.worker_id != cur.worker_id];
+        others = sort([w for w in values(workers)
+                       if isopen(w) && w.worker_id != cur.worker_id && visible(viewer, w)];
                       by = w -> w.name)
         isempty(others) && return DOM.div(; class = "bt-menu-group bt-hidden")
         DOM.div(
@@ -7487,7 +7499,9 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         p = get(state.projects[], project_id, nothing)
         p === nothing && return
         w = get(state.workers[], wid, nothing)
-        (w === nothing || !isopen(w)) && (problem("That worker is offline"); return)
+        # Not one this person may use: as if it did not exist.
+        (w === nothing || !visible(viewer, w)) && (problem("There is no such worker"); return)
+        isopen(w) || (problem("That worker is offline"); return)
         wid == p.worker_id && return
         # A turn in flight would be cut off mid-answer by the session stop: the
         # user stops it (or waits) first, knowingly.
@@ -7702,7 +7716,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     devmode_item = dev.item
     devmode_on   = dev.is_on
     # Both reach past this chat (other workers; the whole server): admins only.
-    is_admin(state) || (remote_item = DOM.div(); devmode_item = DOM.div())
+    is_admin(viewer) || (remote_item = DOM.div(); devmode_item = DOM.div())
 
     menu_trigger_class = map(session, devmode_on) do on
         on ? "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger bt-menu-trigger-danger" :

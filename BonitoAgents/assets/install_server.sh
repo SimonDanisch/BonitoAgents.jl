@@ -290,7 +290,7 @@ echo "    Mail         : $([[ $SMTP_MODE == none ]] && echo "none (codes go to a
 step "Sanity checks"
 [[ -f "$SERVER_BIN" ]] || fail "$SERVER_BIN not found: run from the cloned repo"
 [[ -n "$JULIA_BIN" ]]  || fail "julia not found (checked PATH and $SERVICE_HOME/.juliaup/bin): install Julia (juliaup) first"
-for tool in sudo curl tar sha256sum sha512sum getent ss systemctl; do
+for tool in sudo curl tar sha256sum sha512sum getent ss systemctl timeout; do
     command -v "$tool" > /dev/null || fail "$tool not found"
 done
 chmod +x "$MONOREPO_DIR/BonitoAgents/bin/"*
@@ -485,7 +485,14 @@ case $SMTP_MODE in
             sudo tee "$STATE_DIR/smtp.json" > /dev/null
         sudo chown "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR/smtp.json"
         sudo chmod 600 "$STATE_DIR/smtp.json"
-        ok "sending through $SMTP_HOST:$SMTP_PORT" ;;
+        # Authelia starts without checking the mail server (a mail outage must not
+        # lock everyone out), so a wrong host or port shows here or not at all.
+        if timeout 5 bash -c ': > "/dev/tcp/$1/$2"' _ "$SMTP_HOST" "$SMTP_PORT" 2> /dev/null; then
+            ok "sending through $SMTP_HOST:$SMTP_PORT"
+        else
+            info "$SMTP_HOST:$SMTP_PORT does not answer from here: mail fails until it does" \
+                 "(Authelia starts anyway; only confirming a new second factor needs mail)"
+        fi ;;
     keep) ok "keeping the current settings" ;;
     none)
         sudo rm -f "$STATE_DIR/smtp.json"

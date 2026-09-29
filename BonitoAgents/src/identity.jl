@@ -103,6 +103,23 @@ end
 public_origin(cfg::ProxyConfig, host::AbstractString) =
     "https://" * host * (cfg.https_port == 443 ? "" : ":$(cfg.https_port)")
 
+"""
+    ProxyWriter()
+
+How the server writes the proxy's files (`apply_proxy!`): one writer at a time,
+so the last file written is the last state rendered, and when Authelia's users
+database last changed. Authelia ignores a change to it within half a second of
+its last reread (its watcher's cooldown), so writes to it keep `spacing` seconds
+apart.
+"""
+mutable struct ProxyWriter
+    const lock::ReentrantLock
+    const spacing::Float64
+    users_written::Float64
+end
+
+ProxyWriter(; spacing::Real = 1.0) = ProxyWriter(ReentrantLock(), Float64(spacing), 0.0)
+
 "A server behind the Caddy + Authelia proxy the installer set up."
 struct ProxyAuth <: AuthMode
     config::ProxyConfig
@@ -398,8 +415,13 @@ function render_authelia_config(cfg::ProxyConfig, secrets, smtp::Union{AbstractD
             filename: $(q(notifications_file(cfg)))
         """
     else
+        # Authelia would refuse to start while the mail server is unreachable,
+        # which locks everyone out of the dashboard over a mail outage. Mail is
+        # only needed to confirm a new second factor; that one action fails
+        # instead.
         """
         notifier:
+          disable_startup_check: true
           smtp:
             address: $(q("submission://$(smtp["host"]):$(smtp["port"])"))
             username: $(q(smtp["username"]))

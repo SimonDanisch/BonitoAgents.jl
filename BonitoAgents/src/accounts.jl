@@ -86,22 +86,38 @@ apply_proxy!(::LocalAuth, ::ServerState) = nothing
 
 function apply_proxy!(auth::ProxyAuth, root::ServerState)
     cfg = auth.config
-    caddyfile, users = lock(root.lock) do
-        (render_caddyfile(auth, values(root.worker_credentials[])),
-         render_users_yaml(values(root.accounts[])))
+    writer = root.proxy_writer
+    # Rendered and written as one step, one writer at a time: two changes at
+    # once must not leave the earlier state on disk.
+    lock(writer.lock) do
+        caddyfile, users = lock(root.lock) do
+            (render_caddyfile(auth, values(root.worker_credentials[])),
+             render_users_yaml(values(root.accounts[])))
+        end
+        candidate = cfg.caddyfile * ".new"
+        atomic_write(io -> write(io, caddyfile), candidate; mode = 0o600)
+        try
+            check_caddyfile(cfg, candidate)
+        catch
+            rm(candidate; force = true)
+            rethrow()
+        end
+        mv(candidate, cfg.caddyfile; force = true)
+        # Authelia rereads its users database when the file changes, but a
+        # change within half a second of its last reread is dropped, not
+        # deferred: Authelia would keep the state before it (a disabled account
+        # still able to log in) until some later change. So the file is only
+        # written when it changes (a rewrite starts that half second too), and
+        # never sooner than `spacing` after the last write.
+        if !(isfile(cfg.users_file) && read(cfg.users_file, String) == users)
+            delay = writer.users_written + writer.spacing - time()
+            delay > 0 && sleep(delay)
+            atomic_write(io -> write(io, users), cfg.users_file; mode = 0o600)
+            writer.users_written = time()
+        end
+        authelia = render_authelia_config(cfg, authelia_secrets(root.state_dir), smtp_settings(root.state_dir))
+        atomic_write(io -> write(io, authelia), authelia_config_file(cfg); mode = 0o600)
     end
-    candidate = cfg.caddyfile * ".new"
-    atomic_write(io -> write(io, caddyfile), candidate; mode = 0o600)
-    try
-        check_caddyfile(cfg, candidate)
-    catch
-        rm(candidate; force = true)
-        rethrow()
-    end
-    mv(candidate, cfg.caddyfile; force = true)
-    atomic_write(io -> write(io, users), cfg.users_file; mode = 0o600)
-    authelia = render_authelia_config(cfg, authelia_secrets(root.state_dir), smtp_settings(root.state_dir))
-    atomic_write(io -> write(io, authelia), authelia_config_file(cfg); mode = 0o600)
     return nothing
 end
 

@@ -418,6 +418,8 @@ mutable struct ServerState
     # with every hello acknowledgement. `nothing`: workers manage none (dev and
     # test servers, which must not download anything). Persisted in settings.json.
     harness_spec       :: Observable{Union{Nothing,Dict{String,Any}}}
+    # Writes the proxy's files one at a time, spaced for Authelia (identity.jl).
+    proxy_writer       :: ProxyWriter
 
     # The parent state a per-session `copy(state, session)` was derived from;
     # `nothing` on the root itself. The Observable bridges above are ONE-WAY
@@ -493,6 +495,7 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,Invite}()),        # invites
         Dict{String,Vector{Bonito.Session}}(),    # user_sessions
         Observable{Union{Nothing,Dict{String,Any}}}(nothing),  # harness_spec (load_settings! below)
+        ProxyWriter(),                            # proxy_writer
         nothing,                                  # root (this IS the root)
     )
     load_workers!(s)
@@ -556,6 +559,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.invites,
             s.user_sessions,
             s.harness_spec,
+            s.proxy_writer,
             root_state(s),             # copies of copies still point at the true root
         )
     end

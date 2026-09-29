@@ -1290,7 +1290,7 @@ function Bonito.jsrender(session::Bonito.Session, r::ChatPaneRef)
         # Make the per-session view HERE (rather than letting
         # jsrender(::ChatModel) do it) so the window's plotpane can ride
         # along — chat command handlers reach it as `model.plotpane`.
-        view = copy(model, session)
+        view = copy(model, session, r.state)
         view.plotpane = r.plotpane
         DOM.div(view; style = Styles("flex" => "1 1 auto", "min-height" => "0",
                                      "display" => "flex", "flex-direction" => "column"))

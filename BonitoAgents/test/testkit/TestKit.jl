@@ -894,23 +894,28 @@ function invoke_mcp(client, ev::AbstractDict, mcp_env)
 end
 
 """
-    add_worker!(s; name = "worker-extra") -> Base.Process
+    add_worker!(s; name = "worker-extra", credential = "") -> Base.Process
 
 Spawn an ADDITIONAL worker process against the same dev server (its own config
-dir + projects root, same server url + secret), exactly as a second machine
-running the installer would. Returns the worker process so the test can later
-`kill` it to simulate that machine going offline.
+dir + projects root), exactly as a second machine running the installer would.
+Behind the proxy it comes in like any worker there: through Caddy, with the
+`credential` "Add worker" issued (the one its install command carries),
+trusting Caddy's certificate authority. Returns the worker process so the test
+can later `kill` it to simulate that machine going offline.
 """
-function add_worker!(s::TestServer; name::AbstractString = "worker-extra")
+function add_worker!(s::TestServer; name::AbstractString = "worker-extra", credential::AbstractString = "")
     cfg  = mktempdir(prefix = "bonitoagents-test-wcfg2-")
     root = mktempdir(prefix = "bonitoagents-test-w2root-")
     prev = get(ENV, "BONITOAGENTS_CONFIG_DIR", nothing)
     ENV["BONITOAGENTS_CONFIG_DIR"] = cfg
     # A distinct, pinned worker id so it registers as a separate worker.
     write(joinpath(cfg, "worker_id"), "test-" * String(name) * "-" * string(rand(UInt32); base = 16))
-    BonitoWorker.write_config!(; server_url = s.h.url,
+    rig = s.h.proxy
+    url = rig === nothing ? s.h.url : "https://127.0.0.1:$(s.h.state.auth.config.https_port)"
+    BonitoWorker.write_config!(; server_url = url, credential,
                                  projects_root = root, name = String(name))
-    proc, _ = BonitoWorker.spawn_worker()
+    proc, _ = rig === nothing ? BonitoWorker.spawn_worker() :
+        withenv(BonitoWorker.spawn_worker, "JULIA_SSL_CA_ROOTS_PATH" => rig.root_cert)
     prev === nothing ? delete!(ENV, "BONITOAGENTS_CONFIG_DIR") : (ENV["BONITOAGENTS_CONFIG_DIR"] = prev)
     return proc
 end
@@ -991,8 +996,11 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     old = s.browser[]
     old === nothing || close(old)
     url = s.h.url * route
-    # Behind the proxy the pages come with a certificate from Caddy's own CA.
-    electron_args = s.admin === nothing ? String[] : ["--ignore-certificate-errors"]
+    # Behind the proxy the pages come with a certificate from Caddy's own CA, and
+    # each browser keeps cookies of its own: Electron's default profile is shared
+    # by every window, so a second browser would be logged in as the first.
+    electron_args = s.admin === nothing ? String[] :
+        ["--ignore-certificate-errors", "--user-data-dir=$(mktempdir())"]
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
     # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
     # capturePage on the headless (show=false) window stays fresh.
@@ -1284,6 +1292,17 @@ end
 "The page's host: the dashboard's, or Authelia's portal (`auth.…`)."
 page_host(s::TestServer) = String(eval_js(s, "location.host"))
 
+const AUTHELIA_ERRORS = "[...document.querySelectorAll('[data-slot=toast][data-type=error]')]"
+
+# What Authelia logged last, bar the steady stream of "not logged in" redirects:
+# why it refused someone.
+function authelia_log_tail(s::TestServer; lines::Int = 15)
+    f = joinpath(s.h.proxy.dir, "authelia.log")
+    isfile(f) || return "(no Authelia log)"
+    kept = filter(l -> !occursin("is not authorized to user <anonymous>", l), readlines(f))
+    return "--- Authelia's log ---\n" * join(kept[max(1, end - lines + 1):end], "\n")
+end
+
 """
     login!(s, login = s.admin)
 
@@ -1294,10 +1313,29 @@ function login!(s::TestServer, login::Login = s.admin)
     wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
     set_input(s, "#username-textfield", login.user)
     set_input(s, "#password-textfield", login.password)
+    # Errors already on screen (a refusal just before) are not this attempt's.
+    before = eval_js(s, "$(AUTHELIA_ERRORS).length")
     click(s, "#sign-in-button")
-    wait_for(s, "the one-time code form", "document.querySelectorAll('input[autocomplete=off]').length >= 5";
-             timeout = 30)
-    # Authelia takes a code once: after a login in this 30 s step, wait for the next.
+    past = wait_for(s, "the one-time code form",
+        """(() => { if (document.querySelectorAll('input[autocomplete=off]').length >= 5) return 'code';
+                    const e = $(AUTHELIA_ERRORS);
+                    return e.length > $(before) ? e.map(x => x.textContent.trim()).join(' ') : false; })()""";
+        timeout = 30)
+    past == "code" || error("login!: Authelia refused $(login.user)'s password: $(past)\n" * authelia_log_tail(s))
+    enter_code!(s, login)
+    wait_for(s, "the dashboard after the login", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    install_pane_scope!(s)
+    return s
+end
+
+"""
+    enter_code!(s, login)
+
+Type the current one-time code for `login` into Authelia's code boxes, as an
+authenticator app's user does. Authelia takes a code once: after one in this
+30 s step, it waits for the next.
+"""
+function enter_code!(s::TestServer, login::Login)
     step = floor(Int, time() / 30)
     if get(s.otp_used, login.user, -1) >= step
         sleep(30 * (step + 1) - time() + 0.5)
@@ -1314,10 +1352,211 @@ function login!(s::TestServer, login::Login = s.admin)
             boxes[i].focus(); set.call(boxes[i], d);
             boxes[i].dispatchEvent(new Event('input', {bubbles: true})); });
         return true; })()""")
-    wait_for(s, "the dashboard after the login", "!!document.querySelector('.bt-dash')"; timeout = 60)
-    install_pane_scope!(s)
     return s
 end
+
+"""
+    register_authenticator!(admin, s, user, password) -> Login
+
+A new account's first login on a server without mail, as it happens: `user`
+signs in with `password` in browser `s`, Authelia asks them to register a
+second factor and first to confirm who they are with a one-time code it would
+have mailed, an admin reads that code on the dashboard's "Login codes" card
+(browser `admin`) and passes it on, and `user` registers an authenticator app
+with the secret Authelia shows. Returns once `user` is on the dashboard.
+"""
+function register_authenticator!(admin::TestServer, s::TestServer, user::AbstractString, password::AbstractString)
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
+    set_input(s, "#username-textfield", user)
+    set_input(s, "#password-textfield", password)
+    click(s, "#sign-in-button")
+    wait_for(s, "the offer to register a device", "!!document.querySelector('#register-link')"; timeout = 30)
+    click(s, "#register-link")
+    wait_for(s, "the second factor settings", "!!document.querySelector('#one-time-password-add')"; timeout = 30)
+    # The admin's side: the code Authelia writes instead of mailing it, shown on
+    # the "Login codes" card. "Show the latest" reads the file when pressed, so
+    # it is pressed until a code is there that was not there before (pressing
+    # changes nothing). The mail greets by display name.
+    card = """[...document.querySelectorAll('details')].find(d => d.querySelector('summary')?.textContent.includes('Login codes'))"""
+    latest_code = """(() => { const d = $(card); d.open = true;
+        [...d.querySelectorAll('button')].find(b => b.textContent.trim() === 'Show the latest').click();
+        const m = (d.querySelector('pre').innerText || '').match(/Hi [^\\n,]*,[\\s\\S]*?-{20,}\\s+([A-Z0-9]{6,})\\s+-{20,}/);
+        return m ? m[1] : ''; })()"""
+    eval_js(admin, latest_code); sleep(1.0)
+    before = String(eval_js(admin, latest_code))
+    click(s, "#one-time-password-add")
+    wait_for(s, "the identity check", "!!document.querySelector('#one-time-code')"; timeout = 30)
+    code = String(wait_for(admin, "$(user)'s code on the Login codes card",
+        "(() => { const c = $(latest_code); return c !== '' && c !== $(json(before)) && c; })()";
+        timeout = 30, interval = 1.0))
+    set_input(s, "#one-time-code", code)
+    click(s, "#dialog-verify")
+    # Registering the app: start, the secret (as its QR code encodes it), confirm.
+    wait_for(s, "the registration dialog", "!!document.querySelector('#dialog-next')"; timeout = 30)
+    click(s, "#dialog-next")
+    uri = String(wait_for(s, "the secret", "(document.querySelector('#secret-url') || {}).value || false"; timeout = 30))
+    login = Login(String(user), String(password), match(r"secret=([A-Z2-7]+)", uri)[1])
+    click(s, "#dialog-next")
+    wait_for(s, "the code boxes", "document.querySelectorAll('input[autocomplete=off]').length >= 5"; timeout = 30)
+    enter_code!(s, login)
+    wait_for(s, "the app registered", "document.body.innerText.includes('Successfully added the One-Time Password')";
+             timeout = 30)
+    # Now the login proper: the second factor from the app.
+    eval_js(s, "location.href = $(json(s.h.url * "/")); true")
+    wait_for(s, "the code boxes", "document.querySelectorAll('input[autocomplete=off]').length >= 5"; timeout = 30)
+    enter_code!(s, login)
+    wait_for(s, "the dashboard after the login", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    install_pane_scope!(s)
+    return login
+end
+
+"""
+    another_browser(s) -> TestServer
+
+A second browser on the same server, with cookies of its own: another person
+logged in at the same time (`login!` into it). Everything that takes a
+`TestServer` drives it. Close it with `close_browser!`, never `close`, which
+stops the server.
+"""
+function another_browser(s::TestServer)
+    b = TestServer(s.h, s.agent_fn, s.dispatcher_sock, s.dispatcher_port, s.dispatcher_task,
+                   Ref{Any}(nothing), Ref(false), s.browser_size, s.admin, s.otp_used)
+    open_browser(b)
+    return b
+end
+
+function close_browser!(s::TestServer)
+    ctx = s.browser[]
+    ctx === nothing || close(ctx)
+    s.browser[] = nothing
+    return s
+end
+
+"""
+    login_refused(s, login) -> String
+
+Try to log in with `login` from Authelia's form and return what Authelia says
+when it refuses (a wrong password, a disabled or removed account). Throws if it
+lets them in instead.
+"""
+function login_refused(s::TestServer, login::Login)
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
+    set_input(s, "#username-textfield", login.user)
+    set_input(s, "#password-textfield", login.password)
+    # Authelia says why in a toast (the same words for a wrong password and a
+    # disabled account: it does not tell which). One from before is not this one.
+    before = eval_js(s, "$(AUTHELIA_ERRORS).length")
+    click(s, "#sign-in-button")
+    refusal = wait_for(s, "Authelia's refusal",
+        """(() => { if (document.querySelectorAll('input[autocomplete=off]').length >= 5 || document.querySelector('.bt-dash'))
+                        return 'LET IN';
+                    const e = $(AUTHELIA_ERRORS);
+                    return e.length > $(before) ? e.map(x => x.textContent.trim()).join(' ') : false; })()""";
+        timeout = 30, interval = 0.1)
+    refusal == "LET IN" && error("login_refused: Authelia let $(login.user) in")
+    return String(refusal)
+end
+
+# The admin's Accounts section: `expr` is JS run with `sec` bound to it.
+accounts_js(expr::AbstractString) = """(() => {
+    const h = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Accounts');
+    const sec = h && h.closest('.bt-section').parentElement;
+    if (!sec) return false;
+    return $(expr); })()"""
+
+"Wait until the Accounts section's status line says `text`; returns the line."
+account_status(s::TestServer, text::AbstractString; timeout::Real = 30) =
+    wait_for(s, "account status '$(text)'",
+        accounts_js("sec.querySelector('.bt-admin-status').textContent.includes($(json(text))) && " *
+                    "sec.querySelector('.bt-admin-status').textContent"); timeout)
+
+"""
+    add_account_ui!(s, name; display_name = name, groups = "") -> password
+
+Add an account with the Accounts section's form, as an admin does, and return
+the password it shows once.
+"""
+function add_account_ui!(s::TestServer, name::AbstractString; display_name::AbstractString = name,
+                         groups::AbstractString = "")
+    eval_js(s, accounts_js("""(() => {
+        const form = sec.querySelector('.bt-admin-form');
+        const set = (ph, v) => { const el = [...form.querySelectorAll('input[type=text]')].find(e => e.placeholder === ph);
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+            el.dispatchEvent(new Event('input', {bubbles: true})); };
+        set('account name', $(json(name))); set('full name', $(json(display_name))); set('groups', $(json(groups)));
+        return true; })()"""))
+    sleep(0.3)   # the inputs reach the server before the click that reads them
+    eval_js(s, accounts_js("[...sec.querySelectorAll('button')].find(b => b.textContent.trim() === 'Add account').click() || true"))
+    account_status(s, "account $(name) added")
+    return shown_password(s, name)
+end
+
+"The password the Accounts section shows for `name`, once."
+shown_password(s::TestServer, name::AbstractString) = String(wait_for(s, "the password for $(name)",
+    accounts_js("(sec.querySelector('.bt-admin-secret').textContent.match(/Password for $(name), shown only now: (\\S+)/) || [false, false])[1]");
+    timeout = 30))
+
+"Press `label` (\"Disable\", \"Make admin\", …) on `name`'s row of the Accounts table."
+function account_action!(s::TestServer, name::AbstractString, label::AbstractString)
+    ok = eval_js(s, accounts_js("""(() => {
+        const row = [...sec.querySelectorAll('.bt-admin-table tr')].find(r => r.cells[0] && r.cells[0].textContent.trim() === $(json(name)));
+        const b = row && [...row.querySelectorAll('button')].find(x => x.textContent.trim() === $(json(label)));
+        if (!b) return false;
+        window.confirm = () => true;   // "Remove" asks first
+        b.click(); return true; })()"""))
+    ok === true || error("account_action!: no $(repr(label)) on $(name)'s row")
+    return s
+end
+
+"Type `groups` into `name`'s row of the Accounts table and press Enter."
+function set_account_groups_ui!(s::TestServer, name::AbstractString, groups::AbstractString)
+    ok = eval_js(s, accounts_js("""(() => {
+        const row = [...sec.querySelectorAll('.bt-admin-table tr')].find(r => r.cells[0] && r.cells[0].textContent.trim() === $(json(name)));
+        const el = row && row.querySelector('input[type=text]');
+        if (!el) return false;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, $(json(groups)));
+        el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return true; })()"""))
+    ok === true || error("set_account_groups_ui!: no row for $(name)")
+    return s
+end
+
+"Share the (first) worker with `groups` from its card, as its owner does."
+function share_worker_ui!(s::TestServer, groups::AbstractString)
+    wait_for(s, "the worker's sharing field", "!!document.querySelector('.bt-worker-cell input[placeholder=groups]')";
+             timeout = 60)
+    set_input(s, ".bt-worker-cell input[placeholder=groups]", groups)
+    eval_js(s, """(() => { const el = document.querySelector('.bt-worker-cell input[placeholder=groups]');
+        el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return true; })()""")
+    wait_for(s, "the share saved", "document.querySelector('.bt-worker-cell').textContent.includes('shared')";
+             timeout = 30)
+    return s
+end
+
+"""
+    reload!(s) -> :dashboard | :portal
+
+Load the dashboard's address again, as a person reloading does; returns where it
+lands: the dashboard, or Authelia's portal (not logged in, or refused).
+"""
+function reload!(s::TestServer)
+    eval_js(s, "location.href = $(json(s.h.url * "/")); true")
+    where = wait_for(s, "the dashboard or the login portal",
+        "document.querySelector('.bt-dash') ? 'dashboard' : document.querySelector('#username-textfield') ? 'portal' : false";
+        timeout = 30)
+    where == "dashboard" && install_pane_scope!(s)
+    return Symbol(where)
+end
+
+"Is the page's connection to the server gone (the server closed its session)?"
+dropped(s::TestServer) = eval_js(s, "document.body.textContent.includes('The link to the server dropped')") === true
+
+"The \"Signed in as …\" line of the account card."
+signed_in_as(s::TestServer) = String(wait_for(s, "the account card",
+    "([...document.querySelectorAll('.bt-card')].map(c => c.textContent).find(t => t.includes('Signed in as')) || '').match(/Signed in as [^.]*\\./)?.[0] || false";
+    timeout = 30))
+
+"The h2 section headings on the page."
+headings(s::TestServer) = String.(eval_js(s, "[...document.querySelectorAll('h2')].map(h => h.textContent.trim())"))
 
 "Log out through the account card's link; returns once Authelia's form is back."
 function logout!(s::TestServer)

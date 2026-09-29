@@ -8,11 +8,34 @@
 
 @testitem "e2e:proxy_login" setup = [SharedServer] tags = [:e2e] begin
     TK = SharedServer.TK
+    using HTTP
     z = TK.dev_server(; proxy = true)
     try
         TK.open_browser(z)
         # Nobody gets the dashboard without logging in: the browser lands on the portal.
         @test TK.wait_for(z, "Authelia's portal", "location.host.startsWith('auth.')"; timeout = 30) == true
+
+        # Nor does anything else, however it asks. From outside, through Caddy:
+        host, port = match(r"https://([^:/]+):(\d+)", z.h.url).captures
+        portal = "302 https://auth.$(host):$(port)/"
+        curl(args...) = read(`curl -sk --resolve $(host):$(port):127.0.0.1 -o /dev/null
+                                   -w "%{http_code} %{redirect_url}" $(args)`, String)
+        # identity headers a client made up;
+        @test startswith(curl("-H", "Remote-User: admin", "-H", "Remote-Groups: admins",
+                              "-H", "X-BonitoAgents-Proxy: forged", z.h.url * "/"), portal)
+        # the routes open to anyone, spelled to lead somewhere else;
+        for path in ("/invite/../", "/invite/%2e%2e/", "/install.sh/../", "/invite/..%2f..%2f", "//")
+            @test startswith(curl("--path-as-is", z.h.url * path), portal)
+        end
+        # a worker without its credential, or with a wrong one.
+        @test startswith(curl(z.h.url * "/w"), "401")
+        @test startswith(curl("-u", "w-nope:wrong", z.h.url * "/w"), "401")
+        @test startswith(curl(z.h.url * "/install.sh"), "200")
+        # And the server itself, past the proxy: whatever a request claims, no identity.
+        direct = HTTP.get("http://127.0.0.1:$(z.h.state.auth.config.port)/",
+                          ["Remote-User" => "admin", "Remote-Groups" => "admins"]; status_exception = false)
+        @test occursin("This server answers only through its login proxy", String(direct.body))
+
         TK.login!(z)
         @test startswith(TK.page_host(z), "bonito.localhost")
         @test TK.wait_for(z, "the account card",
@@ -32,6 +55,7 @@ end
 @testitem "e2e:proxy_invite" setup = [SharedServer] tags = [:e2e] begin
     TK = SharedServer.TK
     z = TK.dev_server(; proxy = true)
+    b = nothing
     try
         TK.open_browser(z)
         TK.login!(z)
@@ -43,55 +67,74 @@ end
         link = TK.wait_for(z, "the invite link",
             "(document.body.textContent.match(/https:\\/\\/\\S+?\\/invite\\/[0-9a-f]{64}/) || [false])[0]"; timeout = 30)
         @test startswith(link, z.h.url * "/invite/")
-        TK.logout!(z)
+        invites_js(expr) = """(() => { const h = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Invites');
+            const sec = h.closest('.bt-section').parentElement; return $(expr); })()"""
+        invite_rows = invites_js("[...sec.querySelectorAll('.bt-admin-table tr')].filter(r => r.querySelector('button')).length")
+        @test TK.wait_for(z, "the open invite listed", "$(invite_rows) === 1"; timeout = 30) == true
 
-        # The invite page is open to anyone; it makes the account and shows its password once.
-        TK.eval_js(z, "location.href = $(repr(link)); true")
-        TK.wait_for(z, "the invite form", "!!document.querySelector('form input[name=name]')"; timeout = 30)
-        TK.set_input(z, "input[name=name]", "carol")
-        TK.set_input(z, "input[name=display_name]", "Carol C")
-        TK.click(z, "form button[type=submit]")
-        password = TK.wait_for(z, "the new password", "(document.querySelector('.pw') || {}).textContent || false";
+        # A second invite, revoked before anyone uses it.
+        TK.click_text(z, "Create invite link")
+        second = TK.wait_for(z, "the second link",
+            "(() => { const m = document.body.textContent.match(/https:\\/\\/\\S+?\\/invite\\/[0-9a-f]{64}/); " *
+            "return m && m[0] !== $(TK.json(link)) && m[0]; })()"; timeout = 30)
+        @test TK.wait_for(z, "two open invites", "$(invite_rows) === 2"; timeout = 30) == true
+        TK.eval_js(z, invites_js("""(() => { const rows = [...sec.querySelectorAll('.bt-admin-table tr')].filter(r => r.querySelector('button'));
+            rows[rows.length - 1].querySelector('button').click(); return true; })()"""))
+        @test TK.wait_for(z, "the invite revoked", "document.body.textContent.includes('invite revoked')"; timeout = 30) == true
+        @test TK.wait_for(z, "one open invite", "$(invite_rows) === 1"; timeout = 30) == true
+        # How long an invite lasts is a number of days, at least one.
+        TK.set_input(z, "input[type=text][size='3']", "0")
+        TK.click_text(z, "Create invite link")
+        @test TK.wait_for(z, "the refusal", "document.body.textContent.includes('valid for: a number of days, at least 1')";
+                          timeout = 30) == true
+
+        # Carol, in a browser of her own, not logged in: the revoked link leads
+        # nowhere; hers opens the invite page, which makes the account and shows
+        # its password once.
+        b = TK.another_browser(z)
+        TK.eval_js(b, "location.href = $(repr(second)); true")
+        @test TK.wait_for(b, "the revoked invite", "document.body.textContent.includes('This invite is not valid')";
+                          timeout = 30) == true
+        TK.eval_js(b, "location.href = $(repr(link)); true")
+        TK.wait_for(b, "the invite form", "!!document.querySelector('form input[name=name]')"; timeout = 30)
+        TK.set_input(b, "input[name=name]", "carol")
+        TK.set_input(b, "input[name=display_name]", "Carol C")
+        TK.click(b, "form button[type=submit]")
+        password = TK.wait_for(b, "the new password", "(document.querySelector('.pw') || {}).textContent || false";
                                timeout = 30)
         @test length(password) >= 16
+        # This server sends no mail: the page says who has the code.
+        @test TK.eval_js(b, "document.body.textContent.includes('this server sends no mail, so ask an admin for it')") == true
         # The same link again: used up.
-        TK.eval_js(z, "location.href = $(repr(link)); true")
-        @test TK.wait_for(z, "the used-up invite", "document.body.textContent.includes('This invite is not valid')";
+        TK.eval_js(b, "location.href = $(repr(link)); true")
+        @test TK.wait_for(b, "the used-up invite", "document.body.textContent.includes('This invite is not valid')";
                           timeout = 30) == true
 
-        # Carol logs in (her authenticator app registered with Authelia) and sees
-        # her own account only: no admin sections, and none of the admin's workers.
-        carol = TK.Login("carol", password, TK.seed_totp!(z, "carol"))
-        TK.eval_js(z, "location.href = $(repr(z.h.url * "/")); true")
-        TK.login!(z, carol)
-        @test TK.wait_for(z, "carol's account card",
-            "document.body.textContent.includes('Signed in as Carol C (carol); groups: lab.')"; timeout = 30) == true
-        @test TK.wait_for(z, "the stats strip", "document.body.textContent.includes('/0 workers online')"; timeout = 30) == true
-        @test TK.eval_js(z, "[...document.querySelectorAll('h2')].some(h => ['Accounts', 'Invites'].includes(h.textContent.trim()))") == false
-        @test TK.eval_js(z, "document.querySelectorAll('.bt-worker-cell').length") == 0
-        TK.logout!(z)
+        # Her first login: she registers her authenticator app, with the code the
+        # admin reads her from the dashboard's "Login codes" card. Then she sees
+        # her own account only: no admin sections, none of the admin's workers.
+        TK.eval_js(b, "location.href = $(repr(z.h.url * "/")); true")
+        carol = TK.register_authenticator!(z, b, "carol", password)
+        @test TK.signed_in_as(b) == "Signed in as Carol C (carol); groups: lab."
+        @test TK.wait_for(b, "the stats strip", "document.body.textContent.includes('/0 workers online')"; timeout = 30) == true
+        @test !any(in(("Accounts", "Invites", "Agent adapters")), TK.headings(b))
+        @test TK.eval_js(b, "document.querySelectorAll('.bt-worker-cell').length") == 0
 
-        # The admin shares the worker with "lab" on its card.
-        TK.eval_js(z, "location.href = $(repr(z.h.url * "/")); true")
-        TK.login!(z)
-        TK.wait_for(z, "the worker's sharing field", "!!document.querySelector('.bt-worker-cell input[placeholder=groups]')";
-                    timeout = 60)
-        TK.set_input(z, ".bt-worker-cell input[placeholder=groups]", "lab")
-        TK.eval_js(z, """(() => { const el = document.querySelector('.bt-worker-cell input[placeholder=groups]');
-            el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return true; })()""")
-        @test TK.wait_for(z, "the share saved", "document.querySelector('.bt-worker-cell').textContent.includes('shared')";
-                          timeout = 30) == true
-        TK.logout!(z)
-
-        # Now carol sees it and may start chats there; managing it stays with the admin.
-        TK.eval_js(z, "location.href = $(repr(z.h.url * "/")); true")
-        TK.login!(z, carol)
-        @test TK.wait_for(z, "the shared worker", "!!document.querySelector('.bt-worker-cell .bt-dot-online')";
+        # The admin shares the worker with "lab" on its card. Carol sees it and
+        # may start chats there; managing it stays with the admin.
+        TK.share_worker_ui!(z, "lab")
+        @test TK.reload!(b) == :dashboard
+        @test TK.wait_for(b, "the shared worker", "!!document.querySelector('.bt-worker-cell .bt-dot-online')";
                           timeout = 60) == true
-        @test TK.eval_js(z, "!!document.querySelector('.bt-worker-cell .bt-card-remove')") == false
-        @test TK.eval_js(z, "!!document.querySelector('.bt-worker-cell .bt-card-name-edit')") == false
-        @test TK.eval_js(z, "[...document.querySelectorAll('.bt-worker-cell button')].some(b => b.textContent.includes('Project'))") == true
+        @test TK.eval_js(b, "!!document.querySelector('.bt-worker-cell .bt-card-remove')") == false
+        @test TK.eval_js(b, "!!document.querySelector('.bt-worker-cell .bt-card-name-edit')") == false
+        @test TK.eval_js(b, "[...document.querySelectorAll('.bt-worker-cell button')].some(b => b.textContent.includes('Project'))") == true
+        # And her authenticator keeps working: out and in again with it.
+        TK.logout!(b)
+        TK.login!(b, carol)
+        @test TK.signed_in_as(b) == "Signed in as Carol C (carol); groups: lab."
     finally
+        b === nothing || TK.close_browser!(b)
         close(z)
     end
 end
