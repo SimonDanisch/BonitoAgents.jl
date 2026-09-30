@@ -62,6 +62,34 @@ function run_suite(server)
             const t = [...document.querySelectorAll('.bt-text-input')].find(e => e.offsetParent); if (!t) return 'no input';
             return t.dispatchEvent(new KeyboardEvent('keydown', {key: 'a', bubbles: true, cancelable: true})) ? 'typed' : 'swallowed'; })()""") == "typed"
     end
+    # "expired": the server has no session for the page (it restarted, or dropped
+    # the page after an hour away) and closes its socket with 4404, which Bonito
+    # announces as `on_connection_expired()` (Bonito's reconnect tests cover that
+    # part). Nothing reconnects such a page, so the guard reloads it, or asks
+    # first when a reload would throw away a message typed but not sent.
+    composer = "[...document.querySelectorAll('.bt-text-input')].find(e => e.offsetParent)"
+    @testset "a page the server no longer has reloads itself" begin
+        TK.eval_js(server, "window.__before_reload = true; true")
+        TK.eval_js(server, "Bonito.on_connection_expired(); true")
+        @test TK.wait_for(server, "the page reloads and connects again",
+            "window.__before_reload === undefined && $(led)?.dataset.status === 'connected'"; timeout = 60) == true
+        @test TK.eval_js(server, "!$(modal).classList.contains('bt-conn-open')") == true
+    end
+    @testset "with a message typed and not sent, it asks before reloading" begin
+        @test TK.wait_for(server, "a composer to type into", "!!$(composer)"; timeout = 30) == true
+        TK.eval_js(server, """(() => { const t = $(composer); t.value = 'half a message';
+            t.dispatchEvent(new Event('input', {bubbles: true})); window.__before_reload = true; return true; })()""")
+        TK.eval_js(server, "Bonito.on_connection_expired(); true")
+        @test TK.wait_for(server, "the guard asks",
+            "$(modal).classList.contains('bt-conn-open') && $(modal).dataset.status === 'expired'"; timeout = 10) == true
+        @test TK.eval_js(server, "window.__before_reload === true") == true          # not reloaded
+        @test occursin("reload", TK.eval_js(server, "$(modal).querySelector('.bt-conn-title').textContent"))
+        @test TK.eval_js(server, "$(composer).value") == "half a message"
+        # The card's button is the way out.
+        TK.eval_js(server, "$(modal).querySelector('.bt-conn-reload').click(); true")
+        @test TK.wait_for(server, "the reload",
+            "window.__before_reload === undefined && $(led)?.dataset.status === 'connected'"; timeout = 60) == true
+    end
     return server
 end
 

@@ -29,7 +29,9 @@ or sent while Bonito is reconnecting is at risk, so a small dot changing colour
 was not a warning, it was a way to lose work. "connecting" is the retry phase,
 shown as reconnecting; "disconnected" is Bonito giving up after its retries,
 shown with a reload button. Before the first successful connection nothing is
-shown: the page is still loading then.
+shown: the page is still loading then. "expired" is final: the server has no
+session for this page (it restarted, or dropped the page after an hour away), so
+the page reloads itself, or asks first when a reload would lose unsent text.
 
 NOT the same signal as the in-chat status dot: that one is the AGENT session's
 liveness, this one is whether this browser tab can still talk to the server at
@@ -47,6 +49,7 @@ function connection_guard(session::Bonito.Session)
         CSS(".bt-conn-led[data-status=\"connected\"]",  "background" => "var(--bt-status-online)"),
         CSS(".bt-conn-led[data-status=\"connecting\"]", "background" => "var(--bt-warning)"),
         CSS(".bt-conn-led[data-status=\"disconnected\"]", "background" => "var(--bt-status-offline)"),
+        CSS(".bt-conn-led[data-status=\"expired\"]", "background" => "var(--bt-status-offline)"),
         # The overlay blocks from the first millisecond of a drop but only BECOMES
         # VISIBLE if the drop outlasts a blink: Bonito reconnects a healthy local
         # link within milliseconds, and a modal flashing on every such blip would
@@ -76,11 +79,12 @@ function connection_guard(session::Bonito.Session)
             "border-top-color" => "var(--bt-warning)",
             "animation" => "bt-conn-spin 0.9s linear infinite"),
         CSS("@keyframes bt-conn-spin", CSS("to", "transform" => "rotate(360deg)")),
-        # Given up: the ring stops, turns red and shows an exclamation mark.
-        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph",
+        # Given up, or nothing left to reconnect to: the ring stops, turns red and
+        # shows an exclamation mark.
+        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph, .bt-conn-modal[data-status=\"expired\"] .bt-conn-glyph",
             "animation" => "none", "border-color" => "var(--bt-status-offline)",
             "background" => "color-mix(in srgb, var(--bt-status-offline) 12%, transparent)"),
-        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph::after",
+        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph::after, .bt-conn-modal[data-status=\"expired\"] .bt-conn-glyph::after",
             "content" => "\"!\"", "position" => "absolute", "inset" => "0",
             "display" => "flex", "align-items" => "center", "justify-content" => "center",
             "font-weight" => "700", "font-size" => "22px", "color" => "var(--bt-status-offline)"),
@@ -119,13 +123,29 @@ function connection_guard(session::Bonito.Session)
         const msg     = modal.querySelector('.bt-conn-msg');
         const elapsed = modal.querySelector('.bt-conn-elapsed');
         const titles = {connected: 'Connected to the server', connecting: 'Reconnecting to the server…',
-                        disconnected: 'Disconnected from the server', no_connection: 'No server connection'};
+                        disconnected: 'Disconnected from the server', no_connection: 'No server connection',
+                        expired: 'This page has to be reloaded'};
         const copy = {
             connecting:   ['Reconnecting to the server',
                            'The link to the server dropped. The composer is locked until it is back, so nothing you type is lost.'],
             disconnected: ['Connection lost',
                            'Reconnecting did not succeed. Reload the page to continue; anything sent since the drop did not reach the server.'],
+            expired:      ['This page has to be reloaded',
+                           'The server restarted, or this page sat unused for over an hour, so it cannot reconnect. Copy what you typed, then reload.'],
         };
+        // Text typed into a chat composer and not sent: a reload would throw it
+        // away. What the page rendered into it (the yolo reminders) the server keeps.
+        const unsent = () => Array.from(document.querySelectorAll('textarea.bt-text-input'))
+            .some(t => t.value.trim() !== '' && t.value !== t.defaultValue);
+        function reloadWhenShown() {
+            if (document.visibilityState === 'visible') { window.location.reload(); return; }
+            const onShow = () => {
+                if (document.visibilityState !== 'visible') return;
+                document.removeEventListener('visibilitychange', onShow);
+                window.location.reload();
+            };
+            document.addEventListener('visibilitychange', onShow);
+        }
         // While the guard is up, a keystroke aimed at an editable element goes
         // nowhere: the overlay stops clicks, this stops the textarea that still
         // had focus when the socket dropped.
@@ -133,8 +153,9 @@ function connection_guard(session::Bonito.Session)
         let wasConnected = false, blocking = false, since = 0, ticker = null;
         function tick() {
             const s = Math.max(0, Math.round((Date.now() - since) / 1000));
-            elapsed.textContent = modal.dataset.status === 'disconnected'
-                ? 'Gave up after ' + s + ' s'
+            const st = modal.dataset.status;
+            elapsed.textContent = st === 'expired' ? ''
+                : st === 'disconnected' ? 'Gave up after ' + s + ' s'
                 : (s < 1 ? 'Trying again…' : 'Trying again for ' + s + ' s');
         }
         function setBlocked(on, status) {
@@ -160,6 +181,13 @@ function connection_guard(session::Bonito.Session)
             led.dataset.status = status; led.title = titles[status] || titles.disconnected;
             if (status === 'connected') { wasConnected = true; setBlocked(false, status); return; }
             if (status === 'no_connection') { setBlocked(false, status); return; }
+            // The server has no session for this page (Bonito: close code 4404).
+            // Nothing will reconnect it, and before the first connection too:
+            // a page restored from the back/forward cache never connects at all.
+            if (status === 'expired') {
+                if (!unsent()) { reloadWhenShown(); return; }
+                setBlocked(true, status); return;
+            }
             if (!wasConnected) return;            // first load: the page is still coming up
             setBlocked(true, status);
         }});

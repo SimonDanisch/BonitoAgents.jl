@@ -105,7 +105,11 @@ enumerates.
 - If the BROWSER loses the server, a modal takes over the window and locks the
   composer, since anything typed then would be lost: a live "trying again for
   N s" counter, a reload button, and it lifts itself when the socket is back.
-  Sub-second reconnects, the usual case, never raise it.
+  Sub-second reconnects, the usual case, never raise it. A tab the server no
+  longer has a session for (it restarted, or the tab was away for over an hour)
+  reloads itself instead of retrying forever, unless that would lose a message
+  typed and not sent; then it asks. A phone tab coming back checks its socket and
+  replaces one that stays silent.
 - Every chat in the sidebar wears an **icon**: its own picture once it has
   shown one (a plot, a screenshot), an identicon coloured by its folder until
   then, and a corner badge with the initials of the machine it runs on — so the

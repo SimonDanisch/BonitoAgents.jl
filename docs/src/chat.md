@@ -153,4 +153,7 @@ ended · Reconnect** chip appears next to the title.
   composer, because anything typed while the socket is down would be lost. It
   names how long the reconnect has been running, offers a reload, and lifts by
   itself when the connection is back. A sub-second blip, which is the usual
-  case, never shows it.
+  case, never shows it. When the server no longer has a session for the tab (it
+  restarted, or the tab was away for over an hour), no reconnect can work: the
+  tab reloads itself, or, if that would lose a message typed and not sent, says
+  so and waits for you to copy it and reload.
