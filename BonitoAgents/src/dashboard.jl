@@ -2546,11 +2546,9 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         class = "bt-dash")
 end
 
-# One install command with its Copy button. Copy MUST work on plain-http origins
-# too: `navigator.clipboard` is undefined outside secure contexts (https /
-# localhost), so it falls back to the hidden-textarea + execCommand path there.
-# The command is copied from its own element, never interpolated into the script:
-# a credential command carries quotes, which a JS string literal would break on.
+# One install command with its Copy button. The command is copied from its own
+# element, never interpolated into the script: a credential command carries
+# quotes, which a JS string literal would break on.
 install_command_row(label::AbstractString, cmd::AbstractString) = DOM.div(
     DOM.div(label; class = "bt-install-os"),
     DOM.div(
@@ -2558,27 +2556,10 @@ install_command_row(label::AbstractString, cmd::AbstractString) = DOM.div(
         DOM.span("Copy";
             class   = "bt-install-copy",
             onclick = js"""event => {
-                const btn  = event.target;
-                const cmd  = btn.parentNode.querySelector('code').textContent;
-                const done = () => {
-                    btn.textContent = 'Copied';
-                    setTimeout(() => btn.textContent = 'Copy', 1200);
-                };
-                const fallback = () => {
-                    const ta = document.createElement('textarea');
-                    ta.value = cmd;
-                    ta.style.position = 'fixed';
-                    ta.style.opacity = '0';
-                    document.body.appendChild(ta);
-                    ta.select();
-                    try { document.execCommand('copy'); done(); }
-                    finally { ta.remove(); }
-                };
-                if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.writeText(cmd).then(done, fallback);
-                } else {
-                    fallback();
-                }
+                const btn = event.target;
+                const say = t => { btn.textContent = t; setTimeout(() => btn.textContent = 'Copy', 1200); };
+                ($(COPY_TEXT_JS))(btn.parentNode.querySelector('code').textContent)
+                    .then(() => say('Copied'), () => say('Copy failed'));
             }"""),
         class = "bt-install-cmd"))
 

@@ -1709,6 +1709,7 @@ class BonitoChat {
                 }
             }
         }
+        const inserted = [];
         for (let i = s; i <= e; i++) {
             if (this.parked.has(i)) {
                 // Re-entering the viewport: un-park the kept-alive app
@@ -1721,6 +1722,7 @@ class BonitoChat {
                 const node = this.cache.get(i);
                 this.insertSorted(i, node);
                 this.rendered.add(i);
+                inserted.push([i, node]);
                 // Entering the window: (re-)observe for live height
                 // corrections. Bounded to the window (see the remove branch).
                 if (!this.observed.has(i)) this.observe(i, node);
@@ -1729,6 +1731,15 @@ class BonitoChat {
                 this.applyVisibility(i, node);
                 if (node?.dataset?.btApp) this.touchApp(i);
             }
+        }
+        // Measure what entered before sizing the spacers. A row still on the
+        // estimate (a media card that finished loading off-screen) moves the
+        // anchor by the difference, the next scroll event drops it again, and
+        // the ResizeObserver reports only once it is gone: in and out every frame.
+        for (const [i, node] of inserted) {
+            if (this.heights.has(i) || !this.heightIsFinal(node)) continue;
+            const h = node.getBoundingClientRect().height;
+            if (h > 0) this.heights.set(i, h);
         }
         this.enforceAppLru();
         // Skip no-op spacer writes: this runs on every scroll event, and an
@@ -4465,6 +4476,26 @@ class BonitoChat {
 // false positives: package names, "Project.toml" as a concept, …).
 const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
 
+// `text` onto the clipboard; rejects when it did not get there. The same as
+// COPY_TEXT_JS (styles.jl), which the Julia-rendered Copy buttons use.
+function copyText(text) {
+    const legacy = () => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+    };
+    return navigator.clipboard && window.isSecureContext ?
+        navigator.clipboard.writeText(text).catch(legacy) : legacy();
+}
+
 // Give every fenced code block (<pre>) in a rendered message a hover action row
 // (copy · download), Signal-style. The <pre> is wrapped in a positioned
 // `.bt-code-wrap` so the buttons can float top-right without disturbing layout.
@@ -4488,25 +4519,8 @@ function decorateCodeBlocks(rootEl) {
             return b;
         };
         const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b) => {
-            const done = () => {
-                b.textContent = '✓';
-                setTimeout(() => { b.textContent = '⧉'; }, 1200);
-            };
-            const fallback = () => {
-                const ta = document.createElement('textarea');
-                ta.value = codeText();
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.select();
-                try { document.execCommand('copy'); done(); }
-                finally { ta.remove(); }
-            };
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(codeText()).then(done, fallback);
-            } else {
-                fallback();
-            }
+            const say = t => { b.textContent = t; setTimeout(() => { b.textContent = '⧉'; }, 1200); };
+            copyText(codeText()).then(() => say('✓'), () => say('✕'));
         });
         const dlBtn = mk('bt-code-download', '⤓', 'Download', () => {
             const blob = new Blob([codeText()], { type: 'text/plain' });
@@ -4587,7 +4601,7 @@ function linkifyPaths(rootEl) {
 
 // Click-to-enlarge for JS-created media (user-bubble attachment images).
 // Mirrors the Julia-side LIGHTBOX_OPEN_JS (chat.jl) used by bt_show / Read
-// previews: clone into a fullscreen overlay, Esc or backdrop click closes.
+// previews: clone into a fullscreen overlay, Esc or any click closes.
 function openLightbox(media) {
     const overlay = document.createElement('div');
     overlay.className = 'bt-lightbox-overlay';
@@ -4596,7 +4610,7 @@ function openLightbox(media) {
     overlay.appendChild(big);
     const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
     const onkey = e => { if (e.key === 'Escape') close(); };
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    overlay.addEventListener('click', close);
     document.addEventListener('keydown', onkey);
     document.body.appendChild(overlay);
 }

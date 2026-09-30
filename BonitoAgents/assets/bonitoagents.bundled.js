@@ -1055,6 +1055,7 @@ class BonitoChat {
                 }
             }
         }
+        const inserted = [];
         for(let i = s; i <= e; i++){
             if (this.parked.has(i)) {
                 const node = this.cache.get(i);
@@ -1065,10 +1066,19 @@ class BonitoChat {
                 const node = this.cache.get(i);
                 this.insertSorted(i, node);
                 this.rendered.add(i);
+                inserted.push([
+                    i,
+                    node
+                ]);
                 if (!this.observed.has(i)) this.observe(i, node);
                 this.applyVisibility(i, node);
                 if (node?.dataset?.btApp) this.touchApp(i);
             }
+        }
+        for (const [i, node] of inserted){
+            if (this.heights.has(i) || !this.heightIsFinal(node)) continue;
+            const h = node.getBoundingClientRect().height;
+            if (h > 0) this.heights.set(i, h);
         }
         this.enforceAppLru();
         const topH = this.cumHeight(0, s);
@@ -2966,6 +2976,22 @@ class BonitoChat {
     }
 }
 const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+function copyText(text) {
+    const legacy = ()=>{
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+    };
+    return navigator.clipboard && window.isSecureContext ? navigator.clipboard.writeText(text).catch(legacy) : legacy();
+}
 function decorateCodeBlocks(rootEl) {
     rootEl.querySelectorAll('pre').forEach((pre)=>{
         if (pre.dataset.btDecorated || pre.closest('.bt-code-wrap')) return;
@@ -2989,31 +3015,13 @@ function decorateCodeBlocks(rootEl) {
             return b;
         };
         const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b)=>{
-            const done = ()=>{
-                b.textContent = '✓';
+            const say = (t)=>{
+                b.textContent = t;
                 setTimeout(()=>{
                     b.textContent = '⧉';
                 }, 1200);
             };
-            const fallback = ()=>{
-                const ta = document.createElement('textarea');
-                ta.value = codeText();
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.select();
-                try {
-                    document.execCommand('copy');
-                    done();
-                } finally{
-                    ta.remove();
-                }
-            };
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(codeText()).then(done, fallback);
-            } else {
-                fallback();
-            }
+            copyText(codeText()).then(()=>say('✓'), ()=>say('✕'));
         });
         const dlBtn = mk('bt-code-download', '⤓', 'Download', ()=>{
             const blob = new Blob([
@@ -3097,9 +3105,7 @@ function openLightbox(media) {
     const onkey = (e)=>{
         if (e.key === 'Escape') close();
     };
-    overlay.addEventListener('click', (e)=>{
-        if (e.target === overlay) close();
-    });
+    overlay.addEventListener('click', close);
     document.addEventListener('keydown', onkey);
     document.body.appendChild(overlay);
 }

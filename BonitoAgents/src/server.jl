@@ -534,8 +534,16 @@ function serve_worker_file(state::ServerState, request, worker_id::String, path:
             # transfer protocol. Upgrading them enables seeking without a full copy.
             return worker_file_copy_response(state, request, worker_id, path, info)
         end
-        range = Bonito.parse_byte_range(HTTP.header(request, "Range", ""), info.size)
-        if range === nothing && !isempty(HTTP.header(request, "Range", ""))
+        # A preview that is re-rendered or enlarged asks again (no-cache): answer
+        # from the stat instead of moving the whole file through the worker.
+        etag = "\"$(info.size)-$(info.mtime)\""
+        HTTP.header(request, "If-None-Match", "") == etag &&
+            return HTTP.Response(304, ["ETag" => etag, "Cache-Control" => "no-cache"])
+        range_header = HTTP.header(request, "Range", "")
+        if_range = HTTP.header(request, "If-Range", "")
+        isempty(if_range) || if_range == etag || (range_header = "")   # changed: send it whole
+        range = Bonito.parse_byte_range(range_header, info.size)
+        if range === nothing && !isempty(range_header)
             return HTTP.Response(416, ["Content-Range" => "bytes */$(info.size)"])
         end
         start, stop = range === nothing ? (0, info.size - 1) : range
@@ -549,7 +557,7 @@ function serve_worker_file(state::ServerState, request, worker_id::String, path:
             append!(body, bytes)
             offset += count
         end
-        headers = ["Content-Type" => mime, "Cache-Control" => "no-cache",
+        headers = ["Content-Type" => mime, "Cache-Control" => "no-cache", "ETag" => etag,
                    "Accept-Ranges" => "bytes", "Content-Length" => string(length(body))]
         range === nothing || push!(headers, "Content-Range" => "bytes $start-$stop/$(info.size)")
         return HTTP.Response(range === nothing ? 200 : 206, headers; body)

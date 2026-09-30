@@ -87,8 +87,9 @@ enumerates.
   a staleness badge).
 - **Background tasks** (long test runs, builds) stay pinned across turns with
   live line counts, monitored until their writer exits, with per-task stop.
-- Inline **images and videos** with hover copy/download and a click
-  **lightbox**; code blocks with hover copy/download.
+- Inline **images and videos** with copy/download buttons (on hover, always
+  shown on touch screens); an image opens in a **lightbox** that any tap closes,
+  a video goes fullscreen. Code blocks get the same copy/download buttons.
 - **Image attachments** on the way in: paste, drag-drop, or the composer's
   attach button, which on a phone opens the camera/gallery sheet. Queued
   images show as removable thumbnails and render inline in your own message

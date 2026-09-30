@@ -893,8 +893,7 @@ function Bonito.jsrender(session::Session, p::FilePanel)
                 flash(ed && ed.getValue() !== ed.__btOriginal ?
                       'reloaded preview — editor keeps your unsaved edits' : 'reloaded');
             } else if (act.dataset.fvAction === 'copy') {
-                navigator.clipboard?.writeText(wpath).then(() => flash('path copied'),
-                                                           () => flash('could not copy'));
+                ($(COPY_TEXT_JS))(wpath).then(() => flash('path copied'), () => flash('could not copy'));
             } else if (act.dataset.fvAction === 'download') {
                 if (!dlurl) { flash('no project to download from'); return; }
                 const a = document.createElement('a');

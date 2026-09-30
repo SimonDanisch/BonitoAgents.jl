@@ -10,6 +10,28 @@
 #   • one-shot actions go into a `.bt-menu` popover, not into a row of buttons;
 #   • outcomes are reported by a toast, never by rewriting a button's label;
 #   • spacing from the `--bt-space-*` scale, radii from `--bt-radius(-sm)`.
+# `text` onto the clipboard: resolves once it is there, rejects when it is not.
+# The async clipboard needs a secure context; a LAN http:// page falls back to a
+# selected textarea (iOS ignores `select()` without `setSelectionRange`, and
+# `readonly` keeps the keyboard shut). Interpolate it: `($(COPY_TEXT_JS))(text)`.
+const COPY_TEXT_JS = js"""(text) => {
+    const legacy = () => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+    };
+    return navigator.clipboard && window.isSecureContext ?
+        navigator.clipboard.writeText(text).catch(legacy) : legacy();
+}"""
+
 """
     connection_guard(session) -> Node
 
@@ -2450,13 +2472,17 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "13px", "line-height" => "1",
         "padding" => "3px 6px", "border-radius" => "5px", "cursor" => "pointer"),
     CSS(".bt-code-action:hover", "background" => "rgba(0,0,0,0.8)"),
+    # Without hover (touch screens) the actions would stay invisible yet take
+    # the taps that land on them: show them.
+    CSS("@media (hover: none)",
+        CSS(".bt-media-actions, .bt-code-actions", "opacity" => "1")),
     CSS(".bt-lightbox-overlay",
         "position" => "fixed", "inset" => "0", "z-index" => "9999",
         "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
         "display" => "flex", "align-items" => "center", "justify-content" => "center"),
     CSS(".bt-lightbox-media",
         "max-width" => "95vw", "max-height" => "95vh",
-        "box-shadow" => "0 8px 40px rgba(0,0,0,0.6)", "cursor" => "default"),
+        "box-shadow" => "0 8px 40px rgba(0,0,0,0.6)"),
     CSS(".bt-tool-md",
         "font-size" => "13px", "line-height" => "1.5",
         "padding-top" => "8px"),

@@ -11,8 +11,9 @@ anchored to *content*, so it survives tab switches, reconnects, and messages
 growing above the viewport.
 
 - **Prose** renders as CommonMark with syntax-highlighted code blocks. Code
-  blocks and images grow hover buttons for copy and download; images open in
-  a lightbox on click.
+  blocks and images grow buttons for copy and download (on hover; always shown
+  on a touch screen), and a copy says whether it worked; images open in a
+  lightbox on click, videos go fullscreen.
 - **Tool calls** appear as one-line pills (icon, title, status) that expand
   in place: file edits into a Monaco diff viewer, shell commands into
   scrollable terminal output, searches into match lists.

@@ -99,7 +99,8 @@ export TestServer, dev_server, add_worker!, drop_worker_connection!,
        diff_block, text_block, error_reply, crash, end_turn,
        mcp_call, bt_eval, bt_continue,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
-       send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
+       send_message, switch_agent, set_window_size, emulate_phone, tap, swipe,
+       click, click_until, click_text, set_input,
        exit_success,
        screenshot, eval_js, wait_for, current_chat_id,
        js_errors, clear_js_errors
@@ -1939,6 +1940,73 @@ function set_window_size(s::TestServer, w::Integer, h::Integer)
     ctx = s.browser[]
     ctx === nothing && error("open_browser first")
     ECT.set_window_size(ctx, Int(w), Int(h))
+    return s
+end
+
+"""
+    emulate_phone(f, s; width = 390, height = 844)
+
+Run `f()` with the page as a phone: a mobile viewport and touch input, so
+`(hover: none)` holds and [`tap`](@ref) / [`swipe`](@ref) arrive as touch. The
+window is a desktop again afterwards (the next item on a shared server expects one).
+"""
+function emulate_phone(f, s::TestServer; width::Integer = 390, height::Integer = 844)
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    wc = "electron.BrowserWindow.fromId($(ctx.window.id)).webContents"
+    run(ctx.app, """(async () => { const wc = $wc;
+        wc.enableDeviceEmulation({screenPosition: 'mobile', screenSize: {width: $width, height: $height},
+            viewSize: {width: $width, height: $height}, viewPosition: {x: 0, y: 0}, deviceScaleFactor: 3, scale: 1});
+        globalThis.__btPhoneAttached = !wc.debugger.isAttached();
+        if (globalThis.__btPhoneAttached) wc.debugger.attach('1.3');
+        await wc.debugger.sendCommand('Emulation.setTouchEmulationEnabled', {enabled: true, maxTouchPoints: 5});
+        return true; })()""")
+    try
+        return f()
+    finally
+        run(ctx.app, """(async () => { const wc = $wc;
+            await wc.debugger.sendCommand('Emulation.setTouchEmulationEnabled', {enabled: false});
+            if (globalThis.__btPhoneAttached) wc.debugger.detach();
+            wc.disableDeviceEmulation();
+            return true; })()""")
+    end
+end
+
+# A touch gesture through the page's debugger (attached by `emulate_phone`).
+touch(s::TestServer, events::AbstractString) = run(s.browser[].app, """(async () => {
+    const wc = electron.BrowserWindow.fromId($(s.browser[].window.id)).webContents;
+    const T = (type, x, y) => wc.debugger.sendCommand('Input.dispatchTouchEvent',
+        {type, touchPoints: type === 'touchEnd' ? [] : [{x, y}]});
+    $events
+    return true; })()""")
+
+"""
+    tap(s, selector)
+
+A touch tap on the centre of the first rendered element matching `selector`.
+Inside [`emulate_phone`](@ref).
+"""
+function tap(s::TestServer, selector::AbstractString)
+    xy = eval_js(s, """(() => { const e = [...document.querySelectorAll($(json(selector)))].find(e => e.getClientRects().length);
+        if (!e) return null; const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()""")
+    xy === nothing && error("tap: nothing rendered matches $(selector)")
+    touch(s, "await T('touchStart', $(xy[1]), $(xy[2])); await T('touchEnd');")
+    return s
+end
+
+"""
+    swipe(s, dy; x = 200, y = 450)
+
+A finger drag of `dy` pixels (positive moves the content down, scrolling up),
+in frames like a real one. The finger rests before it lifts, so no fling
+carries the page on afterwards. Inside [`emulate_phone`](@ref).
+"""
+function swipe(s::TestServer, dy::Real; x::Real = 200, y::Real = 450, steps::Integer = 12)
+    touch(s, """await T('touchStart', $x, $y);
+        for (let i = 1; i <= $steps; i++) { await T('touchMove', $x, $y + $dy * i / $steps); await new Promise(r => setTimeout(r, 16)); }
+        await new Promise(r => setTimeout(r, 200));
+        await T('touchMove', $x, $y + $dy);
+        await T('touchEnd');""")
     return s
 end
 

@@ -3118,50 +3118,53 @@ const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
 const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
     ".avif", ".ico")
 
-# Click-to-enlarge. Clones the media into a fullscreen overlay (Esc or backdrop
-# click closes). Self-contained so there's no global-JS dependency or load-order
-# coupling; shared by bt_show previews and inline Read-tool images.
+# Click-to-enlarge. An image is cloned into a fullscreen overlay that any click or
+# Esc closes (a phone has no Esc, and the picture covers the backdrop). A video
+# goes fullscreen itself: a clone would download it again and start over.
+# Self-contained so there's no global-JS dependency or load-order coupling;
+# shared by bt_show previews and inline Read-tool images.
 const LIGHTBOX_OPEN_JS = js"""
 event => {
     event.stopPropagation();
     const wrap = event.currentTarget.closest('.bt-media-wrap');
     const media = wrap && wrap.querySelector('.bt-media');
     if (!media) return;
+    if (media.tagName === 'VIDEO') {
+        // iPhones only have the webkit call
+        if (media.requestFullscreen) media.requestFullscreen().catch(e => console.warn('fullscreen refused', e));
+        else if (media.webkitEnterFullscreen) media.webkitEnterFullscreen();
+        return;
+    }
     const overlay = document.createElement('div');
     overlay.className = 'bt-lightbox-overlay';
     const big = media.cloneNode(true);
     big.classList.add('bt-lightbox-media');
-    if (big.tagName === 'VIDEO') { big.controls = true; big.autoplay = true; }
     overlay.appendChild(big);
     const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
     const onkey = e => { if (e.key === 'Escape') close(); };
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    overlay.addEventListener('click', close);
     document.addEventListener('keydown', onkey);
     document.body.appendChild(overlay);
 }
 """
 
-# Copy the image to the clipboard (Signal-style). PNG copies cleanly; other
-# types are re-encoded to PNG via a canvas so `ClipboardItem` accepts them.
+# Copy the image to the clipboard (Signal-style) as PNG, the one image type every
+# clipboard takes, drawn from the <img> already on screen. The item is made during
+# the click with a promised blob: Safari refuses a clipboard write after an await.
 const COPY_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
-    const wrap = event.currentTarget.closest('.bt-media-wrap');
-    const media = wrap && wrap.querySelector('.bt-media');
-    const srcEl = media && (media.tagName === 'VIDEO' ? media.querySelector('source') : media);
-    const src = srcEl && (srcEl.currentSrc || srcEl.src || srcEl.getAttribute('src'));
-    if (!src || !navigator.clipboard || !window.ClipboardItem) return;
-    fetch(src).then(r => r.blob()).then(blob => {
-        if (blob.type === 'image/png') {
-            return navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
-        }
-        return createImageBitmap(blob).then(bmp => {
-            const cv = document.createElement('canvas');
-            cv.width = bmp.width; cv.height = bmp.height;
-            cv.getContext('2d').drawImage(bmp, 0, 0);
-            return new Promise(res => cv.toBlob(res, 'image/png'));
-        }).then(png => navigator.clipboard.write([new ClipboardItem({'image/png': png})]));
-    }).catch(() => {});
+    const btn = event.currentTarget;
+    const img = btn.closest('.bt-media-wrap')?.querySelector('img.bt-media');
+    const say = t => { btn.textContent = t; setTimeout(() => { btn.textContent = '⧉'; }, 1200); };
+    if (!img || !img.complete || !navigator.clipboard?.write || !window.ClipboardItem) return say('✕');
+    const png = new Promise((resolve, reject) => {
+        const cv = document.createElement('canvas');
+        cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+        cv.getContext('2d').drawImage(img, 0, 0);
+        cv.toBlob(b => b ? resolve(b) : reject(new Error('could not encode the image')), 'image/png');
+    });
+    navigator.clipboard.write([new ClipboardItem({'image/png': png})]).then(() => say('✓'), () => say('✕'));
 }
 """
 
@@ -3185,8 +3188,8 @@ event => {
 # A media element (image / video) with click-to-enlarge. `src` can be a streamed
 # proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
 # an <img>/<video> src. `mime` only matters for the <video><source> type. Images
-# enlarge on click; videos keep native controls for clicks and enlarge via the ⤢
-# button (so a frame click still plays/pauses). `worker_path` names the file on
+# enlarge on click; videos keep native controls for clicks and go fullscreen via
+# the ⤢ button (so a frame click still plays/pauses). `worker_path` names the file on
 # the worker; a picture that has one can be made the chat's icon (chat_icons.jl).
 function media_element(src, mime::AbstractString, is_video::Bool;
                        filename::AbstractString = "", worker_path::AbstractString = "")
