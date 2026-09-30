@@ -1512,17 +1512,21 @@ function subagent_transcript_done(m::TaskToolMsg)
     state = chat.state
     wid   = bg_worker_id(state, chat)
     wid === nothing && return false
-    # Read the whole transcript (bounded) from the top each poll: `end_turn` sits
-    # at the END, and reading forward from a rolling offset could split the marker
-    # across two reads. Transcripts are small; the poll is 1 Hz and stops once done.
+    # Forward from the last read, overlapping it by the marker's length so a
+    # marker split across two reads is still found. Reading from the top every
+    # second moved whole transcripts (MBs each) through the worker link, and a
+    # cap on that read hid the marker of any transcript longer than the cap.
+    from = max(0, m.bg_offset - ncodeunits(SUBAGENT_DONE_MARKER))
     r = try
-        tail_worker_file(state, wid, m.bg_output_path; offset = 0,
-                         max_bytes = 4_000_000, timeout = 10.0)
+        tail_worker_file(state, wid, m.bg_output_path; offset = from,
+                         max_bytes = 1_000_000, timeout = 10.0)
     catch e
         @debug "subagent transcript read failed (will retry)" id = tool_id(m) exception = e
         return false
     end
-    return r.exists && occursin(SUBAGENT_DONE_MARKER, r.chunk)
+    r.exists || return false
+    m.bg_offset = r.offset
+    return occursin(SUBAGENT_DONE_MARKER, r.chunk)
 end
 
 # Tail a background task's output file on the worker: stream new bytes (bash),
@@ -7578,12 +7582,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     menu_pick = Observable("")
     # Picking an item closes whatever holds it: the popover on wide panes, and
     # on narrow panes the expanded ⋯ panel the items are laid out in.
-    close_menu_js = """
-        const m = event.currentTarget.closest('.bt-menu');
-        if (m) {
-            m.classList.remove('bt-menu-open');
-            if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
-        }
+    close_menu_js = MENU_CLOSE_JS * """
         const more = event.currentTarget.closest('.bt-header')?.querySelector('.bt-header-more-check');
         if (more) more.checked = false;"""
     menu_item(text, action; class = "", title = "") = DOM.button(text;
@@ -7851,21 +7850,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     menu_trigger = DOM.button("⋯";
         class = menu_trigger_class,
         title = "More actions",
-        onclick = js"""event => {
-            event.stopPropagation();
-            const m = event.currentTarget.parentElement;
-            if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
-            const open = m.classList.toggle('bt-menu-open');
-            if (open) {
-                m.__close = (ev) => {
-                    if (m.contains(ev.target)) return;
-                    m.classList.remove('bt-menu-open');
-                    document.removeEventListener('click', m.__close, true);
-                    m.__close = null;
-                };
-                document.addEventListener('click', m.__close, true);
-            }
-        }""")
+        onclick = MENU_TOGGLE_JS)
     # In the ⋯ menu with every other one-shot action, not as a lone button in
     # the strip. The strip is for what the user READS continuously (the context
     # meter) and for the pickers that describe the session; a verb parked next

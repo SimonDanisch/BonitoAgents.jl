@@ -33,12 +33,13 @@ function install_workspace!(session::Bonito.Session,
                    style = Bonito.Styles("min-height" => "0"))
     pane.workspace[] = ws
 
-    # The chat panel doubles as the Home/dashboard view (current_view == ""). A
-    # sidebar click (Home or a project) must (1) bring this panel to the front —
-    # the user may have a file/app tab active — and (2) relabel its tab so "Home"
-    # reads as Home, not a stale "Chat". `Panel.label` is an Observable, so the
-    # tab updates live.
-    relabel_chat_panel!() = (chat_panel.label[] = isempty(current_view[]) ? "Home" : "Chat")
+    # The chat panel doubles as the Home/dashboard view (current_view == "") and
+    # the Settings page. A sidebar click (Home, Settings or a project) must (1)
+    # bring this panel to the front — the user may have a file/app tab active —
+    # and (2) relabel its tab so "Home" reads as Home, not a stale "Chat".
+    # `Panel.label` is an Observable, so the tab updates live.
+    relabel_chat_panel!() = (chat_panel.label[] =
+        isempty(current_view[]) ? "Home" : current_view[] == SETTINGS_VIEW ? "Settings" : "Chat")
     relabel_chat_panel!()
     on(session, current_view) do _
         relabel_chat_panel!()

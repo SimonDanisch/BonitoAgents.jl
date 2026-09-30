@@ -60,7 +60,8 @@ end
         TK.open_browser(z)
         TK.login!(z)
 
-        # The admin invites someone into the "lab" group.
+        # The admin invites someone into the "lab" group, from Settings.
+        TK.to_settings(z)
         TK.set_input(z, "input[type=text]", "lab"; placeholder = "groups (\"admins\" for an admin)")
         # One click, one invite: each click makes another.
         TK.click_text(z, "Create invite link")
@@ -154,9 +155,9 @@ end
         # One click, one credential: each click issues another.
         TK.click_text(z, "Add worker")
         command = TK.wait_for(z, "the install command",
-            "(document.body.textContent.match(/BONITOAGENTS_WORKER_CREDENTIAL='w-[0-9a-f]+:[0-9a-f]+'/) || [false])[0]";
+            "(document.body.textContent.match(/sh -s w-[0-9a-f]+:[0-9a-f]+/) || [false])[0]";
             timeout = 30)
-        @test occursin("BONITOAGENTS_WORKER_CREDENTIAL='w-", command)
+        @test occursin("sh -s w-", command)
         @test isempty(TK.js_errors(z))
         sleep(6)   # Caddy rereads its file within ~2 s; a dropped worker takes 5 s to return
         @test TK.eval_js(z, "clearInterval(window.__btWatch), window.__btWentOffline") == false

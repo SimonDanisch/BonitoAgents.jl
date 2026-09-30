@@ -17,8 +17,8 @@ Each chat's header carries the agent's own settings as pills: the **permission
 mode** (how much it may do before asking), the **effort** or thinking level, and
 whatever else the provider reports, such as the model. The options come over ACP
 from the running agent, so the list always matches the provider. Change them for
-one chat in its header, or set fleet-wide starting points in the dashboard's
-*Session defaults* bar, which every new chat inherits.
+one chat in its header, or set fleet-wide starting points under *Defaults* on
+the Settings page, which every new chat inherits.
 
 ## Claude Code
 

@@ -24,6 +24,10 @@
         spec = BW.HarnessSpec("lts", Dict(claude => "latest", codex => "2.0.0"))
         @test sync(spec) == Dict("node" => "24.9.0", claude => "1.0.0", codex => "2.0.0")
         @test sort(installs(dist)) == ["$(claude)@1.0.0", "$(codex)@2.0.0"]
+        # npm keeps its cache beside the adapters: the user's ~/.npm is often
+        # partly root's (a past `sudo npm install -g`), and every install then
+        # failed with EACCES.
+        @test strip(read(joinpath(dist.registry, "cache.log"), String)) == joinpath(root, "npm-cache")
         # What a chat runs: the managed adapter, with the private Node first on PATH.
         managed = BW.managed_agent(AP.ClaudeCodeAgent(); root)
         @test read(`$(managed.bin)`, String) == "$(claude) 1.0.0\n"
@@ -56,7 +60,10 @@
         # What the mirror or the registry does not have fails, naming it.
         err = try sync(BW.HarnessSpec("18", Dict(claude => "0.9.0"))); "" catch e; sprint(showerror, e) end
         @test occursin("lists no Node 18 release", err)
-        @test_throws ProcessFailedException sync(BW.HarnessSpec("25", Dict("@x/not-published" => "latest")))
+        # npm's own reason, not Julia's command dump with the whole environment.
+        err = try sync(BW.HarnessSpec("25", Dict("@x/not-published" => "latest"))); "" catch e; sprint(showerror, e) end
+        @test occursin("looking up @x/not-published failed: 404 '@x/not-published' is not in this registry", err)
+        @test !occursin("PATH=", err) && !occursin("setenv", err)
         # A version that is none is refused before anything is fetched.
         err = try BW.resolve_node_version("latest"; dist = dist.url); "" catch e; sprint(showerror, e) end
         @test occursin("\"lts\", a major", err)

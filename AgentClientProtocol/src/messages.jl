@@ -733,6 +733,19 @@ function parse_json_object(s::AbstractString)
     return v isa AbstractDict ? Dict{String,Any}(String(k) => x for (k, x) in v) : nothing
 end
 
+# An update's content replaces the call's (ACP), with one exception: a call that
+# SUCCEEDED keeps its diff when the result brings none. claude-agent-acp streams
+# an edit's diff mid-flight and ends with only `rawOutput` "The file … has been
+# updated successfully." (test/fixtures/claude_edit_wire.jsonl), which says
+# nothing the diff does not. A failed edit gets its error text as usual.
+function replace_content!(tc::ToolCall, content::Vector)
+    isempty(content) && return tc
+    has_diff(c) = any(x -> x isa DiffContent, c)
+    tc.status == "completed" && has_diff(tc.content) && !has_diff(content) && return tc
+    tc.content = Vector{ToolContent}(content)
+    return tc
+end
+
 function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never touches the text bubble
     tc = get(st.tools, u.tool_call_id, nothing)
     tc === nothing && return nothing
@@ -750,7 +763,7 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
     # overwrite content. See `streamed_input_text`.
     args_text = streamed_input_text(tc, u)
     if args_text === nothing
-        isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+        replace_content!(tc, u.content)
     else
         parsed = parse_json_object(args_text)
         parsed === nothing || merge_late_input!(tc, parsed)

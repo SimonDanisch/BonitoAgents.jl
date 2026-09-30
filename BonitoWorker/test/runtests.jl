@@ -243,6 +243,34 @@ end
         @test BW.scan_acp_providers() == Dict{String,Any}[]
     end
     AgentProviders.refresh_providers!()
+
+    # An agent that never answers costs the scan its deadline, not more, and the
+    # others' sessions still come back: asked one after another with 20 s per
+    # request, a slow agent ran the scan past the server's 15 s, and the worker
+    # card showed no projects at all.
+    mktempdir() do dir
+        silent = joinpath(dir, "silent"); fast = joinpath(dir, "fast")
+        write(silent, "#!/bin/sh\nexec sleep 60\n")
+        write(fast, """
+            #!/bin/sh
+            while IFS= read -r line; do
+              case "\$line" in
+                *'"initialize"'*) echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"list":{}}}}}' ;;
+                *'"session/list"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"sessions":[{"sessionId":"s1","cwd":"/tmp","title":"hi","updatedAt":"2026-09-30T10:00:00Z"}]}}' ;;
+              esac
+            done
+            """)
+        chmod(silent, 0o755); chmod(fast, 0o755)
+        withenv("KIMI_AGENT_ACP" => silent, "MIMO_AGENT_ACP" => silent,
+                "OPENCODE_AGENT_ACP" => fast, "CODEX_AGENT_ACP" => "/nonexistent/codex-acp") do
+            AgentProviders.refresh_providers!()
+            rows = nothing
+            t = @elapsed rows = BW.scan_acp_providers(; timeout = 2.0)
+            @test t < 5.0                    # two silent agents, in parallel: ~2 s
+            @test [(r["provider"], r["session_id"]) for r in rows] == [("OpenCode", "s1")]
+        end
+    end
+    AgentProviders.refresh_providers!()
 end
 
 @testset "pidfile singleton guard" begin

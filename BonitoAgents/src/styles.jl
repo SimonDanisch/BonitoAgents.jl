@@ -32,6 +32,84 @@ const COPY_TEXT_JS = js"""(text) => {
         navigator.clipboard.writeText(text).catch(legacy) : legacy();
 }"""
 
+# The `⋯` trigger of a `.bt-menu`: toggles the list open, and while it is open a
+# click anywhere outside closes it. One capture listener per open (a re-open
+# replaces it), removed on every close path.
+const MENU_TOGGLE_JS = js"""event => {
+    event.stopPropagation();
+    const m = event.currentTarget.parentElement;
+    if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
+    const open = m.classList.toggle('bt-menu-open');
+    if (open) {
+        m.__close = (ev) => {
+            if (m.contains(ev.target)) return;
+            m.classList.remove('bt-menu-open');
+            document.removeEventListener('click', m.__close, true);
+            m.__close = null;
+        };
+        document.addEventListener('click', m.__close, true);
+    }
+}"""
+
+# Closes the `.bt-menu` holding `event.currentTarget`: the first statements of a
+# menu item's handler (splice it in with `Bonito.JSString`).
+const MENU_CLOSE_JS = """
+    const m = event.currentTarget.closest('.bt-menu');
+    if (m) {
+        m.classList.remove('bt-menu-open');
+        if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
+    }"""
+
+"""
+    action_menu(items...; title = "More actions") -> Node
+
+A `⋯` button that opens `items` (`.bt-menu-item` buttons) in a popover.
+"""
+action_menu(items...; title::AbstractString = "More actions") = DOM.div(
+    DOM.button("⋯"; class = "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger",
+               title = title, onclick = MENU_TOGGLE_JS),
+    DOM.div(items...; class = "bt-menu-list");
+    class = "bt-menu")
+
+"""
+    modal(content, session, is_open, title) -> Observable
+
+A form over the page (`.bt-modal-overlay`) while `is_open[]`. `content()` builds
+its body anew on every open. Closes on its ✕, on the backdrop and on Escape.
+"""
+function modal(content::Function, session::Bonito.Session, is_open::Observable{Bool},
+               title::AbstractString)
+    return map(session, is_open) do open
+        open || return DOM.div()
+        close = js"event => $(is_open).notify(false)"
+        DOM.div(
+            DOM.div(
+                DOM.div(DOM.span(title; class = "bt-modal-title"),
+                        DOM.button("✕"; class = "bt-btn bt-btn-ghost bt-btn-sm bt-modal-close",
+                                   title = "Close", onclick = close);
+                        class = "bt-modal-head"),
+                DOM.div(content(); class = "bt-modal-body");
+                class = "bt-modal-card",
+                # A click inside the card must not reach the backdrop handler.
+                onclick = js"event => event.stopPropagation()"),
+            # The listener is on the document (the overlay never has focus) and
+            # retires itself once the overlay is gone: the node is discarded when
+            # `is_open` flips, so there is nothing else to hang a teardown on.
+            js"""(() => {
+                const esc = (e) => {
+                    if (!document.querySelector('.bt-modal-overlay')) {
+                        document.removeEventListener('keydown', esc, true);
+                        return;
+                    }
+                    if (e.key === 'Escape') { e.stopPropagation(); $(is_open).notify(false); }
+                };
+                document.addEventListener('keydown', esc, true);
+            })()""";
+            class = "bt-modal-overlay",
+            onclick = close)
+    end
+end
+
 """
     connection_guard(session) -> Node
 
@@ -1236,6 +1314,12 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-worker-update-note",
         "display" => "block", "margin" => "0 14px 8px", "font-size" => "12px",
         "color" => "#92400e"),
+    CSS(".bt-worker-adapters",
+        "display" => "block", "margin" => "0 14px 8px", "font-size" => "12px",
+        "color" => "var(--bt-text-muted)"),
+    # npm's reason comes as several lines; keep them apart.
+    CSS(".bt-worker-adapters-error",
+        "display" => "block", "color" => "var(--bt-error)", "white-space" => "pre-line"),
 
     # (The old `.bt-banner-error` / `.bt-banner-detail` session-ended banner
     # has been removed: the reconnect chip next to the title is the failure

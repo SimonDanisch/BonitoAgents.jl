@@ -859,6 +859,14 @@ const DashboardStyles = Bonito.Styles(
         "user-select" => "none"),
     CSS(".bt-tagline",
         "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+    # The wordmark, and the Settings button at the far end of its line.
+    CSS(".bt-header-top",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "12px",
+        "align-self" => "stretch", "flex-basis" => "100%"),
+    CSS(".bt-copy-project",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "flex-wrap" => "wrap"),
 
     # ── Stats strip ──────────────────────────────────────────────────────────
     CSS(".bt-stats",
@@ -1522,9 +1530,6 @@ const DashboardStyles = Bonito.Styles(
         "background" => "rgba(255,255,255,0.12)"),
 
     # ── Global agent instructions (AGENTS.md) editor ─────────────────────────
-    CSS(".bt-agents-body",
-        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
-        "padding-top" => "8px"),
     CSS(".bt-agents-hint",
         "font-size" => "12px", "color" => "var(--bt-text-muted)",
         "line-height" => "1.5"),
@@ -1964,45 +1969,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
 
     # Workers self-register over WS — no manual "Add worker" form.
 
-    # `which_form` is the single source of truth for which slide-in panel is
-    # open. `:none` (closed) or `:copy_project` — new-project and GitHub clone
-    # now live on the per-worker cards, so the dashboard's own forms are Copy
-    # only. One enum is clearer than two booleans that always have to be kept
-    # opposite.
-    which_form = Observable(:none)
     # Where this dashboard's long-running work (sync, project import, GitHub
-    # clone, copy) reports. In the app this is the WINDOW's one progress card
+    # clone) reports. In the app this is the WINDOW's one progress card
     # (`pane.progress`, passed in by `unified_main`), so a sync started from the
     # dashboard stays readable after the user switches to a chat. A standalone
     # `dashboard_app` has no window, so it owns the observable and mounts its
     # own `progress_overlay`. Either way there is exactly one card. See
     # progress.jl.
     busy = progress === nothing ? Observable{Any}(BUSY_IDLE) : progress
-
-    # ── Copy-project form state ────────────────────────────────────────────────
-    cp_src_worker  = Observable("")
-    cp_src_project = Observable("")
-    cp_tgt_worker  = Observable("")
-    cp_new_name    = Observable("")
-
-    # When source worker changes, auto-select the first project on that worker.
-    on(session, cp_src_worker) do wid
-        isempty(wid) && return
-        wid_projs = sort([p for p in values(state.projects[]) if p.worker_id == wid && visible(state, p)];
-                         by = p -> p.name)
-        cp_src_project[] = isempty(wid_projs) ? "" : first(wid_projs).id
-    end
-    # Seed the copy name from the source's OWN name. No scrub: `copy_to!` now
-    # applies `valid_project_name` like every other create path, so a project
-    # called "Mantle DNN" seeds "Mantle DNN-copy" rather than the
-    # "Mantle-DNN-copy" the old whitelist invented for a name it had itself
-    # accepted at create time.
-    on(session, cp_src_project) do pid
-        isempty(pid) && return
-        p = get(state.projects[], pid, nothing)
-        p === nothing && return
-        cp_new_name[] = p.name * "-copy"
-    end
 
     # ── Sync-to-server click handler ─────────────────────────────────────────
     # Fired by the project card's "Sync to server" / "Re-sync" button. The
@@ -2079,72 +2053,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                            error_detail(e, bt))
             end
         end
-    end
-
-    cp_submit = Bonito.Button("Copy"; style=nothing, class = "bt-btn")
-    cp_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
-
-    on(session, cp_submit.value) do clicked
-        clicked || return
-        refuse_if_busy(busy, error_obs, "Can't copy right now") && return
-        pid = String(cp_src_project[])
-        tgt = String(cp_tgt_worker[])
-        nm  = String(strip(cp_new_name[]))
-        isempty(pid) && (error_obs[] = "Select a source project."; return)
-        isempty(tgt) && (error_obs[] = "Select a target worker."; return)
-        isempty(nm)  && (error_obs[] = "Enter a name for the copy."; return)
-        haskey(state.projects[], pid) ||
-            (error_obs[] = "Source project not found."; return)
-        haskey(state.workers[], tgt) ||
-            (error_obs[] = "Target worker not found."; return)
-        p    = state.projects[][pid]
-        tgt_w = state.workers[][tgt]
-        busy_start!(busy, "Copying $(p.name) → $(tgt_w.name)")
-        @async begin
-            try
-                new_p = copy_to!(state, p, tgt; name = nm,
-                    progress = (stage, info) -> busy_event!(busy, stage, info))
-                safe_set!(error_obs, "")
-                which_form[] = :none
-                busy_done!(busy, "Copied $(p.name) → $(tgt_w.name)")
-                current_view !== nothing && (current_view[] = new_p.id)
-            catch e
-                bt = catch_backtrace()
-                @warn "copy_to! failed" project=p.name target=tgt exception=(e, bt)
-                busy_fail!(busy, "Copy failed", error_detail(e, bt))
-            end
-        end
-    end
-
-    on(session, cp_cancel.value) do clicked
-        clicked || return
-        is_busy_running(busy[]) && return
-        which_form[] = :none
-        error_obs[]  = ""
-    end
-
-    cp_btn = Bonito.Button("Copy project…"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(session, cp_btn.value) do clicked
-        clicked || return
-        mine = [w.worker_id for w in values(state.workers[]) if visible(state, w)]
-        workers_with_projs = unique(p.worker_id for p in values(state.projects[]) if visible(state, p))
-        if isempty(mine) || isempty(workers_with_projs)
-            error_obs[] = isempty(mine) ?
-                "Register a worker before copying projects." :
-                "No projects to copy yet."
-            return
-        end
-        # Prefer a source worker that actually has projects; fall back to first.
-        src_wid = isempty(workers_with_projs) ?
-            first(mine) : first(workers_with_projs)
-        # Default target to a DIFFERENT worker than source when one exists.
-        other_wids = [w for w in mine if w != src_wid]
-        tgt_wid = isempty(other_wids) ? src_wid : first(other_wids)
-        cp_src_worker[] = ""          # force on(cp_src_worker) to fire even if same value
-        cp_src_worker[] = src_wid
-        cp_tgt_worker[] = tgt_wid
-        which_form[] = :copy_project
-        error_obs[]  = ""
     end
 
     # `picker_state` holds the worker_id whose picker form is currently
@@ -2269,58 +2177,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         return nothing
     end
 
-    # A submit failure has to be visible WHERE you submitted. Each call builds
-    # its own node — the same mapped node can't be mounted in two places.
-    form_error() = map(error_obs) do msg
-        isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
-    end
-
-    # `class` is the stable hook the e2e suite queries by. Keying a test on the
-    # placeholder TEXT means rewording a user-facing hint silently breaks the
-    # suite — same reason `.bt-np-worker-select` exists.
-    text_input(obs::Observable, ph::String; class::String = "") = DOM.input(
-        type = "text", placeholder = ph, class = class,
-        value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
-        oninput = js"event => $(obs).notify(event.target.value)")
-
-    worker_select(id_obs::Observable, cls::String) = DOM.select(
-        (DOM.option(w.name; value=w.worker_id,
-                    selected=w.worker_id==id_obs[]) for w in values(state.workers[]) if visible(state, w))...;
-        class = cls,
-        value = id_obs,
-        onchange = js"event => $(id_obs).notify(event.target.value)")
-
-    cp_form() = DOM.div(
-        DOM.label("Source worker"),
-        worker_select(cp_src_worker, "bt-cp-src-worker"),
-        DOM.label("Source project"),
-        map(session, state.projects, cp_src_worker) do projects, wid
-            wid_projs = sort([p for p in values(projects) if p.worker_id == wid && visible(state, p)];
-                             by = p -> lowercase(p.title[]))
-            isempty(wid_projs) ?
-                DOM.div("No projects on this worker";
-                        style = Styles("color"=>"var(--bt-text-muted)", "font-size"=>"12px")) :
-                DOM.select(
-                    # Listed by the name the user knows the chat by (its title,
-                    # or the folder when it has none), with the folder alongside
-                    # when the two differ.
-                    (DOM.option(titled(p) ? "$(p.title[]) ($(p.name))" : p.name;
-                                value=p.id,
-                                selected=p.id==cp_src_project[]) for p in wid_projs)...;
-                    class = "bt-cp-src-project",
-                    value = cp_src_project,
-                    onchange = js"event => $(cp_src_project).notify(event.target.value)")
-        end,
-        DOM.label("Target worker"),
-        worker_select(cp_tgt_worker, "bt-cp-tgt-worker"),
-        DOM.label("Name on target"),
-        text_input(cp_new_name, "e.g. my-project-copy"),
-        DOM.div("It becomes a folder on the target worker: no / or \\, no leading dot.";
-                class = "bt-form-note"),
-        form_error(),
-        DOM.div(cp_cancel, cp_submit; class = "bt-form-actions"),
-        class = "bt-form")
-
     # The per-worker picker form and discover panel are now rendered inside
     # WorkerCard (see worker_widget.jl) and toggled via class binding —
     # which means each card owns its own RemoteFolderPicker, persistent
@@ -2377,49 +2233,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         end
     end
     install_block = worker_install_block(state.auth, session, state)
-    # ── Global agent instructions (AGENTS.md) ────────────────────────────────
-    # A server-wide system-prompt appendix every agent session gets, across
-    # all workers (state_dir/AGENTS.md; see `system_prompt_meta`). Read at
-    # session bring-up, so a save applies to the NEXT chat opened.
-    agents_status = Observable("")
-    agents_saved  = Observable{Union{Nothing,String}}(nothing)
-    on(session, agents_saved) do txt
-        txt === nothing && return
-        try
-            set_global_agents_md!(state, txt)
-            safe_set!(agents_status,
-                "saved · applies to chats opened from now on")
-        catch e
-            @warn "AGENTS.md save failed" exception = e
-            safe_set!(agents_status, "save failed: $(sprint(showerror, e))")
-        end
-    end
-    agents_block = DOM.details(
-        DOM.summary(
-            DOM.span("Global agent instructions (AGENTS.md)";
-                     class = "bt-discover-title");
-            class = "bt-discover-header"),
-        DOM.div(
-            DOM.div("Appended to the system prompt of every agent session " *
-                    "on every worker — shared conventions, house rules, " *
-                    "tool guidance. Saved to the server's state dir.";
-                    class = "bt-agents-hint"),
-            DOM.textarea(global_agents_md(state);
-                class = "bt-agents-textarea", rows = 10,
-                placeholder = "e.g. ## Conventions every agent must follow…"),
-            DOM.div(
-                DOM.span(agents_status; class = "bt-agents-status"),
-                DOM.button("Save";
-                    class = "bt-btn bt-btn-sm",
-                    onclick = js"""event => {
-                        const ta = event.target.closest('.bt-agents-body')
-                                       .querySelector('textarea');
-                        $(agents_saved).notify(ta.value);
-                    }""");
-                class = "bt-agents-actions");
-            class = "bt-agents-body");
-        class = "bt-card bt-agents-block")
-
     # Drive the KeyedList off a derived Observable that yields a stable
     # vector of WorkerCard instances (same widget objects across renders →
     # same hash → no spurious unmount/remount).
@@ -2443,68 +2256,31 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # worker pills and the sidebar. (`sync_request` / `open_request` above
     # remain defined for the future move-to-worker redesign.)
 
-    # One form, one source of truth: which one is open right now. Only
-    # copy-project remains on the dashboard; new-project and GitHub clone moved
-    # onto the per-worker cards (worker_widget.jl).
-    #
-    # It opens as a MODAL, not as a panel in the page: the button that opens it
-    # lives in the Settings card at the very bottom, so a user who scrolled up
-    # to pick a project clicked it and saw nothing happen — the form was
-    # appended below the fold. Closes on the ✕, on the backdrop, and on Escape.
-    form_close = Observable("")
-    on(session, form_close) do v
-        isempty(v) && return
-        form_close[] = ""
-        which_form[] = :none
-        error_obs[]  = ""
-    end
-    form_block = map(session, which_form) do which
-        which === :copy_project || return DOM.div()
-        close_btn = DOM.button("✕";
-            class = "bt-btn bt-btn-ghost bt-btn-sm bt-modal-close",
-            title = "Close",
-            onclick = js"event => $(form_close).notify('x')")
-        DOM.div(
-            DOM.div(
-                DOM.div(DOM.span("Copy project"; class = "bt-modal-title"), close_btn;
-                        class = "bt-modal-head"),
-                DOM.div(cp_form(); class = "bt-modal-body");
-                class = "bt-modal-card",
-                # A click inside the card must not reach the backdrop handler.
-                onclick = js"event => event.stopPropagation()"),
-            # Escape closes it too. The listener is on the document (the overlay
-            # never has focus) and retires itself once the overlay is gone — the
-            # node is discarded when `which_form` flips, so there is nothing else
-            # to hang a teardown on.
-            js"""(() => {
-                const esc = (e) => {
-                    if (!document.querySelector('.bt-modal-overlay')) {
-                        document.removeEventListener('keydown', esc, true);
-                        return;
-                    }
-                    if (e.key === 'Escape') { e.stopPropagation(); $(form_close).notify('x'); }
-                };
-                document.addEventListener('keydown', esc, true);
-            })()""";
-            class = "bt-modal-overlay",
-            onclick = js"event => $(form_close).notify('x')")
-    end
     # Top-of-page errors, for failures with no form on screen ("Register a
-    # worker before creating a project"). While a form IS open its own copy
-    # shows the message next to the button — see `form_error` — so this one
-    # stands down rather than duplicating it far above the fold.
-    error_block = map(error_obs, which_form) do msg, wf
-        (isempty(msg) || wf !== :none) ? DOM.div() : DOM.div(msg; class = "bt-error")
+    # worker before creating a project").
+    error_block = map(error_obs) do msg
+        isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
+
+    # Everything that configures rather than runs (defaults, agent
+    # instructions, accounts) is on the Settings page; this is its door.
+    settings_link = current_view === nothing ? nothing :
+        DOM.button("Settings";
+            class = "bt-btn bt-btn-secondary bt-btn-sm bt-open-settings",
+            title = "Defaults, agent instructions, accounts",
+            onclick = js"event => $(current_view).notify($(SETTINGS_VIEW))")
 
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
     DOM.div(
         DOM.div(
-            DOM.h1(
-                DOM.img(src = logo_svg(), alt = "", class = "bt-logo",
-                        draggable = "false"),
-                "BonitoAgents"),
+            DOM.div(
+                DOM.h1(
+                    DOM.img(src = logo_svg(), alt = "", class = "bt-logo",
+                            draggable = "false"),
+                    "BonitoAgents"),
+                settings_link;
+                class = "bt-header-top"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";
                     class = "bt-tagline"),
             # Recent-chats overview — the header IS the landing overview: the
@@ -2516,34 +2292,235 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         error_block,
 
         DOM.div(DOM.h2("Workers"); class = "bt-section"),
-        worker_list,
+        worker_list;
 
-        DOM.div(DOM.h2("Agents"); class = "bt-section"),
-        agents_block,
+        class = "bt-dash")
+end
 
-        # Your account behind the proxy; accounts, invites and agent adapter
-        # versions for admins.
-        account_sections(session, state),
+"""
+    settings_dom(session, state; current_view = nothing, progress = nothing) → DOM
 
-        # Everything that is neither a worker nor a chat lives in ONE card of
-        # uniform rows, so the tail of the dashboard reads as one place rather
-        # than a stack of differently shaped sections.
-        DOM.div(DOM.h2("Settings"); class = "bt-section"),
+The Settings page: chat defaults, copying a project to another worker, Debug
+BonitoAgents, the global agent instructions, and the account sections.
+`progress` is the window's progress card, as for `dashboard_dom`.
+"""
+function settings_dom(session::Bonito.Session, state::ServerState;
+                      current_view::Union{Observable{String},Nothing} = nothing,
+                      progress::Union{Observable,Nothing} = nothing)
+    busy = progress === nothing ? Observable{Any}(BUSY_IDLE) : progress
+    copy_ui = copy_project_controls(session, state, busy, current_view)
+    DOM.div(
+        DOM.div(DOM.h1("Settings"); class = "bt-header"),
+        # Loose controls, one card of uniform rows.
+        DOM.div(DOM.h2("General"); class = "bt-section"),
         DOM.div(
             settings_row("Defaults",
                 "Applied to new and unconfigured chats; a chat's own picks override.",
                 session_defaults_bar(session, state)),
-            # New project & GitHub clone live on the per-worker cards; Copy stays
-            # here because it genuinely crosses workers.
+            # New project & GitHub clone live on the per-worker cards; Copy is
+            # here because it crosses workers.
             settings_row("Copy project",
                 "Snapshot a project's files onto another worker as a new project. " *
                 "To carry on a chat elsewhere, use that chat's ⋯ menu → Continue on.",
-                cp_btn),
+                copy_ui.button),
             debug_section(session, state, current_view);
             class = "bt-card bt-settings"),
-        form_block;
+        agents_md_section(session, state),
+        # Your account behind the proxy; accounts, invites and agent adapter
+        # versions for admins.
+        account_sections(session, state),
+        copy_ui.modal;
+        class = "bt-dash bt-settings-page")
+end
 
-        class = "bt-dash")
+"""
+    copy_project_controls(session, state, busy, current_view) -> (; button, modal)
+
+"Copy project…" and the form it opens: a snapshot of a project's files onto
+another worker as a new project. The copy reports into `busy`, and navigates to
+the new project when `current_view` is given.
+"""
+function copy_project_controls(session::Bonito.Session, state::ServerState, busy::Observable,
+                               current_view::Union{Observable{String},Nothing})
+    error_obs  = Observable("")
+    is_open    = Observable(false)
+    src_worker = Observable("")
+    src_project = Observable("")
+    tgt_worker = Observable("")
+    new_name   = Observable("")
+
+    # When source worker changes, auto-select the first project on that worker.
+    on(session, src_worker) do wid
+        isempty(wid) && return
+        wid_projs = sort([p for p in values(state.projects[]) if p.worker_id == wid && visible(state, p)];
+                         by = p -> p.name)
+        src_project[] = isempty(wid_projs) ? "" : first(wid_projs).id
+    end
+    # Seed the copy name from the source's OWN name. No scrub: `copy_to!`
+    # applies `valid_project_name` like every other create path, so a project
+    # called "Mantle DNN" seeds "Mantle DNN-copy".
+    on(session, src_project) do pid
+        isempty(pid) && return
+        p = get(state.projects[], pid, nothing)
+        p === nothing && return
+        new_name[] = p.name * "-copy"
+    end
+    # Closing the form (✕, backdrop, Escape, Cancel, a finished copy) drops
+    # its error with it.
+    on(session, is_open) do open
+        open || (error_obs[] = "")
+    end
+
+    submit = Bonito.Button("Copy"; style = nothing, class = "bt-btn")
+    cancel = Bonito.Button("Cancel"; style = nothing, class = "bt-btn bt-btn-secondary")
+    on(session, submit.value) do clicked
+        clicked || return
+        refuse_if_busy(busy, error_obs, "Can't copy right now") && return
+        pid = String(src_project[])
+        tgt = String(tgt_worker[])
+        nm  = String(strip(new_name[]))
+        isempty(pid) && (error_obs[] = "Select a source project."; return)
+        isempty(tgt) && (error_obs[] = "Select a target worker."; return)
+        isempty(nm)  && (error_obs[] = "Enter a name for the copy."; return)
+        haskey(state.projects[], pid) ||
+            (error_obs[] = "Source project not found."; return)
+        haskey(state.workers[], tgt) ||
+            (error_obs[] = "Target worker not found."; return)
+        p     = state.projects[][pid]
+        tgt_w = state.workers[][tgt]
+        busy_start!(busy, "Copying $(p.name) → $(tgt_w.name)")
+        @async begin
+            try
+                new_p = copy_to!(state, p, tgt; name = nm,
+                    progress = (stage, info) -> busy_event!(busy, stage, info))
+                is_open[] = false
+                busy_done!(busy, "Copied $(p.name) → $(tgt_w.name)")
+                current_view !== nothing && (current_view[] = new_p.id)
+            catch e
+                bt = catch_backtrace()
+                @warn "copy_to! failed" project=p.name target=tgt exception=(e, bt)
+                busy_fail!(busy, "Copy failed", error_detail(e, bt))
+            end
+        end
+    end
+    on(session, cancel.value) do clicked
+        clicked || return
+        is_busy_running(busy[]) && return
+        is_open[] = false
+    end
+
+    button = Bonito.Button("Copy project…"; style = nothing, class = "bt-btn bt-btn-secondary")
+    on(session, button.value) do clicked
+        clicked || return
+        mine = [w.worker_id for w in values(state.workers[]) if visible(state, w)]
+        workers_with_projs = unique(p.worker_id for p in values(state.projects[]) if visible(state, p))
+        if isempty(mine) || isempty(workers_with_projs)
+            error_obs[] = isempty(mine) ?
+                "Register a worker before copying projects." :
+                "No projects to copy yet."
+            return
+        end
+        # Prefer a source worker that actually has projects.
+        src_wid = first(workers_with_projs)
+        # Default target to a DIFFERENT worker than source when one exists.
+        other_wids = [w for w in mine if w != src_wid]
+        tgt_wid = isempty(other_wids) ? src_wid : first(other_wids)
+        src_worker[] = ""          # force on(src_worker) to fire even if same value
+        src_worker[] = src_wid
+        tgt_worker[] = tgt_wid
+        error_obs[]  = ""
+        is_open[]    = true
+    end
+
+    # `class` is the stable hook the e2e suite queries by, not the placeholder.
+    worker_select(id_obs::Observable, cls::String) = DOM.select(
+        (DOM.option(w.name; value = w.worker_id,
+                    selected = w.worker_id == id_obs[]) for w in values(state.workers[]) if visible(state, w))...;
+        class = cls,
+        value = id_obs,
+        onchange = js"event => $(id_obs).notify(event.target.value)")
+    # A refusal shows where it was asked for: next to the button while the
+    # form is closed, in the form once it is open. Each call builds its own
+    # node — the same mapped node can't be mounted in two places.
+    shown_error(when_open::Bool) = map(error_obs, is_open) do msg, open
+        (isempty(msg) || open != when_open) ? DOM.div() : DOM.div(msg; class = "bt-error")
+    end
+
+    form = modal(session, is_open, "Copy project") do
+        DOM.div(
+            DOM.label("Source worker"),
+            worker_select(src_worker, "bt-cp-src-worker"),
+            DOM.label("Source project"),
+            map(session, state.projects, src_worker) do projects, wid
+                wid_projs = sort([p for p in values(projects) if p.worker_id == wid && visible(state, p)];
+                                 by = p -> lowercase(p.title[]))
+                isempty(wid_projs) ?
+                    DOM.div("No projects on this worker"; class = "bt-form-note") :
+                    DOM.select(
+                        # Listed by the name the user knows the chat by (its title,
+                        # or the folder when it has none), with the folder alongside
+                        # when the two differ.
+                        (DOM.option(titled(p) ? "$(p.title[]) ($(p.name))" : p.name;
+                                    value = p.id,
+                                    selected = p.id == src_project[]) for p in wid_projs)...;
+                        class = "bt-cp-src-project",
+                        value = src_project,
+                        onchange = js"event => $(src_project).notify(event.target.value)")
+            end,
+            DOM.label("Target worker"),
+            worker_select(tgt_worker, "bt-cp-tgt-worker"),
+            DOM.label("Name on target"),
+            DOM.input(type = "text", placeholder = "e.g. my-project-copy", value = new_name,
+                      oninput = js"event => $(new_name).notify(event.target.value)"),
+            DOM.div("It becomes a folder on the target worker: no / or \\, no leading dot.";
+                    class = "bt-form-note"),
+            shown_error(true),
+            DOM.div(cancel, submit; class = "bt-form-actions"),
+            class = "bt-form")
+    end
+    return (; button = DOM.div(button, shown_error(false); class = "bt-copy-project"), modal = form)
+end
+
+"""
+    agents_md_section(session, state)
+
+The global agent instructions (AGENTS.md): a system-prompt appendix every agent
+session gets, on every worker (state_dir/AGENTS.md; see `system_prompt_meta`).
+Read at session bring-up, so a save applies to the NEXT chat opened.
+"""
+function agents_md_section(session::Bonito.Session, state::ServerState)
+    status = Observable("")
+    saved  = Observable{Union{Nothing,String}}(nothing)
+    on(session, saved) do txt
+        txt === nothing && return
+        try
+            set_global_agents_md!(state, txt)
+            safe_set!(status, "saved · applies to chats opened from now on")
+        catch e
+            @warn "AGENTS.md save failed" exception = e
+            safe_set!(status, "save failed: $(sprint(showerror, e))")
+        end
+    end
+    return DOM.div(
+        DOM.div(DOM.h2("Agent instructions"); class = "bt-section"),
+        DOM.div(
+            DOM.div("AGENTS.md, appended to the system prompt of every agent session " *
+                    "on every worker: shared conventions, house rules, tool guidance.";
+                    class = "bt-agents-hint"),
+            DOM.textarea(global_agents_md(state);
+                class = "bt-agents-textarea", rows = 6,
+                placeholder = "e.g. ## Conventions every agent must follow…"),
+            DOM.div(
+                DOM.span(status; class = "bt-agents-status"),
+                DOM.button("Save";
+                    class = "bt-btn bt-btn-sm",
+                    onclick = js"""event => {
+                        const ta = event.target.closest('.bt-agents-block')
+                                       .querySelector('textarea');
+                        $(saved).notify(ta.value);
+                    }""");
+                class = "bt-agents-actions");
+            class = "bt-card bt-agents-block"))
 end
 
 # One install command with its Copy button. The command is copied from its own

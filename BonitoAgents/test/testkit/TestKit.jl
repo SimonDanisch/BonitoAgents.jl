@@ -1519,21 +1519,25 @@ account_status(s::TestServer, text::AbstractString; timeout::Real = 30) =
 """
     add_account_ui!(s, name; display_name = name, groups = "") -> Login
 
-Add an account with the Accounts section's form, as an admin does, and return
-what it shows once, the password and the authenticator, as the `Login` the admin
-passes on.
+Add an account the way an admin does: Settings, "Add account…", the form, and
+return what it shows once, the password and the authenticator, as the `Login`
+the admin passes on.
 """
 function add_account_ui!(s::TestServer, name::AbstractString; display_name::AbstractString = name,
                          groups::AbstractString = "")
+    to_settings(s)
+    eval_js(s, accounts_js("sec.querySelector('.bt-add-account').click() || true"))
+    wait_for(s, "the Add account form", accounts_js("!!sec.querySelector('.bt-modal-card .bt-add-account-submit')"); timeout = 10)
     eval_js(s, accounts_js("""(() => {
-        const form = sec.querySelector('.bt-admin-form');
-        const set = (ph, v) => { const el = [...form.querySelectorAll('input[type=text]')].find(e => e.placeholder === ph);
+        const form = sec.querySelector('.bt-modal-card .bt-form');
+        const set = (label, v) => {
+            const el = [...form.querySelectorAll('label')].find(l => l.textContent.trim() === label).nextElementSibling;
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
             el.dispatchEvent(new Event('input', {bubbles: true})); };
-        set('account name', $(json(name))); set('full name', $(json(display_name))); set('groups', $(json(groups)));
+        set('Account', $(json(name))); set('Full name', $(json(display_name))); set('Groups', $(json(groups)));
         return true; })()"""))
     sleep(0.3)   # the inputs reach the server before the click that reads them
-    eval_js(s, accounts_js("[...sec.querySelectorAll('button')].find(b => b.textContent.trim() === 'Add account').click() || true"))
+    eval_js(s, accounts_js("sec.querySelector('.bt-add-account-submit').click() || true"))
     account_status(s, "account $(name) added")
     uri = String(wait_for(s, "the authenticator for $(name)",
         accounts_js("(sec.querySelector('.bt-admin-secret .bt-admin-uri') || {}).textContent || false"); timeout = 30))
@@ -1547,22 +1551,26 @@ shown_password(s::TestServer, name::AbstractString) = String(wait_for(s, "the pa
     accounts_js("(sec.querySelector('.bt-admin-secret').innerText.match(/Password for $(name), shown only now: (\\S+)/) || [false, false])[1]");
     timeout = 30))
 
-"Press `label` (\"Disable\", \"Make admin\", …) on `name`'s row of the Accounts table."
+"Pick `label` (\"Disable\", \"Make admin\", …) from the ⋯ menu of `name`'s row in the Accounts table."
 function account_action!(s::TestServer, name::AbstractString, label::AbstractString)
+    to_settings(s)
     ok = eval_js(s, accounts_js("""(() => {
-        const row = [...sec.querySelectorAll('.bt-admin-table tr')].find(r => r.cells[0] && r.cells[0].textContent.trim() === $(json(name)));
-        const b = row && [...row.querySelectorAll('button')].find(x => x.textContent.trim() === $(json(label)));
-        if (!b) return false;
+        const row = sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + ']');
+        if (!row) return 'no row';
+        row.querySelector('.bt-menu-trigger').click();
+        const b = [...row.querySelectorAll('.bt-menu-open .bt-menu-item')].find(x => x.textContent.trim() === $(json(label)));
+        if (!b) return 'no item';
         window.confirm = () => true;   // "Remove" asks first
         b.click(); return true; })()"""))
-    ok === true || error("account_action!: no $(repr(label)) on $(name)'s row")
+    ok === true || error("account_action!: $(ok) for $(repr(label)) on $(name)'s row")
     return s
 end
 
 "Type `groups` into `name`'s row of the Accounts table and press Enter."
 function set_account_groups_ui!(s::TestServer, name::AbstractString, groups::AbstractString)
+    to_settings(s)
     ok = eval_js(s, accounts_js("""(() => {
-        const row = [...sec.querySelectorAll('.bt-admin-table tr')].find(r => r.cells[0] && r.cells[0].textContent.trim() === $(json(name)));
+        const row = sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + ']');
         const el = row && row.querySelector('input[type=text]');
         if (!el) return false;
         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, $(json(groups)));
@@ -1573,6 +1581,7 @@ end
 
 "Share the (first) worker with `groups` from its card, as its owner does."
 function share_worker_ui!(s::TestServer, groups::AbstractString)
+    to_dashboard(s)
     wait_for(s, "the worker's sharing field", "!!document.querySelector('.bt-worker-cell input[placeholder=groups]')";
              timeout = 60)
     set_input(s, ".bt-worker-cell input[placeholder=groups]", groups)
@@ -1686,6 +1695,16 @@ function set_input(s::TestServer, selector::AbstractString, value::AbstractStrin
         el.dispatchEvent(new Event('input', {bubbles: true}));
         return true; })()""")
     ok === true || error("set_input: no visible element for $(repr(selector))")
+    return s
+end
+
+"Go to the Settings page by clicking its entry in the sidebar."
+function to_settings(s::TestServer)
+    # By its view, not its label: the icon rail (collapsed, or a phone) hides the text.
+    eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\"settings\"]').click(); true")
+    wait_for(s, "the Settings page",
+        "(() => { const v = document.querySelector('.bt-view-settings'); return !!v && getComputedStyle(v).display !== 'none'; })()";
+        timeout = 10)
     return s
 end
 

@@ -131,7 +131,7 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
                         target_value::AbstractString, title::AbstractString;
                         active::Bool = false, closeable::Bool = false,
                         extra_class::AbstractString = "")
-    # Only the static "Home" entry uses this form; chat rows are `SidebarChat`,
+    # Only the static Home and Settings entries use this form; chat rows are `SidebarChat`,
     # which own a `status` Observable and render it as the icon's glow class.
     kids = Any[icon, DOM.span(label; class = "bt-side-name")]
     # A ✕ to close (stop) an active chat. Plain markup — the delegated
@@ -144,9 +144,9 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
     DOM.div(kids...;
         class = cls,
         title = title,
-        # `data-project-id` is the empty string for "Home" (the dashboard
-        # entry) and the project id for everything else. The delegated
-        # click handler reads this to know which view to switch to.
+        # `data-project-id` is the view the entry opens: "" for Home (the
+        # dashboard), `SETTINGS_VIEW`, or a project id. The delegated click
+        # handler reads this to know which view to switch to.
         dataProjectId = target_value)
 end
 
@@ -380,15 +380,14 @@ so it does not rebuild rows or re-register `current_view` in row subsessions.
 function project_sidebar(session::Bonito.Session, state::ServerState,
                           current_view::Observable{String},
                           pane::Union{Nothing,PlotPane} = nothing)
-    # The home glyph isn't a project — it's nav. Renders as a borderless
-    # 32px slot so it visually reads as "go home" instead of competing
-    # with the colored project tiles below it.
-    home_icon = DOM.div(
-        DOM.img(src = bonito_asset("icons", "home.svg"), alt = "Home", draggable = "false",
+    # Home and Settings aren't projects — they're nav. Each renders as a
+    # borderless 32px slot so it reads as navigation instead of competing with
+    # the colored project tiles below.
+    nav_icon(file, alt) = DOM.div(
+        DOM.img(src = bonito_asset("icons", file), alt = alt, draggable = "false",
                 style = Styles("width" => "18px", "height" => "18px",
                                "display" => "block", "pointer-events" => "none"));
-        class = "bt-side-home-icon",
-        title = "Dashboard")
+        class = "bt-side-nav-icon")
 
     # Closing an active chat from the sidebar: tear its session down and, if it
     # was the one on screen, fall back to the dashboard. Interpolated once on
@@ -484,7 +483,11 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     end
 
     body = DOM.div(
-        sidebar_entry("Home", home_icon, "", "Dashboard"; active = current_view[] == ""),
+        sidebar_entry("Home", nav_icon("home.svg", "Home"), "", "Dashboard";
+                      active = current_view[] == "", extra_class = "bt-side-nav"),
+        sidebar_entry("Settings", nav_icon("settings.svg", "Settings"), SETTINGS_VIEW,
+                      "Settings: defaults, agent instructions, accounts";
+                      active = current_view[] == SETTINGS_VIEW, extra_class = "bt-side-nav"),
         KeyedList(entries_obs; key = c -> c.pid),
         empty_note;
         class = "bt-side-list")
@@ -748,18 +751,18 @@ const SidebarStyles = Bonito.Styles(
         "text-shadow" => "0 1px 2px rgba(15,23,42,0.55)",
         "border-radius" => "5px 0 8px 0", "pointer-events" => "none",
         "font-family" => "'Inter', system-ui, sans-serif"),
-    # Home icon: borderless 32px slot, glyph in muted text color so it sits
-    # quietly above the colorful project tiles. The SVG ships with white
-    # strokes, so we recolor it via a CSS filter.
-    CSS(".bt-side-home-icon",
+    # Home / Settings icons: borderless 32px slot, glyph in muted text color so
+    # it sits quietly above the colorful project tiles. The SVGs ship with white
+    # strokes, so we recolor them via a CSS filter.
+    CSS(".bt-side-nav-icon",
         "width" => "32px", "height" => "32px",
         "display" => "flex", "align-items" => "center", "justify-content" => "center",
         "flex-shrink" => "0"),
     # invert+sepia+rotate is the standard trick for tinting a white SVG via
     # CSS without per-color SVG variants. Lands close to --bt-text-muted (#64748b).
-    CSS(".bt-side-home-icon img",
+    CSS(".bt-side-nav-icon img",
         "filter" => "invert(48%) sepia(13%) saturate(540%) hue-rotate(176deg) brightness(92%) contrast(86%)"),
-    CSS(".bt-side-active .bt-side-home-icon img",
+    CSS(".bt-side-active .bt-side-nav-icon img",
         "filter" => "invert(38%) sepia(86%) saturate(2400%) hue-rotate(212deg) brightness(99%) contrast(95%)"),
     CSS(".bt-side-name",
         "font-size" => "12px",
@@ -1032,6 +1035,8 @@ const UnifiedShellStyles = Bonito.Styles(
     CSS(".bt-view",
         "position" => "absolute", "inset" => "0",
         "display" => "flex", "flex-direction" => "column", "min-width" => "0"),
+    # Hidden until the nav handler shows it (a fresh window opens on Home).
+    CSS(".bt-view-settings", "display" => "none"),
     # The chats container is just a positioning context; its panes are the
     # absolutely-positioned, individually-toggled children. It is stacked ON TOP
     # of the dashboard (later in DOM), so it MUST be click-transparent — otherwise
@@ -1311,6 +1316,10 @@ function Bonito.jsrender(session::Bonito.Session, r::ChatPaneRef)
     Bonito.jsrender(session, pane)
 end
 
+# The `current_view` of the Settings page. Every other value is "" (Home) or a
+# project id, which is 8 hex digits, so it cannot collide.
+const SETTINGS_VIEW = "settings"
+
 # Render the main panel given the current view + the bonito session. Pulled out
 # so unified_app's body stays small.
 #
@@ -1324,10 +1333,15 @@ function unified_main(session::Bonito.Session, state::ServerState,
                       current_view::Observable{String}, ls::LoadingState,
                       pane::Union{Nothing,PlotPane} = nothing)
     # ── Dashboard pane: rendered ONCE, mounted forever ──────────────────────
+    progress = pane === nothing ? nothing : pane.progress
     dash_pane = DOM.div(
-        dashboard_dom(session, state; current_view = current_view,
-                      progress = pane === nothing ? nothing : pane.progress);
+        dashboard_dom(session, state; current_view = current_view, progress = progress);
         class = "bt-view bt-view-dash")
+    # The Settings page, the same way: rendered once, shown while
+    # `current_view == SETTINGS_VIEW`.
+    settings_pane = DOM.div(
+        settings_dom(session, state; current_view = current_view, progress = progress);
+        class = "bt-view bt-view-settings")
 
     # ── Chat panes: one per opened chat, DOM-preserved via KeyedList ────────
     # `alive` is the LRU-ordered list of pids whose pane stays mounted. Memoized
@@ -1353,7 +1367,7 @@ function unified_main(session::Bonito.Session, state::ServerState,
     # now-removed per-chat curtain painted.)
     overlay = map(session, current_view, ls.settled) do pid, _
         p = get(state.projects[], pid, nothing)
-        if isempty(pid)
+        if isempty(pid) || pid == SETTINGS_VIEW
             DOM.div(; style = Styles("display" => "none"))
         elseif p !== nothing && !visible(state, p)
             # Someone else's chat: a member sees their own only.
@@ -1402,7 +1416,7 @@ function unified_main(session::Bonito.Session, state::ServerState,
         keep == cur || (alive[] = keep)
     end
 
-    container = DOM.div(dash_pane, chats_host, overlay_pane; class = "bt-main-views")
+    container = DOM.div(dash_pane, settings_pane, chats_host, overlay_pane; class = "bt-main-views")
 
     # Visibility: pure DOM toggling (no re-render, no teardown). Sets the active
     # pid on the container (so a freshly-added pane can self-init via its onload)
@@ -1415,6 +1429,8 @@ function unified_main(session::Bonito.Session, state::ServerState,
         root.dataset.activeView = pid || '';
         const dash = root.querySelector('.bt-view-dash');
         if (dash) dash.style.display = (!pid) ? 'flex' : 'none';
+        const settings = root.querySelector('.bt-view-settings');
+        if (settings) settings.style.display = (pid === $(SETTINGS_VIEW)) ? 'flex' : 'none';
         // Per-pane visibility + an `onShown` ping on the one we just
         // revealed. The ping lets BonitoChat re-anchor to the bottom on
         // each open while followMode is on (user was at the bottom), and

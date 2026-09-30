@@ -2794,23 +2794,29 @@ so any agent that supports it can be asked directly. Verified against kimi
 Costs one short-lived agent process per provider, so it runs only on an explicit
 scan (first connect / Rescan), never per chat. Providers whose binary isn't
 installed, or that don't advertise `list`, are skipped.
+
+The providers are asked all at once, each within `timeout`: one after another,
+the scan cost the SUM of every agent's start-up (MiMo alone takes 3 s), passed the
+server's 15 s on a freshly restarted worker, and the card then showed no
+projects at all, Claude's included.
 """
-function scan_acp_providers()
-    rows = Dict{String,Any}[]
-    for prov in AgentProviders.current_providers()
-        prov isa AgentProviders.BinAgent || continue
-        # ClaudeCode is covered by the file scan (which also yields subagents,
-        # liveness and pids that `session/list` doesn't carry).
-        prov isa AgentProviders.ClaudeCodeAgent && continue
-        isfile(prov.bin) || Sys.which(prov.bin) !== nothing || continue
-        try
-            append!(rows, acp_list_sessions(prov))
+function scan_acp_providers(; timeout::Real = 8.0)
+    provs = [prov for prov in AgentProviders.current_providers()
+             # ClaudeCode is covered by the file scan (which also yields subagents,
+             # liveness and pids that `session/list` doesn't carry).
+             if prov isa AgentProviders.BinAgent && !(prov isa AgentProviders.ClaudeCodeAgent) &&
+                (isfile(prov.bin) || Sys.which(prov.bin) !== nothing)]
+    listings = map(provs) do prov
+        @async try
+            acp_list_sessions(prov; timeout)
         catch e
-            e isa InterruptException && rethrow()
-            @debug "BonitoWorker: ACP session listing failed" provider=AgentProviders.provider_name(prov) exception=e
+            # The agent could not be started, or died while we talked to it.
+            e isa Base.IOError || rethrow()
+            @warn "BonitoWorker: listing sessions failed" provider = AgentProviders.provider_name(prov) exception = e
+            Dict{String,Any}[]
         end
     end
-    return rows
+    return reduce(vcat, fetch.(listings); init = Dict{String,Any}[])
 end
 
 # A session/list `title` cleaned the same way the file scan cleans a first
@@ -2860,7 +2866,11 @@ end
 # still precompiling outlives SIGTERM, and with no ownership mark and no group of
 # its own the survivor was invisible to `reap_agents_owned_by` AND to the group
 # kill. Measured at 7 orphans (~500 MB each) over one e2e run.
-function acp_list_sessions(prov; timeout::Real = 20.0)
+#
+# `timeout` bounds the WHOLE listing (start, initialize, every page), not each
+# request: the server gives the entire scan 15 s. What arrived by then is kept.
+function acp_list_sessions(prov; timeout::Real = 8.0)
+    deadline = time() + timeout
     proc = open(detach(Cmd(`$(prov.bin) $(prov.args)`; env = provider_env(prov))), "r+")
     rows = Dict{String,Any}[]
     try
@@ -2884,10 +2894,11 @@ function acp_list_sessions(prov; timeout::Real = 20.0)
             write(proc, JSON.json(Dict("jsonrpc" => "2.0", "id" => id,
                                        "method" => method, "params" => params)), "\n")
             flush(proc)
-            t0 = time()
-            while !haskey(replies, id) && !istaskdone(reader) && time() - t0 < timeout
+            while !haskey(replies, id) && !istaskdone(reader) && time() < deadline
                 sleep(0.05)
             end
+            haskey(replies, id) || time() < deadline ||
+                @warn "BonitoWorker: listing sessions timed out; showing what arrived" provider = AgentProviders.provider_name(prov) method timeout
             get(replies, id, nothing)
         end
 

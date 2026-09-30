@@ -20,10 +20,10 @@
         TK.eval_js(z, "document.querySelector('.bt-install-details').open = true; true")
         TK.click_text(z, "Add worker")
         command = String(TK.wait_for(z, "the install command",
-            "(document.body.textContent.match(/curl -fsSL \\S+\\/install\\.sh \\| BONITOAGENTS_WORKER_CREDENTIAL='w-[0-9a-f]+:[0-9a-f]+' sh/) || [false])[0]";
+            "(document.body.textContent.match(/curl -fsSL \\S+\\/install\\.sh \\| sh -s w-[0-9a-f]+:[0-9a-f]+/) || [false])[0]";
             timeout = 30))
         @test occursin(z.h.url * "/install.sh", command)
-        credential = match(r"BONITOAGENTS_WORKER_CREDENTIAL='([^']+)'", command)[1]
+        credential = match(r"sh -s (w-[0-9a-f]+:[0-9a-f]+)", command)[1]
 
         # A machine that runs it joins; one with a made-up credential does not.
         second = TK.add_worker!(z; name = "second", credential)

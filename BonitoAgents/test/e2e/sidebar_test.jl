@@ -26,7 +26,7 @@
     const TK = TestKit
 
     parseInt_px(v) = (m = match(r"^([0-9.]+)px$", String(v)); m === nothing ? -1.0 : parse(Float64, m[1]))
-    ITEMS = ".bt-side-item[data-project-id]:not([data-project-id=''])"
+    ITEMS = ".bt-side-item[data-project-id]:not(.bt-side-nav)"   # chat rows, not Home / Settings
     # Mark every chat row; a rebuilt row loses the mark.
     stamp = """(() => { let n = 0;
         document.querySelectorAll($(repr(ITEMS))).forEach(e => { e.dataset.keep = '1'; n++; });

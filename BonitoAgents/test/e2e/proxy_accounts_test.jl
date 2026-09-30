@@ -17,8 +17,8 @@
         # An admin adds an account; its password and authenticator are shown once.
         dave = TK.add_account_ui!(z, "dave"; display_name = "Dave D", groups = "lab")
         @test length(dave.password) >= 16
-        @test TK.eval_js(z, TK.accounts_js("""[...sec.querySelectorAll('.bt-admin-table tr')].some(r =>
-            r.cells[0]?.textContent.trim() === 'dave' && r.textContent.includes('member') && r.textContent.includes('active'))""")) == true
+        @test TK.eval_js(z, TK.accounts_js("""(() => { const r = sec.querySelector('tr[data-account="dave"]');
+            return !!r && r.textContent.includes('member') && !r.textContent.includes('disabled'); })()""")) == true
 
         # Dave logs in with them, in a browser of his own, while the admin stays logged in.
         b = TK.another_browser(z)
@@ -54,7 +54,8 @@
         TK.login!(b, dave)
         @test TK.signed_in_as(b) == "Signed in as Dave D (dave); groups: lab."
 
-        # And one of his own, from his account card.
+        # And one of his own, from his account card on Settings.
+        TK.to_settings(b)
         TK.eval_js(b, """(() => { window.confirm = () => true;
             [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'New password').click(); return true; })()""")
         own = String(TK.wait_for(b, "his new password",
@@ -89,7 +90,7 @@
         # Removed: gone for Authelia too.
         TK.account_action!(z, "dave", "Remove")
         TK.account_status(z, "dave removed")
-        @test !TK.eval_js(z, TK.accounts_js("[...sec.querySelectorAll('.bt-admin-table tr')].some(r => r.cells[0]?.textContent.trim() === 'dave')"))
+        @test TK.wait_for(z, "dave's row gone", TK.accounts_js("!sec.querySelector('tr[data-account=\"dave\"]')"); timeout = 30) == true
         @test occursin(refused, TK.login_refused(b, dave))
 
         # Nobody locks themselves out: the admin cannot disable or demote
@@ -153,10 +154,11 @@ end
 
         # A second worker, the admin's and shared with nobody, added the way a
         # new machine is: with the credential its install command carries.
+        TK.to_dashboard(z)
         TK.eval_js(z, "document.querySelector('.bt-install-details').open = true; true")
         TK.click_text(z, "Add worker")
         credential = String(TK.wait_for(z, "the install command's credential",
-            "(document.body.textContent.match(/BONITOAGENTS_WORKER_CREDENTIAL='(w-[0-9a-f]+:[0-9a-f]+)'/) || [false, false])[1]";
+            "(document.body.textContent.match(/sh -s (w-[0-9a-f]+:[0-9a-f]+)/) || [false, false])[1]";
             timeout = 30))
         private = TK.add_worker!(z; name = "private", credential)
         card_online(name) = """[...document.querySelectorAll('.bt-worker-cell')].some(c =>

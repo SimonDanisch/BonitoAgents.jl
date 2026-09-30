@@ -210,7 +210,8 @@ enumerates.
 - Accounts, owners and per-worker credentials: the server binds localhost and
   takes identities from Authelia (through Caddy, with a key only Caddy and the
   server share, or its own gate);
-  admins invite people by link, manage accounts and groups, and issue or revoke
+  admins invite people by link and manage accounts and groups on the Settings
+  page (one-shot account actions in each row's ⋯ menu), and issue or revoke
   worker credentials on the dashboard; members see what they own plus workers
   shared with their groups. Passkeys first: an invite or setup link makes one in
   a single step, the account card lists, adds and removes them (through

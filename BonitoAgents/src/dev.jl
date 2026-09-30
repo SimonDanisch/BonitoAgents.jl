@@ -63,7 +63,11 @@ mutable struct DevHandle
     ephemeral     :: Bool
     closed        :: Threads.Atomic{Bool}
     proxy         :: Union{DevProxyRig,Nothing}   # `dev_server(proxy = …)`: Caddy + Authelia in front
+    prior_env     :: Dict{String,Union{String,Nothing}}   # what `close` puts back (see DEV_SERVER_ENV)
 end
+
+# The env `dev_server` sets for its worker, and `close` restores.
+const DEV_SERVER_ENV = ("BONITOAGENTS_CONFIG_DIR", "CLAUDE_AGENT_ACP", "BONITOAGENTS_DIE_WITH_PARENT")
 
 """
     dev_server(; port=nothing, name="dev", auto_open=false) -> DevHandle
@@ -197,6 +201,7 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # agent (CLAUDE_AGENT_ACP + agent_env) reach it and the BonitoMCP it spawns.
     resolved_agent_bin = agent_bin === nothing ? BonitoWorker.find_agent_bin() :
                           String(agent_bin)
+    prior_env = Dict{String,Union{String,Nothing}}(k => get(ENV, k, nothing) for k in DEV_SERVER_ENV)
     ENV["BONITOAGENTS_CONFIG_DIR"] = worker_config
     write(id_file, worker_id)   # pin the dev id (reused on a persistent rig)
     resolved_agent_bin === nothing || (ENV["CLAUDE_AGENT_ACP"] = resolved_agent_bin)
@@ -239,7 +244,7 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     url = rig === nothing ? server_url : public_origin(state.auth.config, proxy.domain)
     handle = DevHandle(url, state, worker_proc,
                        state_dir, working_dir, worker_root, worker_config,
-                       ephemeral, closed, rig)
+                       ephemeral, closed, rig, prior_env)
 
     # Best-effort cleanup if the Julia process exits without explicit close.
     Base.atexit(() -> close(handle))
@@ -355,11 +360,11 @@ function Base.close(h::DevHandle)
         e isa InterruptException && rethrow()
         @debug "dev_server: could not reap the worker's agents" exception = e
     end
-    # Drop the env we set so this process is left as we found it (the detached
-    # worker already inherited it at spawn; this just prevents leakage into
-    # later dev_server / test runs in the same Julia session).
-    for k in ("BONITOAGENTS_CONFIG_DIR", "CLAUDE_AGENT_ACP", "BONITOAGENTS_DIE_WITH_PARENT")
-        haskey(ENV, k) && delete!(ENV, k)
+    # Put back the env this process had before `dev_server` set its own (the
+    # detached worker already inherited ours at spawn). Deleting it instead lost
+    # a caller's CLAUDE_AGENT_ACP: the next server quietly ran another adapter.
+    for (k, v) in h.prior_env
+        v === nothing ? delete!(ENV, k) : (ENV[k] = v)
     end
     # Bonito.Server.close blocks waiting for accept loops + WS handlers to
     # drain. Run it in a task so a slow/throwing drain doesn't hold cleanup

@@ -1,7 +1,7 @@
 # The agent adapters a server has its workers keep installed, end to end: the
 # server declares them (`dev_server(manage_harnesses = true)`), the worker
 # installs them itself and reports what it has on its card, an admin changes
-# them on the dashboard, and the worker never replaces them under a running chat.
+# them on the Settings page, and the worker never replaces them under a running chat.
 #
 # The worker installs from a local Node mirror and npm registry (TestKit's
 # `fake_node_dist`, reached through `BONITOAGENTS_NODE_DIST` as a real mirror
@@ -22,14 +22,15 @@
     try
         z = TK.dev_server(; manage_harnesses = true, agent = p -> [TK.text("echo: " * p), TK.end_turn()])
         TK.open_browser(z)
-        card_note = "(document.querySelector('.bt-worker-cell .bt-worker-update-note:not(.bt-hidden)') || {}).textContent || ''"
+        card_note = "(document.querySelector('.bt-worker-cell .bt-worker-adapters:not(.bt-hidden)') || {}).textContent || ''"
         shows(text) = "($(card_note)).includes($(TK.json(text)))"
 
         # Connected, the worker installs what the server declares, and says so.
         @test TK.wait_for(z, "the installed adapters on the card",
             shows("adapters: claude-agent-acp 1.0.0 · codex-acp 2.0.0 · node 24.9.0"); timeout = 120) == true
 
-        # An admin pins another version on the dashboard; the worker follows.
+        # An admin pins another version on the Settings page; the worker follows.
+        TK.to_settings(z)
         adapters_js(expr) = """(() => { const h = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Agent adapters');
             const sec = h && h.closest('.bt-section').parentElement; if (!sec) return false; return $(expr); })()"""
         function set_version!(label, version)
@@ -52,7 +53,7 @@
         pid = TK.new_chat(z; cwd = mktempdir())
         TK.send_message(z, "hello")
         @test TK.wait_for(z, "the reply", "document.body.textContent.includes('echo: hello')"; timeout = 60) == true
-        TK.to_dashboard(z)
+        TK.to_settings(z)
         set_version!(claude, "0.8.0")
         save!()
         sleep(10)

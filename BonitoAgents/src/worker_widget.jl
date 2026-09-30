@@ -232,17 +232,20 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
                                  "bt-worker-update-note")
     end
     # The managed agent adapters the worker reports (its harnesses.jl), and why
-    # the last install failed. Always a node, for the same reason as above.
+    # the last install failed. Always a node, for the same reason as above. Not
+    # the update note's amber: what is installed is information, not a warning;
+    # only a failure is red.
     adapters_note = map(session, state.workers) do workers
         w = get(workers, wid, nothing)
         installed = w === nothing ? Dict{String,String}() : w.harnesses
         err = w === nothing ? "" : w.harness_error
-        text = isempty(installed) ? "" :
+        list = isempty(installed) ? "" :
             "adapters: " * join(("$(last(split(k, '/'))) $(v)" for (k, v) in sort!(collect(installed))), " · ")
-        isempty(err) || (text = isempty(text) ? "adapter install failed: " * err :
-                                text * "; adapter install failed: " * err)
-        DOM.span(text; class = isempty(text) ? "bt-worker-update-note bt-hidden" : "bt-worker-update-note",
-                 title = err)
+        DOM.div(
+            DOM.span(list; class = isempty(list) ? "bt-hidden" : ""),
+            DOM.span(isempty(err) ? "" : "adapter install failed: " * err;
+                     class = isempty(err) ? "bt-hidden" : "bt-worker-adapters-error");
+            class = isempty(list) && isempty(err) ? "bt-worker-adapters bt-hidden" : "bt-worker-adapters")
     end
     # `force_worker_update!` flips the worker to `:updating`, which hides this
     # button and changes the note and badge. The replacement worker's hello

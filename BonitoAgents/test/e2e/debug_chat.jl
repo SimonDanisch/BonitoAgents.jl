@@ -73,9 +73,9 @@ function run_suite(server)
         # The expected landing path is the server's own checkout (see REPO_ROOT).
         @test REPO_ROOT !== nothing
 
-        @testset "the dashboard button opens the debug chat" begin
-            TK.to_dashboard(server)
-            @test TK.wait_for(server, "the dashboard offers it",
+        @testset "the Settings button opens the debug chat" begin
+            TK.to_settings(server)
+            @test TK.wait_for(server, "Settings offers it",
                 "!!document.querySelector('.bt-debug-btn')"; timeout = 30) == true
             # The worker picker lists the one connected worker: the chat runs
             # there, and that is where its checkout lives.
@@ -113,7 +113,7 @@ function run_suite(server)
         @testset "pressing it again reuses the SAME chat" begin
             # Otherwise a debugging session's history scatters across identical
             # threads and the whole point of a persistent chat is lost.
-            TK.to_dashboard(server)
+            TK.to_settings(server)
             TK.eval_js(server, "document.querySelector('.bt-debug-btn').click(); true")
             @test TK.wait_for(server, "still the debug chat",
                 "$(HEADER_TITLE) === 'Debug BonitoAgents'"; timeout = 90) == true

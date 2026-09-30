@@ -82,6 +82,13 @@
         TK.screenshot(server, joinpath(tempdir(), "copy_project_before.png"))
 
         @testset "Copy project button opens form" begin
+            # It is on the Settings page, reached from the dashboard's header.
+            @test TK.wait_for(server, "Settings button in viewport",
+                "$(el_center_js(".bt-open-settings")) !== null"; timeout = 10) == true
+            real_click!(ctx, ECT.JS(el_center_js(".bt-open-settings")))
+            @test TK.wait_for(server, "the Settings page",
+                "getComputedStyle(document.querySelector('.bt-view-settings')).display !== 'none'";
+                timeout = 10) == true
             # Scroll the button itself into the viewport (not just the h2 section
             # heading — the button may be below the fold on a small window).
             # IIFE: `const` in plain eval_js persists in the renderer global scope.

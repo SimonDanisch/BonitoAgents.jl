@@ -70,7 +70,7 @@ daemons and MCP processes end to end).
 
 ## Debugging BonitoAgents itself
 
-The dashboard has a **Debug BonitoAgents** section with a worker picker, and
+The Settings page has a **Debug BonitoAgents** row with a worker picker, and
 every chat header has a **Debug** button (which uses that chat's worker). Both
 open a chat whose working directory is a BonitoAgents source checkout **on that
 worker**, so the agent can read the source, edit it, and open a PR the ordinary

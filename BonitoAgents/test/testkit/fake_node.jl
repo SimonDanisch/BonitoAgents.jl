@@ -34,7 +34,8 @@ case "$1" in
         bin="$prefix/node_modules/.bin/${pkg##*/}"
         printf '#!/bin/sh\necho "%s %s"\n' "$pkg" "$ver" > "$bin"
         chmod +x "$bin"
-        echo "$spec" >> "$reg/installs.log" ;;
+        echo "$spec" >> "$reg/installs.log"
+        echo "$npm_config_cache" > "$reg/cache.log" ;;
     *) echo "fake npm: unsupported: $*" >&2; exit 1 ;;
 esac
 """

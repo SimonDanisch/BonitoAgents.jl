@@ -1,0 +1,5 @@
+{"_meta":{"claudeCode":{"toolName":"Edit"}},"toolCallId":"toolu_01Fy94cm8HcD1xFdemMG7vge","sessionUpdate":"tool_call","name":"Edit","status":"pending","title":"Edit","kind":"edit","content":[],"locations":[]}
+{"toolCallId":"toolu_01Fy94cm8HcD1xFdemMG7vge","sessionUpdate":"tool_call_update","title":"Edit a.txt","locations":[{"path":"/tmp/jl_n2ARId/a.txt"}]}
+{"toolCallId":"toolu_01Fy94cm8HcD1xFdemMG7vge","sessionUpdate":"tool_call_update","rawInput":{"replace_all":false,"file_path":"/tmp/jl_n2ARId/a.txt"},"content":[{"type":"diff","path":"/tmp/jl_n2ARId/a.txt","oldText":"foo","newText":"bar"}]}
+{"toolCallId":"toolu_01Fy94cm8HcD1xFdemMG7vge","sessionUpdate":"tool_call_update","content":[{"type":"diff","path":"/tmp/jl_n2ARId/a.txt","oldText":"hello foo","newText":"hello bar"}],"locations":[{"path":"/tmp/jl_n2ARId/a.txt","line":1}]}
+{"toolCallId":"toolu_01Fy94cm8HcD1xFdemMG7vge","sessionUpdate":"tool_call_update","status":"completed","rawOutput":"The file /tmp/jl_n2ARId/a.txt has been updated successfully."}

@@ -50,10 +50,10 @@
         TK.eval_js(z, "document.querySelector('.bt-install-details').open = true; true")
         TK.click_text(z, "Add worker")
         command = TK.wait_for(z, "the install command",
-            "(document.body.textContent.match(/curl -fsSL \\S+\\/install.sh \\| BONITOAGENTS_WORKER_CREDENTIAL='w-[0-9a-f]+:[0-9a-f]+'/) || [false])[0]";
+            "(document.body.textContent.match(/curl -fsSL \\S+\\/install.sh \\| sh -s w-[0-9a-f]+:[0-9a-f]+/) || [false])[0]";
             timeout = 30)
         @test startswith(command, "curl -fsSL $(z.h.url)/install.sh")
-        credential = match(r"'(w-[0-9a-f]+:[0-9a-f]+)'", command)[1]
+        credential = match(r"sh -s (w-[0-9a-f]+:[0-9a-f]+)", command)[1]
         TK.add_worker!(z; name = "through-the-tunnel", credential)
         @test TK.wait_for(z, "the second worker online",
             "document.querySelectorAll('.bt-worker-cell .bt-dot-online').length === 2"; timeout = 120) == true
@@ -61,6 +61,7 @@
         # Someone invited, with a passkey in their password manager: the invite
         # page makes their account, and one button signs them in and makes the
         # passkey. No password to copy, no code, no settings page.
+        TK.to_settings(z)
         TK.set_input(z, "input[type=text]", "lab"; placeholder = "groups (\"admins\" for an admin)")
         TK.click_text(z, "Create invite link")
         link = TK.wait_for(z, "the invite link",

@@ -1,14 +1,14 @@
 #!/usr/bin/env julia
 # BonitoAgents worker installer — cross-platform (Linux / macOS / Windows).
 #
-#   curl -fsSL {{SERVER_URL}}/install.jl | BONITOAGENTS_WORKER_CREDENTIAL='<from Add worker>' julia -
+#   curl -fsSL {{SERVER_URL}}/install.jl | julia - <credential from Add worker>
 #
 # Windows 10 1803+ ships curl.exe, so the same one-liner works everywhere.
 # The server templates {{SERVER_URL}} and its git revision into this file
 # before serving it from the /install.jl route. The file holds no secret: the
 # worker's credential ("Add worker" on the dashboard issues one per machine)
-# arrives in BONITOAGENTS_WORKER_CREDENTIAL, and a server without the login
-# proxy (localhost only) needs none.
+# is its first argument, and a server without the login proxy (localhost only)
+# needs none.
 #
 # What it does:
 #   1. Installs BonitoWorker + BonitoMCP from the public repo into the
@@ -32,7 +32,8 @@ const REPO   = "https://github.com/SimonDanisch/BonitoAgents.jl"
 const REV    = "{{REV}}"
 const SOURCE_ID = "{{SOURCE_ID}}"
 const SERVER = "{{SERVER_URL}}"
-const CREDENTIAL = get(ENV, "BONITOAGENTS_WORKER_CREDENTIAL", "")
+# The environment variable is how commands issued before carried it.
+const CREDENTIAL = isempty(ARGS) || isempty(ARGS[1]) ? get(ENV, "BONITOAGENTS_WORKER_CREDENTIAL", "") : ARGS[1]
 # Bonito (the UI / proxy library) is pinned to the SERVER's version so
 # remote-app frames / dial-back / id_prefix all match across the wire.
 # Templated from the server's `[sources]` Bonito = {url, rev} entry —

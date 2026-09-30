@@ -713,8 +713,6 @@ const AdminStyles = Bonito.Styles(
     CSS(".bt-admin-table th",
         "color" => "var(--bt-text-faint)", "font-weight" => "600", "font-size" => "11px",
         "text-transform" => "uppercase", "letter-spacing" => "0.04em"),
-    CSS(".bt-admin-actions",
-        "display" => "flex", "gap" => "6px", "flex-wrap" => "wrap"),
     CSS(".bt-admin-form",
         "display" => "flex", "gap" => "8px", "flex-wrap" => "wrap", "align-items" => "center",
         "margin-top" => "10px"),
@@ -732,6 +730,24 @@ const AdminStyles = Bonito.Styles(
         "width" => "180px", "image-rendering" => "pixelated", "display" => "block", "margin" => "6px 0"),
     CSS(".bt-admin-uri",
         "font-size" => "11px", "word-break" => "break-all", "user-select" => "all"),
+    CSS(".bt-accounts-table td", "vertical-align" => "middle"),
+    # The groups field takes its column's width, not its default 20 characters:
+    # on a phone those pushed Role and ⋯ out of the card.
+    CSS(".bt-accounts-table input[type=text]",
+        "width" => "100%", "min-width" => "4em", "box-sizing" => "border-box"),
+    # A checkbox in a `.bt-form`'s value column: box and text on one line.
+    CSS(".bt-form .bt-form-check",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "color" => "var(--bt-text)"),
+    CSS(".bt-form .bt-form-check input", "width" => "auto", "margin" => "0"),
+    CSS(".bt-form .bt-admin-status", "grid-column" => "1 / -1", "margin-top" => "0"),
+    CSS(".bt-account-name", "font-weight" => "600"),
+    CSS(".bt-account-detail", "font-size" => "12px", "overflow-wrap" => "anywhere"),
+    CSS("@media (max-width: 560px)",
+        CSS(".bt-admin-table th, .bt-admin-table td", "padding" => "6px 4px")),
+    CSS(".bt-account-off td:not(.bt-admin-menu-cell)", "opacity" => "0.55"),
+    CSS(".bt-account-disabled", "margin-left" => "6px"),
+    CSS(".bt-admin-menu-cell", "width" => "1%", "text-align" => "right"),
     CSS(".bt-admin-pre",
         "white-space" => "pre-wrap", "font-size" => "12px", "max-height" => "240px",
         "overflow" => "auto", "margin-top" => "8px"),
@@ -752,6 +768,11 @@ function admin_action!(status::Observable{String}, f::Function)
     safe_set!(status, String(msg))
     return nothing
 end
+
+# A status or a shown-once secret under a card's controls. Out of the layout
+# while it is empty: an empty line still took a flex gap and its own margin.
+admin_line(obs::Observable, class::AbstractString) =
+    DOM.div(obs; class = map(v -> v == "" ? "$(class) bt-hidden" : class, obs))
 
 text_input(obs::Observable{String}, placeholder::AbstractString) =
     DOM.input(type = "text", placeholder = placeholder, value = obs,
@@ -782,8 +803,8 @@ function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Se
     on(session, add) do _
         admin_action!(status, () -> begin
             cred = add_worker_credential!(state, state.user.name)
-            unix = "curl -fsSL $(base)/install.sh | BONITOAGENTS_WORKER_CREDENTIAL='$(cred)' sh"
-            win  = "\$env:BONITOAGENTS_WORKER_CREDENTIAL='$(cred)'; irm $(base)/install.ps1 | iex"
+            unix = "curl -fsSL $(base)/install.sh | sh -s $(cred)"
+            win  = "& ([scriptblock]::Create((irm $(base)/install.ps1))) $(cred)"
             issued[] = DOM.div(
                 DOM.div("Run this on the new machine. It carries the worker's credential, " *
                         "shown only now; revoking it below disconnects that worker.";
@@ -816,7 +837,7 @@ function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Se
         DOM.button("Add worker"; class = "bt-btn bt-btn-sm",
                    onclick = js"event => $(add).notify(true)"),
         issued,
-        DOM.div(status; class = "bt-admin-status"),
+        admin_line(status, "bt-admin-status"),
         creds;
         class = "bt-install-block")
     # `open` is a boolean attribute: present means open, whatever its value.
@@ -828,7 +849,7 @@ end
 """
     account_sections(session, state)
 
-The dashboard's account sections: everyone's own account behind the proxy, and
+The Settings page's account sections: everyone's own account behind the proxy, and
 for admins the accounts, the invites and the agent adapter versions workers keep
 installed.
 """
@@ -887,8 +908,8 @@ function own_account_section(auth::LoginAuth, session::Bonito.Session, state::Se
                                    $(reauth).notify(true);
                            }""");
                 class = "bt-admin-form bt-account-fallback"),
-            DOM.div(secret; class = "bt-admin-secret"),
-            DOM.div(status; class = "bt-admin-status");
+            admin_line(secret, "bt-admin-secret"),
+            admin_line(status, "bt-admin-status");
             class = "bt-card"))
 end
 
@@ -897,28 +918,14 @@ accounts_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.
 function accounts_section(auth::LoginAuth, session::Bonito.Session, state::ServerState)
     status = Observable("")
     secret = Observable{Any}("")
-    # [verb, account, argument] from a row's buttons and group field.
+    # [verb, account, ""] from a row's ⋯ menu, ["groups", account, groups] from its field.
     action = Observable{Any}(nothing)
-    new_name = Observable("")
-    new_display = Observable("")
-    new_email = Observable("")
-    new_groups = Observable("")
-    new_admin = Observable(false)
     shown(name, pw) = "Password for $(name), shown only now: $(pw)"
     on(session, action) do a
         a isa AbstractVector && length(a) == 3 || return
         verb, name, arg = String(a[1]), String(a[2]), String(a[3])
         admin_action!(status, () -> begin
-            if verb == "add"
-                groups = parse_groups(new_groups[])
-                new_admin[] && union!(groups, ["admins"])
-                login = add_account!(state, new_name[]; display_name = new_display[],
-                                     email = new_email[], groups)
-                secret[] = DOM.div(DOM.div(shown(new_name[], login.password)), authenticator_dom(login.authenticator))
-                added = new_name[]
-                new_name[] = ""; new_display[] = ""; new_email[] = ""; new_groups[] = ""
-                "account $(added) added"
-            elseif verb == "password"
+            if verb == "password"
                 secret[] = shown(name, reset_account_password!(state, name))
                 "new password for $(name)"
             elseif verb == "authenticator"
@@ -942,80 +949,133 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
             end
         end)
     end
-    act(verb, name) = js"event => $(action).notify([$(verb), $(name), ''])"
+
+    # ── Add account: a form over the page ────────────────────────────────────
+    adding = Observable(false)
+    add = Observable(false)
+    add_status = Observable("")
+    new_name = Observable("")
+    new_display = Observable("")
+    new_email = Observable("")
+    new_groups = Observable("")
+    new_admin = Observable(false)
+    on(session, adding) do open
+        open && (add_status[] = "")
+    end
+    on(session, add) do _
+        admin_action!(add_status, () -> begin
+            groups = parse_groups(new_groups[])
+            new_admin[] && union!(groups, ["admins"])
+            login = add_account!(state, new_name[]; display_name = new_display[],
+                                 email = new_email[], groups)
+            # Shown under the table, where the form was opened from.
+            secret[] = DOM.div(DOM.div(shown(new_name[], login.password)), authenticator_dom(login.authenticator))
+            added = new_name[]
+            new_name[] = ""; new_display[] = ""; new_email[] = ""; new_groups[] = ""; new_admin[] = false
+            adding[] = false
+            msg = "account $(added) added"
+            safe_set!(status, msg)
+            msg
+        end)
+    end
+    add_form = modal(session, adding, "Add account") do
+        field(label, obs, placeholder) = (DOM.label(label), text_input(obs, placeholder))
+        DOM.div(
+            field("Account", new_name, "login name, e.g. dave")...,
+            field("Full name", new_display, "Dave Doe")...,
+            field("Email", new_email, "optional")...,
+            field("Groups", new_groups, "comma-separated, optional")...,
+            DOM.label("Admin"),
+            DOM.label(DOM.input(type = "checkbox", checked = new_admin,
+                                onchange = js"event => $(new_admin).notify(event.target.checked)"),
+                      "may manage accounts, workers and settings"; class = "bt-form-check"),
+            DOM.div("The password and authenticator are shown once, after adding.";
+                    class = "bt-form-note"),
+            admin_line(add_status, "bt-admin-status"),
+            DOM.div(DOM.button("Cancel"; class = "bt-btn bt-btn-secondary",
+                               onclick = js"event => $(adding).notify(false)"),
+                    DOM.button("Add account"; class = "bt-btn bt-add-account-submit",
+                               onclick = js"event => $(add).notify(true)");
+                    class = "bt-form-actions");
+            class = "bt-form")
+    end
+
+    # ── The table: who, their groups, their role; everything else in ⋯ ──────
+    item(label, verb, name; danger = false, ask = "") = DOM.button(label;
+        class = danger ? "bt-menu-item bt-menu-danger" : "bt-menu-item",
+        onclick = js"""event => {
+            $(Bonito.JSString(MENU_CLOSE_JS))
+            const ask = $(ask);
+            if (!ask || confirm(ask)) $(action).notify([$(verb), $(name), '']);
+        }""")
     table = map(session, state.accounts) do accounts
         rows = map(sort!(collect(values(accounts)); by = a -> a.name)) do a
+            admin = is_admin(a)
             DOM.tr(
-                DOM.td(a.name), DOM.td(a.display_name), DOM.td(a.email),
+                DOM.td(DOM.div(a.name; class = "bt-account-name"),
+                       DOM.div(isempty(a.email) ? a.display_name : "$(a.display_name) · $(a.email)";
+                               class = "bt-admin-muted bt-account-detail")),
                 DOM.td(DOM.input(type = "text", value = join(filter(!=("admins"), a.groups), ", "),
                                  placeholder = "groups",
                                  title = "Comma-separated; Enter saves. Workers can be shared with a group.",
                                  onkeydown = js"""event => {
                                      if (event.key === 'Enter')
                                          $(action).notify(['groups', $(a.name),
-                                             event.target.value + ($(is_admin(a)) ? ', admins' : '')]);
+                                             event.target.value + ($(admin) ? ', admins' : '')]);
                                  }""")),
-                DOM.td(is_admin(a) ? "admin" : "member"),
-                DOM.td(a.disabled ? "disabled" : "active"),
-                DOM.td(DOM.div(
-                    DOM.button(is_admin(a) ? "Make member" : "Make admin";
-                               class = "bt-btn bt-btn-sm bt-btn-secondary",
-                               onclick = act(is_admin(a) ? "member" : "admin", a.name)),
-                    DOM.button(a.disabled ? "Enable" : "Disable";
-                               class = "bt-btn bt-btn-sm bt-btn-secondary",
-                               onclick = act(a.disabled ? "enable" : "disable", a.name)),
-                    DOM.button("New password"; class = "bt-btn bt-btn-sm bt-btn-secondary",
-                               onclick = act("password", a.name)),
-                    DOM.button("New authenticator"; class = "bt-btn bt-btn-sm bt-btn-secondary",
-                               onclick = act("authenticator", a.name)),
-                    DOM.button("Remove"; class = "bt-btn bt-btn-sm bt-btn-secondary",
-                               onclick = js"""event => {
-                                   if (confirm("Remove the account " + $(a.name) + "?"))
-                                       $(action).notify(['remove', $(a.name), '']);
-                               }""");
-                    class = "bt-admin-actions")))
+                DOM.td(admin ? "admin" : "member",
+                       a.disabled ? DOM.span("disabled"; class = "bt-pill bt-pill-warn bt-account-disabled") : nothing),
+                DOM.td(action_menu(
+                    item(admin ? "Make member" : "Make admin", admin ? "member" : "admin", a.name),
+                    item(a.disabled ? "Enable" : "Disable", a.disabled ? "enable" : "disable", a.name),
+                    DOM.div(; class = "bt-menu-sep"),
+                    item("New password", "password", a.name),
+                    item("New authenticator", "authenticator", a.name;
+                         ask = "Replace the authenticator of $(a.name)? The codes of the old one stop working."),
+                    DOM.div(; class = "bt-menu-sep"),
+                    item("Remove", "remove", a.name; danger = true, ask = "Remove the account $(a.name)?");
+                    title = "Actions for $(a.name)"); class = "bt-admin-menu-cell");
+                class = a.disabled ? "bt-account-off" : "", dataAccount = a.name)
         end
-        DOM.table(DOM.tr(DOM.th("Account"), DOM.th("Name"), DOM.th("Email"), DOM.th("Groups"),
-                         DOM.th("Role"), DOM.th("Status"), DOM.th("")), rows...; class = "bt-admin-table")
+        DOM.table(DOM.tr(DOM.th("Account"), DOM.th("Groups"), DOM.th("Role"), DOM.th("")),
+                  rows...; class = "bt-admin-table bt-accounts-table")
     end
-    form = DOM.div(
-        text_input(new_name, "account name"), text_input(new_display, "full name"),
-        text_input(new_email, "email"), text_input(new_groups, "groups"),
-        DOM.label(DOM.input(type = "checkbox", checked = new_admin,
-                            onchange = js"event => $(new_admin).notify(event.target.checked)"),
-                  " admin"),
-        DOM.button("Add account"; class = "bt-btn bt-btn-sm",
-                   onclick = js"event => $(action).notify(['add', $(new_name).value, ''])");
-        class = "bt-admin-form")
     return DOM.div(
         DOM.div(DOM.h2("Accounts"); class = "bt-section"),
-        DOM.div(table, form, DOM.div(secret; class = "bt-admin-secret"),
-                DOM.div(status; class = "bt-admin-status"),
-                login_codes_block(auth.config, session);
-                class = "bt-card"))
+        DOM.div(table,
+                DOM.div(DOM.button("Add account…"; class = "bt-btn bt-btn-sm bt-add-account",
+                                   onclick = js"event => $(adding).notify(true)"),
+                        login_codes_button(auth.config, session);
+                        class = "bt-admin-form"),
+                admin_line(secret, "bt-admin-secret"),
+                admin_line(status, "bt-admin-status");
+                class = "bt-card"),
+        add_form)
 end
 
 # Without mail, Authelia writes what it would have sent to a file on the server:
 # notices about new devices, and the rare one-time code that confirms who someone
 # is (the server registers everyone's authenticator, so adding a device normally
 # needs none). Admins read it here.
-login_codes_block(cfg::ProxyConfig, session::Bonito.Session) =
-    cfg.smtp ? DOM.div() : login_codes_block(notifications_file(cfg), session)
+login_codes_button(cfg::ProxyConfig, session::Bonito.Session) =
+    cfg.smtp ? nothing : login_codes_button(notifications_file(cfg), session)
 
-function login_codes_block(file::AbstractString, session::Bonito.Session)
-    shown = Observable("")
-    refresh = Observable(false)
-    on(session, refresh) do _
-        safe_set!(shown, isfile(file) ? read(file, String) : "Nothing yet.")
-    end
-    return DOM.details(
-        DOM.summary("Authelia's messages (this server sends no mail)"),
-        DOM.div("What Authelia would have mailed: notices about new devices, and now and then " *
-                "a one-time code someone needs to confirm who they are. Pass that on to the person it names.";
-                class = "bt-admin-muted"),
-        DOM.button("Show the latest"; class = "bt-btn bt-btn-sm bt-btn-secondary",
-                   onclick = js"event => $(refresh).notify(true)"),
-        DOM.pre(shown; class = "bt-admin-pre"))
+function login_codes_button(file::AbstractString, session::Bonito.Session)
+    is_open = Observable(false)
+    return DOM.div(
+        DOM.button("Authelia's messages"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                   title = "What Authelia would have mailed; this server sends no mail",
+                   onclick = js"event => $(is_open).notify(true)"),
+        # Read on every open: it is the latest that matters.
+        modal(session, is_open, "Authelia's messages") do
+            text = isfile(file) ? read(file, String) : ""
+            DOM.div(
+                DOM.div("What Authelia would have mailed (this server sends no mail): notices " *
+                        "about new devices, and now and then a one-time code someone needs to " *
+                        "confirm who they are. Pass that on to the person it names.";
+                        class = "bt-admin-muted"),
+                DOM.pre(isempty(strip(text)) ? "Nothing yet." : text; class = "bt-admin-pre"))
+        end)
 end
 
 invites_section(::OpenAuth, session::Bonito.Session, state::ServerState) = DOM.div()
@@ -1065,8 +1125,8 @@ function invites_section(::LoginAuth, session::Bonito.Session, state::ServerStat
                     DOM.button("Create invite link"; class = "bt-btn bt-btn-sm",
                                onclick = js"event => $(create).notify(true)");
                     class = "bt-admin-form"),
-            DOM.div(link; class = "bt-admin-secret"),
-            DOM.div(status; class = "bt-admin-status"),
+            admin_line(link, "bt-admin-secret"),
+            admin_line(status, "bt-admin-status"),
             table;
             class = "bt-card"))
 end
@@ -1109,7 +1169,7 @@ function adapters_section(session::Bonito.Session, state::ServerState)
             row("Node", node),
             (row(k, packages[k]) for k in sort!(collect(keys(packages))))...,
             DOM.button("Save"; class = "bt-btn bt-btn-sm", onclick = js"event => $(save).notify(true)"),
-            DOM.div(status; class = "bt-admin-status");
+            admin_line(status, "bt-admin-status");
             class = "bt-card"))
 end
 

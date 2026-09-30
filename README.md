@@ -192,7 +192,7 @@ answers before anything can fail (a second run just offers them again;
 `--reconfigure` asks anew), and prints a setup link for the admin at the end.
 People sign in with a passkey (Proton Pass, their phone or computer, a security
 key): a setup link or an invite makes one in a single step, and "Add a passkey"
-on the dashboard adds more. A password and an authenticator code are there for
+on the Settings page adds more. A password and an authenticator code are there for
 whoever cannot use a passkey. Authelia checks all of it, next to the server; no
 mail is involved. The server itself only listens on localhost. Two ways in:
 
@@ -214,7 +214,7 @@ Then, for each machine that should run agents, click **Add worker** on the
 dashboard and run the command it shows on that machine:
 
 ```bash
-curl -fsSL https://team.example.com/install.sh | BONITOAGENTS_WORKER_CREDENTIAL='w-...' sh
+curl -fsSL https://team.example.com/install.sh | sh -s w-...
 ```
 
 Every worker gets its own credential, and revoking it disconnects that machine.

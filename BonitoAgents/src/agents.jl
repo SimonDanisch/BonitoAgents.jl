@@ -27,6 +27,14 @@ import AgentProviders: AgentProvider, BinAgent,
 # resume_session_id) capture session/load history.
 replay(::AgentProvider) = ACP.Message[]
 
+# The client `_meta` sent at `initialize`. The AIR extension goes only to agents
+# that use it: codex-acp for its session-failure notices, and the mocks standing
+# in for it. claude-agent-acp takes any client carrying `_meta.jetbrains.air` for
+# JetBrains AIR and then leaves out what we read: the `outputFile` of an async
+# subagent (its card never finished), tool names, parent tool ids.
+client_meta(::BinAgent) = Dict{String,Any}()
+client_meta(::Union{CodexAgent,MockAgent,AgentProviders.MockAgent2}) = ACP.session_notice_capability()
+
 # ── WorkerAgent — the worker path as a first-class agent ──────────────────────
 # Instead of spawning a local subprocess, a WorkerAgent opens a channel to a
 # registered worker, and the worker runs the chosen provider's binary on it: one
@@ -166,7 +174,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict(
             "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
-            "_meta" => ACP.session_notice_capability(),
+            "_meta" => client_meta(a.provider),
             "elicitation" => a.provider.elicitation),
         "clientInfo"         => Dict("name"    => "BonitoAgents.WorkerAgent",
                                      "version" => "0.1.0")))

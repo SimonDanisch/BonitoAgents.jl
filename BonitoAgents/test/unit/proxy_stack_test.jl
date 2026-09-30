@@ -146,7 +146,7 @@ end
         @test occursin("https://team.example.com", script) && !occursin(auth.key, script)
         installer = String(get_("/install.jl").body)
         @test occursin("const SERVER = \"https://team.example.com\"", installer)
-        @test occursin("const CREDENTIAL = get(ENV, \"BONITOAGENTS_WORKER_CREDENTIAL\", \"\")", installer)
+        @test occursin("const CREDENTIAL = isempty(ARGS)", installer)
         @test !occursin(auth.key, installer)
 
         # A worker that did not come through Caddy with a credential is refused

@@ -15,6 +15,7 @@
 #   node-v<version>-<os>-<arch>/   a Node release, unpacked as published
 #   node-version                   which of those is current
 #   npm/node_modules/…             the adapters (`npm install --prefix npm`)
+#   npm-cache/                     npm's cache (never the user's `~/.npm`)
 
 # Where Node releases come from: nodejs.org, or a mirror of its `dist` tree
 # (`BONITOAGENTS_NODE_DIST`, e.g. inside a network that cannot reach it).
@@ -128,16 +129,36 @@ function install_node!(root::AbstractString, version::AbstractString;
 end
 
 # `npm` from the private Node, with that Node first on PATH (npm is a node
-# script) and none of the worker's credentials in its environment.
-function npm_cmd(nodedir::AbstractString, args::Cmd)
+# script) and none of the worker's credentials in its environment. Its cache is
+# private too: the user's `~/.npm` is often partly root's, after a `sudo npm
+# install -g`, and then every install fails with EACCES.
+function npm_cmd(root::AbstractString, nodedir::AbstractString, args::Cmd)
     bindir = node_bin_dir(nodedir)
     exe = joinpath(bindir, Sys.iswindows() ? "npm.cmd" : "npm")
     env = inherited_env()
     env["PATH"] = bindir * (Sys.iswindows() ? ';' : ':') * get(env, "PATH", "")
+    env["npm_config_cache"] = joinpath(root, "npm-cache")
     env["npm_config_update_notifier"] = "false"
     env["npm_config_fund"] = "false"
     env["npm_config_audit"] = "false"
     return setenv(`$exe $args`, env)
+end
+
+# Runs npm and returns what it printed. A failure throws npm's own `npm error`
+# lines, prefixed with `what`: a ProcessFailedException would show the command
+# with the worker's whole environment, and not one word of npm's reason.
+function npm(root::AbstractString, nodedir::AbstractString, args::Cmd, what::AbstractString;
+             log::IO = devnull)
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(npm_cmd(root, nodedir, args)); stdout = out, stderr = err))
+    output, errors = String(take!(out)), String(take!(err))
+    write(log, output, errors)
+    success(p) && return output
+    # Without the `code`/`syscall`/`path`/`errno` lines: the message says it again.
+    reason = [replace(l, r"^npm (error|ERR!) ?" => "") for l in split(errors, '\n')
+              if occursin(r"^npm (error|ERR!)", l) &&
+                 !occursin(r"^npm (error|ERR!) (code|syscall|path|errno) ", l)]
+    error("$(what) failed: " * (isempty(reason) ? strip(errors) : join(reason, "\n")))
 end
 
 function package_dir(root::AbstractString, pkg::AbstractString)
@@ -176,11 +197,10 @@ function sync_harnesses!(spec::HarnessSpec; root::AbstractString = harness_root(
     prefix = mkpath(joinpath(root, "npm"))
     for (pkg, want) in spec.packages
         target = want == "latest" ?
-            strip(read(npm_cmd(nodedir, `view $pkg version`), String)) : want
+            strip(npm(root, nodedir, `view $pkg version`, "looking up $(pkg)"; log)) : want
         installed_version(root, pkg) == target && continue
         @info "BonitoWorker: installing agent adapter" package = pkg version = target
-        run(pipeline(npm_cmd(nodedir, `install --prefix $prefix $pkg@$target`);
-                     stdout = log, stderr = log))
+        npm(root, nodedir, `install --prefix $prefix $pkg@$target`, "installing $(pkg)@$(target)"; log)
     end
     return installed_harnesses(root, keys(spec.packages))
 end

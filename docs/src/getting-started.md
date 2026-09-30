@@ -95,10 +95,12 @@ a public domain, `--tls internal` uses Caddy's own certificate authority
 instead; every browser and worker machine then has to trust its root
 certificate, whose path the installer prints.
 
-Admins manage people from the dashboard: an invite link lets one person create
-their own account and its passkey in one step (behind a tunnel; behind Caddy the
-page shows a password and authenticator instead), and the Accounts section adds
-accounts directly, puts them in groups and disables them. Members see only their
+Admins manage people on the Settings page (the gear in the sidebar, or the
+Settings button on the dashboard): an invite link lets one person create their
+own account and its passkey in one step (behind a tunnel; behind Caddy the page
+shows a password and authenticator instead), and the Accounts section adds
+accounts directly, puts them in groups and disables them from each row's ⋯
+menu. Members see only their
 own chats and workers, plus the workers an owner shared with one of their
 groups. Everyone lists, adds and removes passkeys on their account card, and gets
 a new password or authenticator there; admins can do the latter from the
@@ -108,7 +110,7 @@ Then, for each machine that should run agents, click **Add worker** on the
 dashboard and run the command it shows on that machine:
 
 ```bash
-curl -fsSL https://team.example.com/install.sh | BONITOAGENTS_WORKER_CREDENTIAL='w-...' sh
+curl -fsSL https://team.example.com/install.sh | sh -s w-...
 ```
 
 Each worker has its own credential; revoking it on the dashboard disconnects
@@ -130,7 +132,7 @@ From the dashboard home:
 - **From GitHub**: clone a repository straight onto a worker.
 
 Discover, folder picking and cloning live on each worker's own card, so the
-machine is chosen before the folder is. **Copy project** (Settings card) is the
+machine is chosen before the folder is. **Copy project** (on the Settings page) is the
 one that crosses machines: it snapshots a project's files onto another worker as
 a new project. To carry an existing chat elsewhere instead, with its files *and*
 the agent's memory, use that chat's ⋯ menu → *Continue on*.

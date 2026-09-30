@@ -91,6 +91,38 @@ function run_suite(server)
         @test gone
         @test BA.tool_finished_at(task) !== nothing
     end
+    @testset "a transcript longer than one read still finishes" begin
+        # A subagent that reads a lot of code writes megabytes; `end_turn` is on
+        # its LAST line. Reading the file from the top with a 4 MB cap never
+        # reached it, so such an agent read "running" forever.
+        model = server.h.state.chat_models[TK.current_chat_id(server)]
+        outpath = tempname() * ".output"
+        line = """{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"$(repeat("x", 1000))"}]}}"""
+        open(outpath, "w") do io
+            for _ in 1:5000; println(io, line); end        # ~5 MB, still working
+        end
+        task = BA.TaskToolMsg(
+            BA.Message("sub-poll-big", "other", "", "Read everything", "in_progress",
+                       "", time(), nothing, model);
+            description = "read everything", is_background = true)
+        task.bg_output_path = outpath
+        BA.push!(BA.chat_taskbar(model), task)
+        lock(BA.shared(model).lock) do; push!(BA.shared(model).msgs_store, task); end
+        sleep(2.5)
+        @test task.phase isa BA.Executing
+        open(outpath, "a") do io
+            println(io, """{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}""")
+        end
+        done = false
+        t0 = time()
+        while time() - t0 < 30
+            (task.phase isa BA.AwaitingReport || task.phase isa BA.Reporting) && (done = true; break)
+            sleep(0.5)
+        end
+        @test done
+        BA.retire_reporting!(model)
+        rm(outpath; force = true)
+    end
     return server
 end
 
