@@ -200,6 +200,15 @@ class BonitoChat {
         });
         this.markUserInput = markUserInput;
         container.addEventListener('click', (e)=>{
+            const chip = e.target.closest('.bt-tool-jump');
+            if (!chip || !container.contains(chip)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.jumpToMessage(parseInt(chip.dataset.jumpIndex ?? '-1', 10), chip.dataset.jumpId);
+        }, {
+            capture: true
+        });
+        container.addEventListener('click', (e)=>{
             const link = e.target.closest('.bt-path-link');
             if (!link || !container.contains(link)) return;
             const path = link.dataset.path || link.textContent.trim();
@@ -1452,6 +1461,15 @@ class BonitoChat {
             node.classList.toggle('bt-tool-live', live);
             if (live) this.ensureElapsedTicker();
         }
+        if (node.collapsable?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading')) this.comm.notify({
+            type: 'tool.render',
+            id: msg.id
+        });
+        if (msg.reopen) {
+            delete node.dataset.toolFinished;
+            node.classList.add('bt-tool-live');
+            this.ensureElapsedTicker();
+        }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
             node.classList.remove('bt-tool-live');
@@ -1546,6 +1564,11 @@ class BonitoChat {
             wb.textContent = `⇢ ${String(msg.worker)}`;
             const title = headerEl.querySelector('.bt-tool-title');
             headerEl.insertBefore(wb, title ? title.nextSibling : null);
+        }
+        if (Array.isArray(msg.jumps) && headerEl) {
+            headerEl.querySelectorAll('.bt-tool-jump').forEach((b)=>b.remove());
+            const anchor = headerEl.querySelector('.bt-tool-summary');
+            anchor?.insertAdjacentHTML('beforebegin', jumpChipsHTML(msg.jumps));
         }
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
@@ -1901,6 +1924,7 @@ class BonitoChat {
         const server = msg.server ? `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
         const timeoutBadge = msg.timeout_s ? `<span class="bt-tool-timeout" title="Soft eval timeout — the call checkpoints with partial output at this cadence">⏱ ${escapeHTML(String(msg.timeout_s))}</span>` : '';
         const workerBadge = msg.worker ? `<span class="bt-tool-worker" title="This runs on another worker">⇢ ${escapeHTML(String(msg.worker))}</span>` : '';
+        const jumpChips = jumpChipsHTML(msg.jumps);
         const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini" type="button"
                      title="Stop"></button>` : '';
         const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
@@ -1914,6 +1938,7 @@ class BonitoChat {
                 ${server}
                 <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
                 ${workerBadge}
+                ${jumpChips}
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 ${timeoutBadge}
                 <span class="bt-tool-timer"></span>
@@ -1957,17 +1982,27 @@ class BonitoChat {
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;
-                const idx = parseInt(slot.dataset.msgIndex ?? '-1', 10);
-                if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
-                const jump = ()=>{
-                    this.container.scrollTop = Math.max(0, this.cumHeight(0, idx) - 60);
-                };
-                this.followMode = false;
-                jump();
-                requestAnimationFrame(()=>requestAnimationFrame(jump));
+                this.jumpToMessage(parseInt(slot.dataset.msgIndex ?? '-1', 10), slot.dataset.taskId);
             };
             this.taskbarEl.addEventListener('click', this.onTaskbarClick);
         }
+    }
+    jumpToMessage(idx, id) {
+        if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
+        const jump = ()=>{
+            this.container.scrollTop = Math.max(0, this.cumHeight(0, idx) - 60);
+        };
+        this.followMode = false;
+        jump();
+        requestAnimationFrame(()=>requestAnimationFrame(()=>{
+                jump();
+                const node = id ? this.nodeById.get(id) : null;
+                if (!node) return;
+                node.classList.remove('bt-jump-flash');
+                void node.offsetWidth;
+                node.classList.add('bt-jump-flash');
+                setTimeout(()=>node.classList.remove('bt-jump-flash'), 1800);
+            }));
     }
     ensureElapsedTicker() {
         if (this.elapsedTimer) return;
@@ -3067,6 +3102,10 @@ function openLightbox(media) {
     });
     document.addEventListener('keydown', onkey);
     document.body.appendChild(overlay);
+}
+function jumpChipsHTML(jumps) {
+    if (!Array.isArray(jumps)) return '';
+    return jumps.map((j)=>`<button type="button" class="bt-tool-jump" data-jump-index="${Number(j.index)}"` + ` data-jump-id="${escapeAttr(String(j.id))}" title="${escapeAttr(String(j.title || ''))}">` + `↑ ${escapeHTML(String(j.label))}</button>`).join('');
 }
 function escapeHTML(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

@@ -533,7 +533,11 @@ mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
     end
 
 function handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
-    if get(d, "type", "") == "eval_stream_chunk"
+    if get(d, "type", "") == "run_update"
+        # A run started, ended or was collected (eval_runs.jl). Unsolicited,
+        # like the stdout chunks; from an eval host it carries its worker.
+        run_update!(state, project_id, host_worker, d)
+    elseif get(d, "type", "") == "eval_stream_chunk"
         # Unsolicited live-stdout push (no request_id): route it to the
         # matching running eval's tail, prefixed with the host's worker id
         # so it cannot reach a local eval on the same env_path.
@@ -649,11 +653,28 @@ function interrupt_project_eval!(state::ServerState, project_id::AbstractString;
     return n
 end
 
-function interrupt_over_channel!(state::ServerState, ws, env_path, timeout::Real, what::AbstractString)
+"""
+    interrupt_run!(state, project_id, run; timeout = 15.0) -> Bool
+
+Stop one run, through the process that runs it: the chat's own MCP, or its eval
+host on the run's worker. False when that process says it had already finished.
+"""
+function interrupt_run!(state::ServerState, project_id::AbstractString, run::ChatRun;
+                        timeout::Real = 15.0)
+    ws = isempty(run.worker_id) ? mcp_ctrl_for(state, project_id) :
+                                  eval_host_ws(state, project_id, run.worker_id)
+    ws === nothing && error("the process running $(run.id) is not connected")
+    return interrupt_over_channel!(state, ws, nothing, timeout, "interrupt $(run.id)";
+                                   run = run.id) > 0
+end
+
+function interrupt_over_channel!(state::ServerState, ws, env_path, timeout::Real, what::AbstractString;
+                                 run::Union{String,Nothing} = nothing)
     rid, ch = register_rpc!(state)
     resp = try
         payload = Dict{String,Any}("op" => "interrupt_eval", "request_id" => rid)
         env_path === nothing || (payload["env_path"] = String(env_path))
+        run === nothing || (payload["run"] = run)
         HTTP.WebSockets.send(ws, JSON.json(payload))
         take_pending!(state, ch, rid, timeout, what)
     finally

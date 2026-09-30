@@ -53,7 +53,7 @@ const BT = BonitoAgents
         @test occursin("bt_julia_eval", BT.BUILTIN_AGENT_RULES)
         # Every background-capable tool is NAMED, so the agent is told what to
         # reach for instead of inventing a shell incantation...
-        for tool in ("run_in_background", "bt_julia_continue", "Task")
+        for tool in ("run_in_background", "background: true", "bt_julia_wait", "Task")
             @test occursin(tool, BT.BUILTIN_AGENT_RULES)
         end
         # ... and the shell forms that produce an UNTRACKED orphan are named

@@ -60,6 +60,7 @@ include("review.jl")           # change-review tab: git diff + per-line ask / ba
 include("lens.jl")             # lens search: parse + fuzzy filter + saved lenses
 include("mcp_relay.jl")
 include("remote_app.jl")       # eval-result bridge — live worker Bonito results in the browser
+include("eval_runs.jl")        # Julia runs (`r4`): cards that outlive their call, task bar, finish notes
 include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + app detach controller
 include("persistence.jl")
 include("chat_icons.jl")        # durable, user-controlled chat image identities

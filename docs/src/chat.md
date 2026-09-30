@@ -20,7 +20,10 @@ growing above the viewport.
   pane while they run, then settle into Code and Output sections that each
   cycle through three states on click: a scrollable ~4-line window, the full
   content, closed. The return value renders below as a live result, an
-  interactive app included (see [Julia Tools & Live Apps](@ref)).
+  interactive app included (see [Julia Tools & Live Apps](@ref)). An eval is a
+  *run* (`r4`) and its card follows the run: a background run stays live after
+  its call returned, gets a task-bar row until it ends, and shows ✓ or ✗ when
+  it does.
 - **Questions** (ACP elicitations) render as forms you answer inline.
 - **Plans and todo lists** the agent maintains are pinned to the taskbar while
   the turn runs.

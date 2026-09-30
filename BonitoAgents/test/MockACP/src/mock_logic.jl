@@ -634,6 +634,11 @@ function run_dispatcher_prompt(prompt_id)
                 (raw_input["env_path"] = String(ev["env_path"]))
             haskey(ev, "timeout") && (raw_input["timeout"] = ev["timeout"])
             haskey(ev, "worker")  && (raw_input["worker"]  = String(ev["worker"]))
+            # Every other argument of the call (background, run, runs, …), as
+            # claude streams the full argument dict into rawInput.
+            for (k, v) in get(ev, "args", Dict{String,Any}())
+                haskey(raw_input, k) || v === nothing || (raw_input[String(k)] = v)
+            end
             toolname = String(get(ev, "tool", "mcp__btworker__bt_julia_eval"))
             meta = Dict("claudeCode" => Dict("toolName" => toolname))
             upd("tool_call", Dict{String,Any}(

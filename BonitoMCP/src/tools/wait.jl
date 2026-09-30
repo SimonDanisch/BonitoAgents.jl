@@ -144,3 +144,199 @@ register!(
     ),
     wait_handler,
 )
+
+# ── bt_julia_wait — block on runs ────────────────────────────────────────────
+# The run-aware sibling of `bt_wait`: one blocking call for one or several
+# Julia runs (runs.jl), here and on other workers, returning when any or all of
+# them have finished. What it replaces is the agent calling `bt_julia_continue`
+# on each worker in turn, one blocking call at a time, while the others' results
+# sat uncollected.
+#
+# Local runs are checked in memory; runs on other workers are asked about
+# through the server (the host's `runs` op), less often. A worker that cannot be
+# reached ends that run's wait as `lost` rather than holding the call to its
+# bound: the answer "I can't see it" is one the agent can act on.
+
+const RUN_WAIT_LOCAL_POLL_S  = 0.2
+const RUN_WAIT_REMOTE_POLL_S = 2.0
+
+const JULIA_WAIT_DESCRIPTION = """
+Block until Julia runs finish — the way to wait for `bt_julia_eval(background = true)`
+runs, and for foreground evals that passed their checkpoint. One call covers runs
+on this worker and on other workers.
+
+  * `runs` — the run ids (`["r4", "r5"]`) from bt_julia_eval's results. Omit to
+    wait on every run of this chat that is still running or whose result you
+    have not collected yet.
+  * `until` — "all" (default): return once every listed run has finished;
+    "any": return as soon as one has.
+  * `seconds` — REQUIRED bound, capped at 3600. Hitting it is a normal result
+    (the still-running runs are listed); call again to keep waiting.
+  * `max_response_bytes` — per finished run, how much of its output to return
+    (the tail; the whole log's path is named when cut). Default 4000.
+
+Returns one status line per run, then the result (output + value) of every run
+that finished, which counts as collected.
+"""
+
+# Status of every run in `ids` as Dicts (`run_status`'s shape), local ones from
+# memory and remote ones from their hosts.
+function poll_runs(ids::Vector{String})
+    reg = SERVER.runs
+    out = Dict{String,Dict{String,Any}}()
+    byworker = Dict{String,Vector{String}}()
+    for id in ids
+        r = @lock reg.lock get(reg.runs, id, nothing)
+        if r !== nothing
+            out[id] = run_status(r)
+        else
+            rr = remote_run(id)
+            push!(get!(byworker, rr.worker, String[]), id)
+        end
+    end
+    for (worker, wids) in byworker
+        reply = try
+            call_server("remote_eval"; timeout = 30.0, worker = worker, op = "runs",
+                        args = Dict{String,Any}("runs" => wids))
+        catch e
+            e isa InterruptException && rethrow()
+            e
+        end
+        for id in wids
+            st = nothing
+            if reply isa AbstractDict
+                for d in get(reply, "runs", Any[])
+                    get(d, "run", "") == id && (st = Dict{String,Any}(String(k) => v for (k, v) in d))
+                end
+            end
+            if st === nothing
+                why = reply isa Exception ? sprint(showerror, reply) : "its eval host no longer knows it"
+                st = Dict{String,Any}("run" => id, "status" => "lost", "collected" => false,
+                                      "line" => "$(id)  lost — $(why)")
+            end
+            st["worker"] = worker
+            st["line"] = replace(String(st["line"]), r"^\S+" => "$(id)  on $(worker)")
+            out[id] = st
+        end
+    end
+    return out
+end
+
+finished_status(st::AbstractDict) = get(st, "status", "running") != "running"
+
+# The runs a wait without `runs` means: everything still open in this chat.
+function open_run_ids()
+    reg = SERVER.runs
+    locals = @lock reg.lock [r.id for r in values(reg.runs)
+                             if is_running(r) || !(@lock r.lock r.collected)]
+    remotes = @lock reg.lock collect(keys(reg.remote))
+    isempty(remotes) && return locals
+    st = poll_runs(remotes)
+    append!(locals, [id for id in remotes
+                     if get(st[id], "status", "") == "running" || get(st[id], "collected", true) === false])
+    return locals
+end
+
+run_number(id::AbstractString) = something(tryparse(Int, id[2:end]), typemax(Int))
+
+# A finished run's result for the wait's response: its content blocks, with the
+# output text headed by the run id. Collects it (here, or through its host).
+function collect_for_wait(id::String, st::AbstractDict, max_bytes::Int)
+    get(st, "status", "") == "lost" && return Any[]
+    reg = SERVER.runs
+    r = @lock reg.lock get(reg.runs, id, nothing)
+    res = if r !== nothing
+        collected_response(r; max_bytes, descriptor = false)
+    else
+        remote_run_call("continue", id, remote_run(id),
+                        Dict{String,Any}("run" => id, "timeout" => 5, "descriptor" => false,
+                                         "max_response_bytes" => max_bytes); wait = 60.0)
+    end
+    blocks = Any[]
+    head = "── $(id) ($(get(st, "status", "?"))) ──"
+    texts = [b for b in get(res, "content", Any[]) if get(b, "type", "") == "text"]
+    others = [b for b in get(res, "content", Any[]) if get(b, "type", "") != "text"]
+    body = join((String(get(b, "text", "")) for b in texts), "\n")
+    push!(blocks, Dict{String,Any}("type" => "text",
+                                   "text" => isempty(body) ? "$(head)\n(no output)" : "$(head)\n$(body)"))
+    append!(blocks, others)
+    return blocks
+end
+
+function julia_wait_handler(args::AbstractDict)
+    secs = get(args, "seconds", nothing)
+    secs === nothing && return wait_result(
+        "error: `seconds` is required — an unbounded wait is a latch, not a wait."; is_error = true)
+    secs = Float64(secs)
+    (isfinite(secs) && secs > 0) ||
+        return wait_result("error: `seconds` must be a positive number, got $(secs)"; is_error = true)
+    secs > WAIT_MAX_SECONDS && return wait_result(
+        "error: `seconds` is capped at $(Int(WAIT_MAX_SECONDS)) (got $(secs)). Call again to keep waiting.";
+        is_error = true)
+    until = String(get(args, "until", "all"))
+    until in ("all", "any") ||
+        return wait_result("error: `until` is \"all\" or \"any\" (got $(repr(until)))"; is_error = true)
+    max_bytes = Int(get(args, "max_response_bytes", 4_000))
+
+    t0 = time()
+    ids = let raw = get(args, "runs", nothing)
+        raw isa AbstractVector && !isempty(raw) ? unique(String.(strip.(String.(raw)))) : open_run_ids()
+    end
+    isempty(ids) && return wait_result("no runs to wait for: nothing of this chat is running or uncollected.")
+    reg = SERVER.runs
+    unknown = [id for id in ids if (@lock reg.lock !haskey(reg.runs, id)) && remote_run(id) === nothing]
+    isempty(unknown) || return wait_result(
+        "error: no run named $(join(unknown, ", ")) in this chat. " *
+        "bt_julia_list_sessions lists the runs."; is_error = true)
+    sort!(ids; by = run_number)
+
+    remote = any(id -> remote_run(id) !== nothing, ids)
+    deadline = t0 + secs
+    st = poll_runs(ids)
+    done(st) = until == "any" ? any(finished_status, values(st)) : all(finished_status, values(st))
+    while !done(st) && time() < deadline
+        sleep(min(remote ? RUN_WAIT_REMOTE_POLL_S : RUN_WAIT_LOCAL_POLL_S, max(deadline - time(), 0.0)))
+        st = poll_runs(ids)
+    end
+
+    waited = round(time() - t0; digits = 1)
+    results = Any[]
+    for id in ids
+        finished_status(st[id]) || continue
+        append!(results, collect_for_wait(id, st[id], max_bytes))
+    end
+    # The status lines AFTER collecting, so they don't call the runs this very
+    # response hands over "not collected".
+    any(id -> finished_status(st[id]), ids) && (st = poll_runs(ids))
+    nfin = count(id -> finished_status(st[id]), ids)
+    running = [id for id in ids if !finished_status(st[id])]
+    head = "waited $(waited)s (until $(until)): $(nfin) of $(length(ids)) " *
+           "run$(length(ids) == 1 ? "" : "s") finished" *
+           (isempty(running) ? "." : "; still running: $(join(running, ", ")) — call bt_julia_wait again to keep waiting.")
+    lines = [head; ["  " * String(st[id]["line"]) for id in ids]]
+    content = Any[Dict{String,Any}("type" => "text", "text" => join(lines, "\n")); results]
+    return Dict{String,Any}(
+        "content" => content,
+        "isError" => false,
+        "_meta"   => Dict{String,Any}("runs" => Dict(id => String(get(st[id], "status", "?")) for id in ids)),
+    )
+end
+
+register!(
+    "bt_julia_wait", JULIA_WAIT_DESCRIPTION,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "runs" => Dict("type" => "array", "items" => Dict("type" => "string"),
+                "description" => "Run ids to wait for (e.g. [\"r4\", \"r5\"]); omit for every open run of this chat."),
+            "until" => Dict("type" => "string", "enum" => ["all", "any"], "default" => "all",
+                "description" => "\"all\": return when every run has finished; \"any\": when the first one has."),
+            "seconds" => Dict("type" => "number",
+                "description" => "How long to block at most, in seconds. Required; capped at 3600."),
+            "max_response_bytes" => Dict("type" => "integer", "default" => 4000,
+                "description" => "Per finished run: how much of its output to return (the tail)."),
+        ),
+        "required" => ["seconds"],
+    ),
+    julia_wait_handler,
+)

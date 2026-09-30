@@ -75,7 +75,14 @@ function dispatch!(out, req::AbstractDict)
         send_response!(out, id, Dict("tools" => tools))
     elseif method == "tools/call"
         tool_name = get(params, "name", "")
-        args = get(params, "arguments", Dict{String,Any}())
+        args = Dict{String,Any}(String(k) => v for (k, v) in get(params, "arguments", Dict{String,Any}()))
+        # Claude Code names the tool call a request belongs to; the chat's card
+        # for it has the same id (claude-agent-acp's ACP toolCallId), which is how
+        # a run finds its card. Other clients send nothing and the chat falls back
+        # to the run's worker and env.
+        meta = get(params, "_meta", nothing)
+        tuid = meta isa AbstractDict ? get(meta, "claudecode/toolUseId", nothing) : nothing
+        tuid isa AbstractString && !isempty(tuid) && (args["_tool_use_id"] = String(tuid))
         # `available_tools()` and not `TOOLS`: a gated-off tool must be as absent
         # to a caller that guessed its name as it is to `tools/list`.
         tools = available_tools()
@@ -155,14 +162,23 @@ end
 # A tracked TEMP session (env_path recorded as `nothing`) is addressed with
 # `scope_temp = true` instead.
 #
+# BACKGROUND runs are skipped unless `background = true`: a cancelled turn is
+# the agent being stopped, not the work it handed off. They stop on their own
+# ⊗, `bt_julia_interrupt`, or a restart.
+#
 # `JuliaSession` isn't defined yet at this file's include time (session.jl
 # loads after server.jl), so stay untyped here — runtime values are sessions.
-function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool = false)
+function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool = false,
+                             background::Bool = false)
     m = manager()
     targets = Any[]
     lock(m.lock) do
         for s in values(m.sessions)
             s.in_flight === nothing && continue
+            if !background
+                r = running_run(SERVER.runs, s)
+                r === nothing || !r.background || continue
+            end
             if env_path === nothing && !scope_temp
                 push!(targets, s)
             else
@@ -175,6 +191,8 @@ function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool 
         # finalizer must only ever escalate against THIS eval, never a fresh one
         # that legitimately started during the grace window (M3).
         f = s.in_flight
+        r = running_run(SERVER.runs, s)
+        r === nothing || @lock r.lock (r.interrupt_requested = true)
         try
             is_alive(s) && request_interrupt!(s)
         catch e
@@ -200,8 +218,10 @@ function finalize_cancelled_eval!(s, f)   # s::JuliaSession, f::Task (typed at c
     if istaskdone(f)
         # The cancel landed: clear in_flight iff it's still our task (an
         # await_or_yield may have already cleared it; a new eval may already own
-        # the slot — leave that one alone).
-        @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
+        # the slot — leave that one alone). A RUN's collector clears it itself
+        # when it takes the result; clearing it first would lose that result.
+        running_run(SERVER.runs, s) === nothing &&
+            @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
     elseif s.in_flight === f && is_alive(s)
         # Our eval is STILL running after the grace → it swallowed the interrupt.
         # Only escalate if it's still the in-flight one; otherwise a newer eval

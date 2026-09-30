@@ -32,7 +32,8 @@
 # server's mirror, like every other transfer between two workers.
 
 const EVAL_HOST_SPAWN_TIMEOUT_S = 180.0
-const REMOTE_OPS = ("eval", "continue", "interrupt", "restart", "sessions")
+# `runs` answers with run statuses as data (`bt_julia_wait` polling a remote run).
+const REMOTE_OPS = ("eval", "continue", "interrupt", "restart", "sessions", "runs")
 
 eval_host_key(project_id::AbstractString, worker_id::AbstractString) =
     "$(project_id)\0$(worker_id)"
@@ -232,7 +233,7 @@ function remote_op_timeout(op::AbstractString, args::AbstractDict)
         return BonitoMCP.remote_wait(t === nothing ? BonitoMCP.DEFAULT_TIMEOUT :
                                      (t > 0 ? t : nothing)) - 5.0
     end
-    return op == "interrupt" ? 85.0 : op == "restart" ? 115.0 : 55.0
+    return op == "interrupt" ? 85.0 : op == "restart" ? 115.0 : op == "runs" ? 25.0 : 55.0
 end
 
 function dev_op(state::ServerState, ::Val{:remote_eval}, args::AbstractDict, caller::String)
@@ -273,6 +274,11 @@ function dev_op(state::ServerState, ::Val{:remote_workers}, args::AbstractDict, 
                 row["sessions"] = [Dict{String,Any}("env_path" => strip(l[3:end]),
                                                     "in_flight" => occursin("EVAL IN FLIGHT", l))
                                    for l in split(text, '\n') if startswith(l, "  - ")]
+                # The chat's runs there (running, or finished and not collected).
+                rr = get(host_rpc(state, ws, "runs", Dict{String,Any}(); timeout = 15.0), "result", nothing)
+                row["runs"] = rr isa AbstractDict ?
+                    [x for x in get(rr, "runs", Any[])
+                     if get(x, "status", "") == "running" || get(x, "collected", true) === false] : Any[]
             catch e
                 e isa InterruptException && rethrow()
                 @warn "eval host did not list its sessions" worker = w.name exception = e

@@ -473,6 +473,17 @@ class BonitoChat {
         // Capture phase, so a click on a linked TOOL TITLE opens the editor
         // instead of toggling the pill's expand state (the Collapsable
         // listener sits on the header, below us on the capture path).
+        // ↑ chips on a card that waits on an eval (bt_julia_continue /
+        // bt_julia_wait): bring that eval's card into view. Capture phase for
+        // the same reason as path links: the chip sits in a header whose
+        // click toggles the card.
+        container.addEventListener('click', (e) => {
+            const chip = e.target.closest('.bt-tool-jump');
+            if (!chip || !container.contains(chip)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.jumpToMessage(parseInt(chip.dataset.jumpIndex ?? '-1', 10), chip.dataset.jumpId);
+        }, { capture: true });
         container.addEventListener('click', (e) => {
             const link = e.target.closest('.bt-path-link');
             if (!link || !container.contains(link)) return;
@@ -2296,6 +2307,20 @@ class BonitoChat {
             // async `create` was still resolving — an unhandled "Cannot read
             // properties of null (reading 'parentNode')".
         }
+        // A body expanded before the tool had any content holds the server's
+        // "(loading…)" placeholder (`render_tool_body`), and nothing replaces it
+        // by itself: a long call — bt_julia_wait, bt_wait — expanded while it
+        // ran stayed "(loading…)" after it finished. Ask again on each update
+        // until the real body is in.
+        if (node.collapsable?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading'))
+            this.comm.notify({ type: 'tool.render', id: msg.id });
+        // A Julia run outlived the call that ended this card: it is live again,
+        // and its elapsed clock runs on from the start instead of the call's end.
+        if (msg.reopen) {
+            delete node.dataset.toolFinished;
+            node.classList.add('bt-tool-live');
+            this.ensureElapsedTicker();
+        }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
             node.classList.remove('bt-tool-live');
@@ -2418,6 +2443,14 @@ class BonitoChat {
             wb.textContent = `⇢ ${String(msg.worker)}`;
             const title = headerEl.querySelector('.bt-tool-title');
             headerEl.insertBefore(wb, title ? title.nextSibling : null);
+        }
+        // What a continue / wait waits on can resolve after the card opened
+        // (its arguments stream in, its run is announced later): replace the
+        // chips whenever an update carries them.
+        if (Array.isArray(msg.jumps) && headerEl) {
+            headerEl.querySelectorAll('.bt-tool-jump').forEach(b => b.remove());
+            const anchor = headerEl.querySelector('.bt-tool-summary');
+            anchor?.insertAdjacentHTML('beforebegin', jumpChipsHTML(msg.jumps));
         }
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
@@ -2967,6 +3000,9 @@ class BonitoChat {
         //     running on a different machine is visible without reading the card.
         const workerBadge = msg.worker ?
             `<span class="bt-tool-worker" title="This runs on another worker">⇢ ${escapeHTML(String(msg.worker))}</span>` : '';
+        //   • `jumps` — the evals a continue / wait waits on, as ↑ chips that
+        //     bring each one's card into view (see jumpToMessage).
+        const jumpChips = jumpChipsHTML(msg.jumps);
         const stopBtn = msg.stoppable ?
             `<button class="bt-tool-stop bt-stop-mini" type="button"
                      title="Stop"></button>` : '';
@@ -3005,6 +3041,7 @@ class BonitoChat {
                 ${server}
                 <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
                 ${workerBadge}
+                ${jumpChips}
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 ${timeoutBadge}
                 <span class="bt-tool-timer"></span>
@@ -3073,26 +3110,39 @@ class BonitoChat {
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;
-                const idx = parseInt(slot.dataset.msgIndex ?? '-1', 10);
-                if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
-                // Jump via the scroller's own geometry — works whether or
-                // not the pill is currently rendered (scrollIntoView on a
-                // recycled node silently does nothing). Two passes: the
-                // first render swaps estimated heights for real ones, the
-                // second corrects the target with the settled geometry.
-                const jump = () => {
-                    this.container.scrollTop =
-                        Math.max(0, this.cumHeight(0, idx) - 60);
-                };
-                this.followMode = false;
-                jump();
-                requestAnimationFrame(() => requestAnimationFrame(jump));
+                this.jumpToMessage(parseInt(slot.dataset.msgIndex ?? '-1', 10),
+                                   slot.dataset.taskId);
             };
             this.taskbarEl.addEventListener('click', this.onTaskbarClick);
         }
         // The in-chat elapsed ticker lives in `ensureElapsedTicker` below —
         // started on demand when a live pill appears, self-stopping when the
         // last one finishes. (The taskbar keeps its own Julia clock.)
+    }
+
+    // Bring message `idx` (its 0-based store index) into view and light up its
+    // node (`id`), so the eye lands on it. Jumps via the scroller's own
+    // geometry — works whether or not the target is currently rendered
+    // (scrollIntoView on a recycled node silently does nothing). Two passes:
+    // the first render swaps estimated heights for real ones, the second
+    // corrects the target with the settled geometry. Used by the task bar's
+    // rows and by the ↑ chips of cards that wait on an eval.
+    jumpToMessage(idx, id) {
+        if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
+        const jump = () => {
+            this.container.scrollTop = Math.max(0, this.cumHeight(0, idx) - 60);
+        };
+        this.followMode = false;
+        jump();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            jump();
+            const node = id ? this.nodeById.get(id) : null;
+            if (!node) return;
+            node.classList.remove('bt-jump-flash');
+            void node.offsetWidth;            // restart the animation on a repeat click
+            node.classList.add('bt-jump-flash');
+            setTimeout(() => node.classList.remove('bt-jump-flash'), 1800);
+        }));
     }
 
     // One shared 1Hz interval ticks the inline `.bt-tool-timer` of every
@@ -4549,6 +4599,16 @@ function openLightbox(media) {
     overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
     document.addEventListener('keydown', onkey);
     document.body.appendChild(overlay);
+}
+
+// ↑ chips for the evals a card waits on (`msg.jumps`: label, store index, id,
+// title). A click brings that card into view (delegated, see jumpToMessage).
+function jumpChipsHTML(jumps) {
+    if (!Array.isArray(jumps)) return '';
+    return jumps.map(j =>
+        `<button type="button" class="bt-tool-jump" data-jump-index="${Number(j.index)}"` +
+        ` data-jump-id="${escapeAttr(String(j.id))}" title="${escapeAttr(String(j.title || ''))}">` +
+        `↑ ${escapeHTML(String(j.label))}</button>`).join('');
 }
 
 function escapeHTML(str) {

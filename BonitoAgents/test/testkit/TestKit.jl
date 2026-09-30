@@ -167,8 +167,9 @@ mcp_call(tool::AbstractString; id = nothing, real_process::Bool = false, args...
     end
     d
 end
-bt_eval(code; env_path = nothing, id = nothing, timeout = nothing, worker = nothing, real_process = false) =
-    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout, worker, real_process)
+bt_eval(code; env_path = nothing, id = nothing, timeout = nothing, worker = nothing,
+        background = nothing, real_process = false) =
+    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout, worker, background, real_process)
 # bt_julia_continue reattaches to the in-flight eval after a soft-timeout
 # checkpoint — its call carries NO code argument, exactly like real claude.
 bt_continue(; env_path = nothing, timeout = nothing, id = nothing) =
@@ -499,7 +500,7 @@ end
 # test left running (it timed out into `:running` and nobody continued) would
 # make the next item's eval on the same env fail with "already in flight".
 function settle_mcp_evals!(; timeout::Real = 60.0)
-    BonitoMCP.interrupt_in_flight!(nothing) == 0 && return nothing
+    BonitoMCP.interrupt_in_flight!(nothing; background = true) == 0 && return nothing
     @warn "TestKit: an eval was still in flight at server teardown; interrupted it"
     m = BonitoMCP.manager()
     settled() = lock(m.lock) do
@@ -853,10 +854,15 @@ function invoke_mcp(client, ev::AbstractDict, mcp_env)
         "type" => "bt_eval_open", "tool_id" => tool_id,
         "tool" => "mcp__btworker__" * tool,
         "code" => String(get(ev, "code", "")),
-        "env_path" => get(ev, "env_path", nothing))
+        "env_path" => get(ev, "env_path", nothing),
+        # The call's whole argument dict, as claude streams it into rawInput.
+        "args" => copy(args))
     haskey(ev, "timeout") && (open_ev["timeout"] = ev["timeout"])
     haskey(ev, "worker")  && (open_ev["worker"]  = ev["worker"])
     println(client, JSON.json(open_ev)); flush(client)
+    # What Claude Code sends with every `tools/call` (`_meta["claudecode/toolUseId"]`,
+    # which BonitoMCP's dispatch copies into the arguments): the card's own id.
+    args["_tool_use_id"] = tool_id
 
     # Dispatch by NAME through the registry, the way a real MCP process does.
     # This used to hardcode the two eval handlers and fall through to

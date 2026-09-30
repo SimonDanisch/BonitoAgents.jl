@@ -180,8 +180,12 @@
             server.agent_fn[] = _ -> [real_eval("relay_value = 41; sleep(60); relay_value";
                 worker = "worker-b", timeout = 0.1, id = "re-running"), TK.end_turn()]
             TK.send_message(server, "start a long remote eval")
-            @test TK.wait_for(server, "remote eval checkpoint",
-                card_shows("re-running", "still running"); timeout = 60) == true
+            # The call returns at its checkpoint, the eval does not: the card
+            # follows the RUN, live, until it ends (eval_runs.jl).
+            @test TK.wait_for(server, "remote eval checkpointed, its card still live",
+                "$(card("re-running"))?.classList.contains('bt-tool-live') === true && " *
+                "($(card("re-running"))?.querySelector('.bt-tool-summary')?.textContent || '').includes('· running')";
+                timeout = 60) == true
             # Eager expansion and the fast checkpoint must share one body
             # mount, including while the first render is still in flight.
             renders = BT.shared(state.chat_models[pid]).tool_renders
@@ -192,6 +196,10 @@
             TK.send_message(server, "interrupt the remote eval")
             @test TK.wait_for(server, "remote interrupt result",
                 card_shows("re-interrupt", "InterruptException"); timeout = 60) == true
+            # …and the run's own card ends with it.
+            @test TK.wait_for(server, "the run's card ends interrupted",
+                "($(card("re-running"))?.querySelector('.bt-tool-summary')?.textContent || '').includes('✗ interrupted')";
+                timeout = 60) == true
             server.agent_fn[] = _ -> [real_eval("relay_value + 1";
                 worker = "worker-b", id = "re-after-interrupt"), TK.end_turn()]
             TK.send_message(server, "reuse the remote session")

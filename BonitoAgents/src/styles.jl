@@ -1773,6 +1773,23 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "11px", "font-weight" => "600", "letter-spacing" => "0.02em",
         "padding" => "1px 8px", "border-radius" => "999px",
         "flex-shrink" => "0", "white-space" => "nowrap"),
+    # ↑ chips on a card that waits on an eval (bt_julia_continue /
+    # bt_julia_wait): the eval's run id, a click away from its card. Outlined,
+    # so they don't compete with the filled worker badge.
+    CSS(".bt-tool-jump",
+        "display" => "inline-flex", "align-items" => "center",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-accent)",
+        "border" => "1px solid var(--bt-accent)", "cursor" => "pointer",
+        "font-size" => "11px", "font-weight" => "600", "font-family" => "inherit",
+        "padding" => "0 7px", "border-radius" => "999px", "line-height" => "16px",
+        "flex-shrink" => "0", "white-space" => "nowrap"),
+    CSS(".bt-tool-jump:hover", "background" => "var(--bt-accent)", "color" => "#fff"),
+    # The card a jump landed on lights up briefly, so the eye finds it.
+    CSS("@keyframes bt-jump-flash",
+        CSS("0%",   "box-shadow" => "0 0 0 0 rgba(59,130,246,0.0)"),
+        CSS("20%",  "box-shadow" => "0 0 0 4px rgba(59,130,246,0.45)"),
+        CSS("100%", "box-shadow" => "0 0 0 0 rgba(59,130,246,0.0)")),
+    CSS(".bt-jump-flash", "animation" => "bt-jump-flash 1.6s ease-out"),
     # Per-pill stop (shares .bt-stop-mini for the look). Hidden until the
     # pill is live — stopping a finished tool is meaningless.
     CSS(".bt-tool-stop",

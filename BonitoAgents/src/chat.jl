@@ -52,6 +52,36 @@ end
 
 # ── ChatModel ──────────────────────────────────────────────────────────────
 # Shared per project, lifetime = project's lifetime. One instance lives in
+# A Julia RUN (BonitoMCP's runs.jl: one `bt_julia_eval`, id `r4`) as the chat
+# knows it — what the chat's MCP, or an eval host on another worker, announced
+# about it — and the eval card that started it. The behaviour is in
+# eval_runs.jl; the type lives here because the chat holds its runs.
+mutable struct ChatRun
+    const id::String
+    tool_use_id::String            # the id of the call that started it, when the agent named it ("" if not)
+    worker_id::String              # "" = the chat's own worker
+    route::String                  # the eval session's stream route, keyed like the stream sinks
+    env_path::String               # "" = temp session
+    background::Bool
+    started::Float64
+    status::String                 # "running" | "passed" | "failed" | "interrupted" | "lost"
+    finished::Float64
+    summary::String                # a failure's first line
+    collected::Bool                # the agent has been handed the result
+    notified::Bool                 # the agent was told that it finished
+    content::Vector{Any}           # the finished run's output + result, as the card shows it
+    card::Any                      # its `JuliaEvalToolMsg` (typed there); nothing until bound
+end
+
+# The chat's runs, and the task that tells the agent when ones it has not
+# collected finish (at most one at a time).
+mutable struct RunBook
+    const runs::Dict{String,ChatRun}
+    const lock::ReentrantLock
+    notifier::Union{Task,Nothing}
+end
+RunBook() = RunBook(Dict{String,ChatRun}(), ReentrantLock(), nothing)
+
 # `state.chat_models[project_id]`; every browser tab viewing the project gets
 # a per-session view via `Base.copy(::ChatModel)`. The shared bits — message
 # store, ACP client, persistent chat session, the user-message queue — are
@@ -310,6 +340,9 @@ mutable struct ChatModel
     # latest generation at its turn skips entirely. Guarded by `model.lock`
     # for the get!/increment; entries are few (one per rendered tool).
     tool_renders::Dict{String, Tuple{ReentrantLock, Ref{Int}}}
+
+    # The chat's Julia runs (eval_runs.jl). Shared across session views.
+    runs::RunBook
 end
 
 # The provider tracked by the `provider` observable: the singleton descriptor the
@@ -401,6 +434,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         String[],                              # tool_cache_order (LRU for the cache)
         TaskBar(),                             # live-task board (owns its poll loop)
         Dict{String, Tuple{ReentrantLock, Ref{Int}}}(),  # tool_renders (serialize + latest-wins)
+        RunBook(),                             # runs
     )
     # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
     # with `chat = nothing` (the model doesn't exist yet while parsing), but
@@ -503,6 +537,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = 
             m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
             m.taskbar,                 # shared → one live-task board per chat
             m.tool_renders,            # shared → renders serialize across every tab
+            m.runs,                    # shared → one run book per chat
         )
     end
 end
@@ -1010,10 +1045,23 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     # node — the message is shared by every tab and each builds its own
     # (`eval_result_node`). Its own slot so the body never re-renders to grow one.
     result::Observable{Any}
+    # `bt_julia_eval(background = true)`: the call returns at once and its own
+    # result is only the start notice; the run's output arrives later.
+    background::Bool
+    # The run this eval started (eval_runs.jl), once the chat heard of it. A run
+    # keeps its card live past the tool call: `is_live`, the task bar and the
+    # live output tail all follow the run, not the call.
+    run::Union{ChatRun,Nothing}
+    # The chat's TaskBar while the run is in it (membership IS liveness, as for
+    # a background bash); `nothing` otherwise.
+    task_bar::Union{TaskBar,Nothing}
+    # Persisted to chat.md already: a run's card can be closed by its tool call
+    # and again when the run ends, and history must hold it once.
+    closed::Bool
 end
 JuliaEvalToolMsg(message::Message, server) =
     JuliaEvalToolMsg(message, server, "", "", nothing, "",
-                     Observable(""), nothing, Observable{Any}(nothing))
+                     Observable(""), nothing, Observable{Any}(nothing), false, nothing, nothing, false)
 
 mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     message::Message
@@ -1025,19 +1073,21 @@ mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
     result::Observable{Any}
+    run::String                   # the run it continues (`run = "r4"`); "" ⇒ by env
 end
 JuliaContinueToolMsg(message::Message, server) =
     JuliaContinueToolMsg(message, server, "", "", nothing, "",
-                         Observable(""), nothing, Observable{Any}(nothing))
+                         Observable(""), nothing, Observable{Any}(nothing), "")
 
 mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
     message::Message
     server::String
     env_path::String              # which session it SIGINTs; "" ⇒ the active one
     worker::String                # on which worker; "" ⇒ the chat's own
+    run::String                   # the run it stops (`run = "r4"`); "" ⇒ by env
 end
 JuliaInterruptToolMsg(message::Message, server) =
-    JuliaInterruptToolMsg(message, server, "", "")
+    JuliaInterruptToolMsg(message, server, "", "", "")
 
 mutable struct JuliaRestartToolMsg <: MCPToolMsg     # bt_julia_restart
     message::Message
@@ -1053,6 +1103,14 @@ mutable struct JuliaListSessionsToolMsg <: MCPToolMsg # bt_julia_list_sessions
     server::String
 end
 
+mutable struct JuliaWaitToolMsg <: MCPToolMsg         # bt_julia_wait
+    message::Message
+    server::String
+    runs::Vector{String}          # the runs it waits on; empty ⇒ every open run
+    until::String                 # "all" | "any"
+end
+JuliaWaitToolMsg(message::Message, server) = JuliaWaitToolMsg(message, server, String[], "all")
+
 # Streamed-argument parsing for the typed MCP variants (see `apply_input!` above).
 function apply_input!(m::GenericMCPToolMsg, raw::AbstractDict)
     merge!(m.raw_input, raw)
@@ -1063,7 +1121,13 @@ function apply_input!(m::ShowToolMsg, raw::AbstractDict)
     p isa AbstractString && !isempty(p) && (m.path = String(p))
     return nothing
 end
-function apply_input!(m::JuliaEvalCall, raw::AbstractDict)
+apply_input!(m::JuliaEvalCall, raw::AbstractDict) = apply_eval_input!(m, raw)
+function apply_input!(m::JuliaEvalToolMsg, raw::AbstractDict)
+    apply_eval_input!(m, raw)
+    get(raw, "background", false) === true && (m.background = true)
+    return nothing
+end
+function apply_eval_input!(m::JuliaEvalCall, raw::AbstractDict)
     c = get(raw, "code", nothing)
     c isa AbstractString && !isempty(c) && (m.code = String(c))
     e = get(raw, "env_path", nothing)
@@ -1072,6 +1136,19 @@ function apply_input!(m::JuliaEvalCall, raw::AbstractDict)
     t isa Real && (m.timeout = Float64(t))
     w = get(raw, "worker", nothing)
     w isa AbstractString && !isempty(strip(w)) && (m.worker = String(strip(w)))
+    return nothing
+end
+function apply_input!(m::JuliaContinueToolMsg, raw::AbstractDict)
+    apply_eval_input!(m, raw)
+    r = get(raw, "run", nothing)
+    r isa AbstractString && !isempty(strip(r)) && (m.run = String(strip(r)))
+    return nothing
+end
+function apply_input!(m::JuliaWaitToolMsg, raw::AbstractDict)
+    r = get(raw, "runs", nothing)
+    r isa AbstractVector && (m.runs = [String(x) for x in r if x isa AbstractString])
+    u = get(raw, "until", nothing)
+    u isa AbstractString && (m.until = String(u))
     return nothing
 end
 function apply_input!(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}, raw::AbstractDict)
@@ -1090,6 +1167,7 @@ const MCP_MSG_TYPES = Dict{String,DataType}(
     "bt_julia_interrupt"     => JuliaInterruptToolMsg,
     "bt_julia_restart"       => JuliaRestartToolMsg,
     "bt_julia_list_sessions" => JuliaListSessionsToolMsg,
+    "bt_julia_wait"          => JuliaWaitToolMsg,
     "bt_show"                => ShowToolMsg,
 )
 mcp_msg_type(tool_name::AbstractString) = get(MCP_MSG_TYPES, tool_name, GenericMCPToolMsg)
@@ -1292,7 +1370,7 @@ is_pinned(chat::ChatModel, id::AbstractString) =
 
 # Enter the bar (become live): add to the live set, mark membership, make sure
 # the bar's poll loop is running.
-function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
+function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg})
     lock(bar.lock) do
         any(t -> t === m, bar.items[]) || (bar.items[] = push!(copy(bar.items[]), m))
     end
@@ -1303,7 +1381,7 @@ end
 
 # Leave the bar (become done): finalize the bubble (persist + emit, per type),
 # then drop from the live set and clear membership. Idempotent.
-function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
+function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg})
     bar = m.task_bar
     bar === nothing && return nothing
     m.task_bar = nothing
@@ -1537,6 +1615,7 @@ end
 # deliberately NOT here either: it blocks the agent, it is not detached work.)
 
 taskbar_label(b::ToolMsg)     = first(pretty_tool_title(tool_title(b)))
+taskbar_icon(b::ToolMsg)      = tool_icon(tool_kind(b))
 taskbar_label(b::BashToolMsg) = first(pretty_tool_title(bash_display_title(b)))
 
 # Live slot label (taskbar.jl calls this per clock tick): re-derive from the
@@ -1578,7 +1657,7 @@ function tool_taskbar_item(chat::ChatModel, b::ToolMsg)
         i = findfirst(m -> m === b, s.msgs_store)
         i === nothing ? -1 : i - 1
     end
-    TaskbarItem(tool_id(b), :tool, tool_icon(tool_kind(b)), taskbar_label(b);
+    TaskbarItem(tool_id(b), :tool, taskbar_icon(b), taskbar_label(b);
                 started = tool_started_at(b), stoppable = true, msg_index = idx,
                 source = b)
 end
@@ -1764,6 +1843,7 @@ tool_key(::JuliaContinueToolMsg)     = "bt_julia_continue"
 tool_key(::JuliaInterruptToolMsg)    = "bt_julia_interrupt"
 tool_key(::JuliaRestartToolMsg)      = "bt_julia_restart"
 tool_key(::JuliaListSessionsToolMsg) = "bt_julia_list_sessions"
+tool_key(::JuliaWaitToolMsg)         = "bt_julia_wait"
 
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
     pretty_title, server = pretty_tool_title(tool_title(m))
@@ -1843,7 +1923,10 @@ end
 # Mirrors BonitoMCP's DEFAULT_TIMEOUT / Pkg auto-disable (session.jl) so the
 # badge shows what the server will actually do when no explicit timeout rides
 # on the call.
-function eval_timeout_label(m::JuliaEvalCall)
+# A background eval returns at once: there is no checkpoint to show.
+eval_timeout_label(m::JuliaEvalToolMsg) = m.background ? nothing : checkpoint_label(m)
+eval_timeout_label(m::JuliaContinueToolMsg) = checkpoint_label(m)
+function checkpoint_label(m::JuliaEvalCall)
     m.timeout === nothing ||
         return m.timeout > 0 ? "$(round(Int, m.timeout))s" : "no timeout"
     return occursin(r"\bPkg\.", m.code) ? "no timeout" : "30s"
@@ -1863,7 +1946,8 @@ function eval_extras!(d::Dict, m::JuliaEvalCall)
     # Ship the code being executed so the client paints a compact preview while
     # the eval runs (the post-completion body renders the same code in Monaco).
     isempty(m.code) || (d["code"] = m.code)       # `continue` has none — that's fine
-    d["timeout_s"] = eval_timeout_label(m)
+    lbl = eval_timeout_label(m)
+    lbl === nothing || (d["timeout_s"] = lbl)
     d["stoppable"] = true                         # a JuliaEvalCall holds an eval in flight
     # Running on ANOTHER worker: the card wears its name as a badge.
     isempty(m.worker) || (d["worker"] = m.worker)
@@ -1871,6 +1955,8 @@ function eval_extras!(d::Dict, m::JuliaEvalCall)
     # edit-tool mechanism): the body stays mounted, collapse is a HEIGHT cap
     # (~4 code lines) — so the "preview" is the real Monaco Code editor.
     d["compact_body"] = true
+    # A run going on past its call keeps the card live (eval_runs.jl).
+    run_header_extras!(d, m)
     return d
 end
 
@@ -1881,13 +1967,18 @@ executed_preview(::MCPToolMsg) = nothing
 mcp_env(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}) =
     (isempty(m.env_path) ? "the active session" : m.env_path) *
     (isempty(m.worker) ? "" : " on " * m.worker)
-executed_preview(m::JuliaInterruptToolMsg)   = "interrupt (SIGINT) " * mcp_env(m)
+executed_preview(m::JuliaInterruptToolMsg)   =
+    isempty(m.run) ? "interrupt (SIGINT) " * mcp_env(m) : "interrupt run " * m.run
 executed_preview(m::JuliaRestartToolMsg)     = "restart (fresh process) " * mcp_env(m)
 executed_preview(::JuliaListSessionsToolMsg) = "list active Julia sessions"
+executed_preview(m::JuliaWaitToolMsg) =
+    "wait for " * (isempty(m.runs) ? "every open run" : join(m.runs, ", ")) *
+    (m.until == "any" ? " (the first to finish)" : "")
 
 # Both (1) and (2), for the header build AND every later snap.
 function mcp_input_extras!(d::Dict, m::MCPToolMsg)
     eval_extras!(d, m)
+    jump_extras!(d, m)
     ex = executed_preview(m)
     ex === nothing || (d["command"] = ex)
     return d
@@ -2523,8 +2614,9 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     # result embed — and that second render detached the Code section's Monaco
     # container while its async `create` was still resolving, which surfaced as
     # an unhandled "Cannot read properties of null (reading 'parentNode')".
-    # `eval_result!` fills both observables when the call completes.
-    eval_result!(m, content)
+    # `eval_result!` fills both observables when the call completes — or, for
+    # a run that outlived its call, when the RUN ends (`result_content`).
+    eval_result!(m, result_content(m, content))
     # The Output section: a `pin_end` Collapsable whose body owns the scrollbar
     # and stays pinned to the newest line, streaming AND done — same widget,
     # same chrome, no styling jump on completion.
@@ -2578,6 +2670,7 @@ Every other text block IS the terminal output, verbatim. Zero content sniffing.
 A checkpoint / `nothing` result simply has no descriptor.
 """
 function eval_result!(m::JuliaEvalCall, content)
+    content === nothing && return nothing       # a run still going: nothing final yet
     chat = tool_chat(m)
     chat === nothing && return nothing
     tool_status(m) in ("completed", "failed") || return nothing
@@ -3421,8 +3514,9 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     content = tool_content_for_render(m, chat_dir)
     # Live tool whose content hasn't arrived yet (user expanded mid-stream
     # before any snap with content reached us). Render a quiet placeholder
-    # instead of the alarming "details not persisted" message — the next
-    # tool_update will trigger a fresh render with real content.
+    # instead of the alarming "details not persisted" message — the client asks
+    # again on the next tool_update while the placeholder is showing
+    # (`onToolUpdate`), which renders the real content.
     #
     # …unless the message can already draw itself from its own INPUT. That is
     # the Edit card's normal case, not a rare one: `auto_expand_body` opens an
@@ -4171,9 +4265,10 @@ end
 # (`snap_summary`, dispatch on type): `env_path` rides the STREAMED rawInput, so
 # it isn't known at construction — once `update_from_snap!` merged the args, the
 # next summary derivation shows the env.
-eval_env_summary(m::JuliaEvalCall) =
+eval_env_label(m::JuliaEvalCall) =
     "env " * (isempty(m.env_path) ? "<temp>" : m.env_path) *
     (isempty(m.worker) ? "" : " · on " * m.worker)
+eval_env_summary(m::JuliaEvalCall) = eval_env_label(m)
 
 snap_summary(::ToolMsg, snap)         = content_summary(builtin_msg_type(snap.kind, tool_call_name(snap)), snap.content)
 # A search's most useful line is the query, not just how many hits it got — and
@@ -4184,6 +4279,18 @@ function snap_summary(b::SearchToolMsg, snap)
     return isempty(hits) ? "\"$(b.pattern)\"" : "\"$(b.pattern)\" · $hits"
 end
 snap_summary(b::JuliaEvalCall, snap)  = eval_env_summary(b)
+# The wait says what it waits on, then how that went: its result's first line
+# ("waited 12.3s (until all): 2 of 3 runs finished; still running: r6 …"),
+# from the colon on.
+function snap_summary(b::JuliaWaitToolMsg, snap)
+    for c in snap.content
+        c isa AgentClientProtocol.TextContent || continue
+        first_line = first(split(c.text, '\n'))
+        i = findfirst(": ", first_line)
+        return String(strip(i === nothing ? first_line : first_line[last(i)+1:end]))
+    end
+    return "waiting for " * (isempty(b.runs) ? "every open run" : join(b.runs, ", "))
+end
 
 # Default: stream the message's text deltas into the bubble, then finalize.
 function process_update!(b::ChatMsg, m::AgentClientProtocol.Message; from::Int = 0)
@@ -4431,7 +4538,10 @@ end
 # appear — there is no second render to carry it (see `eval_body_dom`).
 function update_from_snap!(b::JuliaEvalCall, snap)
     snap isa AgentClientProtocol.MCPCall && apply_input!(b, snap.raw_input)
-    eval_result!(b, snap.content)
+    # The run may have been announced before this card existed: the run's
+    # frames and the call's travel separate roads (eval_runs.jl).
+    adopt_run!(b)
+    eval_result!(b, result_content(b, snap.content))
     return nothing
 end
 function update_from_snap!(b::BuiltinToolMsg, snap)
@@ -4640,7 +4750,7 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
     end
     deadline = time() + 4 * 3600      # hard stop for a wedged status
     try
-        while tool_status(m) in ("pending", "in_progress") && time() < deadline
+        while eval_streaming(m) && time() < deadline
             if isready(ch)
                 # Drain everything queued this tick, then emit ONCE — the MCP
                 # already coalesced + capped each chunk, so this just merges a
@@ -4664,9 +4774,15 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
                 delete!(state.eval_stream_sinks, key)
         end
         close(ch)
+        # A run that goes on after its call may restart the tail (eval_runs.jl).
+        m.stream_task = nothing
     end
     return nothing
 end
+
+# Whether an eval's live tail should keep listening: while its call is open, and
+# for as long as a run it started is still going.
+eval_streaming(m::JuliaEvalCall) = tool_status(m) in ("pending", "in_progress")
 
 function stream_bg_update!(model::ChatModel, m::BashToolMsg)
     write_bg_content!(model.chat_dir, m)
@@ -8827,6 +8943,9 @@ end
 # unlike the chat-level cancel which kills the whole turn.
 function request_tool_stop!(model::ChatModel, t::JuliaEvalCall)
     is_live(t) || return nothing
+    # A card whose run the chat knows stops exactly that run, wherever it runs
+    # (eval_runs.jl). What follows is for cards from before runs.
+    stop_run!(model, t) && return nothing
     tid      = tool_id(t)
     env_path = isempty(t.env_path) ? nothing : t.env_path
     # Immediate visual ack; the result itself arrives with the eval's next

@@ -663,9 +663,10 @@ bar while it runs, and you are notified automatically when it finishes:
 
   * a shell command — `Bash` with `run_in_background: true`
   * a whole sub-task — `Task`/`Agent` with `run_in_background: true`
-  * Julia — `bt_julia_eval`. It keeps running past its soft `timeout`, so pass \
-    a small `timeout`, go do other work, and pick the result up with \
-    `bt_julia_continue`. Never background Julia through Bash.
+  * Julia — `bt_julia_eval` with `background: true`. It returns a run id \
+    (`r4`) at once; the run shows in the task bar, and you are told when it \
+    finishes. Start one per worker/env to run several at once (e.g. a test \
+    suite on each machine). Never background Julia through Bash.
 
 Backgrounding by shell syntax instead — `&`, `nohup`, `disown`, `setsid`, \
 `screen -dm`, `tmux new -d` — produces an ORPHAN: no completion signal, nothing \
@@ -698,6 +699,9 @@ and fires no notification:
 `seconds` is required and capped at an hour; hitting the bound is a normal \
 result, so for longer work just call it again. Waiting in ONE long call is \
 cheaper than many short turns, so do not shrink it to poll faster.
+
+For Julia runs, `bt_julia_wait(runs: ["r4", "r5"], seconds: 600)` is the wait: \
+one call for several runs (on any worker), returning each finished run's result.
 
 ## Julia
 When running Julia code, always use the `bt_julia_eval` tool and never use \

@@ -23,18 +23,24 @@
 # a ref was parked (values AND errors — a CapturedException is a value). No
 # code echo (agent has its tool input, chat has the typed `code` field), no
 # in-band labels, nothing to sniff. A checkpoint (still running) has no
-# descriptor; its footer rides inside the output text.
+# descriptor; its footer rides inside the output text. `_meta.run` names the
+# run (runs.jl) a response is about.
 function running_response(env_path::Union{String,Nothing},
-                          partial::AbstractString, elapsed::Real)
+                          partial::AbstractString, elapsed::Real;
+                          run::Union{String,Nothing} = nothing)
     footer = string(
-        "\n--- still running (", round(elapsed; digits = 2), "s",
+        "\n--- still running", run === nothing ? "" : " as $run",
+        " (", round(elapsed; digits = 2), "s",
         env_path === nothing ? "" : ", env=$env_path", ")",
-        " — next: bt_julia_continue / bt_julia_interrupt / bt_julia_restart")
+        " — next: ", run === nothing ? "" : "bt_julia_wait(runs = [\"$run\"]) / ",
+        "bt_julia_continue / bt_julia_interrupt / bt_julia_restart")
     output = (isempty(partial) ? "(no output captured yet)" : partial) * footer
+    meta = Dict{String,Any}("status" => "running", "elapsed_s" => elapsed)
+    run === nothing || (meta["run"] = run)
     return Dict{String,Any}(
         "content" => [Dict("type" => "text", "text" => output)],
         "isError" => false,
-        "_meta"   => Dict("status" => "running", "elapsed_s" => elapsed),
+        "_meta"   => meta,
     )
 end
 
@@ -44,14 +50,17 @@ end
 # isError = INFRASTRUCTURE failures only — user errors ship a descriptor with
 # `errored: true` instead (claude fuses isError content into one rawOutput
 # string, which must never happen to a plain user error).
-function completed_response(blocks, html, is_error::Bool, elapsed::Real)
+function completed_response(blocks, html, is_error::Bool, elapsed::Real;
+                            run::Union{String,Nothing} = nothing)
     content = copy(blocks)
     html === nothing ||
         push!(content, Dict{String,Any}("type" => "text", "text" => html))
+    meta = Dict{String,Any}("status" => "completed", "elapsed_s" => elapsed)
+    run === nothing || (meta["run"] = run)
     return Dict{String,Any}(
         "content" => content,
         "isError" => is_error,
-        "_meta"   => Dict("status" => "completed", "elapsed_s" => elapsed),
+        "_meta"   => meta,
     )
 end
 
@@ -76,6 +85,24 @@ function remote_worker(args::AbstractDict)
     return isempty(s) ? nothing : String(s)
 end
 
+# The `run` argument (`"r4"`), or nothing.
+function run_arg(args::AbstractDict)
+    r = get(args, "run", nothing)
+    r isa AbstractString || return nothing
+    s = strip(r)
+    return isempty(s) ? nothing : String(s)
+end
+
+# The env a call names, or nothing for the temp session.
+function env_arg(args::AbstractDict)
+    e = get(args, "env_path", nothing)
+    return e isa AbstractString && !isempty(e) ? String(e) : nothing
+end
+
+# The id Claude Code gave this tool call (server.jl copies it into the
+# arguments), "" from any other client.
+tool_use_id(args::AbstractDict) = String(get(args, "_tool_use_id", ""))
+
 # How long to wait for the server's reply: the eval's own soft checkpoint plus
 # room for the host to be spawned on first use (a julia start + `using BonitoMCP`
 # + the eval worker's own start). A checkpoint-free eval (`timeout = 0`, or a
@@ -85,58 +112,123 @@ const REMOTE_UNBOUNDED_S   = 6 * 3600.0
 remote_wait(timeout::Union{Real,Nothing}) =
     timeout === nothing ? REMOTE_UNBOUNDED_S : Float64(timeout) + REMOTE_SPAWN_GRACE_S
 
+# Forward one tool call to `worker`'s eval host. `track` names a FOREGROUND run
+# the call waits on, so a cancel arriving meanwhile can stop it
+# (`interrupt_remote_inflight!`); background runs are never tracked.
 function remote_tool_call(op::AbstractString, worker::AbstractString, args::AbstractDict;
-                          wait::Real)
+                          wait::Real, track::Union{String,Nothing} = nothing)
     fwd = Dict{String,Any}(String(k) => v for (k, v) in args if String(k) != "worker")
-    env_path = get(fwd, "env_path", nothing)
-    env_key  = env_path isa AbstractString && !isempty(env_path) ? String(env_path) : nothing
-    tracked  = op in ("eval", "continue")
-    tracked && @lock SERVER.inflight_lock push!(SERVER.remote_inflight, (worker, env_key))
+    key = (String(worker), something(track, ""))
+    track === nothing || @lock SERVER.inflight_lock push!(SERVER.remote_inflight, key)
     reply = try
         call_server("remote_eval"; timeout = wait, worker = worker, op = op, args = fwd)
     catch e
         e isa InterruptException && rethrow()
         return tool_error(sprint(showerror, e))
     finally
-        tracked && @lock SERVER.inflight_lock delete!(SERVER.remote_inflight, (worker, env_key))
+        track === nothing || @lock SERVER.inflight_lock delete!(SERVER.remote_inflight, key)
     end
     reply isa AbstractDict ||
         return tool_error("unexpected reply from the server for a remote '$(op)': $(repr(reply))")
     return Dict{String,Any}(String(k) => v for (k, v) in reply)
 end
 
-# A cancel (`notifications/cancelled`) reaches evals running on other workers
-# through the server. Best-effort and asynchronous: the cancel path must not
-# wait on a round trip per remote eval.
+# A cancel (`notifications/cancelled`) reaches the foreground runs this chat has
+# going on other workers through the server. Best-effort and asynchronous: the
+# cancel path must not wait on a round trip per remote run.
 function interrupt_remote_inflight!()
     targets = @lock SERVER.inflight_lock collect(SERVER.remote_inflight)
-    for (worker, env_path) in targets
+    for (worker, run) in targets
+        isempty(run) && continue
         Base.errormonitor(@async try
             call_server("remote_eval"; timeout = 30.0, worker = worker, op = "interrupt",
-                        args = Dict{String,Any}("env_path" => env_path))
+                        args = Dict{String,Any}("run" => run))
         catch e
             e isa InterruptException && rethrow()
-            log_info("cancel: remote interrupt on '$(worker)' failed: $(sprint(showerror, e))")
+            log_info("cancel: remote interrupt of $(run) on '$(worker)' failed: $(sprint(showerror, e))")
         end)
     end
     return length(targets)
 end
 
+# The run `id` lives on another worker: where, or nothing.
+remote_run(id::AbstractString) = @lock SERVER.runs.lock get(SERVER.runs.remote, String(id), nothing)
+
+# The run this chat has on `worker` in `env_path` (for calls that name the env
+# instead of the run), or nothing.
+function remote_run_in(worker::AbstractString, env_path::Union{String,Nothing})
+    @lock SERVER.runs.lock begin
+        best = nothing
+        for (id, r) in SERVER.runs.remote
+            r.worker == worker && r.env_path == env_path || continue
+            (best === nothing || parse(Int, id[2:end]) > parse(Int, best[2:end])) && (best = id)
+        end
+        return best
+    end
+end
+
+# Start an eval on another worker as a run with an id from HERE, so the ids of
+# one chat never collide across its workers. A host that refuses (a busy env,
+# a switched-off chat) leaves no run behind.
+function remote_eval_start(worker::String, args::AbstractDict, code::AbstractString,
+                           user_to, background::Bool)
+    reg = SERVER.runs
+    id = new_run_id!(reg)
+    env_path = env_arg(args)
+    @lock reg.lock (reg.remote[id] = RemoteRun(worker, env_path, background))
+    fwd = Dict{String,Any}(String(k) => v for (k, v) in args)
+    fwd["run_id"] = id
+    r = remote_tool_call("eval", worker, fwd;
+        wait = background ? REMOTE_SPAWN_GRACE_S : remote_wait(effective_timeout(code, user_to)),
+        track = background ? nothing : id)
+    meta = get(r, "_meta", nothing)
+    started = meta isa AbstractDict && get(meta, "run", nothing) == id
+    started || @lock reg.lock delete!(reg.remote, id)
+    return r
+end
+
+# Forward a call about a remote run (`continue` / `interrupt`) to its host.
+remote_run_call(op, id, r::RemoteRun, args; wait) =
+    remote_tool_call(op, r.worker, Dict{String,Any}(String(k) => v for (k, v) in args if String(k) != "worker");
+                     wait, track = (op == "continue" && !r.background) ? id : nothing)
+
+max_bytes_arg(args) = Int(get(args, "max_response_bytes", 10_000))
+full_output_arg(args) = get(args, "full_output", false) === true
+
+# A finished run as the eval tool returns it: the collected result, plus the
+# Bonito upgrade card when a DISPLAY value came back as text because this env's
+# Bonito is too old for the live bridge (`s.bonito_mismatch`). Plain-text evals
+# never carry `wants_display`, so a `println` on a mismatched env won't nag.
+function eval_response(run::EvalRun; max_bytes::Int, full_output::Bool, descriptor::Bool = true)
+    r = collected_response(run; max_bytes, full_output, descriptor)
+    s = run.session
+    if run.result.wants_display && !isempty(s.bonito_mismatch)
+        pushfirst!(r["content"], bonito_upgrade_block(s.bonito_mismatch, s.env_path))
+    end
+    return r
+end
+
+# Wait for a run up to `timeout`; its result when it finished, else a checkpoint.
+function await_run_response(run::EvalRun, timeout; max_bytes::Int, full_output::Bool,
+                            descriptor::Bool = true)
+    wait_run(run, timeout) || return running_response(run; max_bytes, full_output)
+    return eval_response(run; max_bytes, full_output, descriptor)
+end
+
 # ── Handlers ────────────────────────────────────────────────────────────────
 function julia_eval_handler(args::AbstractDict)
     code        = String(get(args, "code", ""))
-    env_path    = get(args, "env_path", nothing)
+    env_path    = env_arg(args)
     julia_cmd   = get(args, "julia_cmd", nothing)
     user_to     = get(args, "timeout", nothing)
-    full_output = Bool(get(args, "full_output", false))
-    max_bytes   = Int(get(args, "max_response_bytes", 10_000))
+    full_output = full_output_arg(args)
+    max_bytes   = max_bytes_arg(args)
+    background  = get(args, "background", false) === true
 
     isempty(strip(code)) && return tool_error("empty code")
 
     worker = remote_worker(args)
-    worker === nothing ||
-        return remote_tool_call("eval", worker, args;
-                                wait = remote_wait(effective_timeout(code, user_to)))
+    worker === nothing || return remote_eval_start(worker, args, code, user_to, background)
 
     s = try
         get_or_create!(manager(), env_path; julia_cmd)
@@ -159,30 +251,21 @@ function julia_eval_handler(args::AbstractDict)
         @debug "bt_julia_eval: eval bridge unavailable; result will render text-only" exception = e
     end
 
-    timeout = effective_timeout(code, user_to)
-
-    res = try
-        execute(s, code; timeout, max_bytes, full_output)
+    reg = SERVER.runs
+    given = get(args, "run_id", nothing)      # set when this process hosts another worker's chat
+    id = given isa AbstractString && !isempty(given) ? String(given) : new_run_id!(reg)
+    run = try
+        start_run!(reg, s, code; id, env_path, background, tool_use_id = tool_use_id(args),
+                   max_bytes, full_output)
     catch e
+        e isa RunBusy && return tool_error(sprint(showerror, e))
         return Dict{String,Any}(
             "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
             "isError" => true,
         )
     end
-
-    res.status === :completed || return running_response(env_path, res.partial, res.elapsed_s)
-
-    # A DISPLAY value (App / plot / image) came back as text because this env's
-    # Bonito is too old for the live bridge (`s.bonito_mismatch` set by the gate).
-    # Prepend the upgrade marker so the chat shows the one-click [Update env] card
-    # instead of a bare "App". Plain-text evals never carry `wants_display`, so a
-    # `println` on a mismatched env won't nag.
-    blocks = res.blocks
-    if res.wants_display && !isempty(s.bonito_mismatch)
-        blocks = copy(blocks)
-        pushfirst!(blocks, bonito_upgrade_block(s.bonito_mismatch, s.env_path))
-    end
-    return completed_response(blocks, res.html, res.is_error, res.elapsed_s)
+    background && return started_response(run)
+    return await_run_response(run, effective_timeout(code, user_to); max_bytes, full_output)
 end
 
 # The upgrade-card marker the chat decodes (`bonito_upgrade_descriptor` in
@@ -203,86 +286,108 @@ function bonito_upgrade_block(current::AbstractString, env_path)
     return Dict{String,Any}("type" => "text", "text" => j)
 end
 
+# The run a continue/interrupt without `run` means: the open run of the named
+# env's session here. Throws when there is none.
+function env_run(env_path::Union{String,Nothing})
+    s = lookup_session(manager(), env_path)
+    r = open_run(SERVER.runs, s)
+    r === nothing && error("No eval in flight on this session ($(env_label(env_path))).")
+    return r
+end
+
 function julia_continue_handler(args::AbstractDict)
-    env_path  = get(args, "env_path", nothing)
-    user_to   = get(args, "timeout",  nothing)
-
-    worker = remote_worker(args)
-    worker === nothing ||
-        return remote_tool_call("continue", worker, args;
-            wait = remote_wait(user_to === nothing ? DEFAULT_TIMEOUT : (user_to > 0 ? user_to : nothing)))
-
-    # Pure lookup — never get_or_create! (which would kill+replace the session
-    # holding the in-flight eval; M5). `julia_cmd` is intentionally ignored here.
-    s = try
-        lookup_session(manager(), env_path)
-    catch e
-        return Dict{String,Any}(
-            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
-            "isError" => true,
-        )
+    user_to     = get(args, "timeout", nothing)
+    timeout     = user_to === nothing ? DEFAULT_TIMEOUT : (user_to > 0 ? user_to : nothing)
+    max_bytes   = max_bytes_arg(args)
+    full_output = full_output_arg(args)
+    id = run_arg(args)
+    if id !== nothing
+        r = remote_run(id)
+        r === nothing || return remote_run_call("continue", id, r, args; wait = remote_wait(timeout))
+    else
+        worker = remote_worker(args)
+        if worker !== nothing
+            rid = remote_run_in(worker, env_arg(args))
+            fg = rid === nothing ? nothing : (remote_run(rid).background ? nothing : rid)
+            return remote_tool_call("continue", worker, args; wait = remote_wait(timeout), track = fg)
+        end
     end
-
-    # Use the in-flight code's Pkg-aware behaviour
-    timeout = user_to === nothing ? DEFAULT_TIMEOUT :
-              user_to > 0 ? user_to : nothing
-
-    res = try
-        continue_eval!(s; timeout)
+    # Pure lookups — never get_or_create! (which would kill+replace the session
+    # holding the in-flight eval; M5).
+    run = try
+        id === nothing ? env_run(env_arg(args)) : lookup_run(SERVER.runs, id)
     catch e
-        return Dict{String,Any}(
-            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
-            "isError" => true,
-        )
+        e isa InterruptException && rethrow()
+        return Dict{String,Any}("content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
+                                "isError" => true)
     end
-    return res.status === :completed ?
-        completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s)
+    # `descriptor = false` comes from `bt_julia_wait` collecting a remote run.
+    return await_run_response(run, timeout; max_bytes, full_output,
+                              descriptor = get(args, "descriptor", true) !== false)
 end
 
 function julia_interrupt_handler(args::AbstractDict)
-    env_path  = get(args, "env_path", nothing)
-
-    worker = remote_worker(args)
-    worker === nothing ||
-        return remote_tool_call("interrupt", worker, args; wait = 90.0)
-
-    # Pure lookup — never get_or_create! (M5). Interrupting requires the EXISTING
+    max_bytes   = max_bytes_arg(args)
+    full_output = full_output_arg(args)
+    id = run_arg(args)
+    if id !== nothing
+        r = remote_run(id)
+        r === nothing || return remote_run_call("interrupt", id, r, args; wait = 90.0)
+    else
+        worker = remote_worker(args)
+        worker === nothing || return remote_tool_call("interrupt", worker, args; wait = 90.0)
+    end
+    # Pure lookups — never get_or_create! (M5). Interrupting requires the EXISTING
     # session that owns the in-flight eval, not a freshly created replacement.
-    s = try
-        lookup_session(manager(), env_path)
+    run = try
+        id === nothing ? env_run(env_arg(args)) : lookup_run(SERVER.runs, id)
     catch e
-        return Dict{String,Any}(
-            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
-            "isError" => true,
-        )
+        e isa InterruptException && rethrow()
+        return Dict{String,Any}("content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
+                                "isError" => true)
     end
-
-    res = try
-        interrupt!(s)
-    catch e
-        return Dict{String,Any}(
-            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
-            "isError" => true,
-        )
-    end
-    return res.status === :completed ?
-        completed_response(res.blocks, res.html, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s)
+    # Generous: the user's code might be in a try/catch that swallows the
+    # InterruptException for a while, but should yield within 30s.
+    interrupt_run!(run)
+    return await_run_response(run, 30.0; max_bytes, full_output)
 end
 
 function julia_restart_handler(args::AbstractDict)
-    env_path = get(args, "env_path", nothing)
+    env_path = env_arg(args)
     worker = remote_worker(args)
     worker === nothing ||
         return remote_tool_call("restart", worker, args; wait = 120.0)
+    # A run going in this session ends with it; it was stopped, not broken.
+    s = @lock manager().lock get(manager().sessions, _key(env_path), nothing)
+    r = s === nothing ? nothing : running_run(SERVER.runs, s)
+    r === nothing || @lock r.lock (r.interrupt_requested = true)
     restart!(manager(), env_path)
     label = env_path === nothing ? "<temp>" : env_path
     return Dict{String,Any}(
         "content" => [Dict("type" => "text",
-                            "text" => "Session for $label cleared. Next call rebuilds it.")],
+                            "text" => "Session for $label cleared. Next call rebuilds it." *
+                                      (r === nothing ? "" : " Run $(r.id) was stopped with it."))],
         "isError" => false,
     )
+end
+
+# The runs this process knows, for listings: running and uncollected ones in
+# full, the collected ones as a count.
+function runs_text(reg::RunRegistry = SERVER.runs)
+    runs = @lock reg.lock sort!(collect(values(reg.runs)); by = r -> r.started)
+    open_runs = [r for r in runs if is_running(r) || !(@lock r.lock r.collected)]
+    remote = @lock reg.lock sort!(collect(reg.remote); by = p -> parse(Int, p.first[2:end]))
+    lines = String[]
+    isempty(open_runs) || push!(lines, "runs:")
+    append!(lines, "  " * run_line(r) for r in open_runs)
+    ndone = length(runs) - length(open_runs)
+    ndone > 0 && push!(lines, "  ($(ndone) earlier run$(ndone == 1 ? "" : "s") collected)")
+    if !isempty(remote)
+        push!(lines, "runs started from here on other workers (bt_julia_wait / bt_julia_continue(run = …) reach them):")
+        append!(lines, "  $(id)  on $(r.worker)  env=$(env_label(r.env_path))$(r.background ? ", background" : "")"
+                       for (id, r) in remote)
+    end
+    return join(lines, "\n")
 end
 
 function julia_list_sessions_handler(args::AbstractDict)
@@ -306,6 +411,8 @@ function julia_list_sessions_handler(args::AbstractDict)
         end
         join(lines, "\n")
     end
+    rt = runs_text()
+    isempty(rt) || (text *= "\n\n" * rt)
     # Under BonitoAgents, also say which OTHER workers this chat could run on
     # (and what already runs there). Best-effort: standalone BonitoMCP has no
     # server to ask, and an eval host that doesn't answer must not fail the
@@ -317,6 +424,22 @@ function julia_list_sessions_handler(args::AbstractDict)
         "content" => [Dict("type" => "text", "text" => text)],
         "isError" => false,
     )
+end
+
+# An eval host's answer to `runs`: the status of the named runs (all of them
+# when none are named), as data — `bt_julia_wait` on the chat's own worker polls
+# its remote runs with it.
+function julia_runs_handler(args::AbstractDict)
+    reg = SERVER.runs
+    ids = get(args, "runs", nothing)
+    wanted = ids isa AbstractVector && !isempty(ids) ? String.(ids) :
+             @lock reg.lock collect(keys(reg.runs))
+    found = Any[]; unknown = String[]
+    for id in wanted
+        r = @lock reg.lock get(reg.runs, id, nothing)
+        r === nothing ? push!(unknown, id) : push!(found, run_status(r))
+    end
+    return Dict{String,Any}("runs" => found, "unknown" => unknown)
 end
 
 function remote_workers_text()
@@ -343,6 +466,10 @@ function remote_workers_text()
             s isa AbstractDict || continue
             push!(lines, "      session $(get(s, "env_path", "<temp>"))" *
                          (get(s, "in_flight", false) === true ? "  [EVAL IN FLIGHT]" : ""))
+        end
+        for r in get(w, "runs", Any[])
+            r isa AbstractDict || continue
+            push!(lines, "      " * String(get(r, "line", get(r, "run", "?"))))
         end
     end
     return join(lines, "\n")
@@ -410,22 +537,32 @@ Displaying apps & plots:
   - Don't call `display`, `Page`, or `Bonito.Server` — the session is already
     wired to the chat; return the value instead.
 
-Streaming model — IMPORTANT:
+Runs and the streaming model — IMPORTANT:
+  - Every eval is a RUN with a short id (`r4`), named in the result.
   - `timeout` is a **soft** checkpoint, not a hard kill. The call returns
     within `timeout` seconds with either:
       • status="completed" — full result blocks; OR
-      • status="running"   — the eval is still in flight; the response
-        contains the stdout captured so far so you can decide what to do.
+      • status="running"   — the run goes on; the response contains the
+        output so far and the run id, so you can decide what to do.
   - When you see status="running", choose one:
-      • bt_julia_continue (wait another `timeout` seconds)
-      • bt_julia_interrupt (SIGINT — captures output + InterruptException;
+      • bt_julia_wait(runs = ["r4"], seconds = …) (block until it finishes)
+      • bt_julia_continue(run = "r4") (wait another `timeout` seconds)
+      • bt_julia_interrupt(run = "r4") (captures output + InterruptException;
         session state preserved)
       • bt_julia_restart (SIGKILL — loses all session state)
-  - Lower `timeout` = more frequent feedback on long jobs but more round
-    trips. Higher = less overhead but coarser progress signal.
   - Default 30s; auto-disabled (no checkpointing) when the code uses
     `Pkg.*` since installs are routinely multi-minute. Pass `timeout=0`
     to disable the checkpoint entirely.
+
+Background runs (long work, several machines at once):
+  - `background = true` returns at once with the run id; the run goes on.
+    Start a test suite on each worker this way, then wait for all of them
+    with ONE `bt_julia_wait(runs = [...], seconds = …)` call.
+  - Under BonitoAgents the chat tells you when a background run you have not
+    collected finishes, so there is no need to poll. A cancelled turn leaves
+    background runs running; stop one with bt_julia_interrupt(run = …).
+  - One run per env at a time: a second eval in an env whose run is still
+    going is refused and names that run.
 
 Output:
   - Captured stdout/stderr followed by the return value's repr (or the error),
@@ -466,6 +603,7 @@ register!(
             "full_output"        => Dict("type"=>"boolean", "default"=>false, "description"=>"Disable output truncation/summarisation"),
             "max_response_bytes" => Dict("type"=>"integer", "default"=>10_000, "description"=>"Per-block byte cap"),
             "worker"             => Dict("type"=>"string", "description"=>"Run on this OTHER worker (its display name) instead of the chat's own. Needs the chat's 'remote julia' switch; see bt_julia_list_sessions for the names."),
+            "background"         => Dict("type"=>"boolean", "default"=>false, "description"=>"Return at once with the run id and let the run go on; collect it with bt_julia_wait."),
         ),
         "required" => ["code"],
     ),
@@ -477,14 +615,18 @@ const WORKER_ARG = Dict("type"=>"string", "description"=>"Address the session on
 register!(
     "bt_julia_continue",
     """
-    Continue waiting for an in-flight bt_julia_eval call. Returns the same
-    shape as bt_julia_eval — completed or still-running. Pass `timeout` to
-    set how long this checkpoint waits before returning again.
+    Continue waiting for a run (a bt_julia_eval still going): returns its new
+    output and, once it finished, its result — the same shape as bt_julia_eval.
+    Name it with `run` (e.g. "r4", from bt_julia_eval's result; reaches runs on
+    other workers too), or with `env_path` (+ `worker`) for the run in that
+    session. Pass `timeout` to set how long this checkpoint waits. To wait for
+    several runs at once, use bt_julia_wait.
     """,
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
-            "env_path" => Dict("type"=>"string", "description"=>"Session to continue; omit for temp"),
+            "run"      => Dict("type"=>"string", "description"=>"The run to continue, e.g. \"r4\""),
+            "env_path" => Dict("type"=>"string", "description"=>"Session to continue when no `run` is given; omit for temp"),
             "timeout"  => Dict("type"=>"number", "description"=>"Checkpoint timeout in seconds. Default 30; pass 0 to disable."),
             "worker"   => WORKER_ARG,
         ),
@@ -495,15 +637,17 @@ register!(
 register!(
     "bt_julia_interrupt",
     """
-    SIGINT the in-flight bt_julia_eval. The user code raises InterruptException;
-    the session subprocess and all state survive. Returns the captured stdout
-    so far + the interrupt error block. Use this when you want to stop a
-    runaway computation but keep the loaded packages/variables.
+    Stop a run (a bt_julia_eval still going). The user code raises
+    InterruptException; the session subprocess and all state survive. Returns
+    the output so far + the interrupt error block. Use this when you want to
+    stop a runaway computation but keep the loaded packages/variables. Name it
+    with `run` (e.g. "r4"), or with `env_path` (+ `worker`).
     """,
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
-            "env_path" => Dict("type"=>"string", "description"=>"Session to interrupt; omit for temp"),
+            "run"      => Dict("type"=>"string", "description"=>"The run to stop, e.g. \"r4\""),
+            "env_path" => Dict("type"=>"string", "description"=>"Session to interrupt when no `run` is given; omit for temp"),
             "worker"   => WORKER_ARG,
         ),
     ),
@@ -531,6 +675,7 @@ register!(
 register!(
     "bt_julia_list_sessions",
     "List currently active per-`env_path` Julia sessions (marks any with an in-flight eval), " *
+    "the runs of this chat (running, and finished ones whose result you have not collected), " *
     "and the OTHER workers this chat could run Julia on with `worker = \"<name>\"`.",
     Dict{String,Any}("type" => "object", "properties" => Dict{String,Any}(
         "worker" => Dict("type"=>"string", "description"=>"List the sessions on this other worker instead"))),

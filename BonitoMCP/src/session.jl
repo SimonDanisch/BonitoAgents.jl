@@ -504,12 +504,8 @@ function execute(s::JuliaSession, code::AbstractString;
         try
             Meta.parseall(String(code))
         catch e
-            return (status   = :completed,
-                    blocks   = [Dict{String,Any}("type"=>"text",
-                                                  "text"=>"\e[91mERROR: parse error: $(sprint(showerror, e))\e[39m")],
-                    html     = nothing,
-                    is_error = false,
-                    elapsed_s = 0.0)
+            return completed_result("\e[91mERROR: parse error: $(sprint(showerror, e))\e[39m";
+                                    errored = true)
         end
 
         # Anchor the .bonitoAgents/show/ dir in env_path so rich-output files
@@ -654,24 +650,37 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
         # rawOutput string, so a plain user error must never ride it — the
         # descriptor's typed `errored` flag carries that instead. No block
         # sniffing anywhere: the flag comes from the worker payload.
-        is_error = fetch_failed
-        # Stitch ONE terminal-faithful output text: captured stdout/stderr,
-        # then the echo (result repr / red ERROR text) — exactly what a REPL
-        # session would show. No code echo (the agent has its own tool input,
-        # the chat has the typed `code` field), no in-band labels.
-        output = partial
-        if result.echo !== nothing
-            output = isempty(output) ? result.echo : output * "\n" * result.echo
-        end
-        blocks = Dict{String,Any}[]
-        isempty(output) ||
-            push!(blocks, Dict{String,Any}("type" => "text", "text" => output))
-        append!(blocks, value_blocks)
-        return (status = :completed, blocks = blocks, html = html,
-                is_error = is_error, elapsed_s = elapsed, wants_display = wants_display)
+        return completed_result(result.echo; partial, value_blocks, html,
+                                is_error = fetch_failed, errored = result.errored,
+                                wants_display, elapsed_s = elapsed)
     end
     return (status = :running, partial = partial, elapsed_s = elapsed,
             code = s.in_flight_code)
+end
+
+"""
+    completed_result(echo; partial, value_blocks, html, is_error, errored, wants_display, elapsed_s)
+
+A finished eval, in the one shape every caller reads. `blocks` stitches ONE
+terminal-faithful output text — the captured stdout/stderr (`partial`), then the
+`echo` (result repr / red ERROR text), exactly what a REPL session shows — and
+the value blocks after it. No code echo (the agent has its own tool input, the
+chat the typed `code` field), no in-band labels. The parts ride along too, for
+runs, which hand out output they collected themselves (runs.jl).
+"""
+function completed_result(echo::Union{AbstractString,Nothing}; partial::AbstractString = "",
+                          value_blocks = Dict{String,Any}[], html = nothing,
+                          is_error::Bool = false, errored::Bool = false,
+                          wants_display::Bool = false, elapsed_s::Real = 0.0)
+    output = echo === nothing ? String(partial) :
+             isempty(partial) ? String(echo) : string(partial, "\n", echo)
+    blocks = Dict{String,Any}[]
+    isempty(output) || push!(blocks, Dict{String,Any}("type" => "text", "text" => output))
+    append!(blocks, value_blocks)
+    return (status = :completed, blocks = blocks, html = html, is_error = is_error,
+            elapsed_s = Float64(elapsed_s), wants_display = wants_display,
+            partial = String(partial), echo = echo === nothing ? nothing : String(echo),
+            value_blocks = value_blocks, errored = errored)
 end
 
 # Terminal-faithful text for a Malt task failure (interrupt / worker death).

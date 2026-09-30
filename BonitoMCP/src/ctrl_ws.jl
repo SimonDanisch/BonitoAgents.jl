@@ -12,10 +12,11 @@
 # `notifications/cancelled` path use.
 #
 # Wire: one JSON object per WS message.
-#   server → us:  {"op": "interrupt_eval", "request_id": id, "env_path"?: p}
+#   server → us:  {"op": "interrupt_eval", "request_id": id, "run"?: "r4", "env_path"?: p}
 #                 {"op": "ping", "request_id": id}
 #   us → server:  {"type": "interrupt_result", "request_id": id, "interrupted": n}
 #                 {"type": "pong", "request_id": id}
+#                 {"type": "run_update", "run": "r4", "status": …}   (unsolicited, runs.jl)
 #
 # The channel also runs in the OTHER direction, for the dev tools (`tools/dev.jl`):
 #   us → server:  {"type": "dev_request", "dev_id": n, "op": "...", "args": {…}}
@@ -176,6 +177,9 @@ function ctrl_dial_loop(wsurl::AbstractString, handshake::AbstractString;
                 verdict == "ok" || error("the worker relay answered $(repr(verdict)) instead of ok")
                 connected = true
                 SERVER.control.ws = ws                       # arm the stream forwarder
+                # The server may be new (restarted) or have missed frames while
+                # we were away: tell it about every run it should still show.
+                announce_open_runs()
                 try
                     for msg in ws
                         # Per-frame guard: one malformed frame must not drop the
@@ -275,10 +279,20 @@ function handle_ctrl_frame!(ws, msg::AbstractDict)
                  ErrorException(String(get(msg, "error", "unknown server error"))))
         return nothing
     elseif op == "interrupt_eval"
-        env_path = get(msg, "env_path", nothing)
-        env_path isa AbstractString && isempty(env_path) && (env_path = nothing)
-        n = interrupt_in_flight!(env_path isa AbstractString ? String(env_path) : nothing)
-        log_info("ctrl interrupt_eval (env=$(env_path)) → interrupted $n in-flight eval(s)")
+        # The user's ⊗ on one card: that RUN when the chat knows it, else the
+        # env's eval (a card from before runs). A user's stop reaches background
+        # runs too — only a turn cancel leaves them alone.
+        run = get(msg, "run", nothing)
+        n = if run isa AbstractString && !isempty(run)
+            r = @lock SERVER.runs.lock get(SERVER.runs.runs, String(run), nothing)
+            r !== nothing && interrupt_run!(r) ? 1 : 0
+        else
+            env_path = get(msg, "env_path", nothing)
+            env_path isa AbstractString && isempty(env_path) && (env_path = nothing)
+            interrupt_in_flight!(env_path isa AbstractString ? String(env_path) : nothing;
+                                 background = true)
+        end
+        log_info("ctrl interrupt_eval (run=$(run), env=$(get(msg, "env_path", nothing))) → interrupted $n eval(s)")
         WebSockets.send(ws, JSON.json(Dict(
             "type" => "interrupt_result", "request_id" => rid, "interrupted" => n)))
     elseif op == "ping"

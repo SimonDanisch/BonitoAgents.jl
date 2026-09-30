@@ -159,6 +159,12 @@ enumerates.
   `bt_julia_continue`/`bt_julia_interrupt`/`bt_julia_restart` address a session
   that is still running, and every one of them takes `worker =` to run on
   another machine.
+- **Runs**: every eval is a run with an id (`r4`). `background = true` returns
+  at once, and `bt_julia_wait` blocks on several runs, on several workers, in
+  one call: a test suite on each machine from one chat. The run's card stays
+  live until the run ends, its task-bar row's ⊗ stops that run only, a
+  cancelled turn leaves background runs running, and the agent is told when
+  one it has not collected finishes.
 - **One tool for values and apps**: whatever the eval returns is rendered as
   what it is — a Bonito app or a Makie figure comes back live in the card, with
   interactions round-tripping to Julia in the worker's session. Embeds detach

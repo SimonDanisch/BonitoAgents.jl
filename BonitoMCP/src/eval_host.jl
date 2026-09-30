@@ -14,8 +14,10 @@
 # into the chat on the desktop).
 #
 # Wire, on top of ctrl_ws.jl's:
-#   server → host:  {"op": "eval"|"continue"|"interrupt"|"restart"|"sessions",
+#   server → host:  {"op": "eval"|"continue"|"interrupt"|"restart"|"sessions"|"runs",
 #                    "request_id", "args": {…the tool's own arguments…}}
+#                   (`runs` answers with run statuses as data, not a tool result:
+#                   `bt_julia_wait` on the chat's own worker polls with it)
 #                   {"op": "shutdown", "request_id"}
 #   host → server:  {"type": "eval_host_result", "request_id", "result": <tool result>}
 #
@@ -29,7 +31,7 @@
 
 const HOST_ORPHAN_S   = 600.0
 const HOST_ENV_WORKER = "BONITOAGENTS_EVAL_HOST_WORKER"
-const HOST_OPS        = ("eval", "continue", "interrupt", "restart", "sessions", "shutdown")
+const HOST_OPS        = ("eval", "continue", "interrupt", "restart", "sessions", "runs", "shutdown")
 
 # Which worker this process runs on, when it is an eval host ("" otherwise).
 host_worker_id() = get(ENV, HOST_ENV_WORKER, "")
@@ -111,6 +113,7 @@ function handle_host_op!(ws, msg::AbstractDict)
               op == "interrupt" ? julia_interrupt_handler :
               op == "restart"   ? julia_restart_handler :
               op == "sessions"  ? julia_list_sessions_handler :
+              op == "runs"      ? julia_runs_handler :
               nothing
     if handler === nothing
         host_reply(ws, rid, Dict{String,Any}("error" => "unknown eval host op '$(op)'"))

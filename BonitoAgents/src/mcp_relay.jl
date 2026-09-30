@@ -90,6 +90,8 @@ function serve_mcp_channel(state::ServerState, ch::MCPChannel)
     finally
         close(ch)
         @info "MCP channel closed" project_id = ch.project_id eval_host = ch.host_worker
+        # Its runs end as lost unless it comes back and announces them again.
+        runs_channel_closed!(state, ch.project_id, ch.host_worker)
     end
     return nothing
 end
