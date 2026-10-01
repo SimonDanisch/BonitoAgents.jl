@@ -538,4 +538,29 @@ end
     end
 end
 
+@testset "a ping's round trip is measured, and a slow one is logged" begin
+    # The time from ping to pong is what any small message waits behind on the
+    # connection, which the priorities cannot reorder once it is in the socket.
+    # Here the server's sends are held back for a while, as by a saturated upload.
+    reg = Dict{Vector{UInt8},Link}()
+    client = Link(:client; ping_interval = 0.2, ping_deadline = 30.0, name = "the server")
+    ct, st = memory_pair()
+    gate = GateTransport(st)
+    server_task = Threads.@spawn serve!(reg, gate; ping_interval = 30, ping_deadline = 60)
+    connect!(client, ct, UInt8[])
+    server = fetch(server_task)
+    @test isnan(ping_rtt(server))                     # it has not pinged yet
+    @test eventually(() -> !isnan(ping_rtt(client)))
+    @test ping_rtt(client) < 1.0
+    @test client.slow_logged_at == 0.0
+    hold!(gate, true)
+    sleep(2.6)
+    hold!(gate, false)
+    @test eventually(() -> ping_rtt(client) > 2.0)
+    @test client.slow_logged_at > 0.0                 # and it said so
+    @test eventually(() -> ping_rtt(client) < 1.0)    # the next one is quick again
+    kill!(client, "done")
+    kill!(server, "done")
+end
+
 end # WorkerLink

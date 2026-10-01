@@ -1040,6 +1040,10 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     # section is MOUNTED ONCE and updated in place — see `eval_body_dom`.
     stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
+    # Taken by both writers of `stream_text`, the tail (`append_tail!`, on its
+    # own thread) and the complete output (`eval_result!`), so that the complete
+    # output is the last word.
+    stream_lock::ReentrantLock
     # What the terminal result IS, `nothing` until it lands: a DESCRIPTION
     # (`(kind = :ref | :upgrade | :outdated, …)`, see `eval_result!`), never a
     # node — the message is shared by every tab and each builds its own
@@ -1061,7 +1065,7 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
 end
 JuliaEvalToolMsg(message::Message, server) =
     JuliaEvalToolMsg(message, server, "", "", nothing, "",
-                     Observable(""), nothing, Observable{Any}(nothing), false, nothing, nothing, false)
+                     Observable(""), nothing, ReentrantLock(), Observable{Any}(nothing), false, nothing, nothing, false)
 
 mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     message::Message
@@ -1072,12 +1076,13 @@ mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     worker::String
     stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
+    stream_lock::ReentrantLock
     result::Observable{Any}
     run::String                   # the run it continues (`run = "r4"`); "" ⇒ by env
 end
 JuliaContinueToolMsg(message::Message, server) =
     JuliaContinueToolMsg(message, server, "", "", nothing, "",
-                         Observable(""), nothing, Observable{Any}(nothing), "")
+                         Observable(""), nothing, ReentrantLock(), Observable{Any}(nothing), "")
 
 mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
     message::Message
@@ -2689,7 +2694,7 @@ function eval_result!(m::JuliaEvalCall, content)
     output = join(String[c.text for c in content[begin:stop]
                          if c isa AgentClientProtocol.TextContent &&
                             bonito_upgrade_descriptor(c.text) === nothing], "\n")
-    isempty(strip(output)) || set_once!(m.stream_text, output)
+    isempty(strip(output)) || lock(() -> set_once!(m.stream_text, output), m.stream_lock)
     # Deprecation guard: an outdated worker's output is a ```julia code echo with
     # no v3 descriptor. Surface the hint instead of a silently-mangled card (the
     # raw output above is kept, so nothing is hidden).
@@ -4766,10 +4771,7 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
                 while isready(ch)
                     write(buf, take!(ch))
                 end
-                # Straight into the Observable the Output section is bound to —
-                # no `stream_tail` wire message, no DOM poke from JS.
-                m.stream_text[] = last(m.stream_text[] * strip_ansi_codes(String(take!(buf))),
-                                       EVAL_STREAM_KEEP_CHARS)
+                append_tail!(m, String(take!(buf)))
             else
                 sleep(EVAL_STREAM_IDLE_S)
             end
@@ -4790,6 +4792,20 @@ end
 # Whether an eval's live tail should keep listening: while its call is open, and
 # for as long as a run it started is still going.
 eval_streaming(m::JuliaEvalCall) = tool_status(m) in ("pending", "in_progress")
+
+# A burst of the live tail, straight into the Observable the Output section is
+# bound to (no `stream_tail` wire message, no DOM poke from JS). Only while the
+# eval still runs, checked under the lock `eval_result!` writes the complete
+# output under: the call can end between the loop's check and this write, and a
+# tail appended after that replaced the colored complete output with the
+# stripped tail (`Pkg.status()` came out without color now and then).
+function append_tail!(m::JuliaEvalCall, chunk::AbstractString)
+    lock(m.stream_lock) do
+        eval_streaming(m) || return
+        m.stream_text[] = last(m.stream_text[] * strip_ansi_codes(chunk), EVAL_STREAM_KEEP_CHARS)
+    end
+    return nothing
+end
 
 function stream_bg_update!(model::ChatModel, m::BashToolMsg)
     write_bg_content!(model.chat_dir, m)
@@ -7131,7 +7147,9 @@ end
 function reconcile_replay!(model::ChatModel, replay)
     candidates = filter(keep_in_history, replay)
     # Mutate under the lock; collect what to EMIT and emit after (listeners —
-    # the JS bridges — must never run while we hold the lock).
+    # the JS bridges — must never run while we hold the lock). Every tab's
+    # requests for this chat wait meanwhile, hence `locked_s` in the log.
+    t0 = time()
     event, adopted_n = lock(model.lock) do
         existing = model.msgs_store
         # Trailing store messages that are fresh user bubbles the agent hasn't
@@ -7185,12 +7203,13 @@ function reconcile_replay!(model::ChatModel, replay)
                     length(adopted))
         end
     end
+    locked = time() - t0
     # Stamp even on a no-op: "we checked against the session at time X" is the
     # watermark `session_advanced_since_sync` compares the jsonl mtime against.
     mark_history_synced!(model)
     event === nothing && return nothing
     chat_emit(model, event)
-    @info "reconciled claude history" project_id = model.project_id adopted = adopted_n mode = event["type"]
+    @info "reconciled claude history" project_id = model.project_id adopted = adopted_n mode = event["type"] locked_s = round(locked; digits = 1)
     return nothing
 end
 
@@ -9247,8 +9266,23 @@ end
 # `session::Session` closure binding flows through unchanged because
 # `handle_command!(::Any, ::Any, ::ToolRenderCommand)` needs it for
 # `dom_in_js`.
-chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict) =
+# Runs on the tab's message task (Bonito handles a tab's messages one at a
+# time), so a command that waits holds up everything else in that tab: every
+# chat in it stays as it is while the page looks connected. Slow ones are
+# logged with the tab (`tab_id`; "tab opened" says whose it is).
+function chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict)
+    t0 = time()
     handle_command!(model, session, parse_chat_command(msg))
+    took = time() - t0
+    took > SLOW_COMMAND_S &&
+        @warn "slow chat command: its tab waited on it" project_id = model.project_id type = get(msg, "type", "?") took_s = round(took; digits = 1) tab = tab_id(session)
+    return nothing
+end
+
+const SLOW_COMMAND_S = 1.0
+
+"A browser tab, short, as the log names it (see \"tab opened\")."
+tab_id(session::Session) = first(Bonito.root_session(session).id, 8)
 
 # `ChatModel` is a Bonito component. Per the convention, the shared instance
 # (the one in `state.chat_models[pid]`) should never be rendered directly —

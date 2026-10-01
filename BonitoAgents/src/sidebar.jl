@@ -1570,6 +1570,8 @@ function unified_app(state::ServerState)
             "This server answers only through its login proxy. Open it at its public address.";
             style = "padding: 2em; font-family: sans-serif")
         register_user_session!(state, session, user)
+        # Which device a tab is: the log's slow-command lines name tabs only.
+        @info "tab opened" tab = tab_id(session) user = user.name client = client_address(request)
         # Per-session view of the shared state. `copy(state, session, user)`
         # shares the workers/projects/chat_models tables and the lock, but gives
         # this session its OWN connected child of each version Observable (via

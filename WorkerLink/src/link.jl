@@ -68,6 +68,13 @@ mutable struct Link <: AbstractLink
     generation::Int             # bumped per attach/detach: stale tasks know to stop
     last_rx::Float64
     last_ping::Float64
+    # How long the last ping took to come back (NaN before the first): what a
+    # small message waits behind whatever the connection is carrying, which the
+    # priorities here cannot reorder once it is in the socket. Slow ones are
+    # logged (`SLOW_PING_S`), at most once a minute (`slow_logged_at`).
+    ping_sent::Float64           # when the ping being waited for went out; 0 if none
+    ping_rtt::Float64
+    slow_logged_at::Float64
     detached_at::Float64
     peer_window::Int
     # configuration
@@ -80,32 +87,35 @@ mutable struct Link <: AbstractLink
     on_state::Any               # (link, state::Symbol) -> anything
     dead_reason::String
     attached_once::Bool         # a link that was never connected has nothing to reset
+    name::String                # who is at the other end, for the log ("" if nobody said)
 end
 
 """
-    Link(role; window, grace, ping_interval, ping_deadline, on_open, on_state, id)
+    Link(role; window, grace, ping_interval, ping_deadline, on_open, on_state, id, name)
 
 A link endpoint. `role` is `:client` (the worker, which dials) or `:server`.
 `on_open(ch)` runs (in its own task) for every channel the PEER opens;
 `on_state(link, state)` for every `:connected` / `:detached` / `:dead` change,
 and with `:reset` when a client's link restarts from nothing (see [`connect!`](@ref)).
 Channel 0 exists from the start on both sides: see [`control_channel`](@ref).
+`name` says who is at the other end in this side's log.
 """
 function Link(role::Symbol;
               window::Int = DEFAULT_WINDOW, grace::Real = 300.0,
               ping_interval::Real = 15.0, ping_deadline::Real = 45.0,
               on_open = ch -> abort(ch, "no channels are accepted here"),
               on_state = (link, state) -> nothing,
-              id::Vector{UInt8} = rand(UInt8, 16))
+              id::Vector{UInt8} = rand(UInt8, 16),
+              name::AbstractString = "")
     role in (:client, :server) || throw(ArgumentError("role must be :client or :server"))
     lk = ReentrantLock()
     link = Link(role, id, lk, Threads.Condition(lk), :detached,
                 Dict{UInt32,LinkChannel}(), role === :client ? UInt32(1) : UInt32(2),
                 [UInt32[] for _ in 1:NPRIORITIES], Frame[], Vector{UInt8}[],
                 UInt64(1), Tuple{UInt64,Vector{UInt8}}[], 1, UInt64(0), UInt64(0),
-                nothing, 0, 0.0, 0.0, time(), window,
+                nothing, 0, 0.0, 0.0, 0.0, NaN, 0.0, time(), window,
                 window, Float64(grace), Float64(ping_interval), Float64(ping_deadline),
-                on_open, on_state, "", false)
+                on_open, on_state, "", false, String(name))
     lock(lk) do
         link.channels[0] = new_channel(link, UInt32(0), 0, UInt8[])
     end
@@ -299,7 +309,10 @@ function handle_frame!(link::Link, t::Transport, f::Frame)
         elseif k == F_PING
             enqueue_urgent!(link, Frame(F_PONG, 0))
         elseif k == F_PONG
-            # last_rx above is all a pong is for
+            # Besides `last_rx` above: how long it took. Pongs come back in the
+            # order their pings went, so one arriving while a ping is waited for
+            # answers that one.
+            link.ping_sent > 0.0 && pong_received!(link, link.last_rx)
         elseif is_sequenced(k)
             f.seq <= link.last_received && return nothing   # replayed, already have it
             f.seq == link.last_received + 1 ||
@@ -448,6 +461,7 @@ function attach!(link::Link, t::Transport, peer_last_received::UInt64)
         link.attached_once = true
         link.last_rx = time()
         link.last_ping = time()
+        link.ping_sent = 0.0          # a ping on the old connection is not coming back
         notify(link.wake)
         prev
     end
@@ -515,6 +529,30 @@ end
 
 # Pings, acknowledgements that would otherwise wait, the liveness deadline, and
 # the grace period of a detached link.
+"""
+    ping_rtt(link) -> Float64
+
+How long the link's last ping took to come back, in seconds (`NaN` before the
+first): the time a small message currently waits behind what the connection
+carries.
+"""
+ping_rtt(link::Link) = lock(() -> link.ping_rtt, link.lock)
+
+const SLOW_PING_S = 2.0
+
+# Caller holds the lock.
+function pong_received!(link::Link, now::Float64)
+    rtt = now - link.ping_sent
+    link.ping_sent = 0.0
+    link.ping_rtt = rtt
+    if rtt > SLOW_PING_S && now - link.slow_logged_at > 60.0
+        link.slow_logged_at = now
+        @warn "WorkerLink: slow connection: a ping took $(round(rtt; digits = 1))s to come back; " *
+              "every request on it waits about as long" role = link.role peer = link.name
+    end
+    return nothing
+end
+
 function ticker_loop(link::Link; tick::Real = 0.1)
     while true
         sleep(tick)
@@ -525,6 +563,7 @@ function ticker_loop(link::Link; tick::Real = 0.1)
                 now - link.last_rx > link.ping_deadline && return (:lost, link.transport)
                 if now - link.last_ping >= link.ping_interval
                     link.last_ping = now
+                    link.ping_sent == 0.0 && (link.ping_sent = now)
                     enqueue_urgent!(link, Frame(F_PING, 0))
                 end
                 link.last_received > link.last_ack_sent && send_ack!(link)

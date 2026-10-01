@@ -68,7 +68,10 @@ end
             WorkerLink.kill!(old_link, "the server forgot it")
             @test timedwait(() -> BA.worker_connected(state, "link-test") &&
                                   BA.worker_link(state, "link-test") !== old_link, 30.0) === :ok
-            @test worker.control !== old_control          # a new control channel …
+            # A new control channel … The server counts the worker connected once
+            # it sent its welcome, the worker takes the new channel once that
+            # arrived: a moment later (this failed now and then without the wait).
+            @test timedwait(() -> worker.control !== old_control, 10.0) === :ok
             @test BA.list_worker_dir(state, "link-test", dir).path == dir   # … that works
         end
 

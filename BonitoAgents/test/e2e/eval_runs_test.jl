@@ -192,9 +192,12 @@
                     return r.top >= v.top - 2 && r.top < v.bottom && e.classList.contains('bt-jump-flash'); })()""";
                 timeout = 10) == true
             # Back down, the way a user does (the jump left follow mode, and the
-            # virtual list renders what is near the view).
+            # virtual list renders what is near the view): the pill, which shows
+            # while the end of the chat is out of view. A jump that left the end
+            # partly in view has none, as nothing is hidden below (seen once in a
+            # full suite run); the end being hidden without a pill is the failure.
             @test TK.wait_for(server, "back to the bottom",
-                "(() => { const b = [...document.querySelectorAll('.bt-new-msg-pill-visible')].find(x => x.offsetParent !== null); if (!b) return false; b.click(); return true; })()";
+                "(() => { const b = [...document.querySelectorAll('.bt-new-msg-pill-visible')].find(x => x.offsetParent !== null); if (b) { b.click(); return true; } return !$VP.querySelector('.bt-messages').__bt_chat.lastMessageFullyOutOfView(); })()";
                 timeout = 10) == true
             # It ends with the run's outcome, the row gone with the collection.
             @test TK.wait_for(server, "the continue ends with the run's outcome",

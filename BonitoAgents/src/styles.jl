@@ -131,7 +131,8 @@ shown as reconnecting; "disconnected" is Bonito giving up after its retries,
 shown with a reload button. Before the first successful connection nothing is
 shown: the page is still loading then. "expired" is final: the server has no
 session for this page (it restarted, or dropped the page after an hour away), so
-the page reloads itself, or asks first when a reload would lose unsent text.
+the page reloads itself, or asks first when a reload would lose unsent text (text
+kept as a chat's draft comes back after the reload, so it does not count).
 
 NOT the same signal as the in-chat status dot: that one is the AGENT session's
 liveness, this one is whether this browser tab can still talk to the server at
@@ -233,10 +234,17 @@ function connection_guard(session::Bonito.Session)
             expired:      ['This page has to be reloaded',
                            'The server restarted, or this page sat unused for over an hour, so it cannot reconnect. Copy what you typed, then reload.'],
         };
-        // Text typed into a chat composer and not sent: a reload would throw it
-        // away. What the page rendered into it (the yolo reminders) the server keeps.
+        // Text typed into a chat composer that a reload would throw away: not
+        // sent, and not kept as the chat's draft either (bonitoagents.js keeps one
+        // per chat in localStorage and puts it back after a reload, unless the
+        // storage is full or off). What the page rendered into it (the yolo
+        // reminders) the server keeps.
+        const draftOf = t => {
+            const pid = t.closest('.bt-chatpane')?.dataset.panePid;
+            try { return pid ? localStorage.getItem('bt-draft:' + pid) : null; } catch (_) { return null; }
+        };
         const unsent = () => Array.from(document.querySelectorAll('textarea.bt-text-input'))
-            .some(t => t.value.trim() !== '' && t.value !== t.defaultValue);
+            .some(t => t.value.trim() !== '' && t.value !== t.defaultValue && t.value !== draftOf(t));
         function reloadWhenShown() {
             if (document.visibilityState === 'visible') { window.location.reload(); return; }
             const onShow = () => {

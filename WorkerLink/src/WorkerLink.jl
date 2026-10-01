@@ -20,7 +20,7 @@ include("channel.jl")
 include("handshake.jl")
 
 export Link, LinkChannel, open_channel, control_channel, abort, disconnect!, kill!,
-       connect!, read_hello, welcome!, refuse, Hello,
+       connect!, read_hello, welcome!, refuse, Hello, ping_rtt,
        Transport, WebSocketTransport, MemoryTransport, memory_pair,
        LinkDead, LinkRefused, ProtocolError
 

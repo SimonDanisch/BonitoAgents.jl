@@ -257,6 +257,8 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
     )
 end
 
+jsonable_rtt(rtt::Float64) = isnan(rtt) ? nothing : round(rtt; digits = 3)
+
 function dev_section(state::ServerState, ::Val{:workers}, ::String)
     links     = lock(() -> copy(state.worker_links), state.lock)
     last_scan = lock(() -> copy(state.last_scan), state.lock)
@@ -268,6 +270,9 @@ function dev_section(state::ServerState, ::Val{:workers}, ::String)
         # connected / detached (waiting for the worker to come back) / none
         "link"          => haskey(links, w.worker_id) ?
             String(WorkerLink.state(links[w.worker_id])) : "none",
+        # What a request to it waits behind right now (WorkerLink.ping_rtt).
+        "ping_s"        => haskey(links, w.worker_id) ?
+            jsonable_rtt(WorkerLink.ping_rtt(links[w.worker_id])) : nothing,
         "hostname"      => w.hostname,
         "home"          => w.home,
         "projects_root" => w.projects_root,

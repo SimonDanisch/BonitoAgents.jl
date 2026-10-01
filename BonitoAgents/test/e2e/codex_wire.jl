@@ -93,8 +93,22 @@ function run_suite(server)
         # proves the whole recovery. Asserted on the card that auto-expands;
         # only one does, and driving the other open means clicking, which races
         # Monaco's async create (see the note at the end of this file).
-        @test TK.wait_for(server, "eval output",
-            "$(card_text("cw-eval")).includes('OUTPUT')"; timeout = 60) == true
+        got = try
+            TK.wait_for(server, "eval output", "$(card_text("cw-eval")).includes('OUTPUT')"; timeout = 60) == true
+        catch e
+            (e isa ErrorException && startswith(e.msg, "wait_for timed out")) || rethrow()
+            false
+        end
+        # Missing once in a full suite run (2026-10-01, right after a reboot),
+        # never in repeats: say what the card showed instead.
+        got || @info "the eval card has no output" card = TK.eval_js(server, """(() => {
+            const c = document.querySelector('$(card("cw-eval"))');
+            if (!c) return 'no card';
+            return JSON.stringify({status: c.querySelector('.bt-tool-status')?.textContent,
+                expanded: c.querySelector('.bt-tool-header')?.dataset.expanded,
+                body: (c.querySelector('.bt-tool-body')?.innerHTML || '(no body)').slice(0, 400),
+                text: (c.innerText || '').slice(0, 300)}); })()""")
+        @test got
         @test TK.wait_for(server, "eval result",
             "/OUTPUT\\s*2/.test($(card_text("cw-eval")))"; timeout = 60) == true
         # ANSI colouring renders as styling, not literal escape codes.

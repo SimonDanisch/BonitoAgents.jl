@@ -92,7 +92,7 @@ mutable struct Worker
     end
 end
 
-new_link(w::Worker) = WorkerLink.Link(:client;
+new_link(w::Worker) = WorkerLink.Link(:client; name = "the server",
     on_open  = ch -> serve_channel(w, ch),
     on_state = (link, st) -> link_state!(w, link, st))
 

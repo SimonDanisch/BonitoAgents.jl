@@ -196,7 +196,24 @@
                 rm(red)  # the icon must be independent of the worker's original
                 TK.send_message(server, "second picture")
                 shown = "[...$(visible).querySelectorAll('.bt-media')].find(i => i.naturalWidth === 97)"
-                @test TK.wait_for(server, "new image shown in chat", "!!$(shown)"; timeout=60)
+                got = try
+                    TK.wait_for(server, "new image shown in chat", "!!$(shown)"; timeout=60) == true
+                catch e
+                    (e isa ErrorException && startswith(e.msg, "wait_for timed out")) || rethrow()
+                    false
+                end
+                # Missing once in a full suite run (2026-10-01), never alone or in
+                # order: say what the chat showed instead, and stop here rather
+                # than right-click nothing (which failed the no-JS-errors check too).
+                got || @info "the second picture is not in the chat" chat = TK.eval_js(server, """(() => {
+                    const v = $(visible);
+                    if (!v) return 'no visible chat';
+                    return JSON.stringify({
+                        media: [...v.querySelectorAll('.bt-media')].map(i => [i.naturalWidth, i.complete, (i.currentSrc || i.src || '').slice(-60)]),
+                        tools: [...v.querySelectorAll('.bt-tool-msg')].map(t => (t.querySelector('.bt-tool-header')?.innerText || '').replace(/\\s+/g, ' ')),
+                        tail: v.innerText.slice(-400)}); })()""")
+                @test got
+                got || error("the second picture never showed in the chat")
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))) === window.__recognitionIcon")
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
                 @test TK.eval_js(server, decoded(73))

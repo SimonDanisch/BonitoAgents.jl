@@ -425,7 +425,7 @@ function claim_worker_link!(state::ServerState, worker_id::String, link_id::Vect
         return old, true
     end
     old === nothing || WorkerLink.kill!(old, "the worker connected with a new link")
-    link = WorkerLink.Link(:server; id = link_id,
+    link = WorkerLink.Link(:server; id = link_id, name = worker_id,
                            grace         = state.worker_link_grace,
                            ping_interval = state.heartbeat_interval,
                            ping_deadline = state.heartbeat_deadline,

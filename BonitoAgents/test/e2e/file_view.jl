@@ -305,14 +305,17 @@ function run_suite(server)
         end
 
         @testset "the wireframe overlay draws the edges over the surface" begin
-            # The quad's diagonal edge crosses the middle row of the view: dark
-            # pixels there are the overlay, and red ones the textured surface
-            # still drawn underneath it.
-            middle_row() = TK.eval_js(server, """(() => {
+            # The quad's diagonal edge crosses the middle of the view: dark pixels
+            # there are the overlay, and red ones the textured surface still drawn
+            # underneath it. A band of rows, not one: the line is one antialiased
+            # pixel wide, and on a row it covers only partly its darkest pixel
+            # blends with the red to just above the threshold (canvas 1074x753:
+            # the middle row's darkest pixel read 99, the rows around it 47).
+            middle_band() = TK.eval_js(server, """(() => {
                 const c = document.querySelector('$(view_sel("red.glb")) canvas.bt-mesh-canvas');
                 const t = document.createElement('canvas'); t.width = c.width; t.height = c.height;
                 const x = t.getContext('2d'); x.drawImage(c, 0, 0);
-                const row = x.getImageData(0, c.height >> 1, c.width, 1).data;
+                const row = x.getImageData(0, (c.height >> 1) - 3, c.width, 7).data;
                 let dark = 0, red = 0;
                 for (let i = 0; i < row.length; i += 4) {
                     const [r, g, b] = [row[i], row[i+1], row[i+2]];
@@ -326,15 +329,15 @@ function run_suite(server)
             TK.eval_js(server, open_file("red.glb"))
             @test mesh_status_reaches(server, "red.glb", t -> occursin("1 texture", t))
             before = nothing
-            @test timedwait(() -> (before = middle_row(); before[1] == 0 && before[2] > 0), 20.0;
+            @test timedwait(() -> (before = middle_band(); before[1] == 0 && before[2] > 0), 20.0;
                             pollint = 0.25) === :ok
             TK.eval_js(server, "$(wire_button).click(); true")
             on = nothing
-            @test timedwait(() -> (on = middle_row(); on[1] > 0), 10.0; pollint = 0.25) === :ok
+            @test timedwait(() -> (on = middle_band(); on[1] > 0), 10.0; pollint = 0.25) === :ok
             @test on[2] > 0
             @test TK.eval_js(server, "$(wire_button).dataset.on") == "1"
             TK.eval_js(server, "$(wire_button).click(); true")
-            @test timedwait(() -> middle_row()[1] == 0, 10.0; pollint = 0.25) === :ok
+            @test timedwait(() -> middle_band()[1] == 0, 10.0; pollint = 0.25) === :ok
         end
 
         @testset "the 3D viewer survives losing its graphics context" begin

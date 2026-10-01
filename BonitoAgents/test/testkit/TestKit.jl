@@ -482,6 +482,8 @@ mutable struct TestServer
     # The time step of the last one-time code each account used: Authelia takes a
     # code once, so a second login within the same 30 s waits for the next one.
     otp_used::Dict{String,Int}
+    # The workers `add_worker!` started, stopped with the server (`close`).
+    extra_workers::Vector{@NamedTuple{proc::Base.Process, worker_id::String}}
 end
 
 # The worker relay grant this process's in-process MCP channels (control, and
@@ -725,7 +727,8 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
                        Ref{Any}(nothing), Ref(false),
-                       (browser_width, browser_height), admin, Dict{String,Int}())
+                       (browser_width, browser_height), admin, Dict{String,Int}(),
+                       @NamedTuple{proc::Base.Process, worker_id::String}[])
 end
 
 # Dispatcher loop per mock-agent connection. Reads one `{"prompt": "...",
@@ -914,15 +917,19 @@ dir + projects root), exactly as a second machine running the installer would.
 Behind the proxy it comes in like any worker there: through Caddy, with the
 `credential` "Add worker" issued (the one its install command carries),
 trusting Caddy's certificate authority. Returns the worker process so the test
-can later `kill` it to simulate that machine going offline.
+can later `kill` it to simulate that machine going offline; `close(s)` stops it
+(and the agents it started) in any case.
 """
 function add_worker!(s::TestServer; name::AbstractString = "worker-extra", credential::AbstractString = "")
     cfg  = mktempdir(prefix = "bonitoagents-test-wcfg2-")
     root = mktempdir(prefix = "bonitoagents-test-w2root-")
     prev = get(ENV, "BONITOAGENTS_CONFIG_DIR", nothing)
     ENV["BONITOAGENTS_CONFIG_DIR"] = cfg
-    # A distinct, pinned worker id so it registers as a separate worker.
-    write(joinpath(cfg, "worker_id"), "test-" * String(name) * "-" * string(rand(UInt32); base = 16))
+    # A distinct, pinned worker id so it registers as a separate worker. Not
+    # `rand`: inside a `@testset` the RNG is reseeded, so two runs in one process
+    # would pick the same id.
+    worker_id = "test-" * String(name) * "-" * string(time_ns(); base = 16)
+    write(joinpath(cfg, "worker_id"), worker_id)
     rig = s.h.proxy
     url = rig === nothing ? s.h.url : "https://127.0.0.1:$(s.h.state.auth.config.https_port)"
     BonitoWorker.write_config!(; server_url = url, credential,
@@ -930,6 +937,7 @@ function add_worker!(s::TestServer; name::AbstractString = "worker-extra", crede
     proc, _ = rig === nothing ? BonitoWorker.spawn_worker() :
         withenv(BonitoWorker.spawn_worker, "JULIA_SSL_CA_ROOTS_PATH" => rig.root_cert)
     prev === nothing ? delete!(ENV, "BONITOAGENTS_CONFIG_DIR") : (ENV["BONITOAGENTS_CONFIG_DIR"] = prev)
+    push!(s.extra_workers, (proc = proc, worker_id = worker_id))
     return proc
 end
 
@@ -945,6 +953,15 @@ function Base.close(s::TestServer)
     ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
     close(s.h)
+    # The workers `add_worker!` started go with the server, and so do the agents
+    # they started (their own process groups, see `close(::DevHandle)`). They used
+    # to be each test's job, done as its last step or not at all: every run left
+    # a few behind, reconnecting to a dead port at ~600 MB each.
+    for w in s.extra_workers
+        BT.stop_worker_proc!(w.proc)
+        BonitoWorker.reap_agents_owned_by(w.worker_id)
+    end
+    empty!(s.extra_workers)
     # The mock knobs `BT.dev_server` wrote into ENV stay: another TestServer may
     # still be up in this process (an item that includes its own TestKit cannot
     # release the shared one), and without `BT_DEFAULT_PROVIDER` its next chat
@@ -1492,7 +1509,7 @@ stops the server.
 """
 function another_browser(s::TestServer)
     b = TestServer(s.h, s.agent_fn, s.dispatcher_sock, s.dispatcher_port, s.dispatcher_task,
-                   Ref{Any}(nothing), Ref(false), s.browser_size, s.admin, s.otp_used)
+                   Ref{Any}(nothing), Ref(false), s.browser_size, s.admin, s.otp_used, s.extra_workers)
     open_browser(b)
     return b
 end

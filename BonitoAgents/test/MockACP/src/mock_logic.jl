@@ -85,6 +85,13 @@ CANCEL_DELAY_MS::Int    = 1500
 # Refuse `session/load` unless the transcript sits under the cwd it is loaded
 # in (see `transcript_path`). Declared here, before `_configure!` assigns it.
 STRICT_LOAD::Bool       = false
+# The number of the next tool call this session opens. ACP tool call ids are
+# unique within a session (Claude's are `toolu_…`); counted from 1 in every
+# prompt, a chat's second turn reused the first one's `tool-1`, and the chat
+# delivered the second card's body into the first card (e2e:sidebar, now and
+# then).
+TOOL_SEQ::Int           = 1
+take_tool_seq!() = (global TOOL_SEQ += 1; TOOL_SEQ - 1)
 
 function _configure!()
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
@@ -500,7 +507,6 @@ function run_dispatcher_prompt(prompt_id)
     flush(sock)
 
     stop_reason = "end_turn"
-    next_tool_id = 1
     post_blocks = Any[]   # `post_turn` events, emitted AFTER the prompt response
     while !eof(sock)
         # Cancel arriving mid-stream (set by the concurrently-running stdin
@@ -548,7 +554,7 @@ function run_dispatcher_prompt(prompt_id)
             # A SUBAGENT's tool use: tool_call (announcement) or
             # tool_call_update (status flip on the announced id), tagged
             # like sub_text above.
-            tid = String(get(ev, "id", "subtool-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "subtool-$(take_tool_seq!())"))
             if Bool(get(ev, "update", false))
                 upd("tool_call_update", Dict{String,Any}(
                     "toolCallId" => tid,
@@ -571,7 +577,7 @@ function run_dispatcher_prompt(prompt_id)
             #      and the diff content rides along. ACP merges the rawInput → the
             #      ✎ editable path-link affordance materialises here, not upfront.
             #   3. tool_call_update: status "completed".
-            tid = String(get(ev, "id", "edit-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "edit-$(take_tool_seq!())"))
             path = String(get(ev, "path", "/unknown"))
             old_text = String(get(ev, "old", ""))
             new_text = String(get(ev, "new", ""))
@@ -597,7 +603,7 @@ function run_dispatcher_prompt(prompt_id)
             # status "pending", GENERIC title "Terminal", kind "execute"; a
             # tool_call_update streams rawInput {command,description}, the title
             # becomes the COMMAND, and the output content rides along; then complete.
-            tid = String(get(ev, "id", "bash-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "bash-$(take_tool_seq!())"))
             command = String(get(ev, "command", ""))
             meta = Dict("claudeCode" => Dict("toolName" => "Bash"))
             upd("tool_call", Dict{String,Any}(
@@ -717,7 +723,7 @@ function run_dispatcher_prompt(prompt_id)
             #
             # Claude's shape is emitted by every other event here, so both live
             # side by side and the chat has to handle each.
-            tid  = String(get(ev, "id", "ktool-$(next_tool_id)")); next_tool_id += 1
+            tid  = String(get(ev, "id", "ktool-$(take_tool_seq!())"))
             name = String(ev["name"])
             kind = String(get(ev, "kind", "other"))
             args = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
@@ -764,7 +770,7 @@ function run_dispatcher_prompt(prompt_id)
             #     `rawOutput.error`, a shell call `rawOutput.formatted_output`,
             #     and a shell call's opening content is a bare `terminal`
             #     pointer we never subscribe to.
-            tid    = String(get(ev, "id", "cxtool-$(next_tool_id)")); next_tool_id += 1
+            tid    = String(get(ev, "id", "cxtool-$(take_tool_seq!())"))
             args   = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
             status = String(get(ev, "status", "completed"))
             server = get(ev, "server", nothing)
@@ -823,7 +829,7 @@ function run_dispatcher_prompt(prompt_id)
             # AgentClientProtocol/test/fixtures/codex_image_view.jsonl —
             # claude/kimi send `ImageContent` instead, so this is the only
             # dialect that makes the chat go and fetch the file.
-            tid  = String(get(ev, "id", "cximg-$(next_tool_id)")); next_tool_id += 1
+            tid  = String(get(ev, "id", "cximg-$(take_tool_seq!())"))
             path = String(ev["path"])
             upd("tool_call", Dict{String,Any}(
                 "toolCallId" => tid, "kind" => "read",
@@ -837,7 +843,7 @@ function run_dispatcher_prompt(prompt_id)
             # Generic tool call of any kind (edit/search/execute/other). Opens
             # the bubble, then (unless complete=false) ships content + a final
             # status. Set complete=false to leave it live for `tool_update`s.
-            tid = String(get(ev, "id", "tool-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "tool-$(take_tool_seq!())"))
             open = Dict{String,Any}(
                 "toolCallId" => tid, "kind" => String(get(ev, "kind", "other")),
                 "title" => String(get(ev, "title", "tool")),

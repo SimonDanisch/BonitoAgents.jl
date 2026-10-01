@@ -49,7 +49,9 @@ end
 
 @testset "log ring" begin
     BT.install_log_ring!()      # idempotent; serve() already did it if it ran
-    marker = "unit-dev-api-probe-$(rand(UInt32))"
+    # Not `rand`: `@testset` reseeds the RNG, so the marker repeated on every run
+    # in one process, and the ring still held the previous run's record.
+    marker = "unit-dev-api-probe-$(time_ns())"
     @info marker answer = 42 who = "tester"
     @warn "$(marker)-warning"
 

@@ -179,6 +179,21 @@ try
         @test occursin("[\"r9\", \"r10\"]", two)
     end
 
+    @testset "the live tail never lands on top of the complete output" begin
+        # The tail is drained on a thread of its own and stripped of color, and
+        # the call can end between its check and its write: `Pkg.status()` came
+        # out without color now and then (e2e:bt_eval_types, st-pkg).
+        m = card("toolu_tail", ("code" => "Pkg.status()", "env_path" => "/tmp/envT"); status = "in_progress")
+        colored = "\e[90m[824d6782]\e[39m Bonito\n"
+        BT.append_tail!(m, colored)
+        @test m.stream_text[] == "[824d6782] Bonito\n"          # the tail is plain
+        m.message.status = "completed"
+        BT.eval_result!(m, Any[ACP.TextContent(colored)])
+        @test m.stream_text[] == colored
+        BT.append_tail!(m, "\e[90mlate\e[39m chunk\n")           # drained after the end
+        @test m.stream_text[] == colored
+    end
+
     @testset "short env labels" begin
         @test BT.short_env("/home/me/code/BonitoAgents/test") == "BonitoAgents/test"
         @test BT.short_env("/home/me/code/BonitoAgents/test/") == "BonitoAgents/test"
