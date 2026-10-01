@@ -41,6 +41,8 @@
     st, msg = BT.worker_update_state(older, spec)
     @test st === :available
     @test occursin("Update now", msg)
+    # A server that has not resolved its own build yet cannot judge either.
+    @test BT.worker_update_state(older, nothing) == (:current, "")
 
     # Auto-update switched off does not make an outdated worker current.
     manual = Dict{String,Any}("auto_update" => false, "update_spec" => wire(merge(spec, Dict("rev" => "v0.2.0"))))

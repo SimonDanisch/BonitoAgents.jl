@@ -45,8 +45,8 @@ bonito_asset(parts::AbstractString...) =
     Bonito.Asset(joinpath(pkgdir(@__MODULE__)::String, "assets", parts...))
 
 include("identity.jl")         # User, LocalAuth/ProxyAuth: who is on the other end (the proxy authenticates)
-include("tunnel.jl")           # behind a tunnel: the login gate before every route
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
+include("tunnel.jl")           # behind a tunnel: the login gate before every route
 include("progress.jl")         # notify_progress + the window's ONE progress card (BusyState)
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ACP bring-up payload helpers (mcp list, system prompt)
@@ -76,6 +76,9 @@ include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
 include("remote_eval.jl")      # bt_julia_eval(worker = …): eval hosts on other workers, the per-chat switch
+include("remote_values.jl")    # remote_session(…): Julia values between a chat's session and another worker's
+include("shares.jl")           # shared links: a markdown file or a Bonito app for anyone with the link
+include("crash_recovery.jl")   # continue the chats a worker crash cut off mid-turn
 include("server.jl")           # serve()
 include("dev.jl")              # dev_server() — self-contained dev rig
 

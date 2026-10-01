@@ -62,14 +62,13 @@ end
 
         # The admin invites someone into the "lab" group, from Settings.
         TK.to_settings(z)
-        TK.set_input(z, "input[type=text]", "lab"; placeholder = "groups (\"admins\" for an admin)")
+        TK.pick_groups!(z, TK.invites_js("sec.querySelector('.bt-group-pick')"), ["lab"])
         # One click, one invite: each click makes another.
         TK.click_text(z, "Create invite link")
         link = TK.wait_for(z, "the invite link",
             "(document.body.textContent.match(/https:\\/\\/\\S+?\\/invite\\/[0-9a-f]{64}/) || [false])[0]"; timeout = 30)
         @test startswith(link, z.h.url * "/invite/")
-        invites_js(expr) = """(() => { const h = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Invites');
-            const sec = h.closest('.bt-section').parentElement; return $(expr); })()"""
+        invites_js = TK.invites_js
         invite_rows = invites_js("[...sec.querySelectorAll('.bt-admin-table tr')].filter(r => r.querySelector('button')).length")
         @test TK.wait_for(z, "the open invite listed", "$(invite_rows) === 1"; timeout = 30) == true
 
@@ -120,7 +119,7 @@ end
 
         # The admin shares the worker with "lab" on its card. Carol sees it and
         # may start chats there; managing it stays with the admin.
-        TK.share_worker_ui!(z, "lab")
+        TK.share_worker_ui!(z, ["lab"])
         @test TK.reload!(b) == :dashboard
         @test TK.wait_for(b, "the shared worker", "!!document.querySelector('.bt-worker-cell .bt-dot-online')";
                           timeout = 60) == true

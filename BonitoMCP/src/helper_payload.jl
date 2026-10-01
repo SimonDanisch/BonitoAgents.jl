@@ -108,6 +108,7 @@ const BACKTRACE_NOISE_FRAMES = (
     r"\bclient\.jl\b", r"\brun_main_repl\b", r"\brun_fallback_repl\b",
     r"\brepl_main\b",  r"\b_start\b",
     r"\bMalt\b",                            # Malt's own remote_eval frames
+    r"\bvalue_request\b",                   # a value exchange's call (remote_values.jl)
 )
 
 # ── Public entries ──────────────────────────────────────────────────────────
@@ -542,5 +543,7 @@ function pixel_block(m::AbstractMatrix, out_dir::AbstractString)
         "pixels" => vec(px),              # channel fastest, then x, then y
         "typeof" => typeof_short(m))
 end
+
+include("remote_values.jl")      # remote_session: values to and from another worker's session
 
 end # module BonitoMCPHelper

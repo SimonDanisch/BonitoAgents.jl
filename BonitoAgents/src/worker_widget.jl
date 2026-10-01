@@ -557,10 +557,12 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     empty_block = DOM.div(empty_msg_obs; class = empty_class)
 
     # Errors are 0..N small spans, rebuilt via map(); KeyedList overkill.
-    errors_obs = map(results_obs) do results
+    # Not while a rescan runs: the error is the previous attempt's, and next to
+    # the spinner it read as this one having failed already.
+    errors_obs = map(results_obs, scan_busy) do results, busy
         DOM.div(
             (DOM.div("Error: $(r["error"])"; class = "bt-error")
-             for r in results if haskey(r, "error"))...;
+             for r in results if haskey(r, "error") && !busy)...;
             class = "bt-errors-list")
     end
 

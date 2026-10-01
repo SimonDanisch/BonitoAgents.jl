@@ -19,6 +19,7 @@ delete!(ENV, "JULIA_LOAD_PATH")
     include("test_wait.jl")
     include("test_runs.jl")
     include("test_eval_host.jl")
+    include("test_remote_values.jl")
     # ⚠ LAST on purpose: this one needs `Bonito`, which is not in the test
     # target, so it errors and takes the rest of the file with it. That was
     # invisible while `Pkg.test` could not resolve `Test` at all and the suite

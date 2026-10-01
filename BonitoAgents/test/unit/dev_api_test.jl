@@ -317,10 +317,10 @@ end
             @test_throws Exception BT.dev_request(st, "control", Dict("op" => "not_an_op"))
             @test_throws Exception BT.dev_request(st, "control",
                 Dict("op" => "send_message", "project_id" => pid, "text" => "   "))
-            # move_project refuses a same-worker move rather than doing something
-            # surprising.
+            # continue_project refuses the worker the chat is already on rather
+            # than doing something surprising.
             @test_throws Exception BT.dev_request(st, "control",
-                Dict("op" => "move_project", "project_id" => pid, "worker_id" => wid))
+                Dict("op" => "continue_project", "project_id" => pid, "worker_id" => wid))
         end
 
         @testset "the debug project is created once and gated correctly" begin

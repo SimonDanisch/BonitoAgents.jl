@@ -81,7 +81,7 @@
         # Two changes at once both reach Authelia. It ignores a change to its
         # users file within half a second of its last reread; the disable used to
         # land in that half second, and Authelia kept letting dave in.
-        TK.set_account_groups_ui!(z, "dave", "gpu")
+        TK.set_account_groups_ui!(z, "dave", ["gpu"])
         TK.account_action!(z, "dave", "Disable")
         TK.account_status(z, "dave disabled")
         @test TK.reload!(b) == :portal
@@ -116,7 +116,7 @@ end
     try
         TK.open_browser(z)
         TK.login!(z)
-        TK.share_worker_ui!(z, "lab")
+        TK.share_worker_ui!(z, ["lab"])
         admin_chat = TK.new_chat(z; cwd = mktempdir(; prefix = "admins-chat-"))
         TK.send_message(z, "from the admin")
         @test TK.wait_for(z, "the admin's reply", "document.body.textContent.includes('echo: from the admin')"; timeout = 60) == true

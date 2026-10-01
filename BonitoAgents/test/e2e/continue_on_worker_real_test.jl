@@ -15,7 +15,7 @@
     using .TestKit
     const TK = TestKit
     import BonitoAgents as BT
-    import AgentProviders
+    const AgentProviders = BT.AgentProviders
 
     if get(ENV, "BT_REAL_AGENT", "") != "1"
         @info "e2e:continue_on_worker_real skipped — set BT_REAL_AGENT=1 (needs claude-agent-acp + an authenticated Claude account)"
@@ -34,8 +34,8 @@
 
         server = TK.dev_server(mock = false)
         # Claude Code writes the chat's transcripts under ~/.claude/projects/;
-        # the test removes the two project dirs it causes (A's, then B's after
-        # the move), so a real run leaves nothing in the user's session list.
+        # the test removes the two project dirs it causes (A's, and B's for the
+        # new chat), so a real run leaves nothing in the user's session list.
         transcript_dirs = String[]
         transcript_dir(cwd) = joinpath(homedir(), ".claude", "projects", AgentProviders.claude_project_key(cwd))
         try
@@ -45,7 +45,7 @@
             # card `new_chat` presses "+ Project" on follows the worker list's
             # order); worker B is spawned afterwards and shows up in the menu.
             cwd = mktempdir()
-            write(joinpath(cwd, "README.md"), "a real chat that will move\n")
+            write(joinpath(cwd, "README.md"), "a real chat that goes on elsewhere\n")
             pid = TK.new_chat(server; cwd = cwd, title = "realmove")
             p = state.projects[][pid]
             push!(transcript_dirs, transcript_dir(p.worker_path))
@@ -67,25 +67,30 @@
             sid = p.resume_session_id
             @test sid !== nothing
 
+            known = Set(keys(state.projects[]))
             @test TK.eval_js(server, open_menu) == true
             @test TK.wait_for(server, "the menu offers worker-b",
                 "$(continue_items).includes('worker-b')"; timeout = 30) == true
             @test TK.eval_js(server, click_continue("worker-b")) == true
+            # A NEW chat on B; the window moves to it, the original stays on A.
             proj_dir_b = BT.worker_join(worker_b.projects_root, p.name)
-            @test TK.wait_for(server, "the chat shows B's path",
+            @test TK.wait_for(server, "the new chat shows B's path",
                 "$(header_env) === $(TK.json(replace(proj_dir_b, homedir() => "~")))";
                 timeout = 180) == true
-            # The transcript travelled and the session id was kept — Claude Code
-            # on B will `session/load` a file written on A.
-            @test p.resume_session_id == sid
-            push!(transcript_dirs, transcript_dir(p.worker_path))
-            @test isfile(joinpath(transcript_dir(p.worker_path), sid * ".jsonl"))
+            q = only(x for x in values(state.projects[]) if !(x.id in known))
+            @test q.worker_id == worker_b.worker_id
+            @test p.worker_id != worker_b.worker_id
+            # The transcript travelled and the new chat resumes that session:
+            # Claude Code on B will `session/load` a file written on A.
+            @test q.resume_session_id == sid
+            push!(transcript_dirs, transcript_dir(q.worker_path))
+            @test isfile(joinpath(transcript_dir(q.worker_path), sid * ".jsonl"))
 
             TK.send_message(server, "What was the secret word? Reply with the word only.")
             @test TK.wait_for(server, "the agent remembers on B",
                 "$(last_reply).toLowerCase().includes('pineapple')"; timeout = 180) == true
             # …through a LOADED session, not a fresh one that happened to be told.
-            @test p.resume_session_id == sid
+            @test q.resume_session_id == sid
 
             kill(worker_b_proc)
             @test isempty(TK.js_errors(server))

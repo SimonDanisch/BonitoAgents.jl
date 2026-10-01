@@ -32,6 +32,10 @@ Base.@kwdef struct WorkerConfig
     # `nothing`: this worker does not update itself (dev and standalone workers).
     # An installed update writes its spec back into it.
     update_config::Union{Dict{String,Any},Nothing} = nothing
+    # This run of the worker, and the previous one if it crashed ("" if not),
+    # both in every hello: the server continues what a crash cut off.
+    instance::String = ""
+    crashed_instance::String = ""
 end
 
 # An agent running for one of the server's chats.
@@ -194,6 +198,8 @@ function hello(w::Worker)
         "auto_update"   => c.update_config !== nothing && auto_update_enabled(c.update_config),
         "update_spec"   => c.update_config === nothing ? nothing : configured_update_spec(c.update_config),
         "harnesses"     => installed_harnesses(harness_root(), AgentProviders.managed_packages()),
+        "instance"      => c.instance,
+        "crashed_instance" => c.crashed_instance,
     )
 end
 

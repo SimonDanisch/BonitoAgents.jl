@@ -62,7 +62,7 @@
         # page makes their account, and one button signs them in and makes the
         # passkey. No password to copy, no code, no settings page.
         TK.to_settings(z)
-        TK.set_input(z, "input[type=text]", "lab"; placeholder = "groups (\"admins\" for an admin)")
+        TK.pick_groups!(z, TK.invites_js("sec.querySelector('.bt-group-pick')"), ["lab"])
         TK.click_text(z, "Create invite link")
         link = TK.wait_for(z, "the invite link",
             "(document.body.textContent.match(/https:\\/\\/\\S+?\\/invite\\/[0-9a-f]{64}/) || [false])[0]"; timeout = 30)
@@ -111,15 +111,23 @@
 
         # The login ends while the tab is open (here: logged out behind its back).
         # The tab says so when it next checks, instead of failing on the next
-        # thing it loads, and "Log in again" leads to the login.
+        # thing it loads. It never reloads itself to the login: that took what
+        # was typed with it.
         @test TK.eval_js(z, """fetch('/authelia/api/logout', {method: 'POST',
             headers: {'Content-Type': 'application/json'}, body: '{}'}).then(r => r.status)""") == 200
         @test TK.eval_js(z, "!document.querySelector('.bt-login-ended.bt-conn-open')") == true
         TK.eval_js(z, "document.dispatchEvent(new Event('visibilitychange')); true")
         @test TK.wait_for(z, "the tab saying the login ended",
             "!!document.querySelector('.bt-login-ended.bt-conn-open')"; timeout = 30) == true
-        TK.click(z, ".bt-login-ended .bt-conn-reload")
-        @test TK.wait_for(z, "the login page", "location.pathname.startsWith('/authelia')"; timeout = 30) == true
+        TK.click(z, ".bt-login-ended .bt-conn-reload")   # the login opens in a new tab
+        sleep(1)
+        @test TK.eval_js(z, "location.pathname") == "/"
+        # Logged in again (in "another tab": Authelia's API, same browser), the
+        # card goes away by itself once this tab is looked at again.
+        TK.api_login!(z)
+        TK.eval_js(z, "document.dispatchEvent(new Event('visibilitychange')); true")
+        @test TK.wait_for(z, "the card gone once logged in again",
+            "!document.querySelector('.bt-login-ended.bt-conn-open')"; timeout = 30) == true
     finally
         b === nothing || TK.close_browser!(b)
         close(z)

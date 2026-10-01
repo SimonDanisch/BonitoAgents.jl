@@ -409,6 +409,39 @@ function remote_ref(@nospecialize(value))
     return holder.id
 end
 
+# ── Shared links (BonitoAgents' shares.jl) ───────────────────────────────────
+# The value of a shared Julia file, parked like an eval result, so every viewer
+# of the link mounts their own render of it. Evaluated in a module of its own,
+# and again when the file changed (the old value is freed); one at a time, so
+# two viewers arriving together share one evaluation.
+const SHARED = Dict{String, Tuple{Float64, String}}()   # path => (mtime, holder id)
+const SHARED_LOCK = ReentrantLock()
+
+"""
+    share_value(path) -> (holder, prefix)
+
+The parked value of the Julia file `path`, and the prefix of the bridge it is
+parked on.
+"""
+function share_value(path::AbstractString)
+    lock(SHARED_LOCK) do
+        parent = get_parent_session()
+        stamp = mtime(path)
+        cached = get(SHARED, path, nothing)
+        if cached !== nothing && cached[1] == stamp && Bonito.get_session(parent, cached[2]) !== nothing
+            return (cached[2], parent.id)
+        end
+        value = Base.include(Module(:SharedApp), String(path))
+        if cached !== nothing
+            old = Bonito.get_session(parent, cached[2])
+            old === nothing || close(old)
+        end
+        holder = remote_ref(value)
+        SHARED[String(path)] = (stamp, holder)
+        return (holder, parent.id)
+    end
+end
+
 function handle_control(b::RemoteBridge, msg::AbstractDict)
     op = msg["op"]
     d = b.driver

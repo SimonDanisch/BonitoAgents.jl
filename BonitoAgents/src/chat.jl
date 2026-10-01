@@ -7546,6 +7546,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         sh = shared(model)
         lock(() -> sh.restart_inflight[], sh.restart_lock) && return
         restart_status[] = "Restarting…"
+        # A restart the user asked for replaces whatever a worker crash cut off.
+        forget_interrupted_turn!(model.state, model.project_id)
         @async begin
             try
                 restart_chat_session!(model)
@@ -7593,10 +7595,10 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             $(menu_pick).notify($(action));
         }""")
 
-    # "Continue on <worker>": the whole chat — its files, its history and the
-    # agent's own memory — moves to another machine and picks up there. One item
-    # per OTHER online worker, following the worker list; the group disappears
-    # when there is nowhere else to go. See `start!` for the move itself.
+    # "Continue on <worker>": a NEW chat on another machine that picks up here,
+    # with the project's files and the agent's own memory. This chat stays as it
+    # is. One item per OTHER online worker, following the worker list; the group
+    # disappears when there is nowhere else to go. See `continue_on!`.
     continue_pick = Observable("")
     continue_items = map(session, state.workers) do workers
         cur = isempty(project_id) ? nothing : get(state.projects[], project_id, nothing)
@@ -7609,7 +7611,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             DOM.div("Continue on"; class = "bt-menu-title"),
             (DOM.button(w.name;
                 class = "bt-menu-item bt-menu-continue",
-                title = "Move this chat, its files and the agent's memory to $(w.name) and carry on there",
+                title = "Open a new chat on $(w.name) that picks up here: the files and the agent's memory. This chat stays as it is.",
                 onclick = js"""event => {
                     $(Bonito.JSString(close_menu_js))
                     $(continue_pick).notify($(w.worker_id));
@@ -7628,20 +7630,15 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         (w === nothing || !visible(viewer, w)) && (problem("There is no such worker"); return)
         isopen(w) || (problem("That worker is offline"); return)
         wid == p.worker_id && return
-        # A turn in flight would be cut off mid-answer by the session stop: the
-        # user stops it (or waits) first, knowingly.
+        # The new chat resumes the conversation as it is when this starts. Mid-turn
+        # that would be half an answer: finish (or stop) the turn first.
         sh = shared(model)
         if lock(() -> sh.turn_in_flight[], sh.lock)
             problem("Wait for the current turn to finish, or stop it, before continuing on $(w.name)")
             return
         end
-        # The move stops this chat's session first, which evicts its ChatModel
-        # and prunes THIS pane (sidebar.jl) — so from that moment on nothing in
-        # this header exists to show progress in. It all goes to the WINDOW's one
-        # progress card, which outlives the pane: one card that stays up for the
-        # whole move and updates in place (this used to flash a fresh 3.2 s toast
-        # per transferred FILE, which is why a move looked like a popup loop that
-        # never got anywhere).
+        # Copying a big project takes a while; it reports into the WINDOW's one
+        # progress card, which stays up for the whole of it and updates in place.
         prog = pane === nothing ? nothing : pane.progress
         if prog !== nothing && is_busy_running(prog[])
             problem("Something else is already running in this window — wait for it to finish")
@@ -7649,28 +7646,16 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         end
         prog === nothing || busy_start!(prog, "Continuing on $(w.name)")
         Base.errormonitor(@async try
-            safe_set!(header_status, "Continuing on $(w.name)…")
-            start!(state, p, wid; progress = (stage, info) ->
+            new_p = continue_on!(state, p, wid; progress = (stage, info) ->
                 prog === nothing || busy_event!(prog, stage, info))
-            # The chat pane is rebuilt around the new session (sidebar.jl revives
-            # the current view on the model's re-add); say what the agent knows.
-            prog === nothing || busy_done!(prog, p.resume_session_id === nothing ?
-                "Continued on $(w.name). The agent starts fresh there; the messages above stay." :
-                "Continued on $(w.name). The agent kept its memory.")
-            pane === nothing || (pane.navigate[] = p.id)
+            prog === nothing || busy_done!(prog, new_p.resume_session_id === nothing ?
+                "New chat on $(w.name). The agent starts fresh there; this chat stays as it is." :
+                "New chat on $(w.name), with the agent's memory. This chat stays as it is.")
+            pane === nothing || (pane.navigate[] = new_p.id)
         catch e
             bt = catch_backtrace()
             @warn "continue on worker failed" project = p.name target = w.name exception = (e, bt)
             problem("Could not continue on $(w.name)", error_detail(e, bt))
-            # The session was already stopped for the move; bring the chat back
-            # on the worker it is still bound to, so a failed move is not a
-            # closed chat.
-            try
-                ensure_project_session!(state, p)
-                pane === nothing || (pane.navigate[] = p.id)
-            catch e2
-                @warn "could not bring the chat back after a failed move" project = p.name exception = (e2, catch_backtrace())
-            end
         end)
     end
 
@@ -7826,6 +7811,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             # The restart IS the switch as far as the agent is concerned: the
             # tools ride the MCP process's environment, which is rebuilt on
             # bring-up (`refresh_injected_env`).
+            forget_interrupted_turn!(state, project_id)
             restart_chat_session!(model)
             safe_set!(header_status, "")
         end;
@@ -8072,6 +8058,8 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
     # id rather than reopening with (say) Claude's UUID next time.
     project === nothing || (project.resume_session_id = nothing)
 
+    # Another agent now: whatever a worker crash cut off stays cut off.
+    forget_interrupted_turn!(model.state, model.project_id)
     restart_chat_session!(model)
     if s.session_alive[]
         # Commit only after the worker spawned the provider and ACP completed
@@ -8725,6 +8713,8 @@ function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
     # the UI — no user message can slip through while the autonomous loop runs.
     # The loop's own auto-continue calls `send_message!` directly (never
     # SendCommand), so it is unaffected by this guard.
+    # Whatever a worker crash cut off here, the user carries on themselves.
+    forget_interrupted_turn!(model.state, model.project_id)
     if shared(model).yolo[]
         shared(model).yolo_reminders[] = String(strip(cmd.text))
         return nothing
@@ -8752,6 +8742,8 @@ function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
 end
 
 function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
+    # A stop is a stop, also for a turn a worker crash cut off: never continue it.
+    forget_interrupted_turn!(model.state, model.project_id)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
     # `client(model.agent)` is a single-field read. (Session arg is unused here —

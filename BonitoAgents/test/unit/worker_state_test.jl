@@ -157,6 +157,17 @@ end
     @test length(res) == 1 && haskey(res[1], "error")
     @test haskey(st2.discovered[], "ghost")
     @test JSON.parsefile(joinpath(dir, "discovered.json")) |> d -> haskey(d, "ghost")
+
+    # A worker scanned before keeps what that scan found when a rescan fails
+    # (here: it is not connected), with the failure next to it. Storing the error
+    # alone showed "projects (0)" until some later scan got through.
+    res = BT.scan_and_store!(st2, "wA")
+    @test [r["session_id"] for r in res if !haskey(r, "error")] == ["s1"]
+    @test count(r -> haskey(r, "error"), res) == 1
+    @test startswith(only(r for r in res if haskey(r, "error"))["error"], "the last scan failed: ")
+    # Another failure does not pile up errors.
+    res = BT.scan_and_store!(st2, "wA")
+    @test length(res) == 2 && count(r -> haskey(r, "error"), res) == 1
 end
 
 @testset "teardown_worker! identity guard" begin

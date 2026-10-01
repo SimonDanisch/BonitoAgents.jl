@@ -1,83 +1,87 @@
-# "Continue this chat on another worker", end to end through the real UI.
+# "Continue on <worker>", end to end through the real UI.
 #
-# A chat on worker A is moved to worker B from its header's ⋯ menu, and the
-# move contract is asserted:
-#   1. the item lists the OTHER online worker and moves the chat A → B,
-#   2. files sync to B (server mirror == B's copy), including edits made on A
-#      out of band,
-#   3. `p.worker_id` / `p.worker_path` flip ATOMICALLY to B and the header shows
-#      B's path,
-#   4. the chat's storage follows the move (chats live under
-#      `state_dir/chats/<pid>/`, not on the worker fs), so the same pane keeps
-#      working — proven by re-sending a message that round-trips through B's
-#      mock-agent and renders in the SAME chat pane,
-#   5. the AGENT'S memory follows too: the mock keeps a Claude-shaped transcript
+# A chat on worker A is continued on worker B from its header's ⋯ menu. That
+# makes a NEW chat on B and leaves the original alone. It used to move the chat:
+# its session stopped, it was re-bound to B and restarted there. A move that
+# took a while left the user chatting in a chat that was about to change
+# machines, and afterwards it ran on B while tools it had started on A ran on.
+#
+# The contract:
+#   1. the item lists the OTHER online worker; picking it opens a new chat on B,
+#      with the same title, and the window moves to it,
+#   2. the original chat is untouched: still on A, its session alive, and it
+#      keeps working,
+#   3. B gets the project's files, including edits made on A out of band, and
+#      keeps whatever was there already (the push adds),
+#   4. the AGENT'S memory comes along: the mock keeps a Claude-shaped transcript
 #      (`~/.mockacp/projects/<encoded cwd>/<sid>.jsonl`, plus a subagent folder
 #      and a `memory/` dir seeded here) and, under `strict_load`, refuses
 #      `session/load` unless the transcript sits under the cwd it is loaded in.
-#      After the move the transcript sits under B's cwd with the recorded cwd
-#      rewritten, the memory is merged, `resume_session_id` is KEPT, and nothing
-#      is left in either worker's staging folder,
-#   6. a chat whose record can't be carried (its transcript is gone) still
-#      moves and continues with a fresh session: `resume_session_id` cleared,
-#      the pane still live.
+#      The new chat resumes that session on B and shows the conversation,
+#   5. a chat whose record can't be carried (its transcript is gone) still
+#      continues, with a fresh session,
+#   6. with the source worker offline, only a mirror that was synced is pushed,
+#      and one never synced is refused before anything happens.
 #
-# ISOLATED, like cross_worker_test.jl: it spawns a SECOND worker and mutates
-# worker assignment, so it gets its own throwaway `dev_server` + browser rather
-# than polluting the shared soak server's worker set.
+# ISOLATED, like cross_worker_test.jl: it spawns more workers and kills them, so
+# it gets its own throwaway `dev_server` + browser.
 @testitem "e2e:worker_move" setup = [SharedServer] tags = [:e2e] begin
     const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     import BonitoAgents as BT
-    import AgentProviders
+    const AgentProviders = BT.AgentProviders
 
-    # Echo agent: every prompt comes back as "echo: <prompt>" so a post-move
-    # send proves the session is live on the new worker.
+    # Echo agent: every prompt comes back as "echo: <prompt>".
     agent_script(prompt) = [TK.text("echo: $(prompt)"), TK.end_turn()]
 
-    # Collect every file under `dir` (relative path => contents) so we can assert
-    # the server mirror and the worker copy are byte-identical, exactly like the
-    # legacy `project_files` helper (skipping the legacy `.bonitoAgents` dir).
+    # Every file under `dir` (relative path => contents).
     project_files(dir) = begin
         out = Dict{String,String}()
         isdir(dir) || return out
         for (root, _, files) in walkdir(dir), f in files
             full = joinpath(root, f)
-            rel  = relpath(full, dir)
-            startswith(rel, ".bonitoAgents") && continue
-            out[rel] = read(full, String)
+            out[relpath(full, dir)] = read(full, String)
         end
         out
     end
 
-    # The mock's transcript layout — the same shape as Claude Code's, which is
-    # what the worker's session transport moves (`AgentProviders.transcript_dir`).
+    # The mock's transcript layout: the same shape as Claude Code's, which is what
+    # the worker's session transport moves (`AgentProviders.transcript_dir`).
     mock_fmt = AgentProviders.session_state_format(AgentProviders.MockAgent())
     transcript_dir(cwd) = AgentProviders.transcript_dir(mock_fmt, homedir(), cwd)
     seeded_dirs = String[]   # transcript dirs this test creates; removed at the end
 
-    # Visible-pane helpers: several panes stay mounted, so scope to the live one.
+    # Several panes stay mounted: scope to the visible one.
     VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
     header_env = "(() => { const p=$VP; const e=p && p.querySelector('.bt-header-env'); return e ? (e.textContent||'').trim() : ''; })()"
+    pane_text = "(() => { const p=$VP; return p ? (p.innerText || '') : ''; })()"
     open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bt-menu-trigger'); if(!t) return false; t.click(); return true; })()"
     continue_items = "(() => { const p=$VP; return [...(p ? p.querySelectorAll('.bt-header-menu .bt-menu-continue') : [])].map(b => (b.textContent||'').trim()); })()"
     click_continue(name) = "(() => { const p=$VP; const b=[...p.querySelectorAll('.bt-header-menu .bt-menu-continue')]" *
         ".find(x => (x.textContent||'').trim() === $(repr(name))); if(!b) return false; b.click(); return true; })()"
+    card_done(text) = """(() => { const c = document.querySelector('.bt-prog.bt-prog-ok');
+        return !!c && (c.querySelector('.bt-prog-title')?.textContent || '').includes($(repr(text))); })()"""
+    wait_online(state, name) = begin
+        t0 = time()
+        while time() - t0 < 30 && !any(w -> w.name == name && w.online[], values(state.workers[]))
+            sleep(0.1)
+        end
+        only(w for w in values(state.workers[]) if w.name == name)
+    end
+    # The chats on `wid` other than `known`: what a continue made.
+    new_chats(state, wid, known) = [q for q in values(state.projects[]) if q.worker_id == wid && !(q.id in known)]
 
     server = TK.dev_server(agent = agent_script, strict_load = true)
     try
         TK.open_browser(server)
         state = server.h.state
 
-        @testset "Continue on worker B (A → B), memory carried" begin
-            # ── Create a chat on worker A through the real UI ────────────────
-            # The main dev worker is worker A, and the ONLY worker while the chat
-            # is created: `new_chat` presses "+ Project" on a worker card, and
-            # with two cards on the dashboard which one it lands on follows the
-            # worker list's order. Worker B is spawned afterwards.
-            # Seed a couple of files into the cwd so the move has real content to
-            # sync (the legacy test seeded README/src/nested files on A's fs).
+        @testset "Continue on worker B: a new chat there, the original stays on A" begin
+            # ── A chat on worker A, created through the real UI ──────────────
+            # A is the only worker while it is created: `new_chat` presses
+            # "+ Project" on a card, and with two cards which one follows the
+            # worker list's order.
             @test TK.wait_for(server, "worker A online",
                 "(() => { const m = document.body.innerText.match(/(\\d+)\\s*\\/\\s*\\d+\\s*workers online/); return m && parseInt(m[1]) >= 1; })()";
                 timeout = 20) == true
@@ -88,40 +92,28 @@
             write(joinpath(cwd, "deep", "nested.txt"), "hidden treasure\n")
 
             pid = TK.new_chat(server; cwd = cwd, title = "moveproj")
-            @test !isempty(pid)
             @test haskey(state.projects[], pid)
             p = state.projects[][pid]
             worker_a_id = p.worker_id
             worker_a    = state.workers[][worker_a_id]
 
-            # ── Spawn worker B: a SECOND real worker process, just like
-            # cross_worker_test.jl — the move target. It shows up in the chat's
-            # menu the moment it connects (the item list follows the worker list).
             worker_b_proc = TK.add_worker!(server; name = "worker-b")
-            t0 = time()
-            while time() - t0 < 30 &&
-                  !any(w -> w.name == "worker-b" && w.online[], values(state.workers[]))
-                sleep(0.1)
-            end
-            worker_b  = only(w for w in values(state.workers[]) if w.name == "worker-b")
+            worker_b  = wait_online(state, "worker-b")
             target_id = worker_b.worker_id
             @test worker_b.online[]
-            @test worker_a_id != target_id
-            # Something already lives where the move will land. A move adds the
-            # project's files there; it must never delete what it did not bring
-            # (a move once emptied a live folder this way, 2026-09-15).
-            proj_dir_b_expected = BT.worker_join(worker_b.projects_root, p.name)
-            mkpath(proj_dir_b_expected)
-            stray_on_b = joinpath(proj_dir_b_expected, "already-here.txt")
-            write(stray_on_b, "B had this before the move\n")
+            # Something already lives where the new chat will land. The push adds
+            # the project's files there; it must never delete what it did not
+            # bring (a move once emptied a live folder this way, 2026-09-15).
+            proj_dir_b = BT.worker_join(worker_b.projects_root, p.name)
+            mkpath(proj_dir_b)
+            stray_on_b = joinpath(proj_dir_b, "already-here.txt")
+            write(stray_on_b, "B had this before\n")
 
-            # The chat works on A before the move (round-trips through A's agent).
             TK.send_message(server, "before-move")
-            @test TK.wait_for(server, "A reply rendered",
-                "(document.body.innerText || '').includes('echo: before-move')"; timeout = 60) == true
+            @test TK.wait_for(server, "A reply rendered", "$(pane_text).includes('echo: before-move')"; timeout = 60) == true
 
             # The agent bound a session the server can resume, and the mock wrote
-            # its transcript under A's cwd — the record the move has to carry.
+            # its transcript under A's cwd: the record the new chat needs.
             t0 = time()
             while p.resume_session_id === nothing && time() - t0 < 30; sleep(0.1); end
             sid = p.resume_session_id
@@ -129,148 +121,107 @@
             tdir_a = transcript_dir(cwd)
             push!(seeded_dirs, tdir_a)
             @test isfile(joinpath(tdir_a, sid * ".jsonl"))
-            @test occursin("\"cwd\":" * BT.JSON.json(cwd), read(joinpath(tdir_a, sid * ".jsonl"), String))
-            # Subagent transcripts and project memory travel with the session.
             mkpath(joinpath(tdir_a, sid))
             write(joinpath(tdir_a, sid, "sub.jsonl"), "{\"type\":\"user\",\"cwd\":" * BT.JSON.json(cwd) * "}\n")
             mkpath(joinpath(tdir_a, "memory"))
             write(joinpath(tdir_a, "memory", "MEMORY.md"), "- remember the treasure\n")
+            # What B's agent re-streams when it LOADS the carried session: the
+            # conversation, as a real agent's `session/load` does.
+            TK.REPLAY_FN[] = s -> s == sid ? Any[TK.user("before-move"), TK.text("echo: before-move")] : Any[]
 
-            # Capture the chat-storage dir: it lives under the SERVER's state_dir,
-            # NOT on any worker, which is WHY the chat survives the move without
-            # file sync. Assert it exists before AND after. (Persistence lags the
-            # rendered reply slightly, so poll briefly for the dir to appear.)
-            chat_dir = joinpath(server.h.state_dir, "chats", pid)
-            dir_appears(d) = begin
-                t0 = time(); while !isdir(d) && time() - t0 < 15; sleep(0.1); end; isdir(d)
-            end
-            @test dir_appears(chat_dir)
+            # Edits on A the server does not know about yet: they must arrive.
+            write(joinpath(cwd, "README.md"),  "version 2: edited on A out of band\n")
+            write(joinpath(cwd, "newfile.txt"), "added on A\n")
 
-            # Snapshot the pre-move pane identity so we can prove the SAME chat
-            # (same project id) is still the one open after the move.
-            @test TK.current_chat_id(server) == pid
-
-            # ── Out-of-band edit on A, then MOVE A → B through the menu ───────
-            # Mirror the legacy test: the user edits files on A's fs in their own
-            # editor (server doesn't know yet); the move must pre-pull these.
-            proj_dir_a = p.worker_path
-            @test rstrip(proj_dir_a, '/') == rstrip(cwd, '/')
-            write(joinpath(proj_dir_a, "README.md"),  "version 2: edited on A out of band\n")
-            write(joinpath(proj_dir_a, "newfile.txt"), "added on A\n")
-
+            known = Set(keys(state.projects[]))
             @test TK.eval_js(server, open_menu) == true
             @test TK.wait_for(server, "the menu offers worker-b under Continue on",
                 "$(continue_items).includes('worker-b')"; timeout = 30) == true
-            # Only OTHER workers are offered — never the one the chat is on.
-            @test TK.eval_js(server, continue_items) == ["worker-b"]
+            @test TK.eval_js(server, continue_items) == ["worker-b"]   # never the chat's own worker
             @test TK.eval_js(server, click_continue("worker-b")) == true
 
-            # ── The move reports into the window's ONE progress card ─────────
-            # The move stops this chat's session, which prunes the pane it was
-            # started from — so its progress cannot live in the header. It goes
-            # to the window-level card, which STAYS UP for the whole move. This
-            # used to be a 3.2 s toast re-flashed once per transferred FILE:
-            # feedback that looked like a popup loop and told the user nothing
-            # about whether the move was progressing.
+            # ONE progress card for the whole of it, ending in DONE (a failure
+            # parks it in `.bt-prog-err`, so "gone" would pass either way).
             @test TK.eval_js(server, "document.querySelectorAll('.bt-prog').length") == 1
-            @test TK.wait_for(server, "the progress card names the move",
-                """(() => { const c = document.querySelector('.bt-prog');
-                    if (!c || c.classList.contains('bt-prog-idle')) return false;
-                    return /Continu(ing|ed) on worker-b/.test(
-                        c.querySelector('.bt-prog-title')?.textContent || ''); })()""";
-                timeout = 120) == true
+            @test TK.wait_for(server, "the progress card reports the new chat",
+                card_done("New chat on worker-b"); timeout = 120) == true
+            # The card's width is fixed: sized to its content, it jumped with every
+            # file path a copy showed. A very long path must not move it.
+            @test TK.eval_js(server, """(() => {
+                const c = document.querySelector('.bt-prog'), m = c.querySelector('.bt-prog-msg');
+                const w = c.offsetWidth, t = m.textContent;
+                m.textContent = '/a/very/long/path/that/goes/on'.repeat(30);
+                const same = c.offsetWidth === w;
+                m.textContent = t;
+                return same; })()""") == true
 
-            # The header shows B's path once the chat is re-bound and rebuilt.
-            @test TK.wait_for(server, "header shows the chat on B",
-                "$(header_env) === $(TK.json(replace(proj_dir_b_expected, homedir() => "~")))";
-                timeout = 120) == true
+            # ── A new chat on B, and the window on it ────────────────────────
+            made = new_chats(state, target_id, known)
+            @test length(made) == 1
+            q = only(made)
+            @test q.id != pid
+            @test q.worker_path == proj_dir_b
+            @test q.title[] == p.title[]
+            @test TK.wait_for(server, "the window shows the new chat",
+                "(document.querySelector('.bt-side-item.bt-side-active') || {}).dataset?.projectId === $(TK.json(q.id))";
+                timeout = 60) == true
+            @test TK.wait_for(server, "its header shows B's path",
+                "$(header_env) === $(TK.json(replace(proj_dir_b, homedir() => "~")))"; timeout = 120) == true
 
-            # …and ends in the DONE state saying what the agent kept. Not
-            # "the card disappears": a FAILED move parks it in `.bt-prog-err`,
-            # and an assertion on "gone" would pass for either outcome.
-            @test TK.wait_for(server, "the progress card reports the move done",
-                """(() => { const c = document.querySelector('.bt-prog.bt-prog-ok');
-                    return !!c && (c.querySelector('.bt-prog-title')?.textContent || '')
-                        .includes('Continued on worker-b'); })()"""; timeout = 120) == true
+            # ── The original is untouched ────────────────────────────────────
+            @test p.worker_id == worker_a_id
+            @test p.worker_path == cwd
+            @test p.resume_session_id == sid
+            @test haskey(state.chat_models, pid)                    # its session was never stopped
 
-            # ── Atomic flip of worker_id / worker_path ───────────────────────
-            @test p.worker_id == target_id
-            @test startswith(p.worker_path, worker_b.projects_root)
-            proj_dir_b = p.worker_path
-            @test proj_dir_b != proj_dir_a
-
-            # ── Files synced to B (incl. the out-of-band edits) ──────────────
-            @test isfile(joinpath(proj_dir_b, "README.md"))
-            @test read(joinpath(proj_dir_b, "README.md"), String) ==
-                  "version 2: edited on A out of band\n"
+            # ── Files on B, incl. the out-of-band edits; B's own file kept ───
+            @test read(joinpath(proj_dir_b, "README.md"), String) == "version 2: edited on A out of band\n"
             @test read(joinpath(proj_dir_b, "newfile.txt"), String) == "added on A\n"
-            @test read(joinpath(proj_dir_b, "deep", "nested.txt"), String) ==
-                  "hidden treasure\n"
-            # Every mirrored file arrived byte-identical, and B's own file is
-            # still there: the push is additive.
+            @test read(joinpath(proj_dir_b, "deep", "nested.txt"), String) == "hidden treasure\n"
             files_b = project_files(proj_dir_b)
             @test all(get(files_b, rel, nothing) == bytes for (rel, bytes) in project_files(p.server_path))
-            @test read(stray_on_b, String) == "B had this before the move\n"
+            @test read(stray_on_b, String) == "B had this before\n"
 
-            # ── The agent's memory followed ──────────────────────────────────
-            # The transcript now sits under B's cwd, naming B's cwd; the
-            # subagent folder and the memory came along; the session id is kept
-            # so B's agent LOADS it (strict_load makes a missing transcript a
-            # failed load, which would have cleared the id).
-            @test p.resume_session_id == sid
+            # ── The agent's memory came along ────────────────────────────────
+            @test q.resume_session_id == sid
             tdir_b = transcript_dir(proj_dir_b)
             push!(seeded_dirs, tdir_b)
-            @test isfile(joinpath(tdir_b, sid * ".jsonl"))
-            moved = read(joinpath(tdir_b, sid * ".jsonl"), String)
-            @test occursin("\"cwd\":" * BT.JSON.json(proj_dir_b), moved)
-            @test !occursin(BT.JSON.json(cwd), moved)
+            carried = read(joinpath(tdir_b, sid * ".jsonl"), String)
+            @test occursin("\"cwd\":" * BT.JSON.json(proj_dir_b), carried)
+            @test !occursin(BT.JSON.json(cwd), carried)
             @test read(joinpath(tdir_b, sid, "sub.jsonl"), String) ==
                   "{\"type\":\"user\",\"cwd\":" * BT.JSON.json(proj_dir_b) * "}\n"
             @test read(joinpath(tdir_b, "memory", "MEMORY.md"), String) == "- remember the treasure\n"
-            # Nothing left behind: no transfer folder on either worker, no
-            # server copy.
+            # A's record is still where A's chat needs it.
+            @test isfile(joinpath(tdir_a, sid * ".jsonl"))
+            # Nothing left behind in either worker's staging folder, or on the server.
             @test !ispath(joinpath(worker_a.projects_root, AgentProviders.TRANSFER_DIRNAME))
             @test !ispath(joinpath(worker_b.projects_root, AgentProviders.TRANSFER_DIRNAME))
             @test !ispath(joinpath(server.h.state_dir, "transfers", pid))
 
-            # ── Chat storage followed the move ───────────────────────────────
-            # The chat dir is the SAME server-side dir as before the move (it was
-            # never on a worker), so history is intact across the relocation.
-            @test isdir(chat_dir)
-
-            # ── DOM: the same chat is still open and live on the new worker ───
-            @test TK.current_chat_id(server) == pid
-            @test TK.wait_for(server, "chat pane live after move",
-                "!!document.querySelector('.bt-chatpane') && !!document.querySelector('.bt-text-input')";
-                timeout = 30) == true
-
-            # ── Re-send on the new worker proves storage + session followed ──
-            # This prompt round-trips through B's mock-agent — which LOADED the
-            # moved transcript — and must render in the SAME pane as the
-            # pre-move reply.
+            # ── The new chat resumed the conversation and goes on ────────────
+            @test TK.wait_for(server, "the new chat shows the carried conversation",
+                "$(pane_text).includes('echo: before-move')"; timeout = 60) == true
             TK.send_message(server, "after-move")
-            @test TK.wait_for(server, "B reply rendered",
-                "(document.body.innerText || '').includes('echo: after-move')"; timeout = 60) == true
-            # The pre-move message is STILL in the pane — history survived the move.
-            @test TK.eval_js(server,
-                "(document.body.innerText || '').includes('echo: before-move')") == true
-            # …and the session was loaded, not replaced: the id did not rotate.
-            @test p.resume_session_id == sid
+            @test TK.wait_for(server, "B reply rendered", "$(pane_text).includes('echo: after-move')"; timeout = 60) == true
+            @test q.resume_session_id == sid                        # loaded, not replaced
 
-            # ── A chat whose record can't be carried still moves ─────────────
-            # Its transcript is gone (pruned, another agent's): the move goes on,
-            # the agent starts fresh on the other worker, the pane keeps working.
-            # With two workers up, which card `new_chat` lands on follows the
-            # worker list's order — so the target is "whichever worker the chat
-            # is NOT on", found after the fact.
+            # ── …and so does the original, on A ──────────────────────────────
+            TK.open_chat(server, pid)
+            TK.send_message(server, "still-on-a")
+            @test TK.wait_for(server, "A still answers", "$(pane_text).includes('echo: still-on-a')"; timeout = 60) == true
+            @test p.worker_id == worker_a_id
+            @test !occursin("echo: after-move", TK.eval_js(server, pane_text))
+
+            # ── A chat whose record can't be carried still continues ─────────
+            # Its transcript is gone: the new chat starts a fresh session.
             cwd2 = mktempdir()
             write(joinpath(cwd2, "note.txt"), "second chat\n")
             pid2 = TK.new_chat(server; cwd = cwd2, title = "movefresh")
             p2 = state.projects[][pid2]
             other = only(w for w in values(state.workers[]) if w.online[] && w.worker_id != p2.worker_id)
             TK.send_message(server, "second-before")
-            @test TK.wait_for(server, "second chat replied",
-                "(document.body.innerText || '').includes('echo: second-before')"; timeout = 60) == true
+            @test TK.wait_for(server, "second chat replied", "$(pane_text).includes('echo: second-before')"; timeout = 60) == true
             t0 = time()
             while p2.resume_session_id === nothing && time() - t0 < 30; sleep(0.1); end
             sid2 = p2.resume_session_id
@@ -279,76 +230,63 @@
             push!(seeded_dirs, tdir2)
             rm(joinpath(tdir2, sid2 * ".jsonl"); force = true)
 
+            known = Set(keys(state.projects[]))
             @test TK.eval_js(server, open_menu) == true
             @test TK.wait_for(server, "the menu offers the other worker",
                 "$(continue_items).includes($(repr(other.name)))"; timeout = 30) == true
             @test TK.eval_js(server, click_continue(other.name)) == true
-            proj_dir_b2 = BT.worker_join(other.projects_root, p2.name)
-            @test TK.wait_for(server, "second chat shows the other worker's path",
-                "$(header_env) === $(TK.json(replace(proj_dir_b2, homedir() => "~")))";
-                timeout = 120) == true
-            @test p2.worker_id == other.worker_id
-            @test read(joinpath(p2.worker_path, "note.txt"), String) == "second chat\n"
-            push!(seeded_dirs, transcript_dir(p2.worker_path))
+            @test TK.wait_for(server, "a fresh new chat", card_done("New chat on $(other.name)"); timeout = 120) == true
+            q2 = only(new_chats(state, other.worker_id, known))
+            @test q2.resume_session_id === nothing
+            @test read(joinpath(q2.worker_path, "note.txt"), String) == "second chat\n"
+            push!(seeded_dirs, transcript_dir(q2.worker_path))
+            @test TK.wait_for(server, "the window shows the fresh chat",
+                "$(header_env) === $(TK.json(replace(q2.worker_path, homedir() => "~")))"; timeout = 120) == true
             TK.send_message(server, "second-after")
-            @test TK.wait_for(server, "second chat replied on B",
-                "(document.body.innerText || '').includes('echo: second-after')"; timeout = 60) == true
-            # Fresh session on B: the id the mock hands out for a NEW session is
-            # what is recorded now — not the one whose transcript was gone.
-            @test p2.resume_session_id !== nothing
+            @test TK.wait_for(server, "the fresh chat answers", "$(pane_text).includes('echo: second-after')"; timeout = 60) == true
+            @test q2.resume_session_id !== nothing
+            @test p2.worker_id != other.worker_id && p2.resume_session_id == sid2   # the original as it was
 
-        # A worker that is gone cannot be pulled from, so a move away from it can
-        # only push the server's mirror. Two cases, both through the header menu:
-        # a mirror that WAS synced (the first move pre-pulled it) is pushed, and
-        # adds only; a mirror that never was is refused before anything moves.
-        @testset "source worker offline, synced mirror: the move adds from the mirror" begin
-            TK.kill_worker!(worker_b_proc)                # B, the chat's current worker, dies
+        # With the source worker gone only the server's mirror can be pushed:
+        # one that was never synced is refused before anything happens, one that
+        # was synced (the continue above pulled A's files into it) is pushed.
+        @testset "source worker offline, never synced: refused, nothing happens" begin
+            TK.kill_worker!(worker_b_proc)            # B, where the new chat `q` lives
             t0 = time()
             while worker_b.online[] && time() - t0 < 30; sleep(0.1); end
             @test !worker_b.online[]
-            @test p.last_sync_at !== nothing              # the first move pulled it into the mirror
-            target_on_a = BT.worker_join(worker_a.projects_root, p.name)
+            @test q.last_sync_at === nothing          # a continued chat's mirror starts empty
+            target_on_a = BT.worker_join(worker_a.projects_root, q.name)
             mkpath(target_on_a)
-            stray_on_a = joinpath(target_on_a, "a-had-this.txt")
-            write(stray_on_a, "A's own file\n")
+            before = readdir(target_on_a)
+            known = Set(keys(state.projects[]))
 
-            TK.open_chat(server, pid)
+            TK.open_chat(server, q.id)
             @test TK.eval_js(server, open_menu) == true
             @test TK.wait_for(server, "the menu offers worker A",
                 "$(continue_items).includes($(repr(worker_a.name)))"; timeout = 30) == true
             @test TK.eval_js(server, click_continue(worker_a.name)) == true
-            @test TK.wait_for(server, "the move from the mirror completes",
-                """(() => { const c = document.querySelector('.bt-prog.bt-prog-ok');
-                    return !!c && (c.querySelector('.bt-prog-title')?.textContent || '')
-                        .includes('Continued on ' + $(repr(worker_a.name))); })()"""; timeout = 120) == true
-            @test p.worker_id == worker_a_id
-            @test p.worker_path == target_on_a
-            @test read(joinpath(target_on_a, "README.md"), String) == "version 2: edited on A out of band\n"
-            @test read(joinpath(target_on_a, "deep", "nested.txt"), String) == "hidden treasure\n"
-            @test read(stray_on_a, String) == "A's own file\n"      # the push added, it did not mirror
+            @test TK.wait_for(server, "refused, and says why",
+                """(() => { const c = document.querySelector('.bt-prog.bt-prog-err');
+                    return !!c && (c.innerText || '').includes('never synced'); })()"""; timeout = 120) == true
+            @test Set(keys(state.projects[])) == known
+            @test readdir(target_on_a) == before
+            @test q.worker_id == target_id
         end
 
-        @testset "source worker offline, never synced: the move is refused, nothing is touched" begin
-            cwd3 = mktempdir()
-            write(joinpath(cwd3, "precious.txt"), "only on A\n")
-            pid3 = TK.new_chat(server; cwd = cwd3, title = "neversynced")   # A is the only live card
-            p3 = state.projects[][pid3]
-            @test p3.worker_id == worker_a_id
-            @test p3.last_sync_at === nothing
+        @testset "source worker offline, synced mirror: a new chat from the mirror" begin
             worker_c_proc = TK.add_worker!(server; name = "worker-c")
             try
-                t0 = time()
-                while time() - t0 < 30 &&
-                      !any(w -> w.name == "worker-c" && w.online[], values(state.workers[]))
-                    sleep(0.1)
-                end
-                worker_c = only(w for w in values(state.workers[]) if w.name == "worker-c")
-                @test worker_c.online[]
-                target_on_c = BT.worker_join(worker_c.projects_root, p3.name)
+                worker_c = wait_online(state, "worker-c")
+                @test p.last_sync_at !== nothing       # the first continue pulled A into it
+                target_on_c = BT.worker_join(worker_c.projects_root, p.name)
                 mkpath(target_on_c)
-                write(joinpath(target_on_c, "c-had-this.txt"), "C's own file\n")
+                stray_on_c = joinpath(target_on_c, "c-had-this.txt")
+                write(stray_on_c, "C's own file\n")
+                known = Set(keys(state.projects[]))
 
-                TK.kill_worker!(server)                        # A, the source, dies
+                TK.open_chat(server, pid)
+                TK.kill_worker!(server)                # A, the original's worker, dies
                 t0 = time()
                 while worker_a.online[] && time() - t0 < 30; sleep(0.1); end
                 @test !worker_a.online[]
@@ -357,22 +295,22 @@
                 @test TK.wait_for(server, "the menu offers worker C",
                     "$(continue_items).includes(\"worker-c\")"; timeout = 30) == true
                 @test TK.eval_js(server, click_continue("worker-c")) == true
-                @test TK.wait_for(server, "the move is refused and says why",
-                    """(() => { const c = document.querySelector('.bt-prog.bt-prog-err');
-                        return !!c && (c.innerText || '').includes('never synced'); })()"""; timeout = 120) == true
-                @test p3.worker_id == worker_a_id
-                @test p3.worker_path == cwd3
-                @test readdir(target_on_c) == ["c-had-this.txt"]
-                @test read(joinpath(target_on_c, "c-had-this.txt"), String) == "C's own file\n"
-                @test read(joinpath(cwd3, "precious.txt"), String) == "only on A\n"
+                @test TK.wait_for(server, "a new chat from the mirror", card_done("New chat on worker-c"); timeout = 120) == true
+                q3 = only(new_chats(state, worker_c.worker_id, known))
+                @test q3.worker_path == target_on_c
+                @test read(joinpath(target_on_c, "README.md"), String) == "version 2: edited on A out of band\n"
+                @test read(joinpath(target_on_c, "deep", "nested.txt"), String) == "hidden treasure\n"
+                @test read(stray_on_c, String) == "C's own file\n"   # added, not mirrored
+                @test p.worker_id == worker_a_id                      # the original still names A
             finally
                 TK.kill_worker!(worker_c_proc)
             end
         end
-        end   # "Continue on worker B (A → B), memory carried" and its offline-source follow-ups
+        end   # the first testset, and its offline-source follow-ups
 
         @test isempty(TK.js_errors(server))
     finally
+        TK.REPLAY_FN[] = sid -> Any[]
         close(server)
         for d in seeded_dirs
             rm(d; recursive = true, force = true)

@@ -18,8 +18,16 @@
 #                    "request_id", "args": {…the tool's own arguments…}}
 #                   (`runs` answers with run statuses as data, not a tool result:
 #                   `bt_julia_wait` on the chat's own worker polls with it)
+#                   {"op": "values", "request_id", "args": {"pair", "env_path"}}
+#                   (connect that session to a value exchange the chat's own
+#                   session opened: remote_values.jl)
+#                   {"op": "share_app", "request_id", "args": {"path", "env_path"}}
+#                   (a worker's SHARE host, BonitoAgents' shares.jl: park the
+#                   value of the Julia file `path` for a shared link's viewers)
 #                   {"op": "shutdown", "request_id"}
 #   host → server:  {"type": "eval_host_result", "request_id", "result": <tool result>}
+#                   {"type": "eval_host_result", "request_id", "ok" | "error"}  (values, shutdown)
+#                   {"type": "eval_host_result", "request_id", "holder", "prefix"} (share_app)
 #
 # Lifetime: the process exits on `shutdown` (the chat's session ended, or the
 # user switched remote Julia off), or when it has had no control channel the
@@ -31,7 +39,8 @@
 
 const HOST_ORPHAN_S   = 600.0
 const HOST_ENV_WORKER = "BONITOAGENTS_EVAL_HOST_WORKER"
-const HOST_OPS        = ("eval", "continue", "interrupt", "restart", "sessions", "runs", "shutdown")
+const HOST_OPS        = ("eval", "continue", "interrupt", "restart", "sessions", "runs", "values",
+                         "share_app", "shutdown")
 
 # Which worker this process runs on, when it is an eval host ("" otherwise).
 host_worker_id() = get(ENV, HOST_ENV_WORKER, "")
@@ -105,6 +114,11 @@ function handle_host_op!(ws, msg::AbstractDict)
     end
     raw = get(msg, "args", Dict{String,Any}())
     args = raw isa AbstractDict ? Dict{String,Any}(String(k) => v for (k, v) in raw) : Dict{String,Any}()
+    if op == "values" || op == "share_app"
+        answer = op == "values" ? connect_values : share_app
+        Base.errormonitor(@async host_reply(ws, rid, answer(args)))
+        return nothing
+    end
     # This IS the worker the eval runs on: a `worker` argument that slipped
     # through would send the call back through the server for ever.
     delete!(args, "worker")
@@ -137,4 +151,49 @@ function handle_host_op!(ws, msg::AbstractDict)
         end
     end)
     return nothing
+end
+
+# Connect the session for `env_path` to the value exchange `pair`, starting the
+# session if it is not running. A live session is used whatever Julia it was
+# started with: the chat's side checks the version, and says so if it differs.
+function connect_values(args::AbstractDict)
+    env_path = env_arg(args)
+    pair = String(get(args, "pair", ""))
+    isempty(pair) && return Dict{String,Any}("error" => "no value exchange named")
+    try
+        s = live_session!(env_path)
+        Malt.remote_eval_fetch(s.worker, :(Main.BonitoMCPHelper.serve_values($pair)))
+        return Dict{String,Any}("ok" => true)
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict{String,Any}("error" => "the session for $(env_label(env_path)) could not connect: " *
+                                           sprint(showerror, e))
+    end
+end
+
+# The running session for `env_path`, whatever Julia it was started with, or a
+# new one.
+function live_session!(env_path::Union{String,Nothing})
+    m = manager()
+    s = @lock m.lock get(m.sessions, _key(env_path), nothing)
+    return s !== nothing && is_alive(s) ? s : get_or_create!(m, env_path)
+end
+
+# Park the value of a shared Julia file for its link's viewers (RemoteProxy's
+# `share_value`), in the session for the link's env, which the live-render bridge
+# connects to the server first.
+function share_app(args::AbstractDict)
+    path = String(get(args, "path", ""))
+    env_path = env_arg(args)
+    isempty(path) && return Dict{String,Any}("error" => "no file named")
+    try
+        s = live_session!(env_path)
+        ensure_eval_dialed!(s)
+        isempty(s.dial_error) || error(s.dial_error)
+        holder, prefix = Malt.remote_eval_fetch(s.worker, :(Main.RemoteProxy.share_value($path)))
+        return Dict{String,Any}("holder" => holder, "prefix" => prefix)
+    catch e
+        e isa InterruptException && rethrow()
+        return Dict{String,Any}("error" => sprint(showerror, e))
+    end
 end

@@ -254,19 +254,19 @@ Operations (`op`):
   • `close_chat`    — drop a chat from the open list (the thread is kept on disk).
                       Args: `project_id`.
   • `rescan_worker` — re-scan a worker for agent sessions. Args: `worker_id`.
-  • `move_project`  — copy a project's files from the worker it lives on to
-                      another worker (the cross-worker sync the UI's ⇄ button
-                      runs), then point the project at the destination.
+  • `continue_project` — "Continue on <worker>": a NEW chat on another worker
+                      with the project's files and the agent's memory; the
+                      original chat is left as it is. Returns the new chat's id.
                       Args: `project_id`, `worker_id` (the destination).
   • `set_title`     — rename a chat. Args: `project_id`, `title`.
 
 These have real effects on the user's live session — a `send_message` starts an
-agent turn that costs tokens, `move_project` writes files on another machine.
+agent turn that costs tokens, `continue_project` writes files on another machine.
 Say what you are about to do before doing it.
 """
 
 const DEV_CONTROL_OPS = ("open_chat", "send_message", "restart_chat", "close_chat",
-                         "rescan_worker", "move_project", "set_title")
+                         "rescan_worker", "continue_project", "set_title")
 
 register!("bt_dev_control", DEV_CONTROL_DESCRIPTION,
     Dict{String,Any}(
@@ -287,7 +287,7 @@ register!("bt_dev_control", DEV_CONTROL_DESCRIPTION,
             return dev_error("unknown op '$op'; expected one of " * join(DEV_CONTROL_OPS, ", "))
         # A cross-worker copy moves a whole project tree over the network; the
         # default 30s would time out on anything real.
-        timeout = op == "move_project" ? 900.0 : 60.0
+        timeout = op == "continue_project" ? 900.0 : 60.0
         return dev_call("control"; timeout = timeout, op = op,
                         project_id = String(get(args, "project_id", "")),
                         worker_id  = String(get(args, "worker_id", "")),

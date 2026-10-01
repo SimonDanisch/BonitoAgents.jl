@@ -314,9 +314,12 @@ function login_guard(session::Bonito.Session, ::LoginAuth)
         DOM.div(
             DOM.div(; class = "bt-conn-glyph"),
             DOM.div("Your login has ended"; class = "bt-conn-title"),
-            DOM.div("Log in again to go on; the page reloads to the login."; class = "bt-conn-msg"),
-            DOM.button("Log in again"; class = "bt-btn bt-conn-reload", type = "button",
-                       onclick = js"() => window.location.reload()");
+            # Never a reload: that took whatever was typed with it. The login
+            # happens in a new tab, and this page goes on once it is back.
+            DOM.div("Log in again in a new tab. This page stays as it is and goes on by itself " *
+                    "once you are logged in."; class = "bt-conn-msg"),
+            DOM.button("Log in (new tab)"; class = "bt-btn bt-conn-reload", type = "button",
+                       onclick = js"() => window.open(window.location.origin + '/', '_blank')");
             class = "bt-conn-card", role = "alertdialog", var"aria-live" = "assertive");
         class = "bt-conn-modal bt-login-ended", dataStatus = "disconnected")
     Bonito.onload(session, modal, js"""(modal) => {
@@ -327,12 +330,14 @@ function login_guard(session::Bonito.Session, ::LoginAuth)
             } catch (e) {
                 return;   // the server is out of reach: the connection guard's business
             }
-            if (r.status === 204) return;
+            if (r.status === 204) { modal.classList.remove('bt-conn-open'); return; }
             if (r.type === 'opaqueredirect' || r.status === 401 || r.status === 403)
                 modal.classList.add('bt-conn-open');
         }
         setInterval(check, 5 * 60 * 1000);
         document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && check());
+        // Back from the login tab: the window gets focus without a visibility change.
+        window.addEventListener('focus', () => modal.classList.contains('bt-conn-open') && check());
     }""")
     return modal
 end
@@ -527,8 +532,10 @@ const BASE_CSS = [
         "z-index" => "9998",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "var(--bt-space-2)",
-        "min-width" => "min(320px, 92vw)",
-        "max-width" => "min(760px, 92vw)",
+        # One fixed width, not a range: sized to its content, the card changed
+        # width with every file path it showed (hundreds a second in a copy).
+        # The path is cut with an ellipsis instead (`.bt-prog-msg`).
+        "width" => "min(600px, 92vw)", "box-sizing" => "border-box",
         "padding" => "8px 10px 8px 12px",
         "background" => "var(--bt-surface)",
         "border" => "1px solid var(--bt-border-strong)",
@@ -552,9 +559,10 @@ const BASE_CSS = [
     CSS(".bt-prog-row",
         "display" => "flex", "align-items" => "center",
         "gap" => "var(--bt-space-2)", "min-width" => "0"),
+    # Wraps rather than overflowing the fixed width: an outcome ("New chat on
+    # …, with the agent's memory. …") can be longer than a line.
     CSS(".bt-prog-title",
-        "font-weight" => "600", "flex" => "0 0 auto",
-        "white-space" => "nowrap"),
+        "font-weight" => "600", "flex" => "0 1 auto", "min-width" => "0"),
     CSS(".bt-prog-pct",
         "font-variant-numeric" => "tabular-nums",
         "color" => "var(--bt-text-muted)",
@@ -565,7 +573,7 @@ const BASE_CSS = [
         "color" => "var(--bt-text-muted)",
         "font-family" => "ui-monospace, monospace",
         "font-size" => "var(--bt-text-xs)",
-        "flex" => "1 1 auto", "min-width" => "0",
+        "flex" => "1 1 0", "min-width" => "0",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
     # Spinner only while something is actually in flight — a still card with a
@@ -1311,12 +1319,11 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-status-online)"),
     CSS(".bt-dot-offline", "background" => "var(--bt-status-offline)"),
     CSS(".bt-dot-update", "background" => "var(--bt-status-update)"),
+    # No side margin: the card pads its rows, and these line up with the title.
     CSS(".bt-worker-update-note",
-        "display" => "block", "margin" => "0 14px 8px", "font-size" => "12px",
-        "color" => "#92400e"),
+        "display" => "block", "font-size" => "12px", "color" => "#92400e"),
     CSS(".bt-worker-adapters",
-        "display" => "block", "margin" => "0 14px 8px", "font-size" => "12px",
-        "color" => "var(--bt-text-muted)"),
+        "display" => "block", "font-size" => "12px", "color" => "var(--bt-text-muted)"),
     # npm's reason comes as several lines; keep them apart.
     CSS(".bt-worker-adapters-error",
         "display" => "block", "color" => "var(--bt-error)", "white-space" => "pre-line"),

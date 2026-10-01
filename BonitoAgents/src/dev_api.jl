@@ -182,10 +182,10 @@ jsonable(x) = string(x)
 # chat's MCP may ask them (remote_eval.jl). They share this channel and this
 # allow-list because it is the one request/reply path an MCP process has.
 const DEV_OPS          = (:inspect, :logs, :memory, :control,
-                          :remote_eval, :remote_workers, :sync_folder)
+                          :remote_eval, :remote_workers, :sync_folder, :share)
 const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
-                          :rescan_worker, :move_project, :set_title)
+                          :rescan_worker, :continue_project, :set_title)
 
 known_or_throw(name::Symbol, known, what) =
     name in known ? name :
@@ -817,26 +817,20 @@ function dev_control(state::ServerState, ::Val{:set_title}, args::AbstractDict)
 end
 
 # Continue a chat on another worker. The SAME operation as the chat header's
-# "Continue on <worker>" (`start!`): the project's files and the agent's own
-# record of the conversation move through the server, the project is re-bound to
-# the new worker, and its session is brought up there — so there is one
-# implementation of "move a chat between machines" and this can't drift from it.
-function dev_control(state::ServerState, ::Val{:move_project}, args::AbstractDict)
+# "Continue on <worker>" (`continue_on!`): a new chat there, with the project's
+# files and the agent's own record of the conversation; the original chat is
+# left as it is. One implementation, so this can't drift from what users get.
+function dev_control(state::ServerState, ::Val{:continue_project}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
     dst_worker = String(get(args, "worker_id", ""))
     haskey(state.workers[], dst_worker) || error("no worker '$dst_worker'")
-    p.worker_id == dst_worker &&
-        error("project '$(p.id)' is already on worker '$dst_worker'")
-    w = state.workers[][dst_worker]
-    isopen(w) || error("worker '$dst_worker' is offline — can't continue there")
-    source_worker = p.worker_id
-    start!(state, p, dst_worker)
+    new_p = continue_on!(state, p, dst_worker)
     return Dict{String,Any}("ok" => true, "project_id" => p.id,
-                            "source_worker" => source_worker,
-                            "dest_worker" => p.worker_id, "dest_path" => p.worker_path,
-                            # Whether the agent resumes with its memory (the
-                            # transcript travelled) or starts fresh there.
-                            "conversation_carried" => p.resume_session_id !== nothing)
+                            "new_project_id" => new_p.id,
+                            "dest_worker" => new_p.worker_id, "dest_path" => new_p.worker_path,
+                            # Whether the new chat resumes with the agent's memory
+                            # (the transcript travelled) or starts fresh.
+                            "conversation_carried" => new_p.resume_session_id !== nothing)
 end
 
 # ── the "Debug BonitoAgents" chat ───────────────────────────────────────────

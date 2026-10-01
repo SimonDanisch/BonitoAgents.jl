@@ -256,6 +256,9 @@ it, so it covers the working path; the inactive-close fix is still open.
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |
 | `remote_eval_test.jl` | `bt_julia_eval(worker = …)`: refused while the chat's "remote julia" switch is off (the card still wears the ⇢ worker badge and the result says where the switch is); the header pill turns it on and the same call runs on worker B through an eval host the server spawns there (the result reports B's own worker id); `bt_julia_list_sessions` names B and its live host; `bt_sync_folder` copies a folder A → B; switching it off shuts the host down and the refusal is back |
+| `remote_values_test.jl` | `remote_session("worker-b")` in the chat's own session: refused while the switch is off (the error says where it is); on, a 24 MB value goes A → B (over the 16 MiB message limit) and a remote eval reads it; a value made on B comes back, an anonymous function runs on B, an error there comes back as a `RemoteSessionError`; switched off, the next request is refused |
+| `shares_test.jl` | Behind a tunnel: `bt_share` of a markdown file and a password-protected app file; a browser that is not logged in opens the page (its image from the worker, `![](clip.mp4)` as a video, a `<script>` that does not run), cannot reach the unreferenced file next to it nor the dashboard; the app asks for its password, then renders live from the worker's share host and reacts to a click; unknown sessions/assets still meet the login; ending a link in Settings makes it "Link not found" |
+| `worker_crash_test.jl` | A worker SIGKILLed mid-turn and started again: the busy chat gets the one automatic "carry on" message and the agent's answer, an idle chat gets nothing; a worker stopped on purpose (SIGTERM path, pidfile removed) mid-turn continues nothing; a stop clicked while the worker is down means no continuation; a dropped connection resumes the turn and adds nothing; a crash during the continuation is not continued again |
 | `todo_taskbar.jl`     | live todo as a pinned panel, plan update mutates it in place (done/active), turn end finalizes to one bubble + drops the pin |
 | `bt_wait.jl`          | `bt_wait` through the real chat: the turn is WALL-CLOCK blocked for the requested seconds (the whole contract — a unit test on the handler cannot see it), the real handler ran (its `reason` is echoed in the card), and the task bar did NOT grow (no pill, no notification — the difference from a background sleeper) |
 | `todo_worker_death.jl` | a plan the agent NEVER finishes, then SIGKILL of the chat's own worker: the pin drops and the list lands in history with the statuses it had (`▶○`, not a forged `✓`). Own dev_server — it kills the main worker. The gap that let todo pills count for 35 h: `todo_taskbar` covers the turn-end path, which always worked; nothing covered the machine going away |
@@ -298,8 +301,9 @@ unit test stays — it is headless, not a UI test).
   header's ⋯ → *Continue on* item and also pinning that the agent's transcript
   travels (the mock keeps a Claude-shaped transcript and, under `strict_load`,
   refuses `session/load` unless it sits under the new cwd). The cross-worker
-  *sync* UI (`⇄`, the compare modal, `sync_across_workers!`) was removed with it:
-  there is one operation for a chat on another machine, the move.
+  *sync* UI (`⇄`, the compare modal, `sync_across_workers!`) was removed with it.
+  Since 2026-09-30 *Continue on* opens a NEW chat on the other worker and leaves
+  the original alone; the test pins both halves.
 - `test_remotesync.jl` → headless `../unit/remotesync_test.jl`.
 - `test_chat_stress.jl` → the real-`serve()` render path is exercised by every
   dev_server suite (`smoke_test.jl`, `chat_features.jl`, `workflows.jl`).

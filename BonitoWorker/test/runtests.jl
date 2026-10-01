@@ -322,6 +322,74 @@ end
     end
 end
 
+# A crash is told from a stop by the pidfile a run leaves behind: removed by a
+# normal exit and by whoever stops the worker on purpose (this module, the
+# systemd unit's ExecStop), left by anything that kills it outright. Real
+# processes and real signals.
+@testset "a crashed run is told from a stopped one" begin
+    mktempdir() do dir
+        pf = joinpath(dir, "worker.pid")
+        booted = BW.boot_time()
+        @test 0 < time() - booted < 400 * 24 * 3600
+        @test BW.crashed_instance(pf) == ""                      # no file
+        BW.claim_pidfile!(pf; instance = "live-run")
+        @test BW.pidfile_instance(pf) == "live-run"
+        @test BW.pidfile_boot(pf) ≈ booted atol = 1
+        @test BW.crashed_instance(pf) == ""                      # our own, live
+        write(pf, "1\njulia\nother-run\n$(booted)\n")
+        @test BW.crashed_instance(pf) == ""                      # another, live (pid 1)
+        write(pf, "999999\njulia\n")
+        @test BW.crashed_instance(pf) == ""                      # dead, from before runs had ids
+        write(pf, "999999\njulia\ngone-run\n")
+        @test BW.crashed_instance(pf) == ""                      # dead, boot unknown
+        write(pf, "999999\njulia\ngone-run\n$(booted - 3600)\n")
+        @test BW.crashed_instance(pf) == ""                      # ended with an earlier boot
+        write(pf, "999999\njulia\ngone-run\n$(booted)\n")
+        @test BW.crashed_instance(pf) == "gone-run"
+        rm(pf)
+
+        # The worker's own claim, in a process of its own that is then killed.
+        project = dirname(something(Base.active_project()))
+        function start_claimed(tag)
+            rm(pf; force = true)
+            script = "using BonitoWorker; BonitoWorker.claim_pidfile!($(repr(pf)); instance = \"$(tag)\"); " *
+                     "println(\"ready\"); flush(stdout); sleep(120)"
+            # stderr away: an abort or segfault prints the runtime's crash report.
+            p = open(pipeline(`$(Base.julia_cmd()) --startup-file=no --project=$(project) -e $(script)`;
+                              stderr = devnull), "r")
+            @test readline(p) == "ready"
+            return p
+        end
+        function killed(sig)
+            p = start_claimed("run-$(sig)")
+            ccall(:kill, Cint, (Cint, Cint), getpid(p), sig)
+            wait(p)
+            return BW.crashed_instance(pf)
+        end
+        if Sys.isunix()
+            @test killed(9) == "run-9"                            # SIGKILL, an OOM kill
+            @test killed(6) == "run-6"                            # abort
+            @test killed(11) == "run-11"                          # segfault
+            # The unit's ExecStop, as systemd runs it (`$$` is its literal `$`):
+            # while the worker runs, the stop removes the pidfile; after a crash
+            # (the pid gone) it leaves it.
+            line = BW.service_exec_stop(pf)
+            @test occursin("ExecStop=", BW.render_service_unit(; projects_root = "/tmp"))
+            cmd = replace(line, "ExecStop=/bin/sh -c '" => "", "\$\$" => "\$")
+            cmd = cmd[1:end-1]                                      # the closing quote
+            p = start_claimed("run-stopped")
+            run(`/bin/sh -c $(cmd)`)
+            @test !isfile(pf)
+            kill(p, Base.SIGKILL); wait(p)
+            @test BW.crashed_instance(pf) == ""                   # killed after the stop: not a crash
+            p = start_claimed("run-crashed")
+            kill(p, Base.SIGKILL); wait(p)
+            run(`/bin/sh -c $(cmd)`)                              # systemd runs it after a crash too
+            @test BW.crashed_instance(pf) == "run-crashed"
+        end
+    end
+end
+
 # The bug: `juliaup default 1.13`, install; trouble; `juliaup default 1.12`,
 # re-install — and the 1.13 worker (with the 1.13 BonitoMCP launch command it
 # had told the server about) stayed up, because "did the code change" was the

@@ -143,8 +143,8 @@ ended · Reconnect** chip appears next to the title.
   overnight.
 - **Compact** (⋯ menu) asks the agent to summarize the conversation so far into
   a fresh context, after which the transcript reconciles cleanly.
-- **Continue on** (⋯ menu) moves the chat, its files and the agent's memory to
-  another worker and carries on there; see the workers page.
+- **Continue on** (⋯ menu) opens a new chat on another worker with the project's
+  files and the agent's memory; this chat stays as it is. See the workers page.
 - **Background tasks** (long test runs, builds) stay pinned to the taskbar
   with live line counts and a per-task stop button, monitored across turns
   until their writer exits.

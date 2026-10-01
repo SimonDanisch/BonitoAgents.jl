@@ -880,6 +880,9 @@ class BonitoChat {
         if (this.onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this.onAppClickCapture, true);
         }
+        if (this.onDraftInput && this.textInput) {
+            this.textInput.removeEventListener('input', this.onDraftInput);
+        }
         if (this.onAppChange && this.app) {
             this.app.removeEventListener('change', this.onAppChange);
         }
@@ -3982,6 +3985,31 @@ class BonitoChat {
             this.textInput?.focus();
         };
         this.app.addEventListener('change', this.onAppChange);
+
+        // Unsent text outlives the page. A reload (a login that ended, a server
+        // restart) used to take a half-written message with it; now it is kept
+        // per chat in localStorage and put back here. `submit` clears the field
+        // with an `input` event, which drops the saved copy. Yolo reminders are
+        // not a draft: the server keeps those.
+        const pid = app.closest('.bt-chatpane')?.dataset.panePid;
+        if (pid) {
+            const key = 'bt-draft:' + pid;
+            const yolo = () => this.textInput.classList.contains('bt-text-input-yolo');
+            let saved = null;
+            try { saved = localStorage.getItem(key); } catch (_) {}
+            if (saved && !this.textInput.value && !yolo()) {
+                this.textInput.value = saved;
+                this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
+            }
+            this.onDraftInput = () => {
+                if (yolo()) return;
+                const text = this.textInput.value;
+                try {
+                    text.trim() ? localStorage.setItem(key, text) : localStorage.removeItem(key);
+                } catch (_) {}   // storage full or off: the draft just isn't kept
+            };
+            this.textInput.addEventListener('input', this.onDraftInput);
+        }
 
         // Enter-to-send on the textarea (Shift+Enter newline as usual).
         this.onTextInputKeyCapture = (e) => {

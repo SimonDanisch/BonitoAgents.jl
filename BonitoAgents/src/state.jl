@@ -243,6 +243,92 @@ Base.@kwdef mutable struct ChatIconState
     lock::ReentrantLock = ReentrantLock()
 end
 
+# A shared link (shares.jl): one file on a worker, a markdown page or a Julia
+# file whose value is a Bonito app, for anyone with the link. `id` is random;
+# the link's token is derived from it with the server's url key, so the records
+# on disk do not hold usable links. `env_path` is the project an app runs in
+# ("" for a temp env). No password: `password_hash == ""`.
+struct ShareLink
+    id::String
+    owner::String
+    worker_id::String
+    path::String
+    env_path::String
+    title::String
+    password_salt::String
+    password_hash::String
+    created::DateTime
+end
+
+# A share host's live-render bridge: which worker it serves, and the assets it
+# proxies (which the login gate lets through for app pages).
+struct ShareBridge
+    worker_id::String
+    assets::Bonito.ChildAssetServer
+end
+
+# The links, and what the login gate lets through for them (tunnel.jl): the
+# pages of open app links (their websocket, and the assets they registered) and
+# the live-render bridges of the workers' share hosts (the assets proxied
+# through them). Shared by every session view of the state.
+struct ShareRegistry
+    lock::ReentrantLock
+    links::Observable{Dict{String,ShareLink}}      # by id; persisted in shares.json
+    tokens::Dict{String,String}                    # token => id
+    pages::Dict{String,Bonito.Session}             # open app pages, by root session id
+    bridges::Dict{String,ShareBridge}              # by bridge prefix
+end
+ShareRegistry() = ShareRegistry(ReentrantLock(), Observable(Dict{String,ShareLink}()),
+                                Dict{String,String}(), Dict{String,Bonito.Session}(),
+                                Dict{String,ShareBridge}())
+
+# A chat's turn that was in flight when its worker's link went down
+# (crash_recovery.jl): which run of the worker it ran on, the chat's turn number
+# then, and whether that turn was itself the continuation after a crash.
+struct InterruptedTurn
+    worker_id::String
+    instance::String
+    turn_seq::Int
+    was_continue::Bool
+    at::Float64
+end
+
+# What the server needs to continue chats after a worker crash: the run each
+# connected worker is (its hello's `instance`), the turns cut off, by chat, and
+# the run whose outage the notes were taken for (once per outage), by worker.
+# Guarded by the state's lock.
+struct CrashWatch
+    instances::Dict{String,String}
+    interrupted::Dict{String,InterruptedTurn}
+    noted::Dict{String,String}
+end
+CrashWatch() = CrashWatch(Dict{String,String}(), Dict{String,InterruptedTurn}(), Dict{String,String}())
+
+# The worker build this server offers (`current_worker_update_spec`), as last
+# resolved. Resolving asks GitHub (`git ls-remote`), which takes as long as the
+# network does: a worker's handshake that resolved it itself went unanswered
+# while the network was bad. So it is resolved at startup and again in the
+# background, and a handshake takes what is here. `spec` is `nothing` until the
+# first resolve succeeds; a failed one keeps the last, since the fallback it
+# would give (another rev) sends every auto-updating worker through a reinstall.
+mutable struct WorkerBuild
+    lock::ReentrantLock
+    resolve::Function      # () -> spec, throwing when it cannot tell
+    spec::Union{Nothing,Dict{String,Any}}
+    tried_at::Float64
+    resolving::Union{Nothing,Task}
+end
+WorkerBuild(resolve::Function = current_worker_update_spec) =
+    WorkerBuild(ReentrantLock(), resolve, nothing, 0.0, nothing)
+
+# A value exchange waiting for its other side (remote_values.jl): the session an
+# eval host was told to connect, which only that host may answer for.
+struct ValuePair
+    project_id::String
+    worker_id::String
+    peer::Channel{WorkerLink.LinkChannel}
+end
+
 mutable struct ServerState
     # Convention: every shared-state struct's first field is its lock.
     # Bonito App bodies run on different threads per browser tab and the
@@ -343,6 +429,11 @@ mutable struct ServerState
     # `take_pending!`/`unregister_rpc!` evict it exactly like a plain RPC.
     pending_chunks :: Dict{String,ChunkAccumulator}
 
+    # Worker requests that timed out, by what was asked (`take_pending!`): when
+    # each was last logged, and how many since. One line a minute per kind, so a
+    # stuck worker polled every second leaves a trace without flooding the log.
+    rpc_timeouts :: Dict{String,Tuple{Float64,Int}}
+
     # Persisted result of "discover Claude Code sessions" per worker:
     # worker_id → Vector of session dicts (session_id, path, first_prompt,
     # last_used, running, kind, …). Backs the dashboard's persistent
@@ -373,6 +464,9 @@ mutable struct ServerState
     eval_hosts         :: Dict{String,Any}
     # Single-flight per host key while one is being spawned + waited for.
     eval_host_locks    :: Dict{String,ReentrantLock}
+    # Value exchanges between a chat's session and one on another worker, by
+    # pair token, while the other side is being connected (remote_values.jl).
+    value_pairs        :: Dict{String,ValuePair}
     # Live stdout/stderr stream sinks for RUNNING evals: "project_id\0route" =>
     # Channel the MCP pushes chunks into (drained by `eval_stream_loop!`). The MCP
     # forwards worker IO over its channel (no on-disk log, no polling); the sink exists
@@ -410,6 +504,10 @@ mutable struct ServerState
     accounts           :: Observable{Dict{String,Account}}
     # Open invite links by their token's hash (name => Invite); persisted.
     invites            :: Observable{Dict{String,Invite}}
+    # Shared links (shares.jl); persisted.
+    shares             :: ShareRegistry
+    # Turns a worker crash cut off, to continue when it is back (crash_recovery.jl).
+    crash_watch        :: CrashWatch
     # Live browser sessions by user name, so disabling an account closes them: an
     # open websocket is not re-checked by Authelia.
     user_sessions      :: Dict{String,Vector{Bonito.Session}}
@@ -418,6 +516,8 @@ mutable struct ServerState
     # with every hello acknowledgement. `nothing`: workers manage none (dev and
     # test servers, which must not download anything). Persisted in settings.json.
     harness_spec       :: Observable{Union{Nothing,Dict{String,Any}}}
+    # The worker build handed out with every hello acknowledgement (server.jl).
+    worker_build       :: WorkerBuild
     # Writes the proxy's files one at a time, spaced for Authelia (identity.jl).
     proxy_writer       :: ProxyWriter
 
@@ -475,6 +575,7 @@ function ServerState(; state_dir::String,
         Dict{String,WorkerLink.Link}(),           # worker_links
         Dict{String,Channel{Any}}(),              # pending_rpcs
         Dict{String,ChunkAccumulator}(),          # pending_chunks
+        Dict{String,Tuple{Float64,Int}}(),        # rpc_timeouts
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
         Dict{String,Float64}(),                   # last_scan
         Ref(""),                                  # base_url (set by serve())
@@ -482,6 +583,7 @@ function ServerState(; state_dir::String,
         Dict{String,Any}(),                       # mcp_ctrl
         Dict{String,Any}(),                       # eval_hosts
         Dict{String,ReentrantLock}(),             # eval_host_locks
+        Dict{String,ValuePair}(),                 # value_pairs
         Dict{String,Channel{String}}(),           # eval_stream_sinks
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
@@ -493,8 +595,11 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,WorkerCredential}()),  # worker_credentials
         Observable(Dict{String,Account}()),       # accounts
         Observable(Dict{String,Invite}()),        # invites
+        ShareRegistry(),                          # shares
+        CrashWatch(),                             # crash_watch
         Dict{String,Vector{Bonito.Session}}(),    # user_sessions
         Observable{Union{Nothing,Dict{String,Any}}}(nothing),  # harness_spec (load_settings! below)
+        WorkerBuild(),                            # worker_build (resolved by serve())
         ProxyWriter(),                            # proxy_writer
         nothing,                                  # root (this IS the root)
     )
@@ -504,6 +609,7 @@ function ServerState(; state_dir::String,
     load_worker_credentials!(s)
     load_accounts!(s)
     load_invites!(s)
+    load_shares!(s)
     load_settings!(s; manage_harnesses)
     return s
 end
@@ -535,6 +641,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.worker_links,
             s.pending_rpcs,
             s.pending_chunks,              # shared: one registry per server
+            s.rpc_timeouts,
             map(identity, session, s.discovered),
             s.last_scan,               # shared: scan freshness is per server
             s.base_url,
@@ -542,6 +649,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.mcp_ctrl,                # sessions cooperate on the same tables
             s.eval_hosts,
             s.eval_host_locks,
+            s.value_pairs,
             s.eval_stream_sinks,
             s.session_inflight,
             s.show_fetch_inflight,
@@ -557,8 +665,11 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.worker_credentials,      # shared, like the settings above
             s.accounts,
             s.invites,
+            s.shares,                  # shared registry
+            s.crash_watch,
             s.user_sessions,
             s.harness_spec,
+            s.worker_build,
             s.proxy_writer,
             root_state(s),             # copies of copies still point at the true root
         )
@@ -1183,7 +1294,7 @@ end
 
 # Like `save_workers!`: snapshot + write under `state.lock` (reentrant, so
 # callers already holding it are unaffected). Without this, several savers ran
-# unlocked — `sync_project_to_server!`, `rename_worker!`, `transfer_project!`,
+# unlocked — `sync_project_to_server!`, `rename_worker!`, the old worker move,
 # title backfill, etc. — iterating `values(s.projects[])` while locked writers
 # mutated the dict, and two of them could share a temp file and rename a
 # half-written projects.json into place (T2).

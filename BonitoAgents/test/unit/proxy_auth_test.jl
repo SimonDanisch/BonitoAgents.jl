@@ -83,7 +83,7 @@ end
     end
     @test occursin("basic_auth {\n\t\t\tw-a \$2a\$14\$ha\n\t\t\tw-b \$2a\$14\$hb\n\t\t}", cf)
     @test occursin("header_up Remote-User {http.auth.user.id}", cf)
-    @test occursin("@public path /install /install.sh /install.ps1 /install.jl /invite/*", cf)
+    @test occursin("@public path /install /install.sh /install.ps1 /install.jl /invite/* /s/*", cf)
     @test occursin("forward_auth 127.0.0.1:9091 {\n\t\t\turi /api/authz/forward-auth", cf)
     @test occursin("reverse_proxy 127.0.0.1:8038 {", cf)
     @test occursin("\nauth.team.example.com {\n\treverse_proxy 127.0.0.1:9091\n}", cf)

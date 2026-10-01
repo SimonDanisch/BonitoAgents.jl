@@ -1327,6 +1327,38 @@ function login!(s::TestServer, login::Login = s.admin)
     return s
 end
 
+# The one-time code for `login` now. Authelia takes a code once: after one in
+# this 30 s step, this waits for the next.
+function next_code!(s::TestServer, login::Login)
+    step = floor(Int, time() / 30)
+    if get(s.otp_used, login.user, -1) >= step
+        sleep(30 * (step + 1) - time() + 0.5)
+        step = floor(Int, time() / 30)
+    end
+    s.otp_used[login.user] = step
+    return totp(login.secret, step)
+end
+
+"""
+    api_login!(s, login = s.admin)
+
+Log in through Authelia's API from the open page, without leaving it: what a
+login in another tab of the same browser does to this one.
+"""
+function api_login!(s::TestServer, login::Login = s.admin)
+    code = next_code!(s, login)
+    r = eval_js(s, """(async () => {
+        const post = (p, b) => fetch('/authelia/api/' + p, {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b)}).then(r => r.status);
+        const a = await post('firstfactor', {username: $(json(login.user)), password: $(json(login.password)),
+                                             keepMeLoggedIn: false});
+        if (a !== 200) return 'the password step answered ' + a;
+        const b = await post('secondfactor/totp', {token: $(json(code))});
+        return b === 200 ? true : 'the code step answered ' + b; })()""")
+    r === true || error("api_login!: $(r)\n" * authelia_log_tail(s))
+    return s
+end
+
 """
     enter_code!(s, login)
 
@@ -1335,13 +1367,7 @@ authenticator app's user does. Authelia takes a code once: after one in this
 30 s step, it waits for the next.
 """
 function enter_code!(s::TestServer, login::Login)
-    step = floor(Int, time() / 30)
-    if get(s.otp_used, login.user, -1) >= step
-        sleep(30 * (step + 1) - time() + 0.5)
-        step = floor(Int, time() / 30)
-    end
-    s.otp_used[login.user] = step
-    code = totp(login.secret, step)
+    code = next_code!(s, login)
     # One digit per box, as typing does; the component gathers them and submits.
     eval_js(s, """(() => {
         const boxes = [...document.querySelectorAll('input[autocomplete=one-time-code], input[autocomplete=off]')]
@@ -1503,12 +1529,14 @@ function login_refused(s::TestServer, login::Login)
     return String(refusal)
 end
 
-# The admin's Accounts section: `expr` is JS run with `sec` bound to it.
-accounts_js(expr::AbstractString) = """(() => {
-    const h = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Accounts');
+# A Settings section, by its heading: `expr` is JS run with `sec` bound to it.
+section_js(title::AbstractString, expr::AbstractString) = """(() => {
+    const h = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === $(json(title)));
     const sec = h && h.closest('.bt-section').parentElement;
     if (!sec) return false;
     return $(expr); })()"""
+accounts_js(expr::AbstractString) = section_js("Accounts", expr)
+invites_js(expr::AbstractString) = section_js("Invites", expr)
 
 "Wait until the Accounts section's status line says `text`; returns the line."
 account_status(s::TestServer, text::AbstractString; timeout::Real = 30) =
@@ -1534,8 +1562,10 @@ function add_account_ui!(s::TestServer, name::AbstractString; display_name::Abst
             const el = [...form.querySelectorAll('label')].find(l => l.textContent.trim() === label).nextElementSibling;
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
             el.dispatchEvent(new Event('input', {bubbles: true})); };
-        set('Account', $(json(name))); set('Full name', $(json(display_name))); set('Groups', $(json(groups)));
+        set('Account', $(json(name))); set('Full name', $(json(display_name)));
         return true; })()"""))
+    isempty(groups) || pick_groups!(s, accounts_js("sec.querySelector('.bt-modal-card .bt-group-pick')"),
+                                    strip.(split(groups, ','; keepempty = false)))
     sleep(0.3)   # the inputs reach the server before the click that reads them
     eval_js(s, accounts_js("sec.querySelector('.bt-add-account-submit').click() || true"))
     account_status(s, "account $(name) added")
@@ -1566,28 +1596,48 @@ function account_action!(s::TestServer, name::AbstractString, label::AbstractStr
     return s
 end
 
-"Type `groups` into `name`'s row of the Accounts table and press Enter."
-function set_account_groups_ui!(s::TestServer, name::AbstractString, groups::AbstractString)
-    to_settings(s)
-    ok = eval_js(s, accounts_js("""(() => {
-        const row = sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + ']');
-        const el = row && row.querySelector('input[type=text]');
-        if (!el) return false;
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, $(json(groups)));
-        el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return true; })()"""))
-    ok === true || error("set_account_groups_ui!: no row for $(name)")
+"""
+    pick_groups!(s, picker_js, groups)
+
+Choose exactly `groups` in a group picker, the way a person does: open it, tick
+and untick, add the names that are not on the list through its field, and close
+it, which saves. `picker_js` is a JS expression for the picker (`.bt-group-pick`).
+"""
+function pick_groups!(s::TestServer, picker_js::AbstractString, groups::AbstractVector{<:AbstractString})
+    ok = eval_js(s, """(() => {
+        const m = $(picker_js);
+        if (!m) return 'no group picker';
+        m.querySelector('.bt-group-trigger').click();
+        const want = $(json(collect(String, groups)));
+        for (const g of want) {
+            if ([...m.querySelectorAll('.bt-group-item input')].some(i => i.value === g)) continue;
+            const field = m.querySelector('.bt-group-new-name');
+            if (!field) return g + ' is not on the list, and there is no field for a new group';
+            field.value = g;
+            m.querySelector('.bt-group-add').click();
+        }
+        m.querySelectorAll('.bt-group-item input').forEach(i => { i.checked = want.includes(i.value); });
+        document.body.click();   // closing the list saves it
+        return true; })()""")
+    ok === true || error("pick_groups!: $(ok)")
     return s
 end
 
-"Share the (first) worker with `groups` from its card, as its owner does."
-function share_worker_ui!(s::TestServer, groups::AbstractString)
+"Put `name` in exactly `groups` from its row of the Accounts table."
+function set_account_groups_ui!(s::TestServer, name::AbstractString, groups::AbstractVector{<:AbstractString})
+    to_settings(s)
+    pick_groups!(s, accounts_js("sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + '] .bt-group-pick')"),
+                 groups)
+    return s
+end
+
+"Share the (first) worker with exactly `groups` from its card, as its owner does."
+function share_worker_ui!(s::TestServer, groups::AbstractVector{<:AbstractString})
     to_dashboard(s)
-    wait_for(s, "the worker's sharing field", "!!document.querySelector('.bt-worker-cell input[placeholder=groups]')";
-             timeout = 60)
-    set_input(s, ".bt-worker-cell input[placeholder=groups]", groups)
-    eval_js(s, """(() => { const el = document.querySelector('.bt-worker-cell input[placeholder=groups]');
-        el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return true; })()""")
-    wait_for(s, "the share saved", "document.querySelector('.bt-worker-cell').textContent.includes('shared')";
+    picker = "document.querySelector('.bt-worker-cell .bt-worker-sharing .bt-group-pick')"
+    wait_for(s, "the worker's sharing picker", "!!$(picker)"; timeout = 60)
+    pick_groups!(s, picker, groups)
+    wait_for(s, "the share saved", "document.querySelector('.bt-worker-sharing').textContent.includes('shared')";
              timeout = 30)
     return s
 end

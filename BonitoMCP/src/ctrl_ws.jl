@@ -37,11 +37,14 @@
 using HTTP.WebSockets: WebSockets
 
 # The worker relay's address and the two tokens it handed this process: `token`
-# opens the control channel, `eval_token` the eval workers' live-render bridges.
+# opens the control channel, `eval_token` the eval workers' live-render bridges
+# and value exchanges. `values_addr` is the relay's TCP address for the latter
+# ("" from a worker too old to have one).
 struct RelayGrant
     url::String
     token::String
     eval_token::String
+    values_addr::String
 end
 
 # The MCP process's one control channel to the BonitoAgents server. The live
@@ -103,15 +106,16 @@ starts inherit its environment and run user code, which must not find the
 control token there. `nothing` outside BonitoAgents.
 """
 function take_relay_grant!(env::AbstractDict = ENV)
-    url        = pop!(env, "BONITOAGENTS_CONTROL_URL", "")
-    token      = pop!(env, "BONITOAGENTS_CONTROL_TOKEN", "")
-    eval_token = pop!(env, "BONITOAGENTS_EVAL_TOKEN", "")
+    url         = pop!(env, "BONITOAGENTS_CONTROL_URL", "")
+    token       = pop!(env, "BONITOAGENTS_CONTROL_TOKEN", "")
+    eval_token  = pop!(env, "BONITOAGENTS_EVAL_TOKEN", "")
+    values_addr = pop!(env, "BONITOAGENTS_VALUES_ADDR", "")
     grant = if isempty(url)
         nothing
     elseif isempty(token) || isempty(eval_token)
         error("the local worker relay at $(url) granted no tokens")
     else
-        RelayGrant(url, token, eval_token)
+        RelayGrant(url, token, eval_token, values_addr)
     end
     SERVER.control.grant = grant
     return grant

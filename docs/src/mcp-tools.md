@@ -145,10 +145,10 @@ argument, and a run id reaches its run wherever it runs). Under the hood the cha
 BonitoMCP *eval host* on the other worker for this chat (once; it lives as long
 as the chat's session), and relays the call. The card in the chat wears a filled
 **⇢ MacBook** badge next to the tool name, its live stdout streams in as usual,
-and a returned plot or app renders live over the same bridge. One caveat there:
-a chat holds one live-render bridge, so alternating live values between two
-machines retires the older embed each time (text results, streaming and the rest
-are unaffected).
+and a returned plot or app renders live over that machine's own bridge into the
+chat, so live results from both machines stay live side by side. (Two `env_path`s
+on the SAME worker still share one bridge: there the newer session's embeds
+retire the older one's.)
 
 This is **off by default**. The chat header has a *remote julia* pill next to
 the permissions pill; the server enforces it at relay time, so switching it on
@@ -161,6 +161,62 @@ The other machine has its own filesystem: `bt_sync_folder` copies a folder from
 the chat's worker to the target (through the server's mirror, so a second call
 only moves what changed): the project, its `Project.toml`/`Manifest.toml`, the
 data. It needs the same switch.
+
+### Julia values between machines
+
+```julia
+r = remote_session("MacBook"; env_path = "/Users/me/proj")
+r[:data] = data            # `data` is set in the session there
+model = r[:model]          # its `model`, here
+y = r(f, x; k = 1)         # f(x; k = 1) runs there, the value comes back
+```
+
+Inside the chat's own session, `remote_session` (defined in every session)
+reaches the session that `bt_julia_eval(worker = "MacBook", env_path = …)` runs
+in, starting it if needed. The chat's session is the one that asks; the other
+only answers. Values travel with `Serialization`, streamed in 1 MiB pieces, so
+their size is not limited by the websocket layers in between. That also means
+both sessions need the same Julia version (checked first; a mismatch is an
+error naming both) and the packages that define a value's types loaded. A
+function passed to `r(…)` runs there: an anonymous one travels with its code (it
+cannot take keyword arguments: Serialization does not carry the hidden function
+those compile to), a named one (or `r(:name, …)`) must exist there, and the
+globals it reads are the other session's. A failure on the other side comes back as a
+`RemoteSessionError` with its message and backtrace, and the connection stays
+usable. Needs the chat's *remote julia* switch, like everything above.
+
+The route: the session connects to its worker's relay over loopback TCP, the
+server checks the switch, has the chat's eval host on the other worker connect
+the session asked for, and pipes the two together; it never reads the values.
+
+## `bt_share`, a link for anyone
+
+```
+bt_share(path; title?, password?, env_path?)
+```
+
+A link to a file on the chat's worker that anyone can open without an account,
+for as long as the worker is online (`https://<server>/s/<token>/`):
+
+- **A markdown file** becomes a page, rendered like the chat renders. The images
+  and videos it embeds by relative path come along (`![](clip.mp4)` becomes a
+  video); nothing else in its folder is reachable through the link, and scripts
+  in its raw HTML do not run.
+- **A Julia file whose value is a Bonito app** (or anything `bt_julia_eval`
+  would show live) becomes a live page. A *share host* on the worker, one per
+  worker, evaluates the file in its project's environment (`env_path`, by
+  default the nearest folder above it with a `Project.toml`) and every viewer
+  gets their own render, as with a chat's eval result. The file is evaluated
+  again when it changes, and once when it is shared, so an error in it reaches
+  the agent. Interactive markdown is such an app:
+  `using Bonito, Markdown; App() do; s = Bonito.Slider(1:10); DOM.div(md"Pick: $(s)"); end`
+  (a plain Julia file: it loads what it uses).
+
+The token is the permission; a password can be set on top. Settings lists your
+links (an admin sees all): open, copy, set or remove the password, end. Behind a
+tunnel the login gate lets a link's page, its websocket and its assets through
+and nothing else; behind the Caddy login proxy only the pages are open, so an
+app link there needs a logged-in viewer.
 
 ## `bt_wait`, pausing a turn
 

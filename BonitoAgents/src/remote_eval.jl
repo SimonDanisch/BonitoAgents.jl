@@ -10,16 +10,11 @@
 # workers open the live-render bridge for this project, so a plot returned on the
 # MacBook renders in the chat on the desktop.
 #
-# ⚠ ONE LIVE BRIDGE PER CHAT. `state.eval_workers` is keyed by project, so a
-# remote eval that returns a LIVE value displaces the chat's local bridge, and
-# the next local one displaces it back (each displacement retires the other's
-# host-side wiring — see `serve_eval_bridge`). Text output, stdout streaming and
-# every non-live result are unaffected; it is only interleaved LIVE embeds from
-# two machines in one chat that lose their older half. This is the same
-# limitation the file's note there already records for two `env_path`s in one
-# chat, and it has the same fix: the bridge's channel header has to carry which
-# session dialed (worker + env), so bridges can coexist per session instead of
-# per project.
+# Live results from both machines coexist: a host's bridges are filed under the
+# chat AND its worker (`eval_bridge_key`), and a result finds its bridge by the
+# prefix in its id (`bridge_for_ref`). What remains is the limit the note at
+# `serve_eval_bridge` records for two `env_path`s on ONE worker: one bridge per
+# (chat, worker), so there the newer session displaces the older one's embeds.
 #
 # OFF BY DEFAULT, per chat: `ProjectInfo.remote_eval`. The switch sits in the
 # chat's ⋯ menu, next to 'Dev mode'. It is enforced HERE, at relay time —
@@ -138,22 +133,27 @@ spawning the host through the worker if there is none. Single-flight per host:
 concurrent first calls share one spawn. Waits for the host's channel (a julia
 start plus `using BonitoMCP`; bounded by `EVAL_HOST_SPAWN_TIMEOUT_S`).
 """
-function ensure_eval_host!(state::ServerState, p::ProjectInfo, w::WorkerInfo)
-    ws = eval_host_ws(state, p.id, w.worker_id)
+ensure_eval_host!(state::ServerState, p::ProjectInfo, w::WorkerInfo) =
+    ensure_eval_host!(state, p.id, p.name, w)
+
+# `project_id` is a chat's, or `SHARES_PROJECT` for the worker's share host
+# (shares.jl); `label` names it in the log.
+function ensure_eval_host!(state::ServerState, project_id::String, label::String, w::WorkerInfo)
+    ws = eval_host_ws(state, project_id, w.worker_id)
     ws === nothing || return ws
-    key = eval_host_key(p.id, w.worker_id)
+    key = eval_host_key(project_id, w.worker_id)
     lk = lock(state.lock) do
         get!(state.eval_host_locks, key, ReentrantLock())
     end
     lock(lk) do
-        ws = eval_host_ws(state, p.id, w.worker_id)
+        ws = eval_host_ws(state, project_id, w.worker_id)
         ws === nothing || return ws
-        env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => p.id)
-        r = open_eval_host_on_worker(state, w.worker_id; project_id = p.id, env)
-        @info "eval host spawned" project = p.name worker = w.name pid = r.pid existed = r.existed
+        env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => project_id)
+        r = open_eval_host_on_worker(state, w.worker_id; project_id, env)
+        @info "eval host spawned" project = label worker = w.name pid = r.pid existed = r.existed
         deadline = time() + EVAL_HOST_SPAWN_TIMEOUT_S
         while time() < deadline
-            ws = eval_host_ws(state, p.id, w.worker_id)
+            ws = eval_host_ws(state, project_id, w.worker_id)
             ws === nothing || return ws
             sleep(0.1)
         end
@@ -220,6 +220,37 @@ function close_eval_hosts!(state::ServerState, project_id::AbstractString)
     return nothing
 end
 
+"""
+    host_channel_closed!(state, project_id, host_worker; grace = 60.0)
+
+An eval host's control channel closed. A live-render bridge of its sessions
+whose channel is still down `grace` later is dead (the host exited: its chat's
+session ended, remote Julia was switched off, it crashed, its worker stopped; a
+dropped link reconnects well within it), and is torn down. Nothing to do for a
+chat's own MCP.
+"""
+function host_channel_closed!(state::ServerState, project_id::AbstractString,
+                              host_worker::AbstractString; grace::Real = 60.0)
+    isempty(host_worker) && return nothing
+    Base.errormonitor(@async begin
+        sleep(grace)
+        foreach(key -> teardown_eval_bridge!(state, key),
+                filter(key -> bridge_down(state, key), host_bridge_keys(state, project_id, host_worker)))
+    end)
+    return nothing
+end
+
+# The bridges of one eval host's sessions: a chat's host has one, filed under the
+# chat and the worker; the share host one per session (shares.jl).
+host_bridge_keys(state::ServerState, project_id::AbstractString, host_worker::AbstractString) =
+    project_id == SHARES_PROJECT ? share_bridge_keys(state, host_worker) :
+                                   [eval_bridge_key(project_id, host_worker)]
+
+function bridge_down(state::ServerState, key::AbstractString)
+    eb = eval_bridge_for(state, key)
+    return eb !== nothing && lock(() -> eb.ws === nothing, eb.wlock)
+end
+
 # How long the server waits for the host: the MCP side waits `remote_wait` for
 # the same call (tools/eval.jl); answering a little earlier means the agent gets
 # the server's message ("host did not answer") rather than a bare timeout, and
@@ -258,35 +289,39 @@ function dev_op(state::ServerState, ::Val{:remote_workers}, args::AbstractDict, 
     own = p === nothing ? "" : p.worker_id
     workers = sort([w for w in values(state.workers[]) if isopen(w) && w.worker_id != own];
                    by = w -> w.name)
-    rows = Any[]
-    for w in workers
-        row = Dict{String,Any}("name" => w.name, "worker_id" => w.worker_id,
-                               "hostname" => w.hostname, "projects_root" => w.projects_root,
-                               "host_live" => false, "sessions" => Any[])
-        ws = p === nothing ? nothing : eval_host_ws(state, p.id, w.worker_id)
-        if ws !== nothing
-            row["host_live"] = true
-            try
-                r = host_rpc(state, ws, "sessions", Dict{String,Any}(); timeout = 15.0)
-                res = get(r, "result", nothing)
-                text = res isa AbstractDict && !isempty(get(res, "content", Any[])) ?
-                    String(get(first(res["content"]), "text", "")) : ""
-                row["sessions"] = [Dict{String,Any}("env_path" => strip(l[3:end]),
-                                                    "in_flight" => occursin("EVAL IN FLIGHT", l))
-                                   for l in split(text, '\n') if startswith(l, "  - ")]
-                # The chat's runs there (running, or finished and not collected).
-                rr = get(host_rpc(state, ws, "runs", Dict{String,Any}(); timeout = 15.0), "result", nothing)
-                row["runs"] = rr isa AbstractDict ?
-                    [x for x in get(rr, "runs", Any[])
-                     if get(x, "status", "") == "running" || get(x, "collected", true) === false] : Any[]
-            catch e
-                e isa InterruptException && rethrow()
-                @warn "eval host did not list its sessions" worker = w.name exception = e
-            end
-        end
-        push!(rows, row)
-    end
+    # All hosts at once, each bounded: one that does not answer must not take the
+    # listing past the MCP's own wait (it did, asking them one after another).
+    rows = fetch.([Threads.@spawn worker_row(state, p, w) for w in workers])
     return Dict{String,Any}("enabled" => p !== nothing && p.remote_eval, "workers" => rows)
+end
+
+function worker_row(state::ServerState, p::Union{ProjectInfo,Nothing}, w::WorkerInfo; timeout::Real = 10.0)
+    row = Dict{String,Any}("name" => w.name, "worker_id" => w.worker_id,
+                           "hostname" => w.hostname, "projects_root" => w.projects_root,
+                           "host_live" => false, "sessions" => Any[])
+    ws = p === nothing ? nothing : eval_host_ws(state, p.id, w.worker_id)
+    ws === nothing && return row
+    row["host_live"] = true
+    try
+        r = host_rpc(state, ws, "sessions", Dict{String,Any}(); timeout)
+        res = get(r, "result", nothing)
+        text = res isa AbstractDict && !isempty(get(res, "content", Any[])) ?
+            String(get(first(res["content"]), "text", "")) : ""
+        row["sessions"] = [Dict{String,Any}("env_path" => strip(l[3:end]),
+                                            "in_flight" => occursin("EVAL IN FLIGHT", l))
+                           for l in split(text, '\n') if startswith(l, "  - ")]
+        # The chat's runs there (running, or finished and not collected).
+        rr = get(host_rpc(state, ws, "runs", Dict{String,Any}(); timeout), "result", nothing)
+        row["runs"] = rr isa AbstractDict ?
+            [x for x in get(rr, "runs", Any[])
+             if get(x, "status", "") == "running" || get(x, "collected", true) === false] : Any[]
+    catch e
+        e isa InterruptException && rethrow()
+        (e isa WorkerUnreachableError || e isa ErrorException) || rethrow()
+        @warn "eval host did not list its sessions" worker = w.name exception = e
+        row["error"] = first(split(sprint(showerror, e), '\n'))
+    end
+    return row
 end
 
 # Where a folder being copied between two workers is staged on the server. Per

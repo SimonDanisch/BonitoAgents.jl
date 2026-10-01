@@ -240,6 +240,13 @@ function julia_eval_handler(args::AbstractDict)
         )
     end
 
+    # A busy env refuses at once. Checked BEFORE the bridge below: that takes
+    # the session lock, which the running run's collector holds slice after
+    # slice, so the call used to wait out the whole run instead of saying why.
+    reg = SERVER.runs
+    busy = running_run(reg, s)
+    busy === nothing || return tool_error(sprint(showerror, RunBusy(busy)))
+
     # Bring up the proxy bridge so `format_value` can render the result to an
     # HTML fragment on the worker (loads RemoteProxy worker-side + dials back to
     # the BonitoAgents server). Best-effort: standalone MCP (no server) or a
@@ -251,7 +258,6 @@ function julia_eval_handler(args::AbstractDict)
         @debug "bt_julia_eval: eval bridge unavailable; result will render text-only" exception = e
     end
 
-    reg = SERVER.runs
     given = get(args, "run_id", nothing)      # set when this process hosts another worker's chat
     id = given isa AbstractString && !isempty(given) ? String(given) : new_run_id!(reg)
     run = try
@@ -460,6 +466,7 @@ function remote_workers_text()
         w isa AbstractDict || continue
         tag = String[]
         get(w, "host_live", false) === true && push!(tag, "eval host running")
+        haskey(w, "error") && push!(tag, "its host did not answer: " * String(w["error"]))
         push!(lines, "  - $(get(w, "name", "?")) ($(get(w, "hostname", "?")), projects under $(get(w, "projects_root", "?")))" *
                      (isempty(tag) ? "" : "  [" * join(tag, ", ") * "]"))
         for s in get(w, "sessions", Any[])
@@ -589,6 +596,17 @@ Running on ANOTHER worker (machine):
   - The other machine has its own filesystem: copy code, its Project.toml /
     Manifest.toml and data there first with `bt_sync_folder`, and pass an
     `env_path` that exists THERE.
+  - Julia VALUES move between this chat's session and one there from inside
+    the code, with `remote_session` (defined in every session):
+      r = remote_session("MacBook"; env_path = "/Users/me/proj")  # the session bt_julia_eval(worker = "MacBook", env_path = …) runs in
+      r[:data] = data          # send: `data` is set there
+      model = r[:model]        # fetch its `model`
+      y = r(f, x; k = 1)       # run f(x; k = 1) there, the value comes back
+    Any size. They travel with Serialization, so both sessions need the same
+    Julia version (checked, with an error saying so) and the packages behind
+    the value's types loaded. A function passed to `r(…)` uses the OTHER
+    session's globals; pass local values as arguments. An anonymous function
+    sent that way cannot take keyword arguments (pass keywords to a named one).
 """
 
 register!(

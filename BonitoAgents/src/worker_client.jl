@@ -199,12 +199,34 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
     finally
         close(timer)
     end
-    val === nothing && throw(WorkerUnreachableError(String(op_name),
-        "timed out after $(timeout)s — worker may be offline or stuck"))
+    if val === nothing
+        log_rpc_timeout(state, String(op_name), timeout)
+        throw(WorkerUnreachableError(String(op_name),
+            "timed out after $(timeout)s — worker may be offline or stuck"))
+    end
     # A definitive failure arrives as an Exception (`deliver_rpc_error!`), so
     # the caller fails fast instead of waiting out the timeout.
     val isa Exception && throw(val)
     return val
+end
+
+# A request to a worker got no answer in time. Logged at most once a minute per
+# kind of request (`op_name` names the request and the worker), with how many
+# timed out since the last line.
+function log_rpc_timeout(state::ServerState, op_name::String, timeout::Real; every::Real = 60.0)
+    now_ = time()
+    suppressed = lock(state.lock) do
+        last, count = get(state.rpc_timeouts, op_name, (0.0, 0))
+        if now_ - last < every
+            state.rpc_timeouts[op_name] = (last, count + 1)
+            return nothing
+        end
+        state.rpc_timeouts[op_name] = (now_, 0)
+        count
+    end
+    suppressed === nothing && return nothing
+    @warn "a worker request timed out" request = op_name timeout since_last_line = suppressed
+    return nothing
 end
 
 # Try to deliver a worker-pushed RPC reply by request_id. No-op if the id is
@@ -312,11 +334,13 @@ end
 # configured spec (a dev worker spawned from a checkout) cannot be judged and
 # counts as current. Whether auto-update is on only changes the message: an
 # outdated worker is outdated either way.
-function worker_update_state(hello::AbstractDict, update_spec::AbstractDict)
+function worker_update_state(hello::AbstractDict, update_spec::Union{AbstractDict,Nothing})
     haskey(hello, "auto_update") || return (:reinstall,
         "This worker is too old to update itself. Reinstall it on that machine with the install command.")
     installed = get(hello, "update_spec", nothing)
-    (installed === nothing || installed == update_spec) && return (:current, "")
+    # Nothing to compare: an install that recorded no build, or a server that
+    # has not resolved its own yet (`worker_update_spec`).
+    (installed === nothing || update_spec === nothing || installed == update_spec) && return (:current, "")
     get(hello, "auto_update", false) === true && return (:available,
         "A worker update is available. It installs by itself once no chat runs here; Update now installs it right away and restarts this worker's chats.")
     return (:available,
@@ -355,7 +379,9 @@ function handle_worker_link(state::ServerState, ws, request)
             "registered_as" => shown_as,
             "worker_id"     => worker_id,
             # The same spec /install.jl serves, over the authenticated link.
-            "update_spec"   => current_worker_update_spec())
+            # Never resolved here: that asks GitHub, and a handshake waiting on
+            # a bad network went unanswered (`nothing`: the worker keeps its build).
+            "update_spec"   => worker_update_spec(state))
         # The agent adapters to keep installed (the worker's harnesses.jl).
         spec = state.harness_spec[]
         spec === nothing || (ack["harnesses"] = spec)
@@ -371,6 +397,9 @@ function handle_worker_link(state::ServerState, ws, request)
             # the reader that already serves it.
             Base.errormonitor(@async serve_worker_control(state, worker_id, link))
             worker_came_online!(state, worker_id)
+            # Registered and online: the chats a crash of its previous run cut off
+            # can be continued now.
+            worker_run_started!(state, worker_id, info)
         end
         # Returning closes the websocket, so stay until the connection ends.
         wait(t)
@@ -406,7 +435,8 @@ function claim_worker_link!(state::ServerState, worker_id::String, link_id::Vect
 end
 
 # A channel the worker opened: its relay's connection for a chat's MCP process
-# (`"mcp"`) or for an eval worker's live-render bridge (`"eval"`), see
+# (`"mcp"`), for an eval worker's live-render bridge (`"eval"`) or for a value
+# exchange between two eval sessions (`"values"`, remote_values.jl), see
 # BonitoWorker's mcp_relay.jl. A worker speaks for the chats it runs, and, as an
 # eval host (`host`), for the chats that let it run their Julia. Answered the way
 # the worker answers ours: `{ok: true}` (`accept_channel`) as the first frame
@@ -417,6 +447,7 @@ accept_channel(ch::WorkerLink.LinkChannel) = send_control(ch, Dict("ok" => true)
 function accept_worker_channel(state::ServerState, worker_id::String, ch::WorkerLink.LinkChannel)
     header = decode_control(WorkerLink.header(ch))
     project_id = String(get(header, "project_id", ""))
+    project_id == SHARES_PROJECT && return accept_share_host_channel(state, worker_id, ch, header)
     host = get(header, "host", false) === true
     p = get(state.projects[], project_id, nothing)
     if p === nothing || (host ? !p.remote_eval : p.worker_id != worker_id)
@@ -428,7 +459,10 @@ function accept_worker_channel(state::ServerState, worker_id::String, ch::Worker
         accept_channel(ch)
         serve_mcp_channel(state, MCPChannel(state, ch, project_id, host ? worker_id : ""))
     elseif kind == "eval"
-        serve_eval_bridge(state, ch, project_id, String(get(header, "prefix", "")))
+        serve_eval_bridge(state, ch, eval_bridge_key(project_id, host ? worker_id : ""),
+                          String(get(header, "prefix", "")))
+    elseif kind == "values"
+        serve_values_channel(state, ch, project_id, host ? worker_id : "", header)
     else
         WorkerLink.abort(ch, "unknown channel kind '$(kind)'")
     end
@@ -443,7 +477,7 @@ function register_worker!(state::ServerState, worker_id::String, name::String,
                           hello::AbstractDict, link::WorkerLink.Link,
                           credential::AbstractString = "")
     existing = get(state.workers[], worker_id, nothing)
-    update_state, update_message = worker_update_state(hello, current_worker_update_spec())
+    update_state, update_message = worker_update_state(hello, worker_update_spec(state))
     online = existing === nothing ? Observable(false) : existing.online
     # The worker belongs to whoever issued its credential.
     cred = get(state.worker_credentials[], credential, nothing)
@@ -554,6 +588,13 @@ end
 function worker_link_changed!(state::ServerState, worker_id::String,
                               link::WorkerLink.Link, st::Symbol)
     worker_link(state, worker_id) === link || return nothing   # replaced or removed
+    # The moment the link stops being connected is the moment to know which
+    # chats were mid-turn: a crash cuts exactly those off (crash_recovery.jl).
+    if st === :connected
+        forget_interrupted_turns!(state, worker_id)   # resumed: the same run goes on
+    else
+        note_interrupted_turns!(state, worker_id)
+    end
     st === :dead && return teardown_worker!(state, worker_id, link)
     w = get(state.workers[], worker_id, nothing)
     w === nothing && return nothing
@@ -1345,12 +1386,16 @@ stored vector.
 """
 function scan_and_store!(state::ServerState, worker_id::AbstractString)
     wid = String(worker_id)
-    raw = try
-        scan_worker_sessions(state, wid)
+    norm = try
+        Dict{String,Any}[Dict{String,Any}(r) for r in scan_worker_sessions(state, wid)]
     catch e
-        Any[Dict{String,Any}("error" => sprint(showerror, e))]
+        # A failed scan says so NEXT TO what the last good one found. Storing the
+        # error alone emptied the worker's project list ("projects (0)"), and it
+        # stayed empty, on disk, until some later scan got through.
+        @warn "scanning a worker's sessions failed; keeping what the last scan found" worker_id = wid exception = e
+        kept = [r for r in get(state.discovered[], wid, Dict{String,Any}[]) if !haskey(r, "error")]
+        push!(kept, Dict{String,Any}("error" => "the last scan failed: " * sprint(showerror, e)))
     end
-    norm = Dict{String,Any}[Dict{String,Any}(r) for r in raw]
     lock(state.lock) do
         state.discovered[][wid] = norm
         state.last_scan[wid] = time()
@@ -1514,8 +1559,10 @@ function force_worker_update!(state::ServerState, worker_id::AbstractString)
         throw(WorkerUnreachableError("force update", "worker is not connected"))
     worker_turn_in_flight(state, wid) &&
         throw(ArgumentError("a chat on this worker is mid-turn; let it finish or stop it, then update"))
-    send_command(state, wid, Dict("type" => "force_update", "immediate" => true,
-                                  "update_spec" => current_worker_update_spec()))
+    spec = worker_update_spec(state)
+    spec === nothing && throw(ArgumentError(
+        "the server has not found out which build to install yet (is GitHub reachable from it?); try again in a minute"))
+    send_command(state, wid, Dict("type" => "force_update", "immediate" => true, "update_spec" => spec))
     # Interim wording: the worker's own `update_status` frame replaces it within
     # a moment. A worker predating that frame never sends one, so this stays,
     # and stays true.

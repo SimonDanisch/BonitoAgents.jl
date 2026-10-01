@@ -500,6 +500,9 @@ class BonitoChat {
         if (this.onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this.onAppClickCapture, true);
         }
+        if (this.onDraftInput && this.textInput) {
+            this.textInput.removeEventListener('input', this.onDraftInput);
+        }
         if (this.onAppChange && this.app) {
             this.app.removeEventListener('change', this.onAppChange);
         }
@@ -2638,6 +2641,29 @@ class BonitoChat {
             this.textInput?.focus();
         };
         this.app.addEventListener('change', this.onAppChange);
+        const pid = app.closest('.bt-chatpane')?.dataset.panePid;
+        if (pid) {
+            const key = 'bt-draft:' + pid;
+            const yolo = ()=>this.textInput.classList.contains('bt-text-input-yolo');
+            let saved = null;
+            try {
+                saved = localStorage.getItem(key);
+            } catch (_) {}
+            if (saved && !this.textInput.value && !yolo()) {
+                this.textInput.value = saved;
+                this.textInput.dispatchEvent(new Event('input', {
+                    bubbles: true
+                }));
+            }
+            this.onDraftInput = ()=>{
+                if (yolo()) return;
+                const text = this.textInput.value;
+                try {
+                    text.trim() ? localStorage.setItem(key, text) : localStorage.removeItem(key);
+                } catch (_) {}
+            };
+            this.textInput.addEventListener('input', this.onDraftInput);
+        }
         this.onTextInputKeyCapture = (e)=>{
             if (this.cmdAcHandleKey(e)) return;
             if (e.key !== 'Enter' || e.shiftKey) return;

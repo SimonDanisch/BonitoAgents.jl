@@ -50,6 +50,29 @@ fresh_env() = mktempdir()
         M.restart!(M.manager(), env)
     end
 
+    @testset "under BonitoAgents too: refused at once, not after the run" begin
+        # With a relay grant every eval first brings up the live-render bridge,
+        # under the session lock the running run's collector keeps taking; the
+        # refusal used to come only when the run had ended.
+        prev = M.SERVER.control.grant
+        M.SERVER.control.grant = M.RelayGrant("ws://127.0.0.1:1", "control", "eval", "")
+        try
+            env = fresh_env()
+            r = M.julia_eval_handler(Dict{String,Any}(
+                "code" => "sleep(20)", "env_path" => env, "background" => true))
+            id = run_of(r)
+            t0 = time()
+            busy = M.julia_eval_handler(Dict{String,Any}("code" => "1 + 1", "env_path" => env))
+            @test time() - t0 < 5
+            @test busy["isError"] === true
+            @test occursin("run $id is still running", text_of(busy))
+            M.julia_interrupt_handler(Dict{String,Any}("run" => id))
+            M.restart!(M.manager(), env)
+        finally
+            M.SERVER.control.grant = prev
+        end
+    end
+
     @testset "a second eval in a busy env is refused and names the run" begin
         env = fresh_env()
         r = M.julia_eval_handler(Dict{String,Any}(

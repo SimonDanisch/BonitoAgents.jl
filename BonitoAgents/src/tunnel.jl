@@ -13,6 +13,9 @@
 #     installer (a new machine fetches it before it has a credential) and invite
 #     links (the token is the proof). Only these exact targets, without a query,
 #     so nothing can ride on them to another route;
+#   * so are shared links (shares.jl): `/s/<token>…`, where the token is the
+#     proof, and for an app link's open page its websocket and the assets it
+#     registered, nothing else (`is_share_target`);
 #   * everything else is Authelia's decision, asked the way Caddy asks it
 #     (`/api/authz/forward-auth`): 200 names who it is, anything else goes back
 #     to the client as it is (the redirect to the login page, for a browser).
@@ -21,13 +24,30 @@
 # login may only stay in the browser that fetched it. The gate's own answers are
 # not stored at all.
 
-struct TunnelGate
-    auth::TunnelAuth
+# The login cookie a device last got through with: a short digest of it (never
+# the cookie itself, which IS the login), whose it was, and when.
+struct AcceptedCookie
+    cookie::String
+    user::String
+    at::Float64
 end
 
+struct TunnelGate
+    auth::TunnelAuth
+    # Per browser (`client_address`): the cookie last let
+    # through. Read only when a request is turned away, to say whether it still
+    # carried that cookie (Authelia forgot the login) or another one (something
+    # replaced it). Logins that ended every few minutes left no other trace.
+    accepted::Dict{String,AcceptedCookie}
+    lock::ReentrantLock
+    shares::ShareRegistry
+end
+TunnelGate(auth::TunnelAuth, shares::ShareRegistry = ShareRegistry()) =
+    TunnelGate(auth, Dict{String,AcceptedCookie}(), ReentrantLock(), shares)
+
 "What stands before every route of the server: behind a tunnel the login gate."
-server_gate(::AuthMode) = nothing
-server_gate(auth::TunnelAuth) = TunnelGate(auth)
+server_gate(::AuthMode, ::ShareRegistry) = nothing
+server_gate(auth::TunnelAuth, shares::ShareRegistry) = TunnelGate(auth, shares)
 
 const OPEN_TARGETS = ("/w", "/install", "/install.sh", "/install.ps1", "/install.jl")
 const INVITE_TARGET = r"^/invite/[0-9a-f]{64}/?$"
@@ -45,7 +65,8 @@ function Bonito.HTTPServer.gate_request(g::TunnelGate, request::HTTP.Request)
     startswith(target, "/") || return gate_answer(400, "bad request target\n")
     is_portal_target(target) && return pass_to_authelia(g.auth, request)
     is_open_target(target) && return nothing
-    return admit!(g.auth, request)
+    is_share_target(g.shares, target) && return nothing
+    return admit!(g, request)
 end
 
 Bonito.HTTPServer.gate_response(::TunnelGate, request, response) =
@@ -60,27 +81,81 @@ function private_cache(value::AbstractString)
 end
 
 """
-    admit!(auth, request) -> Union{Nothing,HTTP.Response}
+    admit!(gate, request) -> Union{Nothing,HTTP.Response}
 
 Ask Authelia whether `request` may go on. If so it carries who it is from
 (`IDENTITY_HEADERS`, read by `request_user`) and `nothing` lets it through;
 otherwise Authelia's answer goes back to the client, a browser's being the
 redirect to the login page.
 """
-function admit!(auth::TunnelAuth, request::HTTP.Request)
-    headers = authelia_headers(auth, request)
+function admit!(g::TunnelGate, request::HTTP.Request)
+    headers = authelia_headers(g.auth, request)
     push!(headers, "X-Forwarded-Method" => request.method, "X-Forwarded-URI" => request.target)
-    answer = ask_authelia(auth, "GET", PORTAL_PATH * "/api/authz/forward-auth", headers, UInt8[])
+    answer = ask_authelia(g.auth, "GET", PORTAL_PATH * "/api/authz/forward-auth", headers, UInt8[])
     name = HTTP.header(answer, "Remote-User", "")
+    cookies = session_cookies(request)
+    client = client_address(request)
     if answer.status == 200 && !isempty(name)
         for h in IDENTITY_HEADERS
             HTTP.setheader(request, h => HTTP.header(answer, h, ""))
+        end
+        lock(g.lock) do
+            g.accepted[client] = AcceptedCookie(join(cookies, ","), name, time())
+            # A long-running server meets many addresses; a day of them is plenty.
+            length(g.accepted) > 1000 && filter!(kv -> time() - kv.second.at < 86400, g.accepted)
         end
         return nothing
     end
     refusal = relayed(answer)
     HTTP.setheader(refusal, "Cache-Control" => "no-store")
+    log_refusal(g, client, request, cookies, refusal)
     return refusal
+end
+
+# One line per request turned away: which login cookie it came with, the one
+# this device last got through with, and whether a new cookie goes back to it.
+# (Only the refusals of devices that were let through before: an idle tab's
+# periodic check after its login ended is not news.)
+function log_refusal(g::TunnelGate, client::AbstractString, request::HTTP.Request,
+                     cookies::Vector{String}, refusal::HTTP.Response)
+    last = lock(() -> get(g.accepted, client, nothing), g.lock)
+    last === nothing && return nothing
+    sent = join(cookies, ",")
+    handed = [cookie_digest(first(split(v, ';'))) for (k, v) in refusal.headers
+              if lowercase(k) == "set-cookie" && startswith(v, SESSION_COOKIE * "=")]
+    @info "login gate: turned away a device that was logged in" client target = request.target status = refusal.status cookie = (isempty(sent) ? "none" : sent) cookies_sent = length(cookies) last_accepted = last.cookie last_user = last.user seconds_since = round(Int, time() - last.at) same_cookie = (sent == last.cookie) new_cookie_to_browser = (isempty(handed) ? "none" : join(handed, ","))
+    # Logged once: until it gets through again, the device's next refusals repeat this.
+    lock(() -> delete!(g.accepted, client), g.lock)
+    return nothing
+end
+
+const SESSION_COOKIE = "authelia_session"
+
+# Short digests of the login cookies a request carries. More than one means the
+# browser holds two (a stale one beside the live one) and sends both, and which
+# one Authelia reads is not up to us.
+function session_cookies(request::HTTP.Request)
+    out = String[]
+    for (k, v) in request.headers
+        lowercase(k) == "cookie" || continue
+        for part in split(v, ';')
+            part = strip(part)
+            startswith(part, SESSION_COOKIE * "=") && push!(out, cookie_digest(part))
+        end
+    end
+    return out
+end
+
+cookie_digest(pair::AbstractString) = bytes2hex(sha256(String(pair)))[1:8]
+
+# The browser a request comes from: its address as the tunnel says (Cloudflare
+# names it in `Cf-Connecting-Ip`, other tunnels in `X-Forwarded-For`) and its
+# user agent, so two browsers on one machine (or behind one router) stay apart.
+function client_address(request::HTTP.Request)
+    cf = HTTP.header(request, "Cf-Connecting-Ip", "")
+    xff = HTTP.header(request, "X-Forwarded-For", "")
+    ip = !isempty(cf) ? String(cf) : isempty(xff) ? "unknown" : String(strip(first(split(xff, ','))))
+    return ip * " " * first(HTTP.header(request, "User-Agent", "no user agent"), 60)
 end
 
 # Authelia's login page and API, under the dashboard's own name.
@@ -115,7 +190,14 @@ end
 # One request to Authelia. Its cookies are the browser's, passed on as they
 # came: the client keeps none of its own (a shared cookie jar would hand one
 # person's session to the next), follows no redirect and goes through no proxy.
+#
+# A connection per request (`Connection: close`), never a pooled one: Authelia
+# closes an idle keep-alive connection after a while, and the next request on it
+# failed with "Broken pipe" or "unexpected EOF". Without retries (a login POST
+# must not be sent twice) that was a 500 for whatever the browser had asked for,
+# after every quiet minute. Authelia is on localhost; a connection costs nothing.
 function ask_authelia(auth::TunnelAuth, method::AbstractString, target::AbstractString, headers, body)
+    headers = [headers; "Connection" => "close"]
     try
         return HTTP.request(method, "http://127.0.0.1:$(auth.config.authelia_port)$(target)", headers, body;
                             cookies = false, redirect = false, status_exception = false, retry = false,

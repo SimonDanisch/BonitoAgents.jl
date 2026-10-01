@@ -19,6 +19,12 @@ enumerates.
   a minute; the worker watches for the server's pings, re-dials over the
   current network, and reaps agent sessions the server abandoned. Requests
   against an unreachable worker fail fast with a toast instead of hanging.
+- **A worker crash does not end a turn for good**: when a worker that crashed
+  mid-turn is back, exactly the chats it cut off get one automatic message to
+  carry on. The worker reports the crash itself (a pidfile a normal exit or a
+  deliberate stop removes, same boot only); stops, reboots, dropped connections,
+  and chats the user touched meanwhile are never continued, nor a continuation
+  that crashed again.
 - **Continue a chat on another worker** (the chat's ⋯ menu): the project's
   files move through the server, and so does the agent's own record of the
   conversation (for Claude Code: transcript, subagent transcripts, project
@@ -31,6 +37,9 @@ enumerates.
   live. Off by default, per chat: a *remote julia* pill in the chat header next
   to the permissions pill, enforced by the server. `bt_sync_folder` copies
   code and data across first.
+- **Julia values between machines**: `r = remote_session("MacBook")` inside the
+  chat's session, then `r[:x] = x`, `y = r[:y]`, `r(f, x)`. Serialization,
+  streamed, any size; the Julia versions must match (checked).
 - librsync-based directory sync underneath (project import, the moves above,
   folder sync between workers); single-file transfers over a dedicated channel.
 
@@ -42,7 +51,7 @@ enumerates.
   all three on the worker's own card, so the machine is picked before the
   folder.
 - **Copy project** snapshots a project's files onto another worker as a new
-  project (the cross-machine case; *Continue on* moves a live chat instead).
+  project (the cross-machine case; *Continue on* opens a new chat elsewhere that resumes this one).
 - Chat history persists server-side per project; reopening renders instantly
   from disk. Claude-side history is reconciled on open and after compaction
   (message-order invariant, no duplicates).
@@ -184,6 +193,10 @@ enumerates.
   geometry) into the chat, through the same renderers the file viewer uses.
 - `bt_sync_folder`: copy a folder to another worker (through the server's
   mirror, so a second call moves only what changed).
+- `bt_share`: a link anyone can open while the worker is online: a markdown
+  file as a page with its images and videos, or a Julia file's Bonito app, live
+  from a share host on the worker. Optional password; listed and ended in
+  Settings.
 - `bt_wait`: the one way for an agent to be idle on purpose — a bounded block
   with an optional shell condition, so waiting on a long render costs one tool
   call instead of a turn-per-poll loop that leaves orphaned sleepers behind.

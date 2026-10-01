@@ -47,10 +47,11 @@
             entry = only(configured["params"]["mcpServers"])
             env = Dict(k => v for (k, v) in ENV if !startswith(k, "BONITOAGENTS_"))
             merge!(env, Dict(e["name"] => e["value"] for e in entry["env"]))
-            # Only the relay's address and a grant: no server URL, no secret.
+            # Only the relay's addresses and a grant: no server URL, no secret.
             @test sort([k for k in keys(env) if startswith(k, "BONITOAGENTS_")]) ==
                   ["BONITOAGENTS_CONTROL_TOKEN", "BONITOAGENTS_CONTROL_URL",
-                   "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN", "BONITOAGENTS_PROJECT_ID"]
+                   "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN", "BONITOAGENTS_PROJECT_ID",
+                   "BONITOAGENTS_VALUES_ADDR"]
             proc[] = open(detach(Cmd(Cmd(String[entry["command"]; entry["args"]]); env)), "r+")
             request(1, "initialize", Dict("protocolVersion" => "2025-06-18", "capabilities" => Dict(),
                 "clientInfo" => Dict("name" => "relay-regression", "version" => "1")))

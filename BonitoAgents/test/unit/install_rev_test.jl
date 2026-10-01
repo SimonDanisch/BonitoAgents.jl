@@ -35,9 +35,9 @@
         repo = abspath(pkgdir(BonitoAgents), "..")
         branch = strip(read(`git -C $repo rev-parse --abbrev-ref HEAD`, String))
         sha = strip(read(`git -C $repo rev-parse HEAD`, String))
-        expected = if branch != "HEAD" && BonitoAgents._branch_on_origin(repo, branch)
+        expected = if branch != "HEAD" && BonitoAgents.branch_on_origin(repo, branch)
             branch
-        elseif BonitoAgents._sha_on_origin(repo, sha)
+        elseif BonitoAgents.sha_on_origin(repo, sha)
             sha
         else
             BonitoAgents.install_rev_for(pkgversion(BonitoAgents))

@@ -345,6 +345,14 @@ function start!(s::JuliaSession)
     # Malt can't serialise a `Module` reference back to the parent.
     Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch e; e isa InterruptException && rethrow(); end; nothing))
     Malt.remote_eval_fetch(s.worker, :(include($(helper_payload_path())); nothing))
+    # `remote_session`, to move values to and from another worker's session
+    # (remote_values.jl), through this worker's relay under the eval token.
+    Malt.remote_eval_fetch(s.worker, :(using .BonitoMCPHelper; nothing))
+    grant = relay_grant()
+    if grant !== nothing && !isempty(grant.values_addr)
+        Malt.remote_eval_fetch(s.worker,
+            :(Main.BonitoMCPHelper.set_value_relay!($(grant.values_addr), $(grant.eval_token))))
+    end
     # The worker's PIPED stdout/stderr are write-buffered: plain `println`s in
     # user code would reach the host (and the chat's live stream tail) in
     # multi-second bursts — a terminal flushes far more eagerly. A 4Hz

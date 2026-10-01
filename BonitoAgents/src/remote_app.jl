@@ -123,6 +123,30 @@ eval_bridge_for(state::ServerState, project_id::AbstractString) =
         get(state.eval_workers, String(project_id), nothing)
     end
 
+# Where a chat's bridges are filed: its own sessions' under the chat, an eval
+# host's (remote_eval.jl) under the chat and the host's worker, so a chat that
+# runs Julia here and on another machine keeps both live.
+eval_bridge_key(project_id::AbstractString, host_worker::AbstractString) =
+    isempty(host_worker) ? String(project_id) : String(project_id) * "\0" * String(host_worker)
+
+"""
+    bridge_for_ref(state, project_id, ref) -> Union{EvalBridge,Nothing}
+
+The bridge a result `ref` ("prefix/uuid") was parked on: the one of the chat's
+bridges with that prefix. Without one (its session is gone) the chat's own
+bridge, whose mount then fails fast to the static fallback.
+"""
+function bridge_for_ref(state::ServerState, project_id::AbstractString, ref::AbstractString)
+    prefix = first(split(ref, '/'; limit = 2))
+    host_keys = String(project_id) * "\0"
+    lock(state.lock) do
+        for (key, eb) in state.eval_workers
+            (key == project_id || startswith(key, host_keys)) && eb.prefix == prefix && return eb
+        end
+        get(state.eval_workers, String(project_id), nothing)
+    end
+end
+
 # ── Raw frame transport to the worker ───────────────────────────────────────
 function send_tagged(eb::EvalBridge, tag::UInt8, payload::AbstractVector{UInt8})
     buf = Vector{UInt8}(undef, length(payload) + 1)
@@ -500,6 +524,8 @@ function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
         e
     end
     eb === nothing && return nothing
+    # A share host's bridge (shares.jl) leaves the login gate's list with it.
+    lock(() -> delete!(state.shares.bridges, eb.prefix), state.shares.lock)
     fail_pending!(eb, "eval bridge torn down (worker session ended)")
     # Don't swallow the asset-host close failure (T12) — mirror the sibling at
     # the worker-replace path which logs it. The bridge is being retired either
@@ -820,7 +846,11 @@ struct RemoteRef
     bridge::Union{Nothing, EvalBridge}   # THIS worker incarnation; the id's prefix pins validity
     session_id::String                   # worker-side holder session id ("prefix/uuid")
     snapshot::String                     # static html fallback; "" = none yet
+    # Whether the viewer may close it: the ✕ frees the parked value for EVERY
+    # viewer, which is the owner's call in a chat and nobody's on a shared link.
+    closable::Bool
 end
+RemoteRef(bridge, session_id, snapshot) = RemoteRef(bridge, session_id, snapshot, true)
 
 function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
     body = isempty(r.snapshot) ?
@@ -837,11 +867,10 @@ function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
     # is wired here (not in the async) so an early click is never lost; the async
     # backfills the render-sub id it must also close.
     freed = Bonito.Observable(false)
-    node = Bonito.DOM.div(
-        Bonito.DOM.button("✕"; class = "bt-embed-close",
-            title = "Close this app and free its memory",
-            onclick = Bonito.js"(e) => { e.stopPropagation(); $(freed).notify(true); }"),
-        body; class = "bt-remote-ref")
+    close_button = !r.closable ? nothing : Bonito.DOM.button("✕"; class = "bt-embed-close",
+        title = "Close this app and free its memory",
+        onclick = Bonito.js"(e) => { e.stopPropagation(); $(freed).notify(true); }")
+    node = Bonito.DOM.div(close_button, body; class = "bt-remote-ref")
     node_id = Bonito.uuid(session, node)
     render_sub = Ref{Union{Nothing,String}}(nothing)
     Bonito.on(session, freed) do yes
@@ -927,11 +956,9 @@ end
 function remote_result(state::ServerState, payload::AbstractString, project_id::AbstractString)
     desc = result_descriptor(payload)
     desc === nothing && return RemoteRef(nothing, "", String(payload))
-    # NB the holder id carries no worker identity — `RemoteProxy.remote_ref`
-    # returns `Bonito.Session(parent).id`, and Bonito mints child ids as bare
-    # uuids — so there is nothing here to bind the ref to the worker that minted
-    # it. With one bridge per project that is fine; see the two-env limitation
-    # noted at `serve_eval_bridge`.
+    # The holder id is `Bonito.Session(parent).id`, "<bridge prefix>/<uuid>":
+    # its prefix names the bridge it lives on, which may be an eval host's on
+    # another worker (`bridge_for_ref`).
     #
     # The snapshot is deliberately EMPTY here, even though the descriptor
     # carries the worker's `repr` and the "Static-first" note above describes
@@ -945,5 +972,5 @@ function remote_result(state::ServerState, payload::AbstractString, project_id::
     # has to come WITH a liveness assertion a static snapshot cannot satisfy
     # (the interactive-counter testset below is the shape that works), or it
     # silently guts that coverage.
-    return RemoteRef(eval_bridge_for(state, project_id), desc.ref, "")
+    return RemoteRef(bridge_for_ref(state, project_id, desc.ref), desc.ref, "")
 end

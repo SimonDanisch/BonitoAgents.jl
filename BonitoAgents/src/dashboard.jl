@@ -261,34 +261,17 @@ function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress
 end
 
 """
-    ensure_project_session!(state, p; target_worker="", progress=nothing) → ChatModel
+    ensure_project_session!(state, p; progress=nothing) → ChatModel
 
-Build (or return) the chat ChatModel for `p` running on `target_worker`.
+Build (or return) the chat ChatModel for `p` on the worker it belongs to:
+the cached model, or a new one claimed on that worker. Idempotent. A chat never
+changes workers; "Continue on <worker>" makes a new one (`continue_on!`).
 
-If `target_worker` is unset or matches the project's current `worker_id`,
-this is the fast path: returns the cached model or builds + claims on the
-current worker. Idempotent.
-
-If `target_worker` is a *different* online worker, this routes through
-`start!` to run the full transparent-move flow (pre-pull from current
-worker → push to target → re-bind → claim). The user-visible effect is
-"opening the chat on B"; the file shuffling underneath is bookkeeping.
-
-Called from project creation flows, worker reconnect, and the dashboard's
-"Open chat on <worker>" handler. The unified app's main panel pulls the
-cached model out of state.chat_models when the user selects this project
-in the sidebar.
+Called from project creation flows and worker reconnect. The unified app's main
+panel pulls the cached model out of state.chat_models when the user selects this
+project in the sidebar.
 """
-function ensure_project_session!(state::ServerState, p::ProjectInfo;
-                                  target_worker::AbstractString = "",
-                                  progress = nothing)
-    # When a target worker is specified that differs from the current
-    # owner, delegate to `start!` which handles the atomic move. The
-    # `start!` body updates `p.worker_id` and then calls back here with
-    # no `target_worker` — so we hit the fast path below on the way out.
-    if !isempty(target_worker) && String(target_worker) != p.worker_id
-        return start!(state, p, target_worker; progress = progress)
-    end
+function ensure_project_session!(state::ServerState, p::ProjectInfo; progress = nothing)
     # Funnel concurrent bring-ups for the SAME project through ONE in-flight
     # task (T1). Without this, two tabs opening the same project both pass the
     # unlocked `haskey(state.chat_models, p.id)` check (the cache write happens
@@ -529,6 +512,8 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         notify_chats!(state)   # drop from the active-chats sidebar
     end
     release_project!(state, p)
+    # A closed chat is not continued after a worker crash.
+    forget_interrupted_turn!(state, p.id)
     # The reaped claude subprocess takes its MCP server + eval worker with it, so
     # the eval bridge's worker session is gone — tear the bridge down explicitly
     # (a WS drop alone no longer does; its lifetime is the worker session).
@@ -539,86 +524,71 @@ function stop_session!(state::ServerState, p::ProjectInfo)
 end
 
 """
-    transfer_project!(state, p, target_worker_id; progress=nothing)
+    continue_on!(state, p, target_worker_id; progress = nothing) -> ProjectInfo
 
-File-shuffling half of a project move. Pre-pulls from the current
-worker (if online), pushes the server's mirror to `target_worker_id`,
-then re-binds `p.worker_id` / `p.worker_path` / clears
-`resume_session_id`. Does NOT bring up a chat session — that's
-`ensure_project_session!`'s job. `start!` chains the two together.
+"Continue on <worker>": a NEW chat on `target_worker_id` that picks up where `p`
+is, with the agent's own record of the conversation (so it resumes with its
+memory) and the project's files as they are now. `p` is left alone: its session
+keeps running, and whatever it is doing finishes where it started.
 
-Split out from `start!` so the file-movement contract can be tested
-without standing up an ACP session.
+This used to MOVE the chat: stop its session, re-bind it to the target, start it
+there. A move that took a while left the user chatting in a chat that was about
+to change machines under them, and afterwards it ran on the target while tools
+and background tasks it had started kept running on the source.
+
+The conversation is carried first, at a turn boundary (the caller refuses while
+a turn runs), and the files after, so chatting on in `p` meanwhile changes
+neither what the new chat remembers nor where `p` runs.
 """
-function transfer_project!(state::ServerState, p::ProjectInfo,
-                            target_worker_id::AbstractString;
-                            progress = nothing)
+function continue_on!(state::ServerState, p::ProjectInfo, target_worker_id::AbstractString;
+                      progress = nothing)
     target_id = String(target_worker_id)
-    haskey(state.workers[], target_id) ||
-        error("Unknown worker: $target_id")
-    target_w = state.workers[][target_id]
-    isopen(target_w) ||
-        error("Worker '$(target_w.name)' is offline")
-    target_id == p.worker_id && return p   # no-op
-
+    target_w = get(state.workers[], target_id, nothing)
+    target_w === nothing && error("Unknown worker: $(target_id)")
+    isopen(target_w) || error("Worker '$(target_w.name)' is offline")
+    target_id == p.worker_id && error("$(p.name) already runs on $(target_w.name)")
+    source_online = haskey(state.workers[], p.worker_id) && isopen(state.workers[][p.worker_id])
+    # With the source offline only the server's mirror can be pushed. A project
+    # registered without a sync has an EMPTY mirror; pushing that once emptied a
+    # live folder at the target (2026-09-15). Refuse before anything moves.
+    source_online || p.last_sync_at !== nothing ||
+        error("Cannot continue $(p.name) on $(target_w.name): its worker is offline and the server " *
+              "holds no copy of it (never synced). Bring the worker online, or sync the project first.")
     target_path = worker_join(target_w.projects_root, p.name)
-    notify_progress(progress, :phase,
-        (msg = "Stopping session on $(p.worker_id)…",))
-    stop_session!(state, p)
 
-    # Pre-pull: if the source worker is online, capture its latest
-    # filesystem state into the server's mirror BEFORE we push. Without
-    # this, any edits made on the source worker in an external editor
-    # since the last "Sync to server" would be silently lost on the move.
-    source_online = haskey(state.workers[], p.worker_id) &&
-                    isopen(state.workers[][p.worker_id])
+    carried = carry_session!(state, p, target_w, target_path; progress)
+
     if source_online
         source_name = state.workers[][p.worker_id].name
-        notify_progress(progress, :phase,
-            (msg = "Pulling latest from $(source_name)…",))
+        notify_progress(progress, :phase, (msg = "Pulling the files from $(source_name)…",))
         try
             sync_project_to_server!(state, p; on_progress = progress)
         catch e
-            # Stale-mirror fallback: prefer continuing the move with
-            # whatever the server has over aborting. Surfaced as a warning
-            # so the user can see they were on the optimistic path.
-            @warn "pre-pull from source worker failed; continuing with server's existing mirror" project=p.name source=p.worker_id exception=e
+            e isa InterruptException && rethrow()
+            # A mirror synced before is still worth pushing; none at all is not.
+            p.last_sync_at === nothing && rethrow()
+            @warn "pulling from the source worker failed; continuing from the server's copy" project = p.name source = p.worker_id exception = e
         end
-    else
-        # The mirror is the only copy we can push. It must BE a copy: a project
-        # registered without a sync has an empty mirror, and pushing that used
-        # to arrive at the target with mirror semantics and delete every file
-        # of a live project there (2026-09-15). Refuse rather than guess.
-        p.last_sync_at === nothing &&
-            error("Cannot move $(p.name): its worker is offline and the server holds no copy " *
-                  "of it (never synced). Bring the worker online, or sync the project to the server first.")
-        @info "source worker offline; moving from server's existing mirror" project=p.name source=p.worker_id target=target_id last_sync_at=p.last_sync_at
     end
+    notify_progress(progress, :phase, (msg = "Pushing the files to $(target_w.name)…",))
+    # Additive: whatever already sits at the target path stays.
+    sync_dir_to_worker!(state, target_id, p.server_path, target_path; on_progress = progress)
 
-    notify_progress(progress, :phase,
-        (msg = "Pushing $(p.name) → $(target_w.name)…",))
-    # The push is additive: whatever already sits at the target path stays. A
-    # move never empties a folder it did not fill.
-    sync_dir_to_worker!(state, target_id, p.server_path, target_path;
-                         on_progress = progress)
-
-    # The agent's own record of the conversation travels too, so the session
-    # resumes on the target with its memory intact. When it can't (nothing to
-    # carry, a provider whose record we can't move, the source offline, or a
-    # failed transport) the chat continues with a fresh agent session and the
-    # server-side history stays visible — `resume_session_id` is cleared so the
-    # target's agent isn't asked to load a session it never saw.
-    carried = carry_session!(state, p, target_w, target_path; progress)
-
-    # Re-bind. Persistent state is written before we return so a server crash
-    # mid-`start!` (between this point and ensure_project_session!) doesn't
-    # leave projects.json disagreeing with the bytes on disk.
-    p.worker_id          = target_id
-    p.worker_path        = target_path
-    carried || (p.resume_session_id = nothing)
-    save_projects!(state)
-    notify_projects!(state)
-    return p
+    # The new chat. A folder the target already has a chat in shares that
+    # chat's server mirror; otherwise it gets its own, empty until it is synced,
+    # like a chat opened on a worker's folder (never a second full copy).
+    sibling = find_project_by_location(state, target_id, target_path)
+    new_id = string(uuid4())[1:8]
+    server_path = sibling !== nothing ? sibling.server_path :
+        (base = joinpath(state.working_dir, p.name); ispath(base) ? "$(base)-$(new_id)" : base)
+    new_p = ProjectInfo(new_id, p.name, target_id, server_path, target_path, now(UTC))
+    new_p.resume_session_id = carried ? p.resume_session_id : nothing
+    new_p.provider = p.provider
+    new_p.desired_config = copy(p.desired_config)
+    new_p.title[] = p.title[]
+    add_project!(state, new_p)
+    @info "chat continued on another worker" source = p.id new = new_id target = target_w.name carried
+    return new_p
 end
 
 """
@@ -685,37 +655,6 @@ function carry_session!(state::ServerState, p::ProjectInfo, target_w::WorkerInfo
         @warn "could not remove the staged conversation on the source worker" source = src_w.name staging = staging_src exception = e
     end
     return carried
-end
-
-"""
-    start!(state, p, worker_id; progress=nothing) → ChatModel
-
-Bring up `p`'s chat session on `worker_id`, transparently re-syncing
-through the server. The server is the source of truth; workers are
-caches that may drift between sessions (the user might edit files in
-their own editor on the worker's filesystem outside BonitoAgents).
-
-If `worker_id == p.worker_id` this is just `ensure_project_session!`.
-
-Otherwise: `transfer_project!` does the atomic file-move (pre-pull
-from source → push to target → re-bind), then a fresh session boots
-on the target.
-
-Failure semantics: if any step before `transfer_project!`'s re-bind
-fails, `worker_id` is NOT flipped — the project remains bound to the
-source. The error propagates to the caller (the dashboard's open-on
-handler renders it in the error banner).
-"""
-function start!(state::ServerState, p::ProjectInfo, worker_id::AbstractString;
-                progress = nothing)
-    target_id = String(worker_id)
-    if target_id == p.worker_id
-        return ensure_project_session!(state, p)
-    end
-    transfer_project!(state, p, target_id; progress = progress)
-    notify_progress(progress, :phase,
-        (msg = "Starting chat on $(state.workers[][target_id].name)…",))
-    return ensure_project_session!(state, p)
 end
 
 """
@@ -2010,51 +1949,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         end
     end
 
-    # ── "Open chat on <worker>" click handler ────────────────────────────────
-    # JS sends a {project, worker} payload. Same worker → just swap the
-    # main-panel view. Different worker → `start!` handles the whole
-    # transparent-move sequence (pre-pull from source, push to target,
-    # re-bind, start session). Long-running so it goes through the busy
-    # card; the (stage, info) callback surfaces per-file progress.
-    open_request = Observable(Dict{String,Any}())
-    on(session, open_request) do payload
-        isempty(payload) && return
-        pid    = String(get(payload, "project", ""))
-        target = String(get(payload, "worker",  ""))
-        open_request[] = Dict{String,Any}()   # reset
-        (isempty(pid) || isempty(target)) && return
-        haskey(state.projects[], pid) || return
-        p = state.projects[][pid]
-
-        if target == p.worker_id
-            current_view !== nothing && (current_view[] = p.id)
-            return
-        end
-
-        haskey(state.workers[], target) || return
-        refuse_if_busy(busy, error_obs, "Can't open that chat elsewhere yet") && return
-        target_w = state.workers[][target]
-        # Set the busy guard SYNCHRONOUSLY, before spawning (T16). Doing it
-        # inside the @async let a double-click pass the `is_busy_running` check
-        # twice (busy was still idle until the first task ran) and start two
-        # concurrent project moves. The other long-ops set it synchronously too.
-        busy_start!(busy, "Opening $(p.name) on $(target_w.name)")
-        @async begin
-            try
-                cb = (stage, info) -> busy_event!(busy, stage, info)
-                start!(state, p, target; progress = cb)
-                safe_set!(error_obs, "")
-                busy_done!(busy, "Opened $(p.name) on $(target_w.name)")
-                current_view !== nothing && (current_view[] = p.id)
-            catch e
-                bt = catch_backtrace()
-                @warn "open-on-worker failed" project=p.name target=target exception=(e, bt)
-                busy_fail!(busy, "Failed to open $(p.name) on $(target_w.name)",
-                           error_detail(e, bt))
-            end
-        end
-    end
-
     # `picker_state` holds the worker_id whose picker form is currently
     # visible (""  → none). The folder-picker instances themselves live on
     # each WorkerCard (stable across re-renders because the card is stable).
@@ -2253,8 +2147,8 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # ("running on workers"). The only card-only feature was move-to-worker,
     # which is being redesigned. Project creation stays on the dashboard via the
     # + New project / + From GitHub buttons; the projects themselves live in the
-    # worker pills and the sidebar. (`sync_request` / `open_request` above
-    # remain defined for the future move-to-worker redesign.)
+    # worker pills and the sidebar. (`sync_request` above
+    # remains defined for a future per-project sync control.)
 
     # Top-of-page errors, for failures with no form on screen ("Register a
     # worker before creating a project").
@@ -2326,6 +2220,7 @@ function settings_dom(session::Bonito.Session, state::ServerState;
             debug_section(session, state, current_view);
             class = "bt-card bt-settings"),
         agents_md_section(session, state),
+        shares_section(session, state),
         # Your account behind the proxy; accounts, invites and agent adapter
         # versions for admins.
         account_sections(session, state),

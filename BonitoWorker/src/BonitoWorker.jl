@@ -10,6 +10,7 @@ module BonitoWorker
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
 using MsgPack
 import Random
+import Sockets
 import WorkerLink
 include("mcp_relay.jl")
 include("harnesses.jl")
@@ -133,13 +134,15 @@ config_path() = joinpath(config_dir(), "config.json")
 # already holds it.
 pidfile_path() = joinpath(config_dir(), "worker.pid")
 
-# The pidfile is two lines: the pid, then the `julia_bin()` the worker runs on.
+# The pidfile is four lines: the pid, the `julia_bin()` the worker runs on, the
+# id of this run (`new_instance_id`) and when the machine booted (`boot_time`).
 # The second line is what lets a re-install tell "the live worker is on the
 # Julia this install uses" from "it is on the one juliaup defaulted to LAST
 # time" — without it a reinstall after `juliaup default 1.12` left a 1.13
 # worker (and its 1.13 BonitoMCP launch command) running forever, because
-# nothing else about the install had changed. Files written before the second
-# line existed still parse (a missing line reads as `nothing`).
+# nothing else about the install had changed. The last two are how a crash is
+# told from a stop (`crashed_instance`). Files written before a line existed
+# still parse (a missing line reads as `nothing`).
 pidfile_lines(path::AbstractString) = split(read(path, String), '\n'; keepempty = false)
 
 # The pid recorded in the pidfile, or `nothing` if absent/empty/garbage.
@@ -160,6 +163,71 @@ function pidfile_julia(path::AbstractString = pidfile_path())
     return isempty(julia) ? nothing : String(julia)
 end
 
+# The run the pidfile belongs to, or `nothing` for a pidfile without one.
+function pidfile_instance(path::AbstractString = pidfile_path())
+    isfile(path) || return nothing
+    lines = pidfile_lines(path)
+    length(lines) >= 3 || return nothing
+    instance = strip(lines[3])
+    return isempty(instance) ? nothing : String(instance)
+end
+
+# When the machine had booted, for the run the pidfile belongs to.
+function pidfile_boot(path::AbstractString = pidfile_path())
+    isfile(path) || return nothing
+    lines = pidfile_lines(path)
+    length(lines) >= 4 || return nothing
+    return tryparse(Float64, strip(lines[4]))
+end
+
+"""
+    boot_time() -> Float64
+
+When this machine last booted (Unix time, seconds).
+"""
+@static if Sys.islinux()
+    function boot_time()
+        for line in eachline("/proc/stat")
+            startswith(line, "btime ") && return parse(Float64, split(line)[2])
+        end
+        error("/proc/stat has no btime line")
+    end
+elseif Sys.isapple() || Sys.isbsd()
+    boot_time() = parse(Float64, match(r"sec = (\d+)", read(`sysctl -n kern.boottime`, String))[1])
+elseif Sys.iswindows()
+    boot_time() = time() - ccall((:GetTickCount64, "kernel32"), UInt64, ()) / 1000
+end
+
+# Two boot times this close are the same boot (Windows derives it from uptime,
+# and a clock set by NTP moves Linux's by that much).
+const SAME_BOOT_S = 60.0
+
+"""
+    crashed_instance(path = pidfile_path()) -> String
+
+The run of this worker that CRASHED, or "". A run removes its pidfile when it
+exits normally, and whoever stops it on purpose removes it too: this module
+(`stop_running_worker!`, which updates and re-installs use) and the service
+manager (the systemd unit's `ExecStop`). Julia's own handling of SIGTERM cannot
+be relied on for it: 1.12.7 hangs in it more often than not. So a pidfile naming
+a process that is gone, in the same boot of the machine, was left by a crash:
+SIGKILL, an out-of-memory kill, a segfault or abort. A run from an earlier boot
+ended with the machine (a reboot, a shutdown, a power loss), never counted. Read
+before `claim_pidfile!` overwrites the file. A pid whose state cannot be
+determined does not count either.
+"""
+function crashed_instance(path::AbstractString = pidfile_path())
+    pid = read_pidfile(path)
+    (pid === nothing || pid == getpid() || pid_running(pid) !== false) && return ""
+    booted = pidfile_boot(path)
+    (booted === nothing || abs(booted - boot_time()) > SAME_BOOT_S) && return ""
+    return something(pidfile_instance(path), "")
+end
+
+# A new id for this run of the worker: in its pidfile, and in its hello, so the
+# server can match "the run that crashed" to "the run whose chats were cut off".
+new_instance_id() = bytes2hex(rand(Random.RandomDevice(), UInt8, 16))
+
 # Pid of a *live, other* worker holding the pidfile, or `nothing` if the slot is
 # free (no file, stale file pointing at a dead pid, or it's our own pid). A
 # `pid_running` result of `nothing` (can't determine) is treated as "not
@@ -176,9 +244,9 @@ end
 # Claim the pidfile for this process and arrange to release it on exit. Best
 # effort: a hard kill (SIGKILL) leaves a stale file, which the next start
 # detects as dead and overwrites.
-function claim_pidfile!(path::AbstractString = pidfile_path())
+function claim_pidfile!(path::AbstractString = pidfile_path(); instance::AbstractString = "")
     mkpath(dirname(path))
-    write(path, string(getpid(), '\n', julia_bin(), '\n'))
+    write(path, string(getpid(), '\n', julia_bin(), '\n', instance, '\n', boot_time(), '\n'))
     atexit() do
         # Only remove if it's still ours — a successor that took over the slot
         # must keep its own claim.
@@ -319,6 +387,14 @@ function systemd_user_available()
     end
 end
 
+# A stop the service manager requests (`systemctl stop`/`restart`, a shutdown)
+# is not a crash: it removes the pidfile while the worker it names still runs,
+# before the SIGTERM (`crashed_instance`). After a crash that pid is gone, and
+# the file stays. `$$` is systemd's escape for a literal `$`.
+service_exec_stop(pidfile::AbstractString = pidfile_path()) =
+    "ExecStop=/bin/sh -c 'pid=\$\$(head -n 1 \"$(pidfile)\" 2>/dev/null) && " *
+    "kill -0 \"\$\$pid\" 2>/dev/null && rm -f \"$(pidfile)\"; exit 0'"
+
 # The unit text. PURE (no side effects) so install can diff it against the
 # on-disk unit and only rewrite+reload when it actually changed (template bump,
 # new server, a different PATH). `path_env` is baked in because systemd --user
@@ -345,6 +421,7 @@ function render_service_unit(; project::AbstractString = "@bonito-agents",
     Type=simple
     Environment=PATH=$(path_env)
     ExecStart=$(exec)
+    $(service_exec_stop())
     Restart=on-failure
     RestartSec=5
     # Cap the whole process tree (worker + MCP + Malt eval workers share the
@@ -835,7 +912,12 @@ function start(; force::Bool = false)
               " (kill it first, or call start(; force=true))" pid = other pidfile = pidfile_path()
         return nothing
     end
-    claim_pidfile!()
+    # Before the claim overwrites it: a pidfile the previous run left behind
+    # means it crashed. The server continues the chats it cut off mid-turn.
+    crashed = crashed_instance()
+    isempty(crashed) || @warn "BonitoWorker: the previous run of this worker did not exit (it crashed, was killed, or the machine went down)" instance = crashed
+    instance = new_instance_id()
+    claim_pidfile!(; instance)
     # AFTER the pidfile is ours: that is the proof no other incarnation of this
     # worker is alive, which is exactly what makes killing anything carrying our
     # id safe. Before the claim, a duplicate start would reap the RUNNING
@@ -850,6 +932,7 @@ function start(; force::Bool = false)
         name          = String(get(config, "name", default_worker_name(worker_id))),
         projects_root = String(get(config, "projects_root", pwd())),
         update_config = Dict{String,Any}(config),
+        instance, crashed_instance = crashed,
     )
 end
 
@@ -871,6 +954,11 @@ function connect_and_serve(; server_url::String,
                             # `nothing` is the standalone/dev default. Only a real
                             # installer writes an auto-update-enabled config.
                             update_config::Union{Dict{String,Any},Nothing} = nothing,
+                            # This run, and the previous run if it crashed ("": it
+                            # did not, or nobody knows: a worker started without
+                            # a pidfile never reports one).
+                            instance::String      = new_instance_id(),
+                            crashed_instance::String = "",
                             retry_delay::Real     = 5.0)
     # Here rather than in `start()`: this is the one function EVERY worker goes
     # through, and `worker_standalone.jl` (the monorepo dev loop and the
@@ -882,7 +970,7 @@ function connect_and_serve(; server_url::String,
     # `const` computed at load: that bakes the precompiling machine's clock.
     WORKER_STARTED[] == 0.0 && (WORKER_STARTED[] = time())
     w = Worker(WorkerConfig(; server_url, credential, worker_id, name, mcp_command, mcp_arguments,
-                            projects_root, update_config))
+                            projects_root, update_config, instance, crashed_instance))
     serve(w; retry_delay)
     return nothing
 end
@@ -2710,23 +2798,26 @@ end
 #   `false`   — confirmed dead,
 #   `nothing` — the OS-level check couldn't determine (always show no badge).
 @static if Sys.iswindows()
-    const _PROCESS_QUERY_LIMITED_INFORMATION = UInt32(0x1000)
+    const PROCESS_QUERY_LIMITED_INFORMATION = UInt32(0x1000)
+    const ERROR_ACCESS_DENIED = UInt32(5)
+    const ERROR_INVALID_PARAMETER = UInt32(87)
+    const STILL_ACTIVE = UInt32(259)
     function pid_running(pid::Integer)
-        try
-            h = ccall((:OpenProcess, "kernel32"), Ptr{Cvoid},
-                      (UInt32, Cint, UInt32),
-                      _PROCESS_QUERY_LIMITED_INFORMATION, Cint(0), UInt32(pid))
-            if h != C_NULL
-                ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), h)
-                return true
-            end
-            # NULL could mean "no such process" or "access denied" — we don't
-            # bother calling GetLastError(); be conservative and report
-            # "unknown" so the UI shows no badge.
-            return nothing
-        catch
+        h = ccall((:OpenProcess, "kernel32"), Ptr{Cvoid},
+                  (UInt32, Cint, UInt32),
+                  PROCESS_QUERY_LIMITED_INFORMATION, Cint(0), UInt32(pid))
+        if h == C_NULL
+            err = Libc.GetLastError()
+            err == ERROR_INVALID_PARAMETER && return false   # no such process
+            err == ERROR_ACCESS_DENIED && return true        # there, but not ours to open
             return nothing
         end
+        # A process that exited stays openable while anyone holds a handle to it.
+        code = Ref{UInt32}(0)
+        ok = ccall((:GetExitCodeProcess, "kernel32"), Cint, (Ptr{Cvoid}, Ref{UInt32}), h, code)
+        ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), h)
+        ok == 0 && return nothing
+        return code[] == STILL_ACTIVE
     end
 else
     function pid_running(pid::Integer)
@@ -3394,9 +3485,14 @@ idempotent, so two `serve()` calls in one process share the file.
 
 `timestamps` installs [`TimestampLogger`](@ref) either way, since `since`/`until`
 in `read_log_file` need something to match.
+
+Every `memory_every` seconds (0: never) a line on memory goes in too
+([`log_memory`](@ref)): when a machine froze, the log's last lines say whether
+memory ran out, and to whom.
 """
 function start_file_log!(path::AbstractString; redirect::Bool = true,
-                         max_bytes::Integer = LOG_MAX_BYTES, timestamps::Bool = true)
+                         max_bytes::Integer = LOG_MAX_BYTES, timestamps::Bool = true,
+                         memory_every::Real = 600.0)
     LOG_FILE[] == String(path) && return LOG_FILE[]
     mkpath(dirname(String(path)))
     if redirect
@@ -3411,7 +3507,57 @@ function start_file_log!(path::AbstractString; redirect::Bool = true,
         sleep(LOG_ROTATE_CHECK_S)
         rotate_log_if_big!(Int(max_bytes))
     end)
+    memory_every > 0 && Base.errormonitor(@async while true
+        log_memory()
+        sleep(memory_every)
+    end)
     return LOG_FILE[]
+end
+
+"""
+    log_memory()
+
+One log line on memory: what the machine has available and in total, what this
+process holds, and the five processes holding the most (with their command
+lines, so a `julia` running the server tells itself apart from an eval worker).
+"""
+function log_memory()
+    @info "memory" available_gb = gb(available_memory()) total_gb = gb(Sys.total_memory()) this_process_gb = gb(resident_bytes(getpid())) largest = largest_processes()
+    return nothing
+end
+
+gb(bytes::Integer) = round(bytes / 2^30; digits = 2)
+
+# What the kernel could hand out now. Linux's `Sys.free_memory` is MemFree,
+# which leaves out the page cache it gives back on demand: a healthy machine
+# would read as nearly full.
+function available_memory()
+    if Sys.islinux()
+        for line in eachline("/proc/meminfo")
+            startswith(line, "MemAvailable:") && return 1024 * parse(Int, split(line)[2])
+        end
+    end
+    return Int(Sys.free_memory())
+end
+
+# Resident bytes of `pid`, from `ps` (Linux and macOS); 0 where there is no `ps`.
+function resident_bytes(pid::Integer)
+    Sys.iswindows() && return 0
+    kb = tryparse(Int, strip(read(`ps -o rss= -p $(pid)`, String)))
+    return kb === nothing ? 0 : 1024 * kb
+end
+
+function largest_processes(n::Integer = 5)
+    Sys.iswindows() && return String[]
+    rows = Tuple{Int,String}[]
+    for line in eachline(`ps -axo rss=,args=`)
+        parts = split(strip(line); limit = 2)
+        length(parts) == 2 || continue
+        kb = tryparse(Int, parts[1])
+        kb === nothing || push!(rows, (kb, String(parts[2])))
+    end
+    sort!(rows; by = first, rev = true)
+    return ["$(gb(1024 * kb)) GB  $(first(cmd, 100))" for (kb, cmd) in first(rows, n)]
 end
 
 # Two generations, `path` and `path.1`, so the disk cost is bounded at

@@ -191,9 +191,28 @@
             @test Bonito.HTTPServer.gate_request(gate, forged) isa HTTP.Response
             @test BT.request_user(auth, forged) === nothing
 
+            # A browser let through and later turned away gets ONE log line saying
+            # whether it still sent the cookie that worked (Authelia forgot the
+            # login) or another one (something replaced it). Logins that ended
+            # every few minutes left no other trace.
+            who = ["Cf-Connecting-Ip" => "203.0.113.7", "User-Agent" => "a test browser"]
+            @test Bonito.HTTPServer.gate_request(gate, HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...])) === nothing
+
             # Logged out, it is the login first again.
             @test post_("/authelia/api/logout", Dict{String,Any}(), cookie).status == 200
             @test login_first(get_("/", ["Cookie" => cookie]))
+
+            refused(req) = Test.collect_test_logs(() -> Bonito.HTTPServer.gate_request(gate, req))
+            logs, answer = refused(HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
+            @test answer isa HTTP.Response
+            line = only(l for l in logs if occursin("turned away a device that was logged in", l.message))
+            kw = Dict(line.kwargs)
+            @test kw[:same_cookie] == true && kw[:last_user] == "bob" && kw[:cookies_sent] == 1
+            @test kw[:cookie] == kw[:last_accepted] && !occursin(cookie, string(kw))   # digests, never the cookie
+            @test kw[:new_cookie_to_browser] != "none"   # Authelia hands a refused browser a fresh cookie
+            # Once per incident: the next refusal of that browser is not logged again.
+            logs2, _ = refused(HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
+            @test !any(l -> occursin("turned away a device", l.message), logs2)
         end
 
         @testset "an account made while Authelia runs, and a new authenticator" begin

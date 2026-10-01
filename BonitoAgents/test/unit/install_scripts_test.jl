@@ -6,9 +6,11 @@
     using BonitoAgents
     const BT = BonitoAgents
 
+    spec = Dict{String,Any}("repo" => "r", "rev" => "main", "source_id" => "abc",
+                            "bonito_url" => "u", "bonito_rev" => "master")
     if !Sys.iswindows()
         script = BT.render_install_script(read(joinpath(BT.ASSETS_DIR, "install.sh"), String),
-                                          "https://team.example.com")
+                                          "https://team.example.com", spec)
         # Stand-ins: `curl` serves nothing, `julia` says what it was started with.
         bin = mktempdir()
         write(joinpath(bin, "curl"), "#!/bin/sh\nexit 0\n")
@@ -22,7 +24,7 @@
 
     # The installer takes its first argument, else the variable older commands set.
     jl = BT.render_install_script(read(joinpath(BT.ASSETS_DIR, "install.jl"), String),
-                                  "https://team.example.com")
+                                  "https://team.example.com", spec)
     line = only(filter(l -> startswith(l, "const CREDENTIAL"), split(jl, '\n')))
     credential(args, env) = withenv("BONITOAGENTS_WORKER_CREDENTIAL" => env) do
         m = Module()

@@ -753,6 +753,12 @@ path_span(path::AbstractString; class::AbstractString, title = path) =
 path_span(path::Observable; class::AbstractString) =
     DOM.span(DOM.span(path; class = "bt-path-ltr"); class = class)
 
+# A markdown page or an app file can be shared as a link (shares.jl).
+share_btn(p::FilePanel) =
+    share_kind_of(p.worker_path) === nothing || isempty(p.view.file.project_id) ? () :
+        (fv_action_btn("share", "↗", "Share a link: anyone with it can open this " *
+                       "while the worker is online (Settings lists and ends links)"),)
+
 function file_panel_header(session::Session, p::FilePanel)
     size_txt = p.size_bytes < 0 ? "" : format_bytes(p.size_bytes)
     toggle = has_rendered_view(p) && p.editor !== nothing ?
@@ -782,6 +788,7 @@ function file_panel_header(session::Session, p::FilePanel)
             fv_action_btn("copy", "⧉", "Copy the worker path"),
             fv_action_btn("download", "⤓", "Download to this computer"),
             fv_action_btn("reload", "⟳", "Reload from the worker"),
+            share_btn(p)...,
             save_btn...;
             class = "bt-fv-actions");
         class = "bt-file-editor-header bt-fv-header")
@@ -852,9 +859,28 @@ function Bonito.jsrender(session::Session, p::FilePanel)
         "?path=" * HTTP.URIs.escapeuri(p.worker_path)
     save_obs = p.editor === nothing ? Observable{Union{Nothing,String}}(nothing) : p.editor.save_content
 
+    # ↗: the link, or why there is none ("link:…" / "error:…"). Made off the
+    # session task: an app is evaluated once first, which can take a minute.
+    share_request = Observable(0)
+    share_answer = Observable("")
+    on(session, share_request) do _
+        Base.errormonitor(@async begin
+            answer = try
+                "link:" * share_project_file!(p.view.file.state, p.view.file.project_id, p.worker_path)
+            catch e
+                (e isa ErrorException || e isa WorkerUnreachableError) || rethrow()
+                @warn "sharing a file failed" path = p.worker_path exception = (e, catch_backtrace())
+                "error:" * first(split(sprint(showerror, e), '\n'))
+            end
+            safe_set!(share_answer, answer)
+        end)
+    end
+
     Bonito.onload(session, node, js"""(root) => {
         const reload = $(p.reload);
         const save   = $(save_obs);
+        const shareRequest = $(share_request);
+        const shareAnswer  = $(share_answer);
         const wpath  = $(p.worker_path);
         const dlurl  = $(download_url);
 
@@ -867,6 +893,19 @@ function Bonito.jsrender(session::Session, p::FilePanel)
             root.__btFlash = setTimeout(() => { if (s.textContent === msg) s.textContent = ''; }, 2500);
         };
         const doSave = () => { const ed = editorOf(); if (ed) save.notify(ed.getValue()); };
+        // The link stays in the status line (selectable) until the next action.
+        shareAnswer.on(m => {
+            const s = root.querySelector('.bt-fv-status');
+            if (!s || !m) return;
+            clearTimeout(root.__btFlash);
+            if (m.startsWith('link:')) {
+                const url = m.slice(5);
+                s.textContent = 'shared: ' + url;
+                ($(COPY_TEXT_JS))(url).then(() => { s.textContent = 'link copied: ' + url; }, () => {});
+            } else {
+                s.textContent = 'not shared: ' + m.slice(6);
+            }
+        });
 
         const setView = (v) => {
             root.dataset.view = v;
@@ -894,6 +933,10 @@ function Bonito.jsrender(session::Session, p::FilePanel)
                       'reloaded preview — editor keeps your unsaved edits' : 'reloaded');
             } else if (act.dataset.fvAction === 'copy') {
                 ($(COPY_TEXT_JS))(wpath).then(() => flash('path copied'), () => flash('could not copy'));
+            } else if (act.dataset.fvAction === 'share') {
+                const s = root.querySelector('.bt-fv-status');
+                if (s) { clearTimeout(root.__btFlash); s.textContent = 'sharing…'; }
+                shareRequest.notify(Date.now());
             } else if (act.dataset.fvAction === 'download') {
                 if (!dlurl) { flash('no project to download from'); return; }
                 const a = document.createElement('a');

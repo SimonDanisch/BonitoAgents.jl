@@ -119,6 +119,9 @@ function serve(; host::String        = "127.0.0.1",
     for w in values(state.workers[])
         w.online[] = false
     end
+    # Before any worker can connect: the first handshakes after a deploy are the
+    # ones that bring the new build to the workers.
+    resolve_worker_build!(state.worker_build)
 
     # Survive long browser disconnects (phone goes into pocket, laptop sleeps,
     # network blip) by keeping SOFT_CLOSED sessions alive for an hour, so the
@@ -130,7 +133,7 @@ function serve(; host::String        = "127.0.0.1",
 
     # Single-page app: sidebar + dashboard/chat swap. No per-project routes.
     # Behind a tunnel every request passes the login gate first (tunnel.jl).
-    srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".", gate = server_gate(auth))
+    srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".", gate = server_gate(auth, state.shares))
     state.srv = srv
 
     # online_url uses the post-start srv.port — handles port=0 → ephemeral
@@ -143,11 +146,12 @@ function serve(; host::String        = "127.0.0.1",
     # The dashboard's install snippet renders the SAME url the install routes
     # are templated with — never a "<your-server>" placeholder.
     state.base_url[] = rstrip(base_url, '/')
-    add_install_routes!(srv, base_url)
+    add_install_routes!(srv, state, base_url)
     add_acp_log_routes!(srv, state)
     add_download_routes!(srv, state)
     add_invite_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
+    add_share_routes!(srv, state)
     # Nothing to say: reaching it is the answer (`login_guard`).
     Bonito.route!(srv, LOGIN_CHECK_ROUTE => _ -> HTTP.Response(204))
 
@@ -304,27 +308,29 @@ end
 # /install.jl     — the cross-platform Julia installer the wrappers fetch.
 # None of them carries a secret: the proxy serves them to anyone, since a new
 # machine fetches them before it has a credential (it gets one from "Add worker").
-function add_install_routes!(srv::Bonito.Server, public_url::String)
-    Bonito.route!(srv, "/install.jl" => function(context)
-        script = render_install_script(INSTALL_SCRIPT, public_url)
-        HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=script)
-    end)
-    Bonito.route!(srv, "/install.sh" => function(context)
-        body = render_install_script(INSTALL_SH, public_url)
-        HTTP.Response(200, ["Content-Type" => "text/x-shellscript; charset=utf-8"], body=body)
-    end)
-    Bonito.route!(srv, "/install.ps1" => function(context)
-        body = render_install_script(INSTALL_PS1, public_url)
-        HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=body)
-    end)
+function add_install_routes!(srv::Bonito.Server, state::ServerState, public_url::String)
+    text, shell = "text/plain; charset=utf-8", "text/x-shellscript; charset=utf-8"
+    Bonito.route!(srv, "/install.jl" => _ -> install_response(state, INSTALL_SCRIPT, public_url, text))
+    Bonito.route!(srv, "/install.sh" => _ -> install_response(state, INSTALL_SH, public_url, shell))
+    Bonito.route!(srv, "/install.ps1" => _ -> install_response(state, INSTALL_PS1, public_url, text))
     Bonito.route!(srv, "/install" => function(context)
-        ua   = String(HTTP.header(context.request, "User-Agent", ""))
-        is_ps = occursin("PowerShell", ua)
-        body = render_install_script(is_ps ? INSTALL_PS1 : INSTALL_SH, public_url)
-        ctype = is_ps ? "text/plain; charset=utf-8" :
-                        "text/x-shellscript; charset=utf-8"
-        HTTP.Response(200, ["Content-Type" => ctype], body=body)
+        is_ps = occursin("PowerShell", HTTP.header(context.request, "User-Agent", ""))
+        install_response(state, is_ps ? INSTALL_PS1 : INSTALL_SH, public_url, is_ps ? text : shell)
     end)
+end
+
+# An install script for the worker build the server offers. None before it has
+# resolved one: a guessed build would differ from the one the new worker is
+# offered at its first connect, and it would reinstall right away.
+function install_response(state::ServerState, template::AbstractString, public_url::String,
+                          content_type::AbstractString)
+    spec = worker_update_spec(state)
+    spec === nothing && return HTTP.Response(503,
+        ["Content-Type" => "text/plain; charset=utf-8", "Retry-After" => "60"],
+        body = "The server has not found out which build to install yet (is GitHub reachable " *
+               "from it?). Try again in a minute.\n")
+    return HTTP.Response(200, ["Content-Type" => content_type],
+                         body = render_install_script(template, public_url, spec))
 end
 
 # ── ACP wire-frame log routes ────────────────────────────────────────────────
@@ -653,30 +659,63 @@ end
 esc_html(s::AbstractString) = replace(s,
     "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\"" => "&quot;")
 
-# Substitute the server URL + git rev into a templated install script.
+# Substitute the server URL + the worker build into a templated install script.
 # install.jl guards against being run with the `{{ }}` placeholders intact, so a
 # raw fetch of any asset (bypassing these routes) fails loudly.
-function render_install_script(template::AbstractString, public_url::String)
-    bonito_url, bonito_rev = current_bonito_install_spec()
+render_install_script(template::AbstractString, public_url::String, spec::AbstractDict) =
     replace(template,
         "{{SERVER_URL}}"    => public_url,
-        "{{REV}}"           => current_repo_rev(),
-        "{{SOURCE_ID}}"     => current_repo_source_id(),
-        "{{BONITO_URL}}"    => bonito_url,
-        "{{BONITO_REV}}"    => bonito_rev,
+        "{{REV}}"           => spec["rev"],
+        "{{SOURCE_ID}}"     => spec["source_id"],
+        "{{BONITO_URL}}"    => spec["bonito_url"],
+        "{{BONITO_REV}}"    => spec["bonito_rev"],
     )
+
+"""
+    worker_update_spec(state; max_age = 60) -> Union{Dict,Nothing}
+
+The worker build to hand a worker, as last resolved (`WorkerBuild`), without
+waiting: `nothing` until a resolve succeeded. One tried more than `max_age`
+seconds ago is resolved again in the background, so a checkout on the server
+reaches the workers without a restart.
+"""
+function worker_update_spec(state::ServerState; max_age::Real = 60.0)
+    b = state.worker_build
+    return lock(b.lock) do
+        if time() - b.tried_at > max_age && (b.resolving === nothing || istaskdone(b.resolving))
+            b.tried_at = time()
+            b.resolving = Base.errormonitor(@async resolve_worker_build!(b))
+        end
+        b.spec
+    end
+end
+
+# Resolve the build now and keep it. A failure is logged and keeps the last one.
+function resolve_worker_build!(b::WorkerBuild)
+    lock(() -> (b.tried_at = time()), b.lock)
+    spec = try
+        b.resolve()
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "could not resolve the worker build; workers are offered the last one" last = b.spec exception = e
+        return nothing
+    end
+    lock(() -> (b.spec = spec), b.lock)
+    return spec
 end
 
 # The version identity sent to an installed worker after it authenticates on the
 # control WebSocket. Keep it in terms of source specs, rather than a package
 # version: workers and servers commonly run feature branches where every
-# Project.toml says the same development version.
+# Project.toml says the same development version. Asks GitHub, so it can take
+# a while or throw: handshakes read it through `worker_update_spec`.
 function current_worker_update_spec()
     bonito_url, bonito_rev = current_bonito_install_spec()
-    return Dict(
+    rev = current_repo_rev()
+    return Dict{String,Any}(
         "repo"       => "https://github.com/SimonDanisch/BonitoAgents.jl",
-        "rev"        => current_repo_rev(),
-        "source_id"  => current_repo_source_id(),
+        "rev"        => rev,
+        "source_id"  => current_repo_source_id(rev),
         "bonito_url" => bonito_url,
         "bonito_rev" => bonito_rev,
     )
@@ -685,20 +724,13 @@ end
 # A branch name cannot tell a worker whether it is on yesterday's `main` or
 # today's. Prefer the server's reachable commit as its update identity and only
 # fall back to the install ref when the deployment is not a usable git checkout.
-function current_repo_source_id()
-    ref = current_repo_rev()
+function current_repo_source_id(ref::AbstractString = current_repo_rev())
     pkg = pkgdir(@__MODULE__)
-    pkg === nothing && return ref
+    pkg === nothing && return String(ref)
     repo_root = abspath(pkg, "..")
-    ispath(joinpath(repo_root, ".git")) || return ref
-    try
-        sha = strip(read(`git -C $repo_root rev-parse HEAD`, String))
-        return _sha_on_origin(repo_root, sha) ? String(sha) : ref
-    catch e
-        e isa InterruptException && rethrow()
-        @debug "current_repo_source_id: git resolve failed" exception=e
-        return ref
-    end
+    ispath(joinpath(repo_root, ".git")) || return String(ref)
+    sha = strip(git_read(repo_root, "rev-parse", "HEAD"))
+    return sha_on_origin(repo_root, sha) ? String(sha) : String(ref)
 end
 
 """
@@ -722,8 +754,10 @@ Resolves in order:
      server runs. A prerelease/build-suffixed version (e.g. `0.2.0-DEV` on
      `main` between releases) can only guess `"main"`.
 
-Called per request so a `git checkout` on the server side propagates to the
-next worker install without restarting.
+Asks GitHub (`git ls-remote`) and throws when git fails or takes too long:
+handshakes and install scripts read it through `worker_update_spec`, which
+resolves it again every minute, so a `git checkout` on the server side
+propagates without a restart.
 """
 function current_repo_rev()
     override = get(ENV, "BONITOAGENTS_INSTALL_REV", "")
@@ -735,7 +769,7 @@ function current_repo_rev()
     # lives) is one level up. `.git` may be a directory (normal clone) or a
     # file (submodule / worktree); both count.
     repo_root = abspath(pkg, "..")
-    return _git_head_ref_of(repo_root, install_rev_for(pkgversion(@__MODULE__)))
+    return git_head_ref_of(repo_root, install_rev_for(pkgversion(@__MODULE__)))
 end
 
 # The install rev for a git-less deployment, from the running package version:
@@ -745,10 +779,11 @@ end
 install_rev_for(v::Union{VersionNumber,Nothing}) =
     v !== nothing && isempty(v.prerelease) && isempty(v.build) ? "v$(v)" : "main"
 
-# Helper: best-effort `(branch | sha)` for a working-tree path that a worker's
-# `Pkg.add(rev = …)` can ACTUALLY resolve against the remote. Returns `default`
-# when the path isn't a git checkout, git refuses to answer, or nothing usable
-# is reachable on origin.
+# `(branch | sha)` for a working-tree path that a worker's `Pkg.add(rev = …)`
+# can ACTUALLY resolve against the remote. Returns `default` when the path isn't
+# a git checkout or nothing usable is reachable on origin; throws when git fails
+# (`git_read`), offline for one. Not a fallback then: that would name another
+# build than the last answer, and every auto-updating worker would reinstall.
 #
 # The subtlety: `git rev-parse --abbrev-ref HEAD` happily returns a branch name
 # that only exists locally — e.g. a feature branch that was merged and DELETED on
@@ -756,42 +791,47 @@ install_rev_for(v::Union{VersionNumber,Nothing}) =
 # with "Did not find rev <branch>". So we only hand back the branch when origin
 # still has it; otherwise the exact sha if THAT is reachable on origin; otherwise
 # the caller's default (a `v<version>` tag or "main").
-function _git_head_ref_of(path::AbstractString, default::AbstractString)
-    ispath(joinpath(path, ".git")) || return default
-    try
-        branch = strip(read(`git -C $path rev-parse --abbrev-ref HEAD`, String))
-        sha    = strip(read(`git -C $path rev-parse HEAD`, String))
-        branch != "HEAD" && _branch_on_origin(path, branch) && return String(branch)
-        _sha_on_origin(path, sha) && return String(sha)
-        return default
-    catch e
-        @debug "_git_head_ref_of: git resolve failed" path exception=e
-        return default
-    end
+function git_head_ref_of(path::AbstractString, default::AbstractString)
+    ispath(joinpath(path, ".git")) || return String(default)
+    branch = strip(git_read(path, "rev-parse", "--abbrev-ref", "HEAD"))
+    sha    = strip(git_read(path, "rev-parse", "HEAD"))
+    branch != "HEAD" && branch_on_origin(path, branch) && return String(branch)
+    sha_on_origin(path, sha) && return String(sha)
+    return String(default)
 end
 
-# Does origin still publish this branch? Authoritative (a network `ls-remote`);
-# on ANY failure (offline, git error) assume NO so we fall back to a safe ref
-# rather than template a branch the worker can't fetch.
-function _branch_on_origin(path::AbstractString, branch::AbstractString)
-    try
-        return !isempty(strip(read(`git -C $path ls-remote --heads origin $branch`, String)))
-    catch e
-        e isa InterruptException && rethrow()
-        return false
-    end
-end
+# Does origin still publish this branch? Authoritative: a network `ls-remote`.
+branch_on_origin(path::AbstractString, branch::AbstractString) =
+    !isempty(strip(git_read(path, "ls-remote", "--heads", "origin", branch)))
 
 # Is this sha reachable from a remote-tracking branch (so `Pkg.add(rev=sha)` can
 # fetch it)? `git branch -r` lists ONLY remote-tracking refs, so a non-empty
 # result means some origin branch contains the commit. Fast (local refs).
-function _sha_on_origin(path::AbstractString, sha::AbstractString)
-    try
-        return !isempty(strip(read(`git -C $path branch -r --contains $sha`, String)))
-    catch e
-        e isa InterruptException && rethrow()
-        return false
+sha_on_origin(path::AbstractString, sha::AbstractString) =
+    !isempty(strip(git_read(path, "branch", "-r", "--contains", sha)))
+
+# `git -C path args…`'s output; throws when git fails. Bounded: `ls-remote`
+# waits on the network, and a stalled connection does not end by itself, so
+# after `timeout` seconds git is killed and this throws too.
+function git_read(path::AbstractString, args::AbstractString...; timeout::Real = 15.0)
+    err = IOBuffer()
+    p = open(pipeline(addenv(`git -C $path $args`, "GIT_TERMINAL_PROMPT" => "0"); stderr = err))
+    killed = Ref(false)
+    timer = Timer(timeout) do _
+        killed[] = true
+        kill(p)
     end
+    out = try
+        read(p, String)
+    finally
+        close(timer)
+    end
+    what = "`git $(join(args, ' '))` in $(path)"
+    # Not waited for then: git's network helper may still hold its stderr.
+    killed[] && error("$(what) did not finish within $(timeout)s")
+    wait(p)
+    success(p) || error("$(what) failed: $(strip(String(take!(err))))")
+    return out
 end
 
 """
@@ -815,7 +855,10 @@ Resolution order, mirroring `current_repo_rev`:
      dev'd next to the monorepo): walk into the path and derive
      `url = remote.origin.url`, `rev = current branch | sha`. This is
      what makes `git checkout` on the dev's Bonito propagate to workers.
-  4. Fallback `(github.com/SimonDanisch/Bonito.jl, "main")`.
+  4. Fallback `(github.com/SimonDanisch/Bonito.jl, "master")`.
+
+A git checkout is asked the way `current_repo_rev` asks, so this throws the way
+it does.
 """
 function current_bonito_install_spec()
     url_env = get(ENV, "BONITOAGENTS_BONITO_URL", "")
@@ -828,23 +871,15 @@ function current_bonito_install_spec()
 
     # 1. Project file `[sources]` literal — the common monorepo case.
     project_file = Base.active_project()
-    if project_file !== nothing
-        try
-            proj = Pkg.Types.read_project(project_file)
-            src = get(proj.sources, "Bonito", nothing)
-            if src !== nothing && haskey(src, "url")
-                return (String(src["url"]),
-                        String(get(src, "rev", default_rev)))
-            elseif src !== nothing && haskey(src, "path")
-                p = String(src["path"])
-                abs_p = isabspath(p) ? p :
-                        normpath(joinpath(dirname(project_file), p))
-                got = _spec_from_git_path(abs_p, default_url, default_rev)
-                got === nothing || return got
-            end
-        catch e
-            @debug "current_bonito_install_spec: read_project failed" exception=e
-        end
+    src = project_file === nothing ? nothing :
+          get(Pkg.Types.read_project(project_file).sources, "Bonito", nothing)
+    if src !== nothing && haskey(src, "url")
+        return (String(src["url"]), String(get(src, "rev", default_rev)))
+    elseif src !== nothing && haskey(src, "path")
+        p = String(src["path"])
+        got = spec_from_git_path(isabspath(p) ? p : normpath(joinpath(dirname(project_file), p)),
+                                 default_url, default_rev)
+        got === nothing || return got
     end
 
     # 2. Manifest's resolved Bonito entry. Covers two cases the `[sources]`
@@ -853,42 +888,40 @@ function current_bonito_install_spec()
     # manifest; (b) Bonito is `Pkg.add`'d directly from a git url+rev (so
     # `git_source` / `git_revision` come through populated). For path-tracked,
     # walk the working tree the same way as the `[sources]` path branch.
-    try
-        deps = Pkg.dependencies()
-        if haskey(deps, bonito_uuid)
-            info = deps[bonito_uuid]
-            if info.git_source !== nothing && info.git_revision !== nothing
-                return (String(info.git_source), String(info.git_revision))
-            end
-            if info.is_tracking_path && info.source isa AbstractString
-                got = _spec_from_git_path(String(info.source),
-                                          default_url, default_rev)
-                got === nothing || return got
-            end
+    info = get(manifest_dependencies(), bonito_uuid, nothing)
+    if info !== nothing
+        info.git_source !== nothing && info.git_revision !== nothing &&
+            return (String(info.git_source), String(info.git_revision))
+        if info.is_tracking_path && info.source isa AbstractString
+            got = spec_from_git_path(String(info.source), default_url, default_rev)
+            got === nothing || return got
         end
-    catch e
-        @debug "current_bonito_install_spec: dependencies probe failed" exception=e
     end
 
     return (default_url, default_rev)
 end
 
-# Resolve a working-tree path into a `(remote_url, branch_or_sha)` pair.
-# Returns `nothing` if the path isn't a usable git checkout — callers fall
-# back to their own defaults.
-function _spec_from_git_path(path::AbstractString,
-                              default_url::AbstractString,
-                              default_rev::AbstractString)
-    isdir(path) || return nothing
+# The active environment's resolved packages. None when its manifest does not
+# cover its project (Pkg refuses then), as for a server loaded through a stacked
+# environment.
+function manifest_dependencies()
     try
-        remote = strip(read(`git -C $path config --get remote.origin.url`, String))
-        rev    = _git_head_ref_of(path, default_rev)
-        url    = isempty(remote) ? default_url : String(remote)
-        return (url, rev)
+        return Pkg.dependencies()
     catch e
-        @debug "_spec_from_git_path: probe failed" path exception=e
-        return nothing
+        e isa Pkg.Types.PkgError || rethrow()
+        return Dict{Base.UUID,Pkg.API.PackageInfo}()
     end
+end
+
+# Resolve a working-tree path into a `(remote_url, branch_or_sha)` pair.
+# Returns `nothing` if the path isn't a git checkout — callers fall back to
+# their own defaults. Throws when git fails (`git_head_ref_of`).
+function spec_from_git_path(path::AbstractString, default_url::AbstractString,
+                            default_rev::AbstractString)
+    ispath(joinpath(path, ".git")) || return nothing
+    # Exits 1 when no origin is set: the default url then.
+    remote = strip(read(ignorestatus(`git -C $path config --get remote.origin.url`), String))
+    return (isempty(remote) ? String(default_url) : String(remote), git_head_ref_of(path, default_rev))
 end
 
 # WebSocket routes (worker-side connection terminus). Each closure captures

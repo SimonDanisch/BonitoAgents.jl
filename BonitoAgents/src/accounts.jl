@@ -731,6 +731,27 @@ const AdminStyles = Bonito.Styles(
     CSS(".bt-admin-uri",
         "font-size" => "11px", "word-break" => "break-all", "user-select" => "all"),
     CSS(".bt-accounts-table td", "vertical-align" => "middle"),
+    # The group picker: a list that opens below its button, left-aligned (it
+    # sits at the start of its cell), checkboxes in front of the names.
+    CSS(".bt-group-pick .bt-menu-list",
+        "left" => "0", "right" => "auto", "max-height" => "300px", "overflow-y" => "auto"),
+    CSS(".bt-menu-item.bt-group-item",
+        "display" => "flex", "align-items" => "center", "gap" => "8px"),
+    CSS(".bt-group-item input", "margin" => "0"),
+    CSS(".bt-group-trigger",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "6px", "max-width" => "260px"),
+    CSS(".bt-group-label",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap"),
+    CSS(".bt-group-new",
+        "display" => "flex", "gap" => "6px", "padding" => "6px 6px 2px",
+        "border-top" => "1px solid var(--bt-border)", "margin-top" => "4px"),
+    CSS(".bt-group-new input",
+        "flex" => "1 1 auto", "min-width" => "0", "padding" => "4px 8px",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)", "font-size" => "13px"),
+    CSS(".bt-worker-sharing", "margin-top" => "0"),
+    # A status inside a row of controls sits on the row's line, not below it.
+    CSS(".bt-admin-form .bt-admin-status", "margin-top" => "0"),
     # The groups field takes its column's width, not its default 20 characters:
     # on a phone those pushed Role and ⋯ out of the card.
     CSS(".bt-accounts-table input[type=text]",
@@ -741,6 +762,11 @@ const AdminStyles = Bonito.Styles(
         "color" => "var(--bt-text)"),
     CSS(".bt-form .bt-form-check input", "width" => "auto", "margin" => "0"),
     CSS(".bt-form .bt-admin-status", "grid-column" => "1 / -1", "margin-top" => "0"),
+    # The group picker inside a form: its button keeps its own size, and the
+    # form's input styling stays off its checkboxes.
+    CSS(".bt-form .bt-group-pick", "justify-self" => "start"),
+    CSS(".bt-form .bt-group-item input", "width" => "auto", "padding" => "0"),
+    CSS(".bt-form .bt-group-new input", "padding" => "4px 8px", "font-size" => "13px"),
     CSS(".bt-account-name", "font-weight" => "600"),
     CSS(".bt-account-detail", "font-size" => "12px", "overflow-wrap" => "anywhere"),
     CSS("@media (max-width: 560px)",
@@ -773,6 +799,101 @@ end
 # while it is empty: an empty line still took a flex gap and its own margin.
 admin_line(obs::Observable, class::AbstractString) =
     DOM.div(obs; class = map(v -> v == "" ? "$(class) bt-hidden" : class, obs))
+
+"""
+    pickable_groups(state) -> Vector{String}
+
+The groups this viewer can pick from: an admin every group some account is in, a
+member their own. Never `admins`, which is a role (an account's ⋯ menu), not a
+group to share with.
+"""
+function pickable_groups(state::ServerState)
+    gs = is_admin(state) ?
+        reduce(union, (a.groups for a in values(state.accounts[])); init = String[]) :
+        copy(state.user.groups)
+    return sort!(filter!(!=("admins"), gs))
+end
+
+# The picker's popover. Opening remembers the ticked set; closing (a click
+# outside, or the button again) hands the new set to the caller's `commit`, once
+# and only if it changed: saving on every tick re-rendered the accounts table
+# and closed the list under the pointer.
+const GROUP_PICK_JS = """
+    event.stopPropagation();
+    const m = event.currentTarget.closest('.bt-group-pick');
+    if (m.__close) { m.__close(); return; }
+    const picked = () => [...m.querySelectorAll('.bt-group-item input:checked')].map(i => i.value);
+    const before = JSON.stringify(picked());
+    m.__show = () => {
+        const p = picked();
+        m.querySelector('.bt-group-label').textContent = p.length ? p.join(', ') : m.dataset.empty;
+    };
+    m.classList.add('bt-menu-open');
+    const outside = ev => { if (!m.contains(ev.target)) m.__close(); };
+    m.__close = () => {
+        m.classList.remove('bt-menu-open');
+        document.removeEventListener('click', outside, true);
+        m.__close = null;
+        const now = picked();
+        if (JSON.stringify(now) !== before) commit(now);
+    };
+    document.addEventListener('click', outside, true);"""
+
+"""
+    group_picker(groups, current, commit; empty = "none", allow_new = false) -> Node
+
+Groups are picked, never typed: a button naming the chosen ones, and a list of
+checkboxes over `groups`. `commit` is a JS function called with the chosen names
+when the list closes. `allow_new` adds a field for a group nobody is in yet.
+"""
+function group_picker(groups::Vector{String}, current::Vector{String}, commit::Bonito.JSCode;
+                      empty::AbstractString = "none", allow_new::Bool = false)
+    item(g) = DOM.label(g in current ? DOM.input(type = "checkbox", value = g, checked = true) :
+                                       DOM.input(type = "checkbox", value = g),
+                        g; class = "bt-menu-item bt-group-item")
+    add = js"""event => {
+        const m = event.currentTarget.closest('.bt-group-pick');
+        const field = m.querySelector('.bt-group-new-name');
+        const name = field.value.trim();
+        if (!name) return;
+        let box = [...m.querySelectorAll('.bt-group-item input')].find(i => i.value === name);
+        if (!box) {
+            const row = document.createElement('label');
+            row.className = 'bt-menu-item bt-group-item';
+            box = document.createElement('input');
+            box.type = 'checkbox'; box.value = name;
+            row.append(box, name);
+            m.querySelector('.bt-group-items').append(row);
+        }
+        box.checked = true;
+        field.value = '';
+        m.__show && m.__show();
+    }"""
+    new_row = !allow_new ? nothing : DOM.div(
+        DOM.input(type = "text", placeholder = "new group", class = "bt-group-new-name",
+                  onkeydown = js"""event => { if (event.key === 'Enter') {
+                      event.preventDefault(); event.target.nextElementSibling.click(); } }"""),
+        DOM.button("Add"; class = "bt-btn bt-btn-secondary bt-btn-sm bt-group-add", onclick = add);
+        class = "bt-group-new")
+    all = sort!(union(groups, current))
+    return DOM.div(
+        DOM.button(DOM.span(isempty(current) ? empty : join(current, ", "); class = "bt-group-label"),
+                   DOM.span("▾"; class = "bt-msearch-caret");
+                   class = "bt-btn bt-btn-secondary bt-btn-sm bt-group-trigger",
+                   onclick = js"""event => {
+                       const commit = $(commit);
+                       $(Bonito.JSString(GROUP_PICK_JS))
+                   }"""),
+        DOM.div(
+            DOM.div((item(g) for g in all)...; class = "bt-group-items"),
+            isempty(all) && !allow_new ? DOM.div("No groups yet: an admin puts accounts in groups.";
+                                                  class = "bt-menu-title") : nothing,
+            new_row;
+            class = "bt-menu-list",
+            # `__show` keeps the button's label with the ticks.
+            onchange = js"event => { const m = event.currentTarget.closest('.bt-group-pick'); m.__show && m.__show(); }");
+        class = "bt-menu bt-group-pick", dataEmpty = empty)
+end
 
 text_input(obs::Observable{String}, placeholder::AbstractString) =
     DOM.input(type = "text", placeholder = placeholder, value = obs,
@@ -984,7 +1105,10 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
             field("Account", new_name, "login name, e.g. dave")...,
             field("Full name", new_display, "Dave Doe")...,
             field("Email", new_email, "optional")...,
-            field("Groups", new_groups, "comma-separated, optional")...,
+            DOM.label("Groups"),
+            group_picker(pickable_groups(state),
+                         String[strip(g) for g in split(new_groups[], ',') if !isempty(strip(g))],
+                         js"list => $(new_groups).notify(list.join(', '))"; allow_new = true),
             DOM.label("Admin"),
             DOM.label(DOM.input(type = "checkbox", checked = new_admin,
                                 onchange = js"event => $(new_admin).notify(event.target.checked)"),
@@ -1009,20 +1133,18 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
             if (!ask || confirm(ask)) $(action).notify([$(verb), $(name), '']);
         }""")
     table = map(session, state.accounts) do accounts
+        groups = pickable_groups(state)
         rows = map(sort!(collect(values(accounts)); by = a -> a.name)) do a
             admin = is_admin(a)
             DOM.tr(
                 DOM.td(DOM.div(a.name; class = "bt-account-name"),
                        DOM.div(isempty(a.email) ? a.display_name : "$(a.display_name) · $(a.email)";
                                class = "bt-admin-muted bt-account-detail")),
-                DOM.td(DOM.input(type = "text", value = join(filter(!=("admins"), a.groups), ", "),
-                                 placeholder = "groups",
-                                 title = "Comma-separated; Enter saves. Workers can be shared with a group.",
-                                 onkeydown = js"""event => {
-                                     if (event.key === 'Enter')
-                                         $(action).notify(['groups', $(a.name),
-                                             event.target.value + ($(admin) ? ', admins' : '')]);
-                                 }""")),
+                # Workers are shared with groups. `admins` is the role, kept as it is.
+                DOM.td(group_picker(groups, filter(!=("admins"), a.groups),
+                           js"""list => $(action).notify(['groups', $(a.name),
+                                    list.concat($(admin) ? ['admins'] : []).join(', ')])""";
+                           allow_new = true)),
                 DOM.td(admin ? "admin" : "member",
                        a.disabled ? DOM.span("disabled"; class = "bt-pill bt-pill-warn bt-account-disabled") : nothing),
                 DOM.td(action_menu(
@@ -1119,7 +1241,14 @@ function invites_section(::LoginAuth, session::Bonito.Session, state::ServerStat
             DOM.div("An invite link lets one person create their own account; they get " *
                     "their password on the page it opens.";
                     class = "bt-admin-muted"),
-            DOM.div(text_input(groups, "groups (\"admins\" for an admin)"),
+            DOM.div(DOM.span("Groups"; class = "bt-admin-muted"),
+                    # `admins` is offered here: the invite then makes an admin.
+                    map(session, state.accounts) do _
+                        chosen = String[strip(g) for g in split(groups[], ',') if !isempty(strip(g))]
+                        group_picker(vcat(pickable_groups(state), "admins"), chosen,
+                                     js"list => $(groups).notify(list.join(', '))";
+                                     empty = "member", allow_new = true)
+                    end,
                     DOM.label("valid for ", DOM.input(type = "text", value = days, size = 3,
                               oninput = js"event => $(days).notify(event.target.value)"), " days"),
                     DOM.button("Create invite link"; class = "bt-btn bt-btn-sm",
@@ -1192,12 +1321,18 @@ function worker_sharing_row(::LoginAuth, session::Bonito.Session, state::ServerS
             isempty(strip(text)) ? "not shared" : "shared"
         end)
     end
+    # Re-drawn when accounts change, so a group made since is on the list. The
+    # sharing itself is not an account change, so an open list stays open.
+    picker = map(session, state.accounts) do _
+        current = get(state.workers[], worker_id, w).shared_with
+        # An admin may share with a group nobody is in yet; a member only with theirs.
+        group_picker(pickable_groups(state), current, js"list => $(groups).notify(list.join(', '))";
+                     empty = "nobody", allow_new = is_admin(state))
+    end
     return DOM.div(
-        DOM.span("Shared with"; class = "bt-admin-muted"),
-        DOM.input(type = "text", value = groups, placeholder = "groups", size = 18,
-                  title = "Comma-separated groups; Enter saves. Their members start chats here, " *
-                          "which run as this machine's user.",
-                  onkeydown = js"event => { if (event.key === 'Enter') $(groups).notify(event.target.value); }"),
+        DOM.span("Shared with"; class = "bt-admin-muted",
+                 title = "Members of these groups start chats here, which run as this machine's user."),
+        picker,
         DOM.span(status; class = "bt-admin-status"), AdminStyles;
-        class = "bt-admin-form")
+        class = "bt-admin-form bt-worker-sharing")
 end
