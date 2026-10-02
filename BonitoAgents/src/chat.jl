@@ -3179,6 +3179,32 @@ event => {
 
 # Download the media file. Uses the wrap's `data-filename` (the source path's
 # basename) when present, else a generic name.
+# A picture or clip that does not load because the worker did not deliver it.
+# The card only links to the file (`show_media_src`) and nothing asks the worker
+# first, so this is where a deleted file (or a worker that is offline) shows:
+# said in its place, not left as a broken-image icon. A file the browser cannot
+# DECODE raises the same event; asking for its first byte tells the two apart,
+# and one that is there is left as it is.
+const MEDIA_MISSING_JS = js"""
+event => {
+    const el = event.currentTarget;
+    const wrap = el.closest('.bt-media-wrap');
+    if (!wrap || wrap.dataset.missing) return;
+    const src = el.src || el.getAttribute('src');
+    const missing = () => {
+        if (wrap.dataset.missing) return;
+        wrap.dataset.missing = '1';
+        const note = document.createElement('div');
+        note.className = 'bt-tool-error bt-media-missing';
+        note.textContent = "Can't show " + (wrap.dataset.filename || 'this file') +
+            ': the worker did not deliver it (the file is gone, or the worker is offline).';
+        wrap.replaceChildren(note);
+    };
+    if (!src) return missing();
+    fetch(src, {headers: {Range: 'bytes=0-0'}}).then(r => { r.ok || missing(); }, missing);
+}
+"""
+
 const DOWNLOAD_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
@@ -3209,10 +3235,10 @@ function media_element(src, mime::AbstractString, is_video::Bool;
         # straight into the bug where the render window detached the node under
         # it. Inline is the right default anyway; fullscreen stays available from
         # the native controls, as a choice.
-        DOM.video(DOM.source(; src, type = mime); controls = true, class = "bt-media",
-            playsinline = true,
+        DOM.video(DOM.source(; src, type = mime, onerror = MEDIA_MISSING_JS); controls = true,
+            class = "bt-media", playsinline = true,
             style = Styles("max-width" => "100%", "display" => "block")) :
-        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS,
+        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS, onerror = MEDIA_MISSING_JS,
             style = Styles("max-width" => "100%", "display" => "block", "cursor" => "zoom-in"))
     # Hover action row (Signal-style): enlarge · copy · download. Copy is
     # image-only (no clipboard-image for video). All revealed on wrap hover.
@@ -3231,29 +3257,21 @@ function media_element(src, mime::AbstractString, is_video::Bool;
         (isempty(worker_path) ? (;) : (; dataWorkerPath = String(worker_path)))...)
 end
 
-# Disk media belongs to the worker, not the chat's eval process. Its signed URL
-# remains valid after chat teardown/reload; the HTTP route reads the current file
-# through the worker control connection and revalidates on every browser request.
+# Disk media is a LINK to the worker's file, never a copy. The signed URL stays
+# valid after the chat closes or reloads, and its route streams the current
+# bytes from the worker whenever the browser asks (`serve_worker_file`). Nothing
+# is fetched or even stat'd to show it: a video costs nothing until it plays,
+# and a file that is gone answers 404 then. It used to stat first and, when the
+# worker was slow to answer, copy the whole file to the server instead.
 function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     proj = get(st.state.projects[], st.project_id, nothing)
-    if proj !== nothing
-        info = try
-            stat_worker_path(st.state, proj.worker_id, show_worker_path(st))
-        catch e
-            e isa WorkerUnreachableError || rethrow()
-            nothing
-        end
-        if info !== nothing
-            info.isfile || error("file no longer exists on worker: $(st.path)")
-            return worker_file_url(st.state, proj.worker_id, info.path)
-        end
-    end
-    return mirror_src(st, session)
+    proj === nothing && return mirror_src(st, session)
+    return worker_file_url(st.state, proj.worker_id, show_worker_path(st))
 end
 
-# With no worker to ask (none attached, or it's offline): the server's copy,
-# fetched if it can be, else the last one mirrored. The `?v=` busts the
-# browser's cache when a later fetch replaces it.
+# A chat with no project has no worker to link to: the server's copy, fetched
+# if it can be, else the last one mirrored. The `?v=` busts the browser's cache
+# when a later fetch replaces it.
 function mirror_src(st::ShowTool, session::Union{Bonito.Session,Nothing})
     local_path = fetch_show_file(st)
     asset = Bonito.Asset(local_path)
@@ -3514,7 +3532,7 @@ function save_editor!(fe::FileEditor, content::AbstractString)
     proj = get(fe.state.projects[], fe.project_id, nothing)
     proj === nothing &&
         error("no project bound to this view — can't push $(basename(fe.worker_path)) to a worker")
-    worker_connected(fe.state, proj.worker_id) &&
+    reachable(fe.state, proj.worker_id) &&
         return (send_file_to_worker!(fe.state, proj.worker_id, fe.server_path, fe.worker_path;
                                      handoff_timeout = 15.0); true)
     error("worker '$(proj.worker_id)' is not connected — $(basename(fe.worker_path)) was NOT saved")
@@ -3839,6 +3857,54 @@ markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
     inner = sprint(io -> CM.html(io, MARKDOWN_PARSER(defuse_table_rule(String(text)))))
     "<div class=\"markdown-body\">" * inner * "</div>"
 end
+
+# The same for a markdown FILE, whose pictures and clips are relative to it:
+# every relative source (an image's destination, the `src` of a raw
+# `<img>`/`<video>`/`<source>`/`<audio>`) becomes `link(path)`, `path` being it
+# unescaped and without query or fragment; `nothing` leaves one as written.
+# `![clip](clip.mp4)` becomes a video, as in a shared page.
+function markdown_html(text::AbstractString, link::Function)
+    inner = lock(MARKDOWN_LOCK) do
+        ast = MARKDOWN_PARSER(defuse_table_rule(String(text)))
+        for (node, entering) in ast
+            entering || continue
+            if node.t isa CM.Image
+                url = linked_source(node.t.destination, link)
+                url === nothing || (node.t.destination = url)
+            elseif node.t isa CM.HtmlInline || node.t isa CM.HtmlBlock
+                node.literal = replace(node.literal, RAW_MEDIA_TAG => tag -> relink_tag(tag, link))
+            end
+        end
+        sprint(io -> CM.html(io, ast))
+    end
+    inner = replace(inner, VIDEO_IMAGE_RE => s"<video controls preload=\"metadata\" src=\"\1\" title=\"\2\"></video>")
+    return "<div class=\"markdown-body\">" * inner * "</div>"
+end
+
+const RAW_MEDIA_TAG = r"<(?:img|video|source|audio)\b[^>]*\bsrc=\"[^\"]*\""i
+
+function relink_tag(tag::AbstractString, link::Function)
+    m = match(r"\bsrc=\"([^\"]*)\""i, tag)
+    url = linked_source(m.captures[1], link)
+    url === nothing && return tag
+    return replace(tag, m.match => "src=\"$(url)\""; count = 1)
+end
+
+"""
+    relative_reference(url) -> Union{String,Nothing}
+
+The local path a link in a markdown file names, unescaped and without its query
+or fragment; `nothing` for one that is not relative (a scheme, a leading `/`)
+or empty.
+"""
+function relative_reference(url::AbstractString)
+    u = String(first(split(first(split(url, '#'; limit = 2)), '?'; limit = 2)))
+    (isempty(u) || startswith(u, '/') || occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", u)) && return nothing
+    return HTTP.unescapeuri(u)
+end
+
+linked_source(url::AbstractString, link::Function) =
+    (path = relative_reference(url); path === nothing ? nothing : link(path))
 
 # ── Working around CommonMark's GFM table rule ───────────────────────────────
 # `CommonMark.TableRule` DELETES TEXT. `gfm_table` runs
@@ -4367,6 +4433,8 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
              haskey(d0, "editable") || haskey(d0, "live_embed")) &&
                 chat_emit(h.chat, d0)
         end
+        made_running = h.status in ("pending", "in_progress")
+        shown_running = Ref(false)
         AgentClientProtocol.each_update(m) do snap
             prev_status = h.status
             h.status = snap.status
@@ -4411,8 +4479,10 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
             # (so the compact Monaco preview shows up under the header without a
             # click). `auto_expand_body` dispatches on the type + content
             # presence — no content sniffing inline here.
-            (auto_expand_body(b, snap.content) || has_show_reference(snap.content)) &&
+            (auto_expand_body(b, snap.content) || has_show_reference(snap.content) ||
+             opens_as_finished_run(b, made_running, shown_running[])) &&
                 (d["expand"] = true)
+            shown_running[] |= h.status in ("pending", "in_progress")
             auto_expand_full(b, snap.content) && (d["expand_full"] = true)
             live_result_embed(b, snap.content) && (d["live_embed"] = true)
             # A running eval starts its live stdout tail (idempotent). The real
@@ -4474,6 +4544,16 @@ auto_expand_body(m::JuliaEvalCall, snap_content) =
     (tool_status(m) == "completed" &&
      (outdated_worker_content(snap_content) ||
       bonito_upgrade_content(snap_content) !== nothing))
+
+# An eval opens while it runs (above). One made running whose first state to
+# come through is already its end opens the same way: a tool is one object
+# updated in place, so a quick call's states coalesce, and whether its card
+# opened depended on timing (e2e:codex_wire, now and then). Not one shown running
+# (it opened then, and may have been closed since), not one from history (made
+# finished).
+opens_as_finished_run(::ToolMsg, made_running::Bool, shown_running::Bool) = false
+opens_as_finished_run(m::JuliaEvalCall, made_running::Bool, shown_running::Bool) =
+    made_running && !shown_running && !isempty(m.code)
 
 # The tool holds a LIVE result embed: a worker-parked value the body mounts
 # via `RemoteRef` (values AND errors — both are parked refs rendered live).
@@ -8362,7 +8442,7 @@ function push_attachment_to_worker(model::ChatModel, rel_path::AbstractString)
     isempty(pid) && return
     proj = get(model.state.projects[], pid, nothing)
     proj === nothing && return
-    worker_connected(model.state, proj.worker_id) || return
+    reachable(model.state, proj.worker_id) || return
     src = joinpath(model.cwd, rel_path)
     dst = joinpath(proj.worker_path, rel_path)
     try
@@ -9200,7 +9280,7 @@ end
 function project_file_ending_in(state::ServerState, project_id::AbstractString,
                                 given::AbstractString)
     proj = get(state.projects[], project_id, nothing)
-    (proj === nothing || !worker_connected(state, proj.worker_id)) && return nothing
+    (proj === nothing || !reachable(state, proj.worker_id)) && return nothing
     task = ensure_project_file_index!(state, proj)
     task === nothing || wait(task)
     # A Windows worker lists its files with backslashes.

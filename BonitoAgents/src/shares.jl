@@ -330,9 +330,9 @@ raw HTML (a `<video>`, say). What a shared page may serve from its folder.
 function markdown_references(text::AbstractString)
     refs = Set{String}()
     add(url) = begin
-        u = String(first(split(first(split(url, '#'; limit = 2)), '?'; limit = 2)))
-        (isempty(u) || startswith(u, '/') || occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", u)) && return
-        p = normpath(HTTP.unescapeuri(u))
+        path = relative_reference(url)
+        path === nothing && return
+        p = normpath(path)
         startswith(p, "..") || push!(refs, p)
     end
     ast = lock(() -> MARKDOWN_PARSER(defuse_table_rule(String(text))), MARKDOWN_LOCK)

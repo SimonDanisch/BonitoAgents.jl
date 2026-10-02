@@ -554,26 +554,48 @@ function pong_received!(link::Link, now::Float64)
 end
 
 function ticker_loop(link::Link; tick::Real = 0.1)
+    last_tick = time()
     while true
         sleep(tick)
-        action, t = lock(link.lock) do
-            now = time()
-            link.state === :dead && return (:stop, nothing)
-            if link.state === :connected
-                now - link.last_rx > link.ping_deadline && return (:lost, link.transport)
-                if now - link.last_ping >= link.ping_interval
-                    link.last_ping = now
-                    link.ping_sent == 0.0 && (link.ping_sent = now)
-                    enqueue_urgent!(link, Frame(F_PING, 0))
-                end
-                link.last_received > link.last_ack_sent && send_ack!(link)
-                return (:none, nothing)
-            end
-            now - link.detached_at > link.grace && return (:expired, nothing)
-            return (:none, nothing)
-        end
+        action, t, last_tick = @lock link.lock tick!(link, last_tick)
         action === :stop && return nothing
         action === :lost && connection_lost!(link, t, "no traffic for $(link.ping_deadline)s")
         action === :expired && kill!(link, "no connection for $(link.grace)s")
     end
+end
+
+# One tick; `last_tick` is when the previous one ran. Returns the action, the
+# connection it is about, and the time of this tick. Caller holds the lock.
+function tick!(link::Link, last_tick::Float64; stall::Real = 1.0)
+    now = time()
+    link.state === :dead && return (:stop, nothing, now)
+    if link.state === :connected
+        now - last_tick > stall && stalled!(link, now, now - last_tick)
+        now - link.last_rx > link.ping_deadline && return (:lost, link.transport, now)
+        if now - link.last_ping >= link.ping_interval
+            link.last_ping = now
+            link.ping_sent == 0.0 && (link.ping_sent = now)
+            enqueue_urgent!(link, Frame(F_PING, 0))
+        end
+        link.last_received > link.last_ack_sent && send_ack!(link)
+        return (:none, nothing, now)
+    end
+    now - link.detached_at > link.grace && return (:expired, nothing, now)
+    return (:none, nothing, now)
+end
+
+# This link's tasks did not run for `gap` seconds: a long GC pause, a frozen
+# machine. The reader stopped with the ticker, so what the peer sent meanwhile
+# may be waiting unread in the socket, and "no traffic" would blame the peer for
+# our own pause. Its silence counts again from a ping sent now, which it gets
+# `ping_interval` to answer. Caller holds the lock.
+function stalled!(link::Link, now::Float64, gap::Float64)
+    fresh = now - link.ping_deadline + link.ping_interval
+    link.last_rx >= fresh && return nothing     # the deadline is not near anyway
+    link.last_rx = fresh
+    link.last_ping = 0.0        # ping at once
+    link.ping_sent = 0.0        # and do not time a ping across the pause
+    @warn "WorkerLink: this process did not run for $(round(gap; digits = 1))s; " *
+          "the peer gets a ping before its silence counts" role = link.role peer = link.name
+    return nothing
 end

@@ -90,9 +90,10 @@ function run_suite(server)
 
         # The eval RESULT exists nowhere but `rawOutput.result.content` — codex
         # mirrors it into no content block at all — so a card that shows it
-        # proves the whole recovery. Asserted on the card that auto-expands;
-        # only one does, and driving the other open means clicking, which races
-        # Monaco's async create (see the note at the end of this file).
+        # proves the whole recovery. An eval card opens by itself, also when the
+        # call was over before its running state came through (it used to stay
+        # closed then, now and then); opening one by a click races Monaco's
+        # async create (see the note at the end of this file).
         got = try
             TK.wait_for(server, "eval output", "$(card_text("cw-eval")).includes('OUTPUT')"; timeout = 60) == true
         catch e
@@ -128,7 +129,7 @@ function run_suite(server)
 
         # A resolved MCP tool is titled by its OWN name whoever ran it, so
         # codex's dotted wire name never reaches the header — for BOTH eval
-        # cards, including the one that never expanded. This is the assertion
+        # cards. This is the assertion
         # that would have caught the live `tool_update` path overwriting the
         # identity `build_mcp_msg` had just set.
         @test TK.eval_js(server, """(() => {

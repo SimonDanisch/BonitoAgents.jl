@@ -53,9 +53,14 @@ end
             xfer = Threads.@spawn BA.send_file_to_worker!(state, "link-test", src, dst)
             sleep(0.2)
             link = BA.worker_link(state, "link-test")
+            # Offline while away, but the SAME link: nothing was torn down. The
+            # worker dials straight back, so the offline moment is recorded
+            # rather than polled for (a poll can fall on either side of it).
+            went_offline = Ref(false)
+            watch = BA.Bonito.on(v -> v || (went_offline[] = true), info.online)
             WorkerLink.disconnect!(worker.link)
-            # Offline while away, but the SAME link: nothing was torn down.
-            @test timedwait(() -> !info.online[], 10.0) === :ok
+            @test timedwait(() -> went_offline[], 10.0) === :ok
+            BA.Bonito.off(watch)
             @test timedwait(() -> BA.worker_connected(state, "link-test"), 30.0) === :ok
             @test BA.worker_link(state, "link-test") === link
             fetch(xfer)
@@ -91,4 +96,59 @@ end
         close(state.srv)
     end
     @test isempty(state.worker_links)
+end
+
+# Behind the tunnel a worker's connection drops now and then without either end
+# doing anything (production, 2026-10-01: Bosgame and Desktop one after the
+# other, each back 12 s later). The link resumes; what must not happen is the
+# server failing every request in those seconds ("worker is not connected",
+# broken images), or the worker sitting out its retry delay before it redials.
+@testitem "unit:worker_reconnect" tags = [:unit] begin
+    import BonitoAgents, BonitoWorker, WorkerLink
+    const BA = BonitoAgents
+    const BW = BonitoWorker
+    using Test
+
+    dir = mktempdir()
+    state = BA.serve(; host = "127.0.0.1", port = 0,
+                     state_dir = mkpath(joinpath(dir, "state")),
+                     working_dir = mkpath(joinpath(dir, "working")))
+    worker = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:$(state.srv.port)",
+        worker_id = "reconnect-test", name = "reconnect-test",
+        mcp_command = first(Base.julia_cmd().exec), mcp_arguments = String[],
+        projects_root = mkpath(joinpath(dir, "projects"))))
+    # A long retry delay, so a redial that waited for it is plain to see.
+    task = Threads.@spawn BW.serve(worker; retry_delay = 10.0)
+    try
+        @test timedwait(() -> BA.worker_connected(state, "reconnect-test"), 30.0) === :ok
+
+        @testset "a request while the connection is down waits for it" begin
+            WorkerLink.disconnect!(BA.worker_link(state, "reconnect-test"))
+            @test !BA.worker_connected(state, "reconnect-test")
+            # Up for less than the retry delay: the worker redials after it.
+            listing = BA.list_worker_dir(state, "reconnect-test", dir)
+            @test listing.path == dir
+            @test BA.worker_connected(state, "reconnect-test")
+        end
+
+        @testset "a connection that was up is dialed again at once" begin
+            sleep(10.5)                       # up for longer than the retry delay
+            WorkerLink.disconnect!(BA.worker_link(state, "reconnect-test"))
+            t0 = time()
+            @test timedwait(() -> BA.worker_connected(state, "reconnect-test"), 30.0) === :ok
+            @test time() - t0 < 5.0
+        end
+
+        @testset "a worker that is gone is not waited for" begin
+            @test !BA.reachable(state, "nobody")
+            t0 = time()
+            @test_throws ErrorException BA.list_worker_dir(state, "nobody", dir)
+            @test time() - t0 < 1.0
+        end
+    finally
+        close(worker)
+        wait(task)
+        BA.close_worker_links!(state)
+        close(state.srv)
+    end
 end

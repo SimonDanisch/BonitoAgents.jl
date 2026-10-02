@@ -418,6 +418,36 @@ end
     kill!(client, "done"); kill!(server, "done")
 end
 
+# A long GC pause or a frozen machine stops a link's reader and ticker alike.
+# When they run again, the ticker must not call the peer silent before asking
+# it: in the suite, a minute-long freeze of the box dropped every worker link
+# at once on both ends. Holding the link's lock stops all of the client's tasks
+# for twice its deadline, the same way.
+@testset "a pause of this process does not count as the peer's silence" begin
+    reg = Dict{Vector{UInt8},Link}()
+    client = Link(:client; ping_interval = 0.2, ping_deadline = 1.0)
+    ct, st = memory_pair()
+    sst = SilentTransport(st, false)
+    server_task = Threads.@spawn serve!(reg, sst; ping_interval = 30, ping_deadline = 60)
+    connect!(client, ct, UInt8[])
+    server = fetch(server_task)
+    sleep(0.5)
+    @test WL.state(client) === :connected
+    lock(client.lock) do
+        sst.silent = true       # nothing from the server waits in the socket
+        sleep(2.0)
+        sst.silent = false
+    end
+    sleep(1.5)
+    @test WL.state(client) === :connected
+    @test WL.state(server) === :connected
+    @test ping_rtt(client) < 1.0            # the pause was not timed as a ping
+    # A peer that is really gone is still caught, one ping interval later.
+    sst.silent = true
+    @test eventually(() -> WL.state(client) === :detached; timeout = 5)
+    kill!(client, "done"); kill!(server, "done")
+end
+
 # The wedge behind the worker-zombie incident (#33): a peer that stops reading
 # leaves the socket ESTABLISHED, the kernel buffers fill, and a send parks in
 # the kernel forever. The link's writer must be released anyway: the deadline
@@ -520,15 +550,21 @@ end
         sender = Threads.@spawn WebSockets.send(ch, big)
         @test WebSockets.receive(sch) == big
         wait(sender)
+        # A send while away only queues within the credit the server granted.
+        # `big` is a whole number of windows, so the sender ends at zero, and
+        # the server's last grant may still be on the wire: without it the send
+        # below waits for a reconnect that only comes after it.
+        msg = "queued while away"
+        @test eventually(() -> (@lock client.lock ch.send_credit) >= ncodeunits(msg))
 
         server_t = lock(() -> only(values(reg)).transport, only(values(reg)).lock)
         disconnect!(client)                      # drop the TCP connection
         @test eventually(() -> WL.state(client) === :detached)
         # The server's handler is released once its connection ended.
         @test timedwait(() -> server_t.ended.set, 10.0) === :ok
-        WebSockets.send(ch, "queued while away")
+        WebSockets.send(ch, msg)
         dial()
-        @test WebSockets.receive(sch) == "queued while away"
+        @test WebSockets.receive(sch) == msg
         WebSockets.send(sch, "and back")
         @test WebSockets.receive(ch) == "and back"
         kill!(client, "done")

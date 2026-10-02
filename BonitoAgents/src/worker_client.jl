@@ -32,21 +32,40 @@ worker_link(state::ServerState, worker_id::AbstractString) =
 """
     worker_connected(state, worker_id) -> Bool
 
-Whether the worker can be reached right now: it has a link, and the link has a
-connection. A detached link, waiting for the worker to come back, has none.
+Whether the worker has a connection right now: it has a link, and the link has
+a connection. A detached link, waiting for the worker to come back, has none.
+The instant answer, for status; a request asks [`reachable`](@ref).
 """
 function worker_connected(state::ServerState, worker_id::AbstractString)
     link = worker_link(state, worker_id)
     return link !== nothing && WorkerLink.state(link) === :connected
 end
 
-# The link of a worker that can be reached right now; throws otherwise. A
-# command queued on a detached link would only make its caller sit out a
-# timeout, so nothing is sent to a worker that isn't there.
+"""
+    reachable(state, worker_id; within = RECONNECT_WAIT_S) -> Bool
+
+Whether a request can go to the worker: it is connected, or its link is only
+detached and has its connection back within `within` seconds. Behind a tunnel
+a connection drops now and then without either end doing anything (cloudflared
+closing its streams), and the worker dials straight back: failing every
+request in those seconds showed as broken images and "worker is not
+connected" although nothing was wrong. A worker without a link, or whose link
+died, is not waited for.
+"""
+function reachable(state::ServerState, worker_id::AbstractString; within::Real = RECONNECT_WAIT_S)
+    detached(l) = l !== nothing && WorkerLink.state(l) === :detached
+    worker_connected(state, worker_id) && return true
+    detached(worker_link(state, worker_id)) || return false
+    timedwait(() -> !detached(worker_link(state, worker_id)), within; pollint = 0.1)
+    return worker_connected(state, worker_id)
+end
+
+const RECONNECT_WAIT_S = 20.0
+
+# The link of a worker a request can go to (`reachable`); throws otherwise.
 function connected_link(state::ServerState, worker_id::AbstractString)
-    link = worker_link(state, worker_id)
-    (link === nothing || WorkerLink.state(link) !== :connected) &&
-        error("Worker '$worker_id' is not connected")
+    link = reachable(state, worker_id) ? worker_link(state, worker_id) : nothing
+    link === nothing && error("Worker '$worker_id' is not connected")
     return link
 end
 
@@ -993,7 +1012,7 @@ entries is a Vector of NamedTuple (name, dir).
 """
 function list_worker_dir(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1025,7 +1044,7 @@ exist yet. The worker rejects anything but a single path segment.
 function make_worker_dir(state::ServerState, worker_name::String,
                           parent::AbstractString, name::AbstractString;
                           timeout::Real = 5.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1056,7 +1075,7 @@ exists as a non-directory (the worker refuses).
 """
 function ensure_worker_dir(state::ServerState, worker_name::String,
                            path::AbstractString; timeout::Real = 5.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1086,7 +1105,7 @@ or the RPC errors.
 """
 function stat_worker_path(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         throw(WorkerUnreachableError("stat_path on '$worker_name'", "worker is not connected"))
 
     rid, ch = register_rpc!(state)
@@ -1139,7 +1158,7 @@ file index. `timeout` is generous: a first scan of a large tree can take seconds
 """
 function list_worker_project_files(state::ServerState, worker_name::String,
                                    root::AbstractString; timeout::Real = 20.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
@@ -1235,7 +1254,7 @@ Returned dict shape:
 function inspect_worker_path(state::ServerState, worker_name::String,
                               path::AbstractString;
                               timeout::Real = 30.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1262,7 +1281,7 @@ end
 function tail_worker_file(state::ServerState, worker_id::AbstractString,
                            path::AbstractString; offset::Int = 0,
                            max_bytes::Int = 65536, timeout::Real = 15.0)
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         error("Worker '$worker_id' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1290,7 +1309,7 @@ end
 # returned, not thrown, so the caller can still finalize the UI.
 function kill_worker_file_writers(state::ServerState, worker_id::AbstractString,
                                    path::AbstractString; timeout::Real = 10.0)
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         error("Worker '$worker_id' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1312,7 +1331,7 @@ end
 # that would delete a perfectly valid project.
 function worker_path_missing(state::ServerState, worker_id::AbstractString,
                               path::AbstractString)::Bool
-    worker_connected(state, worker_id) || return false
+    reachable(state, worker_id) || return false
     try
         inspect_worker_path(state, worker_id, path; timeout = 10.0)
         return false                       # path exists
@@ -1362,7 +1381,7 @@ replies or `timeout` seconds elapse.
 """
 function scan_worker_sessions(state::ServerState, worker_name::String;
                                 timeout::Real = 15.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
@@ -1490,7 +1509,7 @@ function clone_repo_on_worker(state::ServerState, worker_name::String,
                                 url::AbstractString, dst_path::AbstractString;
                                 pr_number::Union{Integer,Nothing} = nothing,
                                 timeout::Real = 120.0)
-    worker_connected(state, worker_name) ||
+    reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
 
@@ -1523,7 +1542,7 @@ picture — the server knows what it *asked* the worker to do, this is what the
 worker actually has.
 """
 function worker_state(state::ServerState, worker_id::AbstractString; timeout::Real = 15.0)
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         throw(WorkerUnreachableError("worker_state on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1555,7 +1574,7 @@ end
 # arrives, so the button's feedback is the worker's real state, not a banner.
 function force_worker_update!(state::ServerState, worker_id::AbstractString)
     wid = String(worker_id)
-    worker_connected(state, wid) ||
+    reachable(state, wid) ||
         throw(WorkerUnreachableError("force update", "worker is not connected"))
     worker_turn_in_flight(state, wid) &&
         throw(ArgumentError("a chat on this worker is mid-turn; let it finish or stop it, then update"))
@@ -1637,7 +1656,7 @@ function worker_log(state::ServerState, worker_id::AbstractString;
                         lines::Integer = 200, since::AbstractString = "",
                         until::AbstractString = "", grep::AbstractString = "",
                         timeout::Real = 45.0)
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         throw(WorkerUnreachableError("worker_log on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1669,7 +1688,7 @@ a repeat call finds the checkout in place and returns in seconds.
 function debug_checkout_on_worker(state::ServerState, worker_id::AbstractString;
                                   repo::AbstractString, rev::AbstractString,
                                   packages::Vector{String}, timeout::Real = 900.0)
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         throw(WorkerUnreachableError("debug_checkout on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1696,7 +1715,7 @@ end
 function worker_rpc(state::ServerState, worker_id::AbstractString, kind::AbstractString,
                     fields::AbstractDict; timeout::Real)
     what = "$(kind) on '$(worker_id)'"
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         throw(WorkerUnreachableError(what, "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
@@ -1811,7 +1830,7 @@ can take a while.
 function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
                             path::AbstractString; base::AbstractString = "",
                             timeout::Real = 60.0)
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         throw(WorkerUnreachableError("git_diff on '$worker_id'", "worker is not connected"))
     # Chunked reply, not one-frame: the patch runs to tens of MB on a busy
     # repo, and a single giant frame stalls BOTH sides (the worker's send holds
@@ -1856,7 +1875,7 @@ thing the user asked for against the thing they can already do.
 function find_repos_on_worker(state::ServerState, worker_id::AbstractString,
                               path::AbstractString; max_depth::Int = 4,
                               timeout::Real = 15.0)
-    worker_connected(state, worker_id) ||
+    reachable(state, worker_id) ||
         throw(WorkerUnreachableError("find_repos on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try

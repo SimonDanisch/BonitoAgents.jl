@@ -132,15 +132,22 @@ Connect `w` to its server and keep it connected, until `close(w)`.
 A worker that cannot get in retries every `retry_delay` seconds, possibly for
 days (its credential was revoked, the server is down). It keeps that cadence, so
 it is back seconds after the server is, but it logs the same failure again only
-every `repeat_log_interval` seconds.
+every `repeat_log_interval` seconds. A connection that was up and ended is
+dialed again at once: behind a tunnel that happens without either end doing
+anything, and the link resumes within a handshake. One that lasted less than
+`retry_delay` waits like a failure, so a server that keeps closing at once is
+not hammered.
 """
 function serve(w::Worker; retry_delay::Real = 5.0, repeat_log_interval::Real = 600.0)
     last_failure, logged_at = "", 0.0
     while !w.closed
         isempty(last_failure) && @info "BonitoWorker: connecting" url = ws_url(w.config.server_url, "/w") worker_id = w.config.worker_id name = w.config.name
+        t0 = time()
         try
             connect_once!(w)
             last_failure = ""
+            w.closed && break
+            time() - t0 > retry_delay && continue      # was up: straight back
         catch e
             e isa InterruptException && rethrow()
             w.closed && break

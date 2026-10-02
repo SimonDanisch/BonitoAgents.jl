@@ -412,9 +412,10 @@ function acp_log_response(state::ServerState, project_id::AbstractString)
 end
 
 # /download/<pid>?path=<worker-abs-path> — stream a worker file back to the
-# browser as an attachment. The file tree's ⤓ button navigates here. The file
-# is fetched from the worker on demand (RemoteSync over the control WS), so it
-# works whether or not the project is synced to the server. The `path` MUST live
+# browser as an attachment. The file tree's ⤓ button navigates here. The bytes
+# are streamed from the worker as the browser takes them (`WorkerFileStream`),
+# never copied to the server first, so the download starts at once whether or
+# not the project is synced to the server. The `path` MUST live
 # inside the project's worker tree — a normalized-prefix check blocks traversal /
 # arbitrary worker reads. The route regex captures only the pid; the path rides
 # in the query string (so slashes survive without extra encoding rules).
@@ -457,36 +458,11 @@ function worker_file_url(state::ServerState, worker_id::String, path::String)
     return "/worker-file/$(HTTP.escapeuri(worker_id))?path=$(HTTP.escapeuri(path))&token=$token"
 end
 
-# Compatibility for workers predating range reads. Keep a versioned mirror so
-# seeking in a video doesn't copy the whole file again for every Range request.
-function worker_file_copy_response(state::ServerState, request, worker_id::String,
-                                   path::String, info)
-    key = worker_file_token(state, worker_id, path)
-    dst = joinpath(state.state_dir, "worker-files", key, basename(path))
-    dst_lock = lock(state.lock) do
-        get!(ReentrantLock, state.show_fetch_inflight, dst)
-    end
-    return lock(dst_lock) do
-        stamp = (size=info.size, mtime=info.mtime)
-        previous = lock(state.lock) do
-            get(state.show_mirror_stamps, dst, nothing)
-        end
-        if !isfile(dst) || previous != stamp
-            mkpath(dirname(dst))
-            fetch_file_from_worker(state, worker_id, path, dst)
-            after = stat_worker_path(state, worker_id, path)
-            lock(state.lock) do
-                delete!(state.show_mirror_stamps, dst)
-                (size=after.size, mtime=after.mtime) == stamp &&
-                    (state.show_mirror_stamps[dst] = stamp)
-            end
-        end
-        # Mirror mtimes are transfer times. Do not let a browser validate them
-        # at whole-second precision and miss two rapid rewrites of the source.
-        return Bonito.serve_asset(request, nothing, dst,
-                                   string(Bonito.file_mimetype(path)), "no-store")
-    end
-end
+# A worker from before range reads cannot stream a file, and a file is never
+# copied whole to the server to be shown instead (that made a video or a
+# download wait for the whole file): it is told to update.
+too_old_to_stream() = HTTP.Response(502, ["Content-Type" => "text/plain; charset=utf-8", "Cache-Control" => "no-store"],
+    body = "this worker is too old to stream files; update it from the dashboard\n")
 
 function worker_file_response(state::ServerState, request, worker_id::String,
                               path::String, token::String)
@@ -527,19 +503,93 @@ function worker_folder_response(state::ServerState, request, worker_id::String,
     return serve_worker_file(state, request, worker_id, file)
 end
 
+# Bytes `start:stop` of a worker file as a response body that is sent while it
+# is read. Read whole first, a video (which the browser asks for as `bytes=0-`,
+# all of it) or a download showed nothing until every 256 KiB piece had made its
+# round trip through the tunnel: seconds to minutes, and a download clicked again
+# meanwhile started over in parallel. Now the first piece goes out after one
+# round trip, and `ahead` pieces are asked for at a time so the trips overlap. A
+# browser that stops taking bytes (a paused video) stops the reading: nothing is
+# asked for more than `ahead` pieces past what it took.
+mutable struct WorkerFileStream
+    state::ServerState
+    worker_id::String
+    path::String
+    next::Int                   # first byte not asked for yet
+    stop::Int                   # last byte to send
+    ahead::Int
+    piece_bytes::Int            # at most the worker's FILE_RANGE_BYTES
+    pieces::Vector{Task}        # asked for, in file order
+    piece::Vector{UInt8}        # being sent
+    pos::Int                    # its next byte to send
+end
+
+WorkerFileStream(state::ServerState, worker_id::String, path::String, start::Int, stop::Int;
+                 ahead::Int = 4, piece_bytes::Int = 256 * 1024) =
+    WorkerFileStream(state, worker_id, path, start, stop, ahead, piece_bytes, Task[], UInt8[], 1)
+
+# The response body: HTTP.jl pulls it in small buffers as the browser takes it.
+# A piece still being read when the browser goes away is left to finish.
+worker_file_body(s::WorkerFileStream) = HTTP.CallbackBody(dst -> stream_into!(dst, s), () -> nothing)
+
+function ask_ahead!(s::WorkerFileStream)
+    while length(s.pieces) < s.ahead && s.next <= s.stop
+        offset, count = s.next, min(s.piece_bytes, s.stop - s.next + 1)
+        push!(s.pieces, Threads.@spawn read_piece(s, offset, count))
+        s.next += count
+    end
+    return nothing
+end
+
+function read_piece(s::WorkerFileStream, offset::Int, count::Int)
+    bytes = read_worker_file_range(s.state, s.worker_id, s.path, offset, count)
+    length(bytes) == count || error("file changed while reading: $(s.path)")
+    return bytes
+end
+
+# Fill `dst` from the piece being sent, taking the next one when it is used up;
+# the number of bytes written, 0 at the end. A read that failed ends the
+# response there (the headers are out, so a cut connection is all that is left
+# to say), and is logged.
+function stream_into!(dst::Vector{UInt8}, s::WorkerFileStream)
+    if s.pos > length(s.piece)
+        ask_ahead!(s)
+        isempty(s.pieces) && return 0
+        task = popfirst!(s.pieces)
+        s.piece = try
+            fetch(task)
+        catch e
+            e isa TaskFailedException || rethrow()
+            @warn "worker file: read failed while sending it" worker_id = s.worker_id path = s.path exception = task.result
+            throw(task.result)
+        end
+        s.pos = 1
+        ask_ahead!(s)
+    end
+    n = min(length(dst), length(s.piece) - s.pos + 1)
+    copyto!(dst, 1, s.piece, s.pos, n)
+    s.pos += n
+    return n
+end
+
 # The bytes of a worker file (or the requested range of them), read through the
 # worker's control connection on every request, so they are always current.
-function serve_worker_file(state::ServerState, request, worker_id::String, path::String)
+#
+# HTTP.jl sends a response with a Content-Length only once all of it is in
+# memory (HTTP/1, as the server is reached), and streams one without. So a
+# range (what a video asks for, `bytes=0-` first) is answered with at most
+# `max_range` bytes and its length, as media servers do: the browser plays them
+# within moments and asks for the next part itself, and a seek asks for the
+# part it needs. A request for the whole file (an image, the file opened
+# directly) streams without a length.
+function serve_worker_file(state::ServerState, request, worker_id::String, path::String;
+                           max_range::Int = 2 * 1024 * 1024)
     try
         info = stat_worker_path(state, worker_id, path)
         info.isfile || return HTTP.Response(404, ["Cache-Control" => "no-store"],
                                             "file no longer exists on worker")
         mime = string(Bonito.file_mimetype(path))
-        if !info.range_reads
-            # Workers installed before range reads still work through the existing
-            # transfer protocol. Upgrading them enables seeking without a full copy.
-            return worker_file_copy_response(state, request, worker_id, path, info)
-        end
+        info.range_reads || return too_old_to_stream()
         # A preview that is re-rendered or enlarged asks again (no-cache): answer
         # from the stat instead of moving the whole file through the worker.
         etag = "\"$(info.size)-$(info.mtime)\""
@@ -552,21 +602,18 @@ function serve_worker_file(state::ServerState, request, worker_id::String, path:
         if range === nothing && !isempty(range_header)
             return HTTP.Response(416, ["Content-Range" => "bytes */$(info.size)"])
         end
-        start, stop = range === nothing ? (0, info.size - 1) : range
-        body = UInt8[]
-        sizehint!(body, stop - start + 1)
-        offset = start
-        while offset <= stop
-            count = min(256 * 1024, stop - offset + 1)
-            bytes = read_worker_file_range(state, worker_id, path, offset, count)
-            length(bytes) == count || error("file changed while reading: $path")
-            append!(body, bytes)
-            offset += count
-        end
         headers = ["Content-Type" => mime, "Cache-Control" => "no-cache", "ETag" => etag,
-                   "Accept-Ranges" => "bytes", "Content-Length" => string(length(body))]
-        range === nothing || push!(headers, "Content-Range" => "bytes $start-$stop/$(info.size)")
-        return HTTP.Response(range === nothing ? 200 : 206, headers; body)
+                   "Accept-Ranges" => "bytes"]
+        if range === nothing
+            return HTTP.Response(200, headers;
+                body = worker_file_body(WorkerFileStream(state, worker_id, path, 0, info.size - 1)))
+        end
+        start, stop = range
+        stop = min(stop, start + max_range - 1)
+        push!(headers, "Content-Length" => string(stop - start + 1),
+                       "Content-Range" => "bytes $start-$stop/$(info.size)")
+        return HTTP.Response(206, headers;
+                             body = worker_file_body(WorkerFileStream(state, worker_id, path, start, stop)))
     catch e
         e isa InterruptException && rethrow()
         @warn "worker file: read failed" worker_id path exception = (e, catch_backtrace())
@@ -638,21 +685,25 @@ function download_response(state::ServerState, project_id::AbstractString,
     (npath == wroot || startswith(npath, wroot * "/")) ||
         return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
                              body = "path is outside the project\n")
-    tmp = tempname()
+    headers = ["Content-Type"        => "application/octet-stream",
+               "Content-Disposition" => "attachment; filename=\"$(download_filename(basename(npath)))\"",
+               "Cache-Control"       => "no-cache"]
     try
-        fetch_file_from_worker(state, proj.worker_id, npath, tmp; handoff_timeout = 120.0)
-        data = read(tmp)
-        return HTTP.Response(200,
-            ["Content-Type"        => "application/octet-stream",
-             "Content-Disposition" => "attachment; filename=\"$(download_filename(basename(npath)))\"",
-             "Cache-Control"       => "no-cache"],
-            body = data)
+        info = stat_worker_path(state, proj.worker_id, npath)
+        info.isfile || return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                                            body = "no such file on the worker\n")
+        info.range_reads || return too_old_to_stream()
+        # Sent while it is read (`WorkerFileStream`): the browser shows the
+        # download at once, instead of after the whole file has crossed to the
+        # server. Without its size: with a Content-Length HTTP.jl would hold the
+        # whole response back (see `serve_worker_file`).
+        return HTTP.Response(200, headers;
+            body = worker_file_body(WorkerFileStream(state, proj.worker_id, npath, 0, info.size - 1)))
     catch e
+        e isa InterruptException && rethrow()
         @warn "download: fetch from worker failed" project_id path exception = (e, catch_backtrace())
         return HTTP.Response(502, ["Content-Type" => "text/plain; charset=utf-8"],
                              body = "could not fetch file from worker\n")
-    finally
-        rm(tmp; force = true)
     end
 end
 

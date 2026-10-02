@@ -98,6 +98,22 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test_throws Exception BT.fetch_show_file(st_missing)
     end
 
+    @testset "media is a link to the worker's file, never a copy" begin
+        # A video whose worker does not answer: the card gets its link at once,
+        # without asking the worker or copying anything. It used to stat first
+        # and, when the worker was slow to answer, copy the whole file to the
+        # server; the video sat blank until that was done.
+        state = newstate()
+        cwd = mktempdir()
+        state.projects[]["p1"] = BT.ProjectInfo("p1", "media", "w-gone", cwd, "/home/w/proj", BT.now(BT.UTC))
+        st = BT.ShowTool(state, "p1", cwd, "renders/clip.mp4")
+        t0 = time()
+        src = BT.show_media_src(st)
+        @test time() - t0 < 1.0
+        @test src == BT.worker_file_url(state, "w-gone", "/home/w/proj/renders/clip.mp4")
+        @test !ispath(BT.show_server_path(st))            # nothing on the server
+    end
+
     # `file_kind` is the single decision point every renderer dispatches on —
     # pure, so it's worth pinning exactly. The interesting cases are the ones
     # that used to be lumped together as "not text": .ogg is AUDIO (not a video

@@ -139,7 +139,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     project_id = a.project_id
     isempty(project_id) &&
         error("agent for $(a.worker_path) on '$(a.worker_id)' was built without its chat's project id")
-    worker_connected(a.state, a.worker_id) ||
+    reachable(a.state, a.worker_id) ||
         error("Worker '$(a.worker_id)' is not connected")
 
     # Re-derived on every bring-up, NOT taken from what `a.mcp` was built with.

@@ -42,6 +42,16 @@
     wpid = getpid(s.h.worker_proc)
     agent_pids() = readlines(ignorestatus(pipeline(`pgrep -P $wpid -f MockACP`)))
     online(wid) = s.h.state.workers[][wid].online[]
+    # Drop the connection and see the worker go offline. Recorded as it happens:
+    # the worker dials straight back, so the moment is too short to poll for.
+    function drop_seen_offline!(wid)
+        went = Ref(false)
+        watch = BT.Bonito.on(v -> v || (went[] = true), s.h.state.workers[][wid].online)
+        link = TK.drop_worker_connection!(s)
+        seen = timedwait(() -> went[], 10.0; pollint = 0.05) == :ok
+        BT.Bonito.off(watch)
+        return link, seen
+    end
     newest_reply = """(() => {
         const b = [...document.querySelectorAll('.bt-agent-msg')].filter(e => e.offsetParent);
         return b.length ? b[b.length - 1].innerText.trim() : '';
@@ -68,8 +78,8 @@
         @testset "a reply streaming across the drop arrives whole, in order" begin
             TK.send_message(s, "stream")
             @test TK.wait_for(s, "stream under way", "$(newest_reply).includes('r10')"; timeout = 60) == true
-            link = TK.drop_worker_connection!(s)
-            @test timedwait(() -> !online(wid), 10.0; pollint = 0.05) == :ok
+            link, seen = drop_seen_offline!(wid)
+            @test seen
             @test timedwait(() -> online(wid), 60.0; pollint = 0.2) == :ok
             @test s.h.state.worker_links[wid] === link          # resumed, not replaced
             expected = join(("r$i" for i in 1:CHUNKS), ' ')
@@ -81,9 +91,9 @@
         @testset "an eval's live output keeps streaming after the drop" begin
             TK.send_message(s, "count")
             @test TK.wait_for(s, "eval streaming", "$(max_line) >= 10"; timeout = 180) == true
-            TK.drop_worker_connection!(s)
+            _, seen = drop_seen_offline!(wid)
             at_drop = TK.eval_js(s, max_line)
-            @test timedwait(() -> !online(wid), 10.0; pollint = 0.05) == :ok
+            @test seen
             @test timedwait(() -> online(wid), 60.0; pollint = 0.2) == :ok
             # Live, not the final result: well past the drop while still running.
             # A stream lost with the connection would only jump at completion,

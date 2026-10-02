@@ -61,6 +61,11 @@ write(joinpath(VIEW_CWD, "doc.pdf"),
       "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]>>endobj\n" *
       "trailer<</Root 1 0 R>>\n")
 write(joinpath(VIEW_CWD, "notes.md"), "# Heading One\n\nSome *emphasised* prose.\n")
+# Pictures relative to the markdown FILE (one folder down), as a markdown image
+# and as raw HTML.
+mkpath(joinpath(VIEW_CWD, "docs"))
+write(joinpath(VIEW_CWD, "docs", "pics.md"),
+      "# Pics\n\n![a dot](../pixel.png)\n\n<img src=\"../pixel.png\" alt=\"raw\">\n")
 write(joinpath(VIEW_CWD, "table.csv"), "name,score\nada,42\ngrace,7\nalan,13\n")
 # A unit square as two triangles — the mesh viewer must report exactly this.
 write(joinpath(VIEW_CWD, "square.obj"),
@@ -192,6 +197,21 @@ function run_suite(server)
                     return v.dataset.view === 'source' && !!ed
                         && ed.getValue().includes('Heading One');
                 })()"""; timeout = 30) == true
+        end
+
+        @testset "a markdown file's own pictures show, read from the worker" begin
+            # Relative to the FILE, not to the dashboard the preview sits in:
+            # `../pixel.png` from a subfolder, written both ways. Each loads
+            # through a signed link to the worker's file; nothing is copied.
+            path = joinpath("docs", "pics.md")
+            TK.eval_js(server, open_file(path))
+            @test TK.wait_for(server, "both pictures load from the worker",
+                """(() => {
+                    const v = document.querySelector('$(view_sel(path))');
+                    const imgs = v ? [...v.querySelectorAll('.bt-fv-markdown img')] : [];
+                    return imgs.length === 2 && imgs.every(i => i.complete && i.naturalWidth > 0 &&
+                        new URL(i.src).pathname.startsWith('/worker-folder/'));
+                })()"""; timeout = 40) == true
         end
 
         @testset "saving the source writes the file ON THE WORKER" begin

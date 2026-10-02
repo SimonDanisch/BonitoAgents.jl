@@ -131,18 +131,8 @@ const BT = BonitoAgents
             @test getfile(["Range" => "bytes=599995-"]).body == payload[end-4:end]
             @test getfile(["Range" => "bytes=600000-"]).status == 416
 
-            # Older workers use the established transfer protocol. Seeking
-            # should reuse that mirror; rewriting the source must replace it.
-            copy_request = HTTP.Request("GET", url, ["Range" => "bytes=0-4"])
-            copy_response() = BT.worker_file_copy_response(st, copy_request, wid, special,
-                                                           BT.stat_worker_path(st, wid, special))
-            @test copy_response().body == payload[1:5]
-            key = BT.worker_file_token(st, wid, special)
-            cached = joinpath(st.state_dir, "worker-files", key, basename(special))
-            write(cached, "CACHE")
-            @test String(copy_response().body) == "CACHE"
-            write(special, "REGENERATED")
-            @test String(copy_response().body) == "REGEN"
+            # Served from the worker, never from a copy on the server.
+            @test !isdir(joinpath(st.state_dir, "worker-files"))
 
             # The same URL still works with no chat record, and changing bytes
             # under the same path cannot leave a cached proxy asset behind.
@@ -196,8 +186,8 @@ const BT = BonitoAgents
             # A model's folder is its project, so `../textures/` reaches; outside
             # any project it is the model's own folder.
             proj = st.projects[][pid]
-            @test BT.mesh_folder(proj, joinpath(scene, "model.gltf")) == worker_dir
-            @test BT.mesh_folder(proj, "/elsewhere/models/m.obj") == "/elsewhere/models"
+            @test BT.reference_folder(proj, joinpath(scene, "model.gltf")) == worker_dir
+            @test BT.reference_folder(proj, "/elsewhere/models/m.obj") == "/elsewhere/models"
         end
     finally
         close(h)

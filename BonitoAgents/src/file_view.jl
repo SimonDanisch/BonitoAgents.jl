@@ -249,14 +249,35 @@ end
 
 # ── markdown ────────────────────────────────────────────────────────────────
 # The SAME renderer the chat uses for agent messages (`markdown_html`), so a
-# README reads exactly like a message: GitHub-ish CSS, tables, code blocks.
-markdown_preview_node(text::AbstractString) =
-    DOM.div(Bonito.HTML(markdown_html(text)); class = "bt-fv-markdown")
+# README reads exactly like a message: GitHub-ish CSS, tables, code blocks. Its
+# relative pictures and clips go through `link` (`file_link`): the preview sits
+# in the dashboard page, where the browser would resolve them against the
+# dashboard's own URL.
+markdown_preview_node(text::AbstractString, link::Function) =
+    DOM.div(Bonito.HTML(markdown_html(text, link)); class = "bt-fv-markdown")
 
 function render_file(::MarkdownFile, ::ViewMode, fv::FileView, session)
     _, bytes = view_bytes(fv)
     looks_binary(bytes) && return hexdump_node(bytes)
-    return markdown_preview_node(String(bytes))
+    return markdown_preview_node(String(bytes), file_link(fv))
+end
+
+# Where a path relative to `fv`'s file is read from: that file on the worker,
+# as a signed link (`worker_folder_url`), streamed when the browser asks and
+# never copied. Granted on the project (`reference_folder`), so `../figs/` within
+# it reaches; a path that leaves the grant, or any in a chat with no project, is
+# left as written.
+function file_link(fv::FileView)
+    st = fv.file
+    proj = get(st.state.projects[], st.project_id, nothing)
+    proj === nothing && return _ -> nothing
+    file = show_worker_path(st)
+    folder = reference_folder(proj, file)
+    return function (rel)
+        path = normpath(joinpath(dirname(file), rel))
+        Bonito.is_path_contained(folder, path) || return nothing
+        return worker_folder_url(st.state, proj.worker_id, folder, relpath(path, folder))
+    end
 end
 
 # ── delimited text (csv / tsv) ──────────────────────────────────────────────
@@ -405,12 +426,13 @@ function render_file(::NotebookFile, mode::ViewMode, fv::FileView, session)
     cells = get(nb, "cells", [])
     isempty(cells) && return DOM.div("(notebook has no cells)"; class = "bt-tool-empty")
     limit = mode isa InlineView ? 12 : length(cells)
+    link = file_link(fv)
     nodes = Any[]
     for cell in Iterators.take(cells, limit)
         ctype = String(get(cell, "cell_type", "code"))
         src = notebook_source(cell)
         if ctype == "markdown"
-            push!(nodes, DOM.div(markdown_preview_node(src); class = "bt-fv-nb-cell bt-fv-nb-md"))
+            push!(nodes, DOM.div(markdown_preview_node(src, link); class = "bt-fv-nb-cell bt-fv-nb-md"))
         else
             outs = get(cell, "outputs", [])
             push!(nodes, DOM.div(
@@ -479,35 +501,30 @@ mesh_icon(::Val{:flat}) = mesh_icon(Bonito.SVG.path(d = "M8 2.5 13.5 13h-11z"),
 mesh_button(action::Symbol, title) = DOM.button(mesh_icon(Val(action)); class = "bt-mesh-btn",
     type = "button", title = title, dataMeshAction = string(action), dataOn = "0")
 
-# The folder a model's relative references (a glTF's buffers and textures, an
-# OBJ's .mtl) resolve in: its project, so `../textures/` reaches, or its own
-# folder for a model outside any project.
-mesh_folder(proj::ProjectInfo, path::String) =
+# The folder a file's relative references (a glTF's buffers and textures, an
+# OBJ's .mtl, a markdown file's pictures) resolve in: its project, so
+# `../textures/` reaches, or its own folder for a file outside any project.
+reference_folder(proj::ProjectInfo, path::String) =
     Bonito.is_path_contained(proj.worker_path, path) ? proj.worker_path : dirname(path)
 
 # Where the browser reads a model from: the worker's file, through a signed URL
 # for its folder, so whatever the model names next to it is fetched the same way
-# when the loader asks. With no worker to ask, the server's copy of the model
-# alone (what it names is then out of reach).
+# when the loader asks. A link, never a copy (see `show_media_src`): a worker
+# that does not answer is reported as such. A chat with no project, which has no
+# worker to link to, gets the server's copy of the model alone (what it names is
+# then out of reach).
 function mesh_src(st::ShowTool, session)
     proj = get(st.state.projects[], st.project_id, nothing)
-    if proj !== nothing
-        info = try
-            stat_worker_path(st.state, proj.worker_id, show_worker_path(st))
-        catch e
-            e isa WorkerUnreachableError || rethrow()
-            nothing
-        end
-        if info !== nothing
-            info.isfile || error("no such file on the worker: $(info.path)")
-            check_view_size(MeshFile(), info.size)
-            folder = mesh_folder(proj, info.path)
-            return worker_folder_url(st.state, proj.worker_id, folder, relpath(info.path, folder))
-        end
+    if proj === nothing
+        src = mirror_src(st, session)
+        check_view_size(MeshFile(), filesize(show_server_path(st)))
+        return src
     end
-    src = mirror_src(st, session)
-    check_view_size(MeshFile(), filesize(show_server_path(st)))
-    return src
+    info = stat_worker_path(st.state, proj.worker_id, show_worker_path(st))
+    info.isfile || error("no such file on the worker: $(info.path)")
+    check_view_size(MeshFile(), info.size)
+    folder = reference_folder(proj, info.path)
+    return worker_folder_url(st.state, proj.worker_id, folder, relpath(info.path, folder))
 end
 
 # The browser reads the model itself, with three.js's loader for its format
