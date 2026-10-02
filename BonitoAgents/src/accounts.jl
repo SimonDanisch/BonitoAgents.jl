@@ -724,6 +724,9 @@ const AdminStyles = Bonito.Styles(
         "font-size" => "12px", "color" => "var(--bt-text-muted)", "margin-top" => "8px"),
     CSS(".bt-admin-secret",
         "margin-top" => "10px", "user-select" => "all"),
+    # Commands with their own Copy buttons: a click must not select the block.
+    CSS(".bt-install-issued", "margin-top" => "10px"),
+    CSS(".bt-install-again", "margin-top" => "14px"),
     CSS(".bt-admin-muted",
         "color" => "var(--bt-text-muted)"),
     CSS(".bt-admin-qr",
@@ -904,8 +907,9 @@ text_input(obs::Observable{String}, placeholder::AbstractString) =
 
 "Add worker" where other machines connect (behind the proxy, or on a trusted
 network): an admin issues a credential and gets the install command that carries
-it (shown once); the credentials issued so far can be revoked. A member is told
-to ask an admin. (One machine's server has no credentials: dashboard.jl.)
+it (shown once); the credentials issued so far can be revoked, and the command
+without one reinstalls a machine that has its credential. A member is told to
+ask an admin. (One machine's server has no credentials: dashboard.jl.)
 """
 function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Session, state::ServerState)
     summary = DOM.summary(DOM.span("Add a worker"; class = "bt-discover-title");
@@ -932,7 +936,7 @@ function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Se
                         class = "bt-admin-muted"),
                 install_command_row("Linux / macOS", unix),
                 install_command_row("Windows (PowerShell)", win);
-                class = "bt-admin-secret")
+                class = "bt-install-issued")
             "credential $(first(split(cred, ':'))) issued"
         end)
     end
@@ -959,7 +963,12 @@ function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Se
                    onclick = js"event => $(add).notify(true)"),
         issued,
         admin_line(status, "bt-admin-status"),
-        creds;
+        creds,
+        DOM.div("To update or reinstall a machine that is a worker already, run the command " *
+                "without a credential: it keeps the one it has.";
+                class = "bt-admin-muted bt-install-again"),
+        install_command_row("Linux / macOS", "curl -fsSL $(base)/install.sh | sh"),
+        install_command_row("Windows (PowerShell)", "irm $(base)/install.ps1 | iex");
         class = "bt-install-block")
     # `open` is a boolean attribute: present means open, whatever its value.
     return isempty(state.workers[]) ?

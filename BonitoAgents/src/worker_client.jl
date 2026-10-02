@@ -412,6 +412,7 @@ function handle_worker_link(state::ServerState, ws, request)
         # round.
         if !resumed
             register_worker!(state, worker_id, shown_as, info, link, credential)
+            existing === nothing || retire_replaced_credential!(state, worker_id, existing.credential, credential)
             # One reader per link: a resume keeps the control channel, and so
             # the reader that already serves it.
             Base.errormonitor(@async serve_worker_control(state, worker_id, link))
@@ -430,6 +431,24 @@ function handle_worker_link(state::ServerState, ws, request)
             @error "Worker connection handler failed" worker_id exception = (e, catch_backtrace())
         WorkerLink.close_transport(t)
     end
+    return nothing
+end
+
+# A machine installed again with a credential "Add worker" issued anew: the one
+# it came with before is spare from now on, and a spare credential is only a way
+# in for whoever finds the old install command. It stays while another worker
+# still uses it (one command run on two machines).
+function retire_replaced_credential!(state::ServerState, worker_id::String,
+                                     old::AbstractString, new::AbstractString)
+    (isempty(old) || old == new) && return nothing
+    root = root_state(state)
+    spare = lock(root.lock) do
+        haskey(root.worker_credentials[], old) &&
+            !any(w -> w.worker_id != worker_id && w.credential == old, values(root.workers[]))
+    end
+    spare || return nothing
+    @info "worker credential retired: its machine came back with a new one" credential = old worker_id
+    revoke_worker_credential!(root, old)
     return nothing
 end
 

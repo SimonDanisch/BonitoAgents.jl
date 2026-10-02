@@ -8,7 +8,7 @@
 # before serving it from the /install.jl route. The file holds no secret: the
 # worker's credential ("Add worker" on the dashboard issues one per machine)
 # is its first argument, and a server without the login proxy (localhost only)
-# needs none.
+# needs none. Run again without one, it keeps the credential the machine has.
 #
 # What it does:
 #   1. Installs BonitoWorker + BonitoMCP from the public repo into the
@@ -54,7 +54,7 @@ println("==> BonitoAgents worker installer")
 println("    server : ", SERVER)
 println("    repo   : ", REPO, " @ ", REV)
 println("    workdir: ", pwd())
-println("    login  : ", isempty(CREDENTIAL) ? "none (a server on this machine)" :
+println("    login  : ", isempty(CREDENTIAL) ? "none given (keeps this machine's credential, if it has one)" :
                         "worker credential " * first(split(CREDENTIAL, ':')))
 # The agents log in as this machine's user; the worker installs them but cannot
 # log in for anyone.

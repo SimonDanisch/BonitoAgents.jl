@@ -1236,6 +1236,32 @@ function click(s::TestServer, selector::AbstractString)
     return s
 end
 
+"""
+    real_click(s, css_selector)
+
+Click the middle of the first visible match with TRUSTED mouse input
+(`sendInputEvent`), the way a person does: unlike `click`, it also does what the
+browser itself does on a click, such as selecting text.
+"""
+function real_click(s::TestServer, selector::AbstractString)
+    point = eval_js(s, """(() => {
+        const el = [...document.querySelectorAll($(json(String(selector))))].find(e => e.offsetParent !== null);
+        if (!el) return null;
+        el.scrollIntoView({block: 'center'});
+        const r = el.getBoundingClientRect();
+        return [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)];
+    })()""")
+    point === nothing && error("real_click: no visible element matched $selector")
+    x, y = point
+    ctx = s.browser[]
+    ECT.send_input(ctx, "{type: 'mouseMove', x: $x, y: $y}")
+    sleep(0.05)
+    ECT.send_input(ctx, "{type: 'mouseDown', x: $x, y: $y, button: 'left', clickCount: 1}")
+    sleep(0.05)
+    ECT.send_input(ctx, "{type: 'mouseUp', x: $x, y: $y, button: 'left', clickCount: 1}")
+    return s
+end
+
 # Click the first visible `selector` repeatedly until `predicate` holds — rides
 # out the race where a framework wires the click handler after the element
 # mounts (so a lone synthetic click is dropped). Delegates to the ElectronCall

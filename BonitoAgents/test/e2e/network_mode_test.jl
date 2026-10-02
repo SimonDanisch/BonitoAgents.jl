@@ -24,6 +24,25 @@
             timeout = 30))
         @test occursin(z.h.url * "/install.sh", command)
         credential = match(r"sh -s (w-[0-9a-f]+:[0-9a-f]+)", command)[1]
+        # Copy, clicked for real, selects nothing: the block once had
+        # `user-select: all`, so every click in it selected all of it. Watched as
+        # it happens: in this hidden window the clipboard API refuses, and the
+        # fallback's own textarea selection would erase the evidence.
+        TK.eval_js(z, """(() => {
+            window.__blockSelected = false;
+            document.addEventListener('selectionchange', () => {
+                const b = document.querySelector('.bt-install-issued');
+                if (b && window.getSelection().containsNode(b, true)) window.__blockSelected = true;
+            });
+            return true; })()""")
+        TK.real_click(z, ".bt-install-issued .bt-install-copy")
+        @test TK.wait_for(z, "Copy answered",
+            "document.querySelector('.bt-install-issued .bt-install-copy').textContent !== 'Copy'"; timeout = 10) == true
+        @test TK.eval_js(z, "window.__blockSelected") == false
+        # A machine that has its credential reinstalls with the plain command.
+        again = TK.eval_js(z, "[...document.querySelectorAll('.bt-install-details .bt-install-cmd code')].map(c => c.textContent)")
+        @test "curl -fsSL $(z.h.url)/install.sh | sh" in again
+        @test "irm $(z.h.url)/install.ps1 | iex" in again
 
         # A machine that runs it joins; one with a made-up credential does not.
         second = TK.add_worker!(z; name = "second", credential)

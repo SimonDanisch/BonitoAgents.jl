@@ -677,6 +677,17 @@ function write_config!(; server_url::AbstractString,
                           # Direct callers are dev/test rigs. The public
                           # installer opts in below after recording a real spec.
                           auto_update::Bool = false)
+    cfg = config_path()
+    # Installed again without a credential (to update, or from another folder):
+    # the machine keeps the one it has for this server. Writing "" would lock it
+    # out, and a new credential per reinstall leaves the old ones lying around.
+    if isempty(credential) && isfile(cfg)
+        previous = JSON.parsefile(cfg)
+        if get(previous, "server_url", "") == server_url && !isempty(get(previous, "credential", ""))
+            credential = previous["credential"]
+            @info "BonitoWorker: keeping this machine's worker credential" credential = first(split(credential, ':'))
+        end
+    end
     config = Dict(
         "server_url"    => String(server_url),
         "credential"    => String(credential),
@@ -686,7 +697,6 @@ function write_config!(; server_url::AbstractString,
     )
     update_spec === nothing || (config["update_spec"] = Dict{String,Any}(
         String(k) => String(v) for (k, v) in update_spec))
-    cfg = config_path()
     write(cfg, JSON.json(config))
     # It holds the credential: this user's only.
     chmod(cfg, 0o600)

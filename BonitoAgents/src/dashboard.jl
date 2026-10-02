@@ -1456,9 +1456,11 @@ const DashboardStyles = Bonito.Styles(
         "font-family" => "ui-monospace, monospace", "font-size" => "12.5px",
         "padding" => "10px 12px", "border-radius" => "var(--bt-radius-sm)",
         "margin-top" => "4px"),
+    # One click selects the whole command, for copying it by hand.
     CSS(".bt-install-cmd code",
-        "white-space" => "pre", "overflow-x" => "auto"),
+        "white-space" => "pre", "overflow-x" => "auto", "user-select" => "all"),
     CSS(".bt-install-copy",
+        "user-select" => "none",
         "background" => "rgba(255,255,255,0.06)",
         "color" => "#e2e8f0",
         "border" => "1px solid rgba(255,255,255,0.12)",

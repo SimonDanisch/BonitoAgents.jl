@@ -101,7 +101,59 @@
             close(admitted)
             wait(task)
         end
+
+        # A machine installed again with a new credential keeps its worker entry,
+        # and the credential it came with before is retired. One that another
+        # machine still uses stays.
+        cred_name(c) = first(split(c, ':'))
+        function connect_as(id, credential)
+            wk = worker(id, credential)
+            t = @async BW.serve(wk; retry_delay = 0.2)
+            try
+                @test timedwait(() -> BT.worker_connected(server, id) &&
+                                      server.workers[][id].credential == cred_name(credential), 30.0) === :ok
+            finally
+                close(wk)
+                wait(t)
+            end
+        end
+        first_cred, second_cred = (BT.add_worker_credential!(server, net.user.name) for _ in 1:2)
+        connect_as("laptop", first_cred)
+        connect_as("laptop", second_cred)
+        @test timedwait(() -> !haskey(server.worker_credentials[], cred_name(first_cred)), 10.0) === :ok
+        @test haskey(server.worker_credentials[], cred_name(second_cred))
+        @test count(==("laptop"), keys(server.workers[])) == 1
+
+        shared, own = (BT.add_worker_credential!(server, net.user.name) for _ in 1:2)
+        connect_as("desk-a", shared)
+        connect_as("desk-b", shared)
+        connect_as("desk-a", own)
+        sleep(1.0)
+        @test haskey(server.worker_credentials[], cred_name(shared))   # desk-b still uses it
     finally
         close(server.srv)
+    end
+end
+
+# Installed again without a credential (to update it, or from another folder),
+# a worker keeps the one it has for that server: an empty one locked it out, so
+# every reinstall needed a new credential and left the old one lying around.
+@testitem "unit:worker config keeps its credential" tags = [:unit] begin
+    import BonitoAgents
+    const BW = BonitoAgents.BonitoWorker
+    using Test, JSON
+    dir = mktempdir()
+    withenv("BONITOAGENTS_CONFIG_DIR" => dir) do
+        stored() = JSON.parsefile(BW.config_path())["credential"]
+        BW.write_config!(; server_url = "https://a.example", credential = "w-1:secret", projects_root = dir)
+        @test stored() == "w-1:secret"
+        BW.write_config!(; server_url = "https://a.example", projects_root = dir)
+        @test stored() == "w-1:secret"
+        # A new one replaces it.
+        BW.write_config!(; server_url = "https://a.example", credential = "w-2:other", projects_root = dir)
+        @test stored() == "w-2:other"
+        # Another server's credential is no use here.
+        BW.write_config!(; server_url = "https://b.example", projects_root = dir)
+        @test stored() == ""
     end
 end
