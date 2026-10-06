@@ -222,6 +222,12 @@ class BonitoChat {
         }, {
             capture: true
         });
+        container.addEventListener('click', (e)=>{
+            const img = e.target.closest('.bt-agent-msg img, .bt-tool-md img');
+            if (!img || img.closest('a, .bt-media-wrap')) return;
+            e.stopPropagation();
+            openLightbox(img);
+        });
         this.scrollbarDrag = false;
         this.onContainerMouseDown = ()=>{
             this.scrollbarDrag = true;
@@ -730,6 +736,15 @@ class BonitoChat {
     prefetchTick() {
         if (this.destroyed) return;
         if (this.prefetchPaused) return;
+        const focus = document.activeElement;
+        const selection = window.getSelection();
+        const editing = this.container.closest('.bt-app')?.contains(focus) && focus.matches('input, textarea, [contenteditable="true"]');
+        const selecting = selection && !selection.isCollapsed && (this.container.contains(selection.anchorNode) || this.container.contains(selection.focusNode));
+        if (editing || selecting) {
+            clearTimeout(this.prefetchTimer);
+            this.prefetchTimer = setTimeout(()=>this.prefetchTick(), 250);
+            return;
+        }
         let e = -1;
         for(let i = Math.min(this.prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--){
             if (!this.cache.has(i)) {
@@ -1773,7 +1788,10 @@ class BonitoChat {
                         img.alt = a.name || 'attachment';
                         img.dataset.attachmentName = a.name;
                         img.loading = 'lazy';
-                        img.addEventListener('click', ()=>openLightbox(img));
+                        img.addEventListener('click', (e)=>{
+                            e.stopPropagation();
+                            openLightbox(img);
+                        });
                         img.addEventListener('error', ()=>{
                             const miss = document.createElement('span');
                             miss.className = 'bt-user-att-missing';
@@ -1782,7 +1800,29 @@ class BonitoChat {
                         }, {
                             once: true
                         });
-                        gallery.appendChild(img);
+                        const wrap = document.createElement('div');
+                        wrap.className = 'bt-media-wrap';
+                        wrap.appendChild(img);
+                        const actions = document.createElement('div');
+                        actions.className = 'bt-media-actions';
+                        const enlarge = document.createElement('button');
+                        enlarge.type = 'button';
+                        enlarge.className = 'bt-media-action bt-media-enlarge';
+                        enlarge.title = 'Enlarge';
+                        enlarge.textContent = '⤢';
+                        enlarge.addEventListener('click', (e)=>{
+                            e.stopPropagation();
+                            openLightbox(img);
+                        });
+                        const choose = document.createElement('button');
+                        choose.type = 'button';
+                        choose.className = 'bt-media-action bt-media-chat-icon';
+                        choose.title = 'Set as chat icon';
+                        choose.textContent = '▣';
+                        choose.setAttribute('aria-label', choose.title);
+                        actions.append(enlarge, choose);
+                        wrap.appendChild(actions);
+                        gallery.appendChild(wrap);
                     }
                     div.appendChild(gallery);
                 }
@@ -2528,13 +2568,6 @@ class BonitoChat {
     scrollToBottom() {
         if (this.scrollbarDrag) return;
         this.container.scrollTop = this.container.scrollHeight;
-        const anchor = this.tailEl || this.spacerBottom;
-        if (anchor) {
-            anchor.scrollIntoView({
-                block: 'end',
-                behavior: 'auto'
-            });
-        }
         this.prevScrollTop = this.container.scrollTop;
         this.refresh();
     }
@@ -2877,6 +2910,7 @@ class BonitoChat {
                 return;
             }
             if (this.container.offsetParent === null) return;
+            if (document.querySelector('.bt-lightbox-overlay')) return;
             const modeMenu = this.app.querySelector('.bt-send-mode-menu');
             if (modeMenu && !modeMenu.hidden) {
                 e.preventDefault();
@@ -3101,12 +3135,12 @@ class BonitoChat {
     onViewportResize() {
         if (this.fullscreenActive()) return;
         const vv = window.visualViewport;
+        if (this.destroyed || !this.container.offsetParent) return;
         const h = Math.round(vv.height);
-        if (this.lastViewportHeight !== h) {
-            this.lastViewportHeight = h;
-            const app = this.app || this.container.closest('.bt-app');
-            if (app) app.style.height = h + 'px';
-        }
+        if (this.lastViewportHeight === h) return;
+        this.lastViewportHeight = h;
+        const app = this.app || this.container.closest('.bt-app');
+        if (app) app.style.height = h + 'px';
         if (this.followMode) this.queueScrollToBottom();
     }
     applyUserScroll(prevTop) {
@@ -3324,20 +3358,30 @@ function linkifyPaths(rootEl) {
     });
 }
 function openLightbox(media) {
+    document.querySelector('.bt-lightbox-overlay')?.closeLightbox();
     const overlay = document.createElement('div');
     overlay.className = 'bt-lightbox-overlay';
-    const big = media.cloneNode(true);
-    big.classList.add('bt-lightbox-media');
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'Enlarged image');
+    const big = document.createElement('img');
+    big.src = media.currentSrc || media.src;
+    big.alt = media.alt || '';
+    big.className = 'bt-lightbox-media';
     overlay.appendChild(big);
     const close = ()=>{
         overlay.remove();
-        document.removeEventListener('keydown', onkey);
+        document.removeEventListener('keydown', onkey, true);
     };
+    overlay.closeLightbox = close;
     const onkey = (e)=>{
-        if (e.key === 'Escape') close();
+        if (e.key !== 'Escape') return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        close();
     };
     overlay.addEventListener('click', close);
-    document.addEventListener('keydown', onkey);
+    document.addEventListener('keydown', onkey, true);
     document.body.appendChild(overlay);
 }
 function jumpChipsHTML(jumps) {
@@ -3463,6 +3507,7 @@ function connect(node, comm, init = {}) {
 }
 export { BonitoChat as BonitoChat };
 export { Collapsable as Collapsable };
+export { openLightbox as openLightbox };
 export { msearchFilter as msearchFilter };
 export { msearchOpen as msearchOpen };
 export { msearchSelect as msearchSelect };

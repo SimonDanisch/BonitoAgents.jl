@@ -90,7 +90,7 @@ end
 function project_icon_for(id::AbstractString, name::AbstractString,
                           hue_key::AbstractString, worker_tag::AbstractString,
                           worker_name::AbstractString;
-                          size_px::Int = 32, image = nothing)
+                          size_px::Int = 32, image = nothing, color::AbstractString)
     isempty(worker_tag) && throw(ArgumentError("a chat icon needs its worker's tag"))
     isempty(worker_name) && throw(ArgumentError("a chat icon needs its worker's name"))
     label = String(worker_tag)
@@ -103,7 +103,7 @@ function project_icon_for(id::AbstractString, name::AbstractString,
         DOM.img(; src, alt = "", class = "bt-proj-thumb", loading = "lazy"),
         DOM.span(label; class = "bt-proj-tag");
         class = image === nothing ? "bt-proj-icon" : "bt-proj-icon bt-proj-icon-img",
-        style = "width:$(size_px)px;height:$(size_px)px;",
+        style = Styles("width" => "$(size_px)px", "height" => "$(size_px)px", "--bt-worker" => color),
         title = tip)
 end
 
@@ -119,7 +119,7 @@ worker_label(state::ServerState, p::ProjectInfo) = worker_label(state.workers[],
 
 function project_icon(state::ServerState, p::ProjectInfo; size_px::Int = 32)
     tag, wname = worker_label(state, p)
-    return project_icon_for(p.id, p.name, folder_hue_key(p), tag, wname; size_px = size_px)
+    return project_icon_for(p.id, p.name, folder_hue_key(p), tag, wname; size_px = size_px, color = worker_color(p.worker_id))
 end
 
 # A single sidebar row: icon + label + identifying data-attribute. NO
@@ -203,8 +203,8 @@ function Bonito.jsrender(session::Bonito.Session, c::SidebarChat)
     # freezes at its initial value — which is exactly why the old code had to
     # poke it from JS.
     icon_node = DOM.div(
-        map(session, c.tag, c.wname, c.image) do t, wn, img
-            project_icon_for(c.pid, c.name, c.hue_key, t, wn; image = img)
+        map(session, c.tag, c.wname, c.image, c.color) do t, wn, img, col
+            project_icon_for(c.pid, c.name, c.hue_key, t, wn; image = img, color = col)
         end;
         class = map(session, c.status) do st; "bt-side-icon-wrap bt-glow-$(st)" end,
         # The ring colour rides `style`, which does track: a string assigned to

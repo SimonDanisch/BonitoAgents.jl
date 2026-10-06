@@ -494,6 +494,13 @@ class BonitoChat {
             this.comm.notify({ type: 'edit_file', path });
         }, { capture: true });
 
+        container.addEventListener('click', e => {
+            const img = e.target.closest('.bt-agent-msg img, .bt-tool-md img');
+            if (!img || img.closest('a, .bt-media-wrap')) return;
+            e.stopPropagation();
+            openLightbox(img);
+        });
+
         // Scrollbar drags emit NO wheel/touch/key events — only mousedown on
         // the container (the scrollbar is part of its hit area) and then
         // scroll events while the button is held, possibly for much longer
@@ -1165,6 +1172,21 @@ class BonitoChat {
     prefetchTick() {
         if (this.destroyed) return;
         if (this.prefetchPaused) return;   // hidden pane — onShown resumes
+        // Background history creates and measures dozens of off-screen nodes
+        // per chunk. Give editing and text selection the main thread instead;
+        // visible-range requests still load anything the user scrolls to.
+        const focus = document.activeElement;
+        const selection = window.getSelection();
+        const editing = this.container.closest('.bt-app')?.contains(focus) &&
+            focus.matches('input, textarea, [contenteditable="true"]');
+        const selecting = selection && !selection.isCollapsed &&
+            (this.container.contains(selection.anchorNode) ||
+             this.container.contains(selection.focusNode));
+        if (editing || selecting) {
+            clearTimeout(this.prefetchTimer);
+            this.prefetchTimer = setTimeout(() => this.prefetchTick(), 250);
+            return;
+        }
         // Highest missing index at or below the cursor.
         let e = -1;
         for (let i = Math.min(this.prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
@@ -2755,14 +2777,31 @@ class BonitoChat {
                         img.alt = a.name || 'attachment';
                         img.dataset.attachmentName = a.name;
                         img.loading = 'lazy';
-                        img.addEventListener('click', () => openLightbox(img));
+                        img.addEventListener('click', e => { e.stopPropagation(); openLightbox(img); });
                         img.addEventListener('error', () => {
                             const miss = document.createElement('span');
                             miss.className = 'bt-user-att-missing';
                             miss.textContent = a.name || 'attachment';
                             img.replaceWith(miss);
                         }, { once: true });
-                        gallery.appendChild(img);
+                        const wrap = document.createElement('div');
+                        wrap.className = 'bt-media-wrap';
+                        wrap.appendChild(img);
+                        const actions = document.createElement('div');
+                        actions.className = 'bt-media-actions';
+                        const enlarge = document.createElement('button');
+                        enlarge.type = 'button';
+                        enlarge.className = 'bt-media-action bt-media-enlarge';
+                        enlarge.title = 'Enlarge'; enlarge.textContent = '⤢';
+                        enlarge.addEventListener('click', e => { e.stopPropagation(); openLightbox(img); });
+                        const choose = document.createElement('button');
+                        choose.type = 'button';
+                        choose.className = 'bt-media-action bt-media-chat-icon';
+                        choose.title = 'Set as chat icon'; choose.textContent = '▣';
+                        choose.setAttribute('aria-label', choose.title);
+                        actions.append(enlarge, choose);
+                        wrap.appendChild(actions);
+                        gallery.appendChild(wrap);
                     }
                     div.appendChild(gallery);
                 }
@@ -3740,17 +3779,11 @@ class BonitoChat {
 
     scrollToBottom() {
         if (this.scrollbarDrag) return;   // the drag owns scrollTop
-        // Belt + suspenders: set scrollTop AND scrollIntoView on the LAST
-        // child (the overscroll tail — plain content, see sizeTail).
-        // scrollTop alone uses the container's reported scrollHeight which
-        // can be stale during streaming; scrollIntoView tells the browser
-        // "make this element's bottom edge visible" and lets it compute
-        // the right position from current layout.
+        // Use the scroll container's layout coordinates only. scrollIntoView
+        // uses the tail's transformed box during rubberbanding and moves us
+        // back UP immediately after this write (also dropping bottom padding).
+        // One owner prevents opposing corrections on each viewport/stream tick.
         this.container.scrollTop = this.container.scrollHeight;
-        const anchor = this.tailEl || this.spacerBottom;
-        if (anchor) {
-            anchor.scrollIntoView({ block: 'end', behavior: 'auto' });
-        }
         // Keep the direction baseline honest where no scroll event may fire
         // (see the offscreen note below): a chase leaving a stale, SMALLER
         // prevScrollTop would make the next upward peek read as "moving
@@ -4235,6 +4268,7 @@ class BonitoChat {
             // ancestor-level unmount: self-destroy.
             if (!this.container.isConnected) { this.lazyDestroy(); return; }
             if (this.container.offsetParent === null) return;
+            if (document.querySelector('.bt-lightbox-overlay')) return;
             const modeMenu = this.app.querySelector('.bt-send-mode-menu');
             if (modeMenu && !modeMenu.hidden) {
                 e.preventDefault();
@@ -4492,32 +4526,15 @@ class BonitoChat {
         // user asked for fullscreen, not for the conversation to move.
         if (this.fullscreenActive()) return;
         const vv = window.visualViewport;
-        // Do NOTHING when the geometry is what we already wrote.
-        //
-        // `visualViewport.resize` is not one event per keyboard slide: a phone
-        // fires it for the IME candidate bar appearing and disappearing, for
-        // keyboard height changes, and for address-bar nudges — several times
-        // per typed character. Each one used to write `.bt-app`'s height
-        // unconditionally, which re-lays-out `.bt-messages`, which runs the
-        // container's ResizeObserver, which calls `sizeTail()` and chases the
-        // tail: a full layout + scroll cycle per event. And since the write
-        // changes layout, it can provoke the next resize event itself — so the
-        // cycle feeds back, which is what a wobble IS.
-        //
-        // Rounded, because the fractional jitter is exactly the noise to drop.
-        //
-        // ONLY the style write is skipped, never the chase. The write is the
-        // half that feeds back (it changes layout, which can provoke the next
-        // resize event); the chase only moves scrollTop and cannot. Skipping
-        // BOTH was measurably worse: the repeated write was also acting as a
-        // periodic re-pin, and without it `e2e:composer_wobble` picked up a 2px
-        // drift on a keystroke that resized nothing.
+        // IME notifications can repeat without a viewport change. Do not
+        // re-pin the transcript for every key/selection event. Actual content
+        // and composer resizes are already handled by the ResizeObservers.
+        if (this.destroyed || !this.container.offsetParent) return;
         const h = Math.round(vv.height);
-        if (this.lastViewportHeight !== h) {
-            this.lastViewportHeight = h;
-            const app = this.app || this.container.closest('.bt-app');
-            if (app) app.style.height = h + 'px';
-        }
+        if (this.lastViewportHeight === h) return;
+        this.lastViewportHeight = h;
+        const app = this.app || this.container.closest('.bt-app');
+        if (app) app.style.height = h + 'px';
         if (this.followMode) this.queueScrollToBottom();
     }
 
@@ -4815,19 +4832,28 @@ function linkifyPaths(rootEl) {
     });
 }
 
-// Click-to-enlarge for JS-created media (user-bubble attachment images).
-// Mirrors the Julia-side LIGHTBOX_OPEN_JS (chat.jl) used by bt_show / Read
-// previews: clone into a fullscreen overlay, Esc or any click closes.
-function openLightbox(media) {
+// Shared image viewer: only the source is reused, never thumbnail classes,
+// inline sizing, lazy-loading or tool-body ids/handlers.
+export function openLightbox(media) {
+    document.querySelector('.bt-lightbox-overlay')?.closeLightbox();
     const overlay = document.createElement('div');
     overlay.className = 'bt-lightbox-overlay';
-    const big = media.cloneNode(true);
-    big.classList.add('bt-lightbox-media');
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'Enlarged image');
+    const big = document.createElement('img');
+    big.src = media.currentSrc || media.src;
+    big.alt = media.alt || '';
+    big.className = 'bt-lightbox-media';
     overlay.appendChild(big);
-    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
-    const onkey = e => { if (e.key === 'Escape') close(); };
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey, true); };
+    overlay.closeLightbox = close;
+    const onkey = e => {
+        if (e.key !== 'Escape') return;
+        e.preventDefault(); e.stopImmediatePropagation(); close();
+    };
     overlay.addEventListener('click', close);
-    document.addEventListener('keydown', onkey);
+    document.addEventListener('keydown', onkey, true);
     document.body.appendChild(overlay);
 }
 

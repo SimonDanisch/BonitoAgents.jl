@@ -473,8 +473,6 @@ const BASE_CSS = [
         "z-index" => "60",
         "text-align" => "left"),
     CSS(".bt-menu-open > .bt-menu-list", "display" => "block"),
-    CSS(".bt-chat-icon-menu", "position" => "fixed", "display" => "block",
-        "right" => "auto", "bottom" => "auto", "z-index" => "10000"),
     CSS(".bt-menu-title",
         "font-size" => "11px", "font-weight" => "600",
         "letter-spacing" => "0.06em", "text-transform" => "uppercase",

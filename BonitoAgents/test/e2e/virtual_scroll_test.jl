@@ -62,10 +62,12 @@
 
     # The chat object is hung off the `.bt-messages` node by `connect(node, comm)`
     # in bonitoagents.js as `node.__bt_chat = chat`.
-    CHAT = "document.querySelector('.bt-messages').__bt_chat"
+    P = ".bt-chatpane[data-pane-pid=\"$(pid)\"] "
+    C = "document.querySelector($(TK.json(P * ".bt-messages")))"
+    CHAT = "$C.__bt_chat"
     # Every rendered chat bubble (user + agent + tool). The virtual window
     # decides how many of these are live in the DOM at a given scroll position.
-    MSG_NODES = "document.querySelectorAll('.bt-user-msg, .bt-agent-msg, .bt-tool-msg').length"
+    MSG_NODES = "$C.querySelectorAll('.bt-user-msg, .bt-agent-msg, .bt-tool-msg').length"
     # Total messages the long turn produced: 1 user + N agent + (N-1) tools.
     EXPECTED_TOTAL = 1 + N + (N - 1)
 
@@ -101,7 +103,7 @@
             # full virtual content height (~EXPECTED_TOTAL * EST_HEIGHT). The
             # browser's scrollHeight therefore reflects ALL messages, not just
             # the windowed slice.
-            sh = TK.eval_js(s, "document.querySelector('.bt-messages').scrollHeight")
+            sh = TK.eval_js(s, "$C.scrollHeight")
             @info "virtual scrollHeight" sh
             @test isa(sh, Number) && sh >= 8000
         end
@@ -111,12 +113,12 @@
             # container parked within ~200px of the bottom.
             @test TK.wait_for(s, "MSG-LAST near the bottom", """
                 (() => {
-                    const els = document.querySelectorAll('.bt-agent-msg');
+                    const els = $C.querySelectorAll('.bt-agent-msg');
                     return Array.from(els).some(e => (e.innerText||'').includes('MSG-LAST'));
                 })()
                 """; timeout = 20) == true
             @test TK.eval_js(s, """
-                (() => { const c = document.querySelector('.bt-messages');
+                (() => { const c = $C;
                     return !!c && (c.scrollHeight - (c.scrollTop + c.clientHeight)) < 200; })()
                 """) == true
         end
@@ -125,7 +127,7 @@
             # Capture the current top-most rendered bubble so we can prove a
             # DIFFERENT (earlier) bubble surfaces after scrolling up.
             top_before = TK.eval_js(s, """
-                (() => { const els = document.querySelectorAll('.bt-user-msg, .bt-agent-msg, .bt-tool-msg');
+                (() => { const els = $C.querySelectorAll('.bt-user-msg, .bt-agent-msg, .bt-tool-msg');
                     return els.length > 0 ? (els[0].innerText||'') : ''; })()
                 """)
             # Jump to scrollTop = 0 and dispatch a synthetic 'scroll' event: in
@@ -137,7 +139,7 @@
             # otherwise yank scrollTop straight back off 0 before the head renders
             # (the old ~1.5fps path never fired the chase in time to interfere).
             TK.eval_js(s, """
-                (() => { const ch = $CHAT, c = document.querySelector('.bt-messages');
+                (() => { const ch = $CHAT, c = $C;
                     if (ch) { ch.setFollowMode(false); if (ch.cancelPendingScroll) ch.cancelPendingScroll(); }
                     if (c) { c.scrollTop = 0; c.dispatchEvent(new Event('scroll')); }
                     return true; })()
@@ -145,14 +147,14 @@
             # A different top bubble must surface (a new, earlier range fetched).
             @test TK.wait_for(s, "earlier top bubble after scroll-up", """
                 (() => {
-                    const els = document.querySelectorAll('.bt-user-msg, .bt-agent-msg, .bt-tool-msg');
+                    const els = $C.querySelectorAll('.bt-user-msg, .bt-agent-msg, .bt-tool-msg');
                     return els.length > 0 && (els[0].innerText||'') !== $(TK.json(top_before));
                 })()
                 """; timeout = 10) == true
             # The very first agent bubble (MSG-FIRST) must be present at the top —
             # no message was lost; the head of the history is still reachable.
             @test TK.wait_for(s, "MSG-FIRST visible at top", """
-                (() => { const u = document.querySelectorAll('.bt-agent-msg');
+                (() => { const u = $C.querySelectorAll('.bt-agent-msg');
                     return Array.from(u).some(e => (e.innerText||'').includes('MSG-FIRST')); })()
                 """; timeout = 10) == true
             # Window still bounded even after fetching the top range.
@@ -168,13 +170,13 @@
                 (() => { const c = $CHAT; c.setFollowMode(true); c.scrollToBottom(); return true; })()
                 """)
             @test TK.wait_for(s, "MSG-LAST back at the bottom", """
-                (() => { const els = document.querySelectorAll('.bt-agent-msg');
+                (() => { const els = $C.querySelectorAll('.bt-agent-msg');
                     return Array.from(els).some(e => (e.innerText||'').includes('MSG-LAST')); })()
                 """; timeout = 20) == true
             # MSG-FIRST should have been evicted from the live window again — the
             # head is no longer materialised once we're parked at the tail.
             @test TK.wait_for(s, "MSG-FIRST evicted at the bottom", """
-                (() => { const u = document.querySelectorAll('.bt-agent-msg');
+                (() => { const u = $C.querySelectorAll('.bt-agent-msg');
                     return !Array.from(u).some(e => (e.innerText||'').includes('MSG-FIRST')); })()
                 """; timeout = 10) == true
             @test Int(TK.eval_js(s, MSG_NODES)) < 100

@@ -62,6 +62,8 @@
         ta.focus();
         ta.value = ta.value + 'x';
         ta.dispatchEvent(new Event('input', {bubbles: true}));
+        visualViewport.dispatchEvent(new Event('resize'));
+        visualViewport.dispatchEvent(new Event('resize'));
         return true;
     })()"""
 
@@ -76,6 +78,7 @@
         });
         if (!c || !ta) return { ok: false, hasC: !!c, hasTa: !!ta };
         window.__wobObs.observe(c);
+        visualViewport.dispatchEvent(new Event('resize'));
         // Three lines sit above the minimum height, below the growth cap.
         ta.focus();
         ta.value = ['first line of the draft','second line of the draft','third line'].join(String.fromCharCode(10));

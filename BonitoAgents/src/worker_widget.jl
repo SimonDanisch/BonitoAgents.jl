@@ -172,14 +172,13 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # `[DT]` tag — short worker initials shown next to every chat/project that
     # lives on this worker. Up to 4 chars (room for a short emoji). Empty
     # input clears the override and the UI falls back to derive_initials(name).
-    # The pill's border is the worker's fixed colour: the same ring the
+    # The pill and card stripe use the worker's fixed colour: the same ring the
     # sidebar draws around this machine's chat icons.
     initials_input = DOM.input(
         type      = "text",
         value     = c.initials_obs,
         maxlength = 4,
         class     = "bt-card-initials bt-card-initials-edit",
-        style     = "border:1.5px solid $(worker_color(wid))",
         title     = "Worker tag (1–4 chars, emoji ok) — shown as [XX] in chat labels; its colour rings this machine's chat icons",
         onblur    = js"event => $(c.initials_obs).notify(event.target.value)",
         onkeydown = js"""event => {
@@ -296,8 +295,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
                 class = online_class),
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
-    manage || (initials_input = DOM.span(c.initials_obs; class = "bt-card-initials",
-                                         style = "border:1.5px solid $(worker_color(wid))");
+    manage || (initials_input = DOM.span(c.initials_obs; class = "bt-card-initials");
                name_input = DOM.span(c.name_obs; class = "bt-card-name"))
     card_body = DOM.div(
         DOM.div(status_dot_obs, initials_input, name_input, update_badge;
@@ -329,7 +327,9 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # button refreshes it.
     card = DOM.div(card_row, update_notice, adapters_note,
                    worker_sharing_row(state.auth, session, state, wid),
-                   manage ? render_discover_panel(session, c, wid) : DOM.div(); class = "bt-card")
+                   manage ? render_discover_panel(session, c, wid) : DOM.div();
+                   class = "bt-card bt-worker-card", dataWorkerId = wid,
+                   style = Styles("--bt-worker" => worker_color(wid)))
 
     return Bonito.jsrender(session,
         DOM.div(card, picker_block, gh_block; class = "bt-worker-cell"))

@@ -174,11 +174,8 @@ function chat_icon_image(state::ServerState, p::ProjectInfo)
     return path === nothing ? nothing : Bonito.Asset(path)
 end
 
-# Right-click on a picture in the chat. bt_show and Read results carry their
-# worker path on the media wrap, user attachments their file name (see
-# msg_to_dict(::UserMsg) and the gallery in bonitoagents.js). Opening the menu
-# changes nothing; only its one action does.
-function chat_icon_contextmenu(session, model::ChatModel)
+# Delegated toolbar action; right-click keeps the browser's image menu.
+function chat_icon_click(session, model::ChatModel)
     choose = Observable(Dict{String,Any}())
     on(session, choose) do pick
         p = get(model.state.projects[], model.project_id, nothing)
@@ -186,32 +183,15 @@ function chat_icon_contextmenu(session, model::ChatModel)
         set_chat_icon!(model.state, p, pick["worker"]::Bool, String(pick["path"]))
     end
     return js"""event => {
-        const img = event.target.closest('img.bt-media, img.bt-user-att-img');
-        if (!img) return;
-        const wrap = img.closest('[data-worker-path]');
-        const pick = wrap ? {worker: true, path: wrap.dataset.workerPath}
-                          : {worker: false, path: img.dataset.attachmentName};
+        const button = event.target.closest('.bt-media-chat-icon');
+        if (!button) return;
+        const wrap = button.closest('.bt-media-wrap');
+        const img = wrap?.querySelector('img');
+        const pick = wrap?.dataset.workerPath
+            ? {worker: true, path: wrap.dataset.workerPath}
+            : {worker: false, path: img?.dataset.attachmentName};
         if (!pick.path) return;
         event.preventDefault(); event.stopPropagation();
-        document.querySelector('.bt-chat-icon-menu')?.closeMenu();
-        const menu = document.createElement('div');
-        menu.className = 'bt-menu-list bt-chat-icon-menu'; menu.setAttribute('role', 'menu');
-        const button = document.createElement('button');
-        button.textContent = 'Set as chat icon'; button.setAttribute('role', 'menuitem');
-        button.className = 'bt-menu-item';
-        menu.appendChild(button);
-        (img.closest('.bt-shell, .bt-app, .bt-dash') || document.body).appendChild(menu);
-        menu.style.left = Math.min(event.clientX, innerWidth - menu.offsetWidth) + 'px';
-        menu.style.top = Math.min(event.clientY, innerHeight - menu.offsetHeight) + 'px';
-        const listeners = new AbortController();
-        menu.closeMenu = () => { listeners.abort(); menu.remove(); };
-        document.addEventListener('pointerdown', e => {
-            if (!menu.contains(e.target)) menu.closeMenu();
-        }, {capture:true, signal:listeners.signal});
-        document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') menu.closeMenu();
-        }, {signal:listeners.signal});
-        button.onclick = () => { $(choose).notify(pick); menu.closeMenu(); };
-        button.focus();
+        $(choose).notify(pick);
     }"""
 end

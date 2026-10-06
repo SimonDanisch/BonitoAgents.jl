@@ -72,30 +72,31 @@
     end
     s.agent_fn[] = chase_agent
 
+    pid = TK.new_chat(s; title = "ScrollChase")
+    P = ".bt-chatpane[data-pane-pid=\"$pid\"]"
+
     # ── browser-state probes (read the UI's own client state + scroll geometry)──
-    follow_mode() = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.followMode")
+    follow_mode() = TK.eval_js(s, "document.querySelector('$P .bt-messages').__bt_chat.followMode")
     # Math.round throughout — Chromium returns fractional scrollHeight/clientHeight
     # under subpixel layout; rounding keeps the Julia-side Int() comparisons clean.
-    GAP_JS = "Math.round((() => { const c=document.querySelector('.bt-messages'); return c.scrollHeight - c.scrollTop - c.clientHeight; })())"
+    GAP_JS = "Math.round((() => { const c=document.querySelector('$P .bt-messages'); return c.scrollHeight - c.scrollTop - c.clientHeight; })())"
     gap()    = Int(TK.eval_js(s, GAP_JS))
-    height() = Int(TK.eval_js(s, "Math.round(document.querySelector('.bt-messages').scrollHeight)"))
+    height() = Int(TK.eval_js(s, "Math.round(document.querySelector('$P .bt-messages').scrollHeight)"))
     # The chase settles within ~200ms, but an offscreen/headless window throttles
     # rAF to ~1 Hz, so a fixed sleep races the throttled chase. Poll the gap.
     at_bottom() = TK.wait_for(s, "pinned at bottom",
         "($GAP_JS) < $AT_BOTTOM_PX"; timeout = 8) == true
 
     @testset "scroll chase: stay pinned while content grows (black-box)" begin
-        # Fresh chat on the shared server so we don't inherit a neighbor's state.
-        pid = TK.new_chat(s; title = "ScrollChase")
 
         # ── 1. Overflowing content mounts pinned at the bottom ──────────────
         @testset "overflowing content lands pinned at the bottom" begin
             TK.send_message(s, "seed history please")
             @test TK.wait_for(s, "code block rendered",
-                "!!document.querySelector('.bt-agent-msg pre')"; timeout = 60) == true
+                "!!document.querySelector('$P .bt-agent-msg pre')"; timeout = 60) == true
             # The container genuinely overflows (real scroll range to chase).
             @test TK.wait_for(s, "viewport overflows",
-                "(() => { const c=document.querySelector('.bt-messages'); return !!c && c.scrollHeight > c.clientHeight + 300; })()"; timeout = 10) == true
+                "(() => { const c=document.querySelector('$P .bt-messages'); return !!c && c.scrollHeight > c.clientHeight + 300; })()"; timeout = 10) == true
             # Follow mode pins the newest content at the bottom.
             @test at_bottom()
             @test follow_mode() == true
@@ -112,7 +113,7 @@
 
             # Wait for the bubble to start (held-back delay then chunks land).
             @test TK.wait_for(s, "stream started",
-                "document.querySelector('.bt-messages').__bt_chat.totalCount >= 2"; timeout = 20) == true
+                "document.querySelector('$P .bt-messages').__bt_chat.totalCount >= 2"; timeout = 20) == true
 
             # Sample the gap several times as the height climbs. At each sample the
             # chase must have re-scrolled us back under threshold — if any sample
@@ -139,11 +140,11 @@
             # ── 3. The last agent bubble's bottom edge is within the viewport ──
             # Not just the numeric gap — the user must actually SEE the tail bubble.
             @test TK.eval_js(s, """(() => {
-                const bubbles = document.querySelectorAll('.bt-agent-msg');
+                const bubbles = document.querySelectorAll('$P .bt-agent-msg');
                 if (bubbles.length === 0) return false;
                 const last = bubbles[bubbles.length - 1];
                 const r = last.getBoundingClientRect();
-                const c = document.querySelector('.bt-messages').getBoundingClientRect();
+                const c = document.querySelector('$P .bt-messages').getBoundingClientRect();
                 // The last bubble's bottom should be at or above the container's
                 // bottom (visible), within a generous sub-pixel tolerance.
                 return r.bottom <= c.bottom + 50;
@@ -169,10 +170,10 @@
             # the bottom the seed's far-up <pre> is windowed out, so the two are
             # never in the DOM at the same time.
             @test TK.wait_for(s, "tall block rendered",
-                "[...document.querySelectorAll('.bt-agent-msg pre')].some(p => (p.innerText||'').includes('tail line'))"; timeout = 20) == true
+                "[...document.querySelectorAll('$P .bt-agent-msg pre')].some(p => (p.innerText||'').includes('tail line'))"; timeout = 20) == true
             # Height jumped (the tall block landed)...
             @test TK.wait_for(s, "height grew from tall block",
-                "Math.round(document.querySelector('.bt-messages').scrollHeight) > $(h_before + 100)"; timeout = 10) == true
+                "Math.round(document.querySelector('$P .bt-messages').scrollHeight) > $(h_before + 100)"; timeout = 10) == true
             # ...and the chase kept us pinned across the jump, NOT disengaged.
             @test at_bottom()
             @test follow_mode() == true

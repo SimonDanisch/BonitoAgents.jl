@@ -910,7 +910,7 @@ function invoke_mcp(client, ev::AbstractDict, mcp_env)
 end
 
 """
-    add_worker!(s; name = "worker-extra", credential = "") -> Base.Process
+    add_worker!(s; name = "worker-extra", credential = "", worker_id = ...) -> Base.Process
 
 Spawn an ADDITIONAL worker process against the same dev server (its own config
 dir + projects root), exactly as a second machine running the installer would.
@@ -918,9 +918,11 @@ Behind the proxy it comes in like any worker there: through Caddy, with the
 `credential` "Add worker" issued (the one its install command carries),
 trusting Caddy's certificate authority. Returns the worker process so the test
 can later `kill` it to simulate that machine going offline; `close(s)` stops it
-(and the agents it started) in any case.
+(and the agents it started) in any case. `worker_id` defaults to a fresh id;
+set it explicitly for fixtures that depend on a stable machine identity.
 """
-function add_worker!(s::TestServer; name::AbstractString = "worker-extra", credential::AbstractString = "")
+function add_worker!(s::TestServer; name::AbstractString = "worker-extra", credential::AbstractString = "",
+                     worker_id::AbstractString = "test-" * String(name) * "-" * string(time_ns(); base = 16))
     cfg  = mktempdir(prefix = "bonitoagents-test-wcfg2-")
     root = mktempdir(prefix = "bonitoagents-test-w2root-")
     prev = get(ENV, "BONITOAGENTS_CONFIG_DIR", nothing)
@@ -928,7 +930,6 @@ function add_worker!(s::TestServer; name::AbstractString = "worker-extra", crede
     # A distinct, pinned worker id so it registers as a separate worker. Not
     # `rand`: inside a `@testset` the RNG is reseeded, so two runs in one process
     # would pick the same id.
-    worker_id = "test-" * String(name) * "-" * string(time_ns(); base = 16)
     write(joinpath(cfg, "worker_id"), worker_id)
     rig = s.h.proxy
     url = rig === nothing ? s.h.url : "https://127.0.0.1:$(s.h.state.auth.config.https_port)"

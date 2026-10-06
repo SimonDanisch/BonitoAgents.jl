@@ -168,16 +168,16 @@
             server.agent_fn[] = _ -> [TK.text("ok"), TK.end_turn()]
         end
 
-        @testset "image identity survives new output and source deletion; right-click sets it" begin
+        @testset "image identity survives new output and source deletion; toolbar sets it" begin
             dir = mktempdir()
             cwd = mktempdir()
             red = joinpath(dir, "identity-red.svg")
             blue = joinpath(dir, "identity-blue.svg")
             write(red, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"73\" height=\"41\"><rect width=\"73\" height=\"41\" fill=\"red\"/></svg>")
             write(blue, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"97\" height=\"53\"><rect width=\"97\" height=\"53\" fill=\"blue\"/></svg>")
-            menuitem = "document.querySelector('.bt-chat-icon-menu [role=menuitem]')"
             visible = "[...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent)"
-            rightclick(target) = TK.eval_js(server, "$(target).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:420, clientY:300})); true")
+            native_context(target) = TK.eval_js(server, "$(target).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true}))")
+            choose(target) = TK.eval_js(server, "$(target).closest('.bt-media-wrap').querySelector('.bt-media-chat-icon').click(); true")
             try
                 server.agent_fn[] = prompt -> begin
                     path = occursin("second", prompt) ? blue : red
@@ -218,28 +218,11 @@
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
                 @test TK.eval_js(server, decoded(73))
 
-                # Right-click on the new picture in the chat: its one action
-                # makes it the icon. Opening the menu alone changes nothing.
-                rightclick(shown)
-                @test TK.wait_for(server, "the picture's menu opens", "!!$(menuitem)"; timeout=10)
-                menu = TK.eval_js(server, """(() => {
-                    const b = $(menuitem);
-                    const r = b.getBoundingClientRect();
-                    const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
-                    return {label: b.textContent,
-                            onscreen: r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 &&
-                                      r.right <= innerWidth && r.bottom <= innerHeight,
-                            hit: hit === b ? 'menu' : (hit ? hit.tagName + '.' + hit.className : 'nothing'),
-                            font: getComputedStyle(b).fontFamily,
-                            chatFont: getComputedStyle($(visible)).fontFamily};
-                })()""")
-                @test menu["label"] == "Set as chat icon"
-                @test menu["onscreen"] == true
-                @test menu["hit"] == "menu"
-                @test menu["font"] == menu["chatFont"]  # styled like the chat it floats over
-                TK.screenshot(server, joinpath(tempdir(), "chat_icon_menu.png"))
+                @test native_context(shown)
+                @test TK.eval_js(server, "!document.querySelector('.bt-chat-icon-menu')")
+                @test TK.eval_js(server, "$(shown).closest('.bt-media-wrap').querySelector('.bt-media-chat-icon').title") == "Set as chat icon"
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
-                TK.eval_js(server, "$(menuitem).click(); true")
+                choose(shown)
                 @test TK.wait_for(server, "the picked picture becomes the icon", decoded(97); timeout=30)
                 @test TK.eval_js(server, "!document.querySelector('.bt-chat-icon-menu')")
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") != original
@@ -258,9 +241,8 @@
                 TK.send_message(server, "and this one")
                 attached = "[...$(visible).querySelectorAll('.bt-user-att-img')].find(i => i.complete && i.naturalWidth === 1)"
                 @test TK.wait_for(server, "attachment shown in chat", "!!$(attached)"; timeout=60)
-                rightclick(attached)
-                @test TK.wait_for(server, "the attachment's menu opens", "!!$(menuitem)"; timeout=10)
-                TK.eval_js(server, "$(menuitem).click(); true")
+                @test native_context(attached)
+                choose(attached)
                 @test TK.wait_for(server, "the attachment becomes the icon", decoded(1); timeout=30)
                 chosen = TK.eval_js(server, "document.querySelector($(repr(icon))).src")
 

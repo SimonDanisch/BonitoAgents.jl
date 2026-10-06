@@ -968,6 +968,12 @@ const DashboardStyles = Bonito.Styles(
         "background" => "var(--bt-surface)",
         "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)",
         "color" => "var(--bt-text)"),
+    # Machine identity is shared with every chat badge and border.
+    CSS(".bt-worker-card", "border-left" => "4px solid var(--bt-worker)"),
+    CSS(".bt-worker-card input.bt-card-initials, .bt-worker-card span.bt-card-initials",
+        "background" => "var(--bt-worker)", "color" => "white",
+        "border" => "1px solid var(--bt-worker)",
+        "padding" => "4px 6px", "border-radius" => "var(--bt-radius-sm)"),
     # `[XX]` pill in front of a project's title — read-only mirror of the
     # worker's initials. Same pill shape as the editable input above so the
     # tag reads consistently across worker / project cards.

@@ -3113,11 +3113,9 @@ const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
 const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
     ".avif", ".ico")
 
-# Click-to-enlarge. An image is cloned into a fullscreen overlay that any click or
-# Esc closes (a phone has no Esc, and the picture covers the backdrop). A video
-# goes fullscreen itself: a clone would download it again and start over.
-# Self-contained so there's no global-JS dependency or load-order coupling;
-# shared by bt_show previews and inline Read-tool images.
+# Images use the shared viewer without copying thumbnail sizing or handlers.
+# Videos enter fullscreen in the click handler to retain user activation;
+# cloning a video would download it again and restart playback.
 const LIGHTBOX_OPEN_JS = js"""
 event => {
     event.stopPropagation();
@@ -3130,16 +3128,7 @@ event => {
         else if (media.webkitEnterFullscreen) media.webkitEnterFullscreen();
         return;
     }
-    const overlay = document.createElement('div');
-    overlay.className = 'bt-lightbox-overlay';
-    const big = media.cloneNode(true);
-    big.classList.add('bt-lightbox-media');
-    overlay.appendChild(big);
-    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
-    const onkey = e => { if (e.key === 'Escape') close(); };
-    overlay.addEventListener('click', close);
-    document.addEventListener('keydown', onkey);
-    document.body.appendChild(overlay);
+    $(ChatLib).then(lib => lib.openLightbox(media));
 }
 """
 
@@ -3235,7 +3224,10 @@ function media_element(src, mime::AbstractString, is_video::Bool;
             (DOM.button("⧉"; class = "bt-media-action bt-media-copy", type = "button",
                 title = "Copy image", onclick = COPY_MEDIA_JS),))...,
         DOM.button("⤓"; class = "bt-media-action bt-media-download", type = "button",
-            title = "Download", onclick = DOWNLOAD_MEDIA_JS);
+            title = "Download", onclick = DOWNLOAD_MEDIA_JS),
+        (!is_video && !isempty(worker_path) ?
+            (DOM.button("▣"; class = "bt-media-action bt-media-chat-icon", type = "button",
+                title = "Set as chat icon", var"aria-label" = "Set as chat icon"),) : ())...;
         class = "bt-media-actions")
     return DOM.div(inner, actions;
         class = "bt-media-wrap",
@@ -9252,8 +9244,7 @@ function Bonito.jsrender(session::Session, m::ChatModel)
         # last message (~30% of the pane; JS sizes it from clientHeight).
         DOM.div(class="bt-messages-tail");
         class="bt-messages",
-        # Right-click on a picture offers to make it the chat's icon.
-        oncontextmenu = chat_icon_contextmenu(session, model))
+        onclick = chat_icon_click(session, model))
 
     # Init snapshot: comm events fired before this tab connected are gone, so
     # bake the CURRENT slash-command set into the connect call (a tab opened
