@@ -13,7 +13,7 @@
     saved = "localStorage.getItem('bt-draft:$(pid)')"
 
     TK.set_input(server, ".bt-text-input", "a long thought,\nhalf written")
-    @test TK.eval_js(server, saved) == "a long thought,\nhalf written"
+    @test TK.wait_for(server, "draft saved after typing", "$(saved) === 'a long thought,\\nhalf written'")
 
     # The page reloads (a fresh tab lands back on this chat) and the text is back.
     @test TK.reload!(server) == :dashboard

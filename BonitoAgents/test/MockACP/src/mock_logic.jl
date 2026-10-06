@@ -491,7 +491,11 @@ function run_dispatcher_replay()
 end
 
 function run_dispatcher_prompt(prompt_id)
-    sock = ensure_dispatcher!()
+    # Steering opens overlapping prompts. Each must read its own script;
+    # concurrent readers on the shared replay socket steal each other's events.
+    host, port = rsplit(DISPATCHER_ADDR, ":"; limit=2)
+    sock = Sockets.connect(host, parse(Int, port))
+    try
     # Pull the user's prompt text out of the original message — the
     # dispatcher loop already parsed it, but we don't have it here. The
     # test process keys its agent fn on whatever the user typed; carry
@@ -961,6 +965,9 @@ function run_dispatcher_prompt(prompt_id)
             @warn "post_turn emission failed" exception = e
         end
     end
+    finally
+        close(sock)
+    end
 end
 
 # Most-recent prompt text — used by the dispatcher handler to know what
@@ -1010,7 +1017,8 @@ function dispatch_loop()
             # `loadSession` must match reality (we answer session/load below):
             # the server reads it to decide whether to persist the session id.
             resp(id, Dict("protocolVersion" => 1,
-                          "agentCapabilities" => Dict("loadSession" => true)))
+                          "agentCapabilities" => Dict("loadSession" => true),
+                          "_meta" => Dict("steering" => Dict("supported" => true))))
         elseif method == "session/new" && id !== nothing
             set_mcp_config!(get(msg, "params", Dict()))
             # Only under strict_load: the transcript is what that mode checks,

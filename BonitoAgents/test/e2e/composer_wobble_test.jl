@@ -1,26 +1,6 @@
-# Black-box e2e: typing in a MULTI-LINE composer must not disturb the chat.
-#
-# Exactly two handlers run per keystroke on the composer:
-#   1. the inline `oninput` (chat.jl) — `style.height='auto'`, read
-#      `scrollHeight`, write `min(scrollHeight, 120)px`
-#   2. `onCmdInput` (bonitoagents.js) — a regex on the value, then `acClose()`,
-#      which clears an array and removes an absent class. No layout.
-#
-# (1) is worth pinning down. For a <textarea>, `height:'auto'` is the rows=1
-# height, NOT the content height, so the write really does collapse the box to
-# its 64px min-height before the measured height goes back on. Reading
-# `scrollHeight` between the two writes forces a synchronous layout, so that
-# collapse is a real layout state once per character.
-#
-# What this item measured: it is not an OBSERVABLE one. Both writes land in the
-# same task, layout is committed once, and a ResizeObserver on `.bt-messages`
-# sees nothing — 0 callbacks over 10 keystrokes with the composer multi-line and
-# well above its min-height. The composer also never shrinks while the text only
-# grows, and the transcript never moves on a keystroke that didn't resize it.
-#
-# So the per-keystroke cost that IS real is the forced reflow, not a visible
-# resize. Phone-sized because that is where the wobble was reported; the window
-# is restored at the end (shared browser, like layout_fixes_test).
+# Typing in a growing draft must preserve the transcript's reading position.
+# Native field sizing avoids the old collapse/measure/restore cycle; these
+# rendered-geometry checks also cover real wrap boundaries and viewport changes.
 @testitem "e2e:composer_wobble" setup = [SharedServer] tags = [:e2e] begin
     S = SharedServer
     s = S.server()
@@ -85,11 +65,8 @@
         return true;
     })()"""
 
-    # What does the messages container SEE during a keystroke? Sampling between
-    # keystrokes only ever shows the settled height. The auto-resize collapses
-    # the textarea to its rows=1/min-height box, forces a layout by reading
-    # scrollHeight, then writes the real height back — so a ResizeObserver is
-    # the only way to observe the intermediate state.
+    # Observe the transcript's viewport during edits that keep the same number
+    # of lines. Native sizing should leave it alone.
     setup_ro = TK.eval_js(s, """(() => {
         const c  = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
         const ta = document.querySelector('$(P).bt-text-input');
@@ -99,8 +76,7 @@
         });
         if (!c || !ta) return { ok: false, hasC: !!c, hasTa: !!ta };
         window.__wobObs.observe(c);
-        // Three lines: multi-line, but under the 120px cap so the box really
-        // sits above its 64px min-height and has room to collapse.
+        // Three lines sit above the minimum height, below the growth cap.
         ta.focus();
         ta.value = ['first line of the draft','second line of the draft','third line'].join(String.fromCharCode(10));
         ta.dispatchEvent(new Event('input', {bubbles: true}));
@@ -123,18 +99,12 @@
         # was added), so the transcript's box must never change either. Every
         # entry here is one ResizeObserver callback, and each one runs
         # `sizeTail()` + a tail chase in the real handler.
-        @test multi_h > 70            # genuinely above the 64px min-height
+        @test multi_h > 70            # above the one-line minimum
         @test isempty(ro)
     end
 
-    # Type from EMPTY, one character at a time, across several wrap boundaries.
-    #
-    # Not a pre-filled 12-line draft: past the 120px cap `min(scrollHeight, 120)`
-    # clamps to a constant and the box is trivially stable. The reported regime
-    # is BELOW the cap, where each keystroke re-runs `height:'auto'` → measure →
-    # write, and `overflow-y:auto` can put a 6px scrollbar in (or out of) the
-    # content box between two measurements — which re-wraps the text and changes
-    # the very height being measured.
+    # Keep typing through wrap boundaries below the cap, where a real line
+    # addition should grow the composer without ever shrinking it.
     samples = Any[]
     for _ in 1:110
         TK.eval_js(s, TYPE_ONE)

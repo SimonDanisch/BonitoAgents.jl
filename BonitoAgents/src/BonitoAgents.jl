@@ -55,6 +55,7 @@ include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
+include("chat_queue.jl")       # pending submissions and delivery modes
 include("file_view.jl")        # FileView / FilePanel — the one rich file renderer (bt_show + file tabs)
 include("review.jl")           # change-review tab: git diff + per-line ask / batched feedback
 include("lens.jl")             # lens search: parse + fuzzy filter + saved lenses

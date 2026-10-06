@@ -216,6 +216,13 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     end
 
     a.client = ACP.Client(conn, session_id, a.worker_path, ACP._result_dict(result))
+    # Keep the advertised steering capability with this connection's metadata.
+    caps = init_caps isa AbstractDict ? init_caps : Dict{String,Any}()
+    meta = get(caps, "_meta", Dict{String,Any}())
+    init_meta = get(ACP._result_dict(init), "_meta", Dict{String,Any}())
+    a.client.session_result["bonitoPromptQueueing"] =
+        get(get(meta, "claudeCode", Dict{String,Any}()), "promptQueueing", false) === true ||
+        get(get(init_meta, "steering", Dict{String,Any}()), "supported", false) === true
     a.replay = msgs
     return a
     finally

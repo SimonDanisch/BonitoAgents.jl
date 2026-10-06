@@ -881,8 +881,23 @@ class BonitoChat {
             this.app.removeEventListener('click', this.onAppClickCapture, true);
         }
         if (this.onDraftInput && this.textInput) {
+            this.flushDraft();
             this.textInput.removeEventListener('input', this.onDraftInput);
+            this.textInput.removeEventListener('blur', this.flushDraft);
+            window.removeEventListener('pagehide', this.flushDraft);
+            document.removeEventListener('visibilitychange', this.onDraftVisibility);
         }
+        if (this.textInput) {
+            this.textInput.removeEventListener('compositionstart', this.onCompositionStart);
+            this.textInput.removeEventListener('compositionend', this.onCompositionEnd);
+            if (this.onInputResize) {
+                this.textInput.removeEventListener('input', this.onInputResize);
+                this.textInput.removeEventListener('bt-composer-resize', this.onInputResize);
+            }
+        }
+        if (this.inputResizeFrame) cancelAnimationFrame(this.inputResizeFrame);
+        this.inputWidthObserver?.disconnect();
+        this.inputMeasure?.remove();
         if (this.onAppChange && this.app) {
             this.app.removeEventListener('change', this.onAppChange);
         }
@@ -935,6 +950,8 @@ class BonitoChat {
         }
 
         switch (msg.type) {
+            case 'queue.state': return this.renderQueue(msg);
+            case 'queue.delivered': return this.queueDelivered(msg);
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'msgs.reload':  return this.onMsgsReload(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
@@ -3873,6 +3890,41 @@ class BonitoChat {
         // at click time.
         if (!this.inputArea || !this.textInput) return;
 
+        // Native sizing avoids synchronous textarea collapse/reflow during
+        // Android IME edits and preserves selection/scroll within long drafts.
+        // Older engines measure an unfocused, isolated copy once per frame.
+        if (!CSS.supports('field-sizing', 'content')) {
+            this.textInput.dataset.btSizingFallback = '';
+            const mirror = document.createElement('textarea');
+            mirror.className = 'bt-input-measure';
+            mirror.tabIndex = -1;
+            mirror.setAttribute('aria-hidden', 'true');
+            this.inputArea.appendChild(mirror);
+            this.inputMeasure = mirror;
+            this.onInputResize = () => {
+                if (this.inputResizeFrame) return;
+                this.inputResizeFrame = requestAnimationFrame(() => {
+                    this.inputResizeFrame = null;
+                    if (this.destroyed || !this.textInput.clientWidth) return;
+                    mirror.style.width = this.textInput.clientWidth + 'px';
+                    mirror.value = this.textInput.value;
+                    const height = (mirror.scrollHeight + 2) + 'px';
+                    if (this.textInput.style.height !== height) this.textInput.style.height = height;
+                });
+            };
+            this.textInput.addEventListener('input', this.onInputResize);
+            this.textInput.addEventListener('bt-composer-resize', this.onInputResize);
+            let width = 0;
+            this.inputWidthObserver = new ResizeObserver(entries => {
+                const next = entries[0].contentRect.width;
+                if (width === next) return;
+                width = next;
+                this.onInputResize();
+            });
+            this.inputWidthObserver.observe(this.textInput);
+            this.onInputResize();
+        }
+
         // Thumbnail strip lives ABOVE the input row inside .bt-input-area.
         this.attachBar = document.createElement('div');
         this.attachBar.className = 'bt-attachments';
@@ -3938,7 +3990,34 @@ class BonitoChat {
         // and works regardless of when the buttons are added.
         this.onAppClickCapture = (e) => {
             if (this.destroyed) return;
-            if (e.target.closest('.bt-send-btn')) {
+            const modeOption = e.target.closest('.bt-send-mode-option');
+            const queueAction = e.target.closest('[data-queue-action]');
+            const modeMenu = this.app.querySelector('.bt-send-mode-menu');
+            if (modeMenu && !e.target.closest('.bt-send-mode')) {
+                modeMenu.hidden = true;
+                this.app.querySelector('.bt-send-mode-trigger')?.setAttribute('aria-expanded', 'false');
+            }
+            if (modeOption) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                this.sendMode = modeOption.dataset.sendMode;
+                const trigger = this.app.querySelector('.bt-send-mode-trigger');
+                trigger.textContent = {done: 'Queue when done', next: 'Queue after message', interrupt: 'Interrupt + send'}[this.sendMode];
+                trigger.title = modeOption.textContent;
+                trigger.setAttribute('aria-label', trigger.title);
+                trigger.setAttribute('aria-expanded', 'false');
+                modeMenu.hidden = true;
+                for (const option of modeMenu.children)
+                    option.setAttribute('aria-checked', String(option === modeOption));
+            } else if (e.target.closest('.bt-send-mode-trigger')) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                modeMenu.hidden = !modeMenu.hidden;
+                e.target.closest('button').setAttribute('aria-expanded', String(!modeMenu.hidden));
+            } else if (queueAction) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                this.comm.notify({type: 'queue.action', id: queueAction.dataset.queueId,
+                    action: queueAction.dataset.queueAction});
+
+            } else if (e.target.closest('.bt-send-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this.submit();
@@ -4001,20 +4080,50 @@ class BonitoChat {
                 this.textInput.value = saved;
                 this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
             }
-            this.onDraftInput = () => {
-                if (yolo()) return;
-                const text = this.textInput.value;
+            // Storage is synchronous. Coalesce typing bursts; flush on
+            // background/blur/pagehide so navigating away still keeps the draft.
+            this.flushDraft = () => {
+                clearTimeout(this.draftTimer);
+                if (this.pendingDraft === undefined) return;
+                const text = this.pendingDraft;
+                this.pendingDraft = undefined;
                 try {
                     text.trim() ? localStorage.setItem(key, text) : localStorage.removeItem(key);
-                } catch (_) {}   // storage full or off: the draft just isn't kept
+                } catch (error) {
+                    if (!(error instanceof DOMException) ||
+                        !['QuotaExceededError', 'SecurityError'].includes(error.name)) throw error;
+                    console.warn('Could not save the chat draft:', error.message);
+                }
+            };
+            this.onDraftInput = () => {
+                if (yolo()) return;
+                this.pendingDraft = this.textInput.value;
+                clearTimeout(this.draftTimer);
+                if (!this.pendingDraft.trim()) this.flushDraft();
+                else this.draftTimer = setTimeout(this.flushDraft, 250);
+            };
+            this.onDraftVisibility = () => {
+                if (document.visibilityState === 'hidden') this.flushDraft();
             };
             this.textInput.addEventListener('input', this.onDraftInput);
+            this.textInput.addEventListener('blur', this.flushDraft);
+            window.addEventListener('pagehide', this.flushDraft);
+            document.addEventListener('visibilitychange', this.onDraftVisibility);
         }
 
-        // Enter-to-send on the textarea (Shift+Enter newline as usual).
+        // Mobile Enter belongs to the editor, including autocomplete. IME
+        // confirmation is never Send, even on a desktop keyboard.
+        this.onCompositionStart = () => { this.inputComposing = true; };
+        this.onCompositionEnd = () => { this.inputComposing = false; };
+        this.textInput.addEventListener('compositionstart', this.onCompositionStart);
+        this.textInput.addEventListener('compositionend', this.onCompositionEnd);
         this.onTextInputKeyCapture = (e) => {
-            if (this.cmdAcHandleKey(e)) return;   // autocomplete owns the key
-            if (e.key !== 'Enter' || e.shiftKey) return;
+            if (e.isComposing || this.inputComposing || e.keyCode === 229) return;
+            const mobile = matchMedia('(pointer: coarse)').matches ||
+                navigator.userAgentData?.mobile || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+            if (e.key === 'Enter' && (mobile || e.shiftKey)) return;
+            if (this.cmdAcHandleKey(e)) return;
+            if (e.key !== 'Enter') return;
             e.preventDefault();
             e.stopImmediatePropagation();
             this.submit();
@@ -4042,6 +4151,7 @@ class BonitoChat {
         const acAccept = (cmd) => {
             this.textInput.value = '/' + cmd.name + ' ';
             this.textInput.focus();
+            this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
             acClose();
         };
         const acRender = () => {
@@ -4115,7 +4225,7 @@ class BonitoChat {
         // suppress it. The Monaco tool-body editor owns ESC for its own
         // semantics — skip when the user is editing inside one.
         this.onEscapeKey = (e) => {
-            if (e.key !== 'Escape' || e.repeat) return;
+            if (e.key !== 'Escape' || e.repeat || e.isComposing || this.inputComposing || e.keyCode === 229) return;
             // Document-level listener + kept-alive panes (display:none but
             // connected) = EVERY chat instance hears this. Only the VISIBLE
             // pane may cancel — one ESC used to cancel the running turn of
@@ -4125,6 +4235,15 @@ class BonitoChat {
             // ancestor-level unmount: self-destroy.
             if (!this.container.isConnected) { this.lazyDestroy(); return; }
             if (this.container.offsetParent === null) return;
+            const modeMenu = this.app.querySelector('.bt-send-mode-menu');
+            if (modeMenu && !modeMenu.hidden) {
+                e.preventDefault();
+                modeMenu.hidden = true;
+                const trigger = this.app.querySelector('.bt-send-mode-trigger');
+                trigger.setAttribute('aria-expanded', 'false');
+                trigger.focus();
+                return;
+            }
             // The slash-command popup owns ESC while open (this document-level
             // capture fires BEFORE the textarea's own capture handler, so the
             // popup must be dismissed here or ESC would cancel the turn).
@@ -4257,6 +4376,73 @@ class BonitoChat {
         }, 4500);
     }
 
+    renderQueue(msg) {
+        const box = this.app.querySelector('.bt-message-queue');
+        if (!box) return;
+        const expanded = new Set([...box.querySelectorAll('details[open]')].map(e => e.dataset.queueId));
+        box.replaceChildren();
+        const items = msg.items || [];
+        box.hidden = items.length === 0;
+        if (!items.length) return;
+        box.setAttribute('aria-label', `Pending messages (${items.length})`);
+        for (const item of items) {
+            const row = document.createElement('details');
+            row.className = 'bt-queue-item';
+            row.open = expanded.has(item.id);
+            row.dataset.queueId = item.id;
+            row.dataset.status = item.status;
+            row.dataset.mode = item.mode;
+            const text = document.createElement('div');
+            text.className = 'bt-queue-text';
+            text.textContent = item.text;
+            const status = document.createElement('div');
+            status.className = 'bt-queue-status';
+            status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'sending' ? 'Connecting · not sent yet' :
+                item.mode === 'interrupt' ? 'Waiting for interruption to finish' :
+                item.mode === 'next' ? 'Waiting for the next message boundary' :
+                'Waiting until the agent finishes');
+            const summary = document.createElement('summary');
+            summary.className = 'bt-queue-summary';
+            const preview = document.createElement('span');
+            preview.className = 'bt-queue-preview';
+            preview.textContent = item.text;
+            const badge = document.createElement('span');
+            badge.className = 'bt-queue-badge';
+            badge.textContent = item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' :
+                item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
+            summary.title = status.textContent;
+            summary.append(preview, badge);
+            const detail = document.createElement('div');
+            detail.className = 'bt-queue-detail';
+            detail.append(text, status);
+            row.append(summary, detail);
+            const actions = document.createElement('div');
+            actions.className = 'bt-queue-actions';
+            for (const [action, label] of item.status === 'paused' ?
+                    [['send', 'Queue again'], ['remove', 'Remove']] :
+                    item.status === 'waiting' ? [['remove', 'Remove']] : []) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
+                button.dataset.queueAction = action;
+                button.dataset.queueId = item.id;
+                button.textContent = label;
+                actions.append(button);
+            }
+            detail.append(actions);
+            box.append(row);
+        }
+    }
+
+    queueDelivered(msg) {
+        const box = this.app.querySelector('.bt-queue-delivery');
+        if (!box) return;
+        box.textContent = 'Sent to agent: ' + msg.text.replace(/\s+/g, ' ').slice(0, 100);
+        box.hidden = false;
+    }
+
     async submit() {
         const text = this.textInput.value;
         // Nothing to send → noop. (Pressing Enter on an empty textarea
@@ -4277,7 +4463,7 @@ class BonitoChat {
                 data:     arrayBufferToBase64(buf),
             });
         }
-        this.comm.notify({type: 'send', text, attachments: payload});
+        this.comm.notify({type: 'send', text, attachments: payload, mode: this.sendMode || 'done'});
         // Clear the local input immediately. We don't wait for any
         // server ack — the textarea content is already encoded on the
         // wire, Julia will surface errors (e.g. attachment rejection)
@@ -4469,8 +4655,8 @@ class BonitoChat {
         }
     }
 
-    // Pill lives inside .bt-app, absolutely positioned above the input
-    // area. We append it once and toggle its visibility class. Click →
+    // Anchor above the composer so queues, attachments and growing drafts
+    // cannot overlap it. Append once and toggle visibility. Click →
     // re-engage follow mode and scroll to the bottom.
     createNewMessagePill() {
         const app = this.container?.closest('.bt-app') ||
@@ -4492,7 +4678,9 @@ class BonitoChat {
             this.setFollowMode(true);
             this.scrollToBottom();
         });
-        app.appendChild(pill);
+        const inputArea = app.querySelector('.bt-input-area');
+        if (!inputArea) return;
+        inputArea.appendChild(pill);
         this.pillEl = pill;
         this.pillLabelEl = label;
     }

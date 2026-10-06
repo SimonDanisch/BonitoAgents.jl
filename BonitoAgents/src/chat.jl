@@ -109,21 +109,10 @@ mutable struct ChatModel
     agent::AgentProvider
     mcp_servers::Vector{AgentClientProtocol.MCPServer}
 
-    # The user's turns. The browser send handler `put!`s a `UserMessage`; the
-    # `run_chat!` task is the SOLE consumer (one turn at a time). Shared across
-    # per-session views so every tab feeds the same queue.
+    # Wakeups for the sole turn-completion consumer. The outbox below holds
+    # pending submissions and any steering spans awaiting completion.
     user_messages::Channel{UserMessage}
-
-    # User bubbles pushed into `msgs_store` whose prompt has NOT reached the
-    # agent yet (FIFO mirror of `user_messages`, tracking the rendered bubble
-    # objects). `send_message!` pushes; `begin_turn` pops once `prompt!`
-    # actually delivered the text. `reconcile_replay!` needs this to tell the
-    # user's FRESH messages (which the agent can't know about, so they must
-    # stay at the store's END and must never anchor the replay merge) apart
-    # from history the agent has seen. Guarded by `lock` (the msgs_store lock);
-    # shared across per-session views. The type is `Any` only to dodge the
-    # UserMsg-not-yet-defined ordering here; every element is a UserMsg.
-    pending_sends::Vector{Any}
+    pending_sends::Vector{Any}     # PendingSend (defined after UserMsg)
 
     # The task rendering the agent session's MAIN THREAD (`ACP.Client.messages`)
     # into this chat, for the life of that session. One stream, one renderer:
@@ -297,12 +286,8 @@ mutable struct ChatModel
     # bringing a session up (before any span exists) and while rendering the
     # turn's tail (after the span resolved and ACP is already `Idle`).
     #
-    # A Bool, not the count it used to be. `run_chat!` is the sole consumer and
-    # AWAITS each turn, so there is never more than one — true since 15e1f76 made
-    # the drain awaited instead of spawned, though the counter and its
-    # `last_turn` branch (unconditionally true) outlived that by weeks. Verified
-    # by instrumenting the claim across the unit suite and the cancel / queued /
-    # restart e2e items: never above one.
+    # One consumer awaits spans serially. Steering can have a successor on the
+    # wire already; ACP session_activity accounts for that overlap.
     #
     # Set and cleared by `while_busy` ONLY — see there.
     turn_in_flight::Ref{Bool}
@@ -397,7 +382,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         actual_agent,
         collect(AgentClientProtocol.MCPServer, mcp_servers),
         Channel{UserMessage}(64),
-        Any[],                      # pending_sends (user bubbles not yet prompted)
+        Any[],                      # pending_sends (outbox)
         Ref{Any}(nothing),          # main_consumer (bound with the ACP session)
         Ref{AgentClientProtocol.SessionActivity}(AgentClientProtocol.Idle()),  # activity_seen
         Ref{Any}(nothing),          # activity_timer
@@ -436,6 +421,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Dict{String, Tuple{ReentrantLock, Ref{Int}}}(),  # tool_renders (serialize + latest-wins)
         RunBook(),                             # runs
     )
+    load_pending_sends!(model)
     # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
     # with `chat = nothing` (the model doesn't exist yet while parsing), but
     # the wire form needs the back-ref to resolve the project's /attachment
@@ -502,7 +488,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = 
             m.chat_session, m.msgs_store,
             m.agent, m.mcp_servers,
             m.user_messages,           # shared queue → all sessions feed one consumer
-            m.pending_sends,           # shared → reconcile sees every tab's unsent bubbles
+            m.pending_sends,           # shared outbox across tabs
             m.main_consumer,           # shared → one main-thread renderer per chat
             m.activity_seen,           # shared → one edge detector per chat
             m.activity_timer,          # shared → one quiet-check per chat
@@ -5054,44 +5040,15 @@ plan_update_dict(m::TodoListMsg) = merge(msg_to_dict(m),
     Dict{String,Any}("type" => "plan_update"))
 
 # ── The chat consumer loop ──────────────────────────────────────────────────
-# ONE task per ChatModel drains `user_messages` and drives one prompt turn at a
-# time. ALL chat-state mutation (`send!`/`append!`/`close`) happens on THIS
-# task, so there is no funnel lock and the "user-submit lands mid agent-chunk"
-# race cannot occur. Started in `start_chat_client!`; ends when `user_messages`
-# is closed (chat teardown).
-# Each turn runs in its OWN task — the consumer does NOT wait for one turn
-# to resolve before sending the next prompt. Two reasons (both validated
-# against the real agent on the raw wire):
-#
-#   1. STEERING. claude-agent-acp officially supports a `session/prompt`
-#      while one is running (`promptQueueing: true` in its initialize
-#      capabilities): the new user message is injected into the live turn,
-#      and when the SDK replays it, the FIRST prompt resolves end_turn and
-#      the stream hands off to the second. Serializing client-side would
-#      forfeit that and turn every mid-turn message into a dead wait.
-#   2. BACKGROUND SHELLS. While a background shell lives, the SDK never goes
-#      idle, so the prompt that launched it NEVER resolves on its own —
-#      the held-open turn is how the SDK delivers the shell's completion
-#      notification later. The next prompt (handoff) is the only thing that
-#      releases it. With a serializing consumer the user is locked out of
-#      the chat for as long as the shell runs — the bug this fixes.
-#
-# Update ordering stays strict, and needs no arbitration to do so: every
-# session/update is the session's main thread talking, they arrive in wire order
-# on ONE stream, and one consumer renders them in that order. Which prompt gets
-# credited with a given message is not a question anyone has to answer — a prompt
-# is a span over the stream, ended by a marker the dispatcher stamps at its
-# response frame.
+# One consumer owns turn completion. Steering can open another prompt at an
+# assistant boundary; its already-open span is completed before any queued turn.
 function run_chat!(chat::ChatModel)
-    # One turn at a time, AWAITED rather than spawned. Spawning let the loop come
-    # straight back around and start the next message while this turn was still
-    # streaming — so every queued bubble was promoted (and its prompt put on the
-    # wire) within milliseconds of being typed. That is why the queued badge never
-    # appeared, why two quick sends both claimed "next up", and why stop could not
-    # drain a queue: there wasn't one on our side, only the agent's own
-    # promptQueueing.
-    for user_msg in chat.user_messages
-        run_turn!(chat, user_msg)
+    for _ in chat.user_messages
+        while true
+            entry = next_submission(chat)
+            entry === nothing && break
+            run_submission!(chat, entry)
+        end
     end
     return nothing
 end
@@ -5343,12 +5300,14 @@ function main_consumer!(chat::ChatModel, messages)
                 push!(inflight, (Base.errormonitor(@async begin
                     try
                         process_update!(b, m)
+                        deliver_boundary_message!(chat)
                     catch e
                         @error "rendering a tool update failed" project_id = chat.project_id exception = (e, catch_backtrace())
                     end
                 end), m))
             else
                 process!(chat, m)
+                m isa AgentClientProtocol.AgentMessage && deliver_boundary_message!(chat)
             end
         catch e
             @error "rendering an agent message failed" project_id = chat.project_id exception = (e, catch_backtrace())
@@ -5683,7 +5642,7 @@ function await_cancel_settled!(chat::ChatModel)
     ok = timedwait(CANCEL_SETTLE_SECONDS; pollint = 0.05) do
         !(AgentClientProtocol.session_activity(c.conn) isa AgentClientProtocol.Cancelling)
     end
-    ok === :ok || @warn "cancel did not settle before the next prompt; sending anyway" project_id = chat.project_id
+    ok === :ok || @warn "cancel did not settle before the next prompt; delivery remains paused" project_id = chat.project_id
     return nothing
 end
 
@@ -5753,24 +5712,12 @@ const TASK_FEED_WIRE_LIMIT = 300
 
 # Open one turn for `user_msg` and hand its span to `f`.
 #
-# Runs IN the consumer so prompts hit the wire in user order: promote the queued
-# bubble, wait out anything in the way, then SEND the prompt (`prompt!` registers
-# + writes the frame synchronously; only the stream coalescer inside it is a
-# task). The user bubble is already on screen and persisted — `send_message!` did
-# that when the user hit send — so there is nothing to render here.
-#
-# A do-block rather than a function returning a span: the three ways this bails
-# before a prompt exists — chat closed, restart never settled, no client — just
-# return, and `f` never runs. No `nothing` to check and no "you must remember to
-# finish this" contract between two functions.
-#
-# The chat is busy across the WHOLE thing, bring-up included. That is deliberate:
-# the user has pressed send, and a spinner that only lights once the agent is up
-# reads as "Waiting for your next instruction" through the entire bind.
-function begin_turn(f, chat::ChatModel, user_msg::UserMessage)
+# Bind/restart/cancel barriers precede the handoff. A pending submission is
+# appended to history only after prompt! writes it, while holding the store
+# lock so the reply cannot overtake its user message.
+function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothing)
     s = shared(chat)
     return while_busy(chat) do
-        promote_queued_user_bubble!(chat)
         await_cancel_settled!(chat)
         # A new prompt is the boundary of any auto-wake episode that streamed
         # since the last turn: seal it and wait, so its messages persist +
@@ -5824,16 +5771,16 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage)
         # The turn's CONTENT does not come back from here — it is the main thread
         # talking, and `main_consumer!` is already rendering it. What we get is
         # the span: a one-shot response channel that settles with the stopReason.
-        turn = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
-            images=user_msg.images)
-        # The prompt is registered + on the wire: the oldest pending bubble
-        # (FIFO — matches the channel order under `send_message!`, same pairing
-        # `promote_queued_user_bubble!` relies on) has now been SEEN by the
-        # agent, so it stops counting as a fresh/unsent message for reconciles.
-        # A throw above leaves the bubble pending — the agent never got it.
-        lock(s.lock) do
-            isempty(s.pending_sends) || popfirst!(s.pending_sends)
+        turn = lock(s.lock) do
+            submission !== nothing && submission.status != :sending && return nothing
+            AgentClientProtocol.session_activity(cli.conn) isa AgentClientProtocol.Cancelling &&
+                error("The agent is still stopping; message has not been sent.")
+            span = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
+                images=user_msg.images)
+            submission === nothing || submission_sent!(s, submission, span)
+            span
         end
+        turn === nothing && return nothing
         return f(turn)
     end
 end
@@ -5926,7 +5873,7 @@ and do it."""
 
 # Composer placeholder while Yolo is armed — the message input doubles as the
 # reminders editor then (see `chat_input_area`).
-const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Enter to lock in"
+const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Press ✓ to save"
 
 # The sentinel on a line of its own (leading/trailing markdown punctuation and
 # whitespace tolerated, since agents like to bold or bullet a final line). A
@@ -6128,9 +6075,9 @@ said_something(chat::ChatModel, o::TurnOutcome) =
 # The chores are in a `finally` because they have to run for a turn that broke as
 # much as for one that ended: a chat whose spinner never stops and whose
 # permission cards never resolve is worse than the error that caused it.
-function finish_turn!(chat::ChatModel, turn)
+function finish_turn!(chat::ChatModel, turn;
+                      nstore0::Int=lock(() -> length(shared(chat).msgs_store), shared(chat).lock))
     s = shared(chat)
-    nstore0 = lock(() -> length(s.msgs_store), s.lock)
     errored = false
     # The agent's own word for how the turn ended. Read it off the response
     # rather than inferring it from `conn.cancelling`: that latch is dropped the
@@ -6180,9 +6127,14 @@ function finish_turn!(chat::ChatModel, turn)
         # otherwise wait out its full timeout and the card would linger on
         # screen. Resolve this chat's pending asks now (the reply lands on a dead
         # request id, which the agent ignores).
-        sweep_pending_asks!(chat)
-        report_silent_turn!(chat, outcome)
-        continue_yolo!(chat, outcome)
+        # A steering handoff can have its successor already on the wire.
+        # The older span must not dismiss the successor's questions or nudge it.
+        c = client(chat.agent)
+        if c === nothing || !AgentClientProtocol.session_live(c)
+            sweep_pending_asks!(chat)
+            report_silent_turn!(chat, outcome)
+            continue_yolo!(chat, outcome)
+        end
     end
     return nothing
 end
@@ -6739,51 +6691,10 @@ function restart_chat_session!(model::ChatModel)
     return nothing
 end
 
-# Single-entry "user submitted a message" path. Every call site (input area,
-# auto-prompt, scripted hooks) goes through here. We render + persist the user
-# bubble synchronously so the message appears the instant the user hits send —
-# previously the bubble was created inside `run_turn!`, which meant messages
-# submitted while an earlier turn was still running stayed invisible (queued
-# silently on the channel) until that turn finished. Now they show up as
-# "queued" bubbles immediately; `promote_queued_user_bubble!` clears the
-# `queued` flag when `run_turn!` actually picks them up.
-#
-# `images` are sent to the agent as multimodal content blocks; the caller is
-# responsible for embedding any file-path reference into `msg.text` so display
-# + replay see what claude does.
+# Pending submissions live outside history; see chat_queue.jl.
 function send_message!(model::ChatModel, msg::UserMsg;
-    images=AgentClientProtocol.ImageAttachment[])
-    s = shared(model)
-    # If there's a turn in flight, the bubble joins the queue (visually dim).
-    bubble = UserMsg(model, msg.text)
-    bubble.auto = msg.auto   # preserve the Yolo auto-continue marker for dim styling
-    # A REAL user message clears the stuck-loop guards: the streak and the
-    # repeat check are about the agent going round on its own, and anything you
-    # type is new input that deserves a fresh budget.
-    msg.auto || reset!(s.yolo_state)
-    # Queue state + position + enqueue in ONE critical section, and counted off
-    # `pending_sends` — the bubbles whose prompt hasn't reached the agent yet,
-    # i.e. the queue itself. Counting `msgs_store` in a separate lock let two
-    # near-simultaneous sends both observe zero waiting bubbles and both stamp
-    # position 1, so both rendered "next up".
-    #
-    # `pending_sends` also tracks the bubble as "not yet seen by the agent" until
-    # `begin_turn` delivers its prompt — a reconcile landing in between (the
-    # lazy bind on this very send) must keep it at the store's END and never
-    # anchor on it.
-    lock(model.lock) do
-        bubble.queued = s.busy_active[]
-        bubble.queue_pos = bubble.queued ? length(s.pending_sends) + 1 : 0
-        push!(s.pending_sends, bubble)
-    end
-    close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
-    # Refresh the lens vocabulary NOW that a user message exists, rather than
-    # waiting for end-of-turn (finish_turn!'s emit_lens_vocab). Otherwise the
-    # `/user_message` key isn't suggestable until the agent's reply lands — the
-    # user can't lens-filter their own just-sent message mid-turn.
-    emit_lens_vocab(model)
-    put!(s.user_messages,
-        UserMessage(msg.text, collect(AgentClientProtocol.ImageAttachment, images)))
+    images=AgentClientProtocol.ImageAttachment[], mode::Symbol=:done)
+    enqueue_message!(model, msg; images, mode)
     backfill_project_title!(model, msg.text)
     return nothing
 end
@@ -6846,80 +6757,6 @@ function record_bound_session!(model::ChatModel, session_id::AbstractString)
         @warn "record_bound_session!: persist failed" exception=e
     end
     notify_projects!(model.state)
-    return nothing
-end
-
-# `run_turn!` calls this right before driving the agent prompt for a popped
-# `UserMessage`. Finds the oldest UserMsg in `msgs_store` still marked queued
-# (FIFO matches the channel order under `send_message!`) and emits a
-# `user_unqueue` event so the browser drops the "queued" class. No-op when
-# the chat was idle — the just-pushed bubble was never queued.
-"""
-    drop_queued_sends!(chat) -> Int
-
-Discard every user message still waiting to be prompted, and relabel its bubble
-"not sent". Called by stop.
-
-The text is KEPT — silently deleting what someone typed is worse than not
-sending it — so the bubble stays dimmed and badged, and re-sending is a copy
-away. Returns how many were dropped.
-
-Drains `user_messages` (what the consumer would pick up) and `pending_sends`
-(the bubbles mirroring it) together, under the shared lock, so the two can't
-disagree about what is still queued.
-"""
-function drop_queued_sends!(chat::ChatModel)
-    s = shared(chat)
-    dropped = lock(s.lock) do
-        # Non-blocking drain: `isready` is false the moment the queue is empty,
-        # so this never waits on a producer.
-        while isready(s.user_messages)
-            take!(s.user_messages)
-        end
-        stuck = [(i - 1, m) for (i, m) in enumerate(s.msgs_store)
-                 if m isa UserMsg && m.queued]
-        for (_, m) in stuck
-            m.queued = false      # no longer waiting on us
-            m.queue_pos = 0
-        end
-        empty!(s.pending_sends)
-        stuck
-    end
-    isempty(dropped) && return 0
-    # Keep `.bt-queued` (dimmed) and swap the position badge for a plain reason:
-    # `user_unqueue` would clear the class and leave the bubble looking sent.
-    chat_emit(chat, Dict{String,Any}(
-        "type"  => "user_requeue",
-        "items" => [Dict{String,Any}("idx" => i, "label" => "not sent")
-                    for (i, _) in dropped]))
-    return length(dropped)
-end
-
-function promote_queued_user_bubble!(chat::ChatModel)
-    idx, moved = lock(chat.lock) do
-        found = nothing
-        for (i, m) in enumerate(chat.msgs_store)
-            m isa UserMsg && m.queued || continue
-            if found === nothing
-                m.queued = false; m.queue_pos = 0
-                found = i
-            else
-                m.queue_pos = max(1, m.queue_pos - 1)   # everyone behind moves up
-            end
-        end
-        # Store index (0-based for JS) + the new positions of those still waiting.
-        return (found, [(i - 1, m.queue_pos) for (i, m) in enumerate(chat.msgs_store)
-                        if m isa UserMsg && m.queued])
-    end
-    idx === nothing && return nothing
-    isempty(moved) || chat_emit(chat, Dict{String,Any}(
-        "type" => "user_requeue",
-        "items" => [Dict{String,Any}("idx" => i, "pos" => p) for (i, p) in moved]))
-    # Ship the store index (0-based for JS): the client must clear the badge
-    # on the CACHED node at that index — a DOM-only lookup misses bubbles
-    # that are virtually scrolled out, leaving a stale QUEUED badge that
-    # makes the whole chat read as wedged.
-    chat_emit(chat, Dict{String,Any}("type" => "user_unqueue", "idx" => idx - 1))
     return nothing
 end
 
@@ -7232,17 +7069,8 @@ function reconcile_replay!(model::ChatModel, replay)
     t0 = time()
     event, adopted_n = lock(model.lock) do
         existing = model.msgs_store
-        # Trailing store messages that are fresh user bubbles the agent hasn't
-        # seen (`pending_sends`, pushed by `send_message!`, popped once
-        # `begin_turn` delivered the prompt). They never anchor the merge and
-        # adopted history must land BEFORE them — the user's just-typed message
-        # stays the LAST message even when the bind-triggered reconcile floods
-        # in hundreds of adopted turns.
+        # Pending submissions are outside history and cannot anchor a replay.
         npending = 0
-        for m in Iterators.reverse(existing)
-            any(p -> p === m, model.pending_sends) || break
-            npending += 1
-        end
         plan = plan_reconcile(existing, candidates, npending)
         plan.mode == :noop && return (nothing, 0)
         adopted = ChatMsg[replayed_to_msg(model, m) for m in plan.adopt]
@@ -8259,17 +8087,12 @@ function chat_input_area(session::Session, model::ChatModel)
     text_input = DOM.textarea(
         model.yolo[] ? model.yolo_reminders[] : "";
         placeholder = map(y -> y ? YOLO_INPUT_PLACEHOLDER : "Message…", model.yolo),
-        title = map(y -> y ? "Enter to lock in the reminders" :
-                             "Enter to send  ·  Shift+Enter for newline", model.yolo),
+        title = "Write a message",
+        enterkeyhint = "enter",
         class = map(y -> y ? "bt-text-input bt-text-input-yolo" : "bt-text-input",
                     model.yolo),
-        rows = 1,
-        oninput=js"""event => {
-            event.target.style.height = 'auto';
-            event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
-        }""")
-    # Yolo toggle bar: a wide-and-short strip spanning the button column,
-    # right above the send/stop pair. Reads the per-session bridged child
+        rows = 1)
+    # Yolo toggle in the composer controls. Reads the per-session bridged child
     # (`model.yolo`) for label/class; WRITES through the shared source of
     # truth (`shared(model).yolo[]`) so every tab flips.
     yolo_click = Observable("")
@@ -8295,9 +8118,9 @@ function chat_input_area(session::Session, model::ChatModel)
             model.yolo);
         type = "button",
         class = map(y -> y ? "bt-send-btn bt-send-btn-yolo" : "bt-send-btn", model.yolo),
-        title = map(y -> y ? "Lock in reminders (Enter)" : "Send (Enter)", model.yolo))
+        title = map(y -> y ? "Lock in reminders" : "Send", model.yolo))
     stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
-        class="bt-stop-btn", title="Stop generation")
+        class="bt-stop-btn", title="Stop generation and pause queued messages")
     # Attaching an image had exactly two ways in: paste and drag-drop. Neither
     # exists on a phone, so the feature was desktop-only by accident. A file
     # input is the one affordance a mobile browser turns into the native
@@ -8334,8 +8157,7 @@ function chat_input_area(session::Session, model::ChatModel)
             const yolo = $(model.yolo);
             const reminders = $(model.yolo_reminders);
             const resize = () => {
-                input.style.height = 'auto';
-                input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+                input.dispatchEvent(new Event('bt-composer-resize'));
             };
             yolo.on(on => {
                 if (on) {
@@ -8352,13 +8174,28 @@ function chat_input_area(session::Session, model::ChatModel)
             });
         })();
     """
+    send_mode = DOM.div(
+        DOM.button("Queue when done"; type="button",
+            class="bt-btn bt-btn-ghost bt-send-mode-trigger",
+            title="Queue for when done", var"aria-label"="Queue for when done",
+            var"aria-haspopup"="menu", var"aria-expanded"="false"),
+        DOM.div(
+            [DOM.button(label; type="button", role="menuitemradio",
+                class="bt-btn bt-btn-ghost bt-send-mode-option",
+                var"data-send-mode"=mode, var"aria-checked"=mode == "done" ? "true" : "false")
+             for (mode, label) in (("done", "Queue for when done"),
+                 ("next", "Queue after current message"), ("interrupt", "Interrupt + send"))]...;
+            class="bt-send-mode-menu", role="menu", hidden=true),
+        class="bt-send-mode")
     DOM.div(
+        DOM.div(; class="bt-message-queue", role="region", var"aria-label"="Pending messages"),
+        DOM.div(; class="bt-queue-delivery", role="status", var"aria-live"="polite"),
         DOM.div(
             attach_btn, attach_input,
             text_input,
             DOM.div(
                 yolo_bar,
-                DOM.div(send_btn, stop_btn; class="bt-input-btn-row"),
+                DOM.div(send_mode, stop_btn, send_btn; class="bt-input-btn-row"),
                 class="bt-input-controls"),
             class="bt-input-row"),
         yolo_mode_js;
@@ -8603,8 +8440,11 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
         return ThoughtRenderCommand(String(get(msg, "id", "")))
     elseif type == "send"
         atts = get(msg, "attachments", Any[])
-        return SendCommand(String(get(msg, "text", "")),
-            atts isa AbstractVector ? collect(atts) : Any[])
+        return SendModeCommand(SendCommand(String(get(msg, "text", "")),
+            atts isa AbstractVector ? collect(atts) : Any[]),
+            send_mode(get(msg, "mode", "done")))
+    elseif type == "queue.action"
+        return QueueActionCommand(String(get(msg, "id", "")), String(get(msg, "action", "")))
     elseif type == "cancel"
         return CancelCommand(Int(get(msg, "seq", -1)))
     elseif type == "stop_tool"
@@ -8660,6 +8500,7 @@ function handle_command!(model::ChatModel, ::Session, ::InitCommand)
     # saved lenses. Broadcasts are fine — every tab of this chat shares the
     # same vocabulary, and saved lenses are global favorites.
     emit_lens_vocab(model)
+    emit_queue!(model)
     emit_saved_lenses(model, load_saved_lenses())
     return nothing
 end
@@ -8803,7 +8644,11 @@ function handle_command!(model::ChatModel, ::Session, cmd::ThoughtRenderCommand)
     return nothing
 end
 
-function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
+function handle_command!(model::ChatModel, session, cmd::SendCommand)
+    return handle_send!(model, cmd, :done)
+end
+
+function handle_send!(model::ChatModel, cmd::SendCommand, mode::Symbol)
     # (Session arg is unused — typed `::Any` so the send path is unit-testable
     # without a Bonito.Session, like the CancelCommand handler.)
     #
@@ -8836,7 +8681,7 @@ function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
     # submit. Errors (attachment-rejection above, or ACP send failures
     # surfaced by `send_message!`'s downstream code) flow back through
     # their own events.
-    send_message!(model, UserMsg(display_text); images=blocks)
+    send_message!(model, UserMsg(display_text); images=blocks, mode)
     return nothing
 end
 
@@ -8848,7 +8693,6 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # `client(model.agent)` is a single-field read. (Session arg is unused here —
     # typed `::Any` so the cancel path is unit-testable without a Bonito.Session.)
     c = client(model.agent)
-    c === nothing && return nothing
     s = shared(model)
     # Turn-scoped: a cancel aimed at a turn that already ended is DROPPED —
     # it must not kill whatever turn happens to be running now.
@@ -8857,35 +8701,13 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
         return nothing
     end
 
-    # Nothing to cancel means the indicator is LYING, and the honest response is
-    # to fix the indicator — not to punish the user for believing it.
-    #
-    # The stuck shape: an auto-wake episode opens `busy_active` off arriving
-    # frames, and its only end markers are a `usage_update` the agent tags with
-    # an autonomous origin (claude-agent-acp emits it conditionally, so it can
-    # simply be absent) and `begin_turn`. When the tag never comes, the sole
-    # remaining exit is a new turn — and `busy_active` is exactly what makes the
-    # composer queue instead of send. Stop was the one control left, and it ran
-    # `drop_queued_sends!` unconditionally: it deleted the message that would
-    # have released the chat, then cancelled nothing, leaving the spinner up. No
-    # user-reachable way out; observed live as a 53-minute wedge over an agent
-    # that had been idle the whole time.
-    #
-    # So stop is also the RECONCILE: the user telling us it is not running is
-    # ground truth we can check, and `session_live` checks it. Queued messages
-    # are KEPT — the consumer is free to pick them up, which is what the user
-    # wanted when they typed them.
-    if !AgentClientProtocol.session_live(c)
+    # Stop pauses the outbox even during lazy connection setup or while
+    # offline. A stale turn-scoped click above is the only exception.
+    drop_queued_sends!(model)
+    if c === nothing || !AgentClientProtocol.session_live(c)
         refresh_activity!(model)
         return nothing
     end
-
-    # Stop means stop the CHAT, not just this turn. Anything still waiting would
-    # otherwise start a fresh turn the moment the cancelled one ends — the user
-    # presses stop and the agent keeps answering. Drop the waiting prompts (the
-    # bubbles stay, relabelled) BEFORE cancelling, so the consumer can't pick one
-    # up in the window between the cancel landing and the turn winding down.
-    drop_queued_sends!(model)
 
     # A graceful `session/cancel` makes ACP close the active turn's update
     # channel; the `prompt!` loop ends, `run_turn!`'s `finally` clears

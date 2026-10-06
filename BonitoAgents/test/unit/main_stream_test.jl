@@ -621,18 +621,17 @@ end
     @test BT.session_activity(model) isa ACP.Idle
     @test s.busy_active[] == false
 
-    # So the composer SENDS rather than queueing behind a turn that will never
-    # come...
-    BT.send_message!(model, BT.UserMsg("is it actually still running?")) 
+    # With no consumer in this unit harness, the submission stays in the
+    # outbox. It must not appear in history before being handed to the agent.
+    BT.send_message!(model, BT.UserMsg("is it actually still running?"))
     @test timedwait(() -> Base.n_avail(s.user_messages) == 1, 5.0) === :ok
-    bubble = last([m for m in s.msgs_store if m isa BT.UserMsg])
-    @test bubble.queued == false
+    @test !any(m -> m isa BT.UserMsg, s.msgs_store)
+    @test only(s.pending_sends).status == :waiting
 
-    # ...and a stop that finds nothing to cancel KEEPS what the user typed
-    # instead of relabelling it "not sent".
+    # Stop consistently pauses unsent text, even when there is no live turn.
     BT.handle_command!(model, nothing, BT.CancelCommand())
-    @test Base.n_avail(s.user_messages) == 1
-    @test bubble.queued == false
+    @test only(s.pending_sends).status == :paused
+    @test BT.next_submission(model) === nothing
     @test s.busy_active[] == false
     close(model)
 end
@@ -671,7 +670,7 @@ end
 end
 
 # The other half: when the agent IS working, stop keeps its old teeth.
-@testset "stop still cancels and clears the queue when work is live" begin
+@testset "stop cancels live work and pauses the outbox" begin
     model, cli = live_model()
     s = BT.shared(model)
     # A real un-prompted episode, settled the way the dispatcher settles it.
@@ -687,7 +686,8 @@ end
     # prompt to settle, `Cancelling` resolves straight to `Idle`, so a second
     # stop over the same gap no-ops rather than acting again.
     @test ACP.session_activity(cli.conn) isa ACP.Idle
-    @test Base.n_avail(s.user_messages) == 0     # queue dropped, as stop means
+    @test only(s.pending_sends).status == :paused
+    @test BT.next_submission(model) === nothing
     # ...and the session is NOT muted by any of it. Asserted on the STORE, not
     # on `cli.messages`: the renderer this harness starts drains that channel,
     # so its depth is 0 whether frames flow or not.

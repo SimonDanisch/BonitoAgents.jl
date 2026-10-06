@@ -1409,25 +1409,46 @@ const ChatStyles = Bonito.Styles(
         "box-shadow" => "var(--bt-shadow-sm)",
         "position" => "relative",
         "transition" => "opacity 160ms ease"),
-    # Queued state: the user submitted while a prior turn was still running.
-    # Dim the bubble and badge it "queued" until `user_unqueue` promotes it.
-    CSS(".bt-user-msg.bt-queued",
-        "opacity" => "0.65",
-        # Room for the ::after badge, which hangs below the bubble. Without it
-        # consecutive queued bubbles stack tight enough that one bubble's badge
-        # runs into the next one.
-        "margin-bottom" => "18px"),
-    CSS(".bt-user-msg.bt-queued::after",
-        # Position-aware ("next up", "queued · #3"), re-numbered in place as the
-        # queue drains. Falls back to "queued" when no position is known.
-        "content" => "attr(data-queue-label, \"queued\")",
-        "position" => "absolute",
-        "right" => "10px", "bottom" => "-16px",
-        "font-size" => "10px",
-        "font-weight" => "500",
-        "letter-spacing" => "0.04em",
-        "color" => "var(--bt-text-faint)",
-        "text-transform" => "uppercase"),
+    # Pending messages occupy one line each; details/actions expand on demand.
+    CSS(".bt-message-queue", "align-self" => "stretch", "max-height" => "24vh", "overflow-y" => "auto",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)"),
+    CSS(".bt-message-queue:empty, .bt-queue-delivery:empty, .bt-message-queue[hidden], .bt-send-mode-menu[hidden]",
+        "display" => "none"),
+    CSS(".bt-queue-item + .bt-queue-item", "border-top" => "1px solid var(--bt-border)"),
+    CSS(".bt-queue-summary", "display" => "flex", "align-items" => "center",
+        "gap" => "var(--bt-space-2)", "padding" => "var(--bt-space-2)", "cursor" => "pointer",
+        "min-height" => "36px", "box-sizing" => "border-box", "list-style" => "none"),
+    CSS(".bt-queue-summary::-webkit-details-marker", "display" => "none"),
+    CSS(".bt-queue-summary::before", "content" => "'▸'", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-queue-item[open] > .bt-queue-summary::before", "content" => "'▾'"),
+    CSS(".bt-queue-preview", "flex" => "1", "min-width" => "0", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "white-space" => "nowrap", "font-size" => "13px"),
+    CSS(".bt-queue-badge, .bt-queue-status", "font-size" => "12px", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-queue-badge", "flex-shrink" => "0", "white-space" => "nowrap"),
+    CSS(".bt-queue-item[data-status=paused] .bt-queue-badge", "color" => "var(--bt-warning)"),
+    CSS(".bt-queue-text", "white-space" => "pre-wrap", "overflow-wrap" => "anywhere",
+        "max-height" => "5em", "overflow-y" => "auto"),
+    CSS(".bt-queue-detail", "padding" => "0 var(--bt-space-2) var(--bt-space-2)",
+        "display" => "flex", "flex-direction" => "column", "gap" => "var(--bt-space-1)"),
+    CSS(".bt-queue-actions, .bt-send-mode", "display" => "flex",
+        "align-items" => "center"),
+    CSS(".bt-queue-actions", "gap" => "var(--bt-space-2)"),
+    # Announce delivery to screen readers; the delivered message itself is
+    # visible in history. No separate receipt control in the composer.
+    CSS(".bt-queue-delivery", "position" => "absolute", "width" => "1px", "height" => "1px",
+        "overflow" => "hidden", "clip-path" => "inset(50%)", "white-space" => "nowrap"),
+    CSS(".bt-send-mode", "position" => "relative"),
+    CSS(".bt-send-mode-trigger", "min-height" => "36px", "padding" => "0",
+        "font-size" => "11px", "white-space" => "nowrap", "gap" => "var(--bt-space-1)",
+        "justify-content" => "center"),
+    CSS(".bt-send-mode-trigger::after", "content" => "'▾'", "flex-shrink" => "0"),
+    CSS(".bt-send-mode-menu", "position" => "absolute", "bottom" => "calc(100% + var(--bt-space-2))",
+        "right" => "0", "max-width" => "calc(100vw - 2 * var(--bt-space-4))",
+        "z-index" => "40", "display" => "flex", "flex-direction" => "column",
+        "background" => "var(--bt-surface)", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)", "box-shadow" => "var(--bt-shadow-sm)"),
+    CSS(".bt-send-mode-option", "white-space" => "nowrap", "text-align" => "left", "min-height" => "40px"),
+    CSS(".bt-send-mode-option[aria-checked=true]", "color" => "var(--bt-accent)"),
     # Yolo auto-continue nudge: an app-generated (not user) bubble. Muted so it
     # reads as a system message — dimmer, desaturated accent, lighter weight.
     CSS(".bt-user-msg.bt-user-msg-auto",
@@ -3059,10 +3080,8 @@ const ChatStyles = Bonito.Styles(
         "display" => "none",
         "position" => "absolute",
         "left" => "50%",
-        # Bottom offset sits above the input area; chosen large enough
-        # that on mobile (where the input area can grow to ~120px with
-        # an expanded textarea + attachments strip) the pill stays clear.
-        "bottom" => "92px",
+        # Anchor to the actual composer, including its queue and attachments.
+        "bottom" => "calc(100% + var(--bt-space-2))",
         "transform" => "translateX(-50%)",
         "z-index" => "20",
         "align-items" => "center", "gap" => "8px",
@@ -3145,12 +3164,10 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%"),
-    # Button column right of the textarea: the Yolo toggle bar on top, the
-    # send/stop pair below. `stretch` makes the bar span the pair's width
-    # (wide-and-short) without hardcoding it.
+    # Controls share one row on both desktop and phone.
     CSS(".bt-input-controls",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "6px", "align-items" => "stretch",
+        "display" => "flex", "flex-direction" => "row",
+        "gap" => "var(--bt-space-2)", "align-items" => "center",
         "flex-shrink" => "0"),
     CSS(".bt-input-btn-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end"),
@@ -3161,8 +3178,8 @@ const ChatStyles = Bonito.Styles(
         "border" => "1px solid var(--bt-border)",
         "background" => "var(--bt-surface)",
         "color" => "var(--bt-text-muted)",
-        "font-size" => "11px", "line-height" => "1",
-        "padding" => "3px 0",
+        "font-size" => "11px", "line-height" => "1", "flex-shrink" => "0",
+        "padding" => "6px",
         "border-radius" => "8px",
         "cursor" => "pointer",
         "white-space" => "nowrap",
@@ -3302,20 +3319,16 @@ const ChatStyles = Bonito.Styles(
     # drop zone is "the whole chat", not just one nested element.
     CSS(".bt-app.bt-drag-over",
         "box-shadow" => "inset 0 0 0 3px var(--bt-accent)"),
-    CSS(".bt-text-input",
-        "flex" => "1 1 auto", "min-width" => "0",
+    CSS(".bt-text-input, .bt-input-measure",
+        "flex" => "1 1 auto", "min-width" => "0", "width" => "0",
         "border" => "1px solid var(--bt-border-strong)",
         "border-radius" => "20px",
         "padding" => "10px 14px",
         "font-size" => "16px",                          # iOS no-zoom threshold
-        # min-height matches the FULL controls column beside it: send/stop 40px
-        # + 6px gap + the Yolo bar (~18px) = 64px. With the old 40px the
-        # textarea only lined up with the button pair and the Yolo strip's
-        # height was dead space above it. min-height (not height) because the
-        # auto-resize oninput writes an explicit style.height from scrollHeight:
-        # CSS min-height clamps that inline value, so the box grows past 64 up
-        # to the 120 cap and shrinks back to 64 — without touching the JS.
-        "min-height" => "64px", "max-height" => "120px",
+        # Let the browser size text without collapsing the focused editor on
+        # every keystroke. The JS mirror is only for older browsers.
+        "field-sizing" => "content",
+        "min-height" => "44px", "max-height" => "min(320px, 45dvh)",
         "font-family" => "inherit",
         "color" => "var(--bt-text)",
         "background" => "var(--bt-bg)",
@@ -3323,6 +3336,13 @@ const ChatStyles = Bonito.Styles(
         "resize" => "none", "overflow-y" => "auto",
         "line-height" => "1.4",
         "transition" => "border-color 120ms, box-shadow 120ms"),
+    CSS(".bt-text-input[data-bt-sizing-fallback]", "field-sizing" => "fixed"),
+    CSS(".bt-input-measure",
+        "position" => "fixed", "left" => "0", "top" => "0",
+        "visibility" => "hidden", "pointer-events" => "none",
+        "height" => "0", "min-height" => "0", "max-height" => "none",
+        "border" => "0", "overflow" => "hidden", "field-sizing" => "fixed",
+        "contain" => "layout style paint"),
     CSS(".bt-text-input::placeholder",
         "color" => "var(--bt-text-faint)"),
     CSS(".bt-text-input:focus",
@@ -3355,15 +3375,12 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-text-input::-webkit-scrollbar-button, .bt-subsection-body::-webkit-scrollbar-button",
         "display" => "none"),
 
-    # Send / stop buttons — circles, big enough for thumb. `box-sizing:
-    # border-box` is load-bearing: stop has a 1px border, send doesn't, so
-    # without it the buttons end up 42x42 vs 40x40 and the row baselines
-    # disagree by a pixel.
+    # Keep Send and Stop equally sized circles despite Stop's border.
     CSS(".bt-send-btn, .bt-stop-btn",
         "border" => "none", "border-radius" => "50%",
-        "width" => "40px", "height" => "40px",
+        "width" => "36px", "height" => "36px",
         "box-sizing" => "border-box",
-        "font-size" => "20px",                       # larger glyph fills the circle
+        "font-size" => "18px",                       # larger glyph fills the circle
         "line-height" => "1",
         "cursor" => "pointer", "flex-shrink" => "0",
         "display" => "flex", "align-items" => "center",
@@ -3392,12 +3409,11 @@ const ChatStyles = Bonito.Styles(
 
     # ── Attach ───────────────────────────────────────────────────────────────
     # Sits at the START of the input row, left of the text field, where every
-    # chat app puts it. 40px square: below ~40 a touch target is a coin toss,
-    # and this button exists FOR touch — paste and drag-drop already cover the
-    # desktop, and neither exists on a phone.
+    # chat app puts it. Keep its square target aligned with Send and Stop;
+    # phones use this picker instead of desktop paste and drag-drop.
     CSS(".bt-attach-btn",
         "flex" => "0 0 auto", "align-self" => "flex-end",
-        "width" => "40px", "height" => "40px",
+        "width" => "36px", "height" => "36px",
         "display" => "flex", "align-items" => "center", "justify-content" => "center",
         "background" => "transparent", "border" => "1px solid transparent",
         "border-radius" => "999px", "cursor" => "pointer", "padding" => "0",
@@ -3467,7 +3483,11 @@ const ChatStyles = Bonito.Styles(
         # Yolo/send/stop controls drop to a second row. In the single wrapped
         # row the flex-shrink:0 button column (~110px) squeezed a 390px phone's
         # textarea to ~200px — an awkward typing target.
-        CSS(".bt-input-row", "flex-wrap" => "wrap", "row-gap" => "8px"),
+        CSS(".bt-input-row", "flex-wrap" => "wrap", "gap" => "var(--bt-space-1)", "row-gap" => "8px"),
+        CSS(".bt-input-controls, .bt-input-btn-row", "min-width" => "0", "gap" => "var(--bt-space-1)"),
+        CSS(".bt-input-btn-row", "flex" => "1"),
+        CSS(".bt-send-mode", "flex" => "1", "min-width" => "0"),
+        CSS(".bt-send-mode-trigger", "width" => "100%"),
         CSS(".bt-text-input", "flex" => "1 1 100%"),
         # DOM order is attach, input, controls; wrap puts the 100%-basis input
         # on its own row but strands attach ABOVE it. order fixes the rows:
@@ -3475,13 +3495,15 @@ const ChatStyles = Bonito.Styles(
         CSS(".bt-attach-btn", "order" => "1", "flex" => "0 0 auto"),
         CSS(".bt-input-controls",
             "order" => "2",
-            "flex" => "1 1 auto",
+            "flex" => "1 1 0",
             "flex-direction" => "row",
             "align-items" => "center",
             "justify-content" => "flex-end",
-            "gap" => "10px"),
-        # The bar's `padding: 3px 0` assumes the desktop column layout
-        # stretches it wide; in a row that collapses to bare "Yolo" text
-        # glued to the Send circle.
-        CSS(".bt-yolo-bar", "padding" => "8px 12px")),
+            "gap" => "var(--bt-space-1)")),
+    CSS("@media (max-width: 360px)",
+        CSS(".bt-input-area", "padding-left" => "var(--bt-space-2)", "padding-right" => "var(--bt-space-2)"),
+        CSS(".bt-input-row, .bt-input-controls, .bt-input-btn-row", "gap" => "2px"),
+        CSS(".bt-attach-btn, .bt-stop-btn, .bt-send-btn", "width" => "32px", "height" => "32px"),
+        CSS(".bt-yolo-bar", "padding" => "6px"),
+        CSS(".bt-send-mode-trigger", "font-size" => "10px", "min-height" => "32px", "gap" => "2px")),
 )

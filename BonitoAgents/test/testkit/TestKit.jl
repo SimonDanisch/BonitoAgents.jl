@@ -2151,17 +2151,30 @@ end
 """
     screenshot(s, path)
 
-Save a PNG of the current Electron window. Synchronous: blocks until the
-file lands on disk so the next `Read` call sees it.
+Save a PNG of the complete renderer viewport, including an emulated phone
+viewport taller than the host window. Blocks until the file lands on disk.
 """
 function screenshot(s::TestServer, path::AbstractString; timeout::Real = 8)
     ctx = s.browser[]
     ctx === nothing && error("open_browser first")
     path = abspath(String(path))
     mkpath(dirname(path))
-    # ECT.screenshot drives the main-process capturePage and writes the PNG
-    # synchronously before returning.
-    return ECT.screenshot(ctx; path = path)
+    # Phone emulation can exceed the host surface. Enlarge that surface
+    # before capture, then clip to the emulated viewport (no blank desktop).
+    # CDP captureBeyondViewport temporarily changes Electron's emulated layout.
+    run(ctx.app, """(async () => {
+        const win = electron.BrowserWindow.fromId($(ctx.window.id));
+        const wc = win.webContents;
+        const viewport = await wc.executeJavaScript('({width:innerWidth,height:innerHeight})');
+        const original = win.getContentSize();
+        try {
+            win.setContentSize(Math.max(original[0], viewport.width), Math.max(original[1], viewport.height));
+            await wc.executeJavaScript('new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))');
+            const shot = await wc.capturePage({x:0,y:0,width:viewport.width,height:viewport.height});
+            require('fs').writeFileSync($(json(path)), shot.toPNG());
+        } finally { win.setContentSize(...original); }
+    })()""")
+    return path
 end
 
 # Tiny JSON-encode helper (no JSON3 dep in the test module).
