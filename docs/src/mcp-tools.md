@@ -211,6 +211,16 @@ for as long as the worker is online (`https://<server>/s/<token>/`):
   the agent. Interactive markdown is such an app:
   `using Bonito, Markdown; App() do; s = Bonito.Slider(1:10); DOM.div(md"Pick: $(s)"); end`
   (a plain Julia file: it loads what it uses).
+- **Other files** are served directly, including images, videos and documents.
+  Only that file is reachable; HTML and SVG are sandboxed without scripts.
+
+You can also click **Share** on a `bt_show` preview or a successful
+`bt_julia_eval` result, then open or copy the generated link. A live result is
+shared as the value already displayed: its eval code is not run again, and
+viewers can interact with the app. That link needs the original Julia session
+and result to stay open. Closing the result or restarting its Julia session
+ends its availability. To make an app restartable, save it as a Julia file and
+share that file with `bt_share`.
 
 The token is the permission; a password can be set on top. Settings lists your
 links (an admin sees all): open, copy, set or remove the password, end. Behind a

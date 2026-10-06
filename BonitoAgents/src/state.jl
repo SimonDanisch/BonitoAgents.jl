@@ -125,8 +125,8 @@ mutable struct ProjectInfo
     # The chat's title — the ONE value every view shows, exactly as shown. The
     # header input binds a session child of it; the homebar row, overview card
     # and discovered-session row read `p.title[]` on rebuild. Never empty: it
-    # starts as the folder name (`default_title`), the first meaningful prompt
-    # replaces that (`send_message!`), a user edit pins it, a blank edit puts
+    # starts as the folder name (numbered on collision), a user edit replaces
+    # it, and a blank edit puts
     # the default back. Writing it is the whole job: the hook `track_project!`
     # installs persists the table and fans the change out to every tab, so no
     # writer has to remember either.
@@ -243,8 +243,8 @@ Base.@kwdef mutable struct ChatIconState
     lock::ReentrantLock = ReentrantLock()
 end
 
-# A shared link (shares.jl): one file on a worker, a markdown page or a Julia
-# file whose value is a Bonito app, for anyone with the link. `id` is random;
+# A shared link (shares.jl): one worker file or an already held eval result,
+# for anyone with the link. `id` is random;
 # the link's token is derived from it with the server's url key, so the records
 # on disk do not hold usable links. `env_path` is the project an app runs in
 # ("" for a temp env). No password: `password_hash == ""`.
@@ -258,7 +258,12 @@ struct ShareLink
     password_salt::String
     password_hash::String
     created::DateTime
+    project_id::String       # live results: owning chat, used to locate the bridge
+    result_ref::String       # "prefix/holder" pins this Julia session; empty for files
 end
+
+ShareLink(id, owner, worker_id, path, env_path, title, salt, hash, created) =
+    ShareLink(id, owner, worker_id, path, env_path, title, salt, hash, created, "", "")
 
 # A share host's live-render bridge: which worker it serves, and the assets it
 # proxies (which the login gate lets through for app pages).
@@ -277,10 +282,11 @@ struct ShareRegistry
     tokens::Dict{String,String}                    # token => id
     pages::Dict{String,Bonito.Session}             # open app pages, by root session id
     bridges::Dict{String,ShareBridge}              # by bridge prefix
+    asset_checks::Dict{String,Function}            # shared result page => scoped asset check
 end
 ShareRegistry() = ShareRegistry(ReentrantLock(), Observable(Dict{String,ShareLink}()),
                                 Dict{String,String}(), Dict{String,Bonito.Session}(),
-                                Dict{String,ShareBridge}())
+                                Dict{String,ShareBridge}(), Dict{String,Function}())
 
 # A chat's turn that was in flight when its worker's link went down
 # (crash_recovery.jl): which run of the worker it ran on, the chat's turn number
@@ -997,20 +1003,18 @@ worker_color(worker_id::AbstractString) =
     "oklch(52% 0.19 $(Int(hash("worker:" * worker_id) % 360)))"
 worker_color(w::WorkerInfo) = worker_color(w.worker_id)
 
-# The title a chat starts with, before a prompt or the user names it: its folder.
+# The base title a chat starts with: its folder.
 default_title(p::ProjectInfo) = p.name
 
-# Has a prompt or the user named it yet? Views never ask — they show `p.title[]`
-# either way — only the writers that must not overwrite a name do (the
-# first-prompt backfill, the repair sweep, the debug-chat promotion), plus the
-# homebar membership below.
+# Does the title differ from its folder? Includes numbered defaults and custom
+# names. Views show `p.title[]` either way.
 titled(p::ProjectInfo) = p.title[] != default_title(p)
 
 """
     chat_in_sidebar(p) -> Bool
 
 Whether `p` belongs in the homebar's "Open chats" list: the user has
-interacted with it (a backfilled/edited `title` or a bound `resume_session_id`)
+interacted with it (a distinct `title` or a bound `resume_session_id`)
 AND hasn't since closed it via the ✕ (`dismissed`). This is the single source
 of truth shared by the sidebar list, its per-entry LED status sweep, and the
 folder→threads browser's "already open, hide it" dedup — so all three agree on
@@ -1149,9 +1153,20 @@ notify_workers!(s::ServerState)  = safe_notify!(root_state(s).workers)
 # backfill, header edit, dev API, the repair sweep) persists the table and
 # notifies every tab by itself. Saves nothing on entry: creation paths save the
 # new record themselves, and the loader has nothing new to write.
-function track_project!(s::ServerState, p::ProjectInfo)
+function track_project!(s::ServerState, p::ProjectInfo; new_chat::Bool = false)
     isempty(p.owner) && (p.owner = acting_owner(s))
     lock(s.lock) do
+        if new_chat && p.title[] == default_title(p)
+            used = Set(q.title[] for q in values(s.projects[]) if
+                       q.id != p.id && q.owner == p.owner && !q.dismissed)
+            title = default_title(p)
+            suffix = 2
+            while title in used
+                title = "$(default_title(p)) $suffix"
+                suffix += 1
+            end
+            p.title[] = title
+        end
         s.projects[][p.id] = p
     end
     on(p.title) do _
@@ -1169,7 +1184,7 @@ end
 
 # A new project: into the table, onto disk, out to every tab.
 function add_project!(s::ServerState, p::ProjectInfo)
-    track_project!(s, p)
+    track_project!(s, p; new_chat = true)
     save_projects!(s)
     notify_projects!(s)
     return p

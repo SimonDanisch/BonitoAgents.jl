@@ -110,6 +110,15 @@ else
     else
         info "no data at $DATA_DIR"
     fi
+    # The services' own system user, whose home the data dir was. Kept data
+    # keeps it: it owns the files.
+    step "Remove the service user"
+    if getent passwd "$NAME" > /dev/null; then
+        sudo userdel "$NAME"
+        ok "removed $NAME"
+    else
+        info "no user $NAME"
+    fi
     step "Remove config dir"
     if [[ -n "$CONFIG_DIR" && -d "$CONFIG_DIR" ]]; then
         sudo rm -rf "$CONFIG_DIR"

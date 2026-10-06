@@ -42,21 +42,15 @@
         @test !BT.titled(reload(root).projects[]["p1"])
     end
 
-    @testset "the first prompt titles it: every bound view, the table, the disk" begin
+    @testset "prompts never rename the folder title" begin
         model = BT.ChatModel(tab_a, p.server_path; project_id = "p1",
                              agent = BT.WorkerAgent(tab_a, "wid-a", "/p"))
-        BT.backfill_project_title!(model, "Wie bekomme ich die ganzen player daten aus dem replay")
-        @test startswith(p.title[], "Wie bekomme")
-        @test BT.titled(p)
-        @test shown_a[] == p.title[]
-        @test shown_b[] == p.title[]
-        @test tables_b[] == 1
-        @test BT.chat_in_sidebar(p)
-        @test reload(root).projects[]["p1"].title[] == p.title[]
-        # A later prompt never retitles.
-        BT.backfill_project_title!(model, "und jetzt was ganz anderes")
-        @test startswith(p.title[], "Wie bekomme")
-        @test tables_b[] == 1
+        BT.send_message!(model, BT.UserMsg("Wie bekomme ich die ganzen player daten aus dem replay"))
+        BT.send_message!(model, BT.UserMsg("und jetzt was ganz anderes"))
+        @test p.title[] == "HOTS"
+        @test shown_a[] == shown_b[] == "HOTS"
+        @test tables_b[] == 0
+        @test reload(root).projects[]["p1"].title[] == "HOTS"
     end
 
     @testset "a rename from the other tab" begin
@@ -64,11 +58,11 @@
         @test p.title[] == "HOTS renamed"
         @test shown_a[] == "HOTS renamed"
         @test shown_b[] == "HOTS renamed"
-        @test tables_b[] == 2
+        @test tables_b[] == 1
         @test reload(root).projects[]["p1"].title[] == "HOTS renamed"
         # Committing the same value is a no-op: no rebuild, no rewrite.
         BT.set_project_title!(tab_b, "p1", "HOTS renamed")
-        @test tables_b[] == 2
+        @test tables_b[] == 1
         @test_throws ErrorException BT.set_project_title!(root, "no-such-project", "x")
     end
 
@@ -76,7 +70,7 @@
         p.title[] = "direct"
         @test shown_a[] == "direct"
         @test shown_b[] == "direct"
-        @test tables_b[] == 3
+        @test tables_b[] == 2
         again = reload(root)
         @test again.projects[]["p1"].title[] == "direct"
         # …and a project loaded back from disk is hooked the same way.
@@ -100,4 +94,20 @@
         @test shown_a[] == "HOTS"
         @test shown_b[] == "after tab close"
     end
+    @testset "number defaults once; allow explicit duplicate names" begin
+        fresh = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
+        make(id) = BT.ProjectInfo(id, "VideoEdit", "wid-a", joinpath(fresh.working_dir, id),
+                                  "/home/u/VideoEdit", now(UTC))
+        a, b, c = make("a"), make("b"), make("c")
+        foreach(p -> BT.add_project!(fresh, p), (a,b,c))
+        @test [p.title[] for p in (a,b,c)] == ["VideoEdit", "VideoEdit 2", "VideoEdit 3"]
+        @test reload(fresh).projects[]["b"].title[] == "VideoEdit 2"
+        BT.set_project_title!(b, "VideoEdit")
+        @test b.title[] == "VideoEdit"
+        c.dismissed = true
+        d = make("d"); BT.add_project!(fresh, d)
+        @test d.title[] == "VideoEdit 2"
+        @test reload(fresh).projects[]["b"].title[] == "VideoEdit"
+    end
+
 end

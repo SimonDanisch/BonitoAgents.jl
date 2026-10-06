@@ -870,8 +870,12 @@ function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
     close_button = !r.closable ? nothing : Bonito.DOM.button("✕"; class = "bt-embed-close",
         title = "Close this app and free its memory",
         onclick = Bonito.js"(e) => { e.stopPropagation(); $(freed).notify(true); }")
-    node = Bonito.DOM.div(close_button, body; class = "bt-remote-ref")
+    # A mount replaces its target's children. Keep the owner's close control
+    # outside that target so it survives the first live render.
+    content = Bonito.DOM.div(body; class = "bt-remote-content")
+    node = Bonito.DOM.div(close_button, content; class = "bt-remote-ref")
     node_id = Bonito.uuid(session, node)
+    content_id = Bonito.uuid(session, content)
     render_sub = Ref{Union{Nothing,String}}(nothing)
     Bonito.on(session, freed) do yes
         yes || return
@@ -888,7 +892,7 @@ function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
     # round-trips (open_root) so it runs inside the async mount, not in jsrender.
     Base.errormonitor(@async try
         prefix = ensure_page_root!(Bonito.root_session(session), eb)
-        sub = String(call_ctrl(eb, "mount"; sub = r.session_id, root = prefix, node = node_id))
+        sub = String(call_ctrl(eb, "mount"; sub = r.session_id, root = prefix, node = content_id))
         render_sub[] = sub
         Bonito.on(session, session.on_close) do _
             close_remote_sub!(eb, sub)

@@ -420,7 +420,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     end
 
     # ONE unified "Open chats" list. A project is "open" iff the user has
-    # touched it before — `title` backfilled or `resume_session_id` set
+    # touched it before — distinct `title` or `resume_session_id` set
     # (both persist in projects.json, so the list survives a server OR
     # worker restart). The per-entry glow encodes liveness:
     #   green pulse — agent turn in flight (busy_active true) = "working"
@@ -450,17 +450,11 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         keep = Set(p.id for p in open_projs)
         filter!(kv -> kv.first in keep, rows)
 
-        # `[WW] <title>`: WW is the worker's editable initials, carried by the
-        # icon. Two siblings of the same folder get a tail thread-tag so their
-        # rows stay distinguishable when the titles coincide.
-        base(p) = p.title[]
-        base_counts = Dict{String,Int}()
-        for p in open_projs; base_counts[base(p)] = get(base_counts, base(p), 0) + 1; end
-
+        # New defaults are numbered at creation. Show the saved title verbatim,
+        # including duplicates the user chose by editing it.
         map(open_projs) do p
             t, wn = worker_label(workers, p)
-            b = base(p)
-            label = base_counts[b] > 1 ? "$b · $(thread_tag(p))" : b
+            label = p.title[]
             st = chat_status(state, p)
             col = worker_color(p.worker_id)
             tooltip = "$(wn) [$t] · $label · folder: $(p.name) · $(st)"

@@ -35,6 +35,15 @@ check() {   # check "what" command...
 status() { curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -k --resolve "$1:$HTTPS_PORT:127.0.0.1" "$2" 2> /dev/null; }
 body()   { curl -sS --max-time 10 -k --resolve "$1:$HTTPS_PORT:127.0.0.1" "$2" 2> /dev/null; }
 in_list() { local x="$1"; shift; [[ " $* " == *" $x "* ]]; }
+# The unit's process belongs to the install's own system user, not to whoever ran it.
+runs_as_service() { [[ "$(ps -o uid= -p "$(systemctl show "$NAME-$1" -p MainPID --value)" | tr -d ' ')" == "$(id -u "$NAME")" ]]; }
+service_user_checks() {
+    for unit in "$@"; do
+        check "$NAME-$unit runs as $NAME" runs_as_service "$unit"
+    done
+    check "$NAME has no login shell" test "$(getent passwd "$NAME" | cut -d: -f7)" = /usr/sbin/nologin
+    check "$NAME is in no group but its own (no sudo, no docker)" test "$(id -Gn "$NAME")" = "$NAME"
+}
 secrets_digest() { sudo sh -c "cd $STATE && sha256sum proxy_key authelia_jwt_secret authelia_session_secret authelia_storage_key accounts.json url_key"; }
 
 install() {
@@ -56,6 +65,7 @@ checks() {
         <(curl -sS --max-time 10 -H "Remote-User: roundtrip" -H "Remote-Groups: admins" "http://127.0.0.1:$PORT/")
     check "Caddy's admin API is off" bash -c "! curl -s --max-time 3 http://127.0.0.1:2019/config/ > /dev/null"
     check "the proxy's files are private" test "$(sudo stat -c %a "/var/lib/$NAME/caddy/Caddyfile")" = 600
+    service_user_checks server authelia caddy
 }
 
 echo "==> 1. install"
@@ -85,6 +95,7 @@ echo "==> 3. uninstall: the services go, the data stays"
 bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --yes
 removed
 check "projects, accounts and secrets are kept" test "$(secrets_digest)" = "$before"
+check "…and the user that owns them" getent passwd "$NAME"
 
 echo "==> 4. install again over the kept data"
 log3="$(mktemp)"
@@ -97,6 +108,7 @@ echo "==> 5. uninstall --purge: nothing is left"
 bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --purge --yes
 removed
 check "its data is gone" test ! -e "/var/lib/$NAME"
+check "its user is gone" bash -c "! getent passwd $NAME > /dev/null"
 
 # ── Behind a tunnel ───────────────────────────────────────────────────────────
 # What a tunnel sees: the server's plain port on 127.0.0.1, one host name.
@@ -115,6 +127,7 @@ tunnel_checks() {
     check "the worker installer is public, and points at the tunnel" \
         grep -q "https://$DOMAIN" <(curl -sS --max-time 10 "http://127.0.0.1:$PORT/install.sh")
     check "the answers are saved" sudo grep -q '"tls": "tunnel"' "$STATE/proxy.json"
+    service_user_checks server authelia
 }
 tunnel_install() {
     bash "$ASSETS/install_server.sh" --instance "$INSTANCE" "$@" --no-update --no-prompt
@@ -147,6 +160,7 @@ echo "==> 9. uninstall --purge"
 bash "$ASSETS/uninstall_server.sh" --instance "$INSTANCE" --purge --yes
 removed
 check "its data is gone" test ! -e "/var/lib/$NAME"
+check "its user is gone" bash -c "! getent passwd $NAME > /dev/null"
 
 echo ""
 if [[ $failures -eq 0 ]]; then echo "==> round trip passed"; else echo "==> $failures check(s) failed"; fi

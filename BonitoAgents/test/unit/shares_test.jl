@@ -86,9 +86,33 @@
         @test BT.share_kind("/a/b.md") isa BT.MarkdownShare
         @test BT.share_kind("/a/b.MARKDOWN") isa BT.MarkdownShare
         @test BT.share_kind("C:/a/app.jl") isa BT.AppShare
-        @test_throws ErrorException BT.share_kind("/a/data.csv")
+        @test BT.share_kind("/a/data.csv") isa BT.FileShare
+        @test BT.share_kind("/a/image.png") isa BT.FileShare
         @test BT.worker_isabspath("/home/x") && BT.worker_isabspath("C:/x") && BT.worker_isabspath("C:\\x")
         @test !BT.worker_isabspath("report.md")
+    end
+
+    @testset "live result records survive password changes and reload" begin
+        sd = mktempdir()
+        state = BT.ServerState(; state_dir = sd, working_dir = mktempdir())
+        l = BT.ShareLink("ef"^16, "admin", "w2", "", "", "Julia result", "", "",
+                         now(UTC), "chat1", "prefix/holder")
+        @test BT.share_kind(l) isa BT.AppShare
+        state.shares.links[][l.id] = l
+        BT.set_share_password!(state, l.id, "secret")
+        again = BT.ServerState(; state_dir = sd, working_dir = mktempdir())
+        saved = again.shares.links[][l.id]
+        @test saved.project_id == l.project_id
+        @test saved.result_ref == l.result_ref
+        @test saved.worker_id == "w2"
+        @test !isempty(saved.password_hash)
+        @test_throws ErrorException BT.shared_result_bridge(again, l.project_id, l.result_ref)
+        # Asset checks grant only the public page's assets, never a whole chat bridge.
+        again.shares.asset_checks["page"] = path -> path == "/assets/public-image"
+        @test BT.is_share_target(again.shares, "/assets/public-image")
+        @test !BT.is_share_target(again.shares, "/assets/private-image")
+        empty!(again.shares.asset_checks)
+        @test !BT.is_share_target(again.shares, "/assets/public-image")
     end
 end
 

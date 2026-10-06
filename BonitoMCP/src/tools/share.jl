@@ -47,6 +47,11 @@ register!(
               \"\"\")
           end
         The file is evaluated once now, so an error in it comes back here.
+      - Other files are served directly, including images, videos and documents.
+        Only that file is reachable. HTML and SVG are sandboxed without scripts.
+    The chat's Share button can also share a live bt_julia_eval result without
+    evaluating its code again; that link needs the original Julia session and
+    result to stay open.
     The user sees, changes the password of, and ends links in Settings.
     """,
     Dict{String,Any}(

@@ -1362,20 +1362,26 @@ is_pinned(chat::ChatModel, id::AbstractString) =
 # Enter the bar (become live): add to the live set, mark membership, make sure
 # the bar's poll loop is running.
 function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg})
+    added = false
     lock(bar.lock) do
-        any(t -> t === m, bar.items[]) || (bar.items[] = push!(copy(bar.items[]), m))
+        if !any(t -> t === m, bar.items[])
+            bar.items[] = push!(copy(bar.items[]), m)
+            added = true
+        end
     end
     m.task_bar = bar
+    added && log_task_lifecycle(m, "added", "launched")
     ensure_running!(bar)
     return m
 end
 
 # Leave the bar (become done): finalize the bubble (persist + emit, per type),
 # then drop from the live set and clear membership. Idempotent.
-function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg})
+function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg}; reason::String = "finished")
     bar = m.task_bar
     bar === nothing && return nothing
     m.task_bar = nothing
+    log_task_lifecycle(m, "removed", reason)
     try
         finalize!(m)
     catch e
@@ -1430,7 +1436,39 @@ end
 # turns it into the phase change; `isdone` is only true once the whole story is
 # over. See `BgPhase`.
 const BackgroundMsg = Union{BashToolMsg,TaskToolMsg}
+taskbar_dismiss_only(::TaskToolMsg) = true
 isdone(m::BackgroundMsg) = (advance!(m); m.phase isa Reported)
+
+function log_task_lifecycle(m, event::String, reason::String)
+    chat = m isa ToolMsg ? tool_chat(m) : m.chat
+    project_id = chat === nothing ? "" : chat.project_id
+    worker_id = chat === nothing ? nothing : bg_worker_id(chat.state, chat)
+    consumer = chat === nothing ? nothing : shared(chat).main_consumer[]
+    cli = consumer === nothing ? (chat === nothing ? nothing : client(chat.agent)) : consumer.client
+    session_id = cli === nothing ? "" : cli.session_id
+    connection_id = cli === nothing ? "" : string(objectid(cli))
+    @info "task lifecycle" project_id worker_id session_id connection_id task_id = msg_id(m) kind = nameof(typeof(m)) event reason
+    return nothing
+end
+
+# Background launch requests have already completed, so ACP closing its live
+# requests cannot finish these. End them when their owning session ends, after
+# its buffered tool updates have drained. A detached WorkerLink keeps that
+# session open and deliberately does not take this path.
+function interrupt_background_tasks!(chat::ChatModel; reason::String = "agent_session_ended")
+    bar = chat_taskbar(chat)
+    tasks = lock(() -> copy(bar.items[]), bar.lock)
+    for m in tasks
+        m isa BackgroundMsg || continue
+        if m.phase isa Executing
+            m.message.status = "failed"
+            m.message.summary = "Interrupted: agent session ended"
+        end
+        m.phase = Reported()
+        finished!(m; reason)
+    end
+    return nothing
+end
 
 # The one transition function. Only ever moves forward, so a late poll can't
 # rewind a pill, and a task whose work finishes while the agent is ALREADY
@@ -1552,12 +1590,9 @@ function poll_output_file!(m::ToolMsg; stream::Bool)
 end
 
 # ── finalize!: persist + emit the final bubble state as a task leaves the bar ─
-# The subagent reached `end_turn` (or was ⊗-stopped) — it ENDED. We don't get its
-# exit status, so "completed" is the honest terminal. `close` stamps the feed's
-# "N steps" trace + persists; we then EMIT the real terminal `tool_update` so the
-# bubble flips from the in-progress state (the launch-ack `completed` was HIDDEN
-# while it ran, see `process_update!`) to completed. `request_tool_stop!` overrides
-# this with "stopped" right after.
+# Persist and emit the terminal state, preserving interruption failures and
+# explicit dismissal summaries. The launch acknowledgement alone says nothing
+# about whether the background work finished.
 function finalize!(m::TaskToolMsg)
     h = m.message
     h.status in ("completed", "failed") || (h.status = "completed")
@@ -1572,17 +1607,18 @@ function finalize!(m::BashToolMsg)
     h = m.message
     model = h.chat
     model === nothing && return nothing
-    h.status = "completed"
+    h.status == "failed" || (h.status = "completed")
     h.finished_at === nothing && (h.finished_at = time())
+    n = bg_line_count(m)
+    h.status == "failed" || (h.summary = "done · $n line$(n == 1 ? "" : "s")")
     write_bg_content!(model.chat_dir, m)
     try
         append_tool(model.chat_session, m)
     catch e
         @warn "append_tool for finished bg task failed" id = h.id exception = e
     end
-    n = bg_line_count(m)
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => h.id,
-        "status" => "completed", "summary" => "done · $n line$(n == 1 ? "" : "s")",
+        "status" => h.status, "summary" => h.summary,
         "finished_at" => h.finished_at))
     return nothing
 end
@@ -1899,6 +1935,7 @@ end
 function augment_header!(d::Dict, m::TaskToolMsg, chat_dir::AbstractString)
     m.is_background && (d["background"] = true)
     d["stoppable"] = true
+    d["dismiss_only"] = true
     m.task_name === nothing || (d["task_name"] = m.task_name)
     # Subagent-feed snapshot: a remounted / scrolled-back bubble rebuilds its
     # activity section from the header alone (live growth rides the
@@ -2712,8 +2749,16 @@ function eval_result_node(m::JuliaEvalCall, v)
         u = v.upgrade
         return BonitoUpgradeCard(chat, u.current, u.need, u.env, u.add)
     end
-    return wrap_for_detach(tool_id(m),
-        remote_result(chat.state, v.payload, chat.project_id))
+    desc = result_descriptor(v.payload)
+    controls = desc === nothing || desc.errored ? () :
+        (ShareControl(; hint = "Share this live result with anyone who has the link. " *
+                          "It lasts until the result is closed or its Julia session ends. " *
+                          "Manage passwords and end links in Settings.",
+                      progress = chat.plotpane === nothing ? nothing : chat.plotpane.progress) do
+            share_result!(chat.state, chat.project_id, v.payload)
+        end,)
+    return wrap_for_detach(tool_id(m), DOM.div(controls...,
+        remote_result(chat.state, v.payload, chat.project_id)))
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
@@ -2941,7 +2986,12 @@ function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
         DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
             class = "bt-tool-error")
     end
-    return Bonito.jsrender(session, body)
+    controls = isempty(st.project_id) ? () :
+        (ShareControl(; hint = "Share this file with anyone who has the link while its worker is online. " *
+                                     "Manage passwords and end links in Settings.") do
+            share_project_file!(st.state, st.project_id, st.path)
+        end,)
+    return Bonito.jsrender(session, DOM.div(controls..., body))
 end
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
@@ -5310,7 +5360,11 @@ function main_consumer!(chat::ChatModel, messages)
         filter!(((t, _),) -> !istaskdone(t), inflight)   # reap, so this can't grow
     end
     # The stream ended: let every tool render finish before the consumer does.
-    foreach(((t, _),) -> wait(t), inflight)
+    try
+        foreach(((t, _),) -> wait(t), inflight)
+    finally
+        interrupt_background_tasks!(chat)
+    end
     return nothing
 end
 
@@ -6687,8 +6741,6 @@ end
 function send_message!(model::ChatModel, msg::UserMsg;
     images=AgentClientProtocol.ImageAttachment[], mode::Symbol=:done)
     enqueue_message!(model, msg; images, mode)
-    backfill_project_title!(model, msg.text)
-    return nothing
 end
 
 const TITLE_MAX_CHARS = 80
@@ -6709,23 +6761,6 @@ function meaningful_title(provider::AgentProvider, raw::AbstractString)
     isempty(s) && return nothing
     return length(s) > TITLE_MAX_CHARS ?
         String(first(s, TITLE_MAX_CHARS - 1)) * "…" : String(s)
-end
-
-# Set `p.title` from the user's first meaningful prompt — what makes the
-# sidebar / project card read `[DT] resume the build refactor` instead of
-# `[DT] ClaudeExperiments`. Idempotent: only fires while `title` is still the
-# default (a user edit pins it forever). No-op for projects whose
-# state.projects[] entry is gone (project removed mid-send).
-function backfill_project_title!(model::ChatModel, prompt::AbstractString)
-    pid = model.project_id
-    isempty(pid) && return
-    haskey(model.state.projects[], pid) || return
-    p = model.state.projects[][pid]
-    titled(p) && return
-    t = meaningful_title(agent_kind(model.agent), prompt)
-    t === nothing && return
-    p.title[] = t      # persists + reaches every tab through the title hook
-    return nothing
 end
 
 # Persist the agent-assigned session id onto the project so the thread becomes
@@ -8815,15 +8850,14 @@ function request_tool_stop!(model::ChatModel, t::BashToolMsg)
     return nothing
 end
 
-# Background subagent Task: same story (no ACP kill, completion via
-# task-notification). We can't fd-target a subagent, so the honest action is
-# to finalize the pill — the user sees it stop, and the subagent's eventual
-# task-notification lands as its own turn.
+# ACP has no per-subagent cancellation here. This control only dismisses the
+# entry; its label and persisted summary must not claim to stop execution.
 function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
     in_taskbar(t) || return nothing   # in the bar ⇒ a live background subagent
-    finished!(t)   # finalize! (close → feed trace) + drop from the bar
+    t.message.summary = "Dismissed (execution not cancelled)"
+    finished!(t; reason = "dismissed_without_cancellation")
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tool_id(t),
-        "status" => "completed", "summary" => "stopped"))
+        "status" => "completed", "summary" => "Dismissed (execution not cancelled)"))
     return nothing
 end
 

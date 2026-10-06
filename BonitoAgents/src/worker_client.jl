@@ -1440,12 +1440,7 @@ function scan_and_store!(state::ServerState, worker_id::AbstractString)
         save_discovered!(state)
     end
     safe_notify!(state.discovered)
-    # Opportunistic title-repair sweep: re-derive titles for this worker's
-    # projects whose saved title leaks an injected wrapper (a pre-fix
-    # `meaningful_title` would let `<ide_selection>…` or `<command-args
-    # foo="bar">…` through). Bounded to projects on THIS worker so a Rescan
-    # click doesn't churn unrelated state. See `refresh_broken_titles!`.
-    refresh_broken_titles!(state, wid)
+    # A scan never renames an existing chat. Its title is user-controlled.
     return norm
 end
 

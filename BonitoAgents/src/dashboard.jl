@@ -196,7 +196,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     # scan reports the provider per row, so a resumed kimi thread comes back up
     # under kimi instead of the default.
     p.provider = provider
-    track_project!(state, p)
+    track_project!(state, p; new_chat = true)
 
     if sync
         @info "Pulling project from worker" worker=worker_name worker_path server_path

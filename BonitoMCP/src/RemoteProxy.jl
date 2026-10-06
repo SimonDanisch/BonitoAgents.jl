@@ -159,14 +159,14 @@ function RemoteBridge(; compression::Bool = false)
 end
 
 # One proxied root per browser page. A real ROOT (no parent) so Bonito auto-spawns
-# its inbox reader — browser→worker dispatch is free. Its `asset_server` is the
-# bridge's SHARED one (cross-page asset dedup); its object cache is its own
+# its inbox reader — browser→worker dispatch is free. Its asset registry is
+# shared (cross-page asset dedup), but its retained keys and object cache are its own
 # (per-page dedup). Frames envelope with `prefix` via `PageDriver`.
 function open_page_root!(b::RemoteBridge; compression::Bool = false)
     prefix = string(Bonito.uuid4())
     conn = Bonito.ProxyConnection(prefix, PageDriver(b.driver, prefix))
     pr = Bonito.Session(conn; id = prefix,
-                        asset_server = b.parent.asset_server,
+                        asset_server = similar(b.parent.asset_server),
                         compression_enabled = compression)
     isready(pr.connection_ready) || put!(pr.connection_ready, true)
     lock(b.plock) do
@@ -442,12 +442,31 @@ function share_value(path::AbstractString)
     end
 end
 
+# The public viewer may fetch only assets referenced by its own session tree.
+# A bridge also renders private chat results, so its registry is too broad.
+function has_page_asset(session::Bonito.Session, key::String)
+    server = session.asset_server
+    if server isa Bonito.ProxyAssetServer
+        lock(() -> key in server.keys, server.registry.lock) && return true
+    end
+    children = lock(() -> collect(values(session.children)), Bonito.deletion_lock(Bonito.root_session(session)))
+    return any(child -> has_page_asset(child, key), children)
+end
+
 function handle_control(b::RemoteBridge, msg::AbstractDict)
     op = msg["op"]
     d = b.driver
     id = get(msg, "id", nothing)
     try
-        if op == "asset_read"
+        if op == "has_result"
+            holder = Bonito.get_session(b.parent, String(msg["sub"]))
+            valid = holder !== nothing && holder.current_app[] !== nothing
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => valid))
+        elseif op == "has_asset"
+            root = page_root_for(b, String(msg["root"]))
+            valid = root !== nothing && has_page_asset(root, String(msg["key"]))
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => valid))
+        elseif op == "asset_read"
             bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
                         String(msg["key"]), Int(msg["start"]), Int(msg["stop"]))
             send_control(d, Dict("op" => "reply", "id" => id, "val" => bytes))

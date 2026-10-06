@@ -1620,8 +1620,10 @@ class BonitoChat {
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
             sb.type = 'button';
-            sb.className = 'bt-tool-stop bt-stop-mini';
-            sb.title = 'Stop';
+            sb.className = 'bt-tool-stop bt-stop-mini' + (msg.dismiss_only ? ' bt-task-dismiss' : '');
+            sb.title = msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop';
+            sb.setAttribute('aria-label', msg.dismiss_only ? 'Dismiss task entry' : 'Stop');
+            if (msg.dismiss_only) sb.textContent = '×';
             sb.addEventListener('click', (e)=>{
                 e.stopPropagation();
                 this.comm.notify({
@@ -1997,8 +1999,9 @@ class BonitoChat {
         const timeoutBadge = msg.timeout_s ? `<span class="bt-tool-timeout" title="Soft eval timeout — the call checkpoints with partial output at this cadence">⏱ ${escapeHTML(String(msg.timeout_s))}</span>` : '';
         const workerBadge = msg.worker ? `<span class="bt-tool-worker" title="This runs on another worker">⇢ ${escapeHTML(String(msg.worker))}</span>` : '';
         const jumpChips = jumpChipsHTML(msg.jumps);
-        const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini" type="button"
-                     title="Stop"></button>` : '';
+        const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini${msg.dismiss_only ? ' bt-task-dismiss' : ''}" type="button"
+                     title="${msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop'}"
+                     aria-label="${msg.dismiss_only ? 'Dismiss task entry' : 'Stop'}">${msg.dismiss_only ? '×' : ''}</button>` : '';
         const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
         !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
         const cmdPreview = msg.command ? `

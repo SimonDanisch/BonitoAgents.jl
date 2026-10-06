@@ -2508,8 +2508,10 @@ class BonitoChat {
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
             sb.type = 'button';
-            sb.className = 'bt-tool-stop bt-stop-mini';
-            sb.title = 'Stop';
+            sb.className = 'bt-tool-stop bt-stop-mini' + (msg.dismiss_only ? ' bt-task-dismiss' : '');
+            sb.title = msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop';
+            sb.setAttribute('aria-label', msg.dismiss_only ? 'Dismiss task entry' : 'Stop');
+            if (msg.dismiss_only) sb.textContent = '×';
             sb.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.comm.notify({ type: 'stop_tool', id: msg.id });
@@ -3074,8 +3076,9 @@ class BonitoChat {
         //     bring each one's card into view (see jumpToMessage).
         const jumpChips = jumpChipsHTML(msg.jumps);
         const stopBtn = msg.stoppable ?
-            `<button class="bt-tool-stop bt-stop-mini" type="button"
-                     title="Stop"></button>` : '';
+            `<button class="bt-tool-stop bt-stop-mini${msg.dismiss_only ? ' bt-task-dismiss' : ''}" type="button"
+                     title="${msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop'}"
+                     aria-label="${msg.dismiss_only ? 'Dismiss task entry' : 'Stop'}">${msg.dismiss_only ? '×' : ''}</button>` : '';
         // File-path link: when the tool identifies a file (the server ships
         // `edit_path`), its TITLE becomes a clickable link that opens the
         // file in the plotpane editor — same affordance as every other path

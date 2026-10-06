@@ -86,6 +86,33 @@ bg_task_call(id) = ACP.TaskCall(id, "other", "Run tests", "in_progress",
     ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(),
     "Run the suite", "go", true, nothing, "")   # run_in_background = true, no outputFile
 
+@testset "session EOF interrupts background tasks without a completion marker" begin
+    model, cli = live_model()
+    pill = BT.send!(model, BT.to_message(model, bg_task_call("interrupted-bg")))
+    push!(BT.chat_taskbar(model), pill)
+    @test BT.in_taskbar(pill)
+    @test !BT.work_done(pill)
+    shell = BT.send!(model, BT.to_message(model,
+        ACP.BashCall("interrupted-shell", "execute", "sleep 600", "in_progress",
+            ACP.ToolContent[], ACP.MessageStream{ACP.ToolCall}(), "sleep 600", true, nothing)))
+    push!(BT.chat_taskbar(model), shell)
+    done = BT.send!(model, BT.to_message(model, bg_task_call("already-finished")))
+    done.phase = BT.AwaitingReport(time())
+    push!(BT.chat_taskbar(model), done)
+    close(cli)
+    consumer = BT.shared(model).main_consumer[].task
+    @test timedwait(() -> istaskdone(consumer), 10.0) === :ok
+    wait(consumer)
+    @test !BT.in_taskbar(pill)
+    @test BT.tool_status(pill) == "failed"
+    @test occursin("Interrupted", BT.tool_summary(pill))
+    @test BT.tool_status(shell) == "failed"
+    @test occursin("Interrupted", BT.tool_summary(shell))
+    @test BT.tool_status(done) == "completed"
+    @test isempty(BT.chat_taskbar(model).items[])
+    close(model)
+end
+
 @testset "text/tool/text keeps boundaries — tool NOT dropped, text NOT merged (#23)" begin
     model, cli = live_model()
     # The exact shape that reproduced #23 on the wire: two text chunks, a tool,

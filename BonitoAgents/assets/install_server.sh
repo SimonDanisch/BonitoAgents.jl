@@ -144,18 +144,22 @@ info() { echo "    info : $*"; }
 fail() { echo "" >&2; echo "ERROR: $*" >&2; exit 1; }
 
 # ── Paths + service user ──────────────────────────────────────────────────────
-# The services run as the human who invoked the installer: they own the
-# monorepo and the juliaup install, so there are no /home permission issues.
-SERVICE_USER="${SUDO_USER:-$USER}"
-if [[ -z "$SERVICE_USER" || "$SERVICE_USER" == "root" ]]; then
-    fail "cannot determine a non-root user for the services. Run as a regular user; the script sudo's when needed."
+# The services run as their own system user, named like the install, whose home
+# is the data dir: its own Julia (juliaup) and depot live there. Never as the
+# person who installs: a break-in through the dashboard or the login then reaches
+# the data dir, not that person's home, keys or sudo. The monorepo stays where it
+# was cloned, and the services only read it.
+INSTALL_USER="${SUDO_USER:-$USER}"
+if [[ -z "$INSTALL_USER" || "$INSTALL_USER" == "root" ]]; then
+    fail "cannot determine who installs. Run as a regular user; the script sudo's when needed."
 fi
-SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
-[[ -d "$SERVICE_HOME" ]] || fail "$SERVICE_USER's home not found"
+INSTALL_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)"
+[[ -d "$INSTALL_HOME" ]] || fail "$INSTALL_USER's home not found"
 
 [[ -z "$INSTANCE" || "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
     fail "--instance must be lowercase letters, digits and '-' (got '$INSTANCE')"
 NAME="bonitoagents${INSTANCE:+-$INSTANCE}"
+SERVICE_USER="$NAME"
 UNIT_SERVER="$NAME-server"
 UNIT_AUTHELIA="$NAME-authelia"
 UNIT_CADDY="$NAME-caddy"
@@ -167,11 +171,14 @@ STATE_DIR="$DATA_DIR/state"
 CADDY_DIR="$DATA_DIR/caddy"
 AUTHELIA_DIR="$DATA_DIR/authelia"
 BIN_DIR="/usr/local/lib/$NAME/bin"
+# The service user's own Julia, installed below at the installer's version.
+SERVICE_JULIA="$DATA_DIR/.juliaup/bin/julia"
+# The installer's Julia: it updates the monorepo's Manifest and picks the version.
 JULIA_BIN="$(command -v julia || true)"
 # juliaup puts julia on PATH only inside the user's interactive shell, not under
 # sudo or a bare environment: fall back to its well-known locations.
 if [[ -z "$JULIA_BIN" ]]; then
-    for cand in "$SERVICE_HOME/.juliaup/bin/julia" "$SERVICE_HOME/.local/bin/julia"; do
+    for cand in "$INSTALL_HOME/.juliaup/bin/julia" "$INSTALL_HOME/.local/bin/julia"; do
         [[ -x "$cand" ]] && { JULIA_BIN="$cand"; break; }
     done
 fi
@@ -261,7 +268,7 @@ if [[ $PROMPT -eq 1 && $USE_SAVED -eq 0 ]]; then
         ask AUTH_DOMAIN "Login portal domain" "$prev_auth"
     fi
     prev_admin="$(previous admin)"
-    ask ADMIN "Admin account" "${prev_admin:-$SERVICE_USER}"
+    ask ADMIN "Admin account" "${prev_admin:-$INSTALL_USER}"
     ask ADMIN_EMAIL "Admin email (optional)" "$(previous admin_email)"
     [[ "$TLS" == acme ]] &&
         ask ACME_EMAIL "Email for Let's Encrypt notices (optional)" "${ADMIN_EMAIL:-$(previous acme_email)}"
@@ -269,7 +276,7 @@ fi
 default TLS tls tunnel
 default DOMAIN domain ""
 [[ -n "$DOMAIN" ]] || fail "the dashboard's domain is required: --domain team.example.com"
-default ADMIN admin "$SERVICE_USER"
+default ADMIN admin "$INSTALL_USER"
 default ADMIN_EMAIL admin_email ""
 default PORT port 8038
 default AUTHELIA_PORT authelia_port 9091
@@ -330,6 +337,14 @@ fi
 # Before anything can go wrong, so a run that stops halfway is not a lost setup:
 # the next one offers the same settings again. This is also what the server
 # renders the login's configuration from.
+step "Service user: $SERVICE_USER"
+if getent passwd "$SERVICE_USER" > /dev/null; then
+    ok "exists"
+else
+    sudo useradd --system --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+    ok "created (a system user: no password, no login, home $DATA_DIR)"
+fi
+
 step "Data dir: $DATA_DIR"
 sudo mkdir -p "$STATE_DIR" "$DATA_DIR/projects" "$AUTHELIA_DIR"
 [[ "$TLS" == tunnel ]] || sudo mkdir -p "$CADDY_DIR/data" "$CADDY_DIR/config"
@@ -374,11 +389,13 @@ esac
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 step "Sanity checks"
 [[ -f "$SERVER_BIN" ]] || fail "$SERVER_BIN not found: run from the cloned repo"
-[[ -n "$JULIA_BIN" ]]  || fail "julia not found (checked PATH and $SERVICE_HOME/.juliaup/bin): install Julia (juliaup) first"
+[[ -n "$JULIA_BIN" ]]  || fail "julia not found (checked PATH and $INSTALL_HOME/.juliaup/bin): install Julia (juliaup) first"
 for tool in sudo curl tar sha256sum sha512sum getent ss systemctl timeout; do
     command -v "$tool" > /dev/null || fail "$tool not found"
 done
 chmod +x "$MONOREPO_DIR/BonitoAgents/bin/"*
+sudo -u "$SERVICE_USER" test -x "$SERVER_BIN" -a -r "$MONOREPO_DIR/Project.toml" ||
+    fail "$SERVICE_USER cannot read $MONOREPO_DIR. Let others through the folders above it (e.g. chmod o+x $INSTALL_HOME: that opens no listing), or clone the monorepo outside your home"
 ok "julia: $("$JULIA_BIN" --version)"
 
 TMP="$(mktemp -d)"
@@ -526,6 +543,34 @@ if [[ $UPDATE -eq 1 ]]; then
     ok "updated"
 fi
 
+# The service user's own Julia, the same version as the installer's, and its own
+# depot: both in its home, the data dir. What the server needs is precompiled
+# here, so its first start is not a long silent wait.
+step "Julia for $SERVICE_USER"
+as_service() { sudo -u "$SERVICE_USER" env -C "$DATA_DIR" HOME="$DATA_DIR" "$@"; }
+JULIA_VERSION="$("$JULIA_BIN" --version | awk '{print $3}')"
+[[ -n "$JULIA_VERSION" ]] || fail "could not read the version of $JULIA_BIN"
+JULIAUP="$DATA_DIR/.juliaup/bin/juliaup"
+if ! sudo test -x "$JULIAUP"; then
+    # Its installer refuses a folder that exists, and still exits 0: one left by
+    # a run that stopped halfway goes first, and the result is checked.
+    sudo rm -rf "$DATA_DIR/.juliaup"
+    curl -fsSL https://install.julialang.org |
+        as_service sh -s -- --yes --path "$DATA_DIR/.juliaup" --add-to-path no --startup-selfupdate 0
+    sudo test -x "$JULIAUP" || fail "juliaup did not install into $DATA_DIR/.juliaup (see above)"
+    ok "juliaup installed"
+fi
+as_service "$JULIAUP" status | grep -Eq "^\s*\*?\s+$JULIA_VERSION\s" || as_service "$JULIAUP" add "$JULIA_VERSION"
+as_service "$JULIAUP" default "$JULIA_VERSION"
+ok "julia $JULIA_VERSION"
+# The server reads the monorepo's git state (which build workers should run).
+# git refuses a repository someone else owns unless it is named as safe.
+as_service git config --global --get-all safe.directory 2> /dev/null | grep -qxF "$MONOREPO_DIR" ||
+    as_service git config --global --add safe.directory "$MONOREPO_DIR"
+as_service "$SERVICE_JULIA" "--project=$MONOREPO_DIR" --startup-file=no \
+    -e 'import Pkg; Pkg.instantiate(); using BonitoAgents'
+ok "packages installed and precompiled"
+
 # ── The first admin ───────────────────────────────────────────────────────────
 # The server owns the accounts (accounts.json) and renders Authelia's users
 # database from them. Only a fresh install gets its admin here, with a password
@@ -599,17 +644,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$SERVICE_USER
-Environment=PATH=$(dirname "$JULIA_BIN"):$BIN_DIR:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$(dirname "$SERVICE_JULIA"):$BIN_DIR:/usr/local/bin:/usr/bin:/bin
 ExecStart=$SERVER_BIN --state-dir $STATE_DIR --working-dir $DATA_DIR/projects
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
-# ProtectHome stays off: the service runs as the install user and needs its own
-# juliaup lockfile and Julia depot under ~/.julia.
 NoNewPrivileges=true
 ProtectSystem=strict
+# /home only to read the monorepo, which may live there.
+ProtectHome=read-only
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
@@ -619,9 +664,9 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictRealtime=true
 LockPersonality=true
 # Julia JIT requires writable+executable pages: MemoryDenyWriteExecute stays off.
-# ProtectSystem=strict leaves the whole tree read-only, /home included: the depot
-# (precompile caches, the juliaup lockfile) has to be named here.
-ReadWritePaths=$DATA_DIR $SERVICE_HOME/.julia
+# ProtectSystem=strict leaves the whole tree read-only: the data dir, which holds
+# the service user's Julia and depot too, is the one place it writes.
+ReadWritePaths=$DATA_DIR
 
 [Install]
 WantedBy=multi-user.target

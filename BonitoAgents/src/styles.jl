@@ -1919,6 +1919,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "8px", "height" => "8px",
         "border-radius" => "2px",
         "background" => "var(--bt-error)"),
+    CSS(".bt-task-dismiss::before", "display" => "none"),
     CSS(".bt-stop-mini:hover",
         "background" => "rgba(239,68,68,0.08)",
         "border-color" => "var(--bt-error)"),

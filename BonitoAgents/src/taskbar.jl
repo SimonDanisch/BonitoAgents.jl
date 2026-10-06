@@ -56,6 +56,7 @@ taskbar_todo_rows(::Any) = nothing
 # rebuilt by key, so the label can't come from a render-time snapshot. The
 # fallback returns the snapshot label unchanged.
 taskbar_slot_label(::Any, fallback) = fallback
+taskbar_dismiss_only(::Any) = false
 
 """
     TaskBar() -> TaskBar
@@ -162,9 +163,11 @@ function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::Taskba
         act_label === nothing ||
             insert!(head, 3, DOM.span(act_label; class = "bt-taskbar-activity"))
     end                         # between the label and the elapsed timer
-    item.stoppable && push!(head, DOM.button(;
-        type = "button", class = "bt-taskbar-slot-stop bt-stop-mini",
-        title = "Stop",
+    dismiss = taskbar_dismiss_only(item.source)
+    item.stoppable && push!(head, DOM.button(dismiss ? "×" : "";
+        type = "button", class = "bt-taskbar-slot-stop bt-stop-mini" * (dismiss ? " bt-task-dismiss" : ""),
+        title = dismiss ? "Dismiss task entry (does not stop the agent)" : "Stop",
+        aria_label = dismiss ? "Dismiss task entry" : "Stop",
         onclick = js"event => { event.stopPropagation(); $(bar.stop_request).notify($(item.id)); }"))
     if item.kind === :todo
         ents = taskbar_todo_rows(item.source)

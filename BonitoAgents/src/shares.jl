@@ -35,12 +35,13 @@ shares_file(s::ServerState) = joinpath(s.state_dir, "shares.json")
 
 ShareLink(d::AbstractDict) = ShareLink(String(d["id"]), String(d["owner"]), String(d["worker_id"]),
     String(d["path"]), String(get(d, "env_path", "")), String(d["title"]),
-    String(get(d, "password_salt", "")), String(get(d, "password_hash", "")), DateTime(d["created"]))
+    String(get(d, "password_salt", "")), String(get(d, "password_hash", "")), DateTime(d["created"]),
+    String(get(d, "project_id", "")), String(get(d, "result_ref", "")))
 
 Base.Dict(l::ShareLink) = Dict("id" => l.id, "owner" => l.owner, "worker_id" => l.worker_id,
     "path" => l.path, "env_path" => l.env_path, "title" => l.title,
     "password_salt" => l.password_salt, "password_hash" => l.password_hash,
-    "created" => string(l.created))
+    "created" => string(l.created), "project_id" => l.project_id, "result_ref" => l.result_ref)
 
 record_key(l::ShareLink) = l.id
 
@@ -75,6 +76,7 @@ end
 abstract type ShareKind end
 struct MarkdownShare <: ShareKind end
 struct AppShare <: ShareKind end
+struct FileShare <: ShareKind end
 
 function share_kind_of(path::AbstractString)
     ext = lowercase(splitext(path)[2])
@@ -85,13 +87,14 @@ end
 
 function share_kind(path::AbstractString)
     kind = share_kind_of(path)
-    kind === nothing &&
-        error("only markdown files (.md) and Julia files whose value is an app (.jl) can be shared, not $(basename(path))")
-    return kind
+    return kind === nothing ? FileShare() : kind
 end
+
+share_kind(l::ShareLink) = isempty(l.result_ref) ? share_kind(l.path) : AppShare()
 
 kind_label(::MarkdownShare) = "markdown page"
 kind_label(::AppShare) = "app"
+kind_label(::FileShare) = "file"
 
 # ── Passwords ────────────────────────────────────────────────────────────────
 # PBKDF2-HMAC-SHA256: a leaked shares.json must not give the passwords away cheaply.
@@ -167,6 +170,8 @@ check_share(::MarkdownShare, state::ServerState, l::ShareLink, info) =
     info.size <= SHARE_MARKDOWN_MAX_BYTES ||
         error("$(basename(l.path)) is $(format_bytes(info.size)); a shared page can be at most $(format_bytes(SHARE_MARKDOWN_MAX_BYTES))")
 
+check_share(::FileShare, state::ServerState, l::ShareLink, info) = nothing
+
 function check_share(::AppShare, state::ServerState, l::ShareLink, info)
     share_app!(state, l)
     return nothing
@@ -204,7 +209,8 @@ function set_share_password!(state::ServerState, id::AbstractString, password::A
         l = get(reg.links[], id, nothing)
         l === nothing && error("that link is gone")
         salt, hash = password_fields(password)
-        reg.links[][id] = ShareLink(l.id, l.owner, l.worker_id, l.path, l.env_path, l.title, salt, hash, l.created)
+        reg.links[][id] = ShareLink(l.id, l.owner, l.worker_id, l.path, l.env_path, l.title,
+                                  salt, hash, l.created, l.project_id, l.result_ref)
         save_shares!(state)
     end
     notify(reg.links)
@@ -238,11 +244,13 @@ function is_share_target(reg::ShareRegistry, target::AbstractString)
 end
 
 function share_asset(reg::ShareRegistry, path::AbstractString)
-    sessions, hosts = lock(reg.lock) do
-        (collect(values(reg.pages)), [b.assets for b in values(reg.bridges)])
+    sessions, hosts, checks = lock(reg.lock) do
+        (collect(values(reg.pages)), [b.assets for b in values(reg.bridges)],
+         collect(values(reg.asset_checks)))
     end
     any(s -> registers_asset(s, path), sessions) && return true
-    return any(a -> registers_asset(a, path), hosts)
+    any(a -> registers_asset(a, path), hosts) && return true
+    return any(check -> check(path), checks)
 end
 
 function registers_asset(s::Bonito.Session, path::AbstractString)
@@ -275,7 +283,7 @@ function share_response(state::ServerState, context)
     w = get(state.workers[], l.worker_id, nothing)
     (w === nothing || !isopen(w)) && return share_notice(503, l.title,
         "The computer this is shared from is offline right now. Try again later.")
-    rest == "/" && return share_page(share_kind(l.path), state, l, context)
+    rest == "/" && return share_page(share_kind(l), state, l, context)
     return share_file(state, l, request, HTTP.unescapeuri(String(rest[2:end])))
 end
 
@@ -300,9 +308,19 @@ share_notice(status::Int, title::AbstractString, body::AbstractString) =
 
 # A file the markdown page embeds, from the worker.
 function share_file(state::ServerState, l::ShareLink, request::HTTP.Request, rel::String)
+    share_kind(l) isa MarkdownShare || return share_notice(404, "Not found", "This link shares only its result.")
     allowed = markdown_references(read_share_markdown(state, l))
     normpath(rel) in allowed || return share_notice(404, "Not found", "The page does not use this file.")
     return serve_worker_file(state, request, l.worker_id, normpath(joinpath(dirname(l.path), rel)))
+end
+
+function share_page(::FileShare, state::ServerState, l::ShareLink, context)
+    response = serve_worker_file(state, context.request, l.worker_id, l.path)
+    # A shared HTML/SVG file must not execute with the dashboard's origin.
+    HTTP.setheader(response, "Content-Security-Policy" => "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:")
+    HTTP.setheader(response, "X-Content-Type-Options" => "nosniff")
+    HTTP.setheader(response, "Cache-Control" => "no-store")
+    return response
 end
 
 # ── Markdown pages ───────────────────────────────────────────────────────────
@@ -385,17 +403,31 @@ function share_page(::AppShare, state::ServerState, l::ShareLink, context)
         reg = state.shares
         lock(() -> (reg.pages[root.id] = root), reg.lock)
         on(root.on_close) do _
-            lock(() -> delete!(reg.pages, root.id), reg.lock)
+            lock(reg.lock) do
+                delete!(reg.pages, root.id)
+                delete!(reg.asset_checks, root.id)
+            end
         end
         content = Observable{Any}(DOM.div("Starting the app…"; class = "bt-share-note"))
-        Base.errormonitor(@async content[] = share_app_content(state, l))
+        Base.errormonitor(@async content[] = share_app_content(state, l, root))
         return DOM.div(ShareStyles, content; class = "bt-share-page")
     end
     return Bonito.HTTPServer.apply_handler(app, context)
 end
 
-function share_app_content(state::ServerState, l::ShareLink)
+function share_app_content(state::ServerState, l::ShareLink, root::Bonito.Session)
     try
+        if !isempty(l.result_ref)
+            eb = shared_result_bridge(state, l.project_id, l.result_ref)
+            call_ctrl(eb, "has_result"; sub = l.result_ref) === true ||
+                error("This shared result was closed or its Julia session ended.")
+            prefix = ensure_page_root!(root, eb)
+            # Never publish the chat bridge's entire asset registry: other evals
+            # on it may contain private data. Only this viewer's mounted tree.
+            check = path -> shared_result_asset(eb, prefix, path)
+            lock(() -> (state.shares.asset_checks[root.id] = check), state.shares.lock)
+            return RemoteRef(eb, l.result_ref, "", false)
+        end
         return share_app!(state, l)
     catch e
         e isa InterruptException && rethrow()
@@ -461,7 +493,136 @@ whoever clicked. Returns the link.
 function share_project_file!(state::ServerState, project_id::AbstractString, path::AbstractString)
     p = get(state.projects[], String(project_id), nothing)
     p === nothing && error("the chat is gone")
+    path = worker_isabspath(path) ? normalize_worker_path(path) : worker_join(p.worker_path, path)
     return share_url(state, create_share!(state, acting_owner(state), p.worker_id, path))
+end
+
+function shared_result_bridge(state::ServerState, project_id::AbstractString, ref::AbstractString)
+    eb = bridge_for_ref(state, project_id, ref)
+    (eb === nothing || eb.ws === nothing || eb.prefix != first(split(ref, '/'; limit = 2))) &&
+        error("This result is no longer live. Run it again to share it.")
+    return eb
+end
+
+function shared_result_asset(eb::EvalBridge, prefix::String, path::AbstractString)
+    eb.ws === nothing && return false
+    registers_asset(eb.asset_host, path) || return false
+    try
+        return call_ctrl(eb, "has_asset"; root = prefix, key = String(path[9:end]),
+                         timeout = 5.0, redial_grace = 0.0) === true
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "could not verify shared result asset" path exception = (e, catch_backtrace())
+        return false
+    end
+end
+
+"""
+    share_result!(state, project_id, payload) -> String
+
+Share the already displayed eval result, without executing its code again.
+The link lasts while that Julia session and its result remain alive.
+"""
+function share_result!(state::ServerState, project_id::AbstractString, payload::AbstractString)
+    p = get(state.projects[], String(project_id), nothing)
+    p === nothing && error("the chat is gone")
+    desc = result_descriptor(payload)
+    (desc === nothing || desc.errored) && error("There is no successful live result to share.")
+    eb = shared_result_bridge(state, project_id, desc.ref)
+    call_ctrl(eb, "has_result"; sub = desc.ref) === true ||
+        error("This result was closed. Run it again to share it.")
+    # Remote evals live under <project>\0<worker>; use the bridge's worker,
+    # including for bt_julia_continue, whose inputs need not name one.
+    parts = split(eb.project_id, '\0'; limit = 2)
+    wid = length(parts) == 2 ? String(parts[2]) : p.worker_id
+    l = ShareLink(bytes2hex(rand(Random.RandomDevice(), UInt8, 16)), acting_owner(state),
+                  wid, "", "", "Julia result", "", "", now(UTC), String(project_id), desc.ref)
+    reg = state.shares
+    lock(reg.lock) do
+        reg.links[][l.id] = l
+        reg.tokens[share_token(state, l.id)] = l.id
+        save_shares!(state)
+    end
+    notify(reg.links)
+    return share_url(state, l)
+end
+
+const ShareControlStyles = Bonito.Styles(
+    CSS(".bt-share-control", "display" => "flex", "align-items" => "center",
+        "gap" => "var(--bt-space-2)", "flex-wrap" => "wrap"),
+    CSS(".bt-share-control [hidden]", "display" => "none"),
+    CSS(".bt-share-link", "overflow-wrap" => "anywhere", "user-select" => "text"),
+    CSS(".bt-share-error", "white-space" => "pre-wrap"))
+
+struct ShareControl{F}
+    create::F
+    hint::String
+    progress::Union{Nothing,Observable}
+end
+ShareControl(create::F; hint::String, progress = nothing) where F = ShareControl(create, hint, progress)
+
+# Render as a component so a result arriving AFTER the tool body mounted gets
+# its own session/onload, rather than adding onload to an already ready session.
+# Each browser owns its click and resulting link.
+function Bonito.jsrender(session::Bonito.Session, control::ShareControl)
+    progress = control.progress
+    request = Observable(0)
+    answer = Observable("")
+    pending = Ref(false)
+    on(session, request) do _
+        pending[] && return
+        if progress !== nothing && is_busy_running(progress[])
+            safe_set!(answer, "error:Something else is running in this window. Wait for it to finish.")
+            return
+        end
+        pending[] = true
+        progress === nothing || busy_start!(progress, "Sharing result")
+        Base.errormonitor(@async try
+            safe_set!(answer, "link:" * control.create())
+            progress === nothing || busy_done!(progress, "Shared link created")
+        catch e
+            e isa InterruptException && rethrow()
+            detail = sprint(showerror, e)
+            @warn "sharing result failed" exception = (e, catch_backtrace())
+            safe_set!(answer, "error:" * detail)
+            progress === nothing || busy_fail!(progress, "Could not share result", detail)
+        finally
+            pending[] = false
+        end)
+    end
+    button = DOM.button("Share"; type = "button", disabled = true,
+                        class = "bt-btn bt-btn-sm bt-btn-secondary bt-share-result",
+                        title = control.hint, ariaLabel = "Share this output")
+    link = DOM.a(; class = "bt-share-link", target = "_blank", rel = "noopener noreferrer")
+    copy = DOM.button("Copy link"; type = "button", hidden = true,
+                      class = "bt-btn bt-btn-sm bt-btn-secondary bt-share-copy")
+    error = DOM.span(; class = "bt-share-error", role = "status")
+    node = DOM.div(ShareControlStyles, button, link, copy, error; class = "bt-share-control")
+    Bonito.onload(session, node, js"""root => {
+        const button = $(button), link = $(link), copy = $(copy), error = $(error);
+        const request = $(request), answer = $(answer);
+        button.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
+            button.disabled = true; error.textContent = '';
+            request.notify(request.value + 1);
+        });
+        copy.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
+            ($(COPY_TEXT_JS))(link.href).catch(() => {
+                error.textContent = 'Could not copy automatically. Select and copy the link.';
+            });
+        });
+        answer.on(value => {
+            if (value.startsWith('link:')) {
+                link.href = value.slice(5); link.textContent = value.slice(5);
+                copy.hidden = false; button.hidden = true;
+            } else if (value.startsWith('error:')) {
+                error.textContent = value.slice(6); button.disabled = false;
+            }
+        });
+        button.disabled = false;
+    }""")
+    return Bonito.jsrender(session, node)
 end
 
 # ── bt_share ─────────────────────────────────────────────────────────────────
@@ -507,15 +668,16 @@ function shares_section(session::Bonito.Session, state::ServerState)
     end
     table = map(session, state.shares.links, state.workers) do links, workers
         mine = sort!([l for l in values(links) if may_manage(state.user, l)]; by = l -> l.created, rev = true)
-        isempty(mine) && return DOM.div("No shared links. Ask an agent to share a markdown file " *
-                                        "or an app file (its bt_share tool).";
+        isempty(mine) && return DOM.div("No shared links. Use Share on a file or Julia result, " *
+                                        "or ask an agent to share a file with bt_share.";
                                         class = "bt-admin-muted")
         rows = map(mine) do l
             url = share_url(state, l)
             w = get(workers, l.worker_id, nothing)
             where_ = (w === nothing ? l.worker_id : w.name) * (w !== nothing && isopen(w) ? "" : " (offline)")
             DOM.tr(DOM.td(DOM.a(l.title; href = url, target = "_blank", class = "bt-account-name"),
-                          DOM.div(kind_label(share_kind(l.path)), " · ", where_, ": ", l.path;
+                          DOM.div(kind_label(share_kind(l)), " · ", where_, ": ",
+                                  isempty(l.result_ref) ? l.path : "live result (until its Julia session ends)";
                                   class = "bt-account-detail bt-admin-muted")),
                    DOM.td(Dates.format(l.created, "yyyy-mm-dd")),
                    DOM.td(DOM.input(type = "password",
@@ -537,8 +699,8 @@ function shares_section(session::Bonito.Session, state::ServerState)
         AdminStyles,
         DOM.div(DOM.h2("Shared links"); class = "bt-section"),
         DOM.div(
-            DOM.div("Anyone with a link sees the file while its computer is online: a markdown " *
-                    "page with its images and videos, or a live app.";
+            DOM.div("Anyone with a link sees the shared file or app while its computer is online. " *
+                    "Live result links also require the original Julia session and result to stay open.";
                     class = "bt-admin-muted"),
             admin_line(status, "bt-admin-status"),
             table;
