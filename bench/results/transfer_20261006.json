@@ -1,0 +1,305 @@
+{
+  "date": "2026-10-06",
+  "source": {
+    "name": "Desktop",
+    "ip": "192.168.178.28",
+    "nic_mbps": 1000,
+    "julia": "1.12.7",
+    "http": "2.8.0"
+  },
+  "destination": {
+    "name": "Bosgame",
+    "ip": "192.168.178.59",
+    "julia": "1.12.7",
+    "http": "2.8.0"
+  },
+  "repository_head": "6cedfcb3696523741592d21d238bc7f323f8e5a6",
+  "methodology": [
+    "Production measurements time actual bt_sync_folder MCP calls end to end, including tool/RPC overhead, both sequential server mirror legs, and filesystem work.",
+    "Fresh full-copy repetitions use a different source path AND a fresh destination, preventing reuse of the server mirror.",
+    "Direct tests use the existing installed RemoteSync and WorkerLink packages, one TCP hop, no TLS, after per-mode warmup. WebSocket setup is excluded; HTTP request setup is included. Receiver writes include page-cache writes, no fsync.",
+    "SHA-256 verification is outside direct transfer timings. Production destination trees were verified after transfer.",
+    "Large fixtures repeat a deterministic pseudorandom 1 MiB block; the 256 small files each contain the same deterministic pseudorandom 4096 bytes. Tests do not measure compression or a Git clone.",
+    "The packed comparison uses an uncompressed tar, 1454080 bytes, for the same 256 files.",
+    "Allocation figures are cumulative Julia allocations on the sender during the timed interval, not peak RSS.",
+    "Server hostname resolved to home public IPv4 during this test. This does not establish how already-open worker connections are routed.",
+    "Live WorkerLink pings reported approximately 20 ms for Desktop and Bosgame; ICMP mean RTT was 0.386 ms to Mini-Server, 0.440 ms to Bosgame, 0.585 ms to the home public IP.",
+    "Actual production throughput varied. No production service, firewall, DNS, or transport setting was modified."
+  ],
+  "direct": [
+    {
+      "case": "raw-bulk-large64",
+      "trial": 1,
+      "seconds": 0.633506439,
+      "mib_s": 101.0250189422305,
+      "allocated_mib": 66.02530670166016,
+      "gc_seconds": 0.038462502,
+      "verified": true
+    },
+    {
+      "case": "link-bulk-large64",
+      "trial": 1,
+      "seconds": 0.829697499,
+      "mib_s": 77.13654684645493,
+      "allocated_mib": 256.76129150390625,
+      "gc_seconds": 0.143378156,
+      "verified": true
+    },
+    {
+      "case": "raw-directory-large64",
+      "trial": 1,
+      "seconds": 0.829025227,
+      "mib_s": 77.19909830922431,
+      "allocated_mib": 498.0708923339844,
+      "gc_seconds": 0.129538831,
+      "verified": true
+    },
+    {
+      "case": "link-directory-large64",
+      "trial": 1,
+      "seconds": 0.969273549,
+      "mib_s": 66.02883166060688,
+      "allocated_mib": 688.8246002197266,
+      "gc_seconds": 0.106286378,
+      "verified": true
+    },
+    {
+      "case": "raw-directory-small256",
+      "trial": 1,
+      "seconds": 0.075780863,
+      "mib_s": 13.195943677759383,
+      "allocated_mib": 106.67491149902344,
+      "gc_seconds": 0.002870889,
+      "verified": true
+    },
+    {
+      "case": "link-directory-small256",
+      "trial": 1,
+      "seconds": 0.526201087,
+      "mib_s": 1.9004141661911846,
+      "allocated_mib": 109.91913604736328,
+      "gc_seconds": 0.035892198,
+      "verified": true
+    },
+    {
+      "case": "raw-bulk-large64",
+      "trial": 2,
+      "seconds": 0.599655544,
+      "mib_s": 106.72793846461961,
+      "allocated_mib": 66.02530670166016,
+      "gc_seconds": 0.032759256,
+      "verified": true
+    },
+    {
+      "case": "link-bulk-large64",
+      "trial": 2,
+      "seconds": 0.71888216,
+      "mib_s": 89.02710842066243,
+      "allocated_mib": 256.7592010498047,
+      "gc_seconds": 0.05087707,
+      "verified": true
+    },
+    {
+      "case": "raw-directory-large64",
+      "trial": 2,
+      "seconds": 0.816106139,
+      "mib_s": 78.42117212648489,
+      "allocated_mib": 498.0708923339844,
+      "gc_seconds": 0.095653583,
+      "verified": true
+    },
+    {
+      "case": "link-directory-large64",
+      "trial": 2,
+      "seconds": 0.992214688,
+      "mib_s": 64.50216951434608,
+      "allocated_mib": 688.8246459960938,
+      "gc_seconds": 0.115966576,
+      "verified": true
+    },
+    {
+      "case": "raw-directory-small256",
+      "trial": 2,
+      "seconds": 0.1299964,
+      "mib_s": 7.692520715958287,
+      "allocated_mib": 106.67491149902344,
+      "gc_seconds": 0.002761974,
+      "verified": true
+    },
+    {
+      "case": "link-directory-small256",
+      "trial": 2,
+      "seconds": 0.457468192,
+      "mib_s": 2.185944328999381,
+      "allocated_mib": 109.91638946533203,
+      "gc_seconds": 0.003673746,
+      "verified": true
+    },
+    {
+      "case": "raw-bulk-large64",
+      "trial": 3,
+      "seconds": 0.613349696,
+      "mib_s": 104.34504234269646,
+      "allocated_mib": 66.02530670166016,
+      "gc_seconds": 0.032920659,
+      "verified": true
+    },
+    {
+      "case": "link-bulk-large64",
+      "trial": 3,
+      "seconds": 0.833503272,
+      "mib_s": 76.78434164563184,
+      "allocated_mib": 256.76023864746094,
+      "gc_seconds": 0.050139207,
+      "verified": true
+    },
+    {
+      "case": "raw-directory-large64",
+      "trial": 3,
+      "seconds": 0.804032459,
+      "mib_s": 79.59877649665883,
+      "allocated_mib": 498.0708923339844,
+      "gc_seconds": 0.083715517,
+      "verified": true
+    },
+    {
+      "case": "link-directory-large64",
+      "trial": 3,
+      "seconds": 1.101877153,
+      "mib_s": 58.08269989603823,
+      "allocated_mib": 688.8263397216797,
+      "gc_seconds": 0.130338962,
+      "verified": true
+    },
+    {
+      "case": "raw-directory-small256",
+      "trial": 3,
+      "seconds": 0.112154683,
+      "mib_s": 8.916257201672087,
+      "allocated_mib": 106.67501831054688,
+      "gc_seconds": 0.003492817,
+      "verified": true
+    },
+    {
+      "case": "link-directory-small256",
+      "trial": 3,
+      "seconds": 0.839414377,
+      "mib_s": 1.1913067340756305,
+      "allocated_mib": 109.91852569580078,
+      "gc_seconds": 0.004324018,
+      "verified": true
+    },
+    {
+      "case": "http64",
+      "trial": 1,
+      "seconds": 0.673788441,
+      "mib_s": 94.98530414830907,
+      "allocated_mib": null,
+      "gc_seconds": null,
+      "verified": true
+    },
+    {
+      "case": "http64",
+      "trial": 2,
+      "seconds": 0.700074444,
+      "mib_s": 91.41884916456114,
+      "allocated_mib": null,
+      "gc_seconds": null,
+      "verified": true
+    },
+    {
+      "case": "http64",
+      "trial": 3,
+      "seconds": 0.698249959,
+      "mib_s": 91.65772109984471,
+      "allocated_mib": null,
+      "gc_seconds": null,
+      "verified": true
+    }
+  ],
+  "production": [
+    {
+      "case": "warmup",
+      "bytes": 4096,
+      "seconds": 6.765,
+      "verified": true
+    },
+    {
+      "case": "large16",
+      "bytes": 16777216,
+      "seconds": 6.229,
+      "verified": true
+    },
+    {
+      "case": "large64",
+      "bytes": 67108864,
+      "seconds": 17.492,
+      "verified": true
+    },
+    {
+      "case": "small256",
+      "bytes": 1048576,
+      "seconds": 9.687,
+      "verified": true
+    },
+    {
+      "case": "large64-unchanged",
+      "bytes": 0,
+      "seconds": 3.205,
+      "verified": true
+    },
+    {
+      "case": "small256-unchanged",
+      "bytes": 0,
+      "seconds": 3.105,
+      "verified": true
+    },
+    {
+      "case": "large64-r2",
+      "bytes": 67108864,
+      "seconds": 15.584,
+      "verified": true
+    },
+    {
+      "case": "large64-r3",
+      "bytes": 67108864,
+      "seconds": 11.919,
+      "verified": true
+    },
+    {
+      "case": "small256-r2",
+      "bytes": 1048576,
+      "seconds": 14.097,
+      "verified": true
+    },
+    {
+      "case": "small256-r3",
+      "bytes": 1048576,
+      "seconds": 16.129,
+      "verified": true
+    },
+    {
+      "case": "packed256",
+      "bytes": 1454080,
+      "seconds": 5.975,
+      "verified": true
+    },
+    {
+      "case": "large64-destinationfresh",
+      "bytes": 67108864,
+      "seconds": 5.871,
+      "verified": true
+    },
+    {
+      "case": "small256-destinationfresh",
+      "bytes": 1048576,
+      "seconds": 4.809,
+      "verified": true
+    }
+  ],
+  "limitations": [
+    "Microbenchmarks and live production calls have different hop counts, TLS/proxy paths and timing boundaries.",
+    "No privileged server profiling was performed: the existing SSH key was unavailable to batch authentication.",
+    "The exact contribution of server CPU, proxy/TLS, routing, and live load is not isolated."
+  ]
+}

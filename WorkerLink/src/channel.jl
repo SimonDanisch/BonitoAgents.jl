@@ -30,7 +30,9 @@ end
 
 function WebSockets.send(ch::LinkChannel, x::Union{AbstractString,AbstractVector{UInt8}})
     text = x isa AbstractString
-    bytes = text ? Vector{UInt8}(codeunits(x)) : Vector{UInt8}(x)
+    # Each queued chunk below owns its payload. Copying the entire message
+    # first doubles that work and temporarily retains a second large buffer.
+    bytes = text ? codeunits(x) : x
     typeflag = text ? FLAG_TEXT : 0x00
     link = ch.link::Link
     n = length(bytes)
@@ -52,7 +54,7 @@ function WebSockets.send(ch::LinkChannel, x::Union{AbstractString,AbstractVector
                 ch.send_credit -= len
                 last = pos + len > n
                 enqueue!(ch, Frame(F_DATA, ch.id; flags = (last ? FLAG_EOM : 0x00) | typeflag,
-                                   payload = bytes[pos:(pos + len - 1)]))
+                                   payload = Vector{UInt8}(view(bytes, pos:(pos + len - 1)))))
                 pos += len
             end
             return nothing

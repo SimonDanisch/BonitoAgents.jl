@@ -707,8 +707,8 @@ register!(
     server; the two machines never talk directly). Use it before running Julia
     on that worker with `bt_julia_eval(worker = …)`: a project (its code,
     Project.toml and Manifest.toml) and the data it needs have to be there.
-    Re-running only transfers what changed; files that vanished at `src` are
-    removed at `dst`. Needs the chat's 'remote julia' switch, like remote evals.
+    Re-running only transfers what changed; destination-only files are preserved.
+    Needs the chat's 'remote julia' switch, like remote evals.
     """,
     Dict{String,Any}(
         "type" => "object",

@@ -16,10 +16,12 @@ include("librsync.jl")
 include("primitives.jl")
 include("wire.jl")
 include("sync.jl")
+include("streaming.jl")
+include("relay.jl")
 include("websocketio.jl")
 
 export compute_signature, compute_delta, apply_patch, full_signature_bytes,
-       send_directory, receive_directory, walk_directory,
+       send_directory, receive_directory, relay_directory, walk_directory,
        send_file, receive_file,
        WebSocketIO, wait_peer_close, LibrsyncError
 # `ManifestEntry` and `PlanEntry` are accessed as `RemoteSync.ManifestEntry`

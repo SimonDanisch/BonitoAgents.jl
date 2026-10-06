@@ -63,8 +63,8 @@ function recv_frame(ws)
     try
         HTTP.WebSockets.isclosed(ws) && return nothing
         frame = HTTP.WebSockets.receive(ws)
-        return frame isa AbstractVector{UInt8} ?
-            Vector{UInt8}(frame) :
+        return frame isa Vector{UInt8} ? frame :
+            frame isa AbstractVector{UInt8} ? Vector{UInt8}(frame) :
             Vector{UInt8}(codeunits(String(frame)))
     catch e
         e isa HTTP.WebSockets.WebSocketError && return nothing

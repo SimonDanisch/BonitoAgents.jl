@@ -23,8 +23,8 @@
 # down; so does the end of the chat's session (`stop_session!`).
 #
 # `bt_sync_folder` (op `sync_folder`) is the companion: the other machine has
-# its own filesystem, so code and data are copied there first — through the
-# server's mirror, like every other transfer between two workers.
+# its own filesystem, so code and data are streamed there first through the
+# server over the workers' existing authenticated connections.
 
 const EVAL_HOST_SPAWN_TIMEOUT_S = 180.0
 # `runs` answers with run statuses as data (`bt_julia_wait` polling a remote run).
@@ -324,19 +324,13 @@ function worker_row(state::ServerState, p::Union{ProjectInfo,Nothing}, w::Worker
     return row
 end
 
-# Where a folder being copied between two workers is staged on the server. Per
-# (chat, source folder, target worker), so a second copy of the same folder is a
-# delta against the first instead of a full transfer.
-folder_mirror(state::ServerState, p::ProjectInfo, w::WorkerInfo, src::AbstractString) =
-    joinpath(state.state_dir, "transfers",
-             "sync-" * p.id * "-" * string(hash((String(src), w.worker_id)); base = 16))
-
 """
     sync_folder!(state, p, w, src, dst; progress = nothing) -> NamedTuple
 
-Copy `src` (a folder on `p`'s worker) to `dst` on worker `w` through the server
-mirror. Returns what crossed: how many files and bytes the folder holds, and the
-push's own counts (written, deleted at `dst`, skipped as unchanged).
+Copy `src` (a folder on `p`'s worker) to `dst` on worker `w`, streaming through
+the server without a disk mirror. The destination's own files are the delta
+basis. Destination-only files are preserved. Returns the folder size and counts
+of written, deleted (always zero), and unchanged files.
 """
 function sync_folder!(state::ServerState, p::ProjectInfo, w::WorkerInfo,
                       src::AbstractString, dst::AbstractString; progress = nothing)
@@ -344,27 +338,36 @@ function sync_folder!(state::ServerState, p::ProjectInfo, w::WorkerInfo,
     (src_w === nothing || !isopen(src_w)) && error("this chat's own worker is offline")
     isempty(strip(src)) && error("`src` is empty")
     isempty(strip(dst)) && error("`dst` is empty")
-    mirror = folder_mirror(state, p, w, src)
-    mkpath(mirror)
-    notify_progress(progress, :phase, (msg = "Pulling $(src) from $(src_w.name)…",))
-    sync_dir_from_worker!(state, src_w.worker_id, String(src), mirror; on_progress = progress)
-    written = Ref(0); deleted = Ref(0); skipped = Ref(0)
-    counting = (stage, info) -> begin
-        if stage === :transfer_done
-            written[] = Int(get(info, :written, get(info, :files, 0)))
-            deleted[] = Int(get(info, :deleted, 0))
-            skipped[] = Int(get(info, :skipped, 0))
+    started = time()
+    notify_progress(progress, :phase, (msg = "Streaming from $(src_w.name) to $(w.name)…",))
+    source = transfer_channel(state, src_w.worker_id,
+        Dict("direction" => "from_worker", "src_path" => String(src)); timeout = 30.0)
+    destination = nothing
+    try
+        destination = transfer_channel(state, w.worker_id,
+            Dict("direction" => "to_worker", "dst_path" => String(dst)); timeout = 30.0)
+        result = RemoteSync.relay_directory(RemoteSync.WebSocketIO(source),
+            RemoteSync.WebSocketIO(destination); on_progress = progress)
+        # Legacy receivers have no final protocol ACK. Their clean channel
+        # close confirms completion. Inspect the channel directly: WebSocketIO
+        # converts transport errors into EOF, which cannot distinguish success
+        # from a receiver abort (disk full, permissions, interrupted transfer).
+        try
+            WebSockets.receive(destination)
+            error("unexpected data after directory transfer")
+        catch e
+            e isa WebSockets.WebSocketError && WebSockets.isok(e) || rethrow()
         end
-        notify_progress(progress, stage, info)
+        @info "folder transfer completed" project_id = p.id source_worker = src_w.worker_id target_worker = w.worker_id files = result.files bytes = result.bytes written = result.written skipped = result.skipped seconds = round(time() - started; digits = 3)
+        return result
+    catch e
+        WorkerLink.abort(source, "folder transfer failed")
+        destination === nothing || WorkerLink.abort(destination, "folder transfer failed")
+        rethrow()
+    finally
+        close(source)
+        destination === nothing || close(destination)
     end
-    notify_progress(progress, :phase, (msg = "Pushing to $(dst) on $(w.name)…",))
-    sync_dir_to_worker!(state, w.worker_id, mirror, String(dst); on_progress = counting)
-    files = 0; bytes = 0
-    for (root, _, fs) in walkdir(mirror), f in fs
-        files += 1; bytes += filesize(joinpath(root, f))
-    end
-    return (files = files, bytes = bytes, written = written[],
-            deleted = deleted[], skipped = skipped[])
 end
 
 function dev_op(state::ServerState, ::Val{:sync_folder}, args::AbstractDict, caller::String)

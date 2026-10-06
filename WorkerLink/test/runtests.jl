@@ -43,12 +43,19 @@ end
 Acceptor() = Acceptor(Base.Channel{LinkChannel}(Inf))
 (a::Acceptor)(ch::LinkChannel) = put!(a.queue, ch)
 function accepted(a::Acceptor, header::AbstractString)
-    for _ in 1:100
-        ch = take!(a.queue)
-        String(copy(WL.header(ch))) == header && return ch
-        put!(a.queue, ch)
+    pending = LinkChannel[]
+    try
+        while true
+            eventually(() -> isready(a.queue)) || error("no channel with header $(repr(header))")
+            ch = take!(a.queue)
+            String(copy(WL.header(ch))) == header && return ch
+            push!(pending, ch)
+        end
+    finally
+        # on_open callbacks run concurrently. Do not spin on a different
+        # channel and starve the callback that will supply the requested one.
+        foreach(ch -> put!(a.queue, ch), pending)
     end
-    error("no channel with header $(repr(header))")
 end
 
 # A connection whose sends can be held back, recording what goes out.
@@ -290,6 +297,26 @@ end
     @test data[1] == WL.channel_id(bulk)      # the piece the writer was already sending
     @test data[2] == 0                        # then control, ahead of the rest
     @test count(==(WL.channel_id(bulk)), data) == 10
+    kill!(client, "done"); kill!(server, "done")
+end
+
+@testset "send owns queued bytes after returning" begin
+    reg = Dict{Vector{UInt8},Link}()
+    acc = Acceptor()
+    client = Link(:client)
+    ct, st = memory_pair()
+    gate = GateTransport(ct)
+    server_task = Threads.@spawn serve!(reg, st; on_open = acc)
+    connect!(client, gate, UInt8[])
+    server = fetch(server_task)
+    ch = open_channel(client, Vector{UInt8}("owned"))
+    peer = accepted(acc, "owned")
+    hold!(gate, true)
+    data = fill(UInt8(0x31), 128 * 1024)
+    WebSockets.send(ch, view(data, :))
+    fill!(data, 0x72)
+    hold!(gate, false)
+    @test WebSockets.receive(peer) == fill(UInt8(0x31), length(data))
     kill!(client, "done"); kill!(server, "done")
 end
 
