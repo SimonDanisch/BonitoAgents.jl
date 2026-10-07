@@ -1,8 +1,11 @@
-# bonitoagents.js is now an ES6 module — see `ChatLib` further down. It's
-# loaded lazily by the `Bonito.ES6Module(...).then(...)` interpolation
-# inside ChatModel's jsrender, NOT injected as a classic <script> tag.
-# Loading it as a classic script would syntax-error on the `export`
-# statements.
+# bonitoagents.js is an ES6 module, loaded lazily by the
+# `$(ChatLib).then(lib => ...)` interpolation inside ChatModel's jsrender (same
+# pattern as BonitoBook's MonacoEditor), NOT injected as a classic <script> tag.
+# Loading it as a classic script would syntax-error on the `export` statements.
+# `connect(node, comm)` is called by the inline init JS in `jsrender(::ChatModel)`.
+# Defined first: top-level `js"""` consts further down (LIGHTBOX_OPEN_JS, ...)
+# interpolate it at include time, so it must exist before them.
+const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoagents.js"))
 
 # Message types. `ChatModel` is defined FIRST so each message can hold a `chat`
 # back-ref — its emit/persist sink, used by `send!`/`append!`/`close` (the
@@ -8228,10 +8231,6 @@ function chat_input_area(session::Session, model::ChatModel)
         yolo_mode_js;
         class="bt-input-area")
 end
-
-# JS counterpart. `connect(node, comm)` is called by the inline init JS in
-# `jsrender(::ChatModel)` below — same pattern as BonitoBook's MonacoEditor.
-const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoagents.js"))
 
 # ── Image attachments ─────────────────────────────────────────────────────
 # The JS input area collects pasted / dropped images locally and ships them
