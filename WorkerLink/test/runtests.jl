@@ -428,6 +428,34 @@ end
     kill!(client, "done"); kill!(server, "done")
 end
 
+# The ticker sleeps until its next deadline. It used to wake ten times a second
+# per link, and every wakeup made each idle thread of the process spin up: 3% of
+# a core per link in a 24-thread server, with nothing to do.
+@testset "an idle link sleeps until its next deadline" begin
+    reg = Dict{Vector{UInt8},Link}()
+    client = Link(:client; ping_interval = 30, ping_deadline = 60, grace = 300)
+    ct, st = memory_pair()
+    server_task = Threads.@spawn serve!(reg, st; ping_interval = 30, ping_deadline = 60)
+    connect!(client, ct, UInt8[])
+    server = fetch(server_task)
+    @test eventually(() -> lock(() -> client.last_received == client.last_ack_sent, client.lock))
+    now = time()
+    _, _, due = lock(() -> WL.tick!(client, now), client.lock)
+    @test due >= now + 25                # its next ping, not a tenth of a second away
+    # A frame not yet acknowledged brings the next tick within the ack delay.
+    WebSockets.send(WL.control_channel(server), "news")
+    @test WebSockets.receive(WL.control_channel(client)) == "news"
+    now = time()
+    _, _, due = lock(() -> WL.tick!(client, now), client.lock)
+    @test due <= now + WL.ACK_DELAY_S + 0.01
+    # Detached, it next wakes when the grace period runs out.
+    WL.disconnect!(client)
+    now = time()
+    _, _, due = lock(() -> WL.tick!(client, now), client.lock)
+    @test now + 290 <= due <= now + 300.5
+    kill!(client, "done"); kill!(server, "done")
+end
+
 @testset "liveness can be tightened on a live link" begin
     reg = Dict{Vector{UInt8},Link}()
     ct, st = memory_pair()

@@ -76,6 +76,10 @@ mutable struct Link <: AbstractLink
     ping_rtt::Float64
     slow_logged_at::Float64
     detached_at::Float64
+    # The ticker sleeps until its next deadline (`tick!`); this wakes it sooner:
+    # an acknowledgement fell due, the connection changed, liveness was retuned.
+    tick::Base.Event
+    ack_due::Float64             # when the received frames not yet acknowledged must be
     peer_window::Int
     # configuration
     window::Int
@@ -113,7 +117,7 @@ function Link(role::Symbol;
                 Dict{UInt32,LinkChannel}(), role === :client ? UInt32(1) : UInt32(2),
                 [UInt32[] for _ in 1:NPRIORITIES], Frame[], Vector{UInt8}[],
                 UInt64(1), Tuple{UInt64,Vector{UInt8}}[], 1, UInt64(0), UInt64(0),
-                nothing, 0, 0.0, 0.0, 0.0, NaN, 0.0, time(), window,
+                nothing, 0, 0.0, 0.0, 0.0, NaN, 0.0, time(), Base.Event(true), 0.0, window,
                 window, Float64(grace), Float64(ping_interval), Float64(ping_deadline),
                 on_open, on_state, "", false, String(name))
     lock(lk) do
@@ -158,6 +162,7 @@ function set_liveness!(link::Link; ping_interval::Real, ping_deadline::Real)
         link.ping_interval = Float64(ping_interval)
         link.ping_deadline = Float64(ping_deadline)
     end
+    notify(link.tick)
     return link
 end
 
@@ -318,7 +323,13 @@ function handle_frame!(link::Link, t::Transport, f::Frame)
             f.seq == link.last_received + 1 ||
                 throw(ProtocolError("frame $(f.seq) after $(link.last_received)"))
             link.last_received = f.seq
-            link.last_received - link.last_ack_sent >= 64 && send_ack!(link)
+            if link.last_received - link.last_ack_sent >= 64
+                send_ack!(link)
+            elseif link.last_received == link.last_ack_sent + 1
+                # The first frame not acknowledged: the ticker acks it shortly.
+                link.ack_due = link.last_rx + ACK_DELAY_S
+                notify(link.tick)
+            end
             opened = apply_sequenced!(link, f)
         else
             throw(ProtocolError("unknown frame kind $(k)"))
@@ -465,6 +476,7 @@ function attach!(link::Link, t::Transport, peer_last_received::UInt64)
         notify(link.wake)
         prev
     end
+    notify(link.tick)
     old === nothing || close_transport(old)
     errormonitor(Threads.@spawn reader_loop(link, t))
     notify_state(link, :connected)
@@ -484,6 +496,7 @@ function connection_lost!(link::Link, t::Transport, reason)
         notify(link.wake)
         true
     end
+    notify(link.tick)
     close_transport(t)
     if changed
         @warn "WorkerLink: connection lost; the link waits $(link.grace)s for a reconnect" role = link.role reason = string(reason)
@@ -522,6 +535,7 @@ function kill!(link::Link, reason::AbstractString)
         link.transport = nothing
         prev
     end
+    notify(link.tick)
     t === nothing || close_transport(t)
     notify_state(link, :dead)
     return nothing
@@ -553,35 +567,60 @@ function pong_received!(link::Link, now::Float64)
     return nothing
 end
 
-function ticker_loop(link::Link; tick::Real = 0.1)
-    last_tick = time()
+# How long a received frame may go unacknowledged (`ACK_DELAY_S`), unless 64
+# more arrive first: the peer keeps everything unacknowledged for a replay.
+const ACK_DELAY_S = 0.1
+
+# The ticker sleeps until the next thing is due (`tick!` says when) instead of
+# waking ten times a second: an idle link wakes about once per ping interval.
+# A periodic wakeup costs more the more threads the process runs, since the
+# idle ones spin up to look for work: a 100 ms ticker cost 3% of a core in a
+# 24-thread server, for every link.
+function ticker_loop(link::Link; stall::Real = 1.0)
+    due = time()
     while true
-        sleep(tick)
-        action, t, last_tick = @lock link.lock tick!(link, last_tick)
+        action, t, due = @lock link.lock tick!(link, due; stall)
         action === :stop && return nothing
         action === :lost && connection_lost!(link, t, "no traffic for $(link.ping_deadline)s")
         action === :expired && kill!(link, "no connection for $(link.grace)s")
+        wait_until(link, due)
     end
 end
 
-# One tick; `last_tick` is when the previous one ran. Returns the action, the
-# connection it is about, and the time of this tick. Caller holds the lock.
-function tick!(link::Link, last_tick::Float64; stall::Real = 1.0)
+# Until `due`, or until something makes an earlier deadline (`link.tick`).
+function wait_until(link::Link, due::Float64)
+    delay = due - time()
+    delay > 0 || return nothing
+    timer = Timer(_ -> notify(link.tick), delay)
+    try
+        wait(link.tick)
+    finally
+        close(timer)
+    end
+    return nothing
+end
+
+# One tick, which was due at `due`. Returns the action, the connection it is
+# about, and when the next tick is due. Caller holds the lock.
+function tick!(link::Link, due::Float64; stall::Real = 1.0)
     now = time()
     link.state === :dead && return (:stop, nothing, now)
     if link.state === :connected
-        now - last_tick > stall && stalled!(link, now, now - last_tick)
+        # Woken this late, this process did not run (or the lock was held).
+        now - due > stall && stalled!(link, now, now - due)
         now - link.last_rx > link.ping_deadline && return (:lost, link.transport, now)
         if now - link.last_ping >= link.ping_interval
             link.last_ping = now
             link.ping_sent == 0.0 && (link.ping_sent = now)
             enqueue_urgent!(link, Frame(F_PING, 0))
         end
-        link.last_received > link.last_ack_sent && send_ack!(link)
-        return (:none, nothing, now)
+        unacked = link.last_received > link.last_ack_sent
+        unacked && now >= link.ack_due && (send_ack!(link); unacked = false)
+        next = min(link.last_ping + link.ping_interval, link.last_rx + link.ping_deadline)
+        return (:none, nothing, unacked ? min(next, link.ack_due) : next)
     end
     now - link.detached_at > link.grace && return (:expired, nothing, now)
-    return (:none, nothing, now)
+    return (:none, nothing, link.detached_at + link.grace)
 end
 
 # This link's tasks did not run for `gap` seconds: a long GC pause, a frozen
