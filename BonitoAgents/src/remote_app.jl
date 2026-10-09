@@ -563,6 +563,9 @@ function handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
         # A run started, ended or was collected (eval_runs.jl). Unsolicited,
         # like the stdout chunks; from an eval host it carries its worker.
         run_update!(state, project_id, host_worker, d)
+    elseif get(d, "type", "") == "process_update"
+        # One of the chat's processes started or stopped (processes.jl).
+        record_process!(state, project_id, host_worker, d)
     elseif get(d, "type", "") == "eval_stream_chunk"
         # Unsolicited live-stdout push (no request_id): route it to the
         # matching running eval's tail, prefixed with the host's worker id
@@ -708,6 +711,8 @@ function interrupt_over_channel!(state::ServerState, ws, env_path, timeout::Real
         untrack_mcp_request!(ws, rid)
     end
     resp isa AbstractDict || error("$(what): unexpected response shape")
+    # The process tried and failed: its own words, not a timeout's guess.
+    haskey(resp, "error") && error("$(what): $(resp["error"])")
     return Int(get(resp, "interrupted", 0))
 end
 
@@ -883,7 +888,7 @@ function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
         rs === nothing || close_remote_sub!(eb, rs)          # unmount the live render
         send_ctrl(eb, Dict("op" => "evict", "sub" => r.session_id))   # free the holder value
         isopen(session) && Bonito.evaljs(session, Bonito.js"""(() => {
-            const n = document.querySelector('[data-jscall-id="' + $(node_id) + '"]');
+            const n = $(node);
             if (n) n.innerHTML = '<div class="bt-tool-empty">app closed &amp; freed</div>';
         })()""")
     end

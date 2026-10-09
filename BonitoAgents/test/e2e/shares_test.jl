@@ -118,8 +118,11 @@
             "(() => { const i = document.querySelector('img'); return !!i && i.complete && i.naturalWidth === 1; })()";
             timeout = 30) == true
         @test TK.eval_js(b, "document.querySelector('video')?.getAttribute('src')") == "clip.mp4"
-        # Raw HTML in the file cannot run code.
+        # Raw HTML in the file cannot run code: the browser refused its
+        # script, and says so in the console. That refusal is the point.
         @test TK.eval_js(b, "document.title") == "report"
+        @test any(e -> occursin("Refused to execute inline script", e["message"]), TK.js_errors(b))
+        TK.clear_js_errors(b)
         @test TK.eval_js(b, "fetch('secret.txt').then(r => r.status)") == 404
         @test TK.eval_js(b, "fetch('figs/dot.png').then(r => r.status)") == 200
         # The dashboard is still behind the login.

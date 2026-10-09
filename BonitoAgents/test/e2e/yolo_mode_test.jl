@@ -277,7 +277,7 @@
                 "document.querySelector('.bt-send-btn').classList.contains('bt-send-btn-yolo')";
                 timeout = 10) == true
             @test TK.eval_js(server,
-                "(document.querySelector('.bt-text-input').getAttribute('placeholder')||'').includes('lock in')") == true
+                "(document.querySelector('.bt-text-input').getAttribute('placeholder')||'').includes('Press ✓ to save')") == true
             @test TK.wait_for(server, "yolo bar armed",
                 "document.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')";
                 timeout = 10) == true

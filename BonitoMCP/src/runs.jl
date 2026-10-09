@@ -33,6 +33,7 @@
 # tells the agent when a run it has not collected finishes.
 
 const RUN_POLL_S        = 0.5                 # collector slice: how often output reaches the run
+const RUN_KILL_GRACE_S  = 10.0                # an interrupted run still going this long loses its session
 const RUN_LOG_MAX_BYTES = 64 * 1024 * 1024    # per-run log file bound
 const RUN_TAIL_BYTES    = 64 * 1024           # the chat card's final output
 const RUNS_KEPT         = 64                  # collected runs remembered for lookups
@@ -58,6 +59,7 @@ mutable struct EvalRun
     finished::Float64
     summary::String                           # a failure's first line; "" otherwise
     collected::Bool                           # the agent has been handed the result
+    stop_reason::String                       # why WE ended it (its session went); "" otherwise
 end
 
 # A run this chat started on ANOTHER worker: it lives in that worker's eval host
@@ -187,13 +189,22 @@ function start_run!(reg::RunRegistry, s::JuliaSession, code::AbstractString;
     busy = running_run(reg, s)
     busy === nothing || throw(RunBusy(busy))
     prune_runs!(reg)
+    # The log first: a run that cannot have one (a full disk) is refused before
+    # its eval starts. Opened after, its failure left the eval going in the
+    # session with no run and no collector, for good ("EVAL IN FLIGHT").
+    log_path = joinpath(run_logs_dir(reg), "$(id).log")
+    log = open(log_path, "w")
     started = time()
     # Zero checkpoint: `execute` starts the eval and comes straight back.
-    res = execute(s, code; timeout = 0.0, max_bytes, full_output)
-    log_path = joinpath(run_logs_dir(reg), "$(id).log")
+    res = try
+        execute(s, code; timeout = 0.0, max_bytes, full_output)
+    catch
+        close(log)
+        rethrow()
+    end
     run = EvalRun(String(id), s, env_path, background, String(tool_use_id), started,
-                  log_path, ReentrantLock(), Base.Event(), open(log_path, "w"), 0, 0,
-                  UInt8[], UInt8[], :running, false, nothing, 0.0, "", false)
+                  log_path, ReentrantLock(), Base.Event(), log, 0, 0,
+                  UInt8[], UInt8[], :running, false, nothing, 0.0, "", false, "")
     @lock reg.lock (reg.runs[run.id] = run)
     announce(run)
     if res.status === :completed        # rejected before it ran (a parse error)
@@ -209,7 +220,25 @@ end
 # the run (and the agent, and the chat) while it runs, and stores the result
 # when the eval ends. A session that dies under it (restart, a cancel that had to
 # kill the worker) ends the run as failed rather than leaving it running forever.
+#
+# Whatever else stops the collector ends the run too, with what went wrong: a
+# run whose collector is gone stays "running" for good. Every wait on it times
+# out, the chat keeps its task-bar row, and a restart of its session cannot end
+# it either. The error is rethrown for `errormonitor` to show: it is a bug.
 function collect_run!(run::EvalRun)
+    try
+        poll_until_done!(run)
+    catch e
+        e isa InterruptException && rethrow()
+        echo = "\e[91mERROR: this run's collector failed: $(sprint(showerror, e))\e[39m"
+        finish!(run, completed_result(echo; is_error = true,
+                                      elapsed_s = round(time() - run.started; digits = 2)))
+        rethrow()
+    end
+    return nothing
+end
+
+function poll_until_done!(run::EvalRun)
     s = run.session
     while true
         res = try
@@ -241,12 +270,48 @@ function append_output!(run::EvalRun, text::AbstractString)
         keep_tail!(append!(run.unseen, bytes), STDOUT_CAP_BYTES)
         keep_tail!(append!(run.tail, bytes), RUN_TAIL_BYTES)
         if run.log !== nothing && run.log_bytes < RUN_LOG_MAX_BYTES
-            run.log_bytes += write(run.log, text)
+            run.log_bytes += log_write!(run, text)
             run.log_bytes >= RUN_LOG_MAX_BYTES &&
-                write(run.log, "\n[log cut at $(RUN_LOG_MAX_BYTES) bytes]\n")
-            flush(run.log)
+                log_write!(run, "\n[log cut at $(RUN_LOG_MAX_BYTES) bytes]\n")
         end
     end
+    return nothing
+end
+
+# The log is the one place a run writes to disk, and disks fill up. A full disk
+# fails the `flush` (ENOSPC), not the `write`, which only buffers. Such a failure
+# ends the LOG: the output goes on in memory (`unseen`, `tail`), and both say
+# where the log stopped. It used to end the collector, which left the run
+# "running" for good (MacBook, 2026-10-08: the first flush of a run failed).
+# Caller holds `run.lock`. Returns the bytes written.
+function log_write!(run::EvalRun, parts...)
+    run.log === nothing && return 0
+    try
+        n = write(run.log, parts...)
+        flush(run.log)
+        return n
+    catch e
+        e isa Union{SystemError, Base.IOError} || rethrow()
+        stop_log!(run, e)
+        return 0
+    end
+end
+
+function stop_log!(run::EvalRun, e::Exception)
+    log = run.log
+    run.log = nothing
+    # Closing flushes what is buffered, which fails the same way. The log is
+    # given up either way; the note below says why.
+    try
+        close(log)
+    catch e2
+        e2 isa Union{SystemError, Base.IOError} || rethrow()
+    end
+    note = codeunits("\n[the log at $(run.log_path) stopped: $(sprint(showerror, e)). " *
+                     "Only the recent output is kept from here.]\n")
+    keep_tail!(append!(run.unseen, note), STDOUT_CAP_BYTES)
+    keep_tail!(append!(run.tail, note), RUN_TAIL_BYTES)
+    log_info("run $(run.id): its log stopped: $(sprint(showerror, e))")
     return nothing
 end
 
@@ -274,10 +339,19 @@ function failure_line(echo)
     return ""
 end
 
+# The first end of a run is its end: a run's session can be killed under it
+# (`end_with_session!`) while its collector is still taking the result.
 function finish!(run::EvalRun, res)
+    is_running(run) || return run
     append_output!(run, res.partial)
-    failed = res.is_error || res.errored
     @lock run.lock begin
+        run.status === :running || return run
+        # Its session went under it because WE ended it: that, not the worker's
+        # dying words, is the result, whichever end comes first.
+        isempty(run.stop_reason) ||
+            (res = merge(res, (echo = "\e[91mERROR: InterruptException: $(run.stop_reason)\e[39m",
+                               is_error = true)))
+        failed = res.is_error || res.errored
         run.result   = res
         run.finished = time()
         run.status   = !failed ? :passed : run.interrupt_requested ? :interrupted : :failed
@@ -285,14 +359,34 @@ function finish!(run::EvalRun, res)
         # status does not.
         run.summary  = run.status === :failed ? failure_line(res.echo) : ""
         if run.log !== nothing
-            res.echo === nothing || write(run.log, "\n", strip_ansi(String(res.echo)), "\n")
-            close(run.log)
-            run.log = nothing
+            res.echo === nothing || log_write!(run, "\n", strip_ansi(String(res.echo)), "\n")
+            if run.log !== nothing
+                close(run.log)
+                run.log = nothing
+            end
         end
     end
     notify(run.done)
     announce(run)
     return run
+end
+
+# `run`'s session is going (restarted, or killed after ignoring an interrupt):
+# say why before it goes, so whichever end comes first says it.
+function stopping!(run::EvalRun, why::AbstractString)
+    @lock run.lock begin
+        run.interrupt_requested = true
+        isempty(run.stop_reason) && (run.stop_reason = String(why))
+    end
+    return run
+end
+
+# `run`'s session is gone, so nothing of it can be running: end it, whether or
+# not its collector notices.
+function end_with_session!(run::EvalRun, why::AbstractString)
+    stopping!(run, why)
+    return finish!(run, completed_result(nothing; is_error = true,
+                                         elapsed_s = round(time() - run.started; digits = 2)))
 end
 
 "Block until `run` finishes or `timeout` seconds pass (`nothing` = no bound). True when finished."
@@ -336,7 +430,10 @@ function collected_response(run::EvalRun; max_bytes::Int = 10_000, full_output::
         run.collected = true
         !was
     end
-    newly && send_ctrl_frame(Dict("type" => "run_update", "run" => run.id, "collected" => true))
+    # `started` tells the server WHICH run this is: ids count per MCP process,
+    # and a chat outlives its MCP's restarts.
+    newly && send_ctrl_frame(Dict("type" => "run_update", "run" => run.id, "collected" => true,
+                                  "started" => run.started))
     return completed_response(blocks, descriptor ? res.html : nothing, res.is_error,
                               res.elapsed_s; run = run.id)
 end
@@ -432,14 +529,37 @@ function card_content(run::EvalRun)
 end
 
 """
-    interrupt_run!(run) -> Bool
+    interrupt_run!(run; kill_after = RUN_KILL_GRACE_S) -> Bool
 
-Ask `run`'s eval to stop (the same lever as `bt_julia_interrupt`). False when it
-had already finished.
+Stop `run`'s eval (the lever behind `bt_julia_interrupt` and the chat's ⊗). False
+when it had already finished.
+
+An interrupt reaches an eval that waits (`sleep`, IO). One that computes, or
+blocks in C (a GPU wait), does not see it, so a run that is still going
+`kill_after` seconds later loses its session: the worker is killed and the run
+ends as interrupted. A run whose session is already gone ends at once.
 """
-function interrupt_run!(run::EvalRun)
+function interrupt_run!(run::EvalRun; kill_after::Real = RUN_KILL_GRACE_S)
     is_running(run) || return false
     @lock run.lock (run.interrupt_requested = true)
-    request_interrupt!(run.session)
+    s = run.session
+    if !is_alive(s)
+        end_with_session!(run, "its Julia session had ended")
+        return true
+    end
+    request_interrupt!(s)
+    Base.errormonitor(@async kill_if_ignored!(run, kill_after))
     return true
+end
+
+function kill_if_ignored!(run::EvalRun, grace::Real)
+    wait_run(run, grace) && return nothing
+    log_info("run $(run.id) ignored its interrupt for $(grace)s: killing its session")
+    why = "it ignored the interrupt for $(grace)s, so its session was killed " *
+          "(its packages and variables are gone)"
+    # Killed BEFORE it ends: a waiter woken by the end finds the env free.
+    stopping!(run, why)
+    kill_session!(run.session; hard = true)
+    end_with_session!(run, why)
+    return nothing
 end

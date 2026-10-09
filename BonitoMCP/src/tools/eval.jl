@@ -352,10 +352,10 @@ function julia_interrupt_handler(args::AbstractDict)
         return Dict{String,Any}("content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
                                 "isError" => true)
     end
-    # Generous: the user's code might be in a try/catch that swallows the
-    # InterruptException for a while, but should yield within 30s.
+    # A run that ignores the interrupt loses its session after RUN_KILL_GRACE_S
+    # (`interrupt_run!`), so it has ended by then: the answer is definite.
     interrupt_run!(run)
-    return await_run_response(run, 30.0; max_bytes, full_output)
+    return await_run_response(run, RUN_KILL_GRACE_S + 5.0; max_bytes, full_output)
 end
 
 function julia_restart_handler(args::AbstractDict)
@@ -364,10 +364,13 @@ function julia_restart_handler(args::AbstractDict)
     worker === nothing ||
         return remote_tool_call("restart", worker, args; wait = 120.0)
     # A run going in this session ends with it; it was stopped, not broken.
+    # Ended here, not left to its collector to notice: a collector that is gone
+    # left the run "running" after the restart that said it was stopped.
     s = @lock manager().lock get(manager().sessions, _key(env_path), nothing)
     r = s === nothing ? nothing : running_run(SERVER.runs, s)
-    r === nothing || @lock r.lock (r.interrupt_requested = true)
+    r === nothing || stopping!(r, "its session was restarted")
     restart!(manager(), env_path)
+    r === nothing || end_with_session!(r, "its session was restarted")
     label = env_path === nothing ? "<temp>" : env_path
     return Dict{String,Any}(
         "content" => [Dict("type" => "text",
@@ -658,8 +661,11 @@ register!(
     Stop a run (a bt_julia_eval still going). The user code raises
     InterruptException; the session subprocess and all state survive. Returns
     the output so far + the interrupt error block. Use this when you want to
-    stop a runaway computation but keep the loaded packages/variables. Name it
-    with `run` (e.g. "r4"), or with `env_path` (+ `worker`).
+    stop a runaway computation but keep the loaded packages/variables. Code that
+    never yields (a tight loop, a long call into C such as a GPU wait) cannot
+    see the interrupt: when the run is still going 10s later, its session is
+    killed and its packages/variables are lost. Name it with `run` (e.g. "r4"),
+    or with `env_path` (+ `worker`).
     """,
     Dict{String,Any}(
         "type" => "object",

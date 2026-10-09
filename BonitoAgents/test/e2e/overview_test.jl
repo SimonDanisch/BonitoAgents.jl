@@ -13,7 +13,8 @@
     TK.clear_js_errors(s)
 
     # A fresh chat with one turn — the card must materialise on the dashboard.
-    pid = TK.new_chat(s)
+    folder = mkpath(joinpath(mktempdir(), "OverviewProbe"))
+    pid = TK.new_chat(s; cwd = folder)
     P = ".bt-chatpane[data-pane-pid=\"$(pid)\"] "
     TK.send_message(s, "overview probe prompt")
     @test TK.wait_for(s, "turn done",
@@ -34,8 +35,8 @@
                      meta:  c.querySelector('.bt-ov-meta')?.textContent,
                      snips: [...c.querySelectorAll('.bt-ov-snippet')].map(x => x.textContent) };
         })()""")
-        # The first meaningful prompt backfills the persistent title.
-        @test card["title"] == "overview probe prompt"
+        # A chat is titled by its folder; a prompt never renames it.
+        @test card["title"] == "OverviewProbe"
         @test occursin("2 messages", String(card["meta"]))     # user + agent reply
         @test any(t -> occursin("overview probe prompt", String(t)), card["snips"])
     end

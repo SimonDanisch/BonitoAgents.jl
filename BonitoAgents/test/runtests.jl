@@ -101,6 +101,24 @@ else
     shard_name_filter(i, n, FILTER)
 end
 
+# Run after every item: any warning or error a test browser logged fails the
+# item that made it. ReTestItems evaluates setups and items as modules in Main,
+# so the TestKit copies are found there: the SharedServer setup's, and those of
+# the items that include their own (checked once each, by identity).
+const CONSOLE_GATE = quote
+    let kits = Module[]
+        for n in names(Main; all = true)
+            isdefined(Main, n) || continue
+            m = getfield(Main, n)
+            m isa Module && m !== Main && isdefined(m, :TestKit) || continue
+            kit = getfield(m, :TestKit)
+            kit isa Module && isdefined(kit, :check_console!) || continue
+            any(k -> k === kit, kits) || push!(kits, kit)
+        end
+        @test isempty(reduce(vcat, (kit.check_console!() for kit in kits); init = String[]))
+    end
+end
+
 # No `retries` kwarg on purpose: we NEVER retry a failing test. ReTestItems already
 # defaults to 0; a retry that greens a red item only hides a real bug or a test we
 # don't understand (the flakes it used to paper over were all real — chat-bind
@@ -114,4 +132,5 @@ ReTestItems.runtests(BonitoAgents;
     # job in `timeout 420`, so one slow item killed the run with no test report.
     # The slowest item in CI takes ~2 minutes.
     testitem_timeout = 420,
+    test_end_expr = CONSOLE_GATE,
     name = NAME)

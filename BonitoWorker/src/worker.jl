@@ -207,6 +207,10 @@ function hello(w::Worker)
         "harnesses"     => installed_harnesses(harness_root(), AgentProviders.managed_packages()),
         "instance"      => c.instance,
         "crashed_instance" => c.crashed_instance,
+        # The requests this worker knows beyond the original set: the server
+        # sends a request only to a worker that lists it, so an older one is
+        # skipped instead of waited on (it ignores an unknown request unanswered).
+        "capabilities"  => ["kill_processes", "watch_file"],
     )
 end
 
@@ -389,8 +393,6 @@ function dispatch_command(w::Worker, ws, cmd::AbstractDict)
         @async handle_list_project_files(ws, cmd)
     elseif t == "inspect_path"
         @async handle_inspect_path(ws, cmd)
-    elseif t == "tail_file"
-        @async handle_tail_file(ws, cmd)
     elseif t == "kill_file_writers"
         @async handle_kill_file_writers(ws, cmd)
     elseif t == "scan_sessions"
@@ -415,6 +417,8 @@ function dispatch_command(w::Worker, ws, cmd::AbstractDict)
         @async handle_open_eval_host(w, ws, cmd)
     elseif t == "close_eval_host"
         @async handle_close_eval_host(w, ws, cmd)
+    elseif t == "kill_processes"
+        @async handle_kill_processes(ws, cmd)
     elseif t == "stage_session"
         @async handle_stage_session(ws, cmd)
     elseif t == "install_session"
@@ -449,6 +453,8 @@ function serve_channel(w::Worker, ch::WorkerLink.LinkChannel)
         run_agent_session(w, ch, header)
     elseif kind == "transfer"
         run_transfer(ch, header)
+    elseif kind == "watch_file"
+        run_file_watch(ch, header)
     else
         refuse_channel(ch, "unknown channel kind '$(kind)'")
     end
@@ -513,8 +519,10 @@ function run_agent_session(w::Worker, ch::WorkerLink.LinkChannel, header::Abstra
         owner = "acp:" * bytes2hex(rand(Random.RandomDevice(), UInt8, 8))
         proc = try
             # `detach` = `setsid()` in the child: the agent leads its OWN process
-            # group, so everything it spawns (the MCP servers, and the Julia eval
-            # workers under those) goes down with it in `kill_proc!`.
+            # group, so what it spawns (the MCP servers, its shells) goes down with
+            # it in `kill_proc!`. The Julia eval workers under the MCP lead groups
+            # of their own (Malt): the server's record of the chat's processes
+            # reaches them (processes.jl).
             open(detach(Cmd(`$agent_bin $agent_args`; env, dir = cwd)), "r+")
         catch e
             e isa Base.IOError || rethrow()

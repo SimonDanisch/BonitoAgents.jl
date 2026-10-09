@@ -871,6 +871,10 @@ function reader_loop(conn::Connection)
     end
 end
 
+# Whether a request can still go out. `closed` only ever flips false → true
+# (explicit close, or the dispatcher's teardown after the transport ended).
+Base.isopen(conn::Connection) = !conn.closed
+
 function Base.close(conn::Connection)
     conn.closed = true
     # Cascade: close(transport) → reader_loop's recv returns "" → loop

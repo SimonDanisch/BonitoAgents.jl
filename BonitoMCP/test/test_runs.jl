@@ -15,12 +15,27 @@
 using Test
 using BonitoMCP
 const M = BonitoMCP
+const JSON = M.JSON
 
 text_of(r) = join((String(b["text"]) for b in r["content"] if get(b, "type", "") == "text"), "\n")
 run_of(r) = r["_meta"]["run"]
 
 # Fresh temp-session envs, so each testset starts with idle sessions.
 fresh_env() = mktempdir()
+
+# The server's end of the control channel: keeps what this process answers.
+struct RecordingCtrlWS
+    sent::Vector{Any}
+end
+M.WebSockets.send(ws::RecordingCtrlWS, x) = (push!(ws.sent, JSON.parse(String(x))); nothing)
+ctrl_interrupt!(run) = begin
+    ws = RecordingCtrlWS(Any[])
+    M.handle_ctrl_frame!(ws, Dict{String,Any}("op" => "interrupt_eval", "request_id" => "q", "run" => run.id))
+    only(ws.sent)
+end
+
+# Spins without ever yielding: neither the targeted throw nor SIGINT reaches it.
+const SPIN = "function spin(); s = 0.0; while true; s += rand(); end; s; end; spin()"
 
 @testset "runs" begin
     @testset "background eval returns at once, the run finishes on its own" begin
@@ -177,6 +192,109 @@ fresh_env() = mktempdir()
         @test occursin("runs:", t)
         @test occursin("$(id)  running for", t)
         M.julia_interrupt_handler(Dict{String,Any}("run" => id))
+        M.restart!(M.manager(), env)
+    end
+
+    # A run must end, whatever happens to it: one left "running" holds its
+    # chat's task-bar row for good, every wait on it times out, and neither its
+    # ⊗ nor a restart of its session could end it (MacBook, 2026-10-08).
+    if ispath("/dev/full")
+        @testset "a full disk ends the run's log, not the run" begin
+            # A full disk fails the flush (ENOSPC), not the buffered write. It
+            # killed the collector, and the finished eval stayed "running".
+            env = fresh_env()
+            id = run_of(M.julia_eval_handler(Dict{String,Any}(
+                "code" => "for i in 1:6; println(\"line \$i\"); sleep(0.5); end; 42",
+                "env_path" => env, "background" => true)))
+            run = M.lookup_run(M.SERVER.runs, id)
+            @lock run.lock begin
+                close(run.log)
+                run.log = open("/dev/full", "w")
+            end
+            @test M.wait_run(run, 60.0)
+            @test run.status === :passed
+            @test occursin("stopped", String(copy(run.tail)))     # says where the log ended
+            @test occursin("42", text_of(M.collected_response(run)))
+            M.restart!(M.manager(), env)
+        end
+    end
+
+    @testset "a run that cannot have a log is refused before its eval starts" begin
+        # Opened after the eval started, a failing log left that eval going in
+        # the session with no run and no collector ("EVAL IN FLIGHT", for good).
+        env = fresh_env()
+        dir = M.run_logs_dir(M.SERVER.runs)
+        chmod(dir, 0o500)
+        r = try
+            M.julia_eval_handler(Dict{String,Any}("code" => "sleep(30)", "env_path" => env, "background" => true))
+        finally
+            chmod(dir, 0o700)
+        end
+        @test r["isError"] === true
+        s = M.manager().sessions[M._key(env)]
+        @test s.in_flight === nothing
+        # The env takes the next eval.
+        @test occursin("2", text_of(M.julia_eval_handler(Dict{String,Any}("code" => "1 + 1", "env_path" => env))))
+        M.restart!(M.manager(), env)
+    end
+
+    @testset "a restart ends the run going in its session" begin
+        env = fresh_env()
+        id = run_of(M.julia_eval_handler(Dict{String,Any}(
+            "code" => "sleep(60)", "env_path" => env, "background" => true)))
+        run = M.lookup_run(M.SERVER.runs, id)
+        t = text_of(M.julia_restart_handler(Dict{String,Any}("env_path" => env)))
+        @test occursin("Run $(id) was stopped with it", t)
+        @test run.status === :interrupted
+        @test occursin("its session was restarted", run.result.echo)
+    end
+
+    @testset "the chat's stop of a run whose session is gone ends it, and is answered" begin
+        # The session died under the run. The stop threw on the dead worker and
+        # sent no answer, so the server waited 15s and called the worker
+        # unreachable, and the run stayed.
+        env = fresh_env()
+        id = run_of(M.julia_eval_handler(Dict{String,Any}(
+            "code" => "sleep(60)", "env_path" => env, "background" => true)))
+        run = M.lookup_run(M.SERVER.runs, id)
+        M.kill_session!(run.session)
+        reply = ctrl_interrupt!(run)
+        @test reply["request_id"] == "q" && reply["interrupted"] == 1 && !haskey(reply, "error")
+        @test run.status === :interrupted
+        M.restart!(M.manager(), env)
+    end
+
+    @testset "an interrupt the eval cannot see ends the run by killing its session" begin
+        # Code that computes, or waits in C, never sees the interrupt: the tool
+        # waited 30s, answered "still running", and the run went on.
+        env = fresh_env()
+        id = run_of(M.julia_eval_handler(Dict{String,Any}(
+            "code" => SPIN, "env_path" => env, "background" => true)))
+        run = M.lookup_run(M.SERVER.runs, id)
+        sleep(2)
+        t0 = time()
+        r = M.julia_interrupt_handler(Dict{String,Any}("run" => id))
+        @test time() - t0 < M.RUN_KILL_GRACE_S + 5
+        @test run.status === :interrupted
+        @test occursin("so its session was killed", text_of(r))
+        @test !M.is_alive(run.session)
+        # The env is free at once for the next eval.
+        @test occursin("2", text_of(M.julia_eval_handler(Dict{String,Any}("code" => "1 + 1", "env_path" => env))))
+        M.restart!(M.manager(), env)
+    end
+
+    @testset "the chat's stop of a busy run is answered at once, and the run ends" begin
+        env = fresh_env()
+        id = run_of(M.julia_eval_handler(Dict{String,Any}(
+            "code" => SPIN, "env_path" => env, "background" => true)))
+        run = M.lookup_run(M.SERVER.runs, id)
+        sleep(2)
+        t0 = time()
+        reply = ctrl_interrupt!(run)
+        @test time() - t0 < 5                    # well under the server's 15s wait
+        @test reply["interrupted"] == 1
+        @test M.wait_run(run, M.RUN_KILL_GRACE_S + 10)
+        @test run.status === :interrupted
         M.restart!(M.manager(), env)
     end
 end

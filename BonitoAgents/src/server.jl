@@ -445,6 +445,11 @@ function add_download_routes!(srv::Bonito.Server, state::ServerState)
         params = HTTP.queryparams(HTTP.URI(context.request.target))
         attachment_response(state, pid, String(get(params, "file", "")))
     end)
+    Bonito.route!(srv, r"^/attachment-upload/([A-Za-z0-9_-]+)(?:$|\?)" => function(context)
+        pid = String(context.match.captures[1])
+        request_sees_chat(state, context.request, pid) || return unknown_chat(pid)
+        attachment_upload(state, context.request, pid)
+    end)
 end
 
 # These URLs depend only on persisted worker identity, path, and the server's
@@ -631,34 +636,107 @@ end
 # the response is cacheable forever.
 const ATTACHMENT_ROUTE_RE = r"^/attachment/([A-Za-z0-9_-]+)"
 
-# Bare, well-formed filename only — no separators, no dot-dot, one of the
-# extensions `save_attachment` can produce.
-is_attachment_name(file::AbstractString) = occursin(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9]+$", file)
+# Bare, well-formed filename only: no separators, so it cannot leave the
+# attachment dir, and not hidden (the dir's `.uploads/` holds partial files).
+is_attachment_name(file::AbstractString) = occursin(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]*$", file)
+
+plain_response(status::Integer, message::AbstractString) =
+    HTTP.Response(status, ["Content-Type" => "text/plain; charset=utf-8"], body = message * "\n")
 
 function attachment_response(state::ServerState, project_id::AbstractString,
                              file::AbstractString)
-    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
-        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
-                             body = "invalid project id\n")
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) || return plain_response(404, "invalid project id")
     proj = get(state.projects[], project_id, nothing)
-    proj === nothing &&
-        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
-                             body = "unknown project '$project_id'\n")
-    is_attachment_name(file) ||
-        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
-                             body = "invalid attachment name\n")
-    mime = get(ATTACHMENT_MIME_BY_EXT, lowercase(lstrip(splitext(file)[2], '.')), nothing)
-    mime === nothing &&
-        return HTTP.Response(403, ["Content-Type" => "text/plain; charset=utf-8"],
-                             body = "unsupported attachment type\n")
+    proj === nothing && return plain_response(404, "unknown project '$project_id'")
+    is_attachment_name(file) || return plain_response(403, "invalid attachment name")
     path = joinpath(proj.server_path, ATTACHMENT_DIR_NAME, file)
-    isfile(path) ||
-        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
-                             body = "no such attachment\n")
-    return HTTP.Response(200,
-        ["Content-Type"  => mime,
-         "Cache-Control" => "public, max-age=31536000, immutable"],
-        body = read(path))
+    isfile(path) || return plain_response(404, "no such attachment")
+    # Images and PDFs show in the browser; anything else is a download. Sent
+    # as the browser takes it, not read whole first: an attachment can be a
+    # video. No Content-Length, or HTTP.jl would hold it back until complete.
+    ext = lowercase(lstrip(splitext(file)[2], '.'))
+    mime = ext == "pdf" ? "application/pdf" : get(ATTACHMENT_MIME_BY_EXT, ext, nothing)
+    headers = mime === nothing ?
+        ["Content-Type" => "application/octet-stream",
+         "Content-Disposition" => "attachment; filename=\"$(download_filename(file))\""] :
+        ["Content-Type" => mime]
+    io = open(path)
+    return HTTP.Response(200, [headers; "Cache-Control" => "public, max-age=31536000, immutable"];
+        body = HTTP.CallbackBody(dst -> readbytes!(io, dst, length(dst)), () -> close(io)))
+end
+
+# /attachment-upload/<pid>?upload=<id>&offset=<n>&total=<n>&name=<file name>
+# One chunk of a file attachment, written at `offset`. Chunks, over plain
+# HTTP: small enough for any proxy's default body limit, never a whole video in
+# memory, and off the chat's websocket (whose messages stop at 16 MiB). The last
+# one moves the file into `.bt-attachments` under a name of its own and copies
+# it to the worker; its answer says where the file is and whether the worker
+# has it.
+function attachment_upload(state::ServerState, request::HTTP.Request, project_id::AbstractString;
+                           chunk_max::Integer = 1024 * 1024, file_max::Integer = 2 * 1024^3)
+    # A header no form or plain cross-site request can carry: another site's
+    # page would need a CORS preflight, which nothing here answers. Without it
+    # any page the user visits could write files into their chats.
+    HTTP.header(request, "X-BT-Upload") == "1" || return plain_response(403, "missing X-BT-Upload header")
+    proj = get(state.projects[], project_id, nothing)
+    proj === nothing && return plain_response(404, "unknown project '$project_id'")
+    params = HTTP.queryparams(HTTP.URI(request.target))
+    upload = get(params, "upload", "")
+    occursin(r"^[A-Za-z0-9-]{8,64}$", upload) || return plain_response(400, "invalid upload id")
+    part = joinpath(proj.server_path, ATTACHMENT_DIR_NAME, ".uploads", upload * ".part")
+    # Removed from the composer before it finished: drop what arrived.
+    if request.method == "DELETE"
+        rm(part; force = true)
+        return json_response(Dict("removed" => true))
+    end
+    request.method == "POST" || return plain_response(405, "POST one chunk per request, or DELETE the upload")
+    offset = tryparse(Int, get(params, "offset", ""))
+    total  = tryparse(Int, get(params, "total", ""))
+    (offset === nothing || total === nothing || offset < 0) && return plain_response(400, "offset and total are byte counts")
+    total <= file_max || return plain_response(413, "file too large: $(total) bytes, at most $(file_max)")
+    chunk = request_bytes(request.body)
+    length(chunk) <= chunk_max || return plain_response(413, "chunk too large: at most $(chunk_max) bytes")
+    offset + length(chunk) <= total || return plain_response(400, "chunk runs past the file's size")
+    mkpath(dirname(part))
+    have = isfile(part) ? filesize(part) : 0
+    have == offset || return plain_response(409, "expected the chunk at offset $(have)")
+    open(io -> write(io, chunk), part, "a")
+    received = offset + length(chunk)
+    received < total && return json_response(Dict("received" => received))
+    rel, on_worker = finish_attachment_upload!(state, proj, part, get(params, "name", ""))
+    return json_response(Dict("received" => received, "path" => rel, "on_worker" => on_worker))
+end
+
+json_response(d::AbstractDict) =
+    HTTP.Response(200, ["Content-Type" => "application/json", "Cache-Control" => "no-store"], body = JSON.json(d))
+
+# The complete upload: renamed into the attachment dir, then to the worker so
+# the agent can open it. A worker out of reach keeps it on the server; sending
+# the message tries again (`process_attachments!`).
+function finish_attachment_upload!(state::ServerState, proj::ProjectInfo, part::AbstractString,
+                                   original::AbstractString)
+    rel = joinpath(ATTACHMENT_DIR_NAME, attachment_file_name(original))
+    abs = joinpath(proj.server_path, rel)
+    mv(part, abs)
+    on_worker = reachable(state, proj.worker_id) && try
+        send_file_to_worker!(state, proj.worker_id, abs, joinpath(proj.worker_path, rel); handoff_timeout = 30.0)
+        true
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "attachment upload: copy to the worker failed; it goes with the message" worker = proj.worker_id rel exception = e
+        false
+    end
+    return rel, on_worker
+end
+
+# Unique, and still recognisable to the agent and the user: the time, a short
+# random part, and the original name with anything but [A-Za-z0-9._-] replaced.
+function attachment_file_name(original::AbstractString)
+    base = replace(basename(String(original)), r"[^A-Za-z0-9._-]" => "_")
+    base = lstrip(base, '.')
+    isempty(base) && (base = "file")
+    length(base) > 80 && (base = last(base, 80))
+    return "$(Dates.format(now(UTC), "yyyy-mm-dd_HHMMSS"))_$(string(uuid4())[1:8])_$(base)"
 end
 
 # Strip anything that could break (or smuggle a header into) the

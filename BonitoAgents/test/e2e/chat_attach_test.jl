@@ -285,18 +285,18 @@
     # That stubs a BROWSER api, not our code: the delegated handler, the
     # `change` listener and `attachAddBlob` all run for real below.
     @test TK.eval_js(s, "document.querySelector('$(P).bt-attach-input') !== null")
-    # `accept` is what makes a mobile browser offer camera/gallery instead of a
-    # generic file tree.
-    @test occursin("image/", String(TK.eval_js(s,
-        "document.querySelector('$(P).bt-attach-input').getAttribute('accept') || ''")))
+    # Any file: no `accept`, which would narrow a phone's sheet to the gallery.
+    @test TK.eval_js(s, "document.querySelector('$(P).bt-attach-input').getAttribute('accept')") === nothing
     # Tap target, measured on the rendered box (not read back out of the
-    # stylesheet): under ~40px a touch is a coin toss, and touch is the point.
+    # stylesheet). The composer's controls are compact since fb5dca1 (36px,
+    # 32px under 360px wide): the attach button is the same square as Send.
     btn_box = TK.eval_js(s, """(() => {
         const r = document.querySelector('$(P).bt-attach-btn').getBoundingClientRect();
-        return {w: r.width, h: r.height};
+        const s = document.querySelector('$(P).bt-send-btn').getBoundingClientRect();
+        return {w: r.width, h: r.height, sw: s.width, sh: s.height};
     })()""")
-    @test btn_box["w"] >= 40
-    @test btn_box["h"] >= 40
+    @test btn_box["w"] >= 32 && btn_box["w"] == btn_box["h"]
+    @test (btn_box["w"], btn_box["h"]) == (btn_box["sw"], btn_box["sh"])
 
     TK.eval_js(s, """(() => {
         const inp = document.querySelector('$(P).bt-attach-input');
@@ -327,8 +327,9 @@
     # `change` and the second attempt silently does nothing.
     @test TK.eval_js(s, "document.querySelector('$(P).bt-attach-input').value === ''")
 
-    # Non-image via the picker: `accept` is a hint, every desktop picker still
-    # offers "all files". The user has to be told, not ignored.
+    # A non-image via the picker is attached as a file: uploaded for the agent
+    # to open (e2e:file_attach follows one all the way to the worker), shown
+    # as a chip, not as an image thumbnail.
     TK.eval_js(s, """(() => {
         const c = document.querySelector('$(P).bt-attach-error'); if (c) c.remove();
         const file = new File([new Uint8Array([1,2,3])], 'notes.zip',
@@ -339,11 +340,11 @@
         inp.dispatchEvent(new Event('change', {bubbles: true}));
         return true;
     })()""")
-    @test TK.wait_for(s, "non-image is refused out loud",
-        "document.querySelector('$(P).bt-attach-error') !== null"; timeout = 5)
-    @test occursin("not an image", lowercase(String(
-        TK.eval_js(s, "document.querySelector('$(P).bt-attach-error')?.innerText || ''"))))
-    @test attach_count() == 1   # the png stays queued, the zip never joins it
+    @test TK.wait_for(s, "the zip is attached as a file",
+        "document.querySelector('$(P).bt-attachment-file')?.dataset.state === 'done'"; timeout = 15)
+    @test attach_count() == 1   # one image thumbnail; the zip is a file chip
+    TK.eval_js(s, "document.querySelector('$(P).bt-attachment-file .bt-attachment-remove').click(); true")
+    @test TK.wait_for(s, "the file chip removed", "!document.querySelector('$(P).bt-attachment-file')"; timeout = 5)
 
     # ── Queue length is capped ────────────────────────────────────────────────
     # "Select all" in a phone gallery is one tap, so the picker can hand over

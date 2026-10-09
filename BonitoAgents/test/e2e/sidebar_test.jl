@@ -137,7 +137,8 @@
                         thumbRadius: getComputedStyle($(wrap).querySelector('.bt-proj-thumb')).borderTopLeftRadius,
                         badgeColor: getComputedStyle($(wrap).querySelector('.bt-proj-tag')).backgroundColor};
             })()""")
-            @test startswith(ring["worker"], "oklch(")
+            # The worker's palette colour (`worker_color`), a plain hex colour.
+            @test occursin(r"^#[0-9A-Fa-f]{6}$", ring["worker"])
             # The ring is the tile's own BACKGROUND with the picture inset and
             # rounded tighter, not a second shape sharing the picture's curved
             # edge — two shapes on one curve are each anti-aliased against it and
@@ -160,7 +161,8 @@
             TK.send_message(server, "glow")
             @test TK.wait_for(server, "the icon pulses while the agent works",
                 "!!$(wrap)?.classList.contains('bt-glow-active')"; timeout = 20) == true
-            @test TK.eval_js(server, "getComputedStyle($(wrap).querySelector('.bt-proj-icon')).animationName") == "bt-icon-glow"
+            # On the icon's own layer (an opacity pulse needs no repaint).
+            @test TK.eval_js(server, "getComputedStyle($(wrap).querySelector('.bt-proj-icon'), '::after').animationName") == "bt-icon-glow"
             TK.screenshot(server, joinpath(tempdir(), "sidebar_ring_glow.png"))
             @test TK.wait_for(server, "and settles when the turn ends",
                 "!!$(wrap)?.classList.contains('bt-glow-online')"; timeout = 30) == true

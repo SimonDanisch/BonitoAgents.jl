@@ -384,8 +384,10 @@ function share_page(::MarkdownShare, state::ServerState, l::ShareLink, context)
         </style></head><body><main>$(body)</main></body></html>"""
     return HTTP.Response(200, ["Content-Type" => "text/html; charset=utf-8",
         # No scripts: raw HTML in the file is for layout and media only.
+        # `font-src data:`: the inlined markdown CSS embeds its link-anchor
+        # font as a data URL, which `default-src 'self'` refused on every page.
         "Content-Security-Policy" => "default-src 'self'; script-src 'none'; object-src 'none'; " *
-                                     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; " *
+                                     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; " *
                                      "base-uri 'self'; form-action 'none'; frame-ancestors 'none'",
         "Cache-Control" => "no-cache", "Referrer-Policy" => "no-referrer"]; body = html)
 end

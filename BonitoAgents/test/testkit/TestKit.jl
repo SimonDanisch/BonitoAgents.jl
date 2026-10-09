@@ -103,7 +103,7 @@ export TestServer, dev_server, add_worker!, drop_worker_connection!,
        click, click_until, click_text, set_input,
        exit_success,
        screenshot, eval_js, wait_for, current_chat_id,
-       js_errors, clear_js_errors
+       js_errors, clear_js_errors, check_console!
 
 # ── Event DSL ──────────────────────────────────────────────────────────────
 # Each constructor returns a small `Dict` carrying the event type + payload.
@@ -483,7 +483,7 @@ mutable struct TestServer
     # code once, so a second login within the same 30 s waits for the next one.
     otp_used::Dict{String,Int}
     # The workers `add_worker!` started, stopped with the server (`close`).
-    extra_workers::Vector{@NamedTuple{proc::Base.Process, worker_id::String}}
+    extra_workers::Vector{@NamedTuple{proc::Base.Process, worker_id::String, config::String}}
 end
 
 # The worker relay grant this process's in-process MCP channels (control, and
@@ -728,7 +728,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
                        Ref{Any}(nothing), Ref(false),
                        (browser_width, browser_height), admin, Dict{String,Int}(),
-                       @NamedTuple{proc::Base.Process, worker_id::String}[])
+                       @NamedTuple{proc::Base.Process, worker_id::String, config::String}[])
 end
 
 # Dispatcher loop per mock-agent connection. Reads one `{"prompt": "...",
@@ -938,7 +938,7 @@ function add_worker!(s::TestServer; name::AbstractString = "worker-extra", crede
     proc, _ = rig === nothing ? BonitoWorker.spawn_worker() :
         withenv(BonitoWorker.spawn_worker, "JULIA_SSL_CA_ROOTS_PATH" => rig.root_cert)
     prev === nothing ? delete!(ENV, "BONITOAGENTS_CONFIG_DIR") : (ENV["BONITOAGENTS_CONFIG_DIR"] = prev)
-    push!(s.extra_workers, (proc = proc, worker_id = worker_id))
+    push!(s.extra_workers, (proc = proc, worker_id = worker_id, config = cfg))
     return proc
 end
 
@@ -951,7 +951,7 @@ function Base.close(s::TestServer)
     # bridge) so the NEXT dev_server re-dials fresh.
     disarm_mcp!("server teardown")
     ctx = s.browser[]
-    ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
+    ctx === nothing || close_browser(ctx)         # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
     close(s.h)
     # The workers `add_worker!` started go with the server, and so do the agents
@@ -960,7 +960,7 @@ function Base.close(s::TestServer)
     # a few behind, reconnecting to a dead port at ~600 MB each.
     for w in s.extra_workers
         BT.stop_worker_proc!(w.proc)
-        BonitoWorker.reap_agents_owned_by(w.worker_id)
+        BonitoWorker.reap_agents_owned_by(w.worker_id, w.config)
     end
     empty!(s.extra_workers)
     # The mock knobs `BT.dev_server` wrote into ENV stay: another TestServer may
@@ -1025,7 +1025,7 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
                        route::AbstractString = "/", offscreen::Bool = true)
     ensure_display!()
     old = s.browser[]
-    old === nothing || close(old)
+    old === nothing || close_browser(old)
     url = s.h.url * route
     # Behind the proxy the pages come with a certificate from Caddy's own CA, and
     # each browser keeps cookies of its own: Electron's default profile is shared
@@ -1041,11 +1041,20 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     # Only pass the kwarg when actually requested: the CI/test env pins a git
     # ElectronCall that predates `offscreen`, so the default path must call the
     # old signature. OSR is opt-in and only resolves against the dev checkout.
-    ctx = offscreen ?
-        ECT.open_window(url; width = width, height = height, show = false, offscreen = true, electron_args) :
-        ECT.open_window(url; width = width, height = height, show = false, electron_args)
+    # Opened blank and loaded only once the console is captured: what the page
+    # logs while it boots (Bonito's session init) is exactly what matters.
+    # ELECTRON_DISABLE_SECURITY_WARNINGS: an unpackaged Electron warns about the
+    # page's CSP allowing eval (Bonito evaluates its js""). Browsers never print
+    # that, so it would fail every item without saying anything about the app.
+    ctx = withenv("ELECTRON_DISABLE_SECURITY_WARNINGS" => "true") do
+        offscreen ?
+            ECT.open_window(; width = width, height = height, show = false, offscreen = true, electron_args) :
+            ECT.open_window(; width = width, height = height, show = false, electron_args)
+    end
+    capture_console!(ctx)
+    follow_pane_scope!(ctx)
     s.browser[] = ctx
-    ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
+    ElectronCall.load(ctx.window, ElectronCall.URI(url))
     sleep(3.0)                     # let the dashboard mount + the chat session boot
     install_pane_scope!(s)
     return s
@@ -1065,8 +1074,7 @@ end
 # selector, and the app's own JS already scopes `.bt-messages` per-pane
 # (`pane.querySelector`), so this never perturbs the product runtime. Installed
 # fresh on every `open_browser` (so a reconnect re-arms it).
-function install_pane_scope!(s::TestServer)
-    eval_js(s, raw"""(() => {
+const PANE_SCOPE_JS = raw"""(() => {
         if (window.__btPaneScopeInstalled) return true;
         window.__btPaneScopeInstalled = true;
         // NB: deliberately NOT scoping `.bt-embed`, `.bw-ws-panel`, `.bt-slot`
@@ -1090,9 +1098,25 @@ function install_pane_scope!(s::TestServer)
         document.querySelector    = wrap(Document.prototype.querySelector,    false);
         document.querySelectorAll = wrap(Document.prototype.querySelectorAll, true);
         return true;
+    })()"""
+
+# Every page load of the test window gets the shim, from Electron's main
+# process. Installing it only in `open_browser`/`navigate` left it off after any
+# other reload (the connection guard's, `location.reload()` in a test), and the
+# items after that one counted hidden panes: the failures appeared only late in
+# a long shared-server run.
+function follow_pane_scope!(ctx::ECT.TestContext)
+    run(ctx.app, """(() => {
+        const wc = electron.BrowserWindow.fromId($(ctx.window.id)).webContents;
+        const shim = $(json(PANE_SCOPE_JS));
+        wc.on('dom-ready', () => wc.executeJavaScript(shim)
+            .catch(e => console.error('TestKit: pane-scope shim not installed on ' + wc.getURL() + ': ' + e)));
+        return true;
     })()""")
-    return s
+    return ctx
 end
+
+install_pane_scope!(s::TestServer) = (eval_js(s, PANE_SCOPE_JS); s)
 
 """
     eval_js(s, code) -> Any
@@ -1134,43 +1158,108 @@ function eval_js(s::TestServer, code::AbstractString; timeout::Real = 20)
     return res[]
 end
 
+# ── Browser console ─────────────────────────────────────────────────────────
+# Every warning and error a test browser logs, recorded by Electron's MAIN
+# process (the window's `console-message` event). The sink this replaces lived
+# inside the page and saw only uncaught exceptions: Bonito reports a failing
+# closure with console.error and a handler it could not attach with
+# console.warn, and every reload wiped the sink. The main process sees each
+# message of the window from before its first page load until it closes, and
+# answers even while the renderer is pegged.
+
+# The browsers this process has open, and what closed ones logged that no check
+# has seen yet. One per process because the per-item check runs after the item
+# and has no handle on the servers the item opened and closed.
+struct ConsoleLog
+    lock::ReentrantLock
+    open::Vector{ECT.TestContext}
+    unchecked::Vector{Any}
+end
+const CONSOLE = ConsoleLog(ReentrantLock(), ECT.TestContext[], Any[])
+
+function capture_console!(ctx::ECT.TestContext)
+    run(ctx.app, """(() => {
+        const wc = electron.BrowserWindow.fromId($(ctx.window.id)).webContents;
+        const log = global.__btConsole = [];
+        // One parameter: Electron warns when a listener takes the older
+        // positional arguments; everything is on the event.
+        wc.on('console-message', (e) => {
+            if (e.level !== 'warning' && e.level !== 'error') return;
+            log.push({type: e.level, message: String(e.message), source: String(e.sourceId ?? ''),
+                      line: e.lineNumber, page: wc.getURL(), time: Date.now()});
+        });
+        return true;
+    })()""")
+    lock(() -> push!(CONSOLE.open, ctx), CONSOLE.lock)
+    return ctx
+end
+
+# The window's logged warnings and errors; `take` also empties the log.
+function console_entries(ctx::ECT.TestContext; take::Bool = false)
+    v = run(ctx.app, take ? "global.__btConsole.splice(0)" : "global.__btConsole.slice()")
+    return v === nothing ? Any[] : collect(Any, v)
+end
+
+# Close a test browser, keeping what it logged for the next `check_console!`.
+function close_browser(ctx::ECT.TestContext)
+    entries = if ctx.app.exists && isopen(ctx.window)
+        try
+            console_entries(ctx; take = true)
+        catch e
+            e isa ElectronCall.ElectronCallError || rethrow()
+            Any[Dict("type" => "error", "message" => "the browser's console log was unreadable at close: $(sprint(showerror, e))")]
+        end
+    else
+        Any[]
+    end
+    lock(CONSOLE.lock) do
+        filter!(c -> c !== ctx, CONSOLE.open)
+        append!(CONSOLE.unchecked, entries)
+    end
+    close(ctx)
+    return nothing
+end
+
 """
     js_errors(s) -> Vector
 
-JavaScript errors captured by the sink installed in `open_browser`
-(`window.onerror` + `unhandledrejection`), since the last `clear_js_errors`.
-Each entry has `type`/`message` (and maybe `filename`/`lineno`). A non-empty
-result means the UI threw during the run — a real bug, not test noise. The
-runner gates every suite on this being empty.
+Every warning and error the browser console logged since the last
+`clear_js_errors`, uncaught exceptions included. Each entry has `type`
+("warning" or "error"), `message`, `source` and `line`.
 """
-function js_errors(s::TestServer)
-    s.browser[] === nothing && return Any[]
-    # Route through the WATCHDOG eval_js, not ECT.js_errors (whose eval is
-    # unbounded): the gate runs right after a suite, and a suite that pegged the
-    # renderer (e.g. the 500-row flood) would otherwise hang the gate — and thus
-    # the whole runner — waiting for the paint to finish. Bounded: a pegged
-    # renderer makes this throw BridgeTimeout, which the runner treats as
-    # "couldn't sample, renderer busy" rather than a hang.
-    v = eval_js(s, "window.__errs || []"; timeout = 10)
-    return v === nothing ? Any[] : v
-end
+js_errors(s::TestServer) = s.browser[] === nothing ? Any[] : console_entries(s.browser[])
 
 """
     clear_js_errors(s)
 
-Reset the JS error sink. The runner calls this between suites so an error is
-attributed to the suite that actually caused it.
+Forget what the browser console logged so far.
 """
 function clear_js_errors(s::TestServer)
-    s.browser[] === nothing && return nothing
-    # Bounded + best-effort (same reasoning as js_errors): if the renderer is
-    # pegged the sink simply clears once it frees; never hang the runner on it.
-    try
-        eval_js(s, "window.__errs = []; true"; timeout = 10)
-    catch e
-        e isa BridgeTimeout || rethrow()
-    end
+    s.browser[] === nothing || console_entries(s.browser[]; take = true)
     return nothing
+end
+
+"""
+    check_console!() -> Vector{String}
+
+Every warning and error any browser of this process logged since the last
+check, open and closed browsers alike, one line each. The suite runs
+`@test isempty(check_console!())` after every item, so a page that logs a
+warning or an error fails the item that made it.
+"""
+function check_console!()
+    open = lock(() -> copy(CONSOLE.open), CONSOLE.lock)
+    entries = Any[]
+    for ctx in open
+        append!(entries, console_entries(ctx; take = true))
+    end
+    lock(CONSOLE.lock) do
+        prepend!(entries, CONSOLE.unchecked)
+        empty!(CONSOLE.unchecked)
+    end
+    return [string(e["type"], ": ", e["message"],
+                   isempty(get(e, "source", "")) ? "" : " ($(e["source"]):$(get(e, "line", "?")))")
+            for e in entries]
 end
 
 # (Removed `refresh_eval_session!`.) It `restart!`-ed the whole eval worker at
@@ -1292,8 +1381,10 @@ For routes that aren't direct URLs, prefer the high-level helpers
 function navigate(s::TestServer, route::AbstractString)
     base = s.h.url
     eval_js(s, "window.__btNavigationPending = true; location.href = $(json(base * String(route)))")
+    # `.bt-shell`, the app's root: `.bt-app` exists only while a chat is open,
+    # so a reload onto the dashboard never satisfied the wait.
     wait_for(s, "new document loaded",
-        "window.__btNavigationPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-app')";
+        "window.__btNavigationPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-shell')";
         timeout = 60)
     # Navigation replaces the document and its selector wrappers. Without
     # reinstalling these, the next suite can read a hidden chat's message
@@ -1543,7 +1634,7 @@ end
 
 function close_browser!(s::TestServer)
     ctx = s.browser[]
-    ctx === nothing || close(ctx)
+    ctx === nothing || close_browser(ctx)
     s.browser[] = nothing
     return s
 end
@@ -1570,6 +1661,11 @@ function login_refused(s::TestServer, login::Login)
                     return e.length > $(before) ? e.map(x => x.textContent.trim()).join(' ') : false; })()""";
         timeout = 30, interval = 0.1)
     refusal == "LET IN" && error("login_refused: Authelia let $(login.user) in")
+    # Authelia's page logs the refused request as an error. That refusal is
+    # what was asked for; anything else the console holds stays for the check.
+    run(s.browser[].app, """(() => { global.__btConsole = global.__btConsole.filter(e =>
+        !(e.message.includes('Request failed with status code 401') && e.source.includes('/static/js/portal')));
+        return true; })()""")
     return String(refusal)
 end
 

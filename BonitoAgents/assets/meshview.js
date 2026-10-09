@@ -12,15 +12,18 @@
 // on the scene's bounding box, so a 1 cm part and a 1 km terrain both open
 // filling the view.
 
-import * as THREE from "https://esm.sh/three@0.173.0";
-import { GLTFLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/GLTFLoader.js";
-import { OBJLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/OBJLoader.js";
-import { MTLLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/MTLLoader.js";
-import { STLLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/STLLoader.js";
-import { PLYLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/PLYLoader.js";
-import { mergeVertices } from "https://esm.sh/three@0.173.0/examples/jsm/utils/BufferGeometryUtils.js";
-import { OrbitControls } from "https://esm.sh/three@0.173.0/examples/jsm/controls/OrbitControls.js";
-import { RoomEnvironment } from "https://esm.sh/three@0.173.0/examples/jsm/environments/RoomEnvironment.js";
+// One esm.sh build target for every import. Without it Deno gets "denonext"
+// builds, but several loaders hard-code the es2022 one: the bundle carried two
+// copies of three.js, and the page warned "Multiple instances of Three.js".
+import * as THREE from "https://esm.sh/three@0.173.0?target=es2022";
+import { GLTFLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/GLTFLoader.js?target=es2022";
+import { OBJLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/OBJLoader.js?target=es2022";
+import { MTLLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/MTLLoader.js?target=es2022";
+import { STLLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/STLLoader.js?target=es2022";
+import { PLYLoader } from "https://esm.sh/three@0.173.0/examples/jsm/loaders/PLYLoader.js?target=es2022";
+import { mergeVertices } from "https://esm.sh/three@0.173.0/examples/jsm/utils/BufferGeometryUtils.js?target=es2022";
+import { OrbitControls } from "https://esm.sh/three@0.173.0/examples/jsm/controls/OrbitControls.js?target=es2022";
+import { RoomEnvironment } from "https://esm.sh/three@0.173.0/examples/jsm/environments/RoomEnvironment.js?target=es2022";
 
 // Thousands-separated and correctly pluralised: a one-triangle file reading
 // "1 triangles" is the sort of thing you notice every single time.

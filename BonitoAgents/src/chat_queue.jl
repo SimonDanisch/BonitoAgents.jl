@@ -28,7 +28,7 @@ function save_pending_sends!(model)
     s = shared(model)
     lock(s.lock) do
         rows = [Dict("id" => e.id, "text" => e.message.text, "auto" => e.bubble.auto,
-            "mode" => String(e.mode), "status" => String(e.status),
+            "mode" => String(e.mode), "status" => String(e.status), "detail" => e.detail,
             "images" => [Dict("mime" => i.mime, "data" => Base64.base64encode(i.data))
                          for i in e.message.images])
             for e in s.pending_sends if e isa PendingSend && e.status != :sent]
@@ -48,10 +48,29 @@ function load_pending_sends!(model)
         bubble.auto = get(row, "auto", false)
         images = [AgentClientProtocol.ImageAttachment(Base64.base64decode(i["data"]), String(i["mime"]))
                   for i in get(row, "images", Any[])]
+        # Only a message the user paused stays paused. Anything else was never
+        # handed to the agent (a handed-over entry is :sent and not persisted),
+        # so it goes out once this chat's consumer runs.
+        paused = get(row, "status", "waiting") == "paused"
         push!(model.pending_sends, PendingSend(String(row["id"]),
             UserMessage(bubble.text, collect(AgentClientProtocol.ImageAttachment, images)), bubble,
-            send_mode(get(row, "mode", "done")), :paused,
-            "Paused after restart; delivery was not confirmed. Review before resending.", nothing))
+            send_mode(get(row, "mode", "done")), paused ? :paused : :waiting,
+            paused ? String(get(row, "detail", "")) : "", nothing))
+    end
+    wake_outbox!(model)
+    return nothing
+end
+
+# Have the consumer look at the outbox again. One pending wakeup is enough; a
+# closed channel means the chat is closed, and its outbox waits on disk for the
+# next ChatModel of this project.
+function wake_outbox!(model)
+    s = shared(model)
+    (isopen(s.user_messages) && !isready(s.user_messages)) || return nothing
+    try
+        put!(s.user_messages, UserMessage("", AgentClientProtocol.ImageAttachment[]))
+    catch e
+        e isa InvalidStateException || rethrow()   # closed between the check and the put
     end
     return nothing
 end
@@ -80,9 +99,7 @@ function enqueue_message!(model, msg; images, mode)
     end
     @info "message queued" project_id=s.project_id message_id=entry.id mode
     emit_queue!(s)
-    # The channel is a wakeup, not the queue itself. Nonblocking coalescing:
-    # one outstanding wakeup is enough, regardless of the outbox's size.
-    isready(s.user_messages) || put!(s.user_messages, entry.message)
+    wake_outbox!(s)
     return nothing
 end
 
@@ -90,11 +107,11 @@ function next_submission(model)
     s = shared(model)
     lock(s.lock) do
         # Already-steered spans must settle before a new ordinary turn starts.
-        for status in (:sent, :waiting)
-            i = findfirst(e -> e isa PendingSend && e.status == status, s.pending_sends)
+        for ready in (==(:sent), in((:waiting, :offline)))
+            i = findfirst(e -> e isa PendingSend && ready(e.status), s.pending_sends)
             i === nothing && continue
             e = s.pending_sends[i]
-            e.status == :waiting && (e.status = :sending)
+            e.status == :sent || (e.status = :sending)
             return e
         end
         return nothing
@@ -116,21 +133,50 @@ function submission_sent!(model, e, span)
     return span
 end
 
+# The bring-up `live_client!` is about to do, shown on the message waiting on it.
+starting_session!(model, ::Nothing) = nothing
+function starting_session!(model, entry::PendingSend)
+    entry.detail = "Starting the agent session"
+    emit_queue!(model)
+    return nothing
+end
+
+# Hand one outbox entry to the agent and see its turn through. Returns whether
+# the consumer should go on with the next entry.
+#
+# A message that was not handed over stays in the outbox:
+#   * the agent could not be brought up → `:offline`, sent on the next wakeup
+#     (a new message, a session coming up, its worker reconnecting). The
+#     consumer stops here instead of retrying in a loop;
+#   * the chat was closed → `:waiting` on disk, sent when the chat reopens;
+#   * anything else failed → `:paused` with the error, for the user to judge.
+# What a message sent "when done" waits for: a turn of ours in flight, or a
+# cancel winding one down. Not work the agent does on its own (`Unprompted`, an
+# auto-wake after backgrounded work, a background subagent reporting): that has
+# no end the agent announces, only 30s of quiet, and a background subagent can
+# keep it going for as long as it runs. The next prompt is what ends such an
+# episode, so waiting for it held the message back for good.
+waits_for_turn(::AgentClientProtocol.SessionActivity) = false
+waits_for_turn(::AgentClientProtocol.Prompted) = true
+waits_for_turn(::AgentClientProtocol.Cancelling) = true
+
 function run_submission!(model, entry)
     emit_queue!(model)
+    failure = nothing
+    go_on = true
     try
         if entry.span !== nothing
             while_busy(model) do
                 finish_turn!(model, entry.span.turn; nstore0=entry.span.nstore0)
             end
         else
-            if entry.mode == :done && AgentClientProtocol.is_working(session_activity(model))
+            if entry.mode == :done && waits_for_turn(session_activity(model))
                 entry.detail = "Waiting until the agent finishes"
                 emit_queue!(model)
-                while entry.status == :sending && AgentClientProtocol.is_working(session_activity(model))
+                while entry.status == :sending && waits_for_turn(session_activity(model))
                     sleep(0.05)
                 end
-                entry.status == :sending || return nothing
+                entry.status == :sending || return true
                 entry.detail = ""
             end
             begin_turn(model, entry.message; submission=entry) do turn
@@ -138,24 +184,48 @@ function run_submission!(model, entry)
             end
         end
     catch e
-        entry.status == :sending && (entry.detail =
-            "Delivery was not confirmed. Review the conversation before retrying.")
+        cause = innermost_cause(e)
         @error "queued message delivery failed" project_id=model.project_id message_id=entry.id exception=(e, catch_backtrace())
-        report_turn_error!(model, e)
-    finally
-        lock(model.lock) do
-            if entry.status == :sent
-                filter!(e -> e !== entry, model.pending_sends)
-            elseif entry.status == :sending
-                entry.status = :paused
-                isempty(entry.detail) && (entry.detail =
-                    "Not sent: the agent could not accept this message. Retry when connected.")
-            end
-            save_pending_sends!(model)
+        if entry.status == :sending && !is_session_dead_error(cause)
+            failure = sprint(showerror, cause)
+        else
+            # Lost the session (before or after the handoff), or the turn
+            # failed after the agent got the message: the chat shows it.
+            report_turn_error!(model, e)
         end
-        emit_queue!(model)
+    finally
+        go_on = settle_submission!(model, entry, failure)
     end
-    return nothing
+    return go_on
+end
+
+function settle_submission!(model, entry, failure)
+    go_on = true
+    lock(model.lock) do
+        if entry.status == :sent
+            filter!(e -> e !== entry, model.pending_sends)
+        elseif entry.status == :sending
+            if failure !== nothing
+                entry.status = :paused
+                entry.detail = "Not sent: $(failure)"
+            elseif !isopen(model.user_messages)
+                entry.status = :waiting
+                entry.detail = ""
+                go_on = false
+            else
+                err = model.last_error[]
+                entry.status = :offline
+                entry.detail = "Not sent yet: the agent is not reachable" *
+                    (isempty(err) ? "" : " ($(err))") * ". It goes out once the session is back."
+                go_on = false
+            end
+        end
+        save_pending_sends!(model)
+    end
+    emit_queue!(model)
+    entry.status == :offline &&
+        @warn "agent unreachable; message held" project_id=model.project_id message_id=entry.id error=model.last_error[]
+    return go_on
 end
 
 function drop_queued_sends!(model::ChatModel)
@@ -163,7 +233,7 @@ function drop_queued_sends!(model::ChatModel)
     count = lock(s.lock) do
         n = 0
         for e in s.pending_sends
-            e isa PendingSend && e.status in (:waiting, :sending) || continue
+            e isa PendingSend && e.status in (:waiting, :offline, :sending) || continue
             e.status = :paused
             e.detail = "Not sent: paused by Stop. Send it again or remove it."
             n += 1
@@ -198,8 +268,12 @@ function deliver_boundary_message!(model)
             span = AgentClientProtocol.prompt!(c, with_prelude(s, e.message.text); images=e.message.images)
             submission_sent!(s, e, span)
         catch err
-            e.status = :paused
-            e.detail = "Steering failed; delivery was not confirmed. Review before retrying."
+            # prompt! threw, so the agent did not take it. Fall back to the
+            # ordinary delivery when the turn ends, which also restarts a
+            # session that died under the steer.
+            e.status = :waiting
+            e.mode = :done
+            e.detail = "Could not reach the running turn; sends when it finishes."
             save_pending_sends!(s)
             emit_queue!(s)
             @error "message steering failed" project_id=s.project_id message_id=e.id exception=(err, catch_backtrace())
@@ -211,7 +285,7 @@ end
 function handle_command!(model::ChatModel, ::Any, cmd::QueueActionCommand)
     s = shared(model)
     entry = lock(s.lock) do
-        i = findfirst(e -> e isa PendingSend && e.id == cmd.id && e.status in (:waiting, :paused), s.pending_sends)
+        i = findfirst(e -> e isa PendingSend && e.id == cmd.id && e.status in (:waiting, :offline, :paused), s.pending_sends)
         i === nothing && return nothing
         e = s.pending_sends[i]
         if cmd.action == "remove"
@@ -228,8 +302,6 @@ function handle_command!(model::ChatModel, ::Any, cmd::QueueActionCommand)
     end
     entry === nothing || @info "message queue action" project_id=s.project_id message_id=entry.id action=cmd.action
     emit_queue!(s)
-    if entry !== nothing && cmd.action == "send"
-        isready(s.user_messages) || put!(s.user_messages, entry.message)
-    end
+    entry !== nothing && cmd.action == "send" && wake_outbox!(s)
     return nothing
 end

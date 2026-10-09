@@ -18,6 +18,7 @@ delete!(ENV, "JULIA_LOAD_PATH")
     include("test_process_reaping.jl")
     include("test_wait.jl")
     include("test_runs.jl")
+    include("test_processes.jl")
     include("test_eval_host.jl")
     include("test_remote_values.jl")
     # ⚠ LAST on purpose: this one needs `Bonito`, which is not in the test

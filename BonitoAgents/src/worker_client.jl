@@ -420,6 +420,8 @@ function handle_worker_link(state::ServerState, ws, request)
             # Registered and online: the chats a crash of its previous run cut off
             # can be continued now.
             worker_run_started!(state, worker_id, info)
+            # What its previous run left running dies now (processes.jl).
+            Base.errormonitor(@async kill_leftovers!(state, worker_id))
         end
         # Returning closes the websocket, so stay until the connection ends.
         wait(t)
@@ -539,7 +541,9 @@ function register_worker!(state::ServerState, worker_id::String, name::String,
         reported_harnesses(get(hello, "harnesses", nothing)),
         "",
     )
+    w.capabilities = String[String(c) for c in get(hello, "capabilities", Any[]) if c isa AbstractString]
     lock(state.lock) do
+        w.color_slot = existing === nothing ? free_color_slot(state.workers[], worker_id) : existing.color_slot
         state.worker_links[worker_id] = link
         state.workers[][worker_id] = w
         migrate_legacy_worker_refs!(state, w)
@@ -551,6 +555,7 @@ function register_worker!(state::ServerState, worker_id::String, name::String,
     link_state === :dead && (teardown_worker!(state, worker_id, link); return w)
     connected = link_state === :connected
     online[] == connected || (online[] = connected)
+    connected && wake_worker_chats!(state, worker_id)
     # `migrate_legacy_worker_refs!` may have rewritten project rows, and the
     # project cards show the worker's name.
     notify_workers!(state)
@@ -623,6 +628,18 @@ end
 
 # The link's state is the worker's: connected is online, detached is offline
 # with everything kept for the reconnect, dead is gone.
+
+# A worker that comes (back) online can take the messages its chats held while
+# no session could be brought up there.
+function wake_worker_chats!(state::ServerState, worker_id::AbstractString)
+    chats = lock(state.lock) do
+        ChatModel[m for (pid, m) in state.chat_models
+                  if (p = get(state.projects[], pid, nothing)) !== nothing && p.worker_id == worker_id]
+    end
+    foreach(wake_outbox!, chats)
+    return nothing
+end
+
 function worker_link_changed!(state::ServerState, worker_id::String,
                               link::WorkerLink.Link, st::Symbol)
     worker_link(state, worker_id) === link || return nothing   # replaced or removed
@@ -641,6 +658,7 @@ function worker_link_changed!(state::ServerState, worker_id::String,
     notify_workers!(state)
     if online
         @info "Worker connected" worker_id name = w.name
+        wake_worker_chats!(state, worker_id)
     else
         @info "Worker connection lost; its agents keep running until it reconnects" worker_id grace = state.worker_link_grace
     end
@@ -665,13 +683,13 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
                 elseif t in ("list_dir_response", "make_dir_response", "ensure_dir_response",
                              "stat_path_response", "read_file_range_response",
                              "list_project_files_response", "clone_repo_response",
-                             "inspect_path_response", "tail_file_response",
+                             "inspect_path_response",
                              "kill_file_writers_response", "git_diff_response",
                              "find_repos_response", "worker_state_response",
                              "read_log_response", "debug_checkout_response",
                              "stage_session_response", "install_session_response",
                              "discard_staging_response", "open_eval_host_response",
-                             "close_eval_host_response")
+                             "close_eval_host_response", "kill_processes_response")
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "scan_sessions_result"
                     sessions = [Dict{String,Any}(s) for s in get(cmd, "sessions", Any[])]
@@ -1291,34 +1309,6 @@ function inspect_worker_path(state::ServerState, worker_name::String,
     summary = get(resp, "summary", nothing)
     summary isa AbstractDict || error("inspect_path: missing summary")
     return Dict{String,Any}(summary)
-end
-
-# Stream a worker file from byte `offset`. Returns the new chunk + offset and
-# whether the file is still held open (the background-task "still running"
-# signal — see the worker's `file_held_open`). `open_known=false` means the
-# worker couldn't tell (non-Linux) and the caller should fall back to mtime.
-function tail_worker_file(state::ServerState, worker_id::AbstractString,
-                           path::AbstractString; offset::Int = 0,
-                           max_bytes::Int = 65536, timeout::Real = 15.0)
-    reachable(state, worker_id) ||
-        error("Worker '$worker_id' is not connected")
-    rid, ch = register_rpc!(state)
-    resp = try
-        send_command(state, worker_id, Dict(
-            "type" => "tail_file", "request_id" => rid,
-            "path" => String(path), "offset" => offset, "max_bytes" => max_bytes))
-        take_pending!(state, ch, rid, timeout, "tail_file on '$worker_id'")
-    finally
-        unregister_rpc!(state, rid)   # T10
-    end
-    resp isa AbstractDict || error("tail_file: unexpected response shape")
-    haskey(resp, "error") && error("tail_file on '$worker_id': $(resp["error"])")
-    return (exists     = Bool(get(resp, "exists", false)),
-            offset     = Int(get(resp, "offset", offset)),
-            chunk      = String(get(resp, "chunk", "")),
-            open       = Bool(get(resp, "open", true)),
-            open_known = Bool(get(resp, "open_known", false)),
-            mtime      = Float64(get(resp, "mtime", 0.0)))
 end
 
 # SIGTERM every process holding `path` open on the worker — the direct stop

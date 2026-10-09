@@ -184,6 +184,7 @@ function ctrl_dial_loop(wsurl::AbstractString, handshake::AbstractString;
                 # The server may be new (restarted) or have missed frames while
                 # we were away: tell it about every run it should still show.
                 announce_open_runs()
+                announce_processes()
                 try
                     for msg in ws
                         # Per-frame guard: one malformed frame must not drop the
@@ -287,18 +288,28 @@ function handle_ctrl_frame!(ws, msg::AbstractDict)
         # env's eval (a card from before runs). A user's stop reaches background
         # runs too — only a turn cancel leaves them alone.
         run = get(msg, "run", nothing)
-        n = if run isa AbstractString && !isempty(run)
-            r = @lock SERVER.runs.lock get(SERVER.runs.runs, String(run), nothing)
-            r !== nothing && interrupt_run!(r) ? 1 : 0
-        else
-            env_path = get(msg, "env_path", nothing)
-            env_path isa AbstractString && isempty(env_path) && (env_path = nothing)
-            interrupt_in_flight!(env_path isa AbstractString ? String(env_path) : nothing;
-                                 background = true)
+        # Always answered, a failure with its error: the server waits on this
+        # reply, and a throw here used to leave it to time out and report the
+        # worker as unreachable.
+        reply = Dict{String,Any}("type" => "interrupt_result", "request_id" => rid)
+        try
+            reply["interrupted"] = if run isa AbstractString && !isempty(run)
+                r = @lock SERVER.runs.lock get(SERVER.runs.runs, String(run), nothing)
+                r !== nothing && interrupt_run!(r) ? 1 : 0
+            else
+                env_path = get(msg, "env_path", nothing)
+                env_path isa AbstractString && isempty(env_path) && (env_path = nothing)
+                interrupt_in_flight!(env_path isa AbstractString ? String(env_path) : nothing;
+                                     background = true)
+            end
+        catch e
+            e isa InterruptException && rethrow()
+            reply["interrupted"] = 0
+            reply["error"] = sprint(showerror, e)
         end
-        log_info("ctrl interrupt_eval (run=$(run), env=$(get(msg, "env_path", nothing))) → interrupted $n eval(s)")
-        WebSockets.send(ws, JSON.json(Dict(
-            "type" => "interrupt_result", "request_id" => rid, "interrupted" => n)))
+        log_info("ctrl interrupt_eval (run=$(run), env=$(get(msg, "env_path", nothing))) → " *
+                 (haskey(reply, "error") ? "failed: $(reply["error"])" : "interrupted $(reply["interrupted"]) eval(s)"))
+        WebSockets.send(ws, JSON.json(reply))
     elseif op == "ping"
         WebSockets.send(ws, JSON.json(Dict("type" => "pong", "request_id" => rid)))
     elseif op in HOST_OPS

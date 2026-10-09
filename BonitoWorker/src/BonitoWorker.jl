@@ -12,9 +12,12 @@ using MsgPack
 import Random
 import Sockets
 import WorkerLink
+import FileWatching
 include("mcp_relay.jl")
 include("harnesses.jl")
 include("worker.jl")
+include("processes.jl")
+include("file_watch.jl")
 import Pkg
 
 # ── The control-WS wire ─────────────────────────────────────────────────────
@@ -358,7 +361,9 @@ function mcp_args()
     return String[
         "--project=$(project)",
         "--startup-file=no",
-        "--threads=auto",
+        # A relay between the agent and its eval sessions (which get every
+        # thread, BonitoMCP session.jl): idle threads here would only spin.
+        "--threads=2",
         "-e", "using BonitoMCP; BonitoMCP.run_stdio()",
     ]
 end
@@ -405,12 +410,20 @@ service_exec_stop(pidfile::AbstractString = pidfile_path()) =
 # ExecStart must name an absolute executable and systemd does not search that
 # PATH for it, so `/usr/bin/env` does the lookup: the worker runs on the `julia`
 # the PATH holds when it starts, like everything it launches.
+# The julia flags every worker starts with. A worker relays and waits: its work
+# is IO, and nothing in it computes in parallel. Two threads keep one free while
+# the other runs a long call; more only cost: every idle thread spins up to look
+# for work on each wakeup. A worker that took 32 from JULIA_NUM_THREADS spent 20
+# times the CPU of a 2-thread one relaying the same agent stream.
+worker_julia_args(project::AbstractString) =
+    ["--project=$(project)", "--startup-file=no", "--threads=2"]
+
 function render_service_unit(; project::AbstractString = "@bonito-agents",
                                projects_root::AbstractString = pwd(),
                                memory_max::AbstractString = "85%",
                                path_env::AbstractString = get(ENV, "PATH", ""))
-    exec = "/usr/bin/env julia --project=$(project) --startup-file=no " *
-           "-e 'using BonitoWorker; BonitoWorker.start()'"
+    exec = "/usr/bin/env julia " * join(worker_julia_args(project), " ") *
+           " -e 'using BonitoWorker; BonitoWorker.start()'"
     return """
     [Unit]
     Description=BonitoAgents worker
@@ -767,7 +780,7 @@ function install!(; server_url::String,
         println("    server/credential on its next reconnect. If you need a hard restart")
         println("    anyway:")
         println()
-        println("      julia --project=@bonito-agents -e \"using BonitoWorker; BonitoWorker.stop_running_worker!(); BonitoWorker.start()\"")
+        println("      julia --project=@bonito-agents --threads=2 -e \"using BonitoWorker; BonitoWorker.stop_running_worker!(); BonitoWorker.start()\"")
         println()
         return result
     end
@@ -779,7 +792,7 @@ function install!(; server_url::String,
     println("    The worker runs detached and survives this shell. To start it")
     println("    again later (e.g. after a reboot), run:")
     println()
-    println("      julia --project=@bonito-agents -e \"using BonitoWorker; BonitoWorker.start()\"")
+    println("      julia --project=@bonito-agents --threads=2 -e \"using BonitoWorker; BonitoWorker.start()\"")
     println()
     return result
 end
@@ -835,7 +848,7 @@ function spawn_worker(; force_restart::Bool = false)
     # points at without losing every line written afterwards.
     rotate_spawn_log!(logfile)
     project = something(Base.active_project(), "@bonito-agents")
-    cmd = `julia --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
+    cmd = `julia $(worker_julia_args(project)) -e $("using BonitoWorker; BonitoWorker.start()")`
     # Tell the child that fd 1/2 ARE the log, so it does not redirect a second
     # time (that would split the log and rotate the file out from under our
     # descriptor). Every other way a worker starts — the installer's systemd
@@ -1236,12 +1249,13 @@ function open_eval_host!(w::Worker, project_id::AbstractString, env::AbstractDic
         revoke_mcp_grants!(relay, owner)
         host_env = merge(inherited_env(),
                          Dict{String,String}(String(k) => String(v) for (k, v) in env),
-                         Dict("BONITOAGENTS_EVAL_HOST_WORKER" => c.worker_id,
-                              AGENT_OWNER_ENV => c.worker_id),
+                         Dict("BONITOAGENTS_EVAL_HOST_WORKER" => c.worker_id),
+                         owner_env(c.worker_id),
                          mcp_relay_env(relay, project_id; host = true, owner))
         args = eval_host_arguments(c.mcp_arguments)
-        # `detach`: the host leads its own process group, so killing it reaches
-        # the eval workers it spawned — same as an agent (see run_agent_session).
+        # `detach`: the host leads its own process group, as an agent does (see
+        # run_agent_session). Its eval workers lead their own; the chat's process
+        # record reaches them (processes.jl).
         proc = try
             open(detach(Cmd(`$(c.mcp_command) $args`; env = host_env)), "r")
         catch
@@ -1283,9 +1297,16 @@ function handle_close_eval_host(w::Worker, ws, cmd::AbstractDict)
     end
 end
 
-# The env var every agent (and everything it spawns) is stamped with, naming the
-# worker that owns it. See `provider_env` and `reap_stray_agents!`.
+# The env vars every agent (and everything it spawns) is stamped with: the id of
+# the worker that owns it, and the config dir of that worker's install. See
+# `provider_env` and `reap_stray_agents!`. The id alone is not enough: anything
+# started with a copy of a real worker's id (a test worker handed the Desktop's
+# id, a copied config) matched that machine's LIVE agents, and its startup sweep
+# killed every chat there. A copy runs from a config dir of its own.
 const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
+const AGENT_OWNER_DIR_ENV = "BONITOAGENTS_OWNER_CONFIG"
+owner_env(worker_id::AbstractString = load_or_generate_worker_id(), dir::AbstractString = config_dir()) =
+    Dict{String,String}(AGENT_OWNER_ENV => String(worker_id), AGENT_OWNER_DIR_ENV => String(dir))
 
 # The environment an agent-side child (agent, session scan, eval host, git in a
 # project) inherits:
@@ -1314,7 +1335,7 @@ end
 function provider_env(provider, extra::AbstractDict = Dict{String,String}())
     return merge(inherited_env(),
                  provider.env,
-                 Dict(AGENT_OWNER_ENV => load_or_generate_worker_id()),
+                 owner_env(),
                  extra)
 end
 
@@ -1361,12 +1382,15 @@ on the same machine has a different id, and its agents are none of our business.
 A previous incarnation of ourselves has the SAME id — and by the time we are
 starting, it is not running.
 """
-reap_stray_agents!() = reap_agents_owned_by(load_or_generate_worker_id())
+reap_stray_agents!() = reap_agents_owned_by(load_or_generate_worker_id(), config_dir())
 
 """
-    reap_agents_owned_by(worker_id) -> Int
+    reap_agents_owned_by(worker_id, config_dir) -> Int
 
-The same sweep for an EXPLICIT worker id. `dev_server` needs this: every test
+The same sweep for an EXPLICIT worker: its id and the config dir it runs from.
+A process counts as its only when it carries both marks (`owner_env`).
+
+`dev_server` needs this: every test
 server gets a throwaway config dir, hence a fresh id, so the startup sweep above
 can never match a previous run's leftovers — it is looking for an id that has
 never existed before. The server knows the id it handed out, so it can reap on
@@ -1375,14 +1399,14 @@ the way down instead.
 Only call this once the worker owning `worker_id` is gone, or you will kill the
 agents of a session that is still in use.
 """
-function reap_agents_owned_by(worker_id::AbstractString)
+function reap_agents_owned_by(worker_id::AbstractString, dir::AbstractString)
     (Sys.isunix() && isdir("/proc")) || return 0
-    isempty(worker_id) && return 0
+    (isempty(worker_id) || isempty(dir)) && return 0
     # The trailing NUL matters. `/proc/<pid>/environ` is a NUL-SEPARATED blob, so
     # a bare `NAME=<id>` also matches `NAME=<id>-something` — and worker ids are
     # not prefix-free. Without the terminator this reaps another worker's LIVE
     # agents, which the test for it caught on the first run.
-    mark = AGENT_OWNER_ENV * "=" * worker_id * "\0"
+    marks = [name * "=" * value * "\0" for (name, value) in owner_env(worker_id, dir)]
     me   = getpid()
     n    = 0
     for entry in readdir("/proc")
@@ -1394,7 +1418,7 @@ function reap_agents_owned_by(worker_id::AbstractString)
             e isa InterruptException && rethrow()
             continue              # gone between readdir and read, or not ours to read
         end
-        occursin(mark, environ) || continue
+        all(m -> occursin(m, environ), marks) || continue
         try
             ccall(:kill, Cint, (Cint, Cint), Cint(pid), 9)
             n += 1
@@ -1427,10 +1451,11 @@ function kill_proc!(proc)
         e isa Base.IOError || @warn "BonitoWorker: SIGKILL failed" exception=e
     end
     # The agent's CHILDREN. `detach` at spawn made the agent its own group
-    # leader, so one signal to `-pgid` reaches the MCP servers it started and the
-    # Julia eval workers under those. Killing only the agent left those running:
-    # they are what actually holds the memory (a julia eval worker is hundreds of
-    # MB; the node agent is tens).
+    # leader, so one signal to `-pgid` reaches the MCP servers it started.
+    # Killing only the agent left those running. The Julia eval workers under
+    # them are not in this group (Malt gives each its own) and are what holds
+    # the memory (hundreds of MB each, the node agent tens): the chat's process
+    # record kills them (processes.jl).
     #
     # Sent AFTER the agent is down, and guarded so we can never signal our own
     # group — same belt-and-braces as BonitoMCP's `reap_process_tree`.
@@ -1711,20 +1736,9 @@ function handle_inspect_path(ws, cmd::AbstractDict)
     end
 end
 
-# Is `path` still held open by some process? This is the reliable "background
-# task still running" signal: a backgrounded shell keeps its `> output` redirect
-# open until it exits, so a quiet-but-open file (e.g. mid `sleep 60`) reads as
-# running, and the fd closing the instant the shell exits reads as done — no
-# completion sentinel needed. Linux only (scans `/proc/*/fd`); returns `nothing`
-# on other OSes so the server can fall back to mtime quiescence.
-function file_held_open(path::AbstractString)::Union{Bool,Nothing}
-    Sys.islinux() || return nothing
-    return !isempty(file_writer_pids(path))
-end
-
 # Every OTHER process holding `path` open — for a background shell that's
 # the shell itself (its `>> output` redirect stays open until exit). Used
-# both for the "still running" signal above and for `kill_file_writers`:
+# both for the "still running" signal (file_watch.jl) and for `kill_file_writers`:
 # claude-agent-acp runs shells inside the SDK with no ACP-level kill, so
 # the redirect fd is the one reliable handle for stopping one directly.
 #
@@ -1734,24 +1748,30 @@ end
 function file_writer_pids(path::AbstractString)::Vector{Int}
     me = getpid()
     if Sys.islinux()
-        target = try realpath(path) catch; abspath(path) end
+        # Compared by inode: one `stat` per descriptor, where `realpath` walked
+        # every component of every target (0.3 s for 14k descriptors here).
+        target = stat(path)
+        isfile(target) || return Int[]
+        uid = ccall(:getuid, Cuint, ())
         pids = Int[]
-        for pid in readdir("/proc")
-            all(isdigit, pid) || continue
-            p = parse(Int, pid)
-            p == me && continue          # our own tail read must not count/die
-            fddir = joinpath("/proc", pid, "fd")
-            try
-                for fd in readdir(fddir)
-                    lnk = try realpath(joinpath(fddir, fd)) catch; "" end
-                    if lnk == target
-                        push!(pids, p)
-                        break
-                    end
+        for name in readdir("/proc")
+            p = tryparse(Int, name)
+            (p === nothing || p == me) && continue    # our own tail read must not count/die
+            # Another user's descriptors are not ours to read (or to kill).
+            stat("/proc/$name").uid == uid || continue
+            holds = try
+                # A descriptor closed meanwhile stats as missing (inode 0).
+                any(readdir("/proc/$name/fd")) do fd
+                    s = stat("/proc/$name/fd/$fd")
+                    s.inode == target.inode && s.device == target.device
                 end
-            catch
-                # process vanished mid-scan or fd not readable — skip
+            catch e
+                # It exited during the scan, or the kernel will not let us look
+                # into it (a sandboxed app runs as us but hides its descriptors).
+                e isa Base.IOError || rethrow()
+                false
             end
+            holds && push!(pids, p)
         end
         return pids
     elseif Sys.isunix()
@@ -1781,7 +1801,7 @@ end
 # non-Linux or when the file isn't present (older kernels without
 # CONFIG_PROC_CHILDREN — rare; the writer-set still covers the common case).
 function child_pids(pid::Int)::Vector{Int}
-    Sys.islinux() || return Int[]
+    Sys.islinux() || return Sys.isunix() ? pgrep_children(pid) : Int[]
     kids = Int[]
     taskdir = "/proc/$pid/task"
     isdir(taskdir) || return kids
@@ -1796,6 +1816,12 @@ function child_pids(pid::Int)::Vector{Int}
         end
     end
     return kids
+end
+
+# macOS and the BSDs have no /proc: ask `pgrep`, which exits 1 for no children.
+function pgrep_children(pid::Int)
+    out = read(pipeline(ignorestatus(`pgrep -P $pid`); stderr = devnull), String)
+    return Int[parse(Int, l) for l in eachline(IOBuffer(out)) if !isempty(strip(l))]
 end
 
 # `pid` plus its full descendant tree (BFS). The background bash that holds
@@ -1847,43 +1873,6 @@ function handle_kill_file_writers(ws, cmd::AbstractDict)
         @warn "kill_file_writers response failed" exception=e
     end
     return nothing
-end
-
-# Stream a file from byte `offset`, plus whether it's still being written
-# (`open`). `open_known=false` ⇒ we couldn't tell (non-Linux) and the server
-# should use mtime quiescence instead.
-function handle_tail_file(ws, cmd::AbstractDict)
-    request_id = String(get(cmd, "request_id", ""))
-    raw_path   = String(get(cmd, "path", ""))
-    offset     = Int(get(cmd, "offset", 0))
-    max_bytes  = Int(get(cmd, "max_bytes", 65536))
-    response = try
-        if !isfile(raw_path)
-            Dict("type" => "tail_file_response", "request_id" => request_id,
-                 "exists" => false, "offset" => offset, "chunk" => "",
-                 "open" => false, "open_known" => true)
-        else
-            sz    = filesize(raw_path)
-            off   = clamp(offset, 0, sz)
-            chunk = open(raw_path, "r") do io
-                seek(io, off)
-                String(read(io, min(max_bytes, sz - off)))
-            end
-            held = file_held_open(raw_path)
-            Dict("type" => "tail_file_response", "request_id" => request_id,
-                 "exists" => true, "offset" => off + sizeof(chunk), "chunk" => chunk,
-                 "open" => held === true, "open_known" => held !== nothing,
-                 "mtime" => mtime(raw_path))
-        end
-    catch e
-        Dict("type" => "tail_file_response", "request_id" => request_id,
-             "error" => sprint(showerror, e))
-    end
-    try
-        send_control(ws, response)
-    catch e
-        @warn "tail_file response failed" exception=e
-    end
 end
 
 function inspect_path_summary(root::AbstractString)

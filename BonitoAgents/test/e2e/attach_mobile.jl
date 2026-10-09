@@ -40,22 +40,24 @@ function run_suite(s)
     m = TK.eval_js(s, """(() => {
         const row  = document.querySelector('$(P).bt-input-row');
         const btn  = document.querySelector('$(P).bt-attach-btn');
+        const send = document.querySelector('$(P).bt-send-btn');
         const ta   = document.querySelector('$(P).bt-text-input');
         const area = document.querySelector('$(P).bt-input-area');
         const r = e => { const b = e.getBoundingClientRect();
                          return {x: b.left, r: b.right, w: b.width, h: b.height}; };
         return {
-            btn: r(btn), ta: r(ta), row: r(row),
+            btn: r(btn), send: r(send), ta: r(ta), row: r(row),
             rowOverflow:  row.scrollWidth  - row.clientWidth,
             areaOverflow: area.scrollWidth - area.clientWidth,
             vw: window.innerWidth,
         };
     })()""")
 
-    # Tap target survives the narrow layout — nothing in the mobile block may
-    # shrink it, since this is the width where it matters most.
-    @test m["btn"]["w"] >= 40
-    @test m["btn"]["h"] >= 40
+    # Tap target survives the narrow layout: the mobile block keeps it the
+    # composer's control size (36px, 32px under 360px wide, since fb5dca1),
+    # the same square as Send.
+    @test m["btn"]["w"] >= 32 && m["btn"]["w"] == m["btn"]["h"]
+    @test (m["btn"]["w"], m["btn"]["h"]) == (m["send"]["w"], m["send"]["h"])
 
     # The icon actually LOADED. Every assertion here passes just as happily with
     # a broken-image glyph sitting in a correctly-sized box: a typo in the asset

@@ -131,24 +131,31 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 # The same convention the pidfile testset already follows for the
                 # same reason.
                 mine   = "test-owner-" * BW.generate_worker_id()
+                mydir  = mktempdir()
                 marked = open(detach(Cmd(`sleep 300`;
-                    env = merge(Dict(ENV), Dict(BW.AGENT_OWNER_ENV => mine)))), "r+")
+                    env = merge(Dict(ENV), BW.owner_env(mine, mydir)))), "r+")
                 # Another worker's agent, alive right now: same shape, different
                 # owner. Reaping it would take down someone else's session. The
                 # id is ours plus a suffix, which is the prefix case the NUL
                 # terminator in the mark exists for.
                 other  = open(detach(Cmd(`sleep 300`;
-                    env = merge(Dict(ENV), Dict(BW.AGENT_OWNER_ENV => mine * "-not-me")))), "r+")
+                    env = merge(Dict(ENV), BW.owner_env(mine * "-not-me", mydir)))), "r+")
+                # The SAME id from another install's config dir: a copy of the
+                # id (a test worker handed a real machine's id) once reaped every
+                # live agent of that machine. The config dir tells them apart.
+                copied = open(detach(Cmd(`sleep 300`;
+                    env = merge(Dict(ENV), BW.owner_env(mine, mktempdir())))), "r+")
                 # Pids captured UP FRONT: `getpid(::Process)` throws ESRCH once
                 # the process is reaped, so reading it after the kill turns a
                 # passing assertion into an error.
-                mpid, opid = getpid(marked), getpid(other)
+                mpid, opid, cpid = getpid(marked), getpid(other), getpid(copied)
                 try
                     sleep(0.5)
                     @test alive(mpid)
                     @test alive(opid)
+                    @test alive(cpid)
 
-                    n = BW.reap_agents_owned_by(mine)
+                    n = BW.reap_agents_owned_by(mine, mydir)
                     # EXACTLY one: a synthetic id matches the one process we
                     # planted and nothing else on the machine. `>= 1` was the
                     # honest bound while this swept the real id — it had to
@@ -157,8 +164,9 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                     @test timedwait(() -> !alive(mpid), 5.0) === :ok
                     sleep(0.5)
                     @test alive(opid)              # NOT ours, NOT touched
+                    @test alive(cpid)              # our id, another install: NOT touched
                 finally
-                    for p in (marked, other)
+                    for p in (marked, other, copied)
                         try; BW.kill_process_group!(p); catch; end
                         try; kill(p, Base.SIGKILL); catch; end
                         try; close(p); catch; end
@@ -175,6 +183,7 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 env  = BW.provider_env(prov)
                 # The mark is what makes a stray findable at all.
                 @test env[BW.AGENT_OWNER_ENV] == BW.load_or_generate_worker_id()
+                @test env[BW.AGENT_OWNER_DIR_ENV] == BW.config_dir()
                 @test env["PROVIDER_ONLY"] == "1"
                 @test haskey(env, "PATH")            # live ENV is the base
                 # ...and a caller's overrides win over both.
@@ -208,5 +217,64 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 rm(pidfile; force = true)
             end
         end
+
+        # A chat's Julia eval workers lead groups of their own (Malt), out of
+        # reach of the agent's group kill: a restart of the chat kills them from
+        # the server's record of its processes (processes.jl). Recorded with a
+        # moment each was alive; a pid another process took since is left alone.
+        @testset "a chat's recorded processes die from the record" begin
+            @testset "the process and everything it started" begin
+                proc = open(detach(`bash -c 'sleep 300 & sleep 300; wait'`), "r")
+                sleep(0.5)
+                pid = Int(getpid(proc))
+                kids = BW.child_pids(pid)
+                @test length(kids) == 2
+                started = BW.process_started(pid)
+                @test started !== nothing && abs(started - time()) < 30
+                r = BW.kill_processes([Dict("pid" => pid, "pgid" => pid, "recorded_at" => time())])
+                @test only(r)["outcome"] == "killed"
+                @test timedwait(() -> !process_running(proc), 5.0) === :ok
+                @test all(k -> timedwait(() -> !alive(k), 5.0) === :ok, kids)
+            end
+
+            @testset "a pid another process took since is left alone" begin
+                proc = open(detach(`sleep 300`), "r")
+                sleep(0.2)
+                pid = Int(getpid(proc))
+                # Recorded before this process started: the recorded one is gone.
+                r = BW.kill_processes([Dict("pid" => pid, "pgid" => pid,
+                                            "recorded_at" => BW.process_started(pid) - 60)])
+                @test only(r)["outcome"] == "gone"
+                @test process_running(proc)
+                kill(proc, Base.SIGKILL)
+            end
+
+            @testset "what a dead process left in its group dies" begin
+                # An eval worker that crashed leaves what its code started in its
+                # group. The pid is the group's while it lives (POSIX reuses
+                # neither), so the group is still the recorded one's.
+                proc = open(detach(`bash -c 'echo $$; sleep 300 & echo $!'`), "r")
+                leader = parse(Int, readline(proc))
+                child = parse(Int, readline(proc))
+                wait(proc)
+                @test BW.process_started(leader) === nothing
+                @test Int(ccall(:getpgid, Cint, (Cint,), child)) == leader
+                r = BW.kill_processes([Dict("pid" => leader, "pgid" => leader, "recorded_at" => time())])
+                @test only(r)["outcome"] == "killed"
+                @test timedwait(() -> !alive(child), 5.0) === :ok
+            end
+
+            @testset "never this worker" begin
+                @test_throws ErrorException BW.kill_recorded!(getpid(), 0)
+                r = BW.kill_processes([Dict("pid" => 999_999_999, "pgid" => 0, "recorded_at" => time())])
+                @test only(r)["outcome"] == "gone"
+            end
+        end
+    end
+
+    @testset "elapsed times as ps prints them" begin
+        @test BW.etime_seconds("03:04") == 184
+        @test BW.etime_seconds("02:03:04") == 7384
+        @test BW.etime_seconds("1-02:03:04") == 93784
     end
 end

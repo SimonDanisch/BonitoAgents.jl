@@ -180,7 +180,29 @@
             @test gap() < AT_BOTTOM_PX
         end
 
-        # ── 5. No JS errors during the whole exercise ───────────────────────
+        # ── 5. A row growing after the last message keeps the pin ───────────
+        # Media lays out late: a `bt_show` image or an editor reaches its real
+        # height after the turn's last message, when no chunk arrives to chase.
+        # The chat stayed in follow mode but stopped at the old bottom, so the
+        # newest messages sat below the fold (e2e:console_clean_reload saw it
+        # on a fresh server: images 10-14 never on screen). The height change
+        # stands in for that layout: no message or chunk comes with it.
+        @testset "a row growing on its own keeps the chat pinned" begin
+            @test at_bottom()
+            @test follow_mode() == true
+            h_before = height()
+            @test TK.eval_js(s, """(() => {
+                const bubbles = document.querySelectorAll('$P .bt-agent-msg');
+                const last = bubbles[bubbles.length - 1];
+                last.style.minHeight = (last.offsetHeight + 600) + 'px';
+                return true; })()""") == true
+            @test TK.wait_for(s, "height grew from the late layout",
+                "Math.round(document.querySelector('$P .bt-messages').scrollHeight) > $(h_before + 500)"; timeout = 10) == true
+            @test at_bottom()
+            @test follow_mode() == true
+        end
+
+        # ── 6. No JS errors during the whole exercise ───────────────────────
         @test isempty(TK.js_errors(s))
     end
 end

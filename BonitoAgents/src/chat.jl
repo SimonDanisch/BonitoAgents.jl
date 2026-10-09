@@ -74,16 +74,26 @@ mutable struct ChatRun
     notified::Bool                 # the agent was told that it finished
     content::Vector{Any}           # the finished run's output + result, as the card shows it
     card::Any                      # its `JuliaEvalToolMsg` (typed there); nothing until bound
+    known::Bool                    # `started` is its process's own (a status frame came)
+    seen::Float64                  # when its process last spoke about it
 end
+ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
+        summary, collected, notified, content, card) =
+    ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
+            summary, collected, notified, content, card, false, time())
 
 # The chat's runs, and the task that tells the agent when ones it has not
-# collected finish (at most one at a time).
+# collected finish (at most one at a time). `runs` holds each id's newest run.
+# Ids count per MCP process and a chat outlives its MCP's restarts, so an id
+# comes back: `older` keeps a run that still runs after a newer one took its id,
+# by (id, start time).
 mutable struct RunBook
     const runs::Dict{String,ChatRun}
+    const older::Dict{Tuple{String,Float64},ChatRun}
     const lock::ReentrantLock
     notifier::Union{Task,Nothing}
 end
-RunBook() = RunBook(Dict{String,ChatRun}(), ReentrantLock(), nothing)
+RunBook() = RunBook(Dict{String,ChatRun}(), Dict{Tuple{String,Float64},ChatRun}(), ReentrantLock(), nothing)
 
 # `state.chat_models[project_id]`; every browser tab viewing the project gets
 # a per-session view via `Base.copy(::ChatModel)`. The shared bits — message
@@ -451,6 +461,11 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     # observable fires many times per turn, and every fire here would rebuild
     # the overview grid. A transition is what "a turn started / finished"
     # actually is.
+    # The bar's ⊗, once for the chat. Every tab used to add its own listener to
+    # this one shared observable, so a click stopped the task once per open tab.
+    on(model.taskbar.stop_request) do id
+        isempty(id) || handle_command!(model, nothing, StopToolCommand(id))
+    end
     busy_seen = Ref(busy_active[])
     on(busy_active) do b
         b == busy_seen[] && return
@@ -609,6 +624,10 @@ mutable struct AgentMsg <: ChatMsg
     # `close` idempotent: re-close on an already-final bubble is a no-op
     # instead of double-appending to chat.md.
     in_flight::Bool
+    # Streamed chunks go out as one render per `stream_chunk!` interval: when the
+    # last one went, and whether one is waiting for its turn.
+    flushed_at::Float64
+    flush_pending::Bool
 end
 # Cache starts empty in BOTH paths (history-load/replay-adopt AND streaming):
 # `ensure_html!` populates on first request, then every subsequent fetch is free.
@@ -618,9 +637,9 @@ end
 # History-load / replay-adopt: `in_flight = false` (text is already final).
 # Streaming construction: `in_flight = true`, flipped in `close(::AgentMsg)`.
 AgentMsg(id::AbstractString, text::AbstractString) =
-    AgentMsg(String(id), String(text), "", nothing, false)
+    AgentMsg(String(id), String(text), "", nothing, false, 0.0, false)
 AgentMsg(chat::ChatModel, text::AbstractString) =
-    AgentMsg(string(uuid4()), String(text), "", chat, true)
+    AgentMsg(string(uuid4()), String(text), "", chat, true, 0.0, false)
 
 # Lazy cache populate. Used by `msg_to_dict` / `wire_final`. Atomic under
 # MARKDOWN_LOCK against `append!` (see the lock's doc near its definition).
@@ -877,6 +896,19 @@ phase_note(::AwaitingReport) = "finished — waiting for the agent"
 phase_note(::Reporting)      = "agent reporting back"
 phase_note(::Reported)       = ""
 
+# A worker following a background task's output file for the chat (BonitoWorker
+# file_watch.jl): new bytes and the end arrive when they happen, where the
+# TaskBar's loop used to ask the worker every second and the worker scanned every
+# process for each answer.
+mutable struct BgWatch
+    channel::Union{Nothing,WorkerLink.LinkChannel}
+    active::Bool          # a watch runs, or is being opened
+    done::Bool            # the writer closed the file / the subagent ended its turn
+    ended_on::UInt        # objectid of the worker link a watch could not run on; 0 if none
+    write_pending::Bool   # the output reaches disk within a second
+end
+BgWatch() = BgWatch(nothing, false, false, UInt(0), false)
+
 mutable struct BashToolMsg <: ToolMsg
     message::Message
     command::String
@@ -901,12 +933,13 @@ mutable struct BashToolMsg <: ToolMsg
     task_bar::Union{TaskBar,Nothing}
     # Which of the three stages this task is in — see `BgPhase`.
     phase::BgPhase
+    watch::BgWatch
 end
 
 BashToolMsg(message::Message; command = "", description = nothing,
             is_background = false) =
     BashToolMsg(message, command, description, is_background, "", 0, "",
-                nothing, Executing())
+                nothing, Executing(), BgWatch())
 
 # What the pill/taskbar shows for a bash: the human-readable description
 # when claude sent one, else the ACP title (usually the raw command).
@@ -976,13 +1009,14 @@ mutable struct TaskToolMsg <: ToolMsg
     # Which of the three stages this task is in — see `BgPhase`. Guarded by the
     # shared chat lock, like the rest of the message's mutable state.
     phase::BgPhase
+    watch::BgWatch
 end
 
 TaskToolMsg(message::Message; description = "", is_background = false,
             task_name = nothing) =
     TaskToolMsg(message, description, is_background, task_name,
                 TaskActivityEntry[], Dict{String,Int}(), 0, time(), false, "", 0,
-                nothing, Executing())
+                nothing, Executing(), BgWatch())
 
 # MCP tool calls (`mcp__<server>__<tool>`). One TYPE per BonitoMCP tool, so all
 # behavior dispatches on the type — the raw `tool_name` is consulted in exactly
@@ -1384,6 +1418,7 @@ function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg
     bar = m.task_bar
     bar === nothing && return nothing
     m.task_bar = nothing
+    stop_watch!(m)
     log_task_lifecycle(m, "removed", reason)
     try
         finalize!(m)
@@ -1514,8 +1549,7 @@ end
 # No file yet ⇒ still launching (stay) unless it already reached a terminal
 # status (a failed/inline launch that produced no file) ⇒ done.
 work_done(m::BashToolMsg) =
-    isempty(m.bg_output_path) ? (tool_status(m) in ("completed", "failed")) :
-    poll_output_file!(m; stream = true)
+    isempty(m.bg_output_path) ? (tool_status(m) in ("completed", "failed")) : output_done(m)
 # A background subagent is done ONLY on a signal we can trust — no timeouts, no
 # staleness heuristic, no guessing. Verified against a live claude-agent-acp agent:
 #   • the parent tool_call goes `completed` ~1s after launch (the launch ACK,
@@ -1531,66 +1565,105 @@ work_done(m::BashToolMsg) =
 # missing / still-streaming file, or a feed mid-tool-loop, has no end_turn ⇒ the
 # pill stays live (until end_turn or ⊗ stop). No `outputFile` at all ⇒ no wire
 # done-signal ⇒ stays until ⊗ stop.
-work_done(m::TaskToolMsg) = !isempty(m.bg_output_path) && subagent_transcript_done(m)
+work_done(m::TaskToolMsg) = !isempty(m.bg_output_path) && output_done(m)
 
-# Read the subagent's transcript and report whether it has reached its final,
-# natural turn-end. `end_turn` appears once, on the FINAL assistant message (a
-# pure text response with no tool_use closes the subagent's turn) — so its
-# presence anywhere in the transcript is the deterministic "subagent finished".
+# ── Following the output file ────────────────────────────────────────────────
+# The chat's worker follows the file and says when it changes and when the task
+# ended (BgWatch), so done is a field read here.
+function output_done(m::BackgroundMsg)
+    m.watch.done && return true
+    watch_output!(m)
+    return false
+end
+
+# A subagent ends its turn with this on its final message: `end_turn` appears
+# once, so its presence in the transcript is the deterministic "finished".
 const SUBAGENT_DONE_MARKER = "\"stop_reason\":\"end_turn\""
-function subagent_transcript_done(m::TaskToolMsg)
+
+watch_header(m::BashToolMsg) = Dict{String,Any}("kind" => "watch_file", "path" => m.bg_output_path,
+                                                "offset" => m.bg_offset, "until" => "closed")
+watch_header(m::TaskToolMsg) = Dict{String,Any}("kind" => "watch_file", "path" => m.bg_output_path,
+                                                "offset" => m.bg_offset, "until" => "marker",
+                                                "marker" => SUBAGENT_DONE_MARKER)
+
+"""
+    watch_output!(m)
+
+Have the chat's worker follow `m`'s output file, unless a watch runs already.
+While the worker is offline the bar's next look tries again. A watch that ended
+without the end, or a worker too old to watch, is tried again only on the
+worker's next link (`BgWatch.ended_on`): asking the same link again would fail
+the same way, every second.
+"""
+function watch_output!(m::BackgroundMsg)
+    w = m.watch
+    w.active && return nothing
     chat = tool_chat(m)
-    chat === nothing && return false
+    chat === nothing && return nothing
     state = chat.state
-    wid   = bg_worker_id(state, chat)
-    wid === nothing && return false
-    # Forward from the last read, overlapping it by the marker's length so a
-    # marker split across two reads is still found. Reading from the top every
-    # second moved whole transcripts (MBs each) through the worker link, and a
-    # cap on that read hid the marker of any transcript longer than the cap.
-    from = max(0, m.bg_offset - ncodeunits(SUBAGENT_DONE_MARKER))
-    r = try
-        tail_worker_file(state, wid, m.bg_output_path; offset = from,
-                         max_bytes = 1_000_000, timeout = 10.0)
-    catch e
-        @debug "subagent transcript read failed (will retry)" id = tool_id(m) exception = e
-        return false
+    wid = bg_worker_id(state, chat)
+    wid === nothing && return nothing
+    worker = get(state.workers[], wid, nothing)
+    (worker !== nothing && isopen(worker)) || return nothing
+    link = lock(() -> get(state.worker_links, wid, nothing), state.lock)
+    (link === nothing || objectid(link) == w.ended_on) && return nothing
+    if !can(worker, "watch_file")
+        w.ended_on = objectid(link)
+        @warn "background task: its worker runs a build without watch_file; it stays in the bar until it is stopped or the worker updates" worker = worker.name id = tool_id(m)
+        return nothing
     end
-    r.exists || return false
-    m.bg_offset = r.offset
-    return occursin(SUBAGENT_DONE_MARKER, r.chunk)
+    w.active = true
+    Base.errormonitor(@async follow_output!(m, chat, wid, objectid(link)))
+    return nothing
 end
 
-# Tail a background task's output file on the worker: stream new bytes (bash),
-# advance the read cursor, and report whether the writer's fd has closed — the
-# deterministic done-signal for BOTH a background shell and an async subagent
-# (its transcript `outputFile`).
-function poll_output_file!(m::ToolMsg; stream::Bool)
-    chat = tool_chat(m)
-    chat === nothing && return false
-    state = chat.state
-    wid   = bg_worker_id(state, chat)
-    wid === nothing && return false
-    r = try
-        tail_worker_file(state, wid, m.bg_output_path; offset = m.bg_offset, timeout = 10.0)
+function follow_output!(m::BackgroundMsg, chat::ChatModel, wid::AbstractString, link_id::UInt)
+    w = m.watch
+    ended = "the worker closed the watch"
+    try
+        ch = open_worker_channel(chat.state, wid, watch_header(m); priority = 2)
+        w.channel = ch
+        # A task that left the bar while the channel opened.
+        m.task_bar === nothing && return close(ch)
+        for frame in ch
+            msg = decode_control(frame)
+            haskey(msg, "chunk") && output_arrived!(m, chat, String(msg["chunk"]), Int(msg["offset"]))
+            if get(msg, "done", false) === true
+                m.bg_offset = Int(get(msg, "offset", m.bg_offset))
+                w.done = true
+            end
+        end
     catch e
-        @debug "taskbar tail failed (will retry)" id = tool_id(m) exception = e
-        return false
+        # The link died, or the worker could not open the watch.
+        (e isa WebSockets.WebSocketError || e isa WorkerUnreachableError ||
+         e isa WorkerLink.LinkDead || e isa ErrorException) || rethrow()
+        ended = sprint(showerror, e)
+    finally
+        w.channel = nothing
+        w.active = false
     end
-    if r.exists && r.offset > m.bg_offset
-        stream && m isa BashToolMsg && (m.bg_text *= r.chunk; stream_bg_update!(chat, m))
-        m.bg_offset = r.offset
+    if !w.done && m.task_bar !== nothing
+        w.ended_on = link_id
+        @warn "background task: the worker stopped following its output; following it again on the worker's next link" id = tool_id(m) path = m.bg_output_path reason = ended
     end
-    # Done ONLY when the file EXISTS and its writer fd has closed (Linux /proc
-    # scan) — the subagent / shell created its output, wrote it, and exited. A
-    # MISSING file is NEVER done: it either hasn't been created yet (the launch
-    # race — the `outputFile` path lands on the wire BEFORE the file is on disk,
-    # and finalizing on `!exists` would kill the pill a tick after launch) or was
-    # removed externally; absence is not a completion signal we can trust. When
-    # fd state is unknowable (non-Linux worker, `open_known == false`) we can't
-    # confirm a close either, so the pill stays until ⊗ stop rather than guess.
-    return r.exists && r.open_known && !r.open
+    return nothing
 end
+
+function output_arrived!(m::BashToolMsg, chat::ChatModel, chunk::String, offset::Int)
+    m.bg_text *= chunk
+    m.bg_offset = offset
+    stream_bg_update!(chat, m)
+    return nothing
+end
+output_arrived!(::TaskToolMsg, ::ChatModel, ::String, ::Int) = nothing
+
+# The task left the bar: the worker can stop following it.
+function stop_watch!(m::BackgroundMsg)
+    ch = m.watch.channel
+    ch === nothing || close(ch)
+    return nothing
+end
+stop_watch!(::Any) = nothing
 
 # ── finalize!: persist + emit the final bubble state as a task leaves the bar ─
 # Persist and emit the terminal state, preserving interruption failures and
@@ -2190,11 +2263,11 @@ function msg_to_dict(m::UserMsg, _chat_dir::AbstractString="")
     d = Dict{String,Any}("type" => "user", "text" => m.text,
                          "queued" => m.queued, "queue_pos" => m.queue_pos,
                          "auto" => m.auto)
-    # Attached images render INLINE in the bubble: swap the raw suffix block
-    # for an `attachments` list the JS gallery understands. The full text (with
-    # the suffix) still goes to the agent prompt and chat.md untouched — only
-    # the wire/display form is split. Files the route can't serve (foreign
-    # extension) stay in the text form.
+    # Attachments render in the bubble, images inline and other files as chips:
+    # swap the raw suffix block for an `attachments` list the JS gallery
+    # understands. The full text (with the suffix) still goes to the agent
+    # prompt and chat.md untouched; only the wire/display form is split. A
+    # message naming something that is not an attachment stays in text form.
     m.chat === nothing && return d
     pid = m.chat.project_id
     isempty(pid) && return d
@@ -2202,11 +2275,12 @@ function msg_to_dict(m::UserMsg, _chat_dir::AbstractString="")
     atts = Any[]
     for rel in rels
         bn = basename(rel)
+        is_attachment_name(bn) || continue
         mime = get(ATTACHMENT_MIME_BY_EXT, lowercase(lstrip(splitext(bn)[2], '.')), nothing)
-        mime === nothing && continue
+        # An image shows inline; any other file is a chip that opens it.
         push!(atts, Dict{String,Any}(
             "url"  => "/attachment/$(pid)?file=$(HTTP.escapeuri(bn))",
-            "name" => bn, "mime" => mime))
+            "name" => bn, "mime" => something(mime, ""), "kind" => mime === nothing ? "file" : "image"))
     end
     if !isempty(atts) && length(atts) == length(rels)
         d["text"] = display
@@ -3282,7 +3356,18 @@ function media_element(src, mime::AbstractString, is_video::Bool;
             (DOM.button("▣"; class = "bt-media-action bt-media-chat-icon", type = "button",
                 title = "Set as chat icon", var"aria-label" = "Set as chat icon"),) : ())...;
         class = "bt-media-actions")
-    return DOM.div(inner, actions;
+    # The error can come before its handler is attached: the session that
+    # attaches it starts once its payload is fetched, and a missing file's 404
+    # can be back sooner, leaving a broken image where the note belongs. So a
+    # media element that already failed gets the event again, after the
+    # handler (rendered before this). The handler checks the file before it
+    # says anything, so an image without intrinsic size costs one byte request.
+    replay_error = js"""(el => {
+        const failed = el.tagName === 'IMG' ? el.complete && el.naturalWidth === 0
+                                            : el.networkState === HTMLMediaElement.NETWORK_NO_SOURCE;
+        if (failed) (el.tagName === 'IMG' ? el : el.querySelector('source')).dispatchEvent(new Event('error'));
+    })($(inner))"""
+    return DOM.div(inner, actions, replay_error;
         class = "bt-media-wrap",
         (isempty(filename) ? (;) : (; dataFilename = String(filename)))...,
         (isempty(worker_path) ? (;) : (; dataWorkerPath = String(worker_path)))...)
@@ -3762,8 +3847,40 @@ function Base.append!(m::AgentMsg, t::AbstractString)
         m.text *= t
         m.html = ""
     end
-    chat_emit(m.chat, wire_chunk(m, t))
+    stream_chunk!(m)
     return m
+end
+
+# Each chunk on the wire is the bubble's WHOLE text rendered (see `wire_chunk`),
+# and the browser swaps the bubble's html for it. Per chunk, that was a parse of
+# everything so far, here and as DOM there: quadratic in the reply, and current
+# agents stream chunks of a few characters (a median of 4, up to 62 per bubble).
+# So chunks go out at most once per `every` seconds: the first of a burst at
+# once, what follows it with the next due one. `close` sends the final render
+# right away, and a pending flush then has nothing left to say.
+function stream_chunk!(m::AgentMsg; every::Real = 0.05)
+    wait_s = lock(MARKDOWN_LOCK) do
+        m.flush_pending && return nothing
+        wait_s = m.flushed_at + every - time()
+        wait_s > 0 && (m.flush_pending = true)
+        wait_s
+    end
+    wait_s === nothing && return nothing
+    if wait_s > 0
+        Timer(_ -> flush_chunk!(m), wait_s)
+    else
+        flush_chunk!(m)
+    end
+    return nothing
+end
+
+function flush_chunk!(m::AgentMsg)
+    lock(MARKDOWN_LOCK) do
+        m.flush_pending = false
+        m.flushed_at = time()
+    end
+    m.in_flight && chat_emit(m.chat, wire_chunk(m, ""))
+    return nothing
 end
 Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wire_chunk(m, t)); m)
 # Summaries arrive whole on replay; live they can stream through `process_update!`
@@ -4778,27 +4895,10 @@ function parse_bg_output_path(content)
     return nothing
 end
 
-# ── Background-task output poller ───────────────────────────────────────────
-# ONE server-wide loop streams every live background bash. The agent backgrounds
-# the shell and only returns a file path (it does NOT stream), so we tail that
-# file ourselves. Per task we back off 0.5s → 1 → 2 → 4 → 5s (responsive while
-# fresh, cheap once settled). "Done" is the output file's fd closing — the shell
-# exited (see the worker's `file_held_open`); a non-Linux worker falls back to
-# output quiescence.
-# Non-Linux fallback: if the worker can't report `open_known` on the
-# output file's fd, we infer "the shell exited" from "no growth in 20 s".
-const BG_QUIESCE_SECS = 20.0
-
-# Per-chat background-output poller. Spawned on `start_chat_client!`,
-# torn down when the chat closes. The task IS the taskbar's bookkeeping
-# loop from the server's side: every second it walks THIS chat's live
-# bg items (the same set the JS `_refreshTaskbar` paints) and tails
-# their output. No global loop walking every model's msgs_store; no
-# global cadence constant — the 1 s sleep is inline, the task's
-# lifetime is the chat's, and a closed chat takes its poller with it.
-#
-# (`start_background_poller!` / `background_poll_loop` are gone — the TaskBar
-# owns its own poll loop now, started lazily on the first `push!`.)
+# ── Background-task output ──────────────────────────────────────────────────
+# The agent backgrounds a shell and only returns the path of its output file;
+# the chat's worker follows that file (`watch_output!`), and these keep the
+# bubble and its persisted content in step.
 
 bg_worker_id(state::ServerState, model::ChatModel) =
     let pid = model.project_id
@@ -4815,6 +4915,18 @@ function write_bg_content!(chat_dir::AbstractString, m::BashToolMsg)
 end
 
 bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
+
+# The whole output is rewritten on each write, so a chatty task writes at most
+# once a second while it runs; `finalize!` writes the last of it.
+function write_bg_content_soon!(model::ChatModel, m::BashToolMsg)
+    m.watch.write_pending && return nothing
+    m.watch.write_pending = true
+    Timer(1.0) do _
+        m.watch.write_pending = false
+        write_bg_content!(model.chat_dir, m)
+    end
+    return nothing
+end
 
 # ── Live stdout tail for a RUNNING bt_julia_eval ─────────────────────────────
 # The MCP forwards the eval worker's stdout/stderr live over its channel (no on-disk
@@ -4919,7 +5031,7 @@ function append_tail!(m::JuliaEvalCall, chunk::AbstractString)
 end
 
 function stream_bg_update!(model::ChatModel, m::BashToolMsg)
-    write_bg_content!(model.chat_dir, m)
+    write_bg_content_soon!(model, m)
     n = bg_line_count(m)
     m.message.summary = "running… $n line$(n == 1 ? "" : "s")"
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tool_id(m),
@@ -4927,12 +5039,6 @@ function stream_bg_update!(model::ChatModel, m::BashToolMsg)
         "background" => true, "taskbar" => true))
     return nothing
 end
-
-# (The old `finalize_bg_task!` / `poll_background_task!` / `poll_subagent_done!`
-# / `finalize_subagent!` / `background_poll_loop` are gone: the TaskBar owns its
-# poll loop now, and `isdone`/`poll_output_file!`/`finalize!` (above) replace
-# them. `bg_worker_id`, `write_bg_content!`, `bg_line_count`, `stream_bg_update!`
-# stay — they're used by `poll_output_file!` and `finalize!`.)
 
 # Todos are one-shot snapshots — nothing to stream, just finalize (persist).
 process_update!(b::TodoListMsg, ::AgentClientProtocol.Plan; from::Int = 0) = (close(b); nothing)
@@ -5092,7 +5198,7 @@ function run_chat!(chat::ChatModel)
         while true
             entry = next_submission(chat)
             entry === nothing && break
-            run_submission!(chat, entry)
+            run_submission!(chat, entry) || break   # agent unreachable: wait for a wakeup
         end
     end
     return nothing
@@ -5803,35 +5909,67 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
             end
             isopen(s.user_messages) || return nothing
         end
-        cli = client(chat.agent)
-        if cli === nothing
+        turn = nothing
+        # Two attempts: the connection can still close between the liveness
+        # check and the write. A throwing prompt! never reached the agent, so
+        # sending again on a fresh session cannot duplicate it.
+        for attempt in 1:2
+            cli = live_client!(chat, submission)
+            cli === nothing && return nothing
+            # Ship the turn's sequence number — a stop-click echoes it back so the
+            # cancel can be scoped to THIS turn (see CancelCommand).
+            seq = (s.turn_seq[] += 1)
+            chat_emit(chat, Dict{String,Any}("type" => "turn_begin", "seq" => seq))
+            # The turn's CONTENT does not come back from here — it is the main thread
+            # talking, and `main_consumer!` is already rendering it. What we get is
+            # the span: a one-shot response channel that settles with the stopReason.
             try
-                start_chat_client!(chat)   # LAZY ACP: bind the agent on the first turn
+                turn = lock(s.lock) do
+                    submission !== nothing && submission.status != :sending && return nothing
+                    AgentClientProtocol.session_activity(cli.conn) isa AgentClientProtocol.Cancelling &&
+                        error("The agent is still stopping; message has not been sent.")
+                    span = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
+                        images=user_msg.images)
+                    submission === nothing || submission_sent!(s, submission, span)
+                    span
+                end
+                break
             catch e
-                @error "lazy ACP bind failed" project_id = chat.project_id exception = (e, catch_backtrace())
+                (attempt == 1 && !isopen(cli) && is_session_dead_error(innermost_cause(e))) || rethrow()
+                @warn "agent connection closed while sending; starting a new session" project_id = chat.project_id
             end
-            cli = client(chat.agent)
-        end
-        cli === nothing && return nothing
-        # Ship the turn's sequence number — a stop-click echoes it back so the
-        # cancel can be scoped to THIS turn (see CancelCommand).
-        seq = (s.turn_seq[] += 1)
-        chat_emit(chat, Dict{String,Any}("type" => "turn_begin", "seq" => seq))
-        # The turn's CONTENT does not come back from here — it is the main thread
-        # talking, and `main_consumer!` is already rendering it. What we get is
-        # the span: a one-shot response channel that settles with the stopReason.
-        turn = lock(s.lock) do
-            submission !== nothing && submission.status != :sending && return nothing
-            AgentClientProtocol.session_activity(cli.conn) isa AgentClientProtocol.Cancelling &&
-                error("The agent is still stopping; message has not been sent.")
-            span = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
-                images=user_msg.images)
-            submission === nothing || submission_sent!(s, submission, span)
-            span
         end
         turn === nothing && return nothing
         return f(turn)
     end
+end
+
+"""
+    live_client!(chat, submission = nothing) -> Union{ACP.Client,Nothing}
+
+The client a prompt goes out on. Every send runs through here, so a send to a
+chat whose session is gone brings it up first: the lazy first bind when there
+never was a client, a restart when its connection closed (the agent exited,
+the worker link dropped). `nothing` only when the agent cannot be brought up;
+`last_error` says why.
+"""
+function live_client!(chat::ChatModel, submission = nothing)
+    isopen(chat.agent) && return client(chat.agent)
+    s = shared(chat)
+    starting_session!(s, submission)
+    if client(chat.agent) === nothing
+        try
+            start_chat_client!(chat)
+        catch e
+            s.session_alive[] = false
+            s.last_error[] = sprint(showerror, innermost_cause(e))
+            @error "starting the agent session failed" project_id = chat.project_id exception = (e, catch_backtrace())
+        end
+    else
+        @info "agent session ended; restarting it for the next message" project_id = chat.project_id
+        restart_chat_session!(chat)
+    end
+    return isopen(chat.agent) ? client(chat.agent) : nothing
 end
 
 # ── Yolo mode (autonomous auto-continue) ────────────────────────────────────
@@ -6599,6 +6737,8 @@ function start_chat_client!(model::ChatModel)
     record_bound_session!(model, new_session_id)
     shared(model).session_alive[] = true
     note_bound!(model.state, model.project_id)
+    # Messages held while no session could be brought up go out now.
+    wake_outbox!(model)
     return nothing
 end
 
@@ -6659,6 +6799,9 @@ function bring_up_once!(model::ChatModel)
             while s.busy_active[] && time() < deadline
                 sleep(0.02)
             end
+            # Everything the old session ran ends with it, on every worker, and
+            # its task bar empties: nothing of it outlives the restart.
+            end_chat_session!(s, "the chat was restarted")
         end
         # The old session is gone, so nothing it was doing counts any more.
         # Forget the edge we last saw with it — otherwise the next session's
@@ -8151,28 +8294,21 @@ function chat_input_area(session::Session, model::ChatModel)
         title = map(y -> y ? "Lock in reminders" : "Send", model.yolo))
     stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
         class="bt-stop-btn", title="Stop generation and pause queued messages")
-    # Attaching an image had exactly two ways in: paste and drag-drop. Neither
-    # exists on a phone, so the feature was desktop-only by accident. A file
-    # input is the one affordance a mobile browser turns into the native
-    # camera/gallery sheet — hence `accept="image/*"` (what the pipeline
-    # supports: `attachAddBlob` reads a data URL for the thumbnail strip).
+    # Attaching had exactly two ways in: paste and drag-drop. Neither exists on
+    # a phone, so the feature was desktop-only by accident. A file input is the
+    # affordance a mobile browser turns into its camera/gallery/files sheet.
+    # Any file: an image the agent can see goes inline, anything else (a PDF, a
+    # video, an image type not stored inline) is uploaded and copied to the
+    # worker for the agent to open (`attachAdd` in bonitoagents.js). No
+    # `accept`: it is what would narrow the sheet to the gallery.
     #
     # The input is hidden and driven by the button, because a raw file input
     # can't be styled to match and reads as a form control in a chat composer.
-    #
-    # `image/*` rather than the exact list in `ATTACHMENT_EXTENSIONS`: the wide
-    # form is what mobile browsers recognise as "offer the camera/gallery
-    # sheet", and narrowing it can leave an HEIF-shooting phone staring at an
-    # empty gallery. The cost is that a format the server doesn't store (HEIC
-    # off some Android pickers — iOS Safari transcodes to JPEG for `image/*`,
-    # so it doesn't arise there) queues a thumbnail and is refused on send with
-    # a mime message, rather than being unselectable. A late clear error beats
-    # an empty picker.
-    attach_input = DOM.input(; type = "file", accept = "image/*", multiple = true,
+    attach_input = DOM.input(; type = "file", multiple = true,
                                class = "bt-attach-input", tabindex = "-1",
                                ariaHidden = "true")
     attach_btn = DOM.button(icon_img(attach_icon(), "Attach"); type = "button",
-        class = "bt-attach-btn", title = "Attach an image")
+        class = "bt-attach-btn", title = "Attach files")
     # Prefill/draft swap for Yolo mode. Runs as an inline script child (the
     # ES6Module/init-script idiom): `$(text_input)` is a direct node ref, the
     # interpolated observables are live proxies. Toggle ON stashes the user's
@@ -8317,9 +8453,11 @@ function push_attachment_to_worker(model::ChatModel, rel_path::AbstractString)
     return
 end
 
-# Parse JS-side attachment payloads ({mime, data, filename?}) into a
-# (display_text_suffix, [ImageAttachment]) pair. `attachments` may be
-# empty (no-op). Each entry's base64 `data` field is decoded once.
+# Parse JS-side attachment payloads into a (display_text_suffix,
+# [ImageAttachment]) pair. `attachments` may be empty (no-op). An image comes
+# inline ({mime, data, filename?}, base64 decoded once) and is also shown to
+# the agent; any other file was uploaded beforehand (`attachment_upload`) and
+# comes as {kind: "file", path, on_worker}: the agent gets its path only.
 function process_attachments!(model::ChatModel, attachments)
     attachments isa AbstractVector || return ("", AgentClientProtocol.ImageAttachment[])
     isempty(attachments) && return ("", AgentClientProtocol.ImageAttachment[])
@@ -8328,6 +8466,17 @@ function process_attachments!(model::ChatModel, attachments)
     blocks = AgentClientProtocol.ImageAttachment[]
     for a in attachments
         a isa AbstractDict || continue
+        if get(a, "kind", "image") == "file"
+            rel = String(get(a, "path", ""))
+            name = basename(rel)
+            (rel == joinpath(ATTACHMENT_DIR_NAME, name) && is_attachment_name(name) &&
+             isfile(joinpath(model.cwd, rel))) || error("Attachment not found on the server: $(rel)")
+            # The upload copies it to the worker; one whose worker was out of
+            # reach then goes now.
+            get(a, "on_worker", false) === true || push_attachment_to_worker(model, rel)
+            push!(suffix_lines, "  - $(rel)")
+            continue
+        end
         mime = String(get(a, "mime", ""))
         b64 = String(get(a, "data", ""))
         (isempty(mime) || isempty(b64)) && continue
@@ -8700,9 +8849,8 @@ function handle_send!(model::ChatModel, cmd::SendCommand, mode::Symbol)
             "type" => "attach_error", "error" => sprint(showerror, e)))
         return nothing
     end
-    display_text = isempty(strip(cmd.text)) && !isempty(blocks) ?
-                   "(image attached)" * suffix :
-                   cmd.text * suffix
+    display_text = !isempty(strip(cmd.text)) || isempty(suffix) ? cmd.text * suffix :
+                   (isempty(blocks) ? "(file attached)" : "(image attached)") * suffix
     # No server-side ack — JS already cleared the input optimistically on
     # submit. Errors (attachment-rejection above, or ACP send failures
     # surfaced by `send_message!`'s downstream code) flow back through
@@ -9242,12 +9390,9 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
 
     # The chat's single live-task board (taskbar.jl) — the shared source of
-    # truth. Its KeyedList bridges the shared `items` per session; its ⊗ routes
-    # through the same per-tool stop dispatch.
+    # truth. Its KeyedList bridges the shared `items` per session; its ⊗ is
+    # handled once for the chat (`ChatModel` constructor), not per tab.
     taskbar = shared(model).taskbar
-    on(session, taskbar.stop_request) do id
-        isempty(id) || handle_command!(model, session, StopToolCommand(id))
-    end
 
     messages_container = DOM.div(
         DOM.div(class="bt-spacer-top"),

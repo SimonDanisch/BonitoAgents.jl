@@ -368,6 +368,10 @@ queued up behind a turn that already ended.
 """
 session_live(client::Client) = is_working(session_activity(client.conn))
 
+# Whether the client's connection can still carry a prompt. Not `session_live`:
+# that asks whether the agent is WORKING; this asks whether it is reachable.
+Base.isopen(client::Client) = isopen(client.conn)
+
 function cancel!(client::Client)
     conn = client.conn
     # A no-op when GENUINELY idle (A8) — no prompt open and no un-prompted work

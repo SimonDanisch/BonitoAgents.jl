@@ -54,6 +54,7 @@ include("session.jl")          # JuliaSession + SessionManager (subprocess-per-e
 include("eval_image.jl")       # colour-matrix results → PNG files (PNGFiles, in OUR env)
 include("runs.jl")             # evals as runs (`r4`): background evals, bt_julia_wait
 include("ctrl_ws.jl")          # control channel to BonitoAgents via the worker relay
+include("processes.jl")        # what this process runs, reported for the server's record
 include("context.jl")          # the one MCPServer value (SERVER) owning all process state
 include("eval_host.jl")        # run_eval_host — serve another worker's chat through its relay
 include("tools/eval.jl")

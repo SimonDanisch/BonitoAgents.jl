@@ -99,6 +99,9 @@ function run_suite(server)
         @test TK.eval_js(server, "window.__before_reload === true") == true          # not reloaded
         @test occursin("reload", TK.eval_js(server, "$(modal).querySelector('.bt-conn-title').textContent"))
         @test TK.eval_js(server, "$(composer).value") == "half a message"
+        # The full storage is reported once in the console; that is this test's doing.
+        @test any(e -> occursin("Could not save the chat draft", e["message"]), TK.js_errors(server))
+        TK.clear_js_errors(server)
         # The card's button is the way out.
         TK.eval_js(server, "$(modal).querySelector('.bt-conn-reload').click(); true")
         @test TK.wait_for(server, "the reload",

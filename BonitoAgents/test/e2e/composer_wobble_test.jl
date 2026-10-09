@@ -30,9 +30,30 @@
         "(() => { const c=[...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent); return !!c && c.scrollHeight > c.clientHeight + 400; })()";
         timeout = 20) == true
 
+    # Every scroll of the transcript from the resize on.
+    TK.eval_js(s, """(() => {
+        const c = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent);
+        window.__narrowT0 = performance.now();
+        window.__narrowLast = null;
+        c.addEventListener('scroll', () => { window.__narrowLast = performance.now(); });
+        return true;
+    })()""")
     TK.set_window_size(s, 390, 780)
     sleep(1.5)
     @test TK.eval_js(s, "window.innerWidth") <= 480
+
+    # The narrower column wraps each row taller than the height stored for it
+    # at the old width. The row at the edge of the render window then entered
+    # and left on every scroll event, each time moving the pinned bottom by the
+    # difference: the transcript scrolled twice a frame, for good.
+    @testset "the pinned transcript comes to rest after the window narrows" begin
+        @test TK.wait_for(s, "a second without a scroll",
+            "performance.now() - (window.__narrowLast ?? window.__narrowT0) > 1000"; timeout = 15) == true
+        @test TK.eval_js(s, """(() => {
+            const c = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent);
+            return c.__bt_chat.followMode && c.scrollHeight - c.scrollTop - c.clientHeight <= 1;
+        })()""") == true
+    end
 
     # One sample: the composer's height, and the transcript position expressed
     # content-true (the top-visible bubble + its offset from the viewport top),

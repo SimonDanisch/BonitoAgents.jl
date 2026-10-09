@@ -86,6 +86,11 @@ const filterKey = (msg)=>msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') :
 const DEFAULT_HIDDEN = [
     'tool:ToolSearch'
 ];
+function formatBytes(n) {
+    if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
 class BonitoChat {
     constructor(container, comm){
         this.container = container;
@@ -112,17 +117,20 @@ class BonitoChat {
         this.messageHeightObserver = new ResizeObserver((entries)=>{
             if (this.destroyed) return;
             let changed = false;
+            let resized = false;
             for (const e of entries){
                 const idx = e.target.__btIdx;
                 if (idx === undefined) continue;
                 const h = e.borderBoxSize && e.borderBoxSize.length ? e.borderBoxSize[0].blockSize : e.target.offsetHeight;
                 if (h > 0 && this.heights.get(idx) !== h) {
+                    resized = true;
                     if (!this.heightIsFinal(e.target)) continue;
                     this.heights.set(idx, h);
                     changed = true;
                 }
             }
             if (changed && !this.scrollbarDrag) this.queueRefresh();
+            if (resized && this.followMode) this.queueScrollToBottom();
         });
         const wantKeepalive = typeof window !== 'undefined' && Number.isFinite(window.BT_APP_KEEPALIVE) ? window.BT_APP_KEEPALIVE : 6;
         this.APP_KEEPALIVE = Math.min(10, Math.max(0, wantKeepalive));
@@ -178,7 +186,7 @@ class BonitoChat {
         comm.notify({
             type: 'init'
         });
-        this.lastUserInputT = 0;
+        this.lastUserInputT = -Infinity;
         this.pendingUserScroll = false;
         const markUserInput = ()=>{
             this.lastUserInputT = performance.now();
@@ -1113,7 +1121,7 @@ class BonitoChat {
             }
         }
         for (const [i, node] of inserted){
-            if (this.heights.has(i) || !this.heightIsFinal(node)) continue;
+            if (!this.heightIsFinal(node)) continue;
             const h = node.getBoundingClientRect().height;
             if (h > 0) this.heights.set(i, h);
         }
@@ -1784,6 +1792,18 @@ class BonitoChat {
                     const gallery = document.createElement('div');
                     gallery.className = 'bt-user-attachments';
                     for (const a of msg.attachments){
+                        if (a.kind === 'file') {
+                            const link = document.createElement('a');
+                            link.className = 'bt-user-att-file';
+                            link.href = a.url;
+                            link.target = '_blank';
+                            link.rel = 'noopener';
+                            link.textContent = a.name.replace(/^\d{4}-\d{2}-\d{2}_\d{6}_[0-9a-f]{8}_/, '');
+                            link.title = a.name;
+                            link.addEventListener('click', (e)=>e.stopPropagation());
+                            gallery.appendChild(link);
+                            continue;
+                        }
                         const img = document.createElement('img');
                         img.className = 'bt-user-att-img';
                         img.src = a.url;
@@ -2659,21 +2679,30 @@ class BonitoChat {
         this.attachments = new Map();
         this.attachIdCounter = 0;
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        this.INLINE_IMAGE_TYPES = new Set([
+            'image/png',
+            'image/jpeg',
+            'image/jpg',
+            'image/gif',
+            'image/webp',
+            'image/svg+xml'
+        ]);
+        this.FILE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+        this.UPLOAD_CHUNK_BYTES = 512 * 1024;
         this.ATTACH_MAX_COUNT = 10;
         this.attachPending = 0;
         this.onPaste = (e)=>{
             const items = e.clipboardData?.items;
             if (!items) return;
             for (const it of items){
-                if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
-                    const blob = it.getAsFile();
-                    if (blob) this.attachAddBlob(blob, blob.type || it.type, blob.name || `pasted-${Date.now()}.png`);
-                }
+                if (it.kind !== 'file') continue;
+                const blob = it.getAsFile();
+                if (blob) this.attachAdd(blob, `pasted-${Date.now()}`);
             }
         };
         this.textInput.addEventListener('paste', this.onPaste);
         this.onDragOver = (e)=>{
-            if (!this.dragHasImage(e)) return;
+            if (!this.dragHasFiles(e)) return;
             e.preventDefault();
             this.app.classList.add('bt-drag-over');
         };
@@ -2686,11 +2715,7 @@ class BonitoChat {
             this.app.classList.remove('bt-drag-over');
             const files = e.dataTransfer?.files;
             if (!files) return;
-            for (const f of files){
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
-                }
-            }
+            for (const f of files)this.attachAdd(f, `dropped-${Date.now()}`);
         };
         this.app.addEventListener('dragover', this.onDragOver);
         this.app.addEventListener('dragleave', this.onDragLeave);
@@ -2751,13 +2776,7 @@ class BonitoChat {
             if (this.destroyed) return;
             const input = e.target.closest('.bt-attach-input');
             if (!input || !input.files) return;
-            for (const f of input.files){
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `picked-${Date.now()}.png`);
-                } else {
-                    this.showAttachError(`${f.name || 'That file'} is not an image; only images can be attached`);
-                }
-            }
+            for (const f of input.files)this.attachAdd(f, `picked-${Date.now()}`);
             input.value = '';
             this.textInput?.focus();
         };
@@ -2941,13 +2960,84 @@ class BonitoChat {
             seq: this.turnSeq ?? -1
         });
     }
-    dragHasImage(e) {
+    dragHasFiles(e) {
         const dt = e.dataTransfer;
         if (!dt) return false;
         if (dt.types) {
             for (const t of dt.types)if (t === 'Files') return true;
         }
         return false;
+    }
+    attachAdd(file, fallbackName) {
+        const mime = file.type || '';
+        if (this.INLINE_IMAGE_TYPES.has(mime) && file.size <= this.ATTACH_MAX_BYTES) {
+            this.attachAddBlob(file, mime, file.name || `${fallbackName}.png`);
+        } else {
+            this.attachAddFile(file, file.name || fallbackName);
+        }
+    }
+    attachAddFile(file, filename) {
+        if (this.attachments.size + this.attachPending >= this.ATTACH_MAX_COUNT) {
+            this.showAttachError(`At most ${this.ATTACH_MAX_COUNT} attachments per message`);
+            return;
+        }
+        if (file.size > this.FILE_MAX_BYTES) {
+            this.showAttachError(`${filename} is too large (${formatBytes(file.size)}, ` + `at most ${formatBytes(this.FILE_MAX_BYTES)})`);
+            return;
+        }
+        const pid = this.app.closest('.bt-chatpane')?.dataset.panePid;
+        if (!pid) {
+            this.showAttachError('Files can only be attached in a chat');
+            return;
+        }
+        const id = `att-${++this.attachIdCounter}`;
+        const bytes = crypto.getRandomValues(new Uint8Array(12));
+        const item = {
+            kind: 'file',
+            file,
+            filename,
+            mime: file.type || '',
+            size: file.size,
+            pid,
+            uploadId: Array.from(bytes, (b)=>b.toString(16).padStart(2, '0')).join(''),
+            sent: 0,
+            path: null,
+            onWorker: false,
+            error: null,
+            removed: false
+        };
+        item.done = this.uploadFile(item);
+        this.attachments.set(id, item);
+        this.renderAttachments();
+    }
+    async uploadFile(item) {
+        const url = (offset)=>`/attachment-upload/${encodeURIComponent(item.pid)}` + `?upload=${item.uploadId}&offset=${offset}&total=${item.size}` + `&name=${encodeURIComponent(item.filename)}`;
+        try {
+            let offset = 0;
+            do {
+                if (item.removed) return;
+                const chunk = item.file.slice(offset, offset + this.UPLOAD_CHUNK_BYTES);
+                const resp = await fetch(url(offset), {
+                    method: 'POST',
+                    body: chunk,
+                    headers: {
+                        'X-BT-Upload': '1'
+                    }
+                });
+                if (!resp.ok) throw new Error((await resp.text()).trim() || `HTTP ${resp.status}`);
+                const answer = await resp.json();
+                offset = answer.received;
+                item.sent = offset;
+                if (answer.path) {
+                    item.path = answer.path;
+                    item.onWorker = answer.on_worker;
+                }
+                if (!this.destroyed) this.renderAttachments();
+            }while (offset < item.size)
+        } catch (error) {
+            item.error = `Upload failed: ${error.message}`;
+            if (!this.destroyed) this.renderAttachments();
+        }
     }
     attachAddBlob(blob, mime, filename) {
         if (this.attachments.size + this.attachPending >= this.ATTACH_MAX_COUNT) {
@@ -2979,7 +3069,17 @@ class BonitoChat {
         reader.readAsDataURL(blob);
     }
     attachRemove(id) {
+        const item = this.attachments.get(id);
         this.attachments.delete(id);
+        if (item?.kind === 'file' && !item.path) {
+            item.removed = true;
+            fetch(`/attachment-upload/${encodeURIComponent(item.pid)}?upload=${item.uploadId}`, {
+                method: 'DELETE',
+                headers: {
+                    'X-BT-Upload': '1'
+                }
+            }).catch((e)=>console.warn('could not drop the partial upload', e));
+        }
         this.renderAttachments();
     }
     attachClear() {
@@ -2996,13 +3096,29 @@ class BonitoChat {
             this.attachBar.classList.add('bt-attachments-active');
             for (const [id, item] of this.attachments){
                 const wrap = document.createElement('div');
-                wrap.className = 'bt-attachment-thumb';
                 wrap.dataset.attachId = id;
-                const img = document.createElement('img');
-                img.src = item.dataUrl;
-                img.alt = item.filename || 'image';
-                img.title = item.filename || 'image';
-                wrap.appendChild(img);
+                if (item.kind === 'file') {
+                    wrap.className = 'bt-attachment-file';
+                    wrap.dataset.state = item.error ? 'error' : item.path ? 'done' : 'uploading';
+                    const name = document.createElement('div');
+                    name.className = 'bt-attachment-file-name';
+                    name.textContent = item.filename;
+                    name.title = item.filename;
+                    const status = document.createElement('div');
+                    status.className = 'bt-attachment-file-status';
+                    status.textContent = item.error ? item.error : item.path ? formatBytes(item.size) : `Uploading ${Math.floor(100 * item.sent / Math.max(1, item.size))}% of ${formatBytes(item.size)}`;
+                    const bar = document.createElement('div');
+                    bar.className = 'bt-attachment-file-bar';
+                    bar.style.width = `${item.path ? 100 : Math.floor(100 * item.sent / Math.max(1, item.size))}%`;
+                    wrap.append(name, status, bar);
+                } else {
+                    wrap.className = 'bt-attachment-thumb';
+                    const img = document.createElement('img');
+                    img.src = item.dataUrl;
+                    img.alt = item.filename || 'image';
+                    img.title = item.filename || 'image';
+                    wrap.appendChild(img);
+                }
                 const rm = document.createElement('button');
                 rm.type = 'button';
                 rm.className = 'bt-attachment-remove';
@@ -3060,7 +3176,7 @@ class BonitoChat {
             text.textContent = item.text;
             const status = document.createElement('div');
             status.className = 'bt-queue-status';
-            status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' : item.status === 'sending' ? 'Connecting · not sent yet' : item.mode === 'interrupt' ? 'Waiting for interruption to finish' : item.mode === 'next' ? 'Waiting for the next message boundary' : 'Waiting until the agent finishes');
+            status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' : item.status === 'offline' ? 'Agent not reachable · sends once it is back' : item.status === 'sending' ? 'Connecting · not sent yet' : item.mode === 'interrupt' ? 'Waiting for interruption to finish' : item.mode === 'next' ? 'Waiting for the next message boundary' : 'Waiting until the agent finishes');
             const summary = document.createElement('summary');
             summary.className = 'bt-queue-summary';
             const preview = document.createElement('span');
@@ -3068,7 +3184,7 @@ class BonitoChat {
             preview.textContent = item.text;
             const badge = document.createElement('span');
             badge.className = 'bt-queue-badge';
-            badge.textContent = item.status === 'paused' ? 'Paused · not sent' : item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' : item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
+            badge.textContent = item.status === 'paused' ? 'Paused · not sent' : item.status === 'offline' ? 'Agent offline · queued' : item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' : item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
             summary.title = status.textContent;
             summary.append(preview, badge);
             const detail = document.createElement('div');
@@ -3086,7 +3202,7 @@ class BonitoChat {
                     'remove',
                     'Remove'
                 ]
-            ] : item.status === 'waiting' ? [
+            ] : item.status === 'waiting' || item.status === 'offline' ? [
                 [
                     'remove',
                     'Remove'
@@ -3114,8 +3230,34 @@ class BonitoChat {
         const text = this.textInput.value;
         const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
         if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
+        if (this.submitting) return;
+        const files = [
+            ...this.attachments.values()
+        ].filter((item)=>item.kind === 'file');
+        if (files.some((item)=>!item.path && !item.error)) {
+            this.submitting = true;
+            try {
+                await Promise.all(files.map((item)=>item.done));
+            } finally{
+                this.submitting = false;
+            }
+        }
+        const failed = files.find((item)=>item.error);
+        if (failed) {
+            this.showAttachError(`${failed.filename}: ${failed.error}. Remove it to send.`);
+            return;
+        }
         const payload = [];
         for (const item of this.attachments.values()){
+            if (item.kind === 'file') {
+                payload.push({
+                    kind: 'file',
+                    path: item.path,
+                    filename: item.filename,
+                    on_worker: item.onWorker
+                });
+                continue;
+            }
             const buf = await item.blob.arrayBuffer();
             payload.push({
                 mime: item.mime,
@@ -3125,7 +3267,7 @@ class BonitoChat {
         }
         this.comm.notify({
             type: 'send',
-            text,
+            text: this.textInput.value,
             attachments: payload,
             mode: this.sendMode || 'done'
         });
@@ -3486,6 +3628,9 @@ function toolSlot(id) {
     }
     return null;
 }
+function flushDrafts() {
+    for (const chat of CHAT_INSTANCES)chat.flushDraft?.();
+}
 function connect(node, comm, init = {}) {
     const chat = new BonitoChat(node, comm);
     if (Array.isArray(init.commands)) chat.slashCommands = init.commands;
@@ -3515,5 +3660,6 @@ export { msearchFilter as msearchFilter };
 export { msearchOpen as msearchOpen };
 export { msearchSelect as msearchSelect };
 export { toolSlot as toolSlot };
+export { flushDrafts as flushDrafts };
 export { connect as connect };
 

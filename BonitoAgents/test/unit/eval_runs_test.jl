@@ -8,6 +8,7 @@
 
 using Test
 using BonitoAgents
+import Bonito, HTTP, JSON
 const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
 
@@ -28,6 +29,27 @@ frame(id; kw...) = Dict{String,Any}("type" => "run_update", "run" => id,
                                     (String(k) => v for (k, v) in kw)...)
 running(id, env; kw...) = frame(id; status = "running", route = abspath(env), env_path = env,
                                 started = time(), kw...)
+
+# A run's process, as the server's channel to it: answers every interrupt with
+# `reply`, and counts them.
+struct FakeRunProcess
+    state::Any
+    reply::Dict{String,Any}
+    asked::Base.RefValue{Int}
+end
+FakeRunProcess(state, reply) = FakeRunProcess(state, Dict{String,Any}(reply), Ref(0))
+function HTTP.WebSockets.send(p::FakeRunProcess, frame::AbstractString)
+    p.asked[] += 1
+    rid = String(JSON.parse(frame)["request_id"])
+    @async BT.deliver_rpc_response!(p.state, rid, copy(p.reply))
+    return nothing
+end
+BT.untrack_mcp_request!(::FakeRunProcess, rid) = nothing
+function host_process!(worker, reply)
+    p = FakeRunProcess(state, reply)
+    lock(state.lock) do; state.eval_hosts[BT.eval_host_key("proj", worker)] = p; end
+    return p
+end
 
 try
     @testset "a run finds its card by the tool id Claude names" begin
@@ -192,6 +214,123 @@ try
         @test m.stream_text[] == colored
         BT.append_tail!(m, "\e[90mlate\e[39m chunk\n")           # drained after the end
         @test m.stream_text[] == colored
+    end
+
+    @testset "an id a restarted MCP gives out again is a new run, on its own card" begin
+        # Ids count per MCP process and a chat outlives its MCP's restarts. The
+        # new process's r20 was taken for the old r20: it reopened yesterday's
+        # card in history and took the bar with that card's start time.
+        t_old = time() - 86_400
+        old = card("toolu_old20", ("code" => "1", "env_path" => "/tmp/envR", "background" => true);
+                   status = "completed")
+        BT.run_update!(state, "proj", "", running("r20", "/tmp/envR"; background = true,
+                                                  tool_use_id = "toolu_old20", started = t_old))
+        BT.run_update!(state, "proj", "", frame("r20"; status = "passed", route = abspath("/tmp/envR"),
+            env_path = "/tmp/envR", background = true, started = t_old, elapsed = 2.0,
+            content = Any[Dict("type" => "text", "text" => "yesterday's result")]))
+        BT.run_update!(state, "proj", "", frame("r20"; collected = true, started = t_old))
+        @test old.run.status == "passed" && old.run.collected
+        new = card("toolu_new20", ("code" => "2", "env_path" => "/tmp/envR", "background" => true))
+        BT.run_update!(state, "proj", "", running("r20", "/tmp/envR"; background = true,
+                                                  tool_use_id = "toolu_new20"))
+        @test new.run !== nothing && new.run.id == "r20" && new.run !== old.run
+        @test BT.run_live(new) && BT.in_taskbar(new)
+        # The old card was not reopened: it stays finished and leaves the bar.
+        @test old.run.status == "passed" && !BT.run_live(old)
+        @test old.message.status == "completed" && BT.isdone(old)
+        # The id now means the new run.
+        @test BT.shared(model).runs.runs["r20"] === new.run
+        # A late word about the old one (its "collected", announced again by its
+        # process) reaches neither: the new run is still running, uncollected.
+        BT.run_update!(state, "proj", "", frame("r20"; collected = true, started = t_old))
+        @test !new.run.collected
+    end
+
+    @testset "two live runs with one id keep their own frames" begin
+        # The old r21 still runs on a worker after the chat's MCP restarted, and
+        # the new MCP's r21 starts on another.
+        t_old = time() - 3_600
+        a = card("toolu_a21", ("code" => "1", "env_path" => "/tmp/envS", "worker" => "worker-x",
+                               "background" => true))
+        BT.run_update!(state, "proj", "worker-x", running("r21", "/tmp/envS"; background = true,
+                                                          tool_use_id = "toolu_a21", started = t_old))
+        b = card("toolu_b21", ("code" => "2", "env_path" => "/tmp/envS", "worker" => "worker-y",
+                               "background" => true))
+        BT.run_update!(state, "proj", "worker-y", running("r21", "/tmp/envS"; background = true,
+                                                          tool_use_id = "toolu_b21"))
+        @test a.run !== b.run && BT.run_live(a) && BT.run_live(b)
+        BT.run_update!(state, "proj", "worker-x", frame("r21"; status = "failed", route = abspath("/tmp/envS"),
+            env_path = "/tmp/envS", background = true, started = t_old, elapsed = 3600.0))
+        @test a.run.status == "failed" && BT.run_live(b)
+        @test a.run.worker_id == "worker-x" && b.run.worker_id == "worker-y"
+    end
+
+    @testset "a process that comes back without a run loses it" begin
+        # Back within the grace is not enough: a restarted process comes back at
+        # once and knows none of the old runs. Only what it announces again stays.
+        kept = card("toolu_kept", ("code" => "1", "env_path" => "/tmp/envK1", "worker" => "worker-k",
+                                   "background" => true))
+        gone = card("toolu_gone", ("code" => "2", "env_path" => "/tmp/envK2", "worker" => "worker-k",
+                                   "background" => true))
+        t_kept = time()
+        BT.run_update!(state, "proj", "worker-k", running("r30", "/tmp/envK1"; background = true,
+                                                          tool_use_id = "toolu_kept", started = t_kept))
+        BT.run_update!(state, "proj", "worker-k", running("r31", "/tmp/envK2"; background = true,
+                                                          tool_use_id = "toolu_gone"))
+        BT.runs_channel_closed!(state, "proj", "worker-k"; grace = 1.0)
+        sleep(0.2)
+        # The process reconnects and announces what it still runs: r30 only.
+        BT.run_update!(state, "proj", "worker-k", running("r30", "/tmp/envK1"; background = true,
+                                                          tool_use_id = "toolu_kept", started = t_kept))
+        @test timedwait(() -> !BT.run_live(gone), 10.0) === :ok
+        @test gone.run.status == "lost"
+        @test BT.run_live(kept)
+    end
+
+    @testset "a stop its process cannot do ends the row" begin
+        # The process says it has no such run (it ended unheard, or that process
+        # is a new one). The row used to say "had already finished" and stay.
+        host_process!("worker-n", ("interrupted" => 0,))
+        n = card("toolu_N", ("code" => "sleep(99)", "env_path" => "/tmp/envN", "worker" => "worker-n",
+                             "background" => true))
+        BT.run_update!(state, "proj", "worker-n", running("r40", "/tmp/envN"; background = true,
+                                                          tool_use_id = "toolu_N"))
+        @test BT.run_live(n) && BT.in_taskbar(n)
+        @test BT.stop_run!(model, n)
+        @test timedwait(() -> !BT.run_live(n), 10.0) === :ok
+        @test n.run.status == "lost"
+        # A process that tried and failed says so, at once instead of after the
+        # 15s timeout that reported the worker as unreachable.
+        host_process!("worker-f", ("interrupted" => 0, "error" => "MethodError: the session is gone"))
+        r = BT.ChatRun("r41", "", "worker-f", "", "", true, time(), "running", 0.0, "",
+                       false, false, Any[], nothing)
+        t0 = time()
+        err = try
+            BT.interrupt_run!(state, "proj", r)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException && occursin("the session is gone", err.msg)
+        @test time() - t0 < 5
+    end
+
+    @testset "the bar's stop runs once, however many tabs show the chat" begin
+        # Every tab added its own listener to the one shared observable, so a
+        # click stopped the task once per open tab (four interrupts per click).
+        p = host_process!("worker-t", ("interrupted" => 1,))
+        t = card("toolu_T", ("code" => "sleep(99)", "env_path" => "/tmp/envTabs", "worker" => "worker-t",
+                             "background" => true))
+        BT.run_update!(state, "proj", "worker-t", running("r50", "/tmp/envTabs"; background = true,
+                                                          tool_use_id = "toolu_T"))
+        for _ in 1:2
+            s = Bonito.Session()
+            Bonito.jsrender(s, copy(model, s))
+        end
+        BT.shared(model).taskbar.stop_request[] = "toolu_T"
+        @test timedwait(() -> p.asked[] >= 1, 10.0) === :ok
+        sleep(0.5)
+        @test p.asked[] == 1
     end
 
     @testset "short env labels" begin

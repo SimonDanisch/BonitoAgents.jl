@@ -190,6 +190,13 @@ const DEFAULT_HIDDEN = ['tool:ToolSearch'];
 // subagent's full history lives on the server either way.
 const TASK_FEED_ROWS = 300;
 
+// "512 KB", "3.4 MB", "1.2 GB": a file's size in the composer and its errors.
+function formatBytes(n) {
+    if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
 class BonitoChat {
     constructor(container, comm) {
         this.container = container;
@@ -235,6 +242,7 @@ class BonitoChat {
         this.messageHeightObserver = new ResizeObserver((entries) => {
             if (this.destroyed) return;
             let changed = false;
+            let resized = false;
             for (const e of entries) {
                 const idx = e.target.__btIdx;
                 if (idx === undefined) continue;
@@ -244,6 +252,7 @@ class BonitoChat {
                 // h>0 guard keeps the last measured height through a
                 // hide/show cycle, so re-showing restores exact sizes.
                 if (h > 0 && this.heights.get(idx) !== h) {
+                    resized = true;
                     // Only pin a height the node has finished growing into.
                     //
                     // In follow mode EVERY message is briefly rendered as it
@@ -267,6 +276,12 @@ class BonitoChat {
             // corrections then wait for release — re-spacing under a held
             // thumb is exactly the flicker.
             if (changed && !this.scrollbarDrag) this.queueRefresh();
+            // A row grew on its own: an image or an editor reached its real
+            // height after the last message, so no chunk comes to chase it.
+            // That moved the bottom away from a pinned view, and `refresh`
+            // reads `atBottom` only after the growth, so it cannot re-pin.
+            // Chase here, as `viewportObserver` does for the container.
+            if (resized && this.followMode) this.queueScrollToBottom();
         });
 
         // ── Live-app keep-alive LRU ──────────────────────────────────────
@@ -453,7 +468,11 @@ class BonitoChat {
         // intervening frame took. Consumed on use; wall-clock can't
         // expire it because a blocked main thread can't deliver an
         // unrelated scroll event in between anyway.
-        this.lastUserInputT = 0;
+        // No input yet. Not 0: `performance.now()` counts from navigation
+        // start, so with 0 every scroll in the page's first 400ms looked like
+        // the user's, and a fast reload opened the chat off the bottom with
+        // follow mode off.
+        this.lastUserInputT = -Infinity;
         this.pendingUserScroll = false;
         const markUserInput = () => {
             this.lastUserInputT = performance.now();
@@ -1778,8 +1797,12 @@ class BonitoChat {
         // estimate (a media card that finished loading off-screen) moves the
         // anchor by the difference, the next scroll event drops it again, and
         // the ResizeObserver reports only once it is gone: in and out every frame.
+        // A stored height goes stale the same way: it was measured at the
+        // width the column had then, and a narrower window wraps the row
+        // taller. Pinned at the bottom, that row entering and leaving moved the
+        // bottom by the difference on every scroll event, for good.
         for (const [i, node] of inserted) {
-            if (this.heights.has(i) || !this.heightIsFinal(node)) continue;
+            if (!this.heightIsFinal(node)) continue;
             const h = node.getBoundingClientRect().height;
             if (h > 0) this.heights.set(i, h);
         }
@@ -2773,6 +2796,20 @@ class BonitoChat {
                     const gallery = document.createElement('div');
                     gallery.className = 'bt-user-attachments';
                     for (const a of msg.attachments) {
+                        if (a.kind === 'file') {
+                            // Not an image: its name, opening the file (a PDF
+                            // in the browser, anything else as a download).
+                            const link = document.createElement('a');
+                            link.className = 'bt-user-att-file';
+                            link.href = a.url;
+                            link.target = '_blank';
+                            link.rel = 'noopener';
+                            link.textContent = a.name.replace(/^\d{4}-\d{2}-\d{2}_\d{6}_[0-9a-f]{8}_/, '');
+                            link.title = a.name;
+                            link.addEventListener('click', e => e.stopPropagation());
+                            gallery.appendChild(link);
+                            continue;
+                        }
                         const img = document.createElement('img');
                         img.className = 'bt-user-att-img';
                         img.src = a.url;
@@ -3968,7 +4005,16 @@ class BonitoChat {
 
         this.attachments = new Map();
         this.attachIdCounter = 0;
+        // An image up to this size goes inline, for the agent to see; anything
+        // bigger, and any other file, is uploaded for the agent to open.
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        // The image types the server stores inline (ATTACHMENT_EXTENSIONS).
+        // Any other image (HEIC off a phone) travels as a file.
+        this.INLINE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg',
+            'image/gif', 'image/webp', 'image/svg+xml']);
+        this.FILE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+        // One upload request: well under any proxy's default body limit (1 MB).
+        this.UPLOAD_CHUNK_BYTES = 512 * 1024;
         // Queue length cap. The file picker makes "select all" in a phone
         // gallery a single tap, so an unbounded queue is one gesture away from
         // dozens of multi-MB data URLs in memory and one enormous message.
@@ -3983,11 +4029,9 @@ class BonitoChat {
             const items = e.clipboardData?.items;
             if (!items) return;
             for (const it of items) {
-                if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
-                    const blob = it.getAsFile();
-                    if (blob) this.attachAddBlob(blob, blob.type || it.type,
-                                                  blob.name || `pasted-${Date.now()}.png`);
-                }
+                if (it.kind !== 'file') continue;
+                const blob = it.getAsFile();
+                if (blob) this.attachAdd(blob, `pasted-${Date.now()}`);
             }
         };
         this.textInput.addEventListener('paste', this.onPaste);
@@ -3995,7 +4039,7 @@ class BonitoChat {
         // Drag-drop — listen on the whole .bt-app so a drop anywhere in
         // the chat counts. dragover MUST preventDefault to enable drop.
         this.onDragOver = (e) => {
-            if (!this.dragHasImage(e)) return;
+            if (!this.dragHasFiles(e)) return;
             e.preventDefault();
             this.app.classList.add('bt-drag-over');
         };
@@ -4010,11 +4054,7 @@ class BonitoChat {
             this.app.classList.remove('bt-drag-over');
             const files = e.dataTransfer?.files;
             if (!files) return;
-            for (const f of files) {
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
-                }
-            }
+            for (const f of files) this.attachAdd(f, `dropped-${Date.now()}`);
         };
         this.app.addEventListener('dragover',  this.onDragOver);
         this.app.addEventListener('dragleave', this.onDragLeave);
@@ -4081,16 +4121,7 @@ class BonitoChat {
             if (this.destroyed) return;
             const input = e.target.closest('.bt-attach-input');
             if (!input || !input.files) return;
-            for (const f of input.files) {
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `picked-${Date.now()}.png`);
-                } else {
-                    // `accept` is a hint, not a rule — most pickers still offer
-                    // "all files". Say so instead of dropping it on the floor.
-                    this.showAttachError(
-                        `${f.name || 'That file'} is not an image; only images can be attached`);
-                }
-            }
+            for (const f of input.files) this.attachAdd(f, `picked-${Date.now()}`);
             // Clear, or picking the SAME file twice fires no `change` at all
             // and the second attempt looks broken.
             input.value = '';
@@ -4306,16 +4337,76 @@ class BonitoChat {
         this.comm.notify({type: 'cancel', seq: this.turnSeq ?? -1});
     }
 
-    dragHasImage(e) {
+    dragHasFiles(e) {
         const dt = e.dataTransfer;
         if (!dt) return false;
         if (dt.types) {
             // 'Files' is the type when the user drags from the OS file picker.
-            // Browsers don't expose individual MIME types during dragover, so
-            // we accept any Files drag here and filter image/* on drop.
             for (const t of dt.types) if (t === 'Files') return true;
         }
         return false;
+    }
+
+    // Any file the user attaches. An image the server stores inline, small
+    // enough, goes into the message for the agent to see; everything else is
+    // uploaded and copied to the worker, and the message names its path.
+    attachAdd(file, fallbackName) {
+        const mime = file.type || '';
+        if (this.INLINE_IMAGE_TYPES.has(mime) && file.size <= this.ATTACH_MAX_BYTES) {
+            this.attachAddBlob(file, mime, file.name || `${fallbackName}.png`);
+        } else {
+            this.attachAddFile(file, file.name || fallbackName);
+        }
+    }
+
+    attachAddFile(file, filename) {
+        if (this.attachments.size + this.attachPending >= this.ATTACH_MAX_COUNT) {
+            this.showAttachError(`At most ${this.ATTACH_MAX_COUNT} attachments per message`);
+            return;
+        }
+        if (file.size > this.FILE_MAX_BYTES) {
+            this.showAttachError(`${filename} is too large (${formatBytes(file.size)}, ` +
+                `at most ${formatBytes(this.FILE_MAX_BYTES)})`);
+            return;
+        }
+        const pid = this.app.closest('.bt-chatpane')?.dataset.panePid;
+        if (!pid) { this.showAttachError('Files can only be attached in a chat'); return; }
+        const id = `att-${++this.attachIdCounter}`;
+        const bytes = crypto.getRandomValues(new Uint8Array(12));
+        const item = {
+            kind: 'file', file, filename, mime: file.type || '', size: file.size,
+            pid, uploadId: Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(''),
+            sent: 0, path: null, onWorker: false, error: null, removed: false,
+        };
+        item.done = this.uploadFile(item);
+        this.attachments.set(id, item);
+        this.renderAttachments();
+    }
+
+    // Chunk after chunk, each one request; the last one's answer says where
+    // the file landed. Resolves either way: `item.error` says what went wrong.
+    async uploadFile(item) {
+        const url = (offset) => `/attachment-upload/${encodeURIComponent(item.pid)}` +
+            `?upload=${item.uploadId}&offset=${offset}&total=${item.size}` +
+            `&name=${encodeURIComponent(item.filename)}`;
+        try {
+            let offset = 0;
+            do {
+                if (item.removed) return;
+                const chunk = item.file.slice(offset, offset + this.UPLOAD_CHUNK_BYTES);
+                const resp = await fetch(url(offset), {
+                    method: 'POST', body: chunk, headers: {'X-BT-Upload': '1'}});
+                if (!resp.ok) throw new Error((await resp.text()).trim() || `HTTP ${resp.status}`);
+                const answer = await resp.json();
+                offset = answer.received;
+                item.sent = offset;
+                if (answer.path) { item.path = answer.path; item.onWorker = answer.on_worker; }
+                if (!this.destroyed) this.renderAttachments();
+            } while (offset < item.size);
+        } catch (error) {
+            item.error = `Upload failed: ${error.message}`;
+            if (!this.destroyed) this.renderAttachments();
+        }
     }
 
     attachAddBlob(blob, mime, filename) {
@@ -4350,7 +4441,15 @@ class BonitoChat {
     }
 
     attachRemove(id) {
+        const item = this.attachments.get(id);
         this.attachments.delete(id);
+        // An upload still running stops, and what arrived of it goes.
+        if (item?.kind === 'file' && !item.path) {
+            item.removed = true;
+            fetch(`/attachment-upload/${encodeURIComponent(item.pid)}?upload=${item.uploadId}`,
+                {method: 'DELETE', headers: {'X-BT-Upload': '1'}})
+                .catch(e => console.warn('could not drop the partial upload', e));
+        }
         this.renderAttachments();
     }
 
@@ -4370,13 +4469,32 @@ class BonitoChat {
             this.attachBar.classList.add('bt-attachments-active');
             for (const [id, item] of this.attachments) {
                 const wrap = document.createElement('div');
-                wrap.className = 'bt-attachment-thumb';
                 wrap.dataset.attachId = id;
-                const img = document.createElement('img');
-                img.src   = item.dataUrl;
-                img.alt   = item.filename || 'image';
-                img.title = item.filename || 'image';
-                wrap.appendChild(img);
+                if (item.kind === 'file') {
+                    // Name, size, and how far the upload got.
+                    wrap.className = 'bt-attachment-file';
+                    wrap.dataset.state = item.error ? 'error' : item.path ? 'done' : 'uploading';
+                    const name = document.createElement('div');
+                    name.className = 'bt-attachment-file-name';
+                    name.textContent = item.filename;
+                    name.title = item.filename;
+                    const status = document.createElement('div');
+                    status.className = 'bt-attachment-file-status';
+                    status.textContent = item.error ? item.error :
+                        item.path ? formatBytes(item.size) :
+                        `Uploading ${Math.floor(100 * item.sent / Math.max(1, item.size))}% of ${formatBytes(item.size)}`;
+                    const bar = document.createElement('div');
+                    bar.className = 'bt-attachment-file-bar';
+                    bar.style.width = `${item.path ? 100 : Math.floor(100 * item.sent / Math.max(1, item.size))}%`;
+                    wrap.append(name, status, bar);
+                } else {
+                    wrap.className = 'bt-attachment-thumb';
+                    const img = document.createElement('img');
+                    img.src   = item.dataUrl;
+                    img.alt   = item.filename || 'image';
+                    img.title = item.filename || 'image';
+                    wrap.appendChild(img);
+                }
                 const rm = document.createElement('button');
                 rm.type = 'button';
                 rm.className = 'bt-attachment-remove';
@@ -4435,6 +4553,7 @@ class BonitoChat {
             const status = document.createElement('div');
             status.className = 'bt-queue-status';
             status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'offline' ? 'Agent not reachable · sends once it is back' :
                 item.status === 'sending' ? 'Connecting · not sent yet' :
                 item.mode === 'interrupt' ? 'Waiting for interruption to finish' :
                 item.mode === 'next' ? 'Waiting for the next message boundary' :
@@ -4447,6 +4566,7 @@ class BonitoChat {
             const badge = document.createElement('span');
             badge.className = 'bt-queue-badge';
             badge.textContent = item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'offline' ? 'Agent offline · queued' :
                 item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' :
                 item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
             summary.title = status.textContent;
@@ -4459,7 +4579,7 @@ class BonitoChat {
             actions.className = 'bt-queue-actions';
             for (const [action, label] of item.status === 'paused' ?
                     [['send', 'Queue again'], ['remove', 'Remove']] :
-                    item.status === 'waiting' ? [['remove', 'Remove']] : []) {
+                    item.status === 'waiting' || item.status === 'offline' ? [['remove', 'Remove']] : []) {
                 const button = document.createElement('button');
                 button.type = 'button';
                 button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
@@ -4491,8 +4611,27 @@ class BonitoChat {
         // lock-in is meaningful there: it clears the reminders.
         const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
         if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
+        // Files still uploading: the message waits for them (the chips show how
+        // far they are). A second click meanwhile does nothing.
+        if (this.submitting) return;
+        const files = [...this.attachments.values()].filter(item => item.kind === 'file');
+        if (files.some(item => !item.path && !item.error)) {
+            this.submitting = true;
+            try { await Promise.all(files.map(item => item.done)); }
+            finally { this.submitting = false; }
+        }
+        const failed = files.find(item => item.error);
+        if (failed) {
+            this.showAttachError(`${failed.filename}: ${failed.error}. Remove it to send.`);
+            return;
+        }
         const payload = [];
         for (const item of this.attachments.values()) {
+            if (item.kind === 'file') {
+                payload.push({kind: 'file', path: item.path, filename: item.filename,
+                              on_worker: item.onWorker});
+                continue;
+            }
             const buf = await item.blob.arrayBuffer();
             payload.push({
                 mime:     item.mime,
@@ -4500,7 +4639,9 @@ class BonitoChat {
                 data:     arrayBufferToBase64(buf),
             });
         }
-        this.comm.notify({type: 'send', text, attachments: payload, mode: this.sendMode || 'done'});
+        // What is in the composer now: typing went on while files uploaded.
+        this.comm.notify({type: 'send', text: this.textInput.value, attachments: payload,
+                          mode: this.sendMode || 'done'});
         // Clear the local input immediately. We don't wait for any
         // server ack — the textarea content is already encoded on the
         // wire, Julia will surface errors (e.g. attachment rejection)
@@ -5030,6 +5171,13 @@ export function toolSlot(id) {
         if (slot) return slot;
     }
     return null;
+}
+
+// Write every chat's pending draft to storage now. A draft is written 250ms
+// after the last keystroke; the connection guard reloads a page only when no
+// typed text would be lost, and text from the last 250ms was not saved yet.
+export function flushDrafts() {
+    for (const chat of CHAT_INSTANCES) chat.flushDraft?.();
 }
 
 export function connect(node, comm, init = {}) {

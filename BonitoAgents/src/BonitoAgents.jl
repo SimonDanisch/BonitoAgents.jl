@@ -20,6 +20,7 @@ using TOML
 using Base64
 using SHA
 import Random
+import Colors          # distinguishable_colors: one clearly different color per worker
 import Sockets
 import WorkerLink      # one multiplexed, resumable connection per worker (always qualified)
 # Used by `current_bonito_install_spec()` to parse `[sources]` out of the
@@ -78,6 +79,7 @@ include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
 include("remote_eval.jl")      # bt_julia_eval(worker = …): eval hosts on other workers, the per-chat switch
 include("remote_values.jl")    # remote_session(…): Julia values between a chat's session and another worker's
+include("processes.jl")        # the record of every process a chat runs; a restart ends them all
 include("shares.jl")           # shared links: a markdown file or a Bonito app for anyone with the link
 include("crash_recovery.jl")   # continue the chats a worker crash cut off mid-turn
 include("server.jl")           # serve()

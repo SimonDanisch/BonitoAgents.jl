@@ -33,6 +33,16 @@
               ("hi", [".bt-attachments/a.png", ".bt-attachments/b.png"])
     end
 
+    # The body streams from the file (an attachment can be a video): drain it.
+    function drain(body)
+        out, buf = UInt8[], Vector{UInt8}(undef, 4)
+        while (n = body.read_cb(buf)) > 0
+            append!(out, view(buf, 1:n))
+        end
+        body.close_cb()
+        return out
+    end
+
     @testset "attachment_response route guards + happy path" begin
         state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
         pid = "attroute1"
@@ -50,13 +60,19 @@
         hdrs = Dict(r.headers)
         @test hdrs["Content-Type"] == "image/png"
         @test occursin("immutable", hdrs["Cache-Control"])
-        @test Vector{UInt8}(r.body) == bytes
+        @test drain(r.body) == bytes
 
         # The exposed surface is EXACTLY `<server_path>/.bt-attachments/<bare name>`.
         @test BT.attachment_response(state, pid, "../chat.md").status == 403
         @test BT.attachment_response(state, pid, "/etc/passwd").status == 403
         @test BT.attachment_response(state, pid, "sub/x.png").status == 403
-        @test BT.attachment_response(state, pid, "evil.html").status == 403   # foreign ext
+        # Any file can be attached, but only images and PDFs show in the
+        # browser: HTML is a download, never a page from this origin.
+        write(joinpath(att, "evil.html"), "<script>alert(1)</script>")
+        h = Dict(BT.attachment_response(state, pid, "evil.html").headers)
+        @test h["Content-Type"] == "application/octet-stream"
+        @test startswith(h["Content-Disposition"], "attachment;")
+        @test BT.attachment_response(state, pid, ".uploads").status == 403    # partial uploads stay hidden
         @test BT.attachment_response(state, pid, "missing.png").status == 404
         @test BT.attachment_response(state, "nope", "x.png").status == 404
         @test BT.attachment_response(state, "../../etc", "x.png").status == 404
@@ -86,12 +102,17 @@
         d2 = BT.msg_to_dict(m2)
         @test d2["text"] == text
         @test !haskey(d2, "attachments")
-        # A foreign extension in the list keeps the whole message textual —
-        # never a partial gallery next to a partial list.
+        # An image and another file: the image inline, the file a chip.
         t3 = "x\n\n[attached files in this message]\n  - .bt-attachments/ok.png\n  - .bt-attachments/odd.tiff"
         d3 = BT.msg_to_dict(BT.UserMsg(model, t3))
-        @test d3["text"] == t3
-        @test !haskey(d3, "attachments")
+        @test d3["text"] == "x"
+        @test [a["kind"] for a in d3["attachments"]] == ["image", "file"]
+        # Something that is no attachment name keeps the whole message textual,
+        # never a partial gallery next to a partial list.
+        t5 = "x\n\n[attached files in this message]\n  - .bt-attachments/ok.png\n  - .bt-attachments/.hidden"
+        d5 = BT.msg_to_dict(BT.UserMsg(model, t5))
+        @test d5["text"] == t5
+        @test !haskey(d5, "attachments")
         # An interrupted send appends "[Request interrupted by user]" onto the
         # last attachment line: the gallery must still render (not fall to text).
         t4 = "look\n\n[attached files in this message]\n  - .bt-attachments/2026-01-01_000000_beef00.png[Request interrupted by user]"

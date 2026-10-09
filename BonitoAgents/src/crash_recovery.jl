@@ -44,7 +44,10 @@ carry the chat on by themselves).
 function interrupted_turn(chat::ChatModel)
     s = shared(chat)
     return lock(s.lock) do
-        (s.turn_in_flight[] && isempty(s.pending_sends)) || return nothing
+        # The outbox keeps the message being answered (status :sent) until its
+        # turn ends, so only a message not delivered yet is one queued behind it.
+        queued_behind = any(e -> e isa PendingSend && e.status !== :sent, s.pending_sends)
+        (s.turn_in_flight[] && !queued_behind) || return nothing
         i = findlast(m -> m isa UserMsg, s.msgs_store)
         prompt = i === nothing ? nothing : s.msgs_store[i]
         (s.turn_seq[], prompt !== nothing && prompt.auto && prompt.text == CRASH_CONTINUE_PROMPT)

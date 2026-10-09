@@ -119,7 +119,7 @@ worker_label(state::ServerState, p::ProjectInfo) = worker_label(state.workers[],
 
 function project_icon(state::ServerState, p::ProjectInfo; size_px::Int = 32)
     tag, wname = worker_label(state, p)
-    return project_icon_for(p.id, p.name, folder_hue_key(p), tag, wname; size_px = size_px, color = worker_color(p.worker_id))
+    return project_icon_for(p.id, p.name, folder_hue_key(p), tag, wname; size_px = size_px, color = worker_color(state, p.worker_id))
 end
 
 # A single sidebar row: icon + label + identifying data-attribute. NO
@@ -456,7 +456,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             t, wn = worker_label(workers, p)
             label = p.title[]
             st = chat_status(state, p)
-            col = worker_color(p.worker_id)
+            col = worker_color(workers, p.worker_id)
             tooltip = "$(wn) [$t] · $label · folder: $(p.name) · $(st)"
             row = get!(rows, p.id) do
                 SidebarChat(p.id, p.name, folder_hue_key(p),
@@ -703,14 +703,18 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-icon-wrap",
         "position" => "relative", "flex-shrink" => "0",
         "display" => "flex", "line-height" => "0"),
-    CSS(".bt-glow-active .bt-proj-icon",
-        "animation" => "bt-icon-glow 1.4s ease-in-out infinite"),
     # From nothing to a hairline of status green about 3px wide and back: a
-    # heartbeat at the icon's edge, not a cloud around it.
+    # heartbeat at the icon's edge, not a cloud around it. The hairline is drawn
+    # once on a layer of its own and only its opacity animates, which the
+    # compositor does without repainting the sidebar every frame.
+    CSS(".bt-glow-active .bt-proj-icon::after",
+        "content" => "\"\"", "position" => "absolute", "inset" => "0",
+        "border-radius" => "inherit", "pointer-events" => "none",
+        "box-shadow" => "0 0 2px 1px var(--bt-status-active)",
+        "animation" => "bt-icon-glow 1.4s steps(4, jump-none) infinite"),
     CSS("@keyframes bt-icon-glow",
-        CSS("0%",   "box-shadow" => "0 0 0 0 transparent"),
-        CSS("50%",  "box-shadow" => "0 0 2px 1px var(--bt-status-active)"),
-        CSS("100%", "box-shadow" => "0 0 0 0 transparent")),
+        CSS("0%, 100%", "opacity" => "0"),
+        CSS("50%",      "opacity" => "1")),
     # Worker down: the picture greys out under a steady red edge.
     CSS(".bt-glow-offline .bt-proj-icon",
         "box-shadow" => "0 0 2px 1px var(--bt-status-offline)"),
@@ -972,6 +976,10 @@ const UnifiedShellStyles = Bonito.Styles(
     # shrinks so the column slides left; once the free space is gone it shrinks
     # down to `--bt-main-min` — the two-stage "slide then shrink at the wall".
     # Side borders give the contained-surface frame the shell used to provide.
+    # The side lines are inset shadows, not borders: inside a workspace pane the
+    # column takes the pane's full width, and borders on top of it ran 2px past
+    # the window's right edge, where the stage clipped the right one away.
+    # Shadows take no space, so the column keeps exactly the pane's width.
     CSS(".bt-main",
         "flex" => "0 1 var(--bt-main-max)",
         "min-width" => "var(--bt-main-min)",
@@ -979,8 +987,7 @@ const UnifiedShellStyles = Bonito.Styles(
         "position" => "relative",
         "display" => "flex", "flex-direction" => "column",
         "overflow" => "hidden",
-        "border-left"  => "1px solid var(--bt-border)",
-        "border-right" => "1px solid var(--bt-border)"),
+        "box-shadow" => "inset 1px 0 var(--bt-border), inset -1px 0 var(--bt-border)"),
     # When the plotpane is OPEN, the chat stops centering and becomes a fixed,
     # resizable LEFT column — the plotpane (flex:1) then fills ALL the space to
     # its right with no gap. The divider sets `--bt-chat-width` (clamped to the

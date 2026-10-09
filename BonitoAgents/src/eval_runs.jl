@@ -176,12 +176,11 @@ function run_update!(state::ServerState, project_id::AbstractString,
     id = String(get(d, "run", ""))
     isempty(id) && return nothing
     book = chat.runs
-    r = lock(book.lock) do
-        get!(book.runs, id) do
-            ChatRun(id, "", String(host_worker), "", "", false, time(), "running", 0.0, "",
-                    false, false, Any[], nothing)
-        end
-    end
+    started = get(d, "started", nothing)
+    started isa Real || (started = nothing)
+    r = lock(() -> run_record!(book, id, String(host_worker), started, haskey(d, "status")), book.lock)
+    r === nothing && return nothing
+    r.seen = time()
     tuid = String(get(d, "tool_use_id", ""))
     isempty(tuid) || (r.tool_use_id = tuid)
     was = r.status
@@ -192,7 +191,7 @@ function run_update!(state::ServerState, project_id::AbstractString,
         env          = get(d, "env_path", nothing)
         r.env_path   = env isa AbstractString ? String(env) : ""
         r.background = get(d, "background", false) === true
-        r.started    = Float64(get(d, "started", r.started))
+        started === nothing || (r.started = Float64(started); r.known = true)
         r.status     = String(d["status"])
         r.summary    = String(get(d, "summary", ""))
         r.status == "running" || (r.finished = r.started + Float64(get(d, "elapsed", 0.0)))
@@ -212,6 +211,47 @@ function run_update!(state::ServerState, project_id::AbstractString,
     end
     return nothing
 end
+
+new_chat_run(id::String, host::String) =
+    ChatRun(id, "", host, "", "", false, time(), "running", 0.0, "", false, false, Any[], nothing)
+
+"""
+    run_record!(book, id, host_worker, started, status_frame) -> Union{ChatRun,Nothing}
+
+The run a frame is about, `nothing` for a late word about a run that is over.
+Caller holds `book.lock`.
+
+An id names a run only within one MCP process, which numbers its runs from r1.
+A chat outlives its MCP's restarts, so after one, "r10" was this morning's run
+AND is the new process's: the frames' `started` tells them apart. Taken for the
+old run, the new one reopened the old card, took the bar with its start time
+("r146 · 1079m" for an hour-old run), and its result landed in yesterday's
+history while its own card never heard of it.
+"""
+function run_record!(book::RunBook, id::String, host::String, started, status_frame::Bool)
+    cur = get(book.runs, id, nothing)
+    cur === nothing && return status_frame ? (book.runs[id] = new_chat_run(id, host)) : nothing
+    (started === nothing || !cur.known || cur.started == started) && return cur
+    older = get(book.older, (id, Float64(started)), nothing)
+    older === nothing || return older
+    status_frame || return nothing
+    if started > cur.started
+        # A newer run took the id. The one it replaces keeps its card and its end,
+        # and its frames, should it still run on another worker. Its process is
+        # gone: the agent cannot collect it by this id any more, so no note.
+        cur.notified = true
+        cur.status == "running" && (book.older[(id, cur.started)] = cur)
+        return book.runs[id] = new_chat_run(id, host)
+    end
+    # An older run than the id's newest, announced again by a process that came
+    # back: it is that one, not the newest.
+    r = book.older[(id, Float64(started))] = new_chat_run(id, host)
+    r.notified = true
+    return r
+end
+
+# Every run the chat knows: each id's newest, and older ones still around.
+all_runs(book::RunBook) = lock(() -> [collect(values(book.runs)); collect(values(book.older))], book.lock)
 
 # The card-side half of binding: an eval card that appears after its run was
 # announced (`adopt_run!` runs on each of its frames until it has one) takes
@@ -333,9 +373,11 @@ function stop_run!(model::ChatModel, t::JuliaEvalToolMsg)
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tid,
         "status" => "in_progress", "summary" => "$(r.id) · stopping…"))
     Base.errormonitor(@async try
+        # Its process has no such running run (it ended unheard, or that process
+        # is a new one): it is over, whatever the chat last heard, and the row
+        # goes. It used to say "had already finished" and stay.
         interrupt_run!(model.state, model.project_id, r) ||
-            chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tid,
-                "status" => "in_progress", "summary" => "$(r.id) had already finished"))
+            lose_run!(shared(model), r, "its process no longer runs it")
     catch e
         e isa InterruptException && rethrow()
         @warn "run interrupt failed" run = r.id tool_id = tid exception = e
@@ -405,31 +447,35 @@ end
 """
     runs_channel_closed!(state, project_id, host_worker)
 
-The channel of the process running some of a chat's runs closed. Unless it is
-back within `RUN_LOST_GRACE_S` (and has announced them again), its running runs
-end as `lost`: that process, and the evals in it, are gone.
+The channel of the process running some of a chat's runs closed. A run its
+process announces again within `RUN_LOST_GRACE_S` goes on; every other running
+run of that process ends as `lost`. A channel that is back is not enough: a
+restarted process (a new MCP after a chat restart, an eval host spawned again)
+comes back within a second and knows none of the old runs, which then stayed
+"running" in the bar for good.
 """
 function runs_channel_closed!(state::ServerState, project_id::AbstractString,
                               host_worker::AbstractString; grace::Real = RUN_LOST_GRACE_S)
+    closed_at = time()
     Base.errormonitor(@async begin
         sleep(grace)
-        back = isempty(host_worker) ? mcp_ctrl_for(state, project_id) !== nothing :
-                                      eval_host_ws(state, project_id, host_worker) !== nothing
-        back && return nothing
         chat = lock(() -> get(state.chat_models, String(project_id), nothing), state.lock)
         chat === nothing && return nothing
         chat = shared(chat)
-        lost = lock(chat.runs.lock) do
-            [r for r in values(chat.runs.runs) if r.status == "running" && r.worker_id == host_worker]
-        end
-        for r in lost
-            r.status  = "lost"
-            r.summary = "the process running it went away"
-            r.finished = time()
-            r.card === nothing || run_ended!(chat, r.card)
-        end
+        lost = [r for r in all_runs(chat.runs)
+                if r.status == "running" && r.worker_id == host_worker && r.seen < closed_at]
+        foreach(r -> lose_run!(chat, r, "the process running it went away"), lost)
         isempty(lost) || @info "runs lost with their process" project_id host_worker runs = [r.id for r in lost]
     end)
+    return nothing
+end
+
+# End a run here, for its process cannot: it is gone, or says it has no such run.
+function lose_run!(chat::ChatModel, r::ChatRun, why::AbstractString)
+    r.status   = "lost"
+    r.summary  = String(why)
+    r.finished = time()
+    r.card === nothing || run_ended!(chat, r.card)
     return nothing
 end
 

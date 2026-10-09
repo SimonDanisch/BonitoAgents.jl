@@ -518,8 +518,9 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     # the eval bridge's worker session is gone — tear the bridge down explicitly
     # (a WS drop alone no longer does; its lifetime is the worker session).
     teardown_eval_bridge!(state, p.id)
-    # Its evals on OTHER workers end with it: those hosts serve this session only.
-    close_eval_hosts!(state, p.id)
+    # Every process it ran ends with it, on every worker: its eval hosts, and the
+    # Julia eval workers, which the kill of the agent's group does not reach.
+    end_chat_processes!(state, p.id)
     return nothing
 end
 
@@ -586,7 +587,7 @@ function continue_on!(state::ServerState, p::ProjectInfo, target_worker_id::Abst
     new_p.provider = p.provider
     new_p.desired_config = copy(p.desired_config)
     new_p.title[] = p.title[]
-    add_project!(state, new_p)
+    add_project!(state, new_p; new_chat = false)
     @info "chat continued on another worker" source = p.id new = new_id target = target_w.name carried
     return new_p
 end
@@ -1327,7 +1328,7 @@ const DashboardStyles = Bonito.Styles(
         "border-bottom" => "2px solid var(--bt-border)",
         "border-left" => "2px solid var(--bt-border)",
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
-        "animation" => "bt-spin 0.7s linear infinite",
+        "animation" => "bt-spin 0.7s steps(8) infinite",
         "flex-shrink" => "0"),
     CSS(".bt-spinner-sm",
         "width" => "11px", "height" => "11px", "border-width" => "1.5px"),
@@ -1368,7 +1369,7 @@ const DashboardStyles = Bonito.Styles(
         "border-left" => "3px solid var(--bt-border)",
         "flex-shrink" => "0",
         "will-change" => "transform",
-        "animation" => "bt-spin 0.7s linear infinite"),
+        "animation" => "bt-spin 0.7s steps(8) infinite"),
     # Stacked text under the spinner (loading state) / standalone message
     # (offline / error). Both centre their own contents; the message variant
     # brings its own ⚠ glyph, so the shared spinner is hidden for it.

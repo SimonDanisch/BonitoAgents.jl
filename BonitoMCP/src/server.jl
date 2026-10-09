@@ -228,7 +228,7 @@ function finalize_cancelled_eval!(s, f)   # s::JuliaSession, f::Task (typed at c
         # owns the worker and killing it would destroy innocent work.
         log_info("eval ignored interrupt after $(CANCEL_KILL_GRACE)s → killing worker (session lost)")
         try
-            kill_session!(s)
+            kill_session!(s; hard = true)
         catch e
             log_info("kill_session! failed: $(sprint(showerror, e))")
         end

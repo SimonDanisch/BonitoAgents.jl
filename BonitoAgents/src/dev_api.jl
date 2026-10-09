@@ -363,6 +363,10 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "turn_in_flight" => sh.turn_in_flight[],
         "turn_seq"       => sh.turn_seq[],
         "taskbar_items"  => length(sh.taskbar.items[]),
+        # What the chat runs, on every worker, as recorded (processes.jl).
+        "processes"      => [Dict{String,Any}("worker" => p.worker_id, "pid" => p.pid, "kind" => p.kind,
+                                              "label" => p.label, "recorded_at" => p.recorded_at)
+                             for p in chat_processes(m.state, project_id)],
         "pending_sends"  => lock(() -> length(sh.pending_sends), sh.lock),
         "pending_asks"   => length(sh.pending_asks),
         "tool_cache"     => length(sh.tool_content_cache),

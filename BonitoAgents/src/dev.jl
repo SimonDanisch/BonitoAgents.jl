@@ -355,7 +355,8 @@ function Base.close(h::DevHandle)
     # this the e2e suite leaked ~3 agent processes per full run, which is how the
     # box ended up at 93% memory and unrelated tests started failing on timing.
     try
-        BonitoWorker.reap_agents_owned_by(strip(read(joinpath(h.worker_config, "worker_id"), String)))
+        BonitoWorker.reap_agents_owned_by(strip(read(joinpath(h.worker_config, "worker_id"), String)),
+                                          h.worker_config)
     catch e
         e isa InterruptException && rethrow()
         @debug "dev_server: could not reap the worker's agents" exception = e

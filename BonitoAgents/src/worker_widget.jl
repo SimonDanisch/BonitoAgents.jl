@@ -329,7 +329,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
                    worker_sharing_row(state.auth, session, state, wid),
                    manage ? render_discover_panel(session, c, wid) : DOM.div();
                    class = "bt-card bt-worker-card", dataWorkerId = wid,
-                   style = Styles("--bt-worker" => worker_color(wid)))
+                   style = Styles("--bt-worker" => worker_color(state, wid)))
 
     return Bonito.jsrender(session,
         DOM.div(card, picker_block, gh_block; class = "bt-worker-cell"))

@@ -50,7 +50,32 @@ mutable struct WorkerInfo
     # each npm package, by version; and why the last attempt to install them failed.
     harnesses::Dict{String,String}
     harness_error::String
+    # Its place in the worker palette (`worker_color`): the lowest one free when
+    # it first registered, persisted, so a new worker never recolors the others.
+    color_slot::Int
+    # The requests it knows beyond the original set, from its hello. Asked of a
+    # worker that does not list one, it would let the request go unanswered.
+    # Runtime only.
+    capabilities::Vector{String}
 end
+
+# Every field but the palette slot: hand-built workers (tests, fixtures) and the
+# paths that assign the slot themselves (`register_worker!`, `load_workers!`).
+WorkerInfo(worker_id, name, initials, owner, credential, shared_with, ssh_target, hostname,
+           home, mcp_path, mcp_args, projects_root, online, last_check, update_state,
+           update_message, harnesses, harness_error) =
+    WorkerInfo(worker_id, name, initials, owner, credential, shared_with, ssh_target, hostname,
+               home, mcp_path, mcp_args, projects_root, online, last_check, update_state,
+               update_message, harnesses, harness_error, 0)
+WorkerInfo(worker_id, name, initials, owner, credential, shared_with, ssh_target, hostname,
+           home, mcp_path, mcp_args, projects_root, online, last_check, update_state,
+           update_message, harnesses, harness_error, color_slot::Integer) =
+    WorkerInfo(worker_id, name, initials, owner, credential, shared_with, ssh_target, hostname,
+               home, mcp_path, mcp_args, projects_root, online, last_check, update_state,
+               update_message, harnesses, harness_error, Int(color_slot), String[])
+
+"Whether worker `w` said it knows the request `capability`."
+can(w::WorkerInfo, capability::AbstractString) = capability in w.capabilities
 
 # A worker is "open" while its control WS is connected. Point read; bind to
 # `w.online` directly for live UI reactivity.
@@ -310,6 +335,25 @@ struct CrashWatch
 end
 CrashWatch() = CrashWatch(Dict{String,String}(), Dict{String,InterruptedTurn}(), Dict{String,String}())
 
+# One process a chat runs on some worker, as the server records it (processes.jl).
+struct ChatProcess
+    worker_id::String
+    pid::Int
+    pgid::Int              # the group it leads (0: none, or not known)
+    kind::String           # "mcp" | "eval host" | "julia session"
+    label::String          # what it runs for (an env), for listings
+    recorded_at::Float64   # a moment it was alive: its pid is still its, if it started before
+    instance::String       # the run of its worker it was recorded under
+end
+
+# Every chat's processes, by project id, then by (worker id, pid). Persisted in
+# processes.json: it outlives the chat models, and the server.
+struct ProcessRecord
+    chats::Dict{String,Dict{Tuple{String,Int},ChatProcess}}
+    lock::ReentrantLock
+end
+ProcessRecord() = ProcessRecord(Dict{String,Dict{Tuple{String,Int},ChatProcess}}(), ReentrantLock())
+
 # The worker build this server offers (`current_worker_update_spec`), as last
 # resolved. Resolving asks GitHub (`git ls-remote`), which takes as long as the
 # network does: a worker's handshake that resolved it itself went unanswered
@@ -526,6 +570,8 @@ mutable struct ServerState
     worker_build       :: WorkerBuild
     # Writes the proxy's files one at a time, spaced for Authelia (identity.jl).
     proxy_writer       :: ProxyWriter
+    # Every process each chat runs, on every worker (processes.jl).
+    processes          :: ProcessRecord
 
     # The parent state a per-session `copy(state, session)` was derived from;
     # `nothing` on the root itself. The Observable bridges above are ONE-WAY
@@ -607,6 +653,7 @@ function ServerState(; state_dir::String,
         Observable{Union{Nothing,Dict{String,Any}}}(nothing),  # harness_spec (load_settings! below)
         WorkerBuild(),                            # worker_build (resolved by serve())
         ProxyWriter(),                            # proxy_writer
+        ProcessRecord(),                          # processes (load_processes! below)
         nothing,                                  # root (this IS the root)
     )
     load_workers!(s)
@@ -617,6 +664,7 @@ function ServerState(; state_dir::String,
     load_invites!(s)
     load_shares!(s)
     load_settings!(s; manage_harnesses)
+    load_processes!(s)
     return s
 end
 
@@ -677,6 +725,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.harness_spec,
             s.worker_build,
             s.proxy_writer,
+            s.processes,               # shared registry
             root_state(s),             # copies of copies still point at the true root
         )
     end
@@ -994,14 +1043,38 @@ worker_initials(w::WorkerInfo) =
     w.initials === nothing || isempty(w.initials) ? derive_initials(w.name) :
                                                     w.initials
 
-# A fixed colour per machine, derived from the install id so a rename, a
-# restart or another server all agree on it. The sidebar rings every chat icon
-# with it and the worker card's tag pill wears it, which is how the mapping is
-# learned. OKLCH with fixed lightness and chroma: only the hue moves, so a
-# yellow ring weighs the same as a blue one (in HSL it looks washed out).
-worker_color(worker_id::AbstractString) =
-    "oklch(52% 0.19 $(Int(hash("worker:" * worker_id) % 360)))"
-worker_color(w::WorkerInfo) = worker_color(w.worker_id)
+# One colour per machine. The sidebar rings every chat icon with it and the
+# worker card's tag pill wears it, which is how the mapping is learned. A hash
+# of the install id put three of six real machines within 10 degrees of hue;
+# `distinguishable_colors` picks each next colour as far as it can get from the
+# ones before it (CIEDE2000), asking for one lightness and chroma so mostly the
+# hue moves and the rings carry similar weight. Teals at that chroma are outside
+# what a screen shows and come out a little lighter and paler; keeping them
+# spreads six workers further apart (CIEDE2000 21.6 against 17.3 without). It
+# picks greedily, so the palette for n workers is the start of the one for
+# more: a worker keeps its colour as the fleet grows.
+worker_palette(n::Integer) =
+    Colors.distinguishable_colors(n, [Colors.LCHab(55, 50, 30)]; lchoices = [55], cchoices = [50],
+                                  hchoices = 0:1:359, transform = identity)
+worker_color(slot::Integer) = "#" * Colors.hex(last(worker_palette(slot + 1)))
+worker_color(w::WorkerInfo) = worker_color(w.color_slot)
+# A chat whose worker the server has no record of (a stale id): neutral, not a
+# colour that belongs to some other machine.
+function worker_color(workers::AbstractDict, worker_id::AbstractString)
+    w = get(workers, worker_id, nothing)
+    return w === nothing ? "#9ca3af" : worker_color(w)
+end
+worker_color(state::ServerState, worker_id::AbstractString) = worker_color(state.workers[], worker_id)
+
+# The lowest palette slot no other worker of this server holds.
+function free_color_slot(workers::AbstractDict, worker_id::AbstractString)
+    taken = Set(w.color_slot for w in values(workers) if w.worker_id != worker_id)
+    slot = 0
+    while slot in taken
+        slot += 1
+    end
+    return slot
+end
 
 # The base title a chat starts with: its folder.
 default_title(p::ProjectInfo) = p.name
@@ -1182,9 +1255,11 @@ function track_project!(s::ServerState, p::ProjectInfo; new_chat::Bool = false)
     return p
 end
 
-# A new project: into the table, onto disk, out to every tab.
-function add_project!(s::ServerState, p::ProjectInfo)
-    track_project!(s, p; new_chat = true)
+# A new project: into the table, onto disk, out to every tab. `new_chat`
+# numbers a folder title another chat already shows ("VideoEdit 2"); a chat
+# continued on another worker is the same conversation and keeps its title.
+function add_project!(s::ServerState, p::ProjectInfo; new_chat::Bool = true)
+    track_project!(s, p; new_chat)
     save_projects!(s)
     notify_projects!(s)
     return p
@@ -1264,7 +1339,7 @@ function save_workers!(s::ServerState)
                      "ssh_target" => w.ssh_target,
                      "hostname" => w.hostname, "home" => w.home,
                      "mcp_path" => w.mcp_path, "mcp_args" => w.mcp_args,
-                     "projects_root" => w.projects_root)
+                     "projects_root" => w.projects_root, "color_slot" => w.color_slot)
                 for w in values(s.workers[])]
         atomic_write_json(workers_file(s), data)
     end
@@ -1299,12 +1374,19 @@ function load_workers!(s::ServerState)
                            # every persisted worker here once `online` became
                            # an Observable ("skipping malformed worker entry").
                            Observable(false), now(UTC), :current, "",
-                           Dict{String,String}(), "")
+                           Dict{String,String}(), "", Int(get(d, "color_slot", -1)))
             s.workers[][wid] = w
         catch e
             @warn "skipping malformed worker entry" entry=d exception=e
         end
     end
+    # Workers saved before they had a palette slot: the lowest free ones, in
+    # name order so every load of the same file hands out the same.
+    unplaced = sort!([w for w in values(s.workers[]) if w.color_slot < 0]; by = w -> (w.name, w.worker_id))
+    for w in unplaced
+        w.color_slot = free_color_slot(s.workers[], w.worker_id)
+    end
+    isempty(unplaced) || save_workers!(s)
 end
 
 # Like `save_workers!`: snapshot + write under `state.lock` (reentrant, so

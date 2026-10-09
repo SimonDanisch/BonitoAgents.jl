@@ -25,7 +25,7 @@
     # BT_MOCK_PROJECT itself; no per-test override needed.)
 
     # Console strings the buggy resume path printed; their ABSENCE is the
-    # core assertion (alongside an empty window.__errs sink).
+    # core assertion (alongside an empty browser console).
     const BUG_PATTERNS = [
         r"Key \d+ not found",
         r"TrackingOnly: Key \d+ not found",
@@ -71,7 +71,7 @@
         })()""")
         @test occursin("Resume", btn_label)
 
-        # Arm the assertion: clear the JS error sink (window.__errs) right
+        # Arm the assertion: clear the captured browser console right
         # BEFORE the resume so anything captured is attributable to resume.
         TK.clear_js_errors(s)
 
@@ -109,7 +109,7 @@
         # Let everything settle so any deferred Observable teardown fires.
         sleep(1.0)
 
-        # ── INVARIANT 1: the error sink is empty (window.onerror + rejections) ─
+        # ── INVARIANT 1: the browser console logged no warning or error ─
         errs = TK.js_errors(s)
         @test isempty(errs)
         if !isempty(errs)
@@ -117,9 +117,8 @@
         end
 
         # ── INVARIANT 2: none of the legacy bug-pattern console strings fired ──
-        # `__errs` carries `message`; scan it for the resume-specific patterns so
-        # a "Key N not found" / null-Observable regression fails LOUD even if it
-        # somehow didn't reach window.onerror.
+        # Scan the console entries for the resume-specific patterns so a
+        # "Key N not found" / null-Observable regression names itself.
         msgs = String[]
         for e in errs
             e isa AbstractDict || continue

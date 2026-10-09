@@ -117,6 +117,9 @@ mutable struct JuliaSession
     bonito_mismatch::String             # project env's Bonito version when it's too old for the bridge ("" = ok); drives the chat's one-click upgrade card
     closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
     pgid::Int                           # worker's own process group (0 = none); reaped in kill_session!
+    # The worker's OS pid, kept from its start (0 = none): `getpid` of a process
+    # that has exited throws, and kill_session! reports the pid after the reap.
+    pid::Int
 end
 
 function JuliaSession(env_path;
@@ -127,7 +130,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), Channel{String}(Inf), false, "", "", false, 0)
+                        ReentrantLock(), Channel{String}(Inf), false, "", "", false, 0, 0)
 end
 
 # The chat routes live stream chunks by this key (matched against the eval
@@ -323,8 +326,12 @@ function start!(s::JuliaSession)
         monitor_stderr = false,
         exeflags       = build_exeflags(s.env_path, s.julia_cmd),
     )
+    s.pid = Int(getpid(s.worker.proc))
     # Before anything can spawn: everything the eval starts inherits this group.
     s.pgid = isolate_worker!(s)
+    # Into the server's record of the chat's processes: this group is out of reach
+    # of every kill but its own (processes.jl).
+    report_session(s)
     # Background pumps drain worker stdout/stderr into our buffer (the agent's
     # copy, drained into the MCP response) AND push each chunk to stream_channel.
     # Both streams merge into the same buffer — same UX as a normal REPL.
@@ -707,7 +714,7 @@ interrupt_echo(e) = "\e[91mERROR: $(sprint(showerror, e))\e[39m"
 # Windows has no process groups, and an orphan can't be found by walking down
 # from a dead parent — so there we snapshot the tree *before* teardown instead.
 
-worker_pid(s::JuliaSession) = s.worker === nothing ? 0 : Int(getpid(s.worker.proc))
+worker_pid(s::JuliaSession) = s.pid
 
 """
     isolate_worker!(s) -> Int
@@ -773,19 +780,31 @@ function reap_process_tree(pgid::Int, strays::Vector{Int} = Int[])
 end
 
 # ── Lifecycle ───────────────────────────────────────────────────────────────
-function kill_session!(s::JuliaSession)
+# `hard` skips the polite stop, for a worker whose eval already ignored an
+# interrupt: it ignores the exit request too, and SIGTERM can hang a Julia 1.12
+# worker, so `Malt.stop` reached its SIGKILL only after 30s.
+function kill_session!(s::JuliaSession; hard::Bool = false)
+    pid = worker_pid(s)
     # Snapshot first: once the worker is gone, a Windows orphan is unreachable.
-    strays = (Sys.iswindows() && is_alive(s)) ? descendant_pids(worker_pid(s)) : Int[]
+    strays = (Sys.iswindows() && is_alive(s)) ? descendant_pids(pid) : Int[]
     if is_alive(s)
-        try
-            Malt.stop(s.worker)
-        catch e
-            e isa InterruptException && rethrow()
-            @debug "kill_session!: Malt.stop failed (worker already gone?)" exception = e
+        if hard
+            w = s.worker
+            Base.kill(w, Base.SIGKILL)
+            timedwait(() -> !Malt.isrunning(w), 5.0; pollint = 0.05)
+        else
+            try
+                Malt.stop(s.worker)
+            catch e
+                e isa InterruptException && rethrow()
+                @debug "kill_session!: Malt.stop failed (worker already gone?)" exception = e
+            end
         end
     end
     reap_process_tree(s.pgid, strays)
     s.pgid = 0
+    s.pid = 0
+    pid > 0 && report_process_gone(pid)
     # Deliberately NOT taken under s.lock: kill_session! must be able to reap a
     # worker whose eval ignored the interrupt, and that eval's await_or_yield
     # poll holds s.lock for its whole duration — locking here would deadlock the

@@ -26,8 +26,12 @@ for JULIAUP_BIN in \
     [[ -d "$JULIAUP_BIN" ]] && export PATH="$JULIAUP_BIN:$PATH"
 done
 
+# A few threads, not one per core: the server waits on sockets far more than it
+# computes, and every idle thread spins up on each wakeup to look for work. On
+# the same agent stream, a 32-thread worker spent 20 times the CPU of a 2-thread
+# one; the server's 42 threads paid that tax on every message.
 exec julia \
     "--project=${PROJECT_DIR}" \
     --startup-file=no \
-    --threads=auto \
+    --threads=4 \
     -m BonitoAgents "$@"

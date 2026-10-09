@@ -421,6 +421,10 @@ end
     # PATH holds (systemd itself does not search that PATH, `env` does).
     @test occursin("ExecStart=/usr/bin/env julia --project=@bonito-agents", u)
     @test occursin("BonitoWorker.start()", u)
+    # Its own thread count, never the shell's JULIA_NUM_THREADS: a relay's idle
+    # threads only spin (32 of them cost 20x the CPU of 2 on the same stream).
+    @test occursin("--threads=2", u)
+    @test "--threads=2" in BW.worker_julia_args("@bonito-agents")
     # PATH is baked in (systemd --user doesn't inherit the shell PATH; without
     # this the worker can't find claude-agent-acp/node/git at runtime).
     @test occursin("Environment=PATH=/usr/bin:/home/u/.local/bin", u)
@@ -739,6 +743,10 @@ include("test_stability.jl")
 # Agent subprocess reaping (process group + startup stray sweep). Spawns
 # short-lived `sleep`/`bash` children only — no agent, no network.
 include("test_agent_reaping.jl")
+
+# A background task's output followed for the server: streamed bytes, the end
+# from the writer's close. Real writer processes over a memory link pair.
+include("test_file_watch.jl")
 
 # The managed agent adapters, installed for real from nodejs.org and npm into a
 # cache, then started and asked for an ACP initialize. Skipped without a network.

@@ -106,7 +106,7 @@ WorkerAgent(state::ServerState, worker_id::AbstractString, worker_path::Abstract
 agent_cwd(a::WorkerAgent) = a.worker_path
 replay(a::WorkerAgent)    = a.replay
 client(a::WorkerAgent)    = a.client
-Base.isopen(a::WorkerAgent) = a.client !== nothing
+Base.isopen(a::WorkerAgent) = a.client !== nothing && isopen(a.client)
 provider_name(a::WorkerAgent) = provider_name(a.provider)
 label(a::WorkerAgent)         = label(a.provider)
 icon(a::WorkerAgent)          = icon(a.provider)

@@ -178,7 +178,7 @@ function connection_guard(session::Bonito.Session)
             "position" => "relative", "width" => "44px", "height" => "44px", "margin-bottom" => "8px",
             "border-radius" => "50%", "border" => "3px solid var(--bt-border)",
             "border-top-color" => "var(--bt-warning)",
-            "animation" => "bt-conn-spin 0.9s linear infinite"),
+            "animation" => "bt-conn-spin 0.9s steps(8) infinite"),
         CSS("@keyframes bt-conn-spin", CSS("to", "transform" => "rotate(360deg)")),
         # Given up, or nothing left to reconnect to: the ring stops, turns red and
         # shows an exclamation mark.
@@ -293,8 +293,11 @@ function connection_guard(session::Bonito.Session)
             // Nothing will reconnect it, and before the first connection too:
             // a page restored from the back/forward cache never connects at all.
             if (status === 'expired') {
-                if (!unsent()) { reloadWhenShown(); return; }
-                setBlocked(true, status); return;
+                $(ChatLib).then(lib => {
+                    lib.flushDrafts();            // text typed just now counts as kept
+                    unsent() ? setBlocked(true, status) : reloadWhenShown();
+                });
+                return;
             }
             if (!wasConnected) return;            // first load: the page is still coming up
             setBlocked(true, status);
@@ -591,7 +594,7 @@ const BASE_CSS = [
         "border" => "2px solid var(--bt-border-strong)",
         "border-top-color" => "var(--bt-accent)",
         "border-radius" => "50%",
-        "animation" => "bt-prog-spin 0.7s linear infinite"),
+        "animation" => "bt-prog-spin 0.7s steps(8) infinite"),
     CSS("@keyframes bt-prog-spin",
         CSS("from", "transform" => "rotate(0deg)"),
         CSS("to",   "transform" => "rotate(360deg)")),
@@ -1011,13 +1014,19 @@ const ChatStyles = Bonito.Styles(
         "cursor" => "pointer",
         "white-space" => "nowrap",
         "flex" => "0 0 auto"),
-    CSS(".bt-header-restart-dead",
-        "animation" => "bt-restart-pulse 1.4s ease-in-out infinite"),
+    # The pulse is a ring on its own layer whose opacity animates (no repaint;
+    # see bt-pulse-glow).
+    CSS(".bt-header-restart-dead", "position" => "relative"),
+    CSS(".bt-header-restart-dead::after",
+        "content" => "\"\"", "position" => "absolute", "inset" => "0",
+        "border-radius" => "inherit", "pointer-events" => "none",
+        "box-shadow" => "0 0 0 6px rgba(220,38,38,0.15)",
+        "animation" => "bt-restart-pulse 1.4s steps(4, jump-none) infinite"),
     CSS(".bt-header-restart-dead:hover",
         "background" => "#fecaca"),
     CSS("@keyframes bt-restart-pulse",
-        CSS("0%, 100%", "box-shadow" => "0 0 0 0 rgba(220,38,38,0.0)"),
-        CSS("50%",      "box-shadow" => "0 0 0 6px rgba(220,38,38,0.15)")),
+        CSS("0%, 100%", "opacity" => "0"),
+        CSS("50%",      "opacity" => "1")),
     # While a restart is running the chip shows this "working" state instead of
     # the red pulse — it reads as "restarting…", not as a failure to click
     # again; the handler ignores clicks meanwhile.
@@ -1027,7 +1036,7 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)",
         "font-weight" => "500",
         "cursor" => "progress",
-        "animation" => "bt-restart-working 1s ease-in-out infinite"),
+        "animation" => "bt-restart-working 1s steps(3, jump-none) infinite"),
     CSS("@keyframes bt-restart-working",
         CSS("0%, 100%", "opacity" => "0.5"),
         CSS("50%",      "opacity" => "0.9")),
@@ -1226,7 +1235,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "10px", "height" => "10px", "margin-left" => "6px",
         "border" => "2px solid var(--bt-border-strong)",
         "border-top-color" => "var(--bt-accent)", "border-radius" => "50%",
-        "animation" => "bt-prog-spin 0.7s linear infinite"),
+        "animation" => "bt-prog-spin 0.7s steps(8) infinite"),
     # The <select> is chrome-stripped — the pill wrapper carries the
     # border/background, matching the bare provider <select> (which has no arrow
     # either, so they stay identical).
@@ -1423,7 +1432,8 @@ const ChatStyles = Bonito.Styles(
         "text-overflow" => "ellipsis", "white-space" => "nowrap", "font-size" => "13px"),
     CSS(".bt-queue-badge, .bt-queue-status", "font-size" => "12px", "color" => "var(--bt-text-muted)"),
     CSS(".bt-queue-badge", "flex-shrink" => "0", "white-space" => "nowrap"),
-    CSS(".bt-queue-item[data-status=paused] .bt-queue-badge", "color" => "var(--bt-warning)"),
+    CSS(".bt-queue-item[data-status=paused] .bt-queue-badge, .bt-queue-item[data-status=offline] .bt-queue-badge",
+        "color" => "var(--bt-warning)"),
     CSS(".bt-queue-text", "white-space" => "pre-wrap", "overflow-wrap" => "anywhere",
         "max-height" => "5em", "overflow-y" => "auto"),
     CSS(".bt-queue-detail", "padding" => "0 var(--bt-space-2) var(--bt-space-2)",
@@ -1476,6 +1486,15 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-user-att-missing",
         "font-size" => "11px", "opacity" => "0.8",
         "font-family" => "ui-monospace, monospace"),
+    # A file that is not an image: its name as a link on the bubble.
+    CSS(".bt-user-att-file",
+        "display" => "inline-block", "max-width" => "260px",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
+        "padding" => "4px 10px", "border-radius" => "8px",
+        "background" => "rgba(255,255,255,0.15)",
+        "border" => "1px solid rgba(255,255,255,0.35)",
+        "color" => "inherit", "font-size" => "12px", "text-decoration" => "none"),
+    CSS(".bt-user-att-file:hover", "background" => "rgba(255,255,255,0.25)"),
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
@@ -1726,21 +1745,26 @@ const ChatStyles = Bonito.Styles(
         "background" => "rgba(239,68,68,0.12)", "color" => "#b91c1c"),
 
     # ── Live tool/todo pulse ─────────────────────────────────────────────────
-    # Subtle box-shadow oscillation while a tool is mid-flight. Two layers:
-    # the rest-state shadow keeps `.bt-tool-msg`'s normal lift, the keyframes
-    # add a softly-pulsing ring on top. `prefers-reduced-motion` disables it
-    # for users who don't want movement.
+    # A softly breathing ring while a tool is mid-flight. The ring is drawn once,
+    # on a layer of its own, and only that layer's opacity animates: the
+    # compositor does that without repainting. Animating the box-shadow itself
+    # repainted the card on every frame (three live cards cost the browser 45%
+    # of a core). Inside the border, since the card clips what lies outside it.
+    # `prefers-reduced-motion` leaves the card still.
     CSS("@keyframes bt-pulse-glow",
-        CSS("0%, 100%",
-            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 0 rgba(59,130,246,0.35)"),
-        CSS("50%",
-            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 6px rgba(59,130,246,0.00)")),
+        CSS("0%, 100%", "opacity" => "0"),
+        CSS("50%", "opacity" => "1")),
     CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
-        "animation" => "bt-pulse-glow 1.6s ease-in-out infinite",
+        "position" => "relative",
         "border-color" => "rgba(59,130,246,0.42)"),
+    CSS(".bt-tool-msg.bt-tool-live::after, .bt-plan-msg.bt-plan-live::after",
+        "content" => "\"\"", "position" => "absolute", "inset" => "0",
+        "border-radius" => "inherit", "pointer-events" => "none",
+        "box-shadow" => "inset 0 0 0 2px rgba(59,130,246,0.35)",
+        "animation" => "bt-pulse-glow 1.6s steps(4, jump-none) infinite"),
     CSS("@media (prefers-reduced-motion: reduce)",
-        CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
-            "animation" => "none")),
+        CSS(".bt-tool-msg.bt-tool-live::after, .bt-plan-msg.bt-plan-live::after",
+            "animation" => "none", "opacity" => "0")),
 
     # ── Tool elapsed timer ───────────────────────────────────────────────────
     # Small monospace span next to the status pill. JS sets `data-tool-started`
@@ -2931,7 +2955,7 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-busy-dot",
         "width" => "7px", "height" => "7px", "border-radius" => "50%",
         "background" => "var(--bt-accent)",
-        "animation" => "bt-pulse 1.2s ease-in-out infinite"),
+        "animation" => "bt-pulse 1.2s steps(3, jump-none) infinite"),
     CSS(".bt-busy-dot:nth-child(2)", "animation-delay" => "0.2s"),
     CSS(".bt-busy-dot:nth-child(3)", "animation-delay" => "0.4s"),
     CSS("@keyframes bt-pulse",
@@ -3096,8 +3120,13 @@ const ChatStyles = Bonito.Styles(
         "display" => "inline-flex"),
     # The pulse glow is a NEW-MESSAGES nudge only; the plain "Move to bottom"
     # form (shown whenever scrolled away from the last message) stays static.
-    CSS(".bt-new-msg-pill.bt-new-msg-pill-glow",
-        "animation" => "bt-new-msg-pulse 2.5s ease-in-out infinite"),
+    # The glow is a layer of its own whose opacity animates (no repaint; see
+    # bt-pulse-glow).
+    CSS(".bt-new-msg-pill.bt-new-msg-pill-glow::after",
+        "content" => "\"\"", "position" => "absolute", "inset" => "0",
+        "border-radius" => "inherit", "pointer-events" => "none",
+        "box-shadow" => "0 4px 28px rgba(16, 185, 129, 0.85)",
+        "animation" => "bt-new-msg-pulse 2.5s steps(5, jump-none) infinite"),
     CSS(".bt-new-msg-pill:hover",
         "filter" => "brightness(1.08)"),
     CSS(".bt-new-msg-pill:active",
@@ -3105,10 +3134,8 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-new-msg-pill-arrow",
         "font-size" => "16px", "line-height" => "1"),
     CSS("@keyframes bt-new-msg-pulse",
-        CSS("0%, 100%",
-            "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)"),
-        CSS("50%",
-            "box-shadow" => "0 4px 28px rgba(16, 185, 129, 0.85)")),
+        CSS("0%, 100%", "opacity" => "0"),
+        CSS("50%", "opacity" => "1")),
 
     # ── Input area ───────────────────────────────────────────────────────────
     # Outer area spans full width (so the top border + background look right);
@@ -3292,6 +3319,25 @@ const ChatStyles = Bonito.Styles(
         "width" => "100%", "height" => "100%",
         "object-fit" => "cover",
         "display" => "block"),
+    # A file being uploaded (or done): name, size or progress, and a bar.
+    CSS(".bt-attachment-file",
+        "position" => "relative",
+        "width" => "180px", "height" => "64px",
+        "padding" => "8px 28px 8px 10px", "box-sizing" => "border-box",
+        "border" => "1px solid var(--bt-border-strong)", "border-radius" => "8px",
+        "background" => "var(--bt-bg)", "overflow" => "hidden", "flex-shrink" => "0",
+        "display" => "flex", "flex-direction" => "column", "justify-content" => "center", "gap" => "2px"),
+    CSS(".bt-attachment-file-name",
+        "font-size" => "12px", "font-weight" => "500",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap"),
+    CSS(".bt-attachment-file-status",
+        "font-size" => "11px", "color" => "var(--bt-text-muted)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap"),
+    CSS(".bt-attachment-file[data-state=error] .bt-attachment-file-status", "color" => "var(--bt-error)"),
+    CSS(".bt-attachment-file-bar",
+        "position" => "absolute", "left" => "0", "bottom" => "0", "height" => "3px",
+        "background" => "var(--bt-accent)", "transition" => "width 120ms linear"),
+    CSS(".bt-attachment-file[data-state=done] .bt-attachment-file-bar", "opacity" => "0"),
     CSS(".bt-attachment-remove",
         "position" => "absolute",
         "top" => "2px", "right" => "2px",
@@ -3434,7 +3480,7 @@ const ChatStyles = Bonito.Styles(
         "border" => "2px solid var(--bt-border)",
         "border-top-color" => "var(--bt-accent)",
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
-        "animation" => "bt-spin 0.7s linear infinite",
+        "animation" => "bt-spin 0.7s steps(8) infinite",
         "flex-shrink" => "0",
         "display" => "inline-block"),
     # Explicit `from` so it's an angle interpolation (0°→360°); `to` alone
