@@ -26,6 +26,11 @@ class Collapsable {
         this.onExpand = opts.onExpand || null;
         this.lazy = !!this.onExpand;
         this.loaded = !this.lazy;
+        if (this.editMode && !this.hideBodyOnCollapse) {
+            bodyEl.addEventListener('monaco-diff-editor-ready', (e)=>{
+                e.target.__btMonacoDiff.setMaxHeight(this.expanded ? this.expandedHeight : this.compactHeight);
+            });
+        }
         this.expanded = false;
         if (this.native) {
             this.details = headerEl.closest('details') || bodyEl.closest('details');
@@ -195,7 +200,8 @@ class BonitoChat {
             this.cancelPendingScroll();
         };
         container.addEventListener('wheel', markUserInput, {
-            passive: true
+            passive: true,
+            capture: true
         });
         container.addEventListener('touchstart', markUserInput, {
             passive: true
@@ -251,10 +257,7 @@ class BonitoChat {
             markUserInput();
             for (const idx of this.rendered){
                 const node = this.cache.get(idx);
-                if (node && node.isConnected && node.dataset.btAutoExpand) {
-                    delete node.dataset.btAutoExpand;
-                    node.collapsable?.setExpanded(true);
-                }
+                if (node && node.isConnected) this.mountDeferred(node);
             }
             this.queueRefresh();
         };
@@ -467,7 +470,9 @@ class BonitoChat {
             this.container.removeEventListener('scroll', this.onScroll);
         }
         if (this.markUserInput) {
-            this.container.removeEventListener('wheel', this.markUserInput);
+            this.container.removeEventListener('wheel', this.markUserInput, {
+                capture: true
+            });
             this.container.removeEventListener('touchstart', this.markUserInput);
             this.container.removeEventListener('touchmove', this.markUserInput);
             this.container.removeEventListener('keydown', this.markUserInput);
@@ -1100,18 +1105,22 @@ class BonitoChat {
                 }
             }
         }
-        const inserted = [];
+        const entered = [];
         for(let i = s; i <= e; i++){
             if (this.parked.has(i)) {
                 const node = this.cache.get(i);
                 this.parked.delete(i);
                 this.applyVisibility(i, node);
                 this.touchApp(i);
+                entered.push([
+                    i,
+                    node
+                ]);
             } else if (this.cache.has(i) && !this.rendered.has(i)) {
                 const node = this.cache.get(i);
                 this.insertSorted(i, node);
                 this.rendered.add(i);
-                inserted.push([
+                entered.push([
                     i,
                     node
                 ]);
@@ -1120,7 +1129,7 @@ class BonitoChat {
                 if (node?.dataset?.btApp) this.touchApp(i);
             }
         }
-        for (const [i, node] of inserted){
+        for (const [i, node] of entered){
             if (!this.heightIsFinal(node)) continue;
             const h = node.getBoundingClientRect().height;
             if (h > 0) this.heights.set(i, h);
@@ -1215,11 +1224,20 @@ class BonitoChat {
         ].filter((i)=>i > idx).sort((a, b)=>a - b);
         const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
         this.container.insertBefore(node, before);
-        if (node.dataset && node.dataset.btAutoExpand && !this.scrollbarDrag) {
+        this.mountDeferred(node);
+    }
+    bodyDied(row) {
+        if (this.destroyed || row.dataset.btSpilled) return;
+        row.dataset.btRemount = '1';
+        if (row.isConnected) queueMicrotask(()=>this.mountDeferred(row));
+    }
+    mountDeferred(node) {
+        if (this.scrollbarDrag) return;
+        if (node.dataset.btAutoExpand) {
             delete node.dataset.btAutoExpand;
             node.collapsable?.setExpanded(true);
         }
-        if (node.dataset && node.dataset.btAutoMount && !this.scrollbarDrag) {
+        if (node.dataset.btAutoMount) {
             delete node.dataset.btAutoMount;
             if (node.collapsable && !node.collapsable.loaded) {
                 node.collapsable.loaded = true;
@@ -1228,6 +1246,13 @@ class BonitoChat {
                     id: node.dataset.msgId
                 });
             }
+        }
+        if (node.dataset.btRemount) {
+            delete node.dataset.btRemount;
+            this.comm.notify({
+                type: 'tool.render',
+                id: node.dataset.msgId
+            });
         }
     }
     appendNewMessage(msg) {
@@ -1895,6 +1920,7 @@ class BonitoChat {
                     const id = msg.id;
                     const compactBody = msg.kind === 'edit' || msg.compact_body === true;
                     if (msg.compact_body === true) div.dataset.compactBody = '1';
+                    div.addEventListener('monaco-editor-disposed', ()=>this.bodyDied(div));
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
                         editMode: compactBody,

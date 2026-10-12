@@ -107,7 +107,8 @@ function busy_diag(s)
     return (; pid,
             turn_in_flight = lock(() -> sh.turn_in_flight[], sh.lock),
             busy           = BA.busy(m),
-            activity       = string(BA.session_activity(m)),
+            open_turns     = [string(nameof(typeof(t))) for t in BA.AgentClientProtocol.open_turns(m)],
+            cancelling     = BA.cancelling(m),
             active_prompts = conn === nothing ? -1 :
                              lock(() -> length(conn.active_prompts), conn.lock),
             pending_sends  = lock(() -> length(sh.pending_sends), sh.lock),
@@ -144,9 +145,9 @@ end
         # the arriving prompt itself cleared, so it took the STREAMING branch
         # and looped forever — the chat was busy because the agent genuinely
         # never stopped talking. Fixed in MockACP with a sticky `INTERRUPTED`
-        # latch; the diagnostic below is what named it (busy flag held,
-        # activity = Prompted, active_prompts = 1 ⇒ a prompt on the wire that
-        # never settled, not a stranded busy flag on our side).
+        # latch; the diagnostic below is what named it (busy flag held, one
+        # open PromptTurn ⇒ a prompt on the wire that never settled, not a
+        # stranded busy flag on our side).
         #
         # The probe is scoped to the VISIBLE pane for the same reason `stop!`
         # above is: a bare `document.querySelector('.bt-busy')` can resolve to a
@@ -162,9 +163,8 @@ end
             # `busy` is a derivation of exactly two things, and the spinner alone
             # cannot say which one is stuck: OUR busy flag (`turn_in_flight`, held
             # by a `finish_turn!` that never finished) or the CONNECTION's view
-            # (`Cancelling` persists while any prompt is active — see
-            # `settle(::Cancelling, …)`). Naming the half is the whole
-            # difference between a client bug and a protocol bug.
+            # (a turn the agent has not ended: `open_turns`). Naming the half is
+            # the whole difference between a client bug and a protocol bug.
             @info "cancel_misbehaving: chat stayed busy" diag = busy_diag(s)
             false
         end

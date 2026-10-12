@@ -50,11 +50,16 @@
             "end"], "\n"))
         TK.new_chat(z; cwd = cwd)
         z.agent_fn[] = _ -> [TK.mcp_call("bt_share"; real_process = true, id = "px-md", path = "report.md"),
-                             TK.mcp_call("bt_share"; real_process = true, id = "px-app", path = "app.jl"),
+                             # The committed eval env: a folder without a project would run
+                             # the app in whatever the default load path finds.
+                             TK.mcp_call("bt_share"; real_process = true, id = "px-app", path = "app.jl",
+                                         env_path = abspath(joinpath(@__DIR__, "..", "evalenv"))),
+                             TK.mcp_call("bt_share"; real_process = true, id = "px-png", path = "figs/dot.png"),
                              TK.end_turn()]
         TK.send_message(z, "share both")
         md_url = TK.wait_for(z, "the markdown link", card_link("px-md"); timeout = 120)
         app_url = TK.wait_for(z, "the app link", card_link("px-app"); timeout = 900)
+        png_url = TK.wait_for(z, "the picture's link", card_link("px-png"); timeout = 120)
         @test startswith(md_url, z.h.url * "/s/") && startswith(app_url, z.h.url * "/s/")
 
         # ── 1. the markdown page, for someone not logged in ─────────────────
@@ -71,6 +76,9 @@
         curl(args...) = read(`curl -sk --resolve $(host):$(port):127.0.0.1 -o /dev/null
                                    -w "%{http_code} %{redirect_url}" $(args)`, String)
         @test startswith(curl(md_url), "200")
+        # A file link, where no viewer page can reach its websocket: the file itself.
+        @test read(`curl -sk --resolve $(host):$(port):127.0.0.1 -o /dev/null -w "%{http_code} %{content_type}"
+                    $(png_url)`, String) == "200 image/png"
         # Nothing rides on `/s/` to somewhere else: the portal, or nothing there.
         for path in ("/s/../", "/s/%2e%2e/acp-log", "/s/..%2f..%2facp-log", "/s/../acp-log")
             answer = curl("--path-as-is", z.h.url * path)

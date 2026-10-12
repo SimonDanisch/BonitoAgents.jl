@@ -69,13 +69,16 @@ export class Collapsable {
         this.onExpand = opts.onExpand || null;
         this.lazy     = !!this.onExpand;
         this.loaded   = !this.lazy;                    // eager bodies start loaded
+        // A diff created after the state was set takes the current height.
+        if (this.editMode && !this.hideBodyOnCollapse) {
+            bodyEl.addEventListener('monaco-diff-editor-ready', (e) => {
+                e.target.__btMonacoDiff.setMaxHeight(
+                    this.expanded ? this.expandedHeight : this.compactHeight);
+            });
+        }
 
-        // Everything (edit tools included) starts collapsed. Edit tools are
-        // in COMPACT visual state (Monaco capped to 240px) but their body
-        // element is rendered/visible from the start; the initial
-        // `setMaxHeight` lookup is deferred to the first toggle (Monaco may
-        // not have finished its async init when createNode runs). Compact
-        // EVAL bodies are capped by the CSS clamp instead (styles.jl).
+        // Everything starts collapsed: edit diffs compact (240px), compact eval
+        // bodies capped by the CSS clamp (styles.jl).
         this.expanded = false;
 
         if (this.native) {
@@ -480,7 +483,8 @@ class BonitoChat {
             this.pendingAnchor = null;
             this.cancelPendingScroll();
         };
-        container.addEventListener('wheel',      markUserInput, { passive: true });
+        // Capture: BonitoBook stops wheels over editors on the way down.
+        container.addEventListener('wheel',      markUserInput, { passive: true, capture: true });
         container.addEventListener('touchstart', markUserInput, { passive: true });
         container.addEventListener('touchmove',  markUserInput, { passive: true });
         container.addEventListener('keydown',    markUserInput, { passive: true });
@@ -541,16 +545,13 @@ class BonitoChat {
             if (!this.scrollbarDrag) return;
             this.scrollbarDrag = false;
             markUserInput();   // the release tick still counts as user input
-            // Auto-expands deferred during the drag (image bodies inflate
-            // scrollHeight — poison for a held thumb): mount them now. Only
+            // Mounts deferred during the drag (image bodies inflate
+            // scrollHeight — poison for a held thumb): do them now. Only
             // rendered nodes can carry a deferred flag from a mid-drag
-            // insert; detached flagged nodes expand on their insertSorted.
+            // insert; detached flagged nodes mount on their insertSorted.
             for (const idx of this.rendered) {
                 const node = this.cache.get(idx);
-                if (node && node.isConnected && node.dataset.btAutoExpand) {
-                    delete node.dataset.btAutoExpand;
-                    node.collapsable?.setExpanded(true);
-                }
+                if (node && node.isConnected) this.mountDeferred(node);
             }
             this.queueRefresh();   // re-true spacers to the corrected heights
         };
@@ -862,7 +863,7 @@ class BonitoChat {
             this.container.removeEventListener('scroll', this.onScroll);
         }
         if (this.markUserInput) {
-            this.container.removeEventListener('wheel',    this.markUserInput);
+            this.container.removeEventListener('wheel',    this.markUserInput, { capture: true });
             this.container.removeEventListener('touchstart', this.markUserInput);
             this.container.removeEventListener('touchmove',  this.markUserInput);
             this.container.removeEventListener('keydown',  this.markUserInput);
@@ -1764,13 +1765,16 @@ class BonitoChat {
                     // doesn't resize anyway; on re-entry the insert branch
                     // re-observes it.
                     if (this.observed.delete(idx) && node) this.messageHeightObserver.unobserve(node);
+                    // Out of the document its body's session ends; bodyDied
+                    // renders the body again when it is back.
                     node?.remove();
                     this.rendered.delete(idx);
                     this.parked.delete(idx);
                 }
             }
         }
-        const inserted = [];
+        // Rows that came into the window: inserted, or un-parked.
+        const entered = [];
         for (let i = s; i <= e; i++) {
             if (this.parked.has(i)) {
                 // Re-entering the viewport: un-park the kept-alive app
@@ -1779,11 +1783,12 @@ class BonitoChat {
                 this.parked.delete(i);
                 this.applyVisibility(i, node);
                 this.touchApp(i);
+                entered.push([i, node]);
             } else if (this.cache.has(i) && !this.rendered.has(i)) {
                 const node = this.cache.get(i);
                 this.insertSorted(i, node);
                 this.rendered.add(i);
-                inserted.push([i, node]);
+                entered.push([i, node]);
                 // Entering the window: (re-)observe for live height
                 // corrections. Bounded to the window (see the remove branch).
                 if (!this.observed.has(i)) this.observe(i, node);
@@ -1801,7 +1806,9 @@ class BonitoChat {
         // width the column had then, and a narrower window wraps the row
         // taller. Pinned at the bottom, that row entering and leaving moved the
         // bottom by the difference on every scroll event, for good.
-        for (const [i, node] of inserted) {
+        // Un-parked apps too: display:none has no layout, so one that grew
+        // while parked comes back with its old height.
+        for (const [i, node] of entered) {
             if (!this.heightIsFinal(node)) continue;
             const h = node.getBoundingClientRect().height;
             if (h > 0) this.heights.set(i, h);
@@ -1918,24 +1925,49 @@ class BonitoChat {
         const sorted = [...this.rendered].filter(i => i > idx).sort((a,b) => a-b);
         const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
         this.container.insertBefore(node, before);
-        // Deferred auto-expand (bt_show / native images): the node is now in
-        // the document, so the tool.render reply has a live slot to mount
-        // into. One-shot — clear the flag before expanding. NOT during a
-        // scrollbar drag: bodies mounting mid-drag inflate scrollHeight and
-        // the thumb's mapping stretches out from under the pointer ("bar
-        // gets stuck before the bottom") — the release sweep handles them.
-        if (node.dataset && node.dataset.btAutoExpand && !this.scrollbarDrag) {
+        this.mountDeferred(node);
+    }
+
+    // An editor in this row's body died with its session: the row left the
+    // document, or the body was mounted while it was out. Render the body again
+    // now if on the page, else on return (mountDeferred). A replaced or
+    // collapsed body leaves the row first. A spilled eval card keeps its code
+    // editor outside the emptied slot, and its Reload: no live remount.
+    bodyDied(row) {
+        if (this.destroyed || row.dataset.btSpilled) return;
+        row.dataset.btRemount = '1';
+        // Several editors in one body die at once: one render, since
+        // mountDeferred clears the flag.
+        if (row.isConnected) queueMicrotask(() => this.mountDeferred(row));
+    }
+
+    // Bodies that wait for their node to be in the document, so the
+    // tool.render reply has a live slot to mount into. One-shot flags,
+    // cleared before acting. NOT during a scrollbar drag: bodies mounting
+    // mid-drag inflate scrollHeight and the thumb's mapping stretches out
+    // from under the pointer ("bar gets stuck before the bottom"); the
+    // release sweep calls this again for every rendered node.
+    mountDeferred(node) {
+        if (this.scrollbarDrag) return;
+        // Auto-expand (bt_show / native images).
+        if (node.dataset.btAutoExpand) {
             delete node.dataset.btAutoExpand;
             node.collapsable?.setExpanded(true);
         }
-        // Deferred eager-mount for edit tools (Monaco body without flipping
-        // the Collapsable to expanded). Same scrollbar-drag guard as above.
-        if (node.dataset && node.dataset.btAutoMount && !this.scrollbarDrag) {
+        // Eager mount for edit tools (Monaco body without flipping the
+        // Collapsable to expanded).
+        if (node.dataset.btAutoMount) {
             delete node.dataset.btAutoMount;
             if (node.collapsable && !node.collapsable.loaded) {
                 node.collapsable.loaded = true;
                 this.comm.notify({type: 'tool.render', id: node.dataset.msgId});
             }
+        }
+        // Its body's editors died (bodyDied): render it again. The reply
+        // replaces the old body in place.
+        if (node.dataset.btRemount) {
+            delete node.dataset.btRemount;
+            this.comm.notify({type: 'tool.render', id: node.dataset.msgId});
         }
     }
 
@@ -2918,6 +2950,9 @@ class BonitoChat {
                 // header toggle plainly hides/shows the mounted body.
                 const compactBody = msg.kind === 'edit' || msg.compact_body === true;
                 if (msg.compact_body === true) div.dataset.compactBody = '1';
+                // An editor in the body died with its Bonito session while
+                // still in this row: render the body again (bodyDied).
+                div.addEventListener('monaco-editor-disposed', () => this.bodyDied(div));
                 div.collapsable = new Collapsable(
                     div.querySelector('.bt-tool-header'),
                     div.querySelector('.bt-tool-body'),

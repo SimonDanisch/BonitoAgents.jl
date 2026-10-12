@@ -49,6 +49,9 @@ function server()
         s = TK.dev_server(agent = default_agent)
         TK.open_browser(s)
         SERVER[] = s
+    else
+        # The window a previous item resized is back to its size.
+        TK.set_window_size(SERVER[], SERVER[].browser_size...)
     end
     return SERVER[]
 end

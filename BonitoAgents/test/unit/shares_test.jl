@@ -86,10 +86,67 @@
         @test BT.share_kind("/a/b.md") isa BT.MarkdownShare
         @test BT.share_kind("/a/b.MARKDOWN") isa BT.MarkdownShare
         @test BT.share_kind("C:/a/app.jl") isa BT.AppShare
-        @test BT.share_kind("/a/data.csv") isa BT.FileShare
-        @test BT.share_kind("/a/image.png") isa BT.FileShare
+        # Everything else gets a page with the viewer the chat shows it in.
+        for f in ("data.csv", "doc.pdf", "image.png", "model.GLB", "clip.mp4", "nb.ipynb", "x.py", "blob.zip")
+            @test BT.share_kind("/a/" * f) isa BT.ViewShare
+        end
         @test BT.worker_isabspath("/home/x") && BT.worker_isabspath("C:/x") && BT.worker_isabspath("C:\\x")
         @test !BT.worker_isabspath("report.md")
+    end
+
+    @testset "a page's file runs no code on the server's origin" begin
+        # Opened on its own: an HTML file's scripts run sandboxed, an SVG's not at
+        # all. A PDF is left alone: Chromium's viewer refuses a sandboxed one.
+        @test BT.share_file_policy(MIME"text/html"()) == "sandbox allow-scripts"
+        @test BT.share_file_policy(MIME"image/svg+xml"()) == "sandbox"
+        @test BT.share_file_policy(MIME"text/csv"()) == "sandbox"
+        @test BT.share_file_policy(MIME"application/pdf"()) === nothing
+        # A notebook's markdown on a shared page: the HTML written into it is left
+        # out, and so are a `javascript:` link and `{onclick=…}` attributes.
+        md = "hi <img src=x onerror=alert(1)>\n\n[a](javascript:alert(1))\n\n<script>x()</script>\n\n" *
+             "{onclick=\"alert(1)\"}\n# T\n"
+        safe = BT.markdown_html(md, BT.no_link; raw_html = false)
+        @test !occursin("onerror", safe) && !occursin("<script", safe) && !occursin("javascript:", safe)
+        @test !occursin("onclick", safe)
+        @test occursin("onerror", BT.markdown_html(md, BT.no_link))     # the chat's own files keep it
+        nb = BT.FileContent(Vector{UInt8}(codeunits(
+            """{"cells":[{"cell_type":"markdown","source":["# T <img src=x onerror=alert(1)>"]}],"metadata":{}}""")); raw_html = false)
+        page = BT.file_viewer(BT.NotebookFile(), nb, "/a/nb.ipynb", BT.PanelView())
+        @test get(Bonito.Hyperscript.attrs(page), "class", "") == "bt-fv-notebook"
+        @test !occursin("onerror", sprint(show, page))
+        # The markdown page has no scripts, so its bar's styles are written out.
+        @test occursin(".bt-btn-secondary", BT.css_text(BT.ShareStyles))
+    end
+
+    @testset "a page's viewer, from the file's content" begin
+        content(s; kw...) = BT.FileContent(Vector{UInt8}(codeunits(s)); kw...)
+        viewer(kind, c, path) = BT.file_viewer(kind, c, path, BT.PanelView())
+        # By the root's class: printed without a session, the viewer's style sheet
+        # comes out as text naming every viewer's classes.
+        class(node) = get(Bonito.Hyperscript.attrs(node), "class", "")
+        table = viewer(BT.TableFile(), content("a,b\n1,2\n3,4\n"), "/a/t.csv")
+        @test class(table) == "bt-fv-table-wrap" && occursin("2 rows", sprint(show, table))
+        # A binary's page reads only its head, and says how much of the file that is.
+        hex = viewer(BT.BinaryFile(), BT.FileContent(zeros(UInt8, 64); size = 10_000), "/a/blob.zip")
+        @test class(hex) == "bt-fv-hex-wrap" && occursin("of 9.8 KB", sprint(show, hex))
+        # A text that holds a NUL is shown as the binary it is.
+        @test class(viewer(BT.TextFile(), content("a\0b"), "/a/x.txt")) == "bt-fv-hex-wrap"
+        @test class(viewer(BT.TextFile(), content("x = 1\n"), "/a/x.py")) == "bt-fv-code"
+        @test class(viewer(BT.PDFFile(), "doc.pdf", "/a/doc.pdf")) == "bt-fv-frame-wrap"
+    end
+
+    @testset "a model's page serves the model and what it names" begin
+        # Under the project root: the model, what it names (a texture one folder
+        # up included), nothing else; a name that leaves the root is refused.
+        file, refs = "/p/models/quad.obj", ["/p/models/quad.mtl", "/p/textures/color.png", "/home/u/.ssh/id"]
+        @test BT.link_serves("/p", file, refs, file)
+        @test BT.link_serves("/p", file, refs, "/p/textures/color.png")
+        @test !BT.link_serves("/p", file, refs, "/p/secret.txt")
+        @test !BT.link_serves("/p", file, refs, "/home/u/.ssh/id")
+        # Only relative references are files next to the model.
+        @test BT.local_references("/p/models/quad.mtl",
+            ["../textures/color.png", "data:image/png;base64,AAAA", "https://x.org/y.png", "/etc/passwd"]) ==
+            ["/p/textures/color.png"]
     end
 
     @testset "live result records survive password changes and reload" begin

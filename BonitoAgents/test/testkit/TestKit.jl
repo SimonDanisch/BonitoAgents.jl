@@ -100,7 +100,7 @@ export TestServer, dev_server, add_worker!, drop_worker_connection!,
        mcp_call, bt_eval, bt_continue,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, emulate_phone, tap, swipe,
-       click, click_until, click_text, set_input,
+       click, click_until, click_text, set_input, wheel_into_view,
        exit_success,
        screenshot, eval_js, wait_for, current_chat_id,
        js_errors, clear_js_errors, check_console!
@@ -120,8 +120,9 @@ user(s::AbstractString)                 = Dict("type" => "user",    "text"  => S
 Agent event carrying frames the mock emits BETWEEN TURNS — `delay_ms` after the
 prompt response, with no turn open. Mirrors the real wire (see
 test/fixtures/bg_subagent_wire.jsonl): a background subagent's tagged activity
-(`sub_text`/`sub_tool`) keeps flowing after end_turn, and the main agent's
-auto-wake completion announcement arrives as untagged `text`.
+(`sub_text`/`sub_tool`) keeps flowing after end_turn, the main agent's
+auto-wake completion announcement arrives as untagged `text`, and the agent
+ends that turn of its own with `usage(; origin = "task-notification")`.
 """
 post_turn(events::Vector; delay_ms = 300) =
     Dict{String,Any}("type" => "post_turn", "events" => events,
@@ -371,15 +372,18 @@ todo(entries::AbstractVector) = Dict("type" => "todo",
                        "priority"  => String(get(e, :priority, "medium"))) for e in entries])
 
 """
-    usage(used, size; cost = nothing) -> Dict
+    usage(used, size; cost = nothing, origin = nothing) -> Dict
 
 Agent event that emits a `usage_update` SessionUpdate (context/cost
 telemetry, the shape claude-agent-acp ≥ 0.44 sends after every assistant
-message). Drives the header context meter.
+message). Drives the header context meter. `origin` tags it the way the agent
+tags a cycle's result (`_meta["_claude/origin"].kind`): `"task-notification"`
+at the end of a cycle the agent ran on its own, which is where that turn ends.
 """
-function usage(used::Integer, size::Integer; cost = nothing)
+function usage(used::Integer = 0, size::Integer = 0; cost = nothing, origin = nothing)
     ev = Dict{String,Any}("type" => "usage", "used" => used, "size" => size)
     cost === nothing || (ev["cost"] = Float64(cost))
+    origin === nothing || (ev["origin"] = String(origin))
     return ev
 end
 
@@ -1350,6 +1354,38 @@ function real_click(s::TestServer, selector::AbstractString)
     sleep(0.05)
     ECT.send_input(ctx, "{type: 'mouseUp', x: $x, y: $y, button: 'left', clickCount: 1}")
     return s
+end
+
+"""
+    wheel_into_view(s, scroller, target; step = 150) -> Bool
+
+Wheel `scroller` from its left padding until `target` is in view: its top, and
+its bottom unless it is taller than the view. A step that overshoots is halved.
+Both are JS expressions for an element; a `target` not on the page counts as
+above. Needs `ECT.install_cursor`.
+"""
+function wheel_into_view(s::TestServer, scroller::AbstractString, target::AbstractString;
+                         step::Real = 150, max_steps::Integer = 120)
+    ctx = s.browser[]
+    ECT.move_to(ctx, ECT.JS("(() => { const r = $(scroller).getBoundingClientRect(); " *
+                            "return [r.left + 3, r.top + r.height / 2]; })()"); duration = 0.05)
+    where() = eval_js(s, """(() => { const e = $(target); if (!e) return -1;
+        const r = e.getBoundingClientRect(), c = $(scroller).getBoundingClientRect();
+        if (r.top < c.top + 40) return -1;
+        return r.top > c.bottom - 80 || (r.bottom > c.bottom - 40 && r.height < c.height - 120) ? 1 : 0; })()""")
+    dy, last = Float64(step), 0
+    for _ in 1:max_steps
+        w = where()
+        w == 0 && return true
+        w == -last && (dy /= 2)
+        last = w
+        # Measured once the scroller's own listeners have seen the step.
+        eval_js(s, "(() => { window.__btWheeled = false; $(scroller).addEventListener('scroll', " *
+                   "() => { window.__btWheeled = true; }, {once: true}); return true; })()")
+        ECT.wheel(ctx, dy * w; steps = 1)
+        wait_for(s, "the wheel step scrolled", "window.__btWheeled"; timeout = 5)
+    end
+    return where() == 0
 end
 
 # Click the first visible `selector` repeatedly until `predicate` holds — rides

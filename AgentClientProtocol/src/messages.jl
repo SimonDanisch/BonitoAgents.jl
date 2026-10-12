@@ -289,9 +289,9 @@ struct Plan <: Message
     # This is the STREAM's answer, and `close_turn!` is the single place it is
     # given — the same one that force-fails live tools, on the same events. It is
     # not the only way a plan ends (an agent that works its entries to terminal
-    # ends it by status, and an episode that simply STOPS is visible to a
-    # consumer as `session_activity` — neither needs a frame). It is the one that
-    # covers a stream dying under a live plan, which nothing else can see.
+    # ends it by status, and a consumer sees the turn it belongs to end:
+    # `open_turns`). It is the one that covers a stream dying under a live plan,
+    # which nothing else can see.
     #
     # The entries are left EXACTLY as the agent last reported them: sealing is a
     # property of the plan, not a status we forge onto its entries. Tools get
@@ -375,21 +375,6 @@ Base.append!(m::UserMessage, t::AbstractString)  = (put!(m.stream, String(t)); m
 # A message now folds its own stream, so there is nothing to drain and no list of
 # types to keep in sync — the three that were missing from it took down every
 # `session/load` that replayed one.)
-
-# Same question as `is_agent_work(::SessionUpdate)`, asked of a coalesced
-# message: is this the agent DOING something, or telling us about the session?
-#
-# A renderer reads it to decide whether an AUTO-WAKE EPISODE has begun — the
-# agent talking with no prompt open. Session metadata (config/mode/usage/
-# commands) arrives on bind and at turn boundaries, so counting it would open an
-# episode on a chat that has done nothing.
-is_agent_work(::Message)        = true
-is_agent_work(::ConfigUpdate)   = false
-is_agent_work(::ModeUpdate)     = false
-is_agent_work(::UsageUpdate)    = false
-is_agent_work(::CommandsUpdate) = false
-is_agent_work(::StreamFlush)    = false
-
 
 # ── Wire → typed dispatch ────────────────────────────────────────────────────
 # One place maps Claude Code's tool name to a concrete `ToolCall` subtype.

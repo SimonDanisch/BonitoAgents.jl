@@ -142,7 +142,9 @@
 
             # The tool-answer turn must be followed by a further CONTINUE prompt:
             # that is the loop refusing the escape.
-            @test poll_until(() -> confirm_prompts(model) == base_k + 1; timeout = 30)
+            # `>=`: the loop does not pause, so a poll can miss this step. The
+            # exact totals are checked once it settles, below.
+            @test poll_until(() -> confirm_prompts(model) >= base_k + 1; timeout = 30)
             @test poll_until(() -> yolo_prompts(model) == base_c + 2; timeout = 30)
             @test poll_until(() -> confirm_prompts(model) == base_k + 2; timeout = 30)
             sleep(3.0)

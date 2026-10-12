@@ -12,14 +12,6 @@
     ACP.transport_eof(t::IdleTransport) = !isopen(t.gate)
     Base.close(t::IdleTransport) = (isopen(t.gate) && close(t.gate); nothing)
 
-    # "When done" waits for our own turn and for a cancel winding one down, not
-    # for work the agent does on its own: an auto-wake episode or a background
-    # subagent has no announced end, and the next prompt is what ends it.
-    @test BT.waits_for_turn(ACP.Prompted())
-    @test BT.waits_for_turn(ACP.Cancelling())
-    @test !BT.waits_for_turn(ACP.Unprompted())
-    @test !BT.waits_for_turn(ACP.Idle())
-
     state = BT.serve(; host="127.0.0.1", port=0, state_dir=mktempdir(), working_dir=mktempdir())
     models = BT.ChatModel[]
     try
@@ -115,6 +107,22 @@
         # Stop still pauses it, like any message not yet handed over.
         @test BT.drop_queued_sends!(dead) == 1
         @test entry.status == :paused
+
+        # "When done" waits for the prompts of ours the agent has not answered,
+        # not for a turn the agent runs on its own: a background subagent can
+        # keep those coming, and a prompt sent meanwhile is simply folded in.
+        agent2 = BT.WorkerAgent(state, "offline", "/project"; project_id="queue-turns")
+        busy = BT.ChatModel(state, mktempdir(); project_id="queue-turns", agent = agent2)
+        push!(models, busy)
+        @test isempty(BT.prompts_ahead(busy))           # no session: nothing ahead
+        conn2 = ACP.Connection(IdleTransport(), ACP.DiscardHandler(); agent_turns = true)
+        agent2.client = ACP.Client(conn2, "sess", "/project")
+        ACP.main_thread!(conn2, ACP.AgentMessageChunk(ACP.TextContent("reporting back")))
+        @test only(ACP.open_turns(busy)) isa ACP.AgentTurn
+        @test isempty(BT.prompts_ahead(busy))
+        ours = ACP.prompt_request(conn2, Dict())
+        @test BT.prompts_ahead(busy) == [ours]
+        close(conn2)
     finally
         foreach(close, models)
         close(state.srv)

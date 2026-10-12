@@ -10,7 +10,8 @@
 #
 # What each kind renders is chosen by DISPATCH on `file_kind(path)`, not by a
 # chain of extension tests at every call site. Adding a format is one `file_kind`
-# entry plus one `render_file` method.
+# entry plus one `file_viewer` method (and a `view_input`, if the browser reads
+# it from somewhere other than `show_media_src`).
 #
 # Bytes: media (image/video/audio/pdf/html) is streamed from the worker through
 # a stable `/worker-file/` URL with byte-range support. A multi-GB video
@@ -19,17 +20,22 @@
 # `fetch_show_file`, which re-fetches exactly when the worker's copy changed.
 
 abstract type FileKind end
-struct ImageFile    <: FileKind end
-struct VideoFile    <: FileKind end
-struct AudioFile    <: FileKind end
-struct MarkdownFile <: FileKind end
-struct TableFile    <: FileKind end   # csv / tsv
-struct NotebookFile <: FileKind end   # .ipynb
-struct MeshFile     <: FileKind end   # .obj / .stl / .ply / .off / .glb / .gltf
-struct PDFFile      <: FileKind end
-struct HTMLFile     <: FileKind end
-struct TextFile     <: FileKind end   # anything Monaco can show — the default
-struct BinaryFile   <: FileKind end   # known-binary or NUL-sniffed → hex preview
+# The browser reads these itself, from a url: its viewer is given the url.
+abstract type StreamedKind <: FileKind end
+# The server reads these and builds the page from them: its viewer is given
+# the content (`FileContent`).
+abstract type ParsedKind <: FileKind end
+struct ImageFile    <: StreamedKind end
+struct VideoFile    <: StreamedKind end
+struct AudioFile    <: StreamedKind end
+struct MarkdownFile <: ParsedKind end
+struct TableFile    <: ParsedKind end   # csv / tsv
+struct NotebookFile <: ParsedKind end   # .ipynb
+struct MeshFile     <: StreamedKind end   # .obj / .stl / .ply / .off / .glb / .gltf
+struct PDFFile      <: StreamedKind end
+struct HTMLFile     <: StreamedKind end
+struct TextFile     <: ParsedKind end   # anything Monaco can show — the default
+struct BinaryFile   <: ParsedKind end   # known-binary or NUL-sniffed → hex preview
 
 abstract type ViewMode end
 struct InlineView <: ViewMode end
@@ -154,18 +160,21 @@ asset_src(session::Bonito.Session, path::AbstractString) =
     Bonito.url(session, Bonito.Asset(String(path)))
 asset_src(::Nothing, path::AbstractString) = Bonito.Asset(String(path))
 
-# A file that can't be rendered must produce a VISIBLE, self-contained error node
-# — never throw out of `jsrender`, where Bonito's generic handler swaps in its
-# own opaque placeholder and the body loses the `.bt-tool-error` the UI + tests
-# key on.
-function Bonito.jsrender(session::Bonito.Session, fv::FileView)
-    body = try
-        render_file(view_kind(fv), fv.mode, fv, session)
+# Never throw out of `jsrender`: a failed read or parse is the visible
+# `.bt-tool-error` node (`viewer_or_error`).
+Bonito.jsrender(session::Bonito.Session, fv::FileView) =
+    Bonito.jsrender(session, viewer_or_error(() -> render_file(view_kind(fv), fv.mode, fv, session), view_path(fv)))
+
+# What `build` makes, or the error node saying why the file can't be shown. Any
+# error: the worker, the network and the format can each fail many ways.
+function viewer_or_error(build, path::AbstractString)
+    try
+        return build()
     catch e
-        @warn "file view: could not render" path = view_path(fv) exception = (e, catch_backtrace())
-        file_error_node(view_path(fv), e)
+        e isa InterruptException && rethrow()
+        @warn "file view: could not render" path exception = (e, catch_backtrace())
+        return file_error_node(path, e)
     end
-    return Bonito.jsrender(session, body)
 end
 
 file_error_node(path::AbstractString, e) =
@@ -202,50 +211,85 @@ end
 # Monaco would render garbage and a save would corrupt the file.
 looks_binary(bytes::AbstractVector{UInt8}) = 0x00 in view(bytes, 1:min(length(bytes), 8192))
 
-# ── image ───────────────────────────────────────────────────────────────────
-# Inline keeps the chat's existing look (max-width, lightbox, hover actions).
-# The panel adds a checkerboard so transparency reads as transparency, centres
-# the image, and reports its pixel size once the browser knows it.
-function render_file(::ImageFile, ::InlineView, fv::FileView, session)
-    st = fv.file
-    return media_element(show_media_src(st, session), "", false;
-                         filename = basename(st.path), worker_path = show_worker_path(st))
-end
+# ── Viewers ─────────────────────────────────────────────────────────────────
+# `file_viewer(kind, input, path, mode)`: `input` is the file's url (`StreamedKind`)
+# or its content (`ParsedKind`); `InlineView()` is a block in a bubble, `PanelView()`
+# fills its box. Each brings its styles and script: chat, shared page, any app.
 
-function render_file(::ImageFile, ::PanelView, fv::FileView, session)
-    st = fv.file
-    img = media_element(show_media_src(st, session), "", false; filename = basename(st.path))
-    # The behaviour (reporting the decoded pixel size into the header) is wired
-    # by the window's file-view driver when this node appears — see
-    # `file_view_driver` and assets/fileview.js.
-    return DOM.div(img; class = "bt-fv-image-stage")
-end
+"""
+    FileContent(bytes; size = length(bytes), link = no_link, raw_html = true)
 
-# ── video / audio ───────────────────────────────────────────────────────────
-video_element(fv::FileView, session) =
-    media_element(show_media_src(fv.file, session),
-                  get(SHOW_VIDEO_MIME, lowercase(splitext(fv.file.path)[2]), "video/mp4"),
-                  true; filename = basename(fv.file.path))
+A parsed kind's input: its bytes (a binary's head; `size` is the file's).
+`link` maps a relative reference to a url (`nothing`: as written).
+`raw_html = false` leaves out HTML written into markdown.
+"""
+struct FileContent
+    bytes::Vector{UInt8}
+    size::Int
+    link::Function
+    raw_html::Bool
+end
+FileContent(bytes::Vector{UInt8}; size::Integer = length(bytes), link::Function = no_link,
+            raw_html::Bool = true) = FileContent(bytes, Int(size), link, raw_html)
+
+no_link(_) = nothing
+
+# A copy: `String` takes over the vector it is given.
+content_text(c::FileContent) = String(copy(c.bytes))
+
+# The file-view driver as a node, for a viewer built without its session. A
+# second one in a page is a no-op.
+struct FileViewDriver end
+Bonito.jsrender(session::Bonito.Session, ::FileViewDriver) =
+    Bonito.jsrender(session, file_view_driver(session))
+
+file_viewer(::MeshFile, url, path::AbstractString, mode::ViewMode = InlineView()) =
+    MeshViewer(url, path; mode)
+
+# A picture in a bubble at its own size; `worker_path` lets it become the chat's
+# icon (chat_icons.jl).
+file_viewer(::ImageFile, url, path::AbstractString, ::InlineView = InlineView(); worker_path = "") =
+    media_element(url, "", false; filename = basename(path), worker_path)
+
+# Filling a box, it gets a stage: a checkerboard so transparency reads as
+# transparency, and the picture shrunk to fit. The driver reports its pixel size
+# into a file tab's header.
+file_viewer(::ImageFile, url, path::AbstractString, ::PanelView) =
+    DOM.div(FileViewStyles, FileViewDriver(), media_element(url, "", false; filename = basename(path));
+            class = "bt-fv-image-stage")
+
+video_viewer(url, path::AbstractString) =
+    media_element(url, get(SHOW_VIDEO_MIME, lowercase(splitext(path)[2]), "video/mp4"), true;
+                  filename = basename(path))
 
 # In a chat bubble the video belongs in the message flow, at its own size.
-render_file(::VideoFile, ::InlineView, fv::FileView, session) = video_element(fv, session)
+file_viewer(::VideoFile, url, path::AbstractString, ::InlineView = InlineView()) = video_viewer(url, path)
 
-# In a panel it needs a stage, like an image does. Without one the element sits
-# at its intrinsic size in the top-left corner of an otherwise empty tab — and a
-# video TALLER than the panel runs off the bottom, taking its controls with it,
+# Filling a box it needs a stage, like a picture does. Without one the element
+# sits at its intrinsic size in the top-left corner of an otherwise empty tab, and
+# a video TALLER than the box runs off the bottom, taking its controls with it,
 # because `media_element` only constrains width.
-render_file(::VideoFile, ::PanelView, fv::FileView, session) =
-    DOM.div(video_element(fv, session); class = "bt-fv-video-stage")
+file_viewer(::VideoFile, url, path::AbstractString, ::PanelView) =
+    DOM.div(FileViewStyles, video_viewer(url, path); class = "bt-fv-video-stage")
 
-function render_file(::AudioFile, ::ViewMode, fv::FileView, session)
-    st = fv.file
-    mime = get(VIEW_AUDIO_MIME, lowercase(splitext(st.path)[2]), "audio/mpeg")
-    return DOM.div(
-        DOM.audio(DOM.source(; src = show_media_src(st, session), type = mime);
+file_viewer(::AudioFile, url, path::AbstractString, ::ViewMode = InlineView()) =
+    DOM.div(FileViewStyles,
+        DOM.audio(DOM.source(; src = url, type = get(VIEW_AUDIO_MIME, lowercase(splitext(path)[2]), "audio/mpeg"));
                   controls = true, class = "bt-fv-audio"),
-        DOM.div(basename(st.path); class = "bt-fv-audio-name");
+        DOM.div(basename(path); class = "bt-fv-audio-name");
         class = "bt-fv-audio-wrap")
-end
+
+# What the chat gives a kind's viewer: where the browser reads the file, or
+# what it holds (mirrored to the server, `view_bytes`).
+render_file(kind::FileKind, mode::ViewMode, fv::FileView, session) =
+    file_viewer(kind, view_input(kind, fv, session), view_path(fv), mode)
+
+view_input(::StreamedKind, fv::FileView, session) = show_media_src(fv.file, session)
+view_input(::ParsedKind, fv::FileView, session) = FileContent(last(view_bytes(fv)); link = file_link(fv))
+
+render_file(::ImageFile, ::InlineView, fv::FileView, session) =
+    file_viewer(ImageFile(), view_input(ImageFile(), fv, session), view_path(fv), InlineView();
+                worker_path = show_worker_path(fv.file))
 
 # ── markdown ────────────────────────────────────────────────────────────────
 # The SAME renderer the chat uses for agent messages (`markdown_html`), so a
@@ -253,14 +297,11 @@ end
 # relative pictures and clips go through `link` (`file_link`): the preview sits
 # in the dashboard page, where the browser would resolve them against the
 # dashboard's own URL.
-markdown_preview_node(text::AbstractString, link::Function) =
-    DOM.div(Bonito.HTML(markdown_html(text, link)); class = "bt-fv-markdown")
+markdown_preview_node(text::AbstractString, link::Function; raw_html::Bool = true) =
+    DOM.div(FileViewStyles, Bonito.HTML(markdown_html(text, link; raw_html)); class = "bt-fv-markdown")
 
-function render_file(::MarkdownFile, ::ViewMode, fv::FileView, session)
-    _, bytes = view_bytes(fv)
-    looks_binary(bytes) && return hexdump_node(bytes)
-    return markdown_preview_node(String(bytes), file_link(fv))
-end
+file_viewer(::MarkdownFile, c::FileContent, path::AbstractString, ::ViewMode = InlineView()) =
+    looks_binary(c.bytes) ? hexdump_node(c) : markdown_preview_node(content_text(c), c.link; c.raw_html)
 
 # Where a path relative to `fv`'s file is read from: that file on the worker,
 # as a signed link (`worker_folder_url`), streamed when the browser asks and
@@ -270,7 +311,7 @@ end
 function file_link(fv::FileView)
     st = fv.file
     proj = get(st.state.projects[], st.project_id, nothing)
-    proj === nothing && return _ -> nothing
+    proj === nothing && return no_link
     file = show_worker_path(st)
     folder = reference_folder(proj, file)
     return function (rel)
@@ -336,11 +377,10 @@ const TABLE_MAX_ROWS = 5_000
 
 is_numeric_cell(s::AbstractString) = tryparse(Float64, strip(s)) !== nothing
 
-function render_file(::TableFile, mode::ViewMode, fv::FileView, session)
-    _, bytes = view_bytes(fv)
-    looks_binary(bytes) && return hexdump_node(bytes)
-    delim = lowercase(splitext(view_path(fv))[2]) == ".tsv" ? '\t' : ','
-    rows = parse_delimited(String(bytes), delim)
+function file_viewer(::TableFile, c::FileContent, path::AbstractString, mode::ViewMode = InlineView())
+    looks_binary(c.bytes) && return hexdump_node(c)
+    delim = lowercase(splitext(path)[2]) == ".tsv" ? '\t' : ','
+    rows = parse_delimited(content_text(c), delim)
     isempty(rows) && return DOM.div("(empty table)"; class = "bt-tool-empty")
     header = rows[1]
     body   = @view rows[2:end]
@@ -369,15 +409,14 @@ function render_file(::TableFile, mode::ViewMode, fv::FileView, session)
     table = DOM.table(DOM.thead(head), DOM.tbody(trs...); class = "bt-fv-table")
     filter_box = DOM.input(; type = "text", class = "bt-fv-table-filter",
         placeholder = "Filter rows…", spellcheck = "false")
-    node = DOM.div(
+    # Sort + filter are wired by the file-view driver when this node appears
+    # (assets/fileview.js); see `file_view_driver` for why the behaviour can't
+    # ride along with the node.
+    return DOM.div(FileViewStyles, FileViewDriver(),
         DOM.div(filter_box, DOM.span(note; class = "bt-fv-table-note");
                 class = "bt-fv-table-bar"),
         DOM.div(table; class = "bt-fv-table-scroll");
         class = "bt-fv-table-wrap")
-    # Sort + filter are wired by the window's file-view driver when this node
-    # appears (assets/fileview.js) — see `file_view_driver` for why the behaviour
-    # can't ride along with the node.
-    return node
 end
 
 # ── Jupyter notebook ────────────────────────────────────────────────────────
@@ -419,20 +458,18 @@ function notebook_output_node(out::AbstractDict)
     return DOM.pre("($(isempty(otype) ? "output" : otype))"; class = "bt-fv-nb-text")
 end
 
-function render_file(::NotebookFile, mode::ViewMode, fv::FileView, session)
-    _, bytes = view_bytes(fv)
-    nb = JSON.parse(String(bytes))
+function file_viewer(::NotebookFile, c::FileContent, path::AbstractString, mode::ViewMode = InlineView())
+    nb = JSON.parse(content_text(c))
     lang = get(get(get(nb, "metadata", Dict()), "kernelspec", Dict()), "language", "python")
     cells = get(nb, "cells", [])
     isempty(cells) && return DOM.div("(notebook has no cells)"; class = "bt-tool-empty")
     limit = mode isa InlineView ? 12 : length(cells)
-    link = file_link(fv)
     nodes = Any[]
     for cell in Iterators.take(cells, limit)
         ctype = String(get(cell, "cell_type", "code"))
         src = notebook_source(cell)
         if ctype == "markdown"
-            push!(nodes, DOM.div(markdown_preview_node(src, link); class = "bt-fv-nb-cell bt-fv-nb-md"))
+            push!(nodes, DOM.div(markdown_preview_node(src, c.link; c.raw_html); class = "bt-fv-nb-cell bt-fv-nb-md"))
         else
             outs = get(cell, "outputs", [])
             push!(nodes, DOM.div(
@@ -446,7 +483,7 @@ function render_file(::NotebookFile, mode::ViewMode, fv::FileView, session)
     limit < length(cells) &&
         push!(nodes, DOM.div("… $(length(cells) - limit) more cells (open the file to see them all)";
                              class = "bt-fv-more"))
-    return DOM.div(nodes...; class = "bt-fv-notebook")
+    return DOM.div(FileViewStyles, nodes...; class = "bt-fv-notebook")
 end
 
 # ── The window-level driver ─────────────────────────────────────────────────
@@ -529,24 +566,36 @@ end
 
 # The browser reads the model itself, with three.js's loader for its format
 # (assets/meshview.js).
-function render_file(::MeshFile, mode::ViewMode, fv::FileView, session)
-    st = fv.file
-    url = mesh_src(st, session)
+view_input(::MeshFile, fv::FileView, session) = mesh_src(fv.file, session)
 
-    # The url rides on the node as a data attribute; the window's file-view
-    # driver mounts the viewer when the node appears (see `file_view_driver`).
-    return DOM.div(
-        DOM.canvas(; class = "bt-mesh-canvas"),
-        DOM.div(
-            mesh_button(:reset, "Reset the view"),
-            mesh_button(:wire, "Wireframe overlay"),
-            mesh_button(:flat, "Flat shading");
-            class = "bt-mesh-toolbar"),
-        DOM.div(""; class = "bt-mesh-status");
-        class = "bt-mesh-view", dataMeshUrl = url,
-        dataMeshFormat = lstrip(lowercase(splitext(st.path)[2]), '.'),
-        dataMode = mode isa InlineView ? "inline" : "panel")
+"""
+    MeshViewer(url, path; mode = InlineView())
+
+three.js viewer for the model at `url` (format from `path`), with its toolbar,
+status line, styles and driver, so it works in any session. `PanelView()` fills
+its container; `InlineView()` is a box of its own height.
+"""
+struct MeshViewer
+    url::Any
+    format::String
+    mode::ViewMode
 end
+MeshViewer(url, path::AbstractString; mode::ViewMode = InlineView()) =
+    MeshViewer(url, String(lstrip(lowercase(splitext(path)[2]), '.')), mode)
+
+# The url rides on the node as a data attribute; the driver (installed once per
+# page, a second install is a no-op) mounts the viewer when the node appears.
+Bonito.jsrender(session::Bonito.Session, v::MeshViewer) = Bonito.jsrender(session, DOM.div(
+    MeshViewStyles, file_view_driver(session),
+    DOM.canvas(; class = "bt-mesh-canvas"),
+    DOM.div(
+        mesh_button(:reset, "Reset the view"),
+        mesh_button(:wire, "Wireframe overlay"),
+        mesh_button(:flat, "Flat shading");
+        class = "bt-mesh-toolbar"),
+    DOM.div(""; class = "bt-mesh-status");
+    class = "bt-mesh-view", dataMeshUrl = v.url, dataMeshFormat = v.format,
+    dataMode = v.mode isa InlineView ? "inline" : "panel"))
 
 # ── pdf / html ──────────────────────────────────────────────────────────────
 # Both are handed to the browser as a URL: the embedded PDF viewer and a real
@@ -554,49 +603,43 @@ end
 # (scripts allowed, same-origin NOT) so a page in the project can't reach into
 # the dashboard's session.
 
-# The url rides as `data-frame-src` and the window's file-view driver assigns it
-# once the frame is in the document. An `<iframe src=…>` that arrives ALREADY
-# sourced through Bonito's node insertion leaves Chromium's PDF plugin without a
-# live view — the panel shows the viewer's dark backdrop and nothing else. See
+file_viewer(::PDFFile, url, path::AbstractString, ::ViewMode = InlineView()) = frame_viewer(url, path)
+# The page runs, in an origin of its own: it cannot reach the page around it.
+file_viewer(::HTMLFile, url, path::AbstractString, ::ViewMode = InlineView()) =
+    frame_viewer(url, path; sandbox = "allow-scripts")
+
+frame_viewer(src, path::AbstractString; sandbox = nothing) =
+    DOM.div(FileViewStyles, FileViewDriver(),
+            frame_element(src, basename(path), sandbox === nothing ? (;) : (; sandbox));
+            class = "bt-fv-frame-wrap")
+
+# The url rides as `data-frame-src` and the file-view driver assigns it once the
+# frame is in the document. An `<iframe src=…>` that arrives ALREADY sourced
+# through Bonito's node insertion leaves Chromium's PDF plugin without a live
+# view: the panel shows the viewer's dark backdrop and nothing else. See
 # `initFrame` in assets/fileview.js.
-function frame_node(fv::FileView, session; sandbox = nothing)
-    src = show_media_src(fv.file, session)
-    sb = sandbox === nothing ? (;) : (; sandbox = sandbox)
-    title = basename(view_path(fv))
-    # A session-less (headless) render resolves to an `Asset` rather than a url,
-    # and has no driver to hand it to either — there `src` is the only option.
-    src isa AbstractString ||
-        return DOM.iframe(; src = src, class = "bt-fv-frame", title = title, sb...)
-    return DOM.iframe(; class = "bt-fv-frame", dataFrameSrc = src, title = title, sb...)
-end
-
-function render_file(::PDFFile, ::ViewMode, fv::FileView, session)
-    return DOM.div(frame_node(fv, session); class = "bt-fv-frame-wrap")
-end
-
-function render_file(::HTMLFile, ::ViewMode, fv::FileView, session)
-    return DOM.div(frame_node(fv, session; sandbox = "allow-scripts");
-                   class = "bt-fv-frame-wrap")
-end
+frame_element(src::AbstractString, title::AbstractString, sandbox::NamedTuple) =
+    DOM.iframe(; class = "bt-fv-frame", dataFrameSrc = src, title, sandbox...)
+# A headless render (no session) has an `Asset` rather than a url, and no driver
+# to hand it to either: there `src` is the only option.
+frame_element(src::Bonito.Asset, title::AbstractString, sandbox::NamedTuple) =
+    DOM.iframe(; src, class = "bt-fv-frame", title, sandbox...)
 
 # ── plain text ──────────────────────────────────────────────────────────────
-# Syntax highlighting follows the WORKER path, not the mirror's: an out-of-project
-# file lands in a cache directory, and only the real path is guaranteed to still
-# look like the file the user opened.
-function render_file(::TextFile, ::InlineView, fv::FileView, session)
-    _, bytes = view_bytes(fv)
-    looks_binary(bytes) && return hexdump_node(bytes)
-    return monaco_readonly(String(bytes), detect_language(view_path(fv)))
-end
+# Highlighting follows the worker path, not the mirror's. Inline the editor is
+# as tall as the text; `PanelView` fills the box and scrolls.
+file_viewer(::TextFile, c::FileContent, path::AbstractString, ::InlineView = InlineView()) =
+    looks_binary(c.bytes) ? hexdump_node(c) : monaco_readonly(content_text(c), detect_language(path))
 
-# The panel's text body is the editable Monaco — building it is the FilePanel's
-# job (it owns the save wiring), so this arm only exists for a FileView rendered
-# panel-side without a panel around it (ad-hoc display, tests).
-function render_file(::TextFile, ::PanelView, fv::FileView, session)
-    _, bytes = view_bytes(fv)
-    looks_binary(bytes) && return hexdump_node(bytes)
-    return monaco_readonly(String(bytes), detect_language(view_path(fv)))
-end
+file_viewer(::TextFile, c::FileContent, path::AbstractString, mode::PanelView) =
+    looks_binary(c.bytes) ? hexdump_node(c) :
+        DOM.div(FileViewStyles, monaco_readonly(content_text(c), detect_language(path), mode); class = "bt-fv-code")
+
+monaco_readonly(text::AbstractString, lang::AbstractString, ::PanelView) =
+    BonitoBook.MonacoEditor(text; language = lang, readOnly = true, automaticLayout = true,
+        scrollBeyondLastLine = false, minimap = Dict(:enabled => false),
+        # Light, as everywhere (see `monaco_readonly`).
+        theme = Observable("vs"))
 
 # ── binary ──────────────────────────────────────────────────────────────────
 # A hex + ASCII dump of the head. Enough to answer "is this actually a PNG?" /
@@ -625,12 +668,15 @@ function hexdump_text(bytes::AbstractVector{UInt8}; limit::Int = HEXDUMP_BYTES)
     return String(take!(io))
 end
 
-function hexdump_node(bytes::AbstractVector{UInt8})
+hexdump_node(c::FileContent) = hexdump_node(c.bytes, c.size)
+
+# `total`: the whole file's size, when `bytes` is its head.
+function hexdump_node(bytes::AbstractVector{UInt8}, total::Integer = length(bytes))
     shown = min(length(bytes), HEXDUMP_BYTES)
-    note = shown < length(bytes) ?
-        "first $(format_bytes(shown)) of $(format_bytes(length(bytes)))" :
-        format_bytes(length(bytes))
-    return DOM.div(
+    note = shown < total ?
+        "first $(format_bytes(shown)) of $(format_bytes(total))" :
+        format_bytes(total)
+    return DOM.div(FileViewStyles,
         DOM.div(DOM.span("binary"; class = "bt-fv-badge"),
                 DOM.span(note; class = "bt-fv-hex-note");
                 class = "bt-fv-hex-bar"),
@@ -638,10 +684,7 @@ function hexdump_node(bytes::AbstractVector{UInt8})
         class = "bt-fv-hex-wrap")
 end
 
-function render_file(::BinaryFile, ::ViewMode, fv::FileView, session)
-    _, bytes = view_bytes(fv)
-    return hexdump_node(bytes)
-end
+file_viewer(::BinaryFile, c::FileContent, path::AbstractString, ::ViewMode = InlineView()) = hexdump_node(c)
 
 # ── The workspace tab ───────────────────────────────────────────────────────
 # One header for EVERY kind, so opening a png, a csv and a .jl file all feel
@@ -770,9 +813,9 @@ path_span(path::AbstractString; class::AbstractString, title = path) =
 path_span(path::Observable; class::AbstractString) =
     DOM.span(DOM.span(path; class = "bt-path-ltr"); class = class)
 
-# A markdown page or an app file can be shared as a link (shares.jl).
+# A file of a chat's project can be shared as a link (shares.jl).
 share_btn(p::FilePanel) =
-    share_kind_of(p.worker_path) === nothing || isempty(p.view.file.project_id) ? () :
+    isempty(p.view.file.project_id) ? () :
         (fv_action_btn("share", "↗", "Share a link: anyone with it can open this " *
                        "while the worker is online (Settings lists and ends links)"),)
 
@@ -822,13 +865,7 @@ function Bonito.jsrender(session::Session, p::FilePanel)
     # when the worker file changed — so ⟳ (and a save) genuinely refresh rather
     # than redraw stale bytes.
     rendered_dom = Observable{Any}(DOM.div("loading…"; class = "bt-fv-loading"))
-    build_rendered() =
-        try
-            render_file(p.kind, PanelView(), p.view, session)
-        catch e
-            @warn "file view: could not render" path = p.worker_path exception = (e, catch_backtrace())
-            file_error_node(p.worker_path, e)
-        end
+    build_rendered() = viewer_or_error(() -> render_file(p.kind, PanelView(), p.view, session), p.worker_path)
     refresh_rendered!() = Base.errormonitor(@async safe_set!(rendered_dom, build_rendered()))
     has_rendered_view(p) && refresh_rendered!()
     # ⟳ has to reload whatever this panel actually SHOWS. Registering the handler

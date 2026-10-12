@@ -55,7 +55,7 @@ end
 
         BT.while_busy(model) do
             # The claim edge PUBLISHES — the spinner is not something the caller
-            # sets alongside; `busy` is derived and `refresh_activity!` ships it.
+            # sets alongside; `busy` is derived and `publish_busy!` ships it.
             @test model.turn_in_flight[] == true
             @test model.busy_active[] == true
         end
@@ -106,7 +106,7 @@ end
             @test model.busy_active[] == true
             # The bg shell finishing does not touch busy; only the turn ending does.
             BT.finished!(m)                  # bar's loop calls this when the fd closes
-            BT.refresh_activity!(model)      # even re-derived, the open turn rules
+            BT.publish_busy!(model)          # even re-derived, the open turn rules
             @test model.busy_active[] == true
         end
         # Turn ends → spinner clears, even though a taskbar task may linger.

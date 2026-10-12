@@ -53,14 +53,16 @@ end
             xfer = Threads.@spawn BA.send_file_to_worker!(state, "link-test", src, dst)
             sleep(0.2)
             link = BA.worker_link(state, "link-test")
-            # Offline while away, but the SAME link: nothing was torn down. The
-            # worker dials straight back, so the offline moment is recorded
-            # rather than polled for (a poll can fall on either side of it).
+            # Offline while away, but the SAME link: nothing was torn down.
+            # Dropped at the server's end, it goes offline inside `disconnect!`.
+            # Dropped at the worker's, its redial can reach the server before
+            # the server notices, and it never goes offline. The worker dials
+            # straight back either way, so the moment is recorded, not polled.
             went_offline = Ref(false)
             watch = BA.Bonito.on(v -> v || (went_offline[] = true), info.online)
-            WorkerLink.disconnect!(worker.link)
-            @test timedwait(() -> went_offline[], 10.0) === :ok
+            WorkerLink.disconnect!(link)
             BA.Bonito.off(watch)
+            @test went_offline[]
             @test timedwait(() -> BA.worker_connected(state, "link-test"), 30.0) === :ok
             @test BA.worker_link(state, "link-test") === link
             fetch(xfer)

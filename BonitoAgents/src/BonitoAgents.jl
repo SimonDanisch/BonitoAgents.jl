@@ -89,6 +89,8 @@ export serve, dev_server
 export AgentProvider, BinAgent, WorkerAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, CodexAgent, MockAgent
 export start!, stop!, client, switch_provider!
+# Viewers that render in any Bonito session (a chat, a shared page, your own app).
+export MeshViewer, media_element
 
 # Bake the real browser-driven paths captured from the e2e suite: literal
 # `precompile(...)` calls (see BonitoAgentsApp/precompile/) that run during

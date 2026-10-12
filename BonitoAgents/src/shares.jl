@@ -8,6 +8,10 @@
 #     so the file's own relative references resolve). Only files the markdown
 #     references are served, never the rest of its folder. Scripts are off
 #     (Content-Security-Policy), so raw HTML in the file cannot run code.
+#   * Any other file: a page with the chat's viewer for it (`file_viewer`) and a
+#     Download button (`share_bar`). Under the link are the file and what it
+#     names inside its project (`file_references`), nothing else; opened alone,
+#     a file runs sandboxed (`share_file_response`).
 #   * A Julia file whose value is a Bonito app (or any value an eval would show
 #     live: a plot, a DataFrame, `App() do … md"…$(slider)…" end`) becomes a live
 #     page: a SHARE HOST on the worker (an eval host under the pseudo chat
@@ -21,7 +25,8 @@
 # the login gate lets through `/s/…`, and for an open app page its websocket and
 # the assets it registered, nothing else (`is_share_target`). Behind the Caddy
 # login proxy only `/s/…` is open (Caddy cannot tell a share page's websocket
-# from the dashboard's), so there an app link needs a logged-in viewer.
+# from the dashboard's): there an app link needs a logged-in viewer, and a file
+# link serves the file itself (`serves_viewer`).
 
 const SHARES_PROJECT = "__shares__"
 const SHARE_ROUTE_RE = r"^/s/([0-9a-f]{32})(/[^?#]*)?(?:$|\?)"
@@ -76,25 +81,20 @@ end
 abstract type ShareKind end
 struct MarkdownShare <: ShareKind end
 struct AppShare <: ShareKind end
-struct FileShare <: ShareKind end
+struct ViewShare <: ShareKind end
 
-function share_kind_of(path::AbstractString)
+function share_kind(path::AbstractString)
     ext = lowercase(splitext(path)[2])
     ext in (".md", ".markdown") && return MarkdownShare()
     ext == ".jl" && return AppShare()
-    return nothing
-end
-
-function share_kind(path::AbstractString)
-    kind = share_kind_of(path)
-    return kind === nothing ? FileShare() : kind
+    return ViewShare()
 end
 
 share_kind(l::ShareLink) = isempty(l.result_ref) ? share_kind(l.path) : AppShare()
 
 kind_label(::MarkdownShare) = "markdown page"
 kind_label(::AppShare) = "app"
-kind_label(::FileShare) = "file"
+kind_label(::ViewShare) = "viewer page"
 
 # ── Passwords ────────────────────────────────────────────────────────────────
 # PBKDF2-HMAC-SHA256: a leaked shares.json must not give the passwords away cheaply.
@@ -143,7 +143,8 @@ above the file with a Project.toml.
 """
 function create_share!(state::ServerState, owner::AbstractString, worker_id::AbstractString,
                        path::AbstractString; env_path::AbstractString = "",
-                       title::AbstractString = "", password::AbstractString = "")
+                       title::AbstractString = "", password::AbstractString = "",
+                       project_id::AbstractString = "")
     w = get(state.workers[], String(worker_id), nothing)
     (w === nothing || !isopen(w)) && error("the worker is offline")
     kind = share_kind(path)
@@ -153,7 +154,7 @@ function create_share!(state::ServerState, owner::AbstractString, worker_id::Abs
     env = kind isa AppShare && isempty(env_path) ? project_env_of(state, w.worker_id, path) : String(env_path)
     l = ShareLink(bytes2hex(rand(Random.RandomDevice(), UInt8, 16)), String(owner), w.worker_id,
                   String(path), env, isempty(title) ? splitext(basename(path))[1] : String(title),
-                  salt, hash, now(UTC))
+                  salt, hash, now(UTC), String(project_id), "")
     check_share(kind, state, l, info)
     reg = state.shares
     lock(reg.lock) do
@@ -170,7 +171,7 @@ check_share(::MarkdownShare, state::ServerState, l::ShareLink, info) =
     info.size <= SHARE_MARKDOWN_MAX_BYTES ||
         error("$(basename(l.path)) is $(format_bytes(info.size)); a shared page can be at most $(format_bytes(SHARE_MARKDOWN_MAX_BYTES))")
 
-check_share(::FileShare, state::ServerState, l::ShareLink, info) = nothing
+check_share(::ViewShare, state::ServerState, l::ShareLink, info) = nothing
 
 function check_share(::AppShare, state::ServerState, l::ShareLink, info)
     share_app!(state, l)
@@ -283,9 +284,37 @@ function share_response(state::ServerState, context)
     w = get(state.workers[], l.worker_id, nothing)
     (w === nothing || !isopen(w)) && return share_notice(503, l.title,
         "The computer this is shared from is offline right now. Try again later.")
-    rest == "/" && return share_page(share_kind(l), state, l, context)
-    return share_file(state, l, request, HTTP.unescapeuri(String(rest[2:end])))
+    # A worker read or a file that will not parse is the viewer's error page,
+    # never a stack trace for whoever has the link.
+    try
+        rest == "/" && return share_root(share_kind(l), state, l, request, context)
+        return share_file(state, l, request, HTTP.unescapeuri(String(rest[2:end])))
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "shared link failed" path = l.path rest exception = (e, catch_backtrace())
+        return share_notice(502, l.title, "This link could not be served right now. Try again later.")
+    end
 end
+
+# The link itself: its page, or the file when another page loads it as an
+# image, a clip or a sound (`Sec-Fetch-Dest`), or where no viewer page can work.
+share_root(kind::ShareKind, state::ServerState, l::ShareLink, request::HTTP.Request, context) =
+    share_page(kind, state, l, context)
+
+function share_root(kind::ViewShare, state::ServerState, l::ShareLink, request::HTTP.Request, context)
+    embedded = HTTP.header(request, "Sec-Fetch-Dest", "document") in ("image", "video", "audio")
+    response = embedded || !serves_viewer(state.auth) ?
+        share_file_response(state, request, l.worker_id, normpath(l.path)) :
+        share_page(kind, state, l, context)
+    HTTP.setheader(response, "Vary" => "Sec-Fetch-Dest")
+    return response
+end
+
+# A viewer page is a Bonito app, so its websocket and assets must reach the
+# server. Caddy opens only `/s/…` to people without a login: there the link
+# serves the file, and the browser shows it as it shows any file.
+serves_viewer(::AuthMode) = true
+serves_viewer(::ProxyAuth) = false
 
 function unlock_share(state::ServerState, l::ShareLink, request::HTTP.Request, token::String)
     given = get(form_fields(String(request.body)), "password", "")
@@ -293,8 +322,11 @@ function unlock_share(state::ServerState, l::ShareLink, request::HTTP.Request, t
         sleep(1.0)                     # guessing stays slow
         return password_page(l, "That password is not right.")
     end
-    secure = startswith(root_state(state).base_url[], "https://") ? "; Secure" : ""
-    cookie = "$(unlock_cookie_name(l))=$(unlock_cookie_value(state, l)); Path=/s/$(token)/; HttpOnly; SameSite=Lax$(secure)"
+    # SameSite=None where it can be (it needs Secure): a shared HTML page runs in
+    # a frame with an origin of its own, and a Lax cookie is not sent with the
+    # requests for its pictures and styles.
+    site = startswith(root_state(state).base_url[], "https://") ? "SameSite=None; Secure" : "SameSite=Lax"
+    cookie = "$(unlock_cookie_name(l))=$(unlock_cookie_value(state, l)); Path=/s/$(token)/; HttpOnly; $(site)"
     return HTTP.Response(303, ["Location" => "/s/$(token)/", "Set-Cookie" => cookie, "Cache-Control" => "no-store"])
 end
 
@@ -306,37 +338,80 @@ password_page(l::ShareLink, error_message::AbstractString) = share_notice(isempt
 share_notice(status::Int, title::AbstractString, body::AbstractString) =
     invite_page(status, title, startswith(body, "<") ? body : "<p>$(esc_html(body))</p>")
 
-# A file the markdown page embeds, from the worker.
-function share_file(state::ServerState, l::ShareLink, request::HTTP.Request, rel::String)
-    share_kind(l) isa MarkdownShare || return share_notice(404, "Not found", "This link shares only its result.")
+# A file under the link: one the page uses, from the worker.
+share_file(state::ServerState, l::ShareLink, request::HTTP.Request, rel::String) =
+    share_file(share_kind(l), state, l, request, rel)
+
+share_file(::AppShare, state::ServerState, l::ShareLink, request::HTTP.Request, rel::String) =
+    share_notice(404, "Not found", "This link shares only its result.")
+
+# The markdown file itself (its Download button) and what it references.
+function share_file(::MarkdownShare, state::ServerState, l::ShareLink, request::HTTP.Request, rel::String)
     allowed = markdown_references(read_share_markdown(state, l))
-    normpath(rel) in allowed || return share_notice(404, "Not found", "The page does not use this file.")
-    return serve_worker_file(state, request, l.worker_id, normpath(joinpath(dirname(l.path), rel)))
+    push!(allowed, basename(l.path))
+    normpath(rel) in allowed || return not_used()
+    return share_file_response(state, request, l.worker_id, normpath(joinpath(dirname(l.path), rel)))
 end
 
-function share_page(::FileShare, state::ServerState, l::ShareLink, context)
-    response = serve_worker_file(state, context.request, l.worker_id, l.path)
-    # A shared HTML/SVG file must not execute with the dashboard's origin.
-    HTTP.setheader(response, "Content-Security-Policy" => "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:")
+function share_file(::ViewShare, state::ServerState, l::ShareLink, request::HTTP.Request, rel::String)
+    root, file = link_root(state, l), normpath(l.path)
+    path = normpath(joinpath(root, rel))
+    link_serves(root, file, file_references(state, l.worker_id, file), path) || return not_used()
+    return share_file_response(state, request, l.worker_id, path)
+end
+
+not_used() = share_notice(404, "Not found", "The page does not use this file.")
+
+# A file under a link, from the worker. Opened as a page of its own, it must not
+# run code on the server's origin, where the dashboard is: an HTML file's
+# scripts run in an origin of their own, nothing else runs at all. The header
+# changes nothing for a file the page loads as a picture, a clip or data.
+function share_file_response(state::ServerState, request::HTTP.Request, worker_id::String, path::String)
+    response = serve_worker_file(state, request, worker_id, path)
     HTTP.setheader(response, "X-Content-Type-Options" => "nosniff")
-    HTTP.setheader(response, "Cache-Control" => "no-store")
+    csp = share_file_policy(MIME(Bonito.file_mimetype(path)))
+    csp === nothing || HTTP.setheader(response, "Content-Security-Policy" => csp)
     return response
 end
 
+share_file_policy(::MIME) = "sandbox"
+share_file_policy(::MIME"text/html") = "sandbox allow-scripts"
+# Chromium's PDF viewer refuses a sandboxed document; a PDF runs no page script.
+share_file_policy(::MIME"application/pdf") = nothing
+
+# A shared page's header: the file's name and a Download button for `url`.
+share_bar(l::ShareLink, url::AbstractString) =
+    DOM.div(DOM.span(basename(l.path); class = "bt-share-name"),
+            DOM.a("Download"; href = url, download = basename(l.path),
+                  class = "bt-btn bt-btn-secondary bt-btn-sm bt-share-download");
+            class = "bt-share-bar")
+
+# A file's path under its link, relative to the page.
+share_href(rel::AbstractString) = join(HTTP.escapeuri.(splitpath(rel)), "/")
+
 # ── Markdown pages ───────────────────────────────────────────────────────────
+
+# The start of a worker file, at most `max_bytes` of it; `info` is its stat.
+function read_worker_bytes(state::ServerState, worker_id::AbstractString, info; max_bytes::Integer)
+    info.isfile || error("$(info.path) is gone")
+    info.range_reads || error("the worker is too old to serve shared pages; update it")
+    n = min(info.size, max_bytes)
+    bytes = UInt8[]
+    while length(bytes) < n
+        append!(bytes, read_worker_file_range(state, worker_id, info.path, length(bytes),
+                                              min(256 * 1024, n - length(bytes))))
+    end
+    return bytes
+end
 
 function read_share_markdown(state::ServerState, l::ShareLink)
     info = stat_worker_path(state, l.worker_id, l.path)
-    info.isfile || error("$(l.path) is gone")
     info.size <= SHARE_MARKDOWN_MAX_BYTES || error("$(l.path) grew over the limit for a shared page")
-    info.range_reads || error("the worker is too old to serve shared pages; update it")
-    bytes = UInt8[]
-    while length(bytes) < info.size
-        append!(bytes, read_worker_file_range(state, l.worker_id, l.path, length(bytes),
-                                              min(256 * 1024, info.size - length(bytes))))
-    end
-    return String(bytes)
+    return String(read_worker_bytes(state, l.worker_id, info; max_bytes = info.size))
 end
+
+# A file an HTML tag names: its `src`, `href` or `poster`.
+const HTML_REFERENCE_RE = r"\b(?:src|href|poster)\s*=\s*[\"']([^\"']+)[\"']"i
 
 """
     markdown_references(text) -> Set{String}
@@ -360,7 +435,7 @@ function markdown_references(text::AbstractString)
         if t isa CM.Image || t isa CM.Link
             add(t.destination)
         elseif t isa CM.HtmlBlock || t isa CM.HtmlInline
-            for m in eachmatch(r"\b(?:src|href|poster)\s*=\s*[\"']([^\"']+)[\"']"i, node.literal)
+            for m in eachmatch(HTML_REFERENCE_RE, node.literal)
                 add(m[1])
             end
         end
@@ -368,20 +443,19 @@ function markdown_references(text::AbstractString)
     return refs
 end
 
-const VIDEO_IMAGE_RE = r"<img src=\"([^\"]+\.(?:mp4|webm|m4v|mov|ogv))\" alt=\"([^\"]*)\"\s*/?>"i
-
+# A page without scripts, so the bar is the viewer pages' one, written out.
 function share_page(::MarkdownShare, state::ServerState, l::ShareLink, context)
-    body = markdown_html(read_share_markdown(state, l))
-    # `![clip](clip.mp4)` is a video, not a broken image.
-    body = replace(body, VIDEO_IMAGE_RE => s"<video controls preload=\"metadata\" src=\"\1\" title=\"\2\"></video>")
+    body = markdown_html(read_share_markdown(state, l), no_link)
     css = read(Bonito.local_path(Bonito.MarkdownCSS), String)
+    bar = sprint(show, MIME"text/html"(), share_bar(l, share_href(basename(l.path))))
     html = """<!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>$(esc_html(l.title))</title><style>$(css)
+        $(css_text(ShareStyles))
         body { margin: 0; background: #fff; }
-        main { max-width: 52rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+        main.bt-share-page { max-width: 52rem; padding: 1.5rem 1.25rem 4rem; }
         img, video { max-width: 100%; }
-        </style></head><body><main>$(body)</main></body></html>"""
+        </style></head><body><main class="bt-share-page">$(bar)$(body)</main></body></html>"""
     return HTTP.Response(200, ["Content-Type" => "text/html; charset=utf-8",
         # No scripts: raw HTML in the file is for layout and media only.
         # `font-src data:`: the inlined markdown CSS embeds its link-anchor
@@ -392,24 +466,152 @@ function share_page(::MarkdownShare, state::ServerState, l::ShareLink, context)
         "Cache-Control" => "no-cache", "Referrer-Policy" => "no-referrer"]; body = html)
 end
 
+# ── Viewer pages ─────────────────────────────────────────────────────────────
+
+# What a viewer link serves files under: the chat's project folder (as the chat
+# allows references within it), or the file's own folder for a link without one.
+# The file sits at its path there, so its relative references resolve.
+function link_root(state::ServerState, l::ShareLink)
+    file = normpath(l.path)
+    p = get(state.projects[], l.project_id, nothing)
+    (p === nothing || p.worker_id != l.worker_id) && return dirname(file)
+    return reference_folder(p, file)
+end
+
+# Whether a viewer link may serve `path`: the shared file, or a file it names,
+# and only inside the root (a model may name `../../.ssh/id_ed25519`).
+link_serves(root::AbstractString, file::AbstractString, refs, path::AbstractString) =
+    Bonito.is_path_contained(root, path) && (path == file || path in refs)
+
+# The local files a reference list names, next to `from` (a scheme, an absolute
+# path or a `data:` uri names none).
+local_references(from::AbstractString, refs) =
+    String[normpath(joinpath(dirname(from), r)) for r in (relative_reference(String(u)) for u in refs) if r !== nothing]
+
+# Files the browser fetches next to this one: a glTF's buffers and images, an
+# OBJ's material libraries and their textures, an HTML page's sources and links.
+file_references(state::ServerState, worker_id::AbstractString, path::AbstractString) =
+    file_references(Val(Symbol(lstrip(lowercase(splitext(path)[2]), '.'))), state, worker_id, path)
+
+file_references(::Val, ::ServerState, ::AbstractString, ::AbstractString) = String[]
+
+# A file that names others, whole; `nothing` if it is gone or too big (a glTF
+# that size embeds its data).
+function read_naming_file(state::ServerState, worker_id::AbstractString, path::AbstractString)
+    info = stat_worker_path(state, worker_id, path)
+    (info.isfile && info.size <= SHARE_MARKDOWN_MAX_BYTES) || return nothing
+    return String(read_worker_bytes(state, worker_id, info; max_bytes = info.size))
+end
+
+function file_references(::Val{:gltf}, state::ServerState, worker_id::AbstractString, path::AbstractString)
+    text = read_naming_file(state, worker_id, path)
+    text === nothing && return String[]
+    gltf = JSON.parse(text)
+    uris = [String(x["uri"]) for key in ("buffers", "images") for x in get(gltf, key, Any[])
+            if x isa AbstractDict && haskey(x, "uri")]
+    return local_references(path, uris)
+end
+
+# An HTML page's sources and links: its pictures, styles and scripts.
+function file_references(::Val{:html}, state::ServerState, worker_id::AbstractString, path::AbstractString)
+    text = read_naming_file(state, worker_id, path)
+    text === nothing && return String[]
+    return local_references(path, [m[1] for m in eachmatch(HTML_REFERENCE_RE, text)])
+end
+file_references(::Val{:htm}, state::ServerState, worker_id::AbstractString, path::AbstractString) =
+    file_references(Val(:html), state, worker_id, path)
+
+# `mtllib` comes first in an OBJ, which can be hundreds of megabytes of vertices.
+function file_references(::Val{:obj}, state::ServerState, worker_id::AbstractString, path::AbstractString)
+    info = stat_worker_path(state, worker_id, path)
+    info.isfile || return String[]
+    head = String(read_worker_bytes(state, worker_id, info; max_bytes = 64 * 1024))
+    libs = [strip(l[8:end]) for l in eachline(IOBuffer(head)) if startswith(l, "mtllib ")]
+    mtls = local_references(path, libs)
+    return [mtls; (t for mtl in mtls for t in mtl_textures(state, worker_id, mtl))...]
+end
+
+# The texture maps a material library names (the file is the last word of a
+# `map_Kd`, `bump`, `disp`, `decal`, `norm` or `refl` line, after its options).
+function mtl_textures(state::ServerState, worker_id::AbstractString, mtl::AbstractString)
+    text = read_naming_file(state, worker_id, mtl)
+    text === nothing && return String[]
+    names = [last(split(l)) for l in eachline(IOBuffer(text))
+             if occursin(r"^\s*(map_\w+|bump|disp|decal|norm|refl)\s+\S", l)]
+    return local_references(mtl, names)
+end
+
+# The page: the file's name, a download button and the file's viewer. The
+# browser reads the file at its path under the link, relative to this page.
+function share_page(::ViewShare, state::ServerState, l::ShareLink, context)
+    url = share_href(relpath(normpath(l.path), link_root(state, l)))
+    kind = file_kind(l.path)
+    # Read here, on the request's task: a parsed kind is a worker round-trip.
+    viewer = viewer_or_error(() -> file_viewer(kind, share_input(kind, state, l, url), l.path, PanelView()), l.path)
+    app = App(; title = l.title) do session
+        open_share_page!(state, Bonito.root_session(session))
+        # Bonito.MarkdownCSS: a notebook's markdown cells.
+        return DOM.div(Bonito.MarkdownCSS, ShareStyles, share_bar(l, url),
+                       DOM.div(viewer; class = "bt-share-viewer");
+                       class = "bt-share-page")
+    end
+    return Bonito.HTTPServer.apply_handler(app, context)
+end
+
+# What the page's viewer is given: the file's url under the link, or its
+# content, read from the worker. HTML written into it is left out (`FileContent`).
+share_input(::StreamedKind, state::ServerState, l::ShareLink, url::AbstractString) = url
+
+function share_input(kind::ParsedKind, state::ServerState, l::ShareLink, url::AbstractString)
+    info = stat_worker_path(state, l.worker_id, l.path)
+    bytes = read_worker_bytes(state, l.worker_id, info; max_bytes = share_read_bytes(kind, info.size))
+    return FileContent(bytes; size = info.size, raw_html = false)
+end
+
+# All of it, if its kind can show that much; of a binary only what its dump shows.
+share_read_bytes(kind::ParsedKind, size::Integer) = check_view_size(kind, size)
+share_read_bytes(::BinaryFile, size::Integer) = min(size, HEXDUMP_BYTES)
+
+# A page the login gate lets through, with its websocket and the assets its
+# session registered (`is_share_target`), until it closes.
+function open_share_page!(state::ServerState, root::Bonito.Session)
+    reg = state.shares
+    lock(() -> (reg.pages[root.id] = root), reg.lock)
+    on(root.on_close) do _
+        lock(reg.lock) do
+            delete!(reg.pages, root.id)
+            delete!(reg.asset_checks, root.id)
+        end
+    end
+    return root
+end
+
 # ── App pages ────────────────────────────────────────────────────────────────
 
 const ShareStyles = Bonito.Styles(
-    CSS(".bt-share-page", "max-width" => "1200px", "margin" => "0 auto", "padding" => "16px",
-        "font-family" => "system-ui, sans-serif"),
-    CSS(".bt-share-note", "color" => "#57534e", "padding" => "2rem 0"))
+    THEME_TOKENS, BUTTON_CSS...,
+    # Light, as the viewers in them are: Bonito's own theme follows a dark
+    # desktop otherwise (see `html:root` in styles.jl BASE_CSS for why `html:`).
+    CSS("html:root", "color-scheme" => "light"),
+    CSS(".bt-share-page", "max-width" => "1200px", "margin" => "0 auto", "padding" => "var(--bt-space-4)",
+        "font-family" => "system-ui, sans-serif", "color" => "var(--bt-text)"),
+    CSS(".bt-share-note", "color" => "var(--bt-text-muted)", "padding" => "2rem 0"),
+    CSS(".bt-share-bar", "display" => "flex", "align-items" => "center", "gap" => "var(--bt-space-3)",
+        "padding-bottom" => "var(--bt-space-3)"),
+    CSS(".bt-share-name", "font-weight" => "600", "overflow-wrap" => "anywhere", "flex" => "1 1 auto"),
+    # The viewer fills the window below the bar.
+    CSS(".bt-share-viewer", "display" => "flex", "flex-direction" => "column",
+        "height" => "calc(100vh - 96px)", "min-height" => "320px",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius)", "overflow" => "hidden"))
+
+# A style sheet as CSS text, for a page without Bonito (`share_page(::MarkdownShare)`).
+# Sheets with an `Asset` in them need a session to name its url.
+css_text(styles::Bonito.Styles) =
+    sprint(io -> foreach(css -> Bonito.render_style(io, nothing, "", css), values(styles.styles)))
 
 function share_page(::AppShare, state::ServerState, l::ShareLink, context)
     app = App(; title = l.title) do session
-        root = Bonito.root_session(session)
-        reg = state.shares
-        lock(() -> (reg.pages[root.id] = root), reg.lock)
-        on(root.on_close) do _
-            lock(reg.lock) do
-                delete!(reg.pages, root.id)
-                delete!(reg.asset_checks, root.id)
-            end
-        end
+        root = open_share_page!(state, Bonito.root_session(session))
         content = Observable{Any}(DOM.div("Starting the app…"; class = "bt-share-note"))
         Base.errormonitor(@async content[] = share_app_content(state, l, root))
         return DOM.div(ShareStyles, content; class = "bt-share-page")
@@ -496,7 +698,7 @@ function share_project_file!(state::ServerState, project_id::AbstractString, pat
     p = get(state.projects[], String(project_id), nothing)
     p === nothing && error("the chat is gone")
     path = worker_isabspath(path) ? normalize_worker_path(path) : worker_join(p.worker_path, path)
-    return share_url(state, create_share!(state, acting_owner(state), p.worker_id, path))
+    return share_url(state, create_share!(state, acting_owner(state), p.worker_id, path; project_id = p.id))
 end
 
 function shared_result_bridge(state::ServerState, project_id::AbstractString, ref::AbstractString)
@@ -638,7 +840,7 @@ function dev_op(state::ServerState, ::Val{:share}, args::AbstractDict, caller::S
     path = String(strip(String(get(args, "path", ""))))
     isempty(path) && error("`path` (the file to share) is required")
     path = worker_isabspath(path) ? normalize_worker_path(path) : worker_join(p.worker_path, path)
-    l = create_share!(state, p.owner, p.worker_id, path;
+    l = create_share!(state, p.owner, p.worker_id, path; project_id = p.id,
                       env_path = String(get(args, "env_path", "")),
                       title = String(get(args, "title", "")),
                       password = String(get(args, "password", "")))

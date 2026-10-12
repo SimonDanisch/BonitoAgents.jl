@@ -47,8 +47,10 @@ register!(
               \"\"\")
           end
         The file is evaluated once now, so an error in it comes back here.
-      - Other files are served directly, including images, videos and documents.
-        Only that file is reachable. HTML and SVG are sandboxed without scripts.
+      - Any other file becomes a page with the chat's viewer for it (3D model,
+        image, video, audio, PDF, HTML, .csv/.tsv, .ipynb, code, text) and a
+        Download button. A model or HTML page also serves the files it names
+        inside its project, nothing else; HTML scripts run sandboxed.
     The chat's Share button can also share a live bt_julia_eval result without
     evaluating its code again; that link needs the original Julia session and
     result to stay open.

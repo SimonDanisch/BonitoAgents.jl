@@ -21,7 +21,7 @@
     # response, then on the render barrier, and with no ACP session bound the
     # barrier is a no-op (there is no renderer to wait for).
     const ACP = BT.AgentClientProtocol
-    span = ACP.PromptSpan(1)
+    span = ACP.PromptTurn(1)
     put!(span.response, Dict{String,Any}("stopReason" => "end_turn"))
     BT.while_busy(tab) do
         # Claimed through the TAB, but the flag and the spinner are the parent's.

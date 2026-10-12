@@ -19,23 +19,24 @@ using BonitoMCP
 using Bonito
 const BT = BonitoAgents
 
-# Classify what `render_show_file` produced without needing a live session.
-# Ordered most-specific first: a notebook contains a rendered markdown cell, so
-# the notebook wrapper has to be recognised before the markdown class.
+# Classify what `render_show_file` produced without needing a live session, by
+# the class of its root: printed without a session, a viewer's style sheet
+# (`FileViewStyles`) comes out as text naming every viewer's classes.
+root_class(node) = node isa Bonito.Hyperscript.Node ? get(Bonito.Hyperscript.attrs(node), "class", "") : ""
+
 function show_kind(node)
     nameof(typeof(node)) === :MonacoEditor && return :text
+    node isa BT.MeshViewer && return :mesh
+    cls = root_class(node)
+    for (c, kind) in ("bt-fv-notebook" => :notebook, "bt-fv-table-wrap" => :table,
+                      "bt-fv-markdown" => :markdown, "bt-fv-hex-wrap" => :binary,
+                      "bt-fv-frame-wrap" => :frame, "bt-fv-audio-wrap" => :audio,
+                      "bt-tool-empty" => :caption, "bt-tool-error" => :error)
+        occursin(c, cls) && return kind
+    end
     s = sprint(show, node)
-    occursin("bt-fv-notebook", s) && return :notebook
-    occursin("bt-mesh-view", s)   && return :mesh
-    occursin("bt-fv-table", s)    && return :table
-    occursin("bt-fv-markdown", s) && return :markdown
-    occursin("bt-fv-hex", s)      && return :binary
-    occursin("bt-fv-frame", s)    && return :frame
     occursin("<img", s)   && return :image
     occursin("<video", s) && return :video
-    occursin("<audio", s) && return :audio
-    occursin("bt-tool-empty", s) && return :caption
-    occursin("bt-tool-error", s) && return :error
     return :unknown
 end
 

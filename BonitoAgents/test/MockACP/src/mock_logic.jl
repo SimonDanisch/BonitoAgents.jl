@@ -424,15 +424,31 @@ function ensure_dispatcher!()
     return DISPATCHER_SOCK[]
 end
 
+# Context/cost telemetry — the shape claude-agent-acp ≥ 0.44 emits after every
+# assistant message, tagged with the cycle's origin at a cycle's result.
+function emit_usage(ev::AbstractDict)
+    fields = Dict{String,Any}("used" => get(ev, "used", 0),
+                              "size" => get(ev, "size", 0))
+    haskey(ev, "cost") && (fields["cost"] =
+        Dict("amount" => ev["cost"], "currency" => "USD"))
+    haskey(ev, "origin") && (fields["_meta"] =
+        Dict("_claude/origin" => Dict("kind" => String(ev["origin"]))))
+    upd("usage_update", fields)
+    return nothing
+end
+
 # One BETWEEN-TURN frame (the `post_turn` event's payload, emitted after the
 # prompt response — like the real agent streaming a bg subagent's activity and
 # its auto-wake announcement after end_turn). Supports the shapes the
 # between-turn wire actually carries (fixtures/bg_subagent_wire.jsonl):
-# untagged text, tagged sub_text/sub_tool.
+# untagged text, tagged sub_text/sub_tool, and the usage that ends the agent's
+# own turn.
 function emit_post_event(ev::AbstractDict)
     et = String(get(ev, "type", ""))
     if et == "text"
         agent_chunk(String(ev["text"]))
+    elseif et == "usage"
+        emit_usage(ev)
     elseif et == "sub_text"
         upd("agent_message_chunk", Dict{String,Any}(
             "content" => Dict("type" => "text", "text" => String(ev["text"])),
@@ -891,13 +907,7 @@ function run_dispatcher_prompt(prompt_id)
                     "text" => "Warning: " * ev["record"]["title"])))
             end
         elseif et == "usage"
-            # Context/cost telemetry — the shape claude-agent-acp ≥ 0.44 emits
-            # after every assistant message.
-            fields = Dict{String,Any}("used" => get(ev, "used", 0),
-                                      "size" => get(ev, "size", 0))
-            haskey(ev, "cost") && (fields["cost"] =
-                Dict("amount" => ev["cost"], "currency" => "USD"))
-            upd("usage_update", fields)
+            emit_usage(ev)
         elseif et == "commands"
             # The agent's slash-command set (complete state).
             upd("available_commands_update",

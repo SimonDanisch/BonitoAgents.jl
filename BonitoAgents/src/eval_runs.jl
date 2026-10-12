@@ -21,8 +21,6 @@
 # `bt_julia_wait` already blocked on them to collect them, which makes the note
 # unnecessary.
 const RUN_NOTE_BATCH_S = 3.0
-# How often a note waiting for the agent to go idle looks again.
-const RUN_NOTE_POLL_S  = 2.0
 # How long a run whose process lost its channel keeps running in the chat before
 # it counts as lost: a reconnect (link blip, server restart on the other side)
 # announces it again within seconds.
@@ -416,7 +414,7 @@ function deliver_run_notes!(chat::ChatModel)
             due = due_notes(book)
             isempty(due) && return nothing
             if chat.busy_active[]
-                sleep(RUN_NOTE_POLL_S)
+                wait_idle(chat)
                 continue
             end
             lock(book.lock) do

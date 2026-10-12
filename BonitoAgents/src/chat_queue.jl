@@ -141,6 +141,12 @@ function starting_session!(model, entry::PendingSend)
     return nothing
 end
 
+# What a "when done" message waits for: our prompts the agent has not answered.
+# Not the agent's own turns, which fold a new prompt in; a Stop winding down is
+# `begin_turn`'s wait.
+prompts_ahead(model) =
+    filter(t -> t isa AgentClientProtocol.PromptTurn, AgentClientProtocol.open_turns(model))
+
 # Hand one outbox entry to the agent and see its turn through. Returns whether
 # the consumer should go on with the next entry.
 #
@@ -150,16 +156,6 @@ end
 #     consumer stops here instead of retrying in a loop;
 #   * the chat was closed → `:waiting` on disk, sent when the chat reopens;
 #   * anything else failed → `:paused` with the error, for the user to judge.
-# What a message sent "when done" waits for: a turn of ours in flight, or a
-# cancel winding one down. Not work the agent does on its own (`Unprompted`, an
-# auto-wake after backgrounded work, a background subagent reporting): that has
-# no end the agent announces, only 30s of quiet, and a background subagent can
-# keep it going for as long as it runs. The next prompt is what ends such an
-# episode, so waiting for it held the message back for good.
-waits_for_turn(::AgentClientProtocol.SessionActivity) = false
-waits_for_turn(::AgentClientProtocol.Prompted) = true
-waits_for_turn(::AgentClientProtocol.Cancelling) = true
-
 function run_submission!(model, entry)
     emit_queue!(model)
     failure = nothing
@@ -170,15 +166,17 @@ function run_submission!(model, entry)
                 finish_turn!(model, entry.span.turn; nstore0=entry.span.nstore0)
             end
         else
-            if entry.mode == :done && waits_for_turn(session_activity(model))
+            # Asked again after each wait: a "next" message steered in
+            # meanwhile is a new prompt this one must also wait for.
+            while entry.mode == :done && entry.status == :sending
+                ahead = prompts_ahead(model)
+                isempty(ahead) && break
                 entry.detail = "Waiting until the agent finishes"
                 emit_queue!(model)
-                while entry.status == :sending && waits_for_turn(session_activity(model))
-                    sleep(0.05)
-                end
-                entry.status == :sending || return true
-                entry.detail = ""
+                foreach(wait, ahead)
             end
+            entry.status == :sending || return true
+            entry.detail = ""
             begin_turn(model, entry.message; submission=entry) do turn
                 finish_turn!(model, turn; nstore0=entry.span.nstore0)
             end
@@ -250,8 +248,8 @@ function deliver_boundary_message!(model)
     s = shared(model)
     c = client(s.agent)
     c === nothing && return nothing
-    AgentClientProtocol.session_live(c) || return nothing
-    AgentClientProtocol.session_activity(c.conn) isa AgentClientProtocol.Cancelling && return nothing
+    isempty(AgentClientProtocol.open_turns(c)) && return nothing
+    cancelling(s) && return nothing
     lock(s.lock) do
         i = findfirst(e -> e isa PendingSend && e.status == :waiting && e.mode == :next, s.pending_sends)
         i === nothing && return nothing

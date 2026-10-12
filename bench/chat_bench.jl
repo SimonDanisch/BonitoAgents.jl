@@ -182,6 +182,73 @@ function background_events(paths)
     return evs
 end
 
+# One edit per file: a 40-line body with one line changed, as an agent's Edit
+# looks in a real session. `base` keeps ids and paths unique across rounds.
+function edit_events(n; marker, base = 0)
+    evs = Any[]
+    for i in 1:n
+        k = base + i
+        old = join(("    x$(j) = compute($(j), $(k))" for j in 1:40), "\n")
+        new = replace(old, "x20 = compute(20" => "x20 = compute_fast(20")
+        push!(evs, TK.text("Editing file $(k)."))
+        push!(evs, TK.edit("/p/src/file$(k).jl", old, new; id = "e$(k)-$(rand(UInt32))"))
+    end
+    push!(evs, TK.text(marker), TK.end_turn())
+    return evs
+end
+
+# The same shape with reads instead of edits: the control for `edit_events`.
+function read_events(n; marker, base = 0)
+    evs = Any[]
+    for i in 1:n
+        k = base + i
+        push!(evs, TK.text("Reading file $(k)."))
+        push!(evs, TK.tool(kind = "read", title = "read file $(k)", id = "r$(k)-$(rand(UInt32))",
+                           content = Any[Dict("type" => "text", "text" =>
+                               join(("    x$(j) = compute($(j), $(k))" for j in 1:40), "\n"))]))
+    end
+    push!(evs, TK.text(marker), TK.end_turn())
+    return evs
+end
+
+# What the page holds: live Monaco editors, DOM nodes, JS heap.
+dom_stats(s) = TK.eval_js(s, """(() => ({
+    diff_editors: document.querySelectorAll('.monaco-diff-editor').length,
+    editors: document.querySelectorAll('.monaco-editor').length,
+    nodes: document.getElementsByTagName('*').length,
+    heap_mb: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1e6) : -1}))()""")
+
+# Scroll the visible chat from bottom to top in `steps`, a frame apart, and
+# report the JS time it cost (the long tasks it caused).
+function scroll_through(s; steps = 40)
+    return timed(s) do
+        t0 = time()
+        TK.eval_js(s, """(async () => {
+            const c = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent);
+            const top = c.scrollHeight;
+            for (let i = 0; i <= $(steps); i++) {
+                c.scrollTop = top * (1 - i / $(steps));
+                await new Promise(r => setTimeout(r, 50));
+            }
+            return true; })()""")
+        time() - t0
+    end
+end
+
+# Rounds of `per_round` tools into one chat: does a round cost more the more the
+# chat already holds?
+function tool_rounds(s, events; rounds = 6, per_round = 50)
+    out = Any[]
+    for r in 1:rounds
+        m = "END-ROUND-$(r)-$(rand(UInt32))"
+        res = timed(s) do
+            send_and_wait(s, events(per_round; marker = m, base = (r - 1) * per_round), m)
+        end
+        push!(out, (; before = (r - 1) * per_round, res..., dom = dom_stats(s)))
+    end
+    return out
+end
+
 # ── workloads ───────────────────────────────────────────────────────────────
 
 function timed(f, s)
@@ -256,6 +323,29 @@ function setup(; width = 1280, height = 900)
     TK.wait_for(s, "the chat", "(() => { const c = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent); return !!c && !!c.__bt_chat; })()"; timeout = 60)
     TK.eval_js(s, INSTRUMENT_JS)
     return s
+end
+
+# Edits against reads, each in a fresh chat of its own: rounds, then a reload
+# and a scroll through the whole history.
+function run_edits(; rounds = 6, per_round = 50)
+    results = Dict{String,Any}()
+    for (name, events) in ("edits" => edit_events, "reads" => read_events)
+        s = setup()
+        try
+            sleep(10.0)
+            rows = tool_rounds(s, events; rounds, per_round)
+            last_marker = "END-LAST-$(name)"
+            SCRIPT.events = Any[TK.text(last_marker), TK.end_turn()]
+            TK.eval_js(s, watch_js(last_marker))
+            TK.send_message(s, "done")
+            wait_marker(s, last_marker)
+            results[name] = (; rounds = rows, scroll = scroll_through(s),
+                              reload = reload_history(s, last_marker), dom_after_reload = dom_stats(s))
+        finally
+            close(s)
+        end
+    end
+    return results
 end
 
 function run_all(; stream_n = 2000, burst_n = 300, background_k = 3)

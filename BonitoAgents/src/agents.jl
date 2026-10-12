@@ -169,7 +169,10 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
         "mcpServers" => mcp_list,
         "provider"   => pname); priority = 1)
 
-    conn = ACP.Connection(transport, a.handler; on_frame)
+    # Claude-like agents start turns of their own and mark where they end; the
+    # connection opens and ends those (`ACP.AgentTurn`).
+    conn = ACP.Connection(transport, a.handler; on_frame,
+                          agent_turns = reports_autonomous_origin(a.provider))
     init = ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict(

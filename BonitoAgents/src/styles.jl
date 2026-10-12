@@ -354,8 +354,9 @@ function login_guard(session::Bonito.Session, ::LoginAuth)
 end
 
 
-const BASE_CSS = [
-    CSS(":root",
+# The design tokens (`--bt-*`): the one rule a component used outside the
+# dashboard needs from the base (see MeshViewStyles / MediaStyles).
+const THEME_TOKENS = CSS(":root",
         # `color-scheme` is NOT declared here — see the `html:root` rule in the
         # reset below for why a plain `:root` loses the cascade to BonitoWidgets.
         "--bt-bg"            => "#fafaf9",
@@ -394,33 +395,13 @@ const BASE_CSS = [
         "--bt-status-online"  => "#16a34a",
         "--bt-status-active"  => "#16a34a",
         "--bt-status-offline" => "#dc2626",
-        "--bt-status-update"  => "#f59e0b"),
+        "--bt-status-update"  => "#f59e0b")
 
-    # ── Reset ────────────────────────────────────────────────────────────────
-    # This is a LIGHT app, and it has to SAY so. Without `color-scheme`, a user
-    # whose desktop is in dark mode gets the UA's DARK defaults for every native
-    # control that doesn't set its own colour: the "new project" worker dropdown
-    # rendered white-on-white and read as an empty box, with nothing in any
-    # stylesheet to blame for the white text. It fixes that whole class at once —
-    # selects, inputs, scrollbars, the native pickers — rather than one
-    # hard-coded colour per control (which is what forcing Monaco's "vs" theme in
-    # chat.jl already had to do).
-    #
-    # `html:root` rather than plain `:root`: BonitoWidgets ships
-    # `@media (prefers-color-scheme: dark) { :root { color-scheme: dark } }`, which
-    # has the SAME specificity and lands later in the cascade, so a plain `:root`
-    # here silently loses. The extra type selector wins on specificity instead of
-    # on source order, which no amount of include-order shuffling can undo.
-    CSS("html:root", "color-scheme" => "light"),
-    # Class-toggle helper: collapses an element without removing it from the
-    # DOM, so interactive state (a folder selection, scan results, focus)
-    # survives while it is hidden.
-    CSS(".bt-hidden", "display" => "none !important"),
-
-    # ── Buttons ──────────────────────────────────────────────────────────────
-    # `.bt-btn` is the filled primary; `-secondary` the bordered surface button
-    # (most controls); `-ghost` borderless; `-danger` for the destructive one;
-    # `-sm` the compact size used in headers and cards.
+# `.bt-btn` is the filled primary; `-secondary` the bordered surface button
+# (most controls); `-ghost` borderless; `-danger` for the destructive one;
+# `-sm` the compact size used in headers and cards. Part of BASE_CSS, and of
+# every sheet that is mounted on its own (a shared page).
+const BUTTON_CSS = [
     CSS(".bt-btn",
         "appearance" => "none", "border" => "1px solid transparent",
         "padding" => "6px 12px",
@@ -428,7 +409,7 @@ const BASE_CSS = [
         "background" => "var(--bt-accent)", "color" => "#fff",
         "font" => "inherit", "font-size" => "13px", "font-weight" => "500",
         "line-height" => "18px",
-        "cursor" => "pointer",
+        "cursor" => "pointer", "text-decoration" => "none",
         # Never break the label across lines: a narrow viewport would otherwise
         # let "+ New project" wrap to two lines inside the button.
         "white-space" => "nowrap",
@@ -455,6 +436,33 @@ const BASE_CSS = [
         "opacity" => "0.7", "cursor" => "wait"),
     CSS(".bt-btn-sm",
         "padding" => "3px 9px", "font-size" => "12px"),
+]
+
+const BASE_CSS = [
+    THEME_TOKENS,
+
+    # ── Reset ────────────────────────────────────────────────────────────────
+    # This is a LIGHT app, and it has to SAY so. Without `color-scheme`, a user
+    # whose desktop is in dark mode gets the UA's DARK defaults for every native
+    # control that doesn't set its own colour: the "new project" worker dropdown
+    # rendered white-on-white and read as an empty box, with nothing in any
+    # stylesheet to blame for the white text. It fixes that whole class at once —
+    # selects, inputs, scrollbars, the native pickers — rather than one
+    # hard-coded colour per control (which is what forcing Monaco's "vs" theme in
+    # chat.jl already had to do).
+    #
+    # `html:root` rather than plain `:root`: BonitoWidgets ships
+    # `@media (prefers-color-scheme: dark) { :root { color-scheme: dark } }`, which
+    # has the SAME specificity and lands later in the cascade, so a plain `:root`
+    # here silently loses. The extra type selector wins on specificity instead of
+    # on source order, which no amount of include-order shuffling can undo.
+    CSS("html:root", "color-scheme" => "light"),
+    # Class-toggle helper: collapses an element without removing it from the
+    # DOM, so interactive state (a folder selection, scan results, focus)
+    # survives while it is hidden.
+    CSS(".bt-hidden", "display" => "none !important"),
+
+    BUTTON_CSS...,
 
     # ── Menu: a popover of one-shot actions ──────────────────────────────────
     # `.bt-menu` wraps a trigger button and a `.bt-menu-list`; the trigger
@@ -634,6 +642,251 @@ const BASE_CSS = [
     CSS(".bt-prog-close", "flex" => "0 0 auto"),
     CSS(".bt-prog-run .bt-prog-close", "display" => "none"),
 ]
+
+# What each file kind shows (file_view.jl `file_viewer`): in the chat's bubbles
+# and file tabs, and on a shared link's page (shares.jl).
+const FILE_VIEW_CSS = [
+    CSS(".bt-fv-badge",
+        "font-size" => "10px", "text-transform" => "uppercase",
+        "letter-spacing" => "0.04em",
+        "color" => "var(--bt-text-faint)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "999px", "padding" => "1px 7px",
+        "flex-shrink" => "0", "white-space" => "nowrap"),
+    CSS(".bt-fv-error", "margin" => "12px"),
+    CSS(".bt-fv-loading",
+        "padding" => "16px", "font-size" => "12.5px",
+        "color" => "var(--bt-text-faint)", "font-style" => "italic"),
+    CSS(".bt-fv-error-title", "font-weight" => "600"),
+    CSS(".bt-fv-error-detail",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
+        "margin-top" => "4px", "opacity" => "0.85"),
+
+    # Image stage: a checkerboard so transparency reads as transparency, and the
+    # image centred + contained rather than pinned to the top-left.
+    CSS(".bt-fv-image-stage",
+        "flex" => "1 1 auto", "min-height" => "0",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "padding" => "12px", "overflow" => "auto",
+        "background-color" => "var(--bt-surface)",
+        "background-image" => string(
+            "linear-gradient(45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
+            "linear-gradient(-45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
+            "linear-gradient(45deg, transparent 75%, rgba(15,23,42,0.06) 75%),",
+            "linear-gradient(-45deg, transparent 75%, rgba(15,23,42,0.06) 75%)"),
+        "background-size" => "18px 18px",
+        "background-position" => "0 0, 0 9px, 9px -9px, -9px 0"),
+    # An IMAGE is shown at its own size, shrunk to fit. `max-height: 100%` on the
+    # <img> ALONE does nothing: the percentage resolves against `.bt-media-wrap`,
+    # whose own height comes from its content, so a 1500px-tall image kept every
+    # pixel and ran off the bottom of the tab. The wrap has to be a flex box
+    # that is allowed to shrink (`min-height: 0`) before the image inside it can.
+    CSS(".bt-fv-image-stage .bt-media-wrap",
+        "max-height" => "100%", "min-height" => "0", "display" => "flex"),
+    CSS(".bt-fv-image-stage img.bt-media",
+        "max-height" => "100%", "min-height" => "0", "object-fit" => "contain"),
+    # A VIDEO instead FILLS its stage and letterboxes, the way every video player
+    # behaves. Left at its intrinsic size a small clip renders as a handful of
+    # pixels with the browser's controls collapsed into nothing: you can see the
+    # file but you cannot play it, which is the one thing a video tab is for.
+    # Sized on the WRAP (whose containing block is the stage, and so has a real
+    # size) rather than by a minimum on the video — a percentage minimum there
+    # resolves against the shrink-to-fit wrapper and comes out as zero.
+    CSS(".bt-fv-video-stage .bt-media-wrap", "width" => "100%", "height" => "100%"),
+    CSS(".bt-fv-video-stage video.bt-media",
+        "width" => "100%", "height" => "100%", "object-fit" => "contain"),
+
+    # Video gets a stage of its own: centred, on a dark backdrop (the neutral
+    # surround every video player uses), and CONTAINED — `media_element` caps
+    # width only, so without the max-height here a portrait or 4K clip pushes its
+    # own controls off the bottom of the tab.
+    CSS(".bt-fv-video-stage",
+        "flex" => "1 1 auto", "min-height" => "0",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "padding" => "12px", "overflow" => "auto",
+        "background" => "#1b1d21"),
+    CSS(".bt-fv-audio-wrap",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
+        "align-items" => "center", "justify-content" => "center",
+        "padding" => "24px", "flex" => "1 1 auto"),
+    CSS(".bt-fv-audio", "width" => "min(520px, 100%)"),
+    CSS(".bt-fv-audio-name",
+        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "font-family" => "ui-monospace, monospace"),
+
+    CSS(".bt-fv-markdown",
+        "padding" => "16px 22px", "overflow" => "auto",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    # Inside a chat bubble the preview is one block among many — no pane padding,
+    # and capped so a 900-line README doesn't bury the rest of the turn.
+    CSS(".bt-tool-body .bt-fv-markdown",
+        "padding" => "0", "max-height" => "420px"),
+
+    # Frames (pdf / html). `border:none` + a surface background so a page that
+    # doesn't set its own doesn't render as a grey void.
+    CSS(".bt-fv-frame-wrap",
+        "flex" => "1 1 auto", "min-height" => "0", "display" => "flex"),
+    CSS(".bt-fv-frame",
+        "flex" => "1 1 auto", "width" => "100%", "border" => "none",
+        "background" => "#fff", "min-height" => "0"),
+    CSS(".bt-tool-body .bt-fv-frame-wrap", "height" => "480px"),
+
+    # ── Table (csv / tsv) ────────────────────────────────────────────────────
+    CSS(".bt-fv-table-wrap",
+        "display" => "flex", "flex-direction" => "column",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-fv-table-bar",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "padding" => "6px 10px", "flex-shrink" => "0",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-fv-table-filter",
+        "flex" => "0 1 260px", "font-size" => "12px",
+        "padding" => "3px 8px", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)"),
+    CSS(".bt-fv-table-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
+    CSS(".bt-fv-table-scroll",
+        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto"),
+    CSS(".bt-tool-body .bt-fv-table-scroll", "max-height" => "420px"),
+    CSS(".bt-fv-table",
+        "border-collapse" => "separate", "border-spacing" => "0",
+        "font-size" => "12px", "font-family" => "ui-monospace, monospace",
+        "width" => "max-content", "min-width" => "100%"),
+    CSS(".bt-fv-table th",
+        # Sticky header: scrolling a 5000-row table without losing the column
+        # names is most of what makes this better than looking at the raw text.
+        "position" => "sticky", "top" => "0", "z-index" => "1",
+        "background" => "var(--bt-surface-2)",
+        "border-bottom" => "1px solid var(--bt-border)",
+        "padding" => "5px 10px", "text-align" => "left",
+        "white-space" => "nowrap", "font-weight" => "600"),
+    CSS(".bt-fv-table td",
+        "padding" => "3px 10px", "white-space" => "nowrap",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-fv-table tbody tr:hover td", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-fv-table .bt-fv-num", "text-align" => "right"),
+    CSS(".bt-fv-table .bt-fv-rownum",
+        "color" => "var(--bt-text-faint)", "text-align" => "right",
+        "user-select" => "none",
+        "position" => "sticky", "left" => "0",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-table th.bt-fv-rownum", "background" => "var(--bt-surface-2)", "z-index" => "2"),
+    CSS(".bt-fv-sortable", "cursor" => "pointer", "user-select" => "none"),
+    CSS(".bt-fv-sort-arrow", "opacity" => "0.35", "margin-left" => "6px"),
+    CSS(".bt-fv-sortable:hover .bt-fv-sort-arrow", "opacity" => "0.8"),
+
+    # ── Notebook ─────────────────────────────────────────────────────────────
+    CSS(".bt-fv-notebook",
+        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto",
+        "padding" => "12px 16px", "display" => "flex", "flex-direction" => "column",
+        "gap" => "10px"),
+    CSS(".bt-fv-nb-cell",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)", "overflow" => "hidden"),
+    CSS(".bt-fv-nb-md", "padding" => "2px 14px", "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-nb-source", "background" => "var(--bt-surface-2)", "padding" => "6px 8px"),
+    CSS(".bt-fv-nb-outputs",
+        "border-top" => "1px solid var(--bt-border)", "padding" => "8px 12px",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-nb-text",
+        "margin" => "0", "font-family" => "ui-monospace, monospace",
+        "font-size" => "11.5px", "white-space" => "pre-wrap",
+        "max-height" => "320px", "overflow" => "auto"),
+    CSS(".bt-fv-nb-image", "max-width" => "100%", "display" => "block"),
+    CSS(".bt-fv-more",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "font-style" => "italic", "padding" => "4px 2px"),
+
+    # ── Hex dump ─────────────────────────────────────────────────────────────
+    CSS(".bt-fv-hex-wrap",
+        "display" => "flex", "flex-direction" => "column",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-fv-hex-bar",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "padding" => "6px 10px", "flex-shrink" => "0"),
+    CSS(".bt-fv-hex-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
+    CSS(".bt-fv-hex",
+        "margin" => "0", "padding" => "0 12px 12px",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
+        "line-height" => "1.5", "color" => "var(--bt-text-muted)",
+        "overflow" => "auto", "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-tool-body .bt-fv-hex", "max-height" => "360px"),
+    # Read-only code that fills its box and scrolls itself (a shared link's page);
+    # in a chat bubble code is sized to its content instead (`monaco_readonly`).
+    CSS(".bt-fv-code", "flex" => "1 1 auto", "min-height" => "0", "height" => "100%"),
+    CSS(".bt-fv-code > div, .bt-fv-code .monaco-editor-div", "height" => "100%", "min-height" => "0"),
+]
+
+# The 3D viewer (file_view.jl `MeshViewer`), in the chat and on shared pages.
+const MESH_VIEW_CSS = [
+    CSS(".bt-mesh-view",
+        "position" => "relative", "flex" => "1 1 auto",
+        "min-height" => "0", "display" => "flex"),
+    # Inline (chat bubble) has no panel to fill, so it needs an explicit box.
+    CSS(""".bt-mesh-view[data-mode="inline"]""", "height" => "360px"),
+    CSS(".bt-mesh-canvas",
+        "flex" => "1 1 auto", "width" => "100%", "height" => "100%",
+        "display" => "block", "touch-action" => "none", "cursor" => "grab"),
+    CSS(".bt-mesh-canvas:active", "cursor" => "grabbing"),
+    CSS(".bt-mesh-toolbar",
+        "position" => "absolute", "top" => "8px", "right" => "8px",
+        "display" => "flex", "gap" => "4px"),
+    CSS(".bt-mesh-btn",
+        "border" => "1px solid var(--bt-border)", "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
+        "border-radius" => "var(--bt-radius-sm)", "padding" => "4px", "line-height" => "0"),
+    CSS(".bt-mesh-btn svg", "width" => "14px", "height" => "14px", "display" => "block"),
+    CSS(".bt-mesh-btn:hover", "color" => "var(--bt-text)"),
+    CSS(""".bt-mesh-btn[data-on="1"]""",
+        "background" => "var(--bt-accent)", "color" => "#fff", "border-color" => "var(--bt-accent)"),
+    CSS(".bt-mesh-btn:disabled", "opacity" => "0.4", "cursor" => "default"),
+    CSS(".bt-mesh-status",
+        "position" => "absolute", "left" => "10px", "bottom" => "8px",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "pointer-events" => "none"),
+]
+
+# Pictures and clips (chat.jl `media_element`) with their hover actions and the
+# click-to-enlarge lightbox: in the chat, and on a shared link's page.
+const MEDIA_CSS = [
+    # Media (bt_show / Read image & video) + click-to-enlarge lightbox. The wrap
+    # is the hover target for the ⤢ button; the fullscreen overlay holds a clone
+    # of the media and closes on backdrop click or Esc.
+    CSS(".bt-media-wrap",
+        "position" => "relative", "display" => "inline-block", "max-width" => "100%"),
+    # Hover action row (enlarge · copy · download), top-right of the media.
+    CSS(".bt-media-actions",
+        "position" => "absolute", "top" => "6px", "right" => "6px",
+        "display" => "flex", "gap" => "4px",
+        "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-media-wrap:hover .bt-media-actions", "opacity" => "1"),
+    CSS(".bt-media-action",
+        "appearance" => "none", "border" => "none",
+        "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
+        "font-size" => "14px", "line-height" => "1",
+        "padding" => "4px 7px", "border-radius" => "6px",
+        "cursor" => "pointer"),
+    CSS(".bt-media-action:hover", "background" => "rgba(0,0,0,0.8)"),
+    CSS(".bt-media-enlarge", "cursor" => "zoom-in"),
+    # Without hover (touch screens) the actions would stay invisible yet take
+    # the taps that land on them: show them. Specific enough to win wherever it
+    # lands: `Styles` merges every "@media (hover: none)" of a sheet into the
+    # place of the first one, which can be before the rule it overrides.
+    CSS("@media (hover: none)", CSS(".bt-media-wrap .bt-media-actions", "opacity" => "1")),
+    CSS(".bt-lightbox-overlay",
+        "position" => "fixed", "inset" => "0", "z-index" => "9999",
+        "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
+    CSS(".bt-lightbox-media",
+        "max-width" => "95vw", "max-height" => "95vh",
+        "box-shadow" => "0 8px 40px rgba(0,0,0,0.6)"),
+]
+
+# Each viewer carries its own sheet, so it renders outside the dashboard too.
+# Bonito renders a CSS object once per session: in the dashboard they cost nothing.
+const MeshViewStyles = Bonito.Styles(THEME_TOKENS, MESH_VIEW_CSS...)
+const MediaStyles    = Bonito.Styles(THEME_TOKENS, MEDIA_CSS...)
+const FileViewStyles = Bonito.Styles(THEME_TOKENS, FILE_VIEW_CSS...)
 
 const ChatStyles = Bonito.Styles(
     BASE_CSS...,
@@ -2047,13 +2300,6 @@ const ChatStyles = Bonito.Styles(
         "margin-left" => "6px", "opacity" => "0.7",
         "font-size" => "10.5px", "font-family" => "ui-monospace, monospace",
         "letter-spacing" => "0.02em"),
-    CSS(".bt-fv-badge",
-        "font-size" => "10px", "text-transform" => "uppercase",
-        "letter-spacing" => "0.04em",
-        "color" => "var(--bt-text-faint)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "999px", "padding" => "1px 7px",
-        "flex-shrink" => "0", "white-space" => "nowrap"),
     CSS(".bt-fv-size, .bt-fv-dims",
         "font-size" => "11px", "color" => "var(--bt-text-faint)",
         "flex-shrink" => "0", "white-space" => "nowrap"),
@@ -2120,191 +2366,11 @@ const ChatStyles = Bonito.Styles(
     # which are fine while the thing you actually read is 5px tall.
     CSS(".bt-fv-source > div, .bt-fv-editor, .bt-fv-editor > div, .bt-fv-source .monaco-editor-div",
         "height" => "100%", "min-height" => "0"),
-    CSS(".bt-fv-error", "margin" => "12px"),
-    CSS(".bt-fv-loading",
-        "padding" => "16px", "font-size" => "12.5px",
-        "color" => "var(--bt-text-faint)", "font-style" => "italic"),
-    CSS(".bt-fv-error-title", "font-weight" => "600"),
-    CSS(".bt-fv-error-detail",
-        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
-        "margin-top" => "4px", "opacity" => "0.85"),
-
-    # Image stage: a checkerboard so transparency reads as transparency, and the
-    # image centred + contained rather than pinned to the top-left.
-    CSS(".bt-fv-image-stage",
-        "flex" => "1 1 auto", "min-height" => "0",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center",
-        "padding" => "12px", "overflow" => "auto",
-        "background-color" => "var(--bt-surface)",
-        "background-image" => string(
-            "linear-gradient(45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
-            "linear-gradient(-45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
-            "linear-gradient(45deg, transparent 75%, rgba(15,23,42,0.06) 75%),",
-            "linear-gradient(-45deg, transparent 75%, rgba(15,23,42,0.06) 75%)"),
-        "background-size" => "18px 18px",
-        "background-position" => "0 0, 0 9px, 9px -9px, -9px 0"),
-    # An IMAGE is shown at its own size, shrunk to fit. `max-height: 100%` on the
-    # <img> ALONE does nothing: the percentage resolves against `.bt-media-wrap`,
-    # whose own height comes from its content, so a 1500px-tall image kept every
-    # pixel and ran off the bottom of the tab. The wrap has to be a flex box
-    # that is allowed to shrink (`min-height: 0`) before the image inside it can.
-    CSS(".bt-fv-image-stage .bt-media-wrap",
-        "max-height" => "100%", "min-height" => "0", "display" => "flex"),
-    CSS(".bt-fv-image-stage img.bt-media",
-        "max-height" => "100%", "min-height" => "0", "object-fit" => "contain"),
-    # A VIDEO instead FILLS its stage and letterboxes, the way every video player
-    # behaves. Left at its intrinsic size a small clip renders as a handful of
-    # pixels with the browser's controls collapsed into nothing: you can see the
-    # file but you cannot play it, which is the one thing a video tab is for.
-    # Sized on the WRAP (whose containing block is the stage, and so has a real
-    # size) rather than by a minimum on the video — a percentage minimum there
-    # resolves against the shrink-to-fit wrapper and comes out as zero.
-    CSS(".bt-fv-video-stage .bt-media-wrap", "width" => "100%", "height" => "100%"),
-    CSS(".bt-fv-video-stage video.bt-media",
-        "width" => "100%", "height" => "100%", "object-fit" => "contain"),
-
-    # Video gets a stage of its own: centred, on a dark backdrop (the neutral
-    # surround every video player uses), and CONTAINED — `media_element` caps
-    # width only, so without the max-height here a portrait or 4K clip pushes its
-    # own controls off the bottom of the tab.
-    CSS(".bt-fv-video-stage",
-        "flex" => "1 1 auto", "min-height" => "0",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center",
-        "padding" => "12px", "overflow" => "auto",
-        "background" => "#1b1d21"),
-    CSS(".bt-fv-audio-wrap",
-        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
-        "align-items" => "center", "justify-content" => "center",
-        "padding" => "24px", "flex" => "1 1 auto"),
-    CSS(".bt-fv-audio", "width" => "min(520px, 100%)"),
-    CSS(".bt-fv-audio-name",
-        "font-size" => "12px", "color" => "var(--bt-text-muted)",
-        "font-family" => "ui-monospace, monospace"),
-
-    CSS(".bt-fv-markdown",
-        "padding" => "16px 22px", "overflow" => "auto",
-        "flex" => "1 1 auto", "min-height" => "0"),
-    # Inside a chat bubble the preview is one block among many — no pane padding,
-    # and capped so a 900-line README doesn't bury the rest of the turn.
-    CSS(".bt-tool-body .bt-fv-markdown",
-        "padding" => "0", "max-height" => "420px"),
-
-    # Frames (pdf / html). `border:none` + a surface background so a page that
-    # doesn't set its own doesn't render as a grey void.
-    CSS(".bt-fv-frame-wrap",
-        "flex" => "1 1 auto", "min-height" => "0", "display" => "flex"),
-    CSS(".bt-fv-frame",
-        "flex" => "1 1 auto", "width" => "100%", "border" => "none",
-        "background" => "#fff", "min-height" => "0"),
-    CSS(".bt-tool-body .bt-fv-frame-wrap", "height" => "480px"),
-
-    # ── Table (csv / tsv) ────────────────────────────────────────────────────
-    CSS(".bt-fv-table-wrap",
-        "display" => "flex", "flex-direction" => "column",
-        "flex" => "1 1 auto", "min-height" => "0"),
-    CSS(".bt-fv-table-bar",
-        "display" => "flex", "align-items" => "center", "gap" => "10px",
-        "padding" => "6px 10px", "flex-shrink" => "0",
-        "border-bottom" => "1px solid var(--bt-border)"),
-    CSS(".bt-fv-table-filter",
-        "flex" => "0 1 260px", "font-size" => "12px",
-        "padding" => "3px 8px", "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "background" => "var(--bt-surface)", "color" => "var(--bt-text)"),
-    CSS(".bt-fv-table-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
-    CSS(".bt-fv-table-scroll",
-        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto"),
-    CSS(".bt-tool-body .bt-fv-table-scroll", "max-height" => "420px"),
-    CSS(".bt-fv-table",
-        "border-collapse" => "separate", "border-spacing" => "0",
-        "font-size" => "12px", "font-family" => "ui-monospace, monospace",
-        "width" => "max-content", "min-width" => "100%"),
-    CSS(".bt-fv-table th",
-        # Sticky header: scrolling a 5000-row table without losing the column
-        # names is most of what makes this better than looking at the raw text.
-        "position" => "sticky", "top" => "0", "z-index" => "1",
-        "background" => "var(--bt-surface-2)",
-        "border-bottom" => "1px solid var(--bt-border)",
-        "padding" => "5px 10px", "text-align" => "left",
-        "white-space" => "nowrap", "font-weight" => "600"),
-    CSS(".bt-fv-table td",
-        "padding" => "3px 10px", "white-space" => "nowrap",
-        "border-bottom" => "1px solid var(--bt-border)"),
-    CSS(".bt-fv-table tbody tr:hover td", "background" => "var(--bt-surface-2)"),
-    CSS(".bt-fv-table .bt-fv-num", "text-align" => "right"),
-    CSS(".bt-fv-table .bt-fv-rownum",
-        "color" => "var(--bt-text-faint)", "text-align" => "right",
-        "user-select" => "none",
-        "position" => "sticky", "left" => "0",
-        "background" => "var(--bt-surface)"),
-    CSS(".bt-fv-table th.bt-fv-rownum", "background" => "var(--bt-surface-2)", "z-index" => "2"),
-    CSS(".bt-fv-sortable", "cursor" => "pointer", "user-select" => "none"),
-    CSS(".bt-fv-sort-arrow", "opacity" => "0.35", "margin-left" => "6px"),
-    CSS(".bt-fv-sortable:hover .bt-fv-sort-arrow", "opacity" => "0.8"),
-
-    # ── Notebook ─────────────────────────────────────────────────────────────
-    CSS(".bt-fv-notebook",
-        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto",
-        "padding" => "12px 16px", "display" => "flex", "flex-direction" => "column",
-        "gap" => "10px"),
-    CSS(".bt-fv-nb-cell",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)", "overflow" => "hidden"),
-    CSS(".bt-fv-nb-md", "padding" => "2px 14px", "background" => "var(--bt-surface)"),
-    CSS(".bt-fv-nb-source", "background" => "var(--bt-surface-2)", "padding" => "6px 8px"),
-    CSS(".bt-fv-nb-outputs",
-        "border-top" => "1px solid var(--bt-border)", "padding" => "8px 12px",
-        "background" => "var(--bt-surface)"),
-    CSS(".bt-fv-nb-text",
-        "margin" => "0", "font-family" => "ui-monospace, monospace",
-        "font-size" => "11.5px", "white-space" => "pre-wrap",
-        "max-height" => "320px", "overflow" => "auto"),
-    CSS(".bt-fv-nb-image", "max-width" => "100%", "display" => "block"),
-    CSS(".bt-fv-more",
-        "font-size" => "11px", "color" => "var(--bt-text-faint)",
-        "font-style" => "italic", "padding" => "4px 2px"),
-
-    # ── Hex dump ─────────────────────────────────────────────────────────────
-    CSS(".bt-fv-hex-wrap",
-        "display" => "flex", "flex-direction" => "column",
-        "flex" => "1 1 auto", "min-height" => "0"),
-    CSS(".bt-fv-hex-bar",
-        "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "padding" => "6px 10px", "flex-shrink" => "0"),
-    CSS(".bt-fv-hex-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
-    CSS(".bt-fv-hex",
-        "margin" => "0", "padding" => "0 12px 12px",
-        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
-        "line-height" => "1.5", "color" => "var(--bt-text-muted)",
-        "overflow" => "auto", "flex" => "1 1 auto", "min-height" => "0"),
-    CSS(".bt-tool-body .bt-fv-hex", "max-height" => "360px"),
+    # The kinds' bodies (file_view.jl `file_viewer`).
+    FILE_VIEW_CSS...,
 
     # ── 3D geometry ──────────────────────────────────────────────────────────
-    CSS(".bt-mesh-view",
-        "position" => "relative", "flex" => "1 1 auto",
-        "min-height" => "0", "display" => "flex"),
-    # Inline (chat bubble) has no panel to fill, so it needs an explicit box.
-    CSS(""".bt-mesh-view[data-mode="inline"]""", "height" => "360px"),
-    CSS(".bt-mesh-canvas",
-        "flex" => "1 1 auto", "width" => "100%", "height" => "100%",
-        "display" => "block", "touch-action" => "none", "cursor" => "grab"),
-    CSS(".bt-mesh-canvas:active", "cursor" => "grabbing"),
-    CSS(".bt-mesh-toolbar",
-        "position" => "absolute", "top" => "8px", "right" => "8px",
-        "display" => "flex", "gap" => "4px"),
-    CSS(".bt-mesh-btn",
-        "border" => "1px solid var(--bt-border)", "background" => "var(--bt-surface)",
-        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
-        "border-radius" => "var(--bt-radius-sm)", "padding" => "4px", "line-height" => "0"),
-    CSS(".bt-mesh-btn svg", "width" => "14px", "height" => "14px", "display" => "block"),
-    CSS(".bt-mesh-btn:hover", "color" => "var(--bt-text)"),
-    CSS(""".bt-mesh-btn[data-on="1"]""",
-        "background" => "var(--bt-accent)", "color" => "#fff", "border-color" => "var(--bt-accent)"),
-    CSS(".bt-mesh-btn:disabled", "opacity" => "0.4", "cursor" => "default"),
-    CSS(".bt-mesh-status",
-        "position" => "absolute", "left" => "10px", "bottom" => "8px",
-        "font-size" => "11px", "color" => "var(--bt-text-faint)",
-        "pointer-events" => "none"),
+    MESH_VIEW_CSS...,
 
     # ── Change review tab (review.jl) ────────────────────────────────────────
     CSS(".bt-review",
@@ -2582,25 +2648,7 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-embed-close:hover",
         "opacity" => "1", "color" => "var(--bt-text)", "background" => "var(--bt-surface-2)"),
 
-    # Media (bt_show / Read image & video) + click-to-enlarge lightbox. The wrap
-    # is the hover target for the ⤢ button; the fullscreen overlay holds a clone
-    # of the media and closes on backdrop click or Esc.
-    CSS(".bt-media-wrap",
-        "position" => "relative", "display" => "inline-block", "max-width" => "100%"),
-    # Hover action row (enlarge · copy · download), top-right of the media.
-    CSS(".bt-media-actions",
-        "position" => "absolute", "top" => "6px", "right" => "6px",
-        "display" => "flex", "gap" => "4px",
-        "opacity" => "0", "transition" => "opacity 80ms"),
-    CSS(".bt-media-wrap:hover .bt-media-actions", "opacity" => "1"),
-    CSS(".bt-media-action",
-        "appearance" => "none", "border" => "none",
-        "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
-        "font-size" => "14px", "line-height" => "1",
-        "padding" => "4px 7px", "border-radius" => "6px",
-        "cursor" => "pointer"),
-    CSS(".bt-media-action:hover", "background" => "rgba(0,0,0,0.8)"),
-    CSS(".bt-media-enlarge", "cursor" => "zoom-in"),
+    MEDIA_CSS...,
 
     # Code-block hover actions (copy · download), top-right of a fenced <pre>.
     CSS(".bt-code-wrap", "position" => "relative"),
@@ -2616,16 +2664,10 @@ const ChatStyles = Bonito.Styles(
         "padding" => "3px 6px", "border-radius" => "5px", "cursor" => "pointer"),
     CSS(".bt-code-action:hover", "background" => "rgba(0,0,0,0.8)"),
     # Without hover (touch screens) the actions would stay invisible yet take
-    # the taps that land on them: show them.
+    # the taps that land on them: show them. Merged into MEDIA_CSS's query, which
+    # comes earlier in ChatStyles, so it wins by specificity (see there).
     CSS("@media (hover: none)",
-        CSS(".bt-media-actions, .bt-code-actions", "opacity" => "1")),
-    CSS(".bt-lightbox-overlay",
-        "position" => "fixed", "inset" => "0", "z-index" => "9999",
-        "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
-    CSS(".bt-lightbox-media",
-        "max-width" => "95vw", "max-height" => "95vh",
-        "box-shadow" => "0 8px 40px rgba(0,0,0,0.6)"),
+        CSS(".bt-code-wrap .bt-code-actions", "opacity" => "1")),
     CSS(".bt-tool-md",
         "font-size" => "13px", "line-height" => "1.5",
         "padding-top" => "8px"),

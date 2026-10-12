@@ -283,7 +283,7 @@ struct ShareLink
     password_salt::String
     password_hash::String
     created::DateTime
-    project_id::String       # live results: owning chat, used to locate the bridge
+    project_id::String       # owning chat: a live result's bridge, a file's reference root
     result_ref::String       # "prefix/holder" pins this Julia session; empty for files
 end
 

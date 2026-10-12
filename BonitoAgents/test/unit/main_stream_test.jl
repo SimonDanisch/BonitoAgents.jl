@@ -37,12 +37,13 @@ Base.close(t::IdleTransport) = (isopen(t.gate) && close(t.gate); nothing)
 
 # A chat with a live ACP session: a real `Client` (hence a real main stream and
 # coalescer) bound to a never-started WorkerAgent, plus the chat's own renderer.
+# The agent runs turns of its own, as Claude does.
 function live_model()
     state = BT.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mktempdir(), working_dir = mktempdir())
     agent = BT.WorkerAgent(state, "w1", "/p")
     model = BT.ChatModel(state, mktempdir(); project_id = "proj", agent = agent)
-    conn  = ACP.Connection(IdleTransport(), ACP.DiscardHandler())
+    conn  = ACP.Connection(IdleTransport(), ACP.DiscardHandler(); agent_turns = true)
     cli   = ACP.Client(conn, "sess", "/p")
     agent.client = cli
     BT.start_main_consumer!(model, cli)
@@ -69,14 +70,18 @@ function stalled_model()
     return model, cli, gate
 end
 
-# Put an update on the main stream exactly as the dispatcher would: settle the
-# session's activity from it, THEN deliver. Liveness is decided where frames
-# really arrive, not by the renderer — so a harness that skipped the settle
-# would be testing a code path production does not have.
-function feed!(cli, u)
-    ACP.settle!(cli.conn; worked = ACP.is_agent_work(u))
-    put!(cli.updates, u)
-end
+# Put an update on the main stream exactly as the dispatcher does: the same
+# function, which also opens and ends the agent's own turns. A harness that put
+# straight on the stream would be testing a code path production does not have.
+feed!(cli, u) = ACP.main_thread!(cli.conn, u)
+
+# The result of a cycle the agent ran on its own (`kind = "task-notification"`),
+# or of the user's turn (`"human"`).
+result_usage(origin) = ACP.UsageUpdateNotif(1, 2, nothing, nothing, origin)
+
+# The agent answers prompt `id` of ours, as a response frame on the wire.
+answer!(cli, id, stop = "end_turn") = ACP.dispatch_message(cli.conn,
+    Dict{String,Any}("jsonrpc" => "2.0", "id" => id, "result" => Dict("stopReason" => stop)))
 
 amc(s) = ACP.AgentMessageChunk(ACP.TextContent(s))
 toolnotif(id, title) = ACP.ToolCallNotif(id, title, "execute", "completed",
@@ -299,16 +304,13 @@ end
     @test BT.flush_main!(model) === nothing
 end
 
-@testset "the busy indicator follows the episode, and the episode ENDS" begin
-    # `busy_active` is DERIVED from the session's activity, never latched. It
-    # used to be assigned from five places, one of which could turn it on with
-    # no path that turned it off — so the spinner ran forever over an idle chat
-    # and `note_bound!` (which skips busy chats) stopped evicting anything.
+@testset "the busy indicator follows the agent's own turn, and the turn ENDS" begin
+    # `busy_active` is derived from the turns, so nothing can leave it on.
     model, cli = live_model()
     s = BT.shared(model)
     @test s.busy_active[] == false
 
-    # A whole episode of un-prompted work: prose, a tool, more prose.
+    # A whole turn of the agent's own: prose, a tool, more prose.
     feed!(cli, amc("The background job finished. "))
     feed!(cli, toolnotif("t1", "read the log"))
     feed!(cli, amc("All green."))
@@ -317,15 +319,14 @@ end
     # It rendered — the work is visible, which is the point...
     @test length(BT.shared(model).msgs_store) == 3
     @test s.turn_in_flight[] == false     # with no prompt of ours open
-    # ... and the chat says so, because it can take it back.
-    @test BT.session_activity(model) isa ACP.Unprompted
+    # ... and the chat says so.
+    @test only(ACP.open_turns(model)) isa ACP.AgentTurn
     @test s.busy_active[] == true
 
-    # The agent's own end-of-cycle tag ends it promptly. It is a HINT, not the
-    # contract — `Unprompted` expires on quiet even when it never arrives.
-    BT.process!(model, ACP.UsageUpdate(1, 2, nothing, nothing, "task-notification"))
-    @test BT.session_activity(model) isa ACP.Idle
-    @test s.busy_active[] == false
+    # The agent's own end-of-cycle result ends it: ACP ends the turn there.
+    feed!(cli, result_usage("task-notification"))
+    @test isempty(ACP.open_turns(model))
+    @test timedwait(() -> !s.busy_active[], 5.0) === :ok
     close(model)
 end
 
@@ -351,52 +352,46 @@ end
     @test BT.in_taskbar(pill)                             # still on screen
     @test BT.isdone(pill) == false                        # ... and not retired
 
-    # (2) The agent auto-wakes: un-prompted work on the main thread.
-    @test !(BT.session_activity(model) isa ACP.Unprompted)
+    # (2) The agent starts a turn of its own: work with no prompt of ours open.
+    @test isempty(ACP.open_turns(model))
     feed!(cli, amc("The background job finished. "))
     BT.flush_main!(model)
-    @test BT.session_activity(model) isa ACP.Unprompted
+    own = only(ACP.open_turns(model))
+    @test own isa ACP.AgentTurn
     @test pill.phase isa BT.Reporting
     @test BT.taskbar_activity(pill, time()) == "agent reporting back"
     @test s.busy_active[] == true                         # spinner, bounded this time
 
-    # (3) The episode's own end marker — an autonomous-origin usage_update.
-    # `human` must NOT end it: that is the user's own turn.
-    BT.process!(model, ACP.UsageUpdate(10, 100, nothing, nothing, "human"))
-    @test BT.session_activity(model) isa ACP.Unprompted
-    BT.process!(model, ACP.UsageUpdate(10, 100, nothing, nothing, "task-notification"))
-    @test BT.session_activity(model) isa ACP.Idle
-    @test pill.phase isa BT.Reported
-    @test s.busy_active[] == false                        # and the spinner stops
+    # (3) Its result, tagged with an autonomous origin, ends it. `human` must NOT
+    # end it: that is the user's own turn.
+    feed!(cli, result_usage("human"))
+    @test !ACP.isover(own)
+    feed!(cli, result_usage("task-notification"))
+    @test ACP.isover(own)
+    @test timedwait(() -> pill.phase isa BT.Reported, 5.0) === :ok
+    @test timedwait(() -> !s.busy_active[], 5.0) === :ok  # and the spinner stops
     @test BT.isdone(pill) == true                         # the bar retires it next poll
     close(model)
 end
 
-@testset "an episode's todo list is finalized when the episode ends" begin
-    # An auto-wake episode builds its own todo list, and there is no end_turn to
-    # finish it. The old between-turn consumer finalized it at episode end; the
-    # one-stream refactor deleted that consumer and lost the behaviour, so the
-    # card sat in the bar frozen at whatever it reached until some LATER turn
-    # happened to end (observed live: `Todos 0/2` still pinned long after).
+@testset "a todo list of the agent's own turn is finalized when the turn ends" begin
+    # No end_turn of ours finishes the agent's own list: its turn's end must.
     model, cli = live_model()
     s = BT.shared(model)
     feed!(cli, amc("Picking up where the background job left off. "))
     feed!(cli, planupd([("step a", "in_progress"), ("step b", "pending")]))
     BT.flush_main!(model)
 
-    @test BT.session_activity(model) isa ACP.Unprompted
+    @test only(ACP.open_turns(model)) isa ACP.AgentTurn
     t = s.live_todo[]
     @test t isa BT.TodoListMsg
-    @test BT.in_taskbar(t)                 # live while the episode runs
+    @test BT.in_taskbar(t)                 # live while the turn runs
     @test t.finished_at === nothing
 
-    # The episode's own end marker ends it, exactly as a turn's end would — and
-    # the list goes with the episode. Nothing pushes that: `isdone` ASKS the
-    # session what it is doing, and the bar's own poll acts on the answer. (Which
-    # is also why an episode that ends by going QUIET, with no end marker at all,
-    # needs no separate handling.)
-    BT.process!(model, ACP.UsageUpdate(1, 2, nothing, nothing, "task-notification"))
-    @test BT.session_activity(model) isa ACP.Idle
+    # The turn's end marker ends it — and the list goes with the turn. Nothing
+    # pushes that: `isdone` asks whether a turn is open, and the bar acts.
+    feed!(cli, result_usage("task-notification"))
+    @test isempty(ACP.open_turns(model))
     @test BT.isdone(t) == true                                # the decision...
     @test timedwait(() -> !BT.in_taskbar(t), 5.0) === :ok     # ...and the bar acts
     @test s.live_todo[] === nothing
@@ -409,8 +404,6 @@ end
     # counting: get it wrong and a list gets retired out from under an agent that
     # is still working it. Under steering a prompt is open while an earlier
     # episode's list is live, and the list belongs to the work still running.
-    # This is what the old `turns_active == 0` gate was for; it is now just what
-    # `Prompted` means.
     model, cli = live_model()
     s = BT.shared(model)
     feed!(cli, planupd([("step a", "in_progress"), ("step b", "pending")]))
@@ -419,8 +412,8 @@ end
     @test t isa BT.TodoListMsg
     @test BT.in_taskbar(t)
 
-    ACP.prompt_request(cli.conn, Dict())     # a span opens and never resolves
-    @test BT.session_activity(model) isa ACP.Prompted
+    ACP.prompt_request(cli.conn, Dict())     # a prompt opens and is never answered
+    @test any(t -> t isa ACP.PromptTurn, ACP.open_turns(model))
     @test BT.isdone(t) == false
     sleep(1.5)                               # let the bar poll at least once
     @test BT.in_taskbar(t)                   # ... and leave it alone
@@ -514,8 +507,8 @@ end
     @test BT.isdone(pill) == true
     @test pill.phase isa BT.Reported
 
-    # A task that IS being reported on is NOT on that clock — the episode's own
-    # end marker governs it, however long the agent talks.
+    # A task that IS being reported on is NOT on that clock — the agent's turn
+    # governs it, however long the agent talks.
     pill2 = BT.send!(model, BT.to_message(model, bg_task_call("task-TALKING")))
     push!(BT.chat_taskbar(model), pill2)
     pill2.phase = BT.Reporting(time() - 10 * BT.REPORT_WAIT_SECONDS)
@@ -523,28 +516,31 @@ end
     close(model)
 end
 
-@testset "an episode with no end marker is closed by the next turn" begin
-    # A provider that never tags an autonomous result would otherwise leave the
-    # episode — and the pill, and the spinner — open forever. The turn boundary
-    # is a signal the agent cannot omit.
+@testset "the agent's own turn is over at the answer to our next prompt" begin
+    # The agent runs one model turn at a time, so it answers a prompt of ours
+    # only once a turn of its own is done: the answer ends that turn too, end
+    # marker or not. A CANCELLED answer does not (a prompt still queued behind
+    # the turn is answered `cancelled` at once).
     model, cli = live_model()
     s = BT.shared(model)
     pill = BT.send!(model, BT.to_message(model, bg_task_call("task-NOEND")))
     push!(BT.chat_taskbar(model), pill)
     pill.phase = BT.AwaitingReport(time())
 
-    feed!(cli, amc("reporting with no end marker"))
+    feed!(cli, amc("reporting, with no end marker coming"))
     BT.flush_main!(model)
-    @test BT.session_activity(model) isa ACP.Unprompted
+    own = only(ACP.open_turns(model))
     @test pill.phase isa BT.Reporting
 
-    # The episode goes quiet with no end marker at all. `Unprompted` expires on
-    # its own — that is the property the old `autowake` latch did not have.
-    @atomic cli.conn.last_work_at = 0.0
-    BT.refresh_activity!(model)
-    @test BT.session_activity(model) isa ACP.Idle
-    @test pill.phase isa BT.Reported
-    @test s.busy_active[] == false
+    queued = ACP.prompt_request(cli.conn, Dict())
+    answer!(cli, queued.id, "cancelled")
+    @test ACP.isover(queued) && !ACP.isover(own)
+
+    p = ACP.prompt_request(cli.conn, Dict())
+    answer!(cli, p.id)
+    @test ACP.isover(p) && ACP.isover(own)
+    @test timedwait(() -> pill.phase isa BT.Reported, 5.0) === :ok
+    @test timedwait(() -> !s.busy_active[], 5.0) === :ok
     close(model)
 end
 
@@ -621,32 +617,17 @@ end
     close(healthy)
 end
 
-# The wedge, and why it is now unrepresentable.
-#
-# An auto-wake episode used to claim liveness with a latch of its own, whose only
-# exits were an end marker the agent may never send and `begin_turn` — and
-# `busy_active` is exactly what makes the composer queue instead of send. So the
-# one way out ran through the thing that was broken. Stop was the last control
-# left, and it dropped the queued sends unconditionally: it deleted the message
-# that would have released the chat and cancelled nothing at all. Observed live
-# as a 53-minute wedge over an agent that had been idle the whole time.
-#
-# `busy_active` is derived now, so "spinner on while the session is idle" is not
-# a state anyone can construct.
-@testset "an episode nobody ends still lets go of the spinner" begin
+# A "when done" message waits only for prompts of ours, and the answer to one
+# ends the agent's own turn: no turn of the agent's can hold the composer (a
+# 53-minute wedge, observed live). Stop still pauses unsent text.
+@testset "the agent's own turn holds the spinner, never the composer" begin
     model, cli = live_model()
     s = BT.shared(model)
     feed!(cli, amc("background task finished, here's the report"))
     BT.flush_main!(model)
-    @test BT.session_activity(model) isa ACP.Unprompted   # no prompt of ours
+    @test only(ACP.open_turns(model)) isa ACP.AgentTurn
     @test s.busy_active[] == true
-
-    # No end marker EVER arrives — the agent simply stops talking. This is the
-    # case the old latch had no answer for.
-    @atomic cli.conn.last_work_at = 0.0
-    BT.refresh_activity!(model)
-    @test BT.session_activity(model) isa ACP.Idle
-    @test s.busy_active[] == false
+    @test isempty(BT.prompts_ahead(model))    # nothing a "when done" message waits for
 
     # With no consumer in this unit harness, the submission stays in the
     # outbox. It must not appear in history before being handed to the agent.
@@ -655,11 +636,10 @@ end
     @test !any(m -> m isa BT.UserMsg, s.msgs_store)
     @test only(s.pending_sends).status == :waiting
 
-    # Stop consistently pauses unsent text, even when there is no live turn.
+    # Stop pauses unsent text.
     BT.handle_command!(model, nothing, BT.CancelCommand())
     @test only(s.pending_sends).status == :paused
     @test BT.next_submission(model) === nothing
-    @test s.busy_active[] == false
     close(model)
 end
 
@@ -674,21 +654,21 @@ end
     model, cli = live_model()
     s = BT.shared(model)
 
-    # A real turn, then a stop: `Cancelling` holds until the turn settles.
-    span = ACP.PromptSpan(4242)
-    lock(() -> push!(cli.conn.active_prompts, span), cli.conn.lock)
-    @test ACP.cancel!(cli) == true
-    @test ACP.session_activity(cli.conn) isa ACP.Cancelling
+    # A real turn, then a stop: the prompt waits until that turn is over.
+    span = ACP.prompt_request(cli.conn, Dict())
+    BT.handle_command!(model, nothing, BT.CancelCommand())
+    @test s.cancelled_turns[] == [span]
+    @test BT.cancelling(model)
 
     # begin_turn must not hand the prompt over yet.
     held = @async BT.await_cancel_settled!(model)
     sleep(0.5)
     @test !istaskdone(held)
 
-    # The cancelled turn settles → the wait releases.
-    lock(() -> empty!(cli.conn.active_prompts), cli.conn.lock)
+    # The agent answers the cancelled turn → the wait releases.
+    answer!(cli, span.id, "cancelled")
     @test timedwait(() -> istaskdone(held), 5.0) === :ok
-    @test !(ACP.session_activity(cli.conn) isa ACP.Cancelling)
+    @test !BT.cancelling(model)
 
     # And with nothing cancelling, it is a straight no-op.
     t0 = time(); BT.await_cancel_settled!(model)
@@ -700,19 +680,21 @@ end
 @testset "stop cancels live work and pauses the outbox" begin
     model, cli = live_model()
     s = BT.shared(model)
-    # A real un-prompted episode, settled the way the dispatcher settles it.
+    # A real turn of the agent's own, opened the way the dispatcher opens it.
     feed!(cli, amc("still working on the background job"))
     BT.flush_main!(model)
-    @test ACP.session_live(cli) == true
+    own = only(ACP.open_turns(model))
     @test s.busy_active[] == true
     BT.send_message!(model, BT.UserMsg("stop for real"))
     @test timedwait(() -> Base.n_avail(s.user_messages) == 1, 5.0) === :ok
 
     BT.handle_command!(model, nothing, BT.CancelCommand())
-    # The cancel went out and the liveness it acted on is consumed: with no
-    # prompt to settle, `Cancelling` resolves straight to `Idle`, so a second
-    # stop over the same gap no-ops rather than acting again.
-    @test ACP.session_activity(cli.conn) isa ACP.Idle
+    # The cancel went out for the agent's turn, which is over when the agent
+    # says so: its result, also after a cancel.
+    @test s.cancelled_turns[] == [own]
+    @test BT.cancelling(model)
+    feed!(cli, result_usage("task-notification"))
+    @test ACP.isover(own) && !BT.cancelling(model)
     @test only(s.pending_sends).status == :paused
     @test BT.next_submission(model) === nothing
     # ...and the session is NOT muted by any of it. Asserted on the STORE, not

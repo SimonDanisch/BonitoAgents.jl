@@ -389,13 +389,8 @@ strip_injected_context(::AgentProvider, raw::AbstractString) = String(strip(raw)
 """
     reports_autonomous_origin(p::AgentProvider) -> Bool
 
-Whether this provider tags the result of an autonomous cycle
-(`_meta["_claude/origin"]`), which is what bounds an auto-wake episode.
-
-It matters because an episode with a start and no end is a latch: the chat would
-claim the agent is working and never be able to take it back. Providers that
-don't send the tag get no episode tracking at all rather than a spinner nothing
-can stop.
+Whether this provider runs cycles of its own and tags each one's result
+(`_meta["_claude/origin"]`), which ends such a turn (`Connection(...; agent_turns)`).
 """
 reports_autonomous_origin(::AgentProvider) = false
 reports_autonomous_origin(::ClaudeLike) = true

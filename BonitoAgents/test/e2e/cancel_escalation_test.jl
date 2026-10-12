@@ -58,12 +58,12 @@
             # nothing — deliberately, since the user has pressed send and the
             # spinner should not read "waiting for your next instruction" through
             # the whole bring-up. A cancel needs an open span to reach anything
-            # (it is a documented no-op when idle), so `Prompted` is the wait.
+            # (it is a documented no-op when idle), so an open prompt is the wait.
             c = nothing
             @test poll_until(timeout = 30) do
                 c = BA.client(model.agent)
-                c !== nothing &&
-                    BA.session_activity(model) isa BA.AgentClientProtocol.Prompted
+                c !== nothing && any(t -> t isa BA.AgentClientProtocol.PromptTurn,
+                                     BA.AgentClientProtocol.open_turns(model))
             end
             @test c !== nothing
             @test model.busy_active[]

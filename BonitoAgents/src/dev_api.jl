@@ -358,7 +358,7 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "yolo_idle"      => sh.yolo_state.idle,
         "provider"       => string(sh.provider[]),
         "agent_provider" => provider_name(agent),
-        "session_activity" => string(nameof(typeof(session_activity(sh)))),
+        "open_turns"     => [string(nameof(typeof(t))) for t in AgentClientProtocol.open_turns(sh)],
         "client_alive"   => client(agent) !== nothing,
         "turn_in_flight" => sh.turn_in_flight[],
         "turn_seq"       => sh.turn_seq[],
@@ -373,7 +373,7 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "consumer_alive" => sh.consumer_task[] !== nothing && !istaskdone(sh.consumer_task[]),
         "poller_alive"   => sh.poller_task[] !== nothing && !istaskdone(sh.poller_task[]),
         "restart_gen"    => sh.restart_gen[],
-        "restart_inflight" => restarting,
+        "restart_inflight" => restarting !== nothing,
         "rendering"      => rendering === nothing ? nothing : Dict{String,Any}(
             "kind" => string(first(rendering)),
             "for_seconds" => max(0.0, round(time() - last(rendering), digits = 1))),

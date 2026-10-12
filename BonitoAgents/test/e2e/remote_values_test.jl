@@ -18,7 +18,11 @@
     using .TestKit
     const TK = TestKit
     import BonitoAgents as BT
-    real_eval(code; kw...) = TK.bt_eval(code; real_process = true, kw...)
+    # The committed eval env on both machines: the default one may lack a
+    # Bonito that can carry the live-render bridge.
+    evalenv = abspath(joinpath(@__DIR__, "..", "evalenv"))
+    real_eval(code; kw...) = TK.bt_eval(code; real_process = true, env_path = evalenv, kw...)
+    on_b = "remote_session(\"worker-b\"; env_path = $(repr(evalenv)))"   # code for B's session
     real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
 
     VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
@@ -79,7 +83,7 @@
 
             # ── 1. off: refused, saying where the switch is ──────────────────
             @test p.remote_eval === false
-            ask(server, "fetch from worker-b", real_eval("remote_session(\"worker-b\")[:x]"; id = "rv-off"))
+            ask(server, "fetch from worker-b", real_eval("$(on_b)[:x]"; id = "rv-off"))
             @test TK.wait_for(server, "refused while the switch is off",
                 card_shows("rv-off", "switched OFF"); timeout = 120) == true
             @test TK.eval_js(server, card_shows("rv-off", "RemoteSessionError")) == true
@@ -88,7 +92,7 @@
             # ── 2. on: a value over one message's limit goes A → B ───────────
             flip!(server, p, true)
             ask(server, "send the data to worker-b", real_eval("""
-                r = remote_session("worker-b")
+                r = $(on_b)
                 r[:rv_data] = collect(1.0:3.0e6)     # 24 MB
                 println("sent to ", r.name, ": ", 3 * 10^6)
                 """; id = "rv-send"))
@@ -110,7 +114,7 @@
             # Returned, so it renders LIVE through this chat's own bridge, while
             # B's session has a bridge into the chat too: the two coexist.
             ask(server, "bring it back", real_eval("""
-                r = remote_session("worker-b")
+                r = $(on_b)
                 string("fetched ", r[:rv_made]["host"], " doubled ", r(x -> 2 .* x, [1, 2, 3]))
                 """; id = "rv-fetch"))
             @test TK.wait_for(server, "the value came back and the function ran there",
@@ -123,7 +127,7 @@
             @test TK.eval_js(server, "document.body.innerText.includes('result not live')") == false
             @test length([k for k in keys(state.eval_workers) if startswith(k, pid)]) == 2
             ask(server, "fail there", real_eval(
-                "remote_session(\"worker-b\")(() -> error(\"bad \" * \"on b\"))"; id = "rv-err"))
+                "$(on_b)(() -> error(\"bad \" * \"on b\"))"; id = "rv-err"))
             @test TK.wait_for(server, "the error on B came back as one",
                 card_shows("rv-err", "RemoteSessionError: on worker-b"); timeout = 120) == true
             @test TK.eval_js(server, card_shows("rv-err", "bad on b")) == true
@@ -131,16 +135,16 @@
             # A long call there, stopped from here: the stop ends it at once,
             # and the next request works (over a new connection).
             ask(server, "a long call", real_eval(
-                "remote_session(\"worker-b\")(() -> (sleep(90); :late))"; id = "rv-long", timeout = 0.5))
+                "$(on_b)(() -> (sleep(90); :late))"; id = "rv-long", timeout = 0.5))
             @test TK.wait_for(server, "the long call is running",
                 "($(card("rv-long"))?.querySelector('.bt-tool-summary')?.textContent || '').includes('· running')";
                 timeout = 60) == true
-            ask(server, "stop it", real_call("bt_julia_interrupt"; id = "rv-stop"))
+            ask(server, "stop it", real_call("bt_julia_interrupt"; id = "rv-stop", env_path = evalenv))
             @test TK.wait_for(server, "the long call stopped",
                 "($(card("rv-long"))?.querySelector('.bt-tool-summary')?.textContent || '').includes('✗ interrupted')";
                 timeout = 60) == true
             ask(server, "again", real_eval("""
-                println("after the stop: ", remote_session("worker-b")[:rv_made]["host"])
+                println("after the stop: ", $(on_b)[:rv_made]["host"])
                 """; id = "rv-after-stop"))
             @test TK.wait_for(server, "the next request works",
                 card_shows("rv-after-stop", "after the stop: $(worker_b.worker_id)"); timeout = 120) == true
@@ -150,7 +154,7 @@
             t0 = time()
             while !isempty(BT.eval_hosts_of(state, pid)) && time() - t0 < 30; sleep(0.1); end
             @test isempty(BT.eval_hosts_of(state, pid))
-            ask(server, "and now?", real_eval("remote_session(\"worker-b\")[:rv_made]"; id = "rv-off2"))
+            ask(server, "and now?", real_eval("$(on_b)[:rv_made]"; id = "rv-off2"))
             @test TK.wait_for(server, "refused again",
                 card_shows("rv-off2", "switched OFF"); timeout = 120) == true
             @test isempty(state.value_pairs)

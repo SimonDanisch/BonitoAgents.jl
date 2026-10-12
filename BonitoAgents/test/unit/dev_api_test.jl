@@ -281,7 +281,7 @@ end
             # The agent's own provider: the default is ENV-driven, and a mock
             # server earlier in the same process sets it to MockCode.
             @test chat["agent_provider"] == BT.provider_name(agent)
-            @test chat["session_activity"] == "Idle"
+            @test chat["open_turns"] == String[]
             @test chat["client_alive"] === false
             @test chat["restart_inflight"] === false
             @test chat["rendering"] === nothing

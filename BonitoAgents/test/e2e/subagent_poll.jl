@@ -75,11 +75,9 @@ function run_suite(server)
         @test BA.taskbar_activity(task, time()) == "finished — waiting for the agent"
         @test BA.tool_finished_at(task) === nothing     # ... and not finalized yet
 
-        # (D) A boundary retires it — `retire_reporting!`, which `begin_turn`
-        # runs on every new turn and `leave_unprompted!` runs when an episode
-        # ends. It is deliberately NOT edge-only: this task finished with the
-        # agent having nothing to say about it, so no auto-wake episode ever
-        # opened and there is no edge to hang it on.
+        # (D) A boundary retires it: `retire_reporting!`, which runs at every
+        # turn of ours and when the agent's own turn ends. Not edge-only: this
+        # task finished with nothing to report, so no turn of the agent's opened.
         BA.retire_reporting!(model)
         @test task.phase isa BA.Reported
         gone = false

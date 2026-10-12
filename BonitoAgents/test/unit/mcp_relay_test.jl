@@ -63,19 +63,22 @@
                 "code" => "6 * 7", "worker" => "worker-b")))
             @test result["isError"] === true
             @test occursin("switched OFF", only(result["content"])["text"])
+            # The committed eval env: the default one may lack a Bonito that can
+            # carry the live-render bridge checked below.
+            evalenv = abspath(joinpath(@__DIR__, "..", "evalenv"))
             running = request(4, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict(
-                "code" => "println(\"relay-started\"); sleep(60); 42", "timeout" => 0.1)))
+                "code" => "println(\"relay-started\"); sleep(60); 42", "timeout" => 0.1, "env_path" => evalenv)))
             @test running["_meta"]["status"] == "running"
             @test BT.interrupt_project_eval!(state, p.id; timeout = 10.0) == 1
-            stopped = request(5, "tools/call", Dict("name" => "bt_julia_continue", "arguments" => Dict()))
+            stopped = request(5, "tools/call", Dict("name" => "bt_julia_continue", "arguments" => Dict("env_path" => evalenv)))
             @test stopped["_meta"]["status"] == "completed"
             @test occursin("InterruptException", join(get(c, "text", "") for c in stopped["content"]))
-            again = request(6, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict("code" => "21 * 2")))
+            again = request(6, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict("code" => "21 * 2", "env_path" => evalenv)))
             @test occursin("42", join(get(c, "text", "") for c in again["content"]))
             # The eval worker runs user code: its environment holds no grant
             # (the MCP process took it out of its own before starting it).
             seen = request(9, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict(
-                "code" => "sort([k for k in keys(ENV) if occursin(r\"CONTROL|EVAL_TOKEN\", k)])")))
+                "code" => "sort([k for k in keys(ENV) if occursin(r\"CONTROL|EVAL_TOKEN\", k)])", "env_path" => evalenv)))
             @test occursin("String[]", join(get(c, "text", "") for c in seen["content"]))
             # The eval worker's live-render bridge came up through the relay too.
             @test timedwait(() -> BT.eval_bridge_for(state, p.id) !== nothing, 30.0) === :ok
