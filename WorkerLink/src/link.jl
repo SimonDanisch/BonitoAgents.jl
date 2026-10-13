@@ -101,6 +101,8 @@ A link endpoint. `role` is `:client` (the worker, which dials) or `:server`.
 `on_open(ch)` runs (in its own task) for every channel the PEER opens;
 `on_state(link, state)` for every `:connected` / `:detached` / `:dead` change,
 and with `:reset` when a client's link restarts from nothing (see [`connect!`](@ref)).
+It runs in the task that made the change, so a drop's call and the call of the
+redial that resumes it can arrive in either order: `state(link)` is the current one.
 Channel 0 exists from the start on both sides: see [`control_channel`](@ref).
 `name` says who is at the other end in this side's log.
 """
@@ -497,10 +499,15 @@ function connection_lost!(link::Link, t::Transport, reason)
         true
     end
     notify(link.tick)
-    close_transport(t)
-    if changed
-        @warn "WorkerLink: connection lost; the link waits $(link.grace)s for a reconnect" role = link.role reason = string(reason)
-        notify_state(link, :detached)
+    # Closed after the handlers ran: until then the peer cannot be back, and the
+    # link connected again, before they knew it was gone.
+    try
+        if changed
+            @warn "WorkerLink: connection lost; the link waits $(link.grace)s for a reconnect" role = link.role reason = string(reason)
+            notify_state(link, :detached)
+        end
+    finally
+        close_transport(t)
     end
     return nothing
 end

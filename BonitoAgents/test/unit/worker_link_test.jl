@@ -69,6 +69,15 @@ end
             @test read(dst) == read(src)
         end
 
+        @testset "a drop's handler the redial overtook changes nothing" begin
+            # CI, 2026-10-13: the redial's `:connected` handler finished first,
+            # the drop's `:detached` after it, and a connected worker stayed offline.
+            link = BA.worker_link(state, "link-test")
+            @test WorkerLink.state(link) === :connected
+            BA.worker_link_changed!(state, "link-test", link, :detached)
+            @test info.online[]
+        end
+
         @testset "a server that forgot the link makes the worker start over" begin
             old_link = BA.worker_link(state, "link-test")
             old_control = worker.control

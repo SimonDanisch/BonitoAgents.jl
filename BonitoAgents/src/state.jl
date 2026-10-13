@@ -572,6 +572,10 @@ mutable struct ServerState
     proxy_writer       :: ProxyWriter
     # Every process each chat runs, on every worker (processes.jl).
     processes          :: ProcessRecord
+    # Taken while a worker's `online` follows its link (`worker_link_changed!`):
+    # the handlers of a drop and of the redial that resumes it run on different
+    # tasks, in either order.
+    link_events        :: ReentrantLock
 
     # The parent state a per-session `copy(state, session)` was derived from;
     # `nothing` on the root itself. The Observable bridges above are ONE-WAY
@@ -654,6 +658,7 @@ function ServerState(; state_dir::String,
         WorkerBuild(),                            # worker_build (resolved by serve())
         ProxyWriter(),                            # proxy_writer
         ProcessRecord(),                          # processes (load_processes! below)
+        ReentrantLock(),                          # link_events
         nothing,                                  # root (this IS the root)
     )
     load_workers!(s)
@@ -726,6 +731,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.worker_build,
             s.proxy_writer,
             s.processes,               # shared registry
+            s.link_events,
             root_state(s),             # copies of copies still point at the true root
         )
     end

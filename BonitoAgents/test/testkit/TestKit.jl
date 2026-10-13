@@ -1034,8 +1034,11 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     # Behind the proxy the pages come with a certificate from Caddy's own CA, and
     # each browser keeps cookies of its own: Electron's default profile is shared
     # by every window, so a second browser would be logged in as the first.
-    electron_args = s.admin === nothing ? String[] :
-        ["--ignore-certificate-errors", "--user-data-dir=$(mktempdir())"]
+    # Without a GPU (CI) WebGL runs on SwiftShader, and Chromium warns about that
+    # fallback unless it was asked for: a 3D view failed the console gate on it.
+    electron_args = String["--enable-unsafe-swiftshader"]
+    s.admin === nothing ||
+        append!(electron_args, ["--ignore-certificate-errors", "--user-data-dir=$(mktempdir())"])
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
     # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
     # capturePage on the headless (show=false) window stays fresh.

@@ -4510,7 +4510,6 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
              haskey(d0, "editable") || haskey(d0, "live_embed")) &&
                 chat_emit(h.chat, d0)
         end
-        made_running = h.status in ("pending", "in_progress")
         shown_running = Ref(false)
         AgentClientProtocol.each_update(m) do snap
             prev_status = h.status
@@ -4557,7 +4556,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
             # click). `auto_expand_body` dispatches on the type + content
             # presence — no content sniffing inline here.
             (auto_expand_body(b, snap.content) || has_show_reference(snap.content) ||
-             opens_as_finished_run(b, made_running, shown_running[])) &&
+             opens_as_finished_run(b, shown_running[])) &&
                 (d["expand"] = true)
             shown_running[] |= h.status in ("pending", "in_progress")
             auto_expand_full(b, snap.content) && (d["expand_full"] = true)
@@ -4622,15 +4621,14 @@ auto_expand_body(m::JuliaEvalCall, snap_content) =
      (outdated_worker_content(snap_content) ||
       bonito_upgrade_content(snap_content) !== nothing))
 
-# An eval opens while it runs (above). One made running whose first state to
-# come through is already its end opens the same way: a tool is one object
-# updated in place, so a quick call's states coalesce, and whether its card
-# opened depended on timing (e2e:codex_wire, now and then). Not one shown running
-# (it opened then, and may have been closed since), not one from history (made
-# finished).
-opens_as_finished_run(::ToolMsg, made_running::Bool, shown_running::Bool) = false
-opens_as_finished_run(m::JuliaEvalCall, made_running::Bool, shown_running::Bool) =
-    made_running && !shown_running && !isempty(m.code)
+# An eval opens while it runs (above). One whose first state to come through is
+# already its end opens the same way: a tool is one object updated in place, so
+# a quick call can be over before the chat first sees it, already "completed"
+# (e2e:codex_wire on CI). Not one shown running: it opened then, and may have
+# been closed since. History never comes through here (`reconcile_replay!`).
+opens_as_finished_run(::ToolMsg, shown_running::Bool) = false
+opens_as_finished_run(m::JuliaEvalCall, shown_running::Bool) =
+    !shown_running && !isempty(m.code)
 
 # The tool holds a LIVE result embed: a worker-parked value the body mounts
 # via `RemoteRef` (values AND errors — both are parked refs rendered live).

@@ -148,7 +148,7 @@ end
         # arrived on stdin (and never on a command line).
         bin = mktempdir()
         write(joinpath(bin, "authelia"),
-              "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
+              "#!/bin/sh\n[ \"\$1\" = storage ] && exec sh $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
         # `adapt` (the check before a Caddyfile is swapped in) rejects a file that
         # contains REJECT.
         write(joinpath(bin, "caddy"), """
@@ -468,7 +468,7 @@ end
     Sys.isunix() || return
     bin = mktempdir()
     write(joinpath(bin, "authelia"),
-          "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
+          "#!/bin/sh\n[ \"\$1\" = storage ] && exec sh $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho 'Random Password: pw-123'\necho 'Digest: \$argon2id\$fake'\n")
     write(joinpath(bin, "caddy"), "#!/bin/sh\nexit 0\n")   # `adapt`: every Caddyfile is fine
     chmod(joinpath(bin, "authelia"), 0o755); chmod(joinpath(bin, "caddy"), 0o755)
     dir = mktempdir()
@@ -682,7 +682,7 @@ end
     bin = mktempdir()
     # As slow as a real argon2 hash, so two requests overlap while it runs.
     write(joinpath(bin, "authelia"),
-          "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\nsleep 0.3\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
+          "#!/bin/sh\n[ \"\$1\" = storage ] && exec sh $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\nsleep 0.3\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
     write(joinpath(bin, "caddy"), "#!/bin/sh\nexit 0\n")
     chmod(joinpath(bin, "authelia"), 0o755); chmod(joinpath(bin, "caddy"), 0o755)
     dir = mktempdir()
@@ -831,7 +831,7 @@ end
 
     bin = mktempdir()
     write(joinpath(bin, "authelia"),
-          "#!/bin/sh\n[ \"\$1\" = storage ] && exec $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
+          "#!/bin/sh\n[ \"\$1\" = storage ] && exec sh $(joinpath(@__DIR__, "..", "fixtures", "fake_authelia_storage.sh")) \"\$@\"\necho \"Random Password: pw-\$\$\"\necho 'Digest: \$argon2id\$fake'\n")
     write(joinpath(bin, "caddy"), """
         #!/bin/sh
         case "\$1" in hash-password) read pw; echo "\\\$2a\\\$14\\\$\$pw" ;; esac

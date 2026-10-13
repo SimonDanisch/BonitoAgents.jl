@@ -551,11 +551,12 @@ function register_worker!(state::ServerState, worker_id::String, name::String,
     end
     # From here on the link keeps it current (`worker_link_changed!`); what it
     # did before it was stored went unseen, so catch up once.
-    link_state = WorkerLink.state(link)
-    link_state === :dead && (teardown_worker!(state, worker_id, link); return w)
-    connected = link_state === :connected
-    online[] == connected || (online[] = connected)
-    connected && wake_worker_chats!(state, worker_id)
+    WorkerLink.state(link) === :dead && (teardown_worker!(state, worker_id, link); return w)
+    lock(state.link_events) do
+        connected = WorkerLink.state(link) === :connected
+        online[] == connected || (online[] = connected)
+        connected && wake_worker_chats!(state, worker_id)
+    end
     # `migrate_legacy_worker_refs!` may have rewritten project rows, and the
     # project cards show the worker's name.
     notify_workers!(state)
@@ -645,22 +646,31 @@ function worker_link_changed!(state::ServerState, worker_id::String,
     worker_link(state, worker_id) === link || return nothing   # replaced or removed
     # The moment the link stops being connected is the moment to know which
     # chats were mid-turn: a crash cuts exactly those off (crash_recovery.jl).
-    if st === :connected
-        forget_interrupted_turns!(state, worker_id)   # resumed: the same run goes on
-    else
+    if st === :dead
         note_interrupted_turns!(state, worker_id)
+        return teardown_worker!(state, worker_id, link)
     end
-    st === :dead && return teardown_worker!(state, worker_id, link)
     w = get(state.workers[], worker_id, nothing)
     w === nothing && return nothing
-    online = st === :connected
-    w.online[] == online || (w.online[] = online)
-    notify_workers!(state)
-    if online
-        @info "Worker connected" worker_id name = w.name
-        wake_worker_chats!(state, worker_id)
-    else
-        @info "Worker connection lost; its agents keep running until it reconnects" worker_id grace = state.worker_link_grace
+    # A redial's handler can finish before the handler of the drop it resumes:
+    # each acts on the link's state NOW, one at a time, so the last one leaves
+    # it current. One that finds nothing to change was overtaken.
+    lock(state.link_events) do
+        online = WorkerLink.state(link) === :connected
+        w.online[] == online && return
+        if online
+            forget_interrupted_turns!(state, worker_id)   # resumed: the same run goes on
+        else
+            note_interrupted_turns!(state, worker_id)
+        end
+        w.online[] = online
+        notify_workers!(state)
+        if online
+            @info "Worker connected" worker_id name = w.name
+            wake_worker_chats!(state, worker_id)
+        else
+            @info "Worker connection lost; its agents keep running until it reconnects" worker_id grace = state.worker_link_grace
+        end
     end
     return nothing
 end
