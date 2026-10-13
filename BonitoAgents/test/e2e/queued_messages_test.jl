@@ -58,8 +58,10 @@
             TK.screenshot(s, joinpath(screenshot_dir, "queue_menu_$(width).png"))
             TK.eval_js(s, "$(q(".bt-send-mode-option[data-send-mode='next']")).click()")
             @test TK.eval_js(s, "$(q(".bt-send-mode-trigger")).textContent.includes('Queue after message')")
-            @test TK.eval_js(s, "(() => {const e=$(q(".bt-send-mode-trigger"));const r=document.createRange();r.selectNodeContents(e);return r.getClientRects().length===1 && getComputedStyle(e).whiteSpace==='nowrap';})()")
+            @test TK.eval_js(s, "(() => {const e=$(q(".bt-send-mode-trigger"));const r=document.createRange();r.selectNodeContents(e.querySelector('.bt-send-mode-label'));return new Set([...r.getClientRects()].map(x=>Math.round(x.top))).size===1 && getComputedStyle(e).whiteSpace==='nowrap';})()")
             @test TK.eval_js(s, "(() => {const e=$(q(".bt-send-mode-trigger"));return e.scrollWidth<=e.clientWidth+1 && e.scrollHeight<=e.clientHeight+1;})()")
+            # Nor does a wider font (CI's ran it out of the button at 320 px).
+            @test TK.eval_js(s, "(() => {const e=$(q(".bt-send-mode-trigger")), l=e.querySelector('.bt-send-mode-label'); l.style.letterSpacing='2px'; const fits=e.scrollWidth<=e.clientWidth+1; l.style.letterSpacing=''; return fits;})()")
             @test TK.eval_js(s, "$(q(".bt-send-btn")).getBoundingClientRect().bottom <= innerHeight")
             shot = TK.screenshot(s, joinpath(screenshot_dir, "queue_compact_$(width).png"))
             size = TK.run(s.browser[].app, "electron.nativeImage.createFromPath($(TK.json(shot))).getSize()")

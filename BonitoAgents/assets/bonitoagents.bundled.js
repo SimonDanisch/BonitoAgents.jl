@@ -2760,7 +2760,7 @@ class BonitoChat {
                 e.stopImmediatePropagation();
                 this.sendMode = modeOption.dataset.sendMode;
                 const trigger = this.app.querySelector('.bt-send-mode-trigger');
-                trigger.textContent = ({
+                trigger.querySelector('.bt-send-mode-label').textContent = ({
                     done: 'Queue when done',
                     next: 'Queue after message',
                     interrupt: 'Interrupt + send'

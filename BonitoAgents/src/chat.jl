@@ -8147,7 +8147,7 @@ function chat_input_area(session::Session, model::ChatModel)
         })();
     """
     send_mode = DOM.div(
-        DOM.button("Queue when done"; type="button",
+        DOM.button(DOM.span("Queue when done"; class="bt-send-mode-label"); type="button",
             class="bt-btn bt-btn-ghost bt-send-mode-trigger",
             title="Queue for when done", var"aria-label"="Queue for when done",
             var"aria-haspopup"="menu", var"aria-expanded"="false"),

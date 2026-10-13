@@ -1703,6 +1703,9 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "11px", "white-space" => "nowrap", "gap" => "var(--bt-space-1)",
         "justify-content" => "center"),
     CSS(".bt-send-mode-trigger::after", "content" => "'▾'", "flex-shrink" => "0"),
+    # A narrow phone with a wide font has no room for the whole label: it ends
+    # in an ellipsis instead of running out of the button.
+    CSS(".bt-send-mode-label", "overflow" => "hidden", "text-overflow" => "ellipsis"),
     CSS(".bt-send-mode-menu", "position" => "absolute", "bottom" => "calc(100% + var(--bt-space-2))",
         "right" => "0", "max-width" => "calc(100vw - 2 * var(--bt-space-4))",
         "z-index" => "40", "display" => "flex", "flex-direction" => "column",

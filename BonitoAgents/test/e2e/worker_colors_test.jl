@@ -41,7 +41,14 @@
         for (width,height,label) in [(1280,1100,"desktop"),(2400,1100,"wide"),(390,844,"phone")]
             TK.set_window_size(s, width, height)
             @test TK.wait_for(s, "dashboard next to sidebar", "(() => {const d=document.querySelector('.bt-main').getBoundingClientRect(), b=document.querySelector('.bt-sidebar').getBoundingClientRect();return d.left-b.right<12 && d.right<=innerWidth+1;})()")
-            @test TK.eval_js(s, "(() => {const d=document.querySelector('.bt-dash');return d.scrollWidth<=d.clientWidth+1;})()")
+            # What sticks out, so a failure says what (it happens on CI only).
+            wide = TK.eval_js(s, """(() => { const d = document.querySelector('.bt-dash');
+                if (d.scrollWidth <= d.clientWidth + 1) return [];
+                const right = d.getBoundingClientRect().right;
+                return [...d.querySelectorAll('*')].filter(e => e.getBoundingClientRect().right > right + 1)
+                    .map(e => e.className + ' ' + Math.round(e.getBoundingClientRect().width) + 'px: ' +
+                              (e.textContent || '').trim().slice(0, 60)).slice(0, 8); })()""")
+            @test isempty(wide)
             TK.screenshot(s, joinpath(screenshots, "$label.png"))
         end
         TK.set_window_size(s,1280,1100)

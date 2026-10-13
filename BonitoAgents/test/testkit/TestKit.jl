@@ -1034,9 +1034,13 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     # Behind the proxy the pages come with a certificate from Caddy's own CA, and
     # each browser keeps cookies of its own: Electron's default profile is shared
     # by every window, so a second browser would be logged in as the first.
-    # Without a GPU (CI) WebGL runs on SwiftShader, and Chromium warns about that
-    # fallback unless it was asked for: a 3D view failed the console gate on it.
-    electron_args = String["--enable-unsafe-swiftshader"]
+    # CI has no GPU. Chromium's own fallback there composites in software, reads
+    # every WebGL frame back ("GPU stall due to ReadPixels") and warns about the
+    # fallback itself, each failing the console gate where a 3D view shows.
+    # SwiftShader asked for keeps the compositing on it. Not on a desktop: it
+    # renders on the CPU.
+    electron_args = get(ENV, "CI", "") == "true" ?
+        String["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : String[]
     s.admin === nothing ||
         append!(electron_args, ["--ignore-certificate-errors", "--user-data-dir=$(mktempdir())"])
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
@@ -1278,13 +1282,15 @@ end
 # by project id). Tests never need to ask for it.
 
 """
-    wait_for(s, label, js_predicate; timeout = 8) -> Bool
+    wait_for(s, label, js_predicate; timeout = 8, describe = nothing) -> Bool
 
 Poll `js_predicate` (a JS expression returning truthy/falsy) until it's
 truthy or `timeout` seconds elapse. Returns the truthy value (or `false`).
+`describe`, a JS expression, says in the timeout error what the page showed.
 """
 function wait_for(s::TestServer, label::AbstractString, predicate::AbstractString;
-                   timeout::Real = 8, interval::Real = 0.1)
+                   timeout::Real = 8, interval::Real = 0.1,
+                   describe::Union{Nothing,AbstractString} = nothing)
     t0 = time()
     code = "(() => { try { return " * String(predicate) * "; } catch (e) { return false; } })()"
     # Per-poll bound is SHORT (≤5s): if the renderer is momentarily pinned (e.g.
@@ -1305,7 +1311,8 @@ function wait_for(s::TestServer, label::AbstractString, predicate::AbstractStrin
         v in (false, nothing) || return v
         sleep(interval)
     end
-    error("wait_for timed out after $(timeout)s: $label")
+    shown = describe === nothing ? "" : " (the page showed: $(repr(eval_js(s, describe))))"
+    error("wait_for timed out after $(timeout)s: $label$shown")
 end
 
 """
@@ -1817,7 +1824,7 @@ function share_worker_ui!(s::TestServer, groups::AbstractVector{<:AbstractString
     wait_for(s, "the worker's sharing picker", "!!$(picker)"; timeout = 60)
     pick_groups!(s, picker, groups)
     wait_for(s, "the share saved", "document.querySelector('.bt-worker-sharing').textContent.includes('shared')";
-             timeout = 30)
+             timeout = 30, describe = "document.querySelector('.bt-worker-sharing')?.textContent")
     return s
 end
 

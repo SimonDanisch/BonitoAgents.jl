@@ -4112,7 +4112,8 @@ class BonitoChat {
                 e.preventDefault(); e.stopImmediatePropagation();
                 this.sendMode = modeOption.dataset.sendMode;
                 const trigger = this.app.querySelector('.bt-send-mode-trigger');
-                trigger.textContent = {done: 'Queue when done', next: 'Queue after message', interrupt: 'Interrupt + send'}[this.sendMode];
+                trigger.querySelector('.bt-send-mode-label').textContent =
+                    {done: 'Queue when done', next: 'Queue after message', interrupt: 'Interrupt + send'}[this.sendMode];
                 trigger.title = modeOption.textContent;
                 trigger.setAttribute('aria-label', trigger.title);
                 trigger.setAttribute('aria-expanded', 'false');
