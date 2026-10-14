@@ -1791,10 +1791,14 @@ and untick, add the names that are not on the list through its field, and close
 it, which saves. `picker_js` is a JS expression for the picker (`.bt-group-pick`).
 """
 function pick_groups!(s::TestServer, picker_js::AbstractString, groups::AbstractVector{<:AbstractString})
+    # The picker is a sub-session: on a slow machine its button is on the page
+    # before its click handler is, and a click then does nothing.
+    wait_for(s, "the group list open", """(() => { const m = $(picker_js);
+        if (!m) return false;
+        if (!m.classList.contains('bt-menu-open')) m.querySelector('.bt-group-trigger').click();
+        return m.classList.contains('bt-menu-open'); })()"""; timeout = 20)
     ok = eval_js(s, """(() => {
         const m = $(picker_js);
-        if (!m) return 'no group picker';
-        m.querySelector('.bt-group-trigger').click();
         const want = $(json(collect(String, groups)));
         for (const g of want) {
             if ([...m.querySelectorAll('.bt-group-item input')].some(i => i.value === g)) continue;

@@ -8,8 +8,9 @@
     P = ".bt-chatpane[data-pane-pid=\"$pid\"] "
     C = "document.querySelector($(TK.json(P * ".bt-messages")))"
     TK.send_message(s, "seed scroll history")
-    @test TK.wait_for(s, "history fills the viewport", "$C?.textContent.includes('line 100') && $C.scrollHeight > $C.clientHeight + 500")
-    @test TK.wait_for(s, "reply finished", "!document.querySelector($(TK.json(P * ".bt-busy-active")))")
+    # The chat's first reply: it waits for the agent to start.
+    @test TK.wait_for(s, "history fills the viewport", "$C?.textContent.includes('line 100') && $C.scrollHeight > $C.clientHeight + 500"; timeout = 60)
+    @test TK.wait_for(s, "reply finished", "!document.querySelector($(TK.json(P * ".bt-busy-active")))"; timeout = 60)
     sleep(0.5)
 
     # Real mouse drag in the empty right margin, past the bottom edge.
