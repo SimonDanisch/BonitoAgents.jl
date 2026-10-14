@@ -295,7 +295,14 @@ function connection_guard(session::Bonito.Session)
             if (status === 'expired') {
                 $(ChatLib).then(lib => {
                     lib.flushDrafts();            // text typed just now counts as kept
-                    unsent() ? setBlocked(true, status) : reloadWhenShown();
+                    if (unsent()) { setBlocked(true, status); return; }
+                    // Its login ended too (the server restarted with Authelia),
+                    // a reload lands on the login page, and a login made there
+                    // drops the one the other tabs have meanwhile: this tab
+                    // waits for the login, with its card, and reloads after.
+                    $(LoginLib).then(login => login.check()
+                        .then(s => s === 'ended' ? login.logged_in() : null)
+                        .then(reloadWhenShown));
                 });
                 return;
             }
@@ -309,6 +316,11 @@ end
 # Answers only through the login: what `login_guard` asks.
 const LOGIN_CHECK_ROUTE = "/session"
 
+# The login as the tabs of one browser share it. Served on its own route too,
+# for Authelia's login page (`LOGIN_SCRIPT_ROUTE`).
+const LOGIN_JS = joinpath(@__DIR__, "..", "assets", "login.js")
+const LoginLib = Bonito.ES6Module(LOGIN_JS)
+
 """
     login_guard(session, auth)
 
@@ -316,7 +328,8 @@ Behind a login, an open tab checks every few minutes (and when it becomes
 visible again) that its login still lets requests through: that keeps the login
 alive while the tab is open, and when it has ended anyway (its time was up, an
 admin disabled the account) the tab says so, with a way to log in again, instead
-of failing on the next thing it loads. Uses the connection guard's card.
+of failing on the next thing it loads. A chat opened meanwhile comes up once the
+login is back. Uses the connection guard's card.
 """
 login_guard(::Bonito.Session, ::OpenAuth) = DOM.div()
 
@@ -333,23 +346,7 @@ function login_guard(session::Bonito.Session, ::LoginAuth)
                        onclick = js"() => window.open(window.location.origin + '/', '_blank')");
             class = "bt-conn-card", role = "alertdialog", var"aria-live" = "assertive");
         class = "bt-conn-modal bt-login-ended", dataStatus = "disconnected")
-    Bonito.onload(session, modal, js"""(modal) => {
-        async function check() {
-            let r;
-            try {
-                r = await fetch($(LOGIN_CHECK_ROUTE), {redirect: 'manual', cache: 'no-store', credentials: 'same-origin'});
-            } catch (e) {
-                return;   // the server is out of reach: the connection guard's business
-            }
-            if (r.status === 204) { modal.classList.remove('bt-conn-open'); return; }
-            if (r.type === 'opaqueredirect' || r.status === 401 || r.status === 403)
-                modal.classList.add('bt-conn-open');
-        }
-        setInterval(check, 5 * 60 * 1000);
-        document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && check());
-        // Back from the login tab: the window gets focus without a visibility change.
-        window.addEventListener('focus', () => modal.classList.contains('bt-conn-open') && check());
-    }""")
+    Bonito.onload(session, modal, js"(modal) => $(LoginLib).then(login => login.guard(modal))")
     return modal
 end
 

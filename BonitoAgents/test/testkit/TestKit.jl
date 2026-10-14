@@ -1212,7 +1212,9 @@ function console_entries(ctx::ECT.TestContext; take::Bool = false)
     return v === nothing ? Any[] : collect(Any, v)
 end
 
-# Close a test browser, keeping what it logged for the next `check_console!`.
+# Close a test browser's window, keeping what it logged for the next
+# `check_console!`. The browser (`ctx.app`) goes with its last window
+# (`another_tab` opens more).
 function close_browser(ctx::ECT.TestContext)
     entries = if ctx.app.exists && isopen(ctx.window)
         try
@@ -1224,11 +1226,16 @@ function close_browser(ctx::ECT.TestContext)
     else
         Any[]
     end
-    lock(CONSOLE.lock) do
+    tabs_left = lock(CONSOLE.lock) do
         filter!(c -> c !== ctx, CONSOLE.open)
         append!(CONSOLE.unchecked, entries)
+        any(c -> c.app === ctx.app, CONSOLE.open)
     end
-    close(ctx)
+    if !tabs_left
+        close(ctx)
+    elseif isopen(ctx.window)
+        close(ctx.window)
+    end
     return nothing
 end
 
@@ -1677,6 +1684,30 @@ function another_browser(s::TestServer)
                    Ref{Any}(nothing), Ref(false), s.browser_size, s.admin, s.otp_used, s.extra_workers)
     open_browser(b)
     return b
+end
+
+"""
+    another_tab(s; route = "/") -> TestServer
+
+A second tab of the browser `s` drives, on `route`: the same cookies, so the
+same login. Everything that takes a `TestServer` drives it. Close it with
+`close_browser!`, which closes only the tab.
+"""
+function another_tab(s::TestServer; route::AbstractString = "/")
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    # What `ECT.open_window` gives its window: hidden, painting, unthrottled.
+    win = ElectronCall.Window(ctx.app; show = false, width = s.browser_size[1], height = s.browser_size[2],
+                              webPreferences = Dict{String,Any}("offscreen" => true, "disableDialogs" => true,
+                                  "backgroundThrottling" => false, "paintWhenInitiallyHidden" => true))
+    ECT.keep_headless!(ctx.app, win)
+    tab = ECT.TestContext(ctx.app, win, false)
+    capture_console!(tab)
+    follow_pane_scope!(tab)
+    t = TestServer(s.h, s.agent_fn, s.dispatcher_sock, s.dispatcher_port, s.dispatcher_task,
+                   Ref{Any}(tab), Ref(false), s.browser_size, s.admin, s.otp_used, s.extra_workers)
+    ElectronCall.load(win, ElectronCall.URI(s.h.url * route))
+    return t
 end
 
 function close_browser!(s::TestServer)

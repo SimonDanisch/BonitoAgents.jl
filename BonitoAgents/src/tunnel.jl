@@ -49,7 +49,10 @@ TunnelGate(auth::TunnelAuth, shares::ShareRegistry = ShareRegistry()) =
 server_gate(::AuthMode, ::ShareRegistry) = nothing
 server_gate(auth::TunnelAuth, shares::ShareRegistry) = TunnelGate(auth, shares)
 
-const OPEN_TARGETS = ("/w", "/install", "/install.sh", "/install.ps1", "/install.jl")
+# assets/login.js, for Authelia's login page (`with_login_script`), which is
+# shown to whoever is not logged in.
+const LOGIN_SCRIPT_ROUTE = "/login.js"
+const OPEN_TARGETS = ("/w", "/install", "/install.sh", "/install.ps1", "/install.jl", LOGIN_SCRIPT_ROUTE)
 const INVITE_TARGET = r"^/invite/[0-9a-f]{64}/?$"
 
 is_open_target(target::AbstractString) = target in OPEN_TARGETS || occursin(INVITE_TARGET, target)
@@ -158,10 +161,27 @@ function client_address(request::HTTP.Request)
     return ip * " " * first(HTTP.header(request, "User-Agent", "no user agent"), 60)
 end
 
-# Authelia's login page and API, under the dashboard's own name.
-pass_to_authelia(auth::TunnelAuth, request::HTTP.Request) =
-    relayed(ask_authelia(auth, request.method, request.target, authelia_headers(auth, request),
-                         request_bytes(request.body)))
+# Authelia's login page and API, under the dashboard's own name. A page the
+# browser navigates to gets assets/login.js: shown while the browser was logged
+# out, it leaves once the browser is logged in in another tab. A login made
+# there anyway would drop the session the other tabs of the browser are using.
+function pass_to_authelia(auth::TunnelAuth, request::HTTP.Request)
+    page = request.method == "GET" && HTTP.header(request, "Sec-Fetch-Dest", "") == "document"
+    headers = authelia_headers(auth, request)
+    page && filter!(h -> lowercase(first(h)) != "accept-encoding", headers)   # HTML as text, to add to
+    answer = relayed(ask_authelia(auth, request.method, request.target, headers, request_bytes(request.body)))
+    return page ? with_login_script(answer) : answer
+end
+
+function with_login_script(page::HTTP.Response)
+    startswith(HTTP.header(page, "Content-Type", ""), "text/html") || return page
+    html = String(copy(page.body))   # `String` takes the vector it is given
+    head_end = findfirst("</head>", html)
+    head_end === nothing && return page
+    tag = "<script type=\"module\" src=\"$(LOGIN_SCRIPT_ROUTE)\"></script>"
+    return HTTP.Response(page.status, page.headers,
+                         Vector{UInt8}(html[1:prevind(html, first(head_end))] * tag * html[first(head_end):end]))
+end
 
 request_bytes(body::HTTP.BytesBody) = Vector{UInt8}(body)
 request_bytes(::HTTP.EmptyBody) = UInt8[]
