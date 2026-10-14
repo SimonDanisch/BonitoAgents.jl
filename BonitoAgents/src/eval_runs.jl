@@ -195,6 +195,15 @@ function run_update!(state::ServerState, project_id::AbstractString,
         r.status == "running" || (r.finished = r.started + Float64(get(d, "elapsed", 0.0)))
     end
     get(d, "collected", false) === true && (r.collected = true)
+    # What it prints before its card listens is held for the card.
+    key = eval_sink_key(project_id, r.route)
+    lock(state.lock) do
+        if r.status != "running"
+            delete!(state.eval_stream_pending, key)
+        elseif haskey(d, "status") && !haskey(state.eval_stream_sinks, key)
+            get!(state.eval_stream_pending, key, "")
+        end
+    end
     if r.status != "running" && haskey(d, "content")
         r.content = Any[AgentClientProtocol.parse_content_block(c) for c in d["content"]
                         if c isa AbstractDict]

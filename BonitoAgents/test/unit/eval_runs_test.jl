@@ -96,6 +96,22 @@ try
         @test BT.in_taskbar(e)
     end
 
+    @testset "what a run prints before its card listens reaches the card" begin
+        # CI, 2026-10-13: a background eval printed at once and ran on silently.
+        # Its card's tail started after the line had come and gone: it never showed.
+        BT.run_update!(state, "proj", "", running("r30", "/tmp/envP"; background = true,
+                                                  tool_use_id = "toolu_P"))
+        BT.route_eval_chunk!(state, "proj", abspath("/tmp/envP"), "SPIN_PID=42\n")
+        p = card("toolu_P", ("code" => "spin()", "env_path" => "/tmp/envP", "background" => true);
+                 status = "completed")
+        BT.adopt_run!(p)                     # takes the run over and starts its tail
+        @test timedwait(() -> occursin("SPIN_PID=42", p.stream_text[]), 5.0) === :ok
+        # Nothing is held for a run that ended.
+        BT.run_update!(state, "proj", "", frame("r30"; status = "passed", route = abspath("/tmp/envP"),
+            env_path = "/tmp/envP", background = true, elapsed = 1.0))
+        @test isempty(lock(() -> copy(state.eval_stream_pending), state.lock))
+    end
+
     @testset "a foreground run takes a bar slot only once its call is over" begin
         f = card("toolu_F", ("code" => "sleep(99)", "env_path" => "/tmp/envF"))
         BT.run_update!(state, "proj", "", running("r2", "/tmp/envF"; tool_use_id = "toolu_F"))

@@ -49,6 +49,14 @@
                     .map(e => e.className + ' ' + Math.round(e.getBoundingClientRect().width) + 'px: ' +
                               (e.textContent || '').trim().slice(0, 60)).slice(0, 8); })()""")
             @test isempty(wide)
+            if label == "phone"
+                # A long subtitle (CI's runner@host · /tmp/... root) ends in an
+                # ellipsis instead of running past the edge.
+                @test TK.eval_js(s, """(() => {
+                    document.querySelectorAll('.bt-card-meta > *').forEach(e => e.textContent = 'runner@a-long-host-name · ' + '/tmp/'.repeat(12));
+                    const right = document.querySelector('.bt-dash').getBoundingClientRect().right;
+                    return [...document.querySelectorAll('.bt-card-meta > *')].every(e => e.getBoundingClientRect().right <= right + 1); })()""") == true
+            end
             TK.screenshot(s, joinpath(screenshots, "$label.png"))
         end
         TK.set_window_size(s,1280,1100)

@@ -49,9 +49,10 @@
             sleep(0.4)
         end
         @test TK.eval_js(s, on_screen) == true
-        # Hover-only actions would be invisible and still take the taps.
-        @test TK.eval_js(s, """(() => { const a = [...$(PANE).querySelectorAll('.bt-media-actions, .bt-code-actions')];
-            return a.length >= 3 && a.every(e => getComputedStyle(e).opacity === '1'); })()""") == true
+        # Hover-only actions would be invisible and still take the taps. Waited
+        # for: the phone's (hover: none) fades them in (80 ms).
+        @test TK.wait_for(s, "the actions shown", """(() => { const a = [...$(PANE).querySelectorAll('.bt-media-actions, .bt-code-actions')];
+            return a.length >= 3 && a.every(e => getComputedStyle(e).opacity === '1'); })()"""; timeout = 5) == true
 
         # A tap anywhere closes the picture, the picture itself too: no Esc on a phone.
         TK.tap(s, ".bt-media-wrap img.bt-media")

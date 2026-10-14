@@ -1034,13 +1034,9 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     # Behind the proxy the pages come with a certificate from Caddy's own CA, and
     # each browser keeps cookies of its own: Electron's default profile is shared
     # by every window, so a second browser would be logged in as the first.
-    # CI has no GPU. Chromium's own fallback there composites in software, reads
-    # every WebGL frame back ("GPU stall due to ReadPixels") and warns about the
-    # fallback itself, each failing the console gate where a 3D view shows.
-    # SwiftShader asked for keeps the compositing on it. Not on a desktop: it
-    # renders on the CPU.
-    electron_args = get(ENV, "CI", "") == "true" ?
-        String["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] : String[]
+    # Without a GPU (CI) WebGL runs on SwiftShader, and Chromium warns about that
+    # fallback unless it was asked for. With a GPU the flag does nothing.
+    electron_args = String["--enable-unsafe-swiftshader"]
     s.admin === nothing ||
         append!(electron_args, ["--ignore-certificate-errors", "--user-data-dir=$(mktempdir())"])
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
@@ -1196,6 +1192,11 @@ function capture_console!(ctx::ECT.TestContext)
         // positional arguments; everything is on the event.
         wc.on('console-message', (e) => {
             if (e.level !== 'warning' && e.level !== 'error') return;
+            // The GPU process's notes on the machine's graphics driver, not the
+            // page's: without a GPU (CI) every WebGL frame is read back for the
+            // software compositor, and Chromium says so ("GPU stall due to
+            // ReadPixels"). Driver errors still count.
+            if (/^\\[\\.WebGL-[^\\]]*\\]GL Driver Message \\([^,]*, Performance,/.test(e.message)) return;
             log.push({type: e.level, message: String(e.message), source: String(e.sourceId ?? ''),
                       line: e.lineNumber, page: wc.getURL(), time: Date.now()});
         });

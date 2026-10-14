@@ -631,15 +631,22 @@ eval_sink_key(project_id::AbstractString, route::AbstractString) = "$project_id\
     route_eval_chunk!(state, project_id, route, chunk)
 
 Deliver a live stdout/stderr chunk (pushed by the MCP over its channel) to the
-matching running eval's tail loop. Drops silently if no tail is listening — the
-live stream is a best-effort display side-channel; the agent's copy of the
-output rides the MCP tool response separately.
+matching running eval's tail loop. With no tail listening, a running run's last
+`keep` bytes wait for its card (`eval_stream_pending`); anything else is dropped.
+The live stream is a display side-channel; the agent's copy of the output rides
+the MCP tool response separately.
 """
 function route_eval_chunk!(state::ServerState, project_id::AbstractString,
-                           route::AbstractString, chunk::AbstractString)
+                           route::AbstractString, chunk::AbstractString; keep::Int = 8192)
     isempty(chunk) && return nothing
+    key = eval_sink_key(project_id, route)
     ch = lock(state.lock) do
-        get(state.eval_stream_sinks, eval_sink_key(project_id, route), nothing)
+        sink = get(state.eval_stream_sinks, key, nothing)
+        # A running run whose card does not listen yet: kept for it.
+        held = get(state.eval_stream_pending, key, nothing)
+        sink === nothing && held !== nothing &&
+            (state.eval_stream_pending[key] = String(last(held * chunk, keep)))
+        sink
     end
     ch === nothing && return nothing
     try

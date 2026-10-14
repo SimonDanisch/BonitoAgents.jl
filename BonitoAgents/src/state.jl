@@ -522,6 +522,10 @@ mutable struct ServerState
     # forwards worker IO over its channel (no on-disk log, no polling); the sink exists
     # only while an eval's tail loop runs. Guarded by `lock`.
     eval_stream_sinks  :: Dict{String,Channel{String}}
+    # A running run's output while no tail listens yet, same keys: its card can
+    # start listening after the first lines (a background call is over before
+    # the chat sees it running). The last few KB. Guarded by `lock`.
+    eval_stream_pending :: Dict{String,String}
     session_inflight   :: Dict{String,Task}             # project_id => in-flight ensure_project_session! task
     # Per-path serialization lock for fetched `bt_show` files (server_dst => lock);
     # a process-level coordination pool, server-scoped here so it dies with the server.
@@ -641,6 +645,7 @@ function ServerState(; state_dir::String,
         Dict{String,ReentrantLock}(),             # eval_host_locks
         Dict{String,ValuePair}(),                 # value_pairs
         Dict{String,Channel{String}}(),           # eval_stream_sinks
+        Dict{String,String}(),                    # eval_stream_pending
         Dict{String,Task}(),                      # session_inflight
         Dict{String,ReentrantLock}(),             # show_fetch_inflight
         Dict{String,@NamedTuple{size::Int, mtime::Float64}}(),  # show_mirror_stamps
@@ -710,6 +715,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.eval_host_locks,
             s.value_pairs,
             s.eval_stream_sinks,
+            s.eval_stream_pending,
             s.session_inflight,
             s.show_fetch_inflight,
             s.show_mirror_stamps,

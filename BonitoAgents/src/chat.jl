@@ -4905,11 +4905,14 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
     state = chat.state
     key = eval_sink_key(chat.project_id, eval_route_key(state, m))
     ch = Channel{String}(Inf)
-    lock(state.lock) do
+    held = lock(state.lock) do
         # A stale sink from a prior eval on the same route can only linger if its
         # loop died without cleanup; overwrite it (the MCP routes to the newest).
         state.eval_stream_sinks[key] = ch
+        # What its run printed before this tail listened.
+        pop!(state.eval_stream_pending, key, "")
     end
+    isempty(held) || append_tail!(m, held)
     deadline = time() + 4 * 3600      # hard stop for a wedged status
     try
         while eval_streaming(m) && time() < deadline

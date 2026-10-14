@@ -1001,6 +1001,10 @@ const DashboardStyles = Bonito.Styles(
         "display" => "flex", "align-items" => "center", "gap" => "6px",
         "white-space" => "nowrap", "overflow" => "hidden",
         "text-overflow" => "ellipsis"),
+    # The text sits in a child (the subtitle Observable's span), which a flex
+    # row does not shrink: a long user@host · root ran past a phone's edge.
+    CSS(".bt-card-meta > *", "min-width" => "0", "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
     CSS(".bt-card-actions",
         "display" => "flex", "gap" => "6px", "flex-shrink" => "0",
         "align-items" => "center"),
