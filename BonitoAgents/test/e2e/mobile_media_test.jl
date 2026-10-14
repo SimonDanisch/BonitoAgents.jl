@@ -72,6 +72,8 @@
         TK.tap(s, ".bt-media-wrap .bt-media-copy")
         @test TK.wait_for(s, "the picture copied",
             "$(PANE).querySelector('.bt-media-wrap .bt-media-copy').textContent === '✓'"; timeout = 10) == true
+        # The code is above the picture: maybe off the screen now.
+        TK.eval_js(s, "$(PANE).querySelector('.bt-code-copy').scrollIntoView({block: 'center'}); true")
         TK.tap(s, ".bt-code-copy")
         @test TK.wait_for(s, "the code copied",
             "[...$(PANE).querySelectorAll('.bt-code-copy')].some(b => b.textContent === '✓')"; timeout = 10) == true

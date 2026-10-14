@@ -2250,6 +2250,9 @@ function tap(s::TestServer, selector::AbstractString)
     xy = eval_js(s, """(() => { const e = [...document.querySelectorAll($(json(selector)))].find(e => e.getClientRects().length);
         if (!e) return null; const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()""")
     xy === nothing && error("tap: nothing rendered matches $(selector)")
+    # A finger lands only on what is on the screen.
+    w, h = eval_js(s, "[innerWidth, innerHeight]")
+    (0 <= xy[1] <= w && 0 <= xy[2] <= h) || error("tap: $(selector) is off the screen, at $(xy)")
     touch(s, "await T('touchStart', $(xy[1]), $(xy[2])); await T('touchEnd');")
     return s
 end
