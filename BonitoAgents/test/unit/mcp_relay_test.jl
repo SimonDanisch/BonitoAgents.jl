@@ -21,12 +21,12 @@
     state.worker_links["worker-a"] = server_link
     relay = BW.start_mcp_relay(worker_link)
     proc = Ref{Any}(nothing)
-    function request(id, method, params)
+    function request(id, method, params; wait = 60.0)
         println(proc[], JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params)))
         flush(proc[])
         result = Channel{Any}(1)
         @async put!(result, try JSON.parse(readline(proc[])) catch e; e end)
-        timedwait(() -> isready(result), 60.0) === :ok || error("MCP subprocess did not reply")
+        timedwait(() -> isready(result), wait) === :ok || error("MCP subprocess did not reply")
         reply = take!(result)
         reply isa Exception && throw(reply)
         @test reply["id"] == id
@@ -66,6 +66,11 @@
             # The committed eval env: the default one may lack a Bonito that can
             # carry the live-render bridge checked below.
             evalenv = abspath(joinpath(@__DIR__, "..", "evalenv"))
+            # Its session first: starting one (and its live-render bridge) comes
+            # before an eval's checkpoint, and on a cold CI runner took over 60 s.
+            warm = request(10, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict(
+                "code" => "1 + 1", "env_path" => evalenv)); wait = 600.0)
+            @test warm["_meta"]["status"] == "completed"
             running = request(4, "tools/call", Dict("name" => "bt_julia_eval", "arguments" => Dict(
                 "code" => "println(\"relay-started\"); sleep(60); 42", "timeout" => 0.1, "env_path" => evalenv)))
             @test running["_meta"]["status"] == "running"
