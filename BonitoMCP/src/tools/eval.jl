@@ -463,7 +463,7 @@ function remote_workers_text()
     workers = get(reply, "workers", Any[])
     lines = String[enabled ?
         "other workers (pass `worker = \"<name>\"` to run there; remote julia is ON for this chat):" :
-        "other workers (remote julia is OFF for this chat — the user can switch it on in the chat header, next to the permissions pill):"]
+        "other workers (remote julia is OFF for this chat; an admin can switch it on in the chat's ⋯ menu → 'Remote julia'):"]
     isempty(workers) && push!(lines, "  (none online)")
     for w in workers
         w isa AbstractDict || continue
@@ -593,9 +593,9 @@ Running on ANOTHER worker (machine):
     `bt_julia_interrupt`, `bt_julia_restart` and `bt_julia_list_sessions` take
     the same `worker` argument to address them. `bt_julia_list_sessions` (no
     arguments) lists the workers you can use.
-  - This is OFF by default: the user switches "remote julia" on per chat, in the
-    chat header next to the permissions pill. While it is off, a call with
-    `worker` errors and says so — ask the user rather than retrying.
+  - This is OFF by default: an admin switches "Remote julia" on per chat, in the
+    chat's ⋯ menu. While it is off, a call with `worker` errors and says so;
+    ask the user rather than retrying.
   - The other machine has its own filesystem: copy code, its Project.toml /
     Manifest.toml and data there first with `bt_sync_folder`, and pass an
     `env_path` that exists THERE.

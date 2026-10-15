@@ -7,29 +7,38 @@ for existing sessions.
 
 ## Adding a machine
 
-Copy the one-liner from the dashboard's home screen and run it on the
-machine:
+Click **Add worker** on the dashboard and run the command it shows on the new
+machine. The command carries the machine's credential, which is shown only
+once:
 
 ```bash
 # Linux / macOS
-curl -fsSL http://<your-server>:8038/install.sh | sh
+curl -fsSL https://<your-server>/install.sh | sh -s w-...
 
 # Windows (PowerShell)
-irm http://<your-server>:8038/install.ps1 | iex
+& ([scriptblock]::Create((irm https://<your-server>/install.ps1))) w-...
 ```
 
-What it does:
+The machine needs `julia` on its PATH; the installer stops with a message if it
+is missing. Then it:
 
-1. checks the prerequisites (`node`, `npm`, `claude`, `claude-agent-acp`),
-2. installs the worker packages into a shared `@bonito-agents` Julia
+1. installs the worker packages into a shared `@bonito-agents` Julia
    environment, pinned to the same code revision the server runs so server
    and workers can't drift apart,
-3. writes the worker config (server URL + secret) and a stable `worker_id`,
-4. starts the worker and, on Linux, installs a systemd user service
+2. records the worker config (server URL, credential and a stable `worker_id`)
+   in a Julia scratchspace,
+3. starts the worker and, on Linux, installs a systemd user service
    (`bonito-worker`) so it survives reboots.
 
-Re-running the one-liner updates the worker to the server's current revision
-and restarts the service.
+The worker then installs a private Node and the agent adapters
+(`claude-agent-acp`, `codex-acp`) itself, at the versions the server declares,
+and updates them while no chat runs there. Admins set those versions under
+*Agent adapters* on the Settings page. Logging in to an agent stays with the
+machine's user: for Claude Code, install it and run `claude` once. The installer
+notes when Claude Code was never used on the machine.
+
+To update, run the command again without the credential: the machine keeps the
+one it has, moves to the server's current revision and restarts the service.
 
 ## Identity and renames
 

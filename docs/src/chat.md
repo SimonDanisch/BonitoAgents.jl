@@ -116,13 +116,13 @@ Left: the session dot, the chat's title (click to rename) and the folder it
 runs in on its worker. Right: one segmented **session group** with the context
 meter (tokens used of the window, percent, cost so far; it turns amber past
 three quarters and red past nine tenths), the model, permissions and effort
-pickers, the *remote julia* switch (may this chat's agent run Julia and copy
-folders on other workers; off by default, see the tools page), and the agent
-provider. Everything you *do* to a chat lives in the **⋯ menu** next to them:
-*Review changes*, *Continue on* another worker, *Compact*, *Restart session*,
-*Debug BonitoAgents* and the *Dev mode* switch. The strip itself stays what you
-read and set, so a verb never sits among the pickers looking like a sixth
-setting.
+pickers, and the agent provider. Everything you *do* to a chat lives in the
+**⋯ menu** next to them: *Review changes*, *Continue on* another worker,
+*Compact*, *Restart session* and *Debug BonitoAgents*. Admins also find two
+switches there, both off by default: *Remote julia* (may this chat's agent run
+Julia and copy folders on other workers, see the tools page) and *Dev mode*
+(see the development page). The strip itself stays what you read and set, so a
+verb never sits among the pickers looking like another setting.
 Long-running actions report in the muted status line left of the controls;
 outcomes arrive as a toast. When the agent session dies, a red **Session
 ended · Reconnect** chip appears next to the title.
@@ -134,7 +134,7 @@ ended · Reconnect** chip appears next to the title.
 - **Yolo mode** (composer toggle) auto-continues an agent that pauses to ask
   "shall I keep going?". Leaving is deliberate and takes two steps: the agent
   answers the nudge with the `YOLO-COMPLETE` sentinel, which only ASKS to stop,
-  and the loop then puts "are you really done?" back to it — the loop ends on
+  and the loop then puts "are you really done?" back to it. The loop ends on
   the answer to that, and only when that turn does no work. The composer doubles
   as the reminders editor while Yolo is armed; the reminders ride along on every
   prompt, including the confirmation. A turn that fails, gets refused, or
@@ -157,4 +157,10 @@ ended · Reconnect** chip appears next to the title.
   case, never shows it. When the server no longer has a session for the tab (it
   restarted, or the tab was away for over an hour), no reconnect can work: the
   tab reloads itself, or, if that would lose a message typed and not sent, says
-  so and waits for you to copy it and reload.
+  so and waits for you to copy it and reload. If the tab's login has ended too,
+  it waits for you to log in again first, so the reload does not land on the
+  login page.
+- If your **login ends** while a tab is open, the tab shows a "Your login has
+  ended" card with a button that opens the login in a new tab. Once any tab of
+  the browser is logged in again, the card goes away by itself and whatever was
+  waiting carries on, a chat opened in the meantime included.

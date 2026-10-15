@@ -46,7 +46,9 @@ another connected machine. The output still streams into the current chat and
 the result still renders there. `bt_sync_folder` moves the required code and
 data first, with subsequent syncs sending only what changed. This makes it
 practical to keep the conversation on a laptop while running the computation
-beside a dataset, a GPU or a long-lived project environment elsewhere.
+beside a dataset, a GPU or a long-lived project environment elsewhere. Running
+on other machines is off by default: an admin switches it on per chat with
+**Remote julia** in the chat's ⋯ menu.
 
 ### Put a working Bonito app inside the conversation
 
@@ -73,6 +75,35 @@ The result is a useful loop for work that produces more than source code: ask
 for an analysis, simulation, visualization, report or small interface, inspect
 the real artifact in place, then continue the conversation with that result in
 view.
+
+### Share a report or a live app with a link
+
+Some results are meant for other people. Ask the agent to share one, or use the
+share button on an eval result, on a file the agent showed you or on a file open
+in a tab. You get a link that opens in any browser without an account.
+
+Say you spent the afternoon with the agent on a simulation that runs on your
+desktop. It wrote `report.md` with a few plots and a short clip, and a small
+Bonito app for trying parameters. The report link opens as a plain web page,
+images and video included. The app link opens the app itself: a colleague drags
+the slider on their phone, and the new result is computed on your desktop, in
+the project's own Julia environment. Each visitor gets their own copy of the
+app.
+
+<p align="center">
+  <img src="BonitoAgents/assets/screenshot-share-phone.png" alt="A shared Bonito app on a phone: the Lorenz attractor with a slider, computed on the worker that shared it" width="300">
+</p>
+
+Other files work the same way. A CSV opens as a table, a 3D model in a viewer,
+a PDF in the browser, each with a download button. A link reaches that one file
+and what it embeds, nothing else in the folder. You can put a password on a
+link, and Settings lists your links so you can end any of them.
+
+A link works while its worker is online. A result shared straight from the chat
+also needs its Julia session to stay open. Share the `.jl` file instead and it
+runs again after a restart, and whenever the file changes. Behind a tunnel, the
+default setup, nobody needs to log in. With Caddy in front (`--tls acme`), app
+links need a logged-in viewer.
 
 ### Review the git diff with the agent
 
@@ -206,12 +237,20 @@ mail is involved. The server itself only listens on localhost. Two ways in:
   installer checks that both names point at the machine and port 80 reaches it
   before it asks for a certificate.
 
+Re-running the script updates the install. That restarts Authelia too, which
+keeps logins in memory, so everyone has to log in again. To restart only the
+dashboard, use `sudo systemctl restart bonitoagents-server`.
+
 Admins invite people with a link (or add accounts directly) and put them in
 groups; members see their own chats and workers, plus the workers shared with
-one of their groups.
+one of their groups. A login ends after a week without use and after four
+weeks at most; an open tab counts as use. When a login ends, every tab of that
+browser says so and waits. One login in any tab brings all of them back,
+including a chat opened in the meantime.
 
 Then, for each machine that should run agents, click **Add worker** on the
-dashboard and run the command it shows on that machine:
+dashboard and run the command it shows on that machine. The machine needs
+`julia` on its PATH.
 
 ```bash
 curl -fsSL https://team.example.com/install.sh | sh -s w-...
@@ -220,7 +259,8 @@ curl -fsSL https://team.example.com/install.sh | sh -s w-...
 Every worker gets its own credential, and revoking it disconnects that machine.
 The installer pins the worker to the server's code revision, registers the
 machine under a stable identity, and sets up a systemd user service on Linux.
-Re-run it any time to update. The server keeps each worker's agent adapters
+Re-run the command without the credential any time to update; the machine
+keeps the credential it has. The server keeps each worker's agent adapters
 (Claude Code, Codex) up to date, in a private Node install on the worker (set
 `BONITOAGENTS_NODE_DIST` on a worker that cannot reach nodejs.org to a mirror of
 its `dist` tree).
@@ -276,8 +316,16 @@ julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=[
 
 ## Security model
 
-Workers authenticate to the server with a shared secret from the install
-one-liner. The dashboard has no user accounts, so keep it on localhost, a
-VPN, or behind reverse-proxy auth. Agents run with the permissions of the
-worker process; the chat's permission prompts and the Yolo toggle decide how
-much they may do unattended.
+- **People** log in through Authelia when the server was set up with
+  `install_server.sh`. Members see only their own chats and workers, plus the
+  workers shared with one of their groups.
+- **Without a login** (`bonito-agents server`, or `--host 0.0.0.0`), whoever
+  reaches the server is its admin. Keep such a server on localhost or a network
+  you trust.
+- **Workers** each have their own credential from **Add worker**. Revoking it
+  disconnects that machine.
+- **Agents** run with the operating-system permissions of the worker process.
+  The chat's permission prompts and the Yolo toggle decide how much they may do
+  unattended.
+- **Shared links** from `bt_share` need no account: the link itself is the
+  permission, with an optional password on top.

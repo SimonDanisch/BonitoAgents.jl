@@ -37,7 +37,7 @@ are never touched by install/update/uninstall.
 
 Node and the agent adapters (Claude Code's and Codex's) are installed for you,
 in a private Node install, and kept up to date. What stays yours is logging in
-to the agents: for Claude Code, run `claude` once and authenticate.
+to the agents: for Claude Code, install it and run `claude` once to log in.
 
 ## From source
 
@@ -73,6 +73,11 @@ then on. A password and an authenticator code are on the same page, folded away,
 for when a passkey is not an option. Lost access? `install_server.sh
 --setup-link` makes a new link.
 
+Re-running the script updates the install. It stops and starts every service,
+Authelia included, and Authelia keeps logins in memory, so everyone has to log
+in again afterwards. To restart only the dashboard, use
+`sudo systemctl restart bonitoagents-server`.
+
 **Behind a tunnel** (the default): something in front of the machine brings
 HTTPS, e.g. a Cloudflare Tunnel with the public hostname `team.example.com`
 pointing at `http://localhost:8038`. Nothing else is needed from the tunnel: the
@@ -106,19 +111,35 @@ groups. Everyone lists, adds and removes passkeys on their account card, and get
 a new password or authenticator there; admins can do the latter from the
 Accounts table. No mail is involved anywhere.
 
+A login ends after a week without use and after four weeks at most; an open
+tab counts as use. When a login ends, every tab of that browser says so with a
+"Your login has ended" card and waits instead of sending you to the login page.
+Log in again in any one tab and the others carry on by themselves, a chat
+opened in the meantime included. Each login replaces the browser's session and
+would throw its other tabs out mid-request, so no tab asks for a login the
+browser already has. Behind a tunnel that includes a login page left open from
+a logged-out moment: it moves on to the dashboard as soon as another tab is
+logged in.
+
 Then, for each machine that should run agents, click **Add worker** on the
-dashboard and run the command it shows on that machine:
+dashboard and run the command it shows on that machine. The machine needs
+`julia` on its PATH; the installer stops with a message if it is missing.
 
 ```bash
+# Linux / macOS
 curl -fsSL https://team.example.com/install.sh | sh -s w-...
+
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://team.example.com/install.ps1))) w-...
 ```
 
 Each worker has its own credential; revoking it on the dashboard disconnects
 that machine. The installer puts the worker packages into a shared `@bonito-agents` Julia
 environment, registers the machine under a stable identity, and (on Linux)
 sets up a systemd user service so the worker survives reboots. The machine
-appears in the dashboard seconds later. Re-run the same one-liner to update;
-it always installs the code revision the server is running.
+appears in the dashboard seconds later. To update, re-run the command without
+the credential: the machine keeps the one it has, and the installer always
+installs the code revision the server is running.
 
 ## Your first project
 

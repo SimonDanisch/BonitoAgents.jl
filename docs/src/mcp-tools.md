@@ -66,8 +66,8 @@ which returns each finished run's output and result (the tail; the whole log
 stays on its worker and the result names its path).
 
 The chat follows the run, not the call. Its card stays live, with its output
-streaming in, until the run ends, then shows ✓ or ✗ with the failure's first
-line ("✗ failed after 3m41s — Some tests did not pass: 812 passed, 2 failed").
+streaming in, until the run ends. Then it shows ✓ or ✗ with how long the run
+took and, for a failure, the error's first line.
 While the call is over and the run is not, the run has a row in the task bar
 (`r4 · MacBook · BonitoAgents/test`) whose ⊗ stops that run and nothing else.
 When a run the agent has not collected finishes and the agent is idle, the chat
@@ -150,8 +150,8 @@ chat, so live results from both machines stay live side by side. (Two `env_path`
 on the SAME worker still share one bridge: there the newer session's embeds
 retire the older one's.)
 
-This is **off by default**. The chat header has a *remote julia* pill next to
-the permissions pill; the server enforces it at relay time, so switching it on
+This is **off by default**. An admin switches it on per chat with *Remote julia*
+in the chat's ⋯ menu. The server enforces it at relay time, so switching it on
 needs no restart, and switching it off ends the chat's evals on other machines.
 While it is off a call with `worker` fails and tells the agent where the switch
 is. `bt_julia_list_sessions` lists the other workers (and their live sessions)
