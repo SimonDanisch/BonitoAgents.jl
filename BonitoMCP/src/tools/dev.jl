@@ -44,9 +44,6 @@ function dev_result(value)
                             "isError" => false)
 end
 
-dev_error(msg::AbstractString) =
-    Dict{String,Any}("content" => [Dict("type" => "text", "text" => "error: $msg")],
-                     "isError" => true)
 
 # One place where a failed server call becomes a tool error. The message is the
 # server's verbatim — "worker 'x' is not connected" is exactly what the agent
@@ -56,7 +53,7 @@ function dev_call(op::AbstractString; timeout::Real = 30.0, kw...)
         return dev_result(call_server(op; timeout, kw...))
     catch e
         e isa InterruptException && rethrow()
-        return dev_error(sprint(showerror, e))
+        return tool_error(sprint(showerror, e))
     end
 end
 
@@ -109,7 +106,7 @@ register!("bt_dev_inspect", DEV_INSPECT_DESCRIPTION,
     function (args::AbstractDict)
         section = String(get(args, "section", "overview"))
         section in DEV_INSPECT_SECTIONS ||
-            return dev_error("unknown section '$section'; expected one of " *
+            return tool_error("unknown section '$section'; expected one of " *
                              join(DEV_INSPECT_SECTIONS, ", "))
         return dev_call("inspect"; section = section,
                         project_id = String(get(args, "project_id", "")),
@@ -125,9 +122,11 @@ FILE that the server and every worker write.
   • omitted / "ring" — the SERVER's own `@info`/`@warn`/`@error` ring. In memory,
     bounded, dies with the process.
   • "server"         — the server's log file.
+  • "authelia"       — the login's log (Authelia, on the server's machine): why
+    a login, a second factor or a passkey was refused. Servers with a login only.
   • a worker's name or id ("MacBook", "Bosgame", …) — that worker's log file,
     read on that machine.
-  • "all"            — the server plus every connected worker, in one reply.
+  • "all"            — the server, its login and every connected worker, in one reply.
 
 Reach for the FILE, not the ring, when the ring cannot have the answer — and it
 often cannot. The file is a redirect of the process's stdout and stderr, so it
@@ -163,8 +162,8 @@ register!("bt_dev_logs", DEV_LOGS_DESCRIPTION,
         "properties" => Dict{String,Any}(
             "source"   => Dict("type" => "string",
                                "description" => "\"ring\" (default, the server's in-memory log), " *
-                                                "\"server\" (the server's log file), a worker " *
-                                                "name/id, or \"all\" for every machine."),
+                                                "\"server\" (the server's log file), \"authelia\" " *
+                                                "(the login's), a worker name/id, or \"all\" for every machine."),
             "limit"    => Dict("type" => "integer",
                                "description" => "Max records/lines (ring 100, file 200; cap 2000)."),
             "level"    => Dict("type" => "string", "enum" => ["debug", "info", "warn", "error"],
@@ -252,19 +251,19 @@ Operations (`op`):
   • `close_chat`    — drop a chat from the open list (the thread is kept on disk).
                       Args: `project_id`.
   • `rescan_worker` — re-scan a worker for agent sessions. Args: `worker_id`.
-  • `move_project`  — copy a project's files from the worker it lives on to
-                      another worker (the cross-worker sync the UI's ⇄ button
-                      runs), then point the project at the destination.
+  • `continue_project` — "Continue on <worker>": a NEW chat on another worker
+                      with the project's files and the agent's memory; the
+                      original chat is left as it is. Returns the new chat's id.
                       Args: `project_id`, `worker_id` (the destination).
   • `set_title`     — rename a chat. Args: `project_id`, `title`.
 
 These have real effects on the user's live session — a `send_message` starts an
-agent turn that costs tokens, `move_project` writes files on another machine.
+agent turn that costs tokens, `continue_project` writes files on another machine.
 Say what you are about to do before doing it.
 """
 
 const DEV_CONTROL_OPS = ("open_chat", "send_message", "restart_chat", "close_chat",
-                         "rescan_worker", "move_project", "set_title")
+                         "rescan_worker", "continue_project", "set_title")
 
 register!("bt_dev_control", DEV_CONTROL_DESCRIPTION,
     Dict{String,Any}(
@@ -282,10 +281,10 @@ register!("bt_dev_control", DEV_CONTROL_DESCRIPTION,
     function (args::AbstractDict)
         op = String(get(args, "op", ""))
         op in DEV_CONTROL_OPS ||
-            return dev_error("unknown op '$op'; expected one of " * join(DEV_CONTROL_OPS, ", "))
+            return tool_error("unknown op '$op'; expected one of " * join(DEV_CONTROL_OPS, ", "))
         # A cross-worker copy moves a whole project tree over the network; the
         # default 30s would time out on anything real.
-        timeout = op == "move_project" ? 900.0 : 60.0
+        timeout = op == "continue_project" ? 900.0 : 60.0
         return dev_call("control"; timeout = timeout, op = op,
                         project_id = String(get(args, "project_id", "")),
                         worker_id  = String(get(args, "worker_id", "")),

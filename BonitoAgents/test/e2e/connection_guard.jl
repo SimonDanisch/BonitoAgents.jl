@@ -62,6 +62,51 @@ function run_suite(server)
             const t = [...document.querySelectorAll('.bt-text-input')].find(e => e.offsetParent); if (!t) return 'no input';
             return t.dispatchEvent(new KeyboardEvent('keydown', {key: 'a', bubbles: true, cancelable: true})) ? 'typed' : 'swallowed'; })()""") == "typed"
     end
+    # "expired": the server has no session for the page (it restarted, or dropped
+    # the page after an hour away) and closes its socket with 4404, which Bonito
+    # announces as `on_connection_expired()` (Bonito's reconnect tests cover that
+    # part). Nothing reconnects such a page, so the guard reloads it, or asks
+    # first when a reload would throw away a message typed but not sent.
+    composer = "[...document.querySelectorAll('.bt-text-input')].find(e => e.offsetParent)"
+    type_in(text) = TK.eval_js(server, """(() => { const t = $(composer); t.value = $(repr(text));
+        t.dispatchEvent(new Event('input', {bubbles: true})); return true; })()""")
+    @testset "a page the server no longer has reloads itself" begin
+        # Text typed and not sent is kept as the chat's draft, so the reload
+        # loses nothing and waits for nobody: the text is back afterwards. (A
+        # kept draft in ANY chat, a hidden one too, used to hold the reload up
+        # behind "This page has to be reloaded".)
+        @test TK.wait_for(server, "a composer to type into", "!!$(composer)"; timeout = 30) == true
+        type_in("kept as a draft")
+        TK.eval_js(server, "window.__before_reload = true; true")
+        TK.eval_js(server, "Bonito.on_connection_expired(); true")
+        @test TK.wait_for(server, "the page reloads and connects again",
+            "window.__before_reload === undefined && $(led)?.dataset.status === 'connected'"; timeout = 60) == true
+        @test TK.eval_js(server, "!$(modal).classList.contains('bt-conn-open')") == true
+        @test TK.wait_for(server, "the draft is back",
+            "($(composer) || {}).value === 'kept as a draft'"; timeout = 30) == true
+        type_in("")                                     # and gone again
+    end
+    @testset "with a message typed that cannot be kept, it asks before reloading" begin
+        @test TK.wait_for(server, "a composer to type into", "!!$(composer)"; timeout = 30) == true
+        # The storage is full (or off), so the draft is not kept and a reload
+        # would lose the text. The reload below brings the storage back.
+        TK.eval_js(server, "Storage.prototype.setItem = function () { throw new DOMException('full', 'QuotaExceededError'); }; true")
+        type_in("half a message")
+        TK.eval_js(server, "window.__before_reload = true; true")
+        TK.eval_js(server, "Bonito.on_connection_expired(); true")
+        @test TK.wait_for(server, "the guard asks",
+            "$(modal).classList.contains('bt-conn-open') && $(modal).dataset.status === 'expired'"; timeout = 10) == true
+        @test TK.eval_js(server, "window.__before_reload === true") == true          # not reloaded
+        @test occursin("reload", TK.eval_js(server, "$(modal).querySelector('.bt-conn-title').textContent"))
+        @test TK.eval_js(server, "$(composer).value") == "half a message"
+        # The full storage is reported once in the console; that is this test's doing.
+        @test any(e -> occursin("Could not save the chat draft", e["message"]), TK.js_errors(server))
+        TK.clear_js_errors(server)
+        # The card's button is the way out.
+        TK.eval_js(server, "$(modal).querySelector('.bt-conn-reload').click(); true")
+        @test TK.wait_for(server, "the reload",
+            "window.__before_reload === undefined && $(led)?.dataset.status === 'connected'"; timeout = 60) == true
+    end
     return server
 end
 

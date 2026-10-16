@@ -10,13 +10,12 @@
     using Dates
     const BT = BonitoAgents
 
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                          worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     # An "online" worker with no control socket: the bring-up registers the
     # chat model for real and its session start fails fast (swallowed by
     # `restart_chat_session!`, which keeps the chat object), so the loading
     # view's completion path runs without any worker.
-    st.workers[]["wid-a"] = BT.WorkerInfo("wid-a", "Desktop", "ws://x", "x", nothing,
+    st.workers[]["wid-a"] = BT.WorkerInfo("wid-a", "Desktop", nothing,
                                           "Desktop-host", "/home/u", "julia", String[],
                                           "/home/u/projects/Desktop", :online, now())
     st.projects[]["p1"] = BT.ProjectInfo("p1", "proj", "wid-a",

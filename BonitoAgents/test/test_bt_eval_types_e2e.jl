@@ -23,7 +23,7 @@
 
 using Test, JSON
 # TestKit / TK come from the enclosing @testitem (setup=[SharedServer]) so the
-# dispatcher + SERVER_CONTEXT are the shared, live ones. Only the DSL names are
+# dispatcher and the in-process MCP are the shared, live ones. Only the DSL names are
 # pulled in here.
 using .TestKit: text, bt_eval, end_turn
 

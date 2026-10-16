@@ -31,6 +31,10 @@ home = (
          details = "Open markdown, images, video, PDF, notebooks, tables and interactive " *
                    "3D geometry inside the chat or as editable workspace tabs.",
          link = "chat.html"),
+        (title = "Share it with a link",
+         details = "Send a report or a live app to anyone. It opens on their phone " *
+                   "without an account, and the app keeps computing on your worker.",
+         link = "index.html#Share-a-report-or-a-live-app-with-a-link"),
         (title = "Review the git diff together",
          details = "Comment on a changed line or block, ask immediately, or collect " *
                    "several review notes into one instruction for the agent.",
@@ -68,6 +72,7 @@ makedocs(
             "Workers & Machines" => "workers.md",
             "Agent Providers" => "providers.md",
             "Julia Tools & Live Apps" => "mcp-tools.md",
+            "Apps" => "apps.md",
         ],
         "Development" => "development.md",
         "API" => "api.md",

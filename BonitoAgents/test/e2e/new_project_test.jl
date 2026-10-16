@@ -10,8 +10,8 @@
 # Black-box throughout — the worker's working directory is read from the card's
 # own meta line, and the picker's selection from the path field, so nothing here
 # knows a server-side path.
-@testitem "e2e:new_project" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:new_project" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     using Test

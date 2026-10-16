@@ -135,6 +135,16 @@ end
     @test BT.renders_from_input(mcp("bt_julia_eval")) === false
 end
 
+@testset "an eval first seen finished opens like a running one" begin
+    # A quick call can be "completed" by the time the chat first sees it (CI,
+    # e2e:codex_wire): it opens. One shown running opened then and stays as left.
+    ev = mcp("bt_julia_eval"; raw = Dict{String,Any}("code" => "1+1"))
+    @test BT.opens_as_finished_run(ev, false)
+    @test !BT.opens_as_finished_run(ev, true)
+    @test !BT.opens_as_finished_run(mcp("bt_julia_eval"), false)   # no code yet
+    @test !BT.opens_as_finished_run(gt("read", "Read", "x"), false)
+end
+
 @testset "the real interrupt is JuliaEvalCall-only; others no-op" begin
     cm = BT.ChatModel
     evalcall(m)  = which(BT.request_tool_stop!, Tuple{cm, typeof(m)}).sig.parameters[3]

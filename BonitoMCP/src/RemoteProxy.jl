@@ -159,14 +159,14 @@ function RemoteBridge(; compression::Bool = false)
 end
 
 # One proxied root per browser page. A real ROOT (no parent) so Bonito auto-spawns
-# its inbox reader — browser→worker dispatch is free. Its `asset_server` is the
-# bridge's SHARED one (cross-page asset dedup); its object cache is its own
+# its inbox reader — browser→worker dispatch is free. Its asset registry is
+# shared (cross-page asset dedup), but its retained keys and object cache are its own
 # (per-page dedup). Frames envelope with `prefix` via `PageDriver`.
 function open_page_root!(b::RemoteBridge; compression::Bool = false)
     prefix = string(Bonito.uuid4())
     conn = Bonito.ProxyConnection(prefix, PageDriver(b.driver, prefix))
     pr = Bonito.Session(conn; id = prefix,
-                        asset_server = b.parent.asset_server,
+                        asset_server = similar(b.parent.asset_server),
                         compression_enabled = compression)
     isready(pr.connection_ready) || put!(pr.connection_ready, true)
     lock(b.plock) do
@@ -248,6 +248,10 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
         try
             Bonito.HTTP.WebSockets.open(wsurl) do ws
                 Bonito.HTTP.WebSockets.send(ws, handshake)
+                # "ok" once the server took the bridge; a refusal closes the
+                # socket with the server's reason instead.
+                verdict = Bonito.HTTP.WebSockets.receive(ws)
+                verdict == "ok" || error("the worker relay answered $(repr(verdict)) instead of ok")
                 connected = true
                 serve_bridge(ws)
             end
@@ -255,7 +259,7 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
             @warn "RemoteProxy: dial failed; will retry" wsurl backoff exception = e
         end
         # `connected` is the right signal — `serve_bridge` returning is normal
-        # (peer EOF); never getting past `open` is a real failure → grow backoff.
+        # (peer EOF); never getting the relay's "ok" is a real failure → grow backoff.
         backoff = connected ? min_backoff : min(backoff * 2, max_backoff)
         sleep(backoff)
     end
@@ -275,7 +279,7 @@ function start_dial!(wsurl::AbstractString, handshake::AbstractString)
     DIAL_TASK[] = @async try
         dial_loop(wsurl, handshake)
     catch e
-        @warn "BonitoMCP eval-ws dial loop crashed" exception = (e, catch_backtrace())
+        @warn "BonitoMCP live-render bridge dial loop crashed" exception = (e, catch_backtrace())
     end
     return nothing
 end
@@ -405,12 +409,64 @@ function remote_ref(@nospecialize(value))
     return holder.id
 end
 
+# ── Shared links (BonitoAgents' shares.jl) ───────────────────────────────────
+# The value of a shared Julia file, parked like an eval result, so every viewer
+# of the link mounts their own render of it. Evaluated in a module of its own,
+# and again when the file changed (the old value is freed); one at a time, so
+# two viewers arriving together share one evaluation.
+const SHARED = Dict{String, Tuple{Float64, String}}()   # path => (mtime, holder id)
+const SHARED_LOCK = ReentrantLock()
+
+"""
+    share_value(path) -> (holder, prefix)
+
+The parked value of the Julia file `path`, and the prefix of the bridge it is
+parked on.
+"""
+function share_value(path::AbstractString)
+    lock(SHARED_LOCK) do
+        parent = get_parent_session()
+        stamp = mtime(path)
+        cached = get(SHARED, path, nothing)
+        if cached !== nothing && cached[1] == stamp && Bonito.get_session(parent, cached[2]) !== nothing
+            return (cached[2], parent.id)
+        end
+        value = Base.include(Module(:SharedApp), String(path))
+        if cached !== nothing
+            old = Bonito.get_session(parent, cached[2])
+            old === nothing || close(old)
+        end
+        holder = remote_ref(value)
+        SHARED[String(path)] = (stamp, holder)
+        return (holder, parent.id)
+    end
+end
+
+# The public viewer may fetch only assets referenced by its own session tree.
+# A bridge also renders private chat results, so its registry is too broad.
+function has_page_asset(session::Bonito.Session, key::String)
+    server = session.asset_server
+    if server isa Bonito.ProxyAssetServer
+        lock(() -> key in server.keys, server.registry.lock) && return true
+    end
+    children = lock(() -> collect(values(session.children)), Bonito.deletion_lock(Bonito.root_session(session)))
+    return any(child -> has_page_asset(child, key), children)
+end
+
 function handle_control(b::RemoteBridge, msg::AbstractDict)
     op = msg["op"]
     d = b.driver
     id = get(msg, "id", nothing)
     try
-        if op == "asset_read"
+        if op == "has_result"
+            holder = Bonito.get_session(b.parent, String(msg["sub"]))
+            valid = holder !== nothing && holder.current_app[] !== nothing
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => valid))
+        elseif op == "has_asset"
+            root = page_root_for(b, String(msg["root"]))
+            valid = root !== nothing && has_page_asset(root, String(msg["key"]))
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => valid))
+        elseif op == "asset_read"
             bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
                         String(msg["key"]), Int(msg["start"]), Int(msg["stop"]))
             send_control(d, Dict("op" => "reply", "id" => id, "val" => bytes))

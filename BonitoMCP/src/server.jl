@@ -67,41 +67,47 @@ function dispatch!(out, req::AbstractDict)
     elseif method == "notifications/initialized"
         # Notification, no response
     elseif method == "tools/list"
-        tools = [Dict(
+        tools = Dict{String,Any}[Dict{String,Any}(
             "name" => t.name,
             "description" => t.description,
             "inputSchema" => t.input_schema,
         ) for t in available_tools()]
+        # The server's apps add theirs (tools/app_tools.jl).
+        append!(tools, app_tool_specs())
         send_response!(out, id, Dict("tools" => tools))
     elseif method == "tools/call"
         tool_name = get(params, "name", "")
-        args = get(params, "arguments", Dict{String,Any}())
-        # `available_tools()` and not `TOOLS`: a gated-off tool must be as absent
-        # to a caller that guessed its name as it is to `tools/list`.
-        tools = available_tools()
-        idx = findfirst(t -> t.name == tool_name, tools)
-        if idx === nothing
-            send_error!(out, id, -32602, "Unknown tool: $tool_name")
-        else
-            # Record requestId → env_path for the eval family so a later
-            # `notifications/cancelled` can target just this session (M9).
-            track = tool_name in EVAL_TOOL_NAMES
-            track && note_inflight_request!(id, get(args, "env_path", nothing))
-            try
-                result = tools[idx].handler(args)
+        args = Dict{String,Any}(String(k) => v for (k, v) in get(params, "arguments", Dict{String,Any}()))
+        # Claude Code names the tool call a request belongs to; the chat's card
+        # for it has the same id (claude-agent-acp's ACP toolCallId), which is how
+        # a run finds its card. Other clients send nothing and the chat falls back
+        # to the run's worker and env.
+        meta = get(params, "_meta", nothing)
+        tuid = meta isa AbstractDict ? get(meta, "claudecode/toolUseId", nothing) : nothing
+        tuid isa AbstractString && !isempty(tuid) && (args["_tool_use_id"] = String(tuid))
+        # `call_tool` looks in `available_tools()` and not `TOOLS`: a gated-off
+        # tool must be as absent to a caller that guessed its name as it is to
+        # `tools/list`. A name that isn't ours goes to the server's apps.
+        # Record requestId → env_path for the eval family so a later
+        # `notifications/cancelled` can target just this session (M9).
+        track = tool_name in EVAL_TOOL_NAMES
+        track && note_inflight_request!(id, get(args, "env_path", nothing))
+        try
+            result = call_tool(tool_name, args)
+            result === nothing ?
+                send_error!(out, id, -32602, "Unknown tool: $tool_name") :
                 send_response!(out, id, result)
-            catch e
-                bt = sprint(showerror, e, catch_backtrace())
-                # Tool execution errors come back as a successful response with
-                # isError=true so the agent can react to it (per MCP spec).
-                send_response!(out, id, Dict(
-                    "content" => [Dict("type" => "text",
-                                       "text" => "tool handler threw:\n$bt")],
-                    "isError" => true,
-                ))
-            finally
-                track && clear_inflight_request!(id)
-            end
+        catch e
+            bt = sprint(showerror, e, catch_backtrace())
+            # Tool execution errors come back as a successful response with
+            # isError=true so the agent can react to it (per MCP spec).
+            send_response!(out, id, Dict(
+                "content" => [Dict("type" => "text",
+                                   "text" => "tool handler threw:\n$bt")],
+                "isError" => true,
+            ))
+        finally
+            track && clear_inflight_request!(id)
         end
     elseif method === nothing
         # Malformed; ignore
@@ -155,14 +161,23 @@ end
 # A tracked TEMP session (env_path recorded as `nothing`) is addressed with
 # `scope_temp = true` instead.
 #
+# BACKGROUND runs are skipped unless `background = true`: a cancelled turn is
+# the agent being stopped, not the work it handed off. They stop on their own
+# ⊗, `bt_julia_interrupt`, or a restart.
+#
 # `JuliaSession` isn't defined yet at this file's include time (session.jl
 # loads after server.jl), so stay untyped here — runtime values are sessions.
-function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool = false)
+function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool = false,
+                             background::Bool = false)
     m = manager()
     targets = Any[]
     lock(m.lock) do
         for s in values(m.sessions)
             s.in_flight === nothing && continue
+            if !background
+                r = running_run(SERVER.runs, s)
+                r === nothing || !r.background || continue
+            end
             if env_path === nothing && !scope_temp
                 push!(targets, s)
             else
@@ -175,6 +190,8 @@ function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool 
         # finalizer must only ever escalate against THIS eval, never a fresh one
         # that legitimately started during the grace window (M3).
         f = s.in_flight
+        r = running_run(SERVER.runs, s)
+        r === nothing || @lock r.lock (r.interrupt_requested = true)
         try
             is_alive(s) && request_interrupt!(s)
         catch e
@@ -200,15 +217,17 @@ function finalize_cancelled_eval!(s, f)   # s::JuliaSession, f::Task (typed at c
     if istaskdone(f)
         # The cancel landed: clear in_flight iff it's still our task (an
         # await_or_yield may have already cleared it; a new eval may already own
-        # the slot — leave that one alone).
-        @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
+        # the slot — leave that one alone). A RUN's collector clears it itself
+        # when it takes the result; clearing it first would lose that result.
+        running_run(SERVER.runs, s) === nothing &&
+            @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
     elseif s.in_flight === f && is_alive(s)
         # Our eval is STILL running after the grace → it swallowed the interrupt.
         # Only escalate if it's still the in-flight one; otherwise a newer eval
         # owns the worker and killing it would destroy innocent work.
         log_info("eval ignored interrupt after $(CANCEL_KILL_GRACE)s → killing worker (session lost)")
         try
-            kill_session!(s)
+            kill_session!(s; hard = true)
         catch e
             log_info("kill_session! failed: $(sprint(showerror, e))")
         end
@@ -228,8 +247,10 @@ function run_stdio(; in::IO = stdin, out::IO = stdout)
                  (length(avail) == length(TOOLS) ? "" :
                   " ($(length(TOOLS) - length(avail)) gated off)"))
     end
-    # BonitoAgents-hosted runs get a control dial-back so the chat UI can
+    # BonitoAgents-hosted runs get a control channel so the chat UI can
     # interrupt in-flight evals per tool (no-op standalone; see ctrl_ws.jl).
+    # Taken first: nothing this process starts may inherit the grant.
+    take_relay_grant!()
     start_ctrl_dialback!()
     for line in eachline(in)
         s = strip(line)

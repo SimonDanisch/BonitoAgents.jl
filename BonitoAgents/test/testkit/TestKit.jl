@@ -48,11 +48,14 @@ chat inside an e2e test. Eval packages → a committed test env (e.g. `test/eval
 module TestKit
 
 using JSON, Sockets, Base64
+import SHA, HTTP
 import BonitoAgents as BT
 import BonitoMCP
 import BonitoWorker
 import ElectronCall
 const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
+
+include("fake_node.jl")   # a Node mirror + npm registry for the managed agent adapters
 
 # `Pkg.test` runs the test process with `JULIA_LOAD_PATH="@:<testdir>"` — note
 # the missing `@stdlib`. Every process spawned from here inherits it, including
@@ -88,7 +91,7 @@ function reset_dialback_or_warn(reset!::Function, what::AbstractString)
     return nothing
 end
 
-export TestServer, dev_server, add_worker!,
+export TestServer, dev_server, add_worker!, drop_worker_connection!,
        text, user, thought, edit, bash, todo, usage, commands, delay, tool, tool_update,
        kimi_tool, codex_mcp_tool, codex_shell, codex_image, REPLAY_FN,
        post_turn,
@@ -96,10 +99,11 @@ export TestServer, dev_server, add_worker!,
        diff_block, text_block, error_reply, crash, end_turn,
        mcp_call, bt_eval, bt_continue,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
-       send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
+       send_message, switch_agent, set_window_size, emulate_phone, tap, swipe,
+       click, click_until, click_text, set_input, wheel_into_view,
        exit_success,
        screenshot, eval_js, wait_for, current_chat_id,
-       js_errors, clear_js_errors
+       js_errors, clear_js_errors, check_console!
 
 # ── Event DSL ──────────────────────────────────────────────────────────────
 # Each constructor returns a small `Dict` carrying the event type + payload.
@@ -116,8 +120,9 @@ user(s::AbstractString)                 = Dict("type" => "user",    "text"  => S
 Agent event carrying frames the mock emits BETWEEN TURNS — `delay_ms` after the
 prompt response, with no turn open. Mirrors the real wire (see
 test/fixtures/bg_subagent_wire.jsonl): a background subagent's tagged activity
-(`sub_text`/`sub_tool`) keeps flowing after end_turn, and the main agent's
-auto-wake completion announcement arrives as untagged `text`.
+(`sub_text`/`sub_tool`) keeps flowing after end_turn, the main agent's
+auto-wake completion announcement arrives as untagged `text`, and the agent
+ends that turn of its own with `usage(; origin = "task-notification")`.
 """
 post_turn(events::Vector; delay_ms = 300) =
     Dict{String,Any}("type" => "post_turn", "events" => events,
@@ -164,8 +169,9 @@ mcp_call(tool::AbstractString; id = nothing, real_process::Bool = false, args...
     end
     d
 end
-bt_eval(code; env_path = nothing, id = nothing, timeout = nothing, worker = nothing, real_process = false) =
-    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout, worker, real_process)
+bt_eval(code; env_path = nothing, id = nothing, timeout = nothing, worker = nothing,
+        background = nothing, real_process = false) =
+    mcp_call("bt_julia_eval"; id, code = String(code), env_path, timeout, worker, background, real_process)
 # bt_julia_continue reattaches to the in-flight eval after a soft-timeout
 # checkpoint — its call carries NO code argument, exactly like real claude.
 bt_continue(; env_path = nothing, timeout = nothing, id = nothing) =
@@ -366,15 +372,22 @@ todo(entries::AbstractVector) = Dict("type" => "todo",
                        "priority"  => String(get(e, :priority, "medium"))) for e in entries])
 
 """
-    usage(used, size; cost = nothing) -> Dict
+    usage(used, size; cost = nothing, origin = nothing, thinking_tokens = nothing) -> Dict
 
 Agent event that emits a `usage_update` SessionUpdate (context/cost
 telemetry, the shape claude-agent-acp ≥ 0.44 sends after every assistant
-message). Drives the header context meter.
+message). Drives the header context meter. `origin` tags it the way the agent
+tags a cycle's result (`_meta["_claude/origin"].kind`): `"task-notification"`
+at the end of a cycle the agent ran on its own, which is where that turn ends.
+`thinking_tokens` is the estimate claude-agent-acp sends while the model thinks
+(`_meta["_claude/thinkingTokens"]`), shown on the chat's reasoning line.
 """
-function usage(used::Integer, size::Integer; cost = nothing)
+function usage(used::Integer = 0, size::Integer = 0; cost = nothing, origin = nothing,
+               thinking_tokens = nothing)
     ev = Dict{String,Any}("type" => "usage", "used" => used, "size" => size)
     cost === nothing || (ev["cost"] = Float64(cost))
+    origin === nothing || (ev["origin"] = String(origin))
+    thinking_tokens === nothing || (ev["thinking_tokens"] = Int(thinking_tokens))
     return ev
 end
 
@@ -448,6 +461,13 @@ end
 
 # ── TestServer ────────────────────────────────────────────────────────────
 
+"An account's way in through Authelia: password and authenticator secret (base32)."
+struct Login
+    user::String
+    password::String
+    secret::String
+end
+
 mutable struct TestServer
     h::BT.DevHandle
     agent_fn::Ref{Function}            # mutable so tests can swap mid-run
@@ -464,15 +484,43 @@ mutable struct TestServer
     # viewport got 1280px and every layout assertion in it passed for the wrong
     # reason.
     browser_size::Tuple{Int,Int}
+    # `dev_server(proxy = true)`: the admin's login through Authelia; `nothing`
+    # for a server without the proxy.
+    admin::Union{Login,Nothing}
+    # The time step of the last one-time code each account used: Authelia takes a
+    # code once, so a second login within the same 30 s waits for the next one.
+    otp_used::Dict{String,Int}
+    # The workers `add_worker!` started, stopped with the server (`close`).
+    extra_workers::Vector{@NamedTuple{proc::Base.Process, worker_id::String, config::String}}
 end
 
-# The dispatcher's TCP server starts BEFORE `dev_server` returns so the
-# worker can connect back the moment it spawns a mock agent. But
-# `bt_eval` needs the server URL + worker-secret to point the eval
-# bridge at — these are known only after `dev_server` returns. Stash
-# them in a Ref the dispatcher reads each time it invokes a real
-# BonitoMCP handler. `nothing` until `TestServer` finishes wiring up.
-const SERVER_CONTEXT = Ref{Union{Nothing, NamedTuple{(:url, :secret, :project_id), Tuple{String, String, Ref{String}}}}}(nothing)
+# The worker relay grant this process's in-process MCP channels (control, and
+# the eval workers' live-render bridges) are armed with; see `with_mcp_env`.
+const ARMED_GRANT = Ref("")
+
+# Tear the in-process MCP's channels down, so the next MCP call re-arms them.
+function disarm_mcp!(why::AbstractString)
+    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl ($why)")
+    reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval ($why)")
+    ARMED_GRANT[] = ""
+    return nothing
+end
+
+# A chat's MCP process dies with its server, and its running evals with it. The
+# in-process MCP stands in for all of them and outlives the server, so an eval a
+# test left running (it timed out into `:running` and nobody continued) would
+# make the next item's eval on the same env fail with "already in flight".
+function settle_mcp_evals!(; timeout::Real = 60.0)
+    BonitoMCP.interrupt_in_flight!(nothing; background = true) == 0 && return nothing
+    @warn "TestKit: an eval was still in flight at server teardown; interrupted it"
+    m = BonitoMCP.manager()
+    settled() = lock(m.lock) do
+        all(s -> s.in_flight === nothing, values(m.sessions))
+    end
+    timedwait(settled, timeout) === :ok ||
+        error("TestKit: in-flight evals did not settle within $(timeout)s of the interrupt")
+    return nothing
+end
 
 """
     scrub_mock_env!()
@@ -487,7 +535,7 @@ function scrub_mock_env!()
     for k in ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
               "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
               "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_CANCEL_DELAY_MS",
-              "BT_MOCK_ACP_STRICT_LOAD")
+              "BT_MOCK_ACP_STRICT_LOAD", "BT_MOCK_ACP_MANY_CHOICES")
         delete!(ENV, k)
     end
     get(ENV, "BT_DEFAULT_PROVIDER", "") in ("MockCode", "MockCode2") &&
@@ -523,6 +571,21 @@ function kill_worker!(proc::Base.Process)
 end
 
 """
+    drop_worker_connection!(s::TestServer) -> link
+
+Drop the dev worker's connection the way a network blip does: the server's end
+of the socket closes and both sides see the connection end, while the worker
+process, its agents and the link stay. The worker reconnects after its retry
+delay (5 s), and the link must RESUME, replaying whatever was in flight. Returns
+the server's link, so a test can check it was resumed rather than replaced.
+"""
+function drop_worker_connection!(s::TestServer)
+    link = lock(() -> only(values(s.h.state.worker_links)), s.h.state.lock)
+    BT.WorkerLink.disconnect!(link)
+    return link
+end
+
+"""
     dev_server(; agent = msg -> end_turn(), port = nothing, kwargs...) -> TestServer
 
 Start a real BonitoAgents dev server, swap the worker's `claude-agent-acp`
@@ -533,6 +596,12 @@ returned `TestServer` is the handle every helper takes as its first arg.
 `claude-agent-acp` from PATH / `CLAUDE_AGENT_ACP`) while still returning a
 `TestServer` with all the browser/eval helpers — used to seed genuine agent
 sessions (e.g. the docs-walkthrough rig); `agent` is then ignored.
+
+`scan_on_connect = false` (the default here): the server does not scan the
+worker's agent sessions when it connects. That scan reads the machine's real
+agent history into the dashboard and starts every installed agent to list its
+sessions, so a test would render whatever the box running it happens to have.
+Tests that need a discover tree seed `state.discovered` instead.
 """
 # The long-lived `SharedServer` stack, if some item in this process started one.
 #
@@ -546,7 +615,10 @@ sessions (e.g. the docs-walkthrough rig); `agent` is then ignored.
 #
 # `SharedServer` registers a releaser here; `dev_server` calls it before building
 # a new stack, and the shared one restarts lazily the next time an item asks for
-# it.
+# it. That only works within ONE TestKit module: an own-server item takes it from
+# SharedServer (`setup = [SharedServer]`, `const TestKit = SharedServer.TestKit`).
+# An item that includes its own copy gets its own, empty `RELEASE_SHARED`, and its
+# server runs next to the shared one.
 const RELEASE_SHARED = Ref{Any}(nothing)
 
 "Register how to tear the shared stack down (called by the SharedServer setup)."
@@ -570,6 +642,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       mock::Bool = true,
                       many_choices::Bool = false,
                       strict_load::Bool = false,
+                      scan_on_connect::Bool = false,
+                      proxy::Bool = false,
+                      tunnel::Bool = false,
                       kwargs...)
     ensure_display!()
     # One stack at a time in this process — see `RELEASE_SHARED` above. A
@@ -610,12 +685,15 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     ) : Dict{String,String}()
     # `BT.dev_server` copies `agent_env` into the PROCESS ENV (so the worker
     # subprocess inherits it) — which means a prior mock dev_server in this
-    # same Julia process left all of the above behind. A later `mock = false`
-    # server must not inherit that: its chats would default to MockCode and
-    # the spawned MockACP would dial the DEAD dispatcher port of the closed
-    # mock server ("ACP connection closed" on every bind, no agent stderr
-    # anywhere near the failure). Scrub the mock leftovers before starting.
-    mock || scrub_mock_env!()
+    # same Julia process left all of the above behind, and its opt-in knobs
+    # below too. Nothing may inherit that. A `mock = false` server's chats would
+    # default to MockCode and dial the DEAD dispatcher port of the closed mock
+    # server ("ACP connection closed" on every bind). A mock server inherited
+    # the knobs it did not ask for: after `worker_move` (strict load) every
+    # later server's resume failed with "Session not found", and after
+    # `cancel_escalation` (ignore cancel) the rebuilt shared server's agent
+    # ignored every cancel. Scrub before starting, always.
+    scrub_mock_env!()
     # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
@@ -639,30 +717,38 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # is loaded in. What "continue this chat on another worker" has to satisfy.
     strict_load && (agent_env["BT_MOCK_ACP_STRICT_LOAD"] = "1")
 
-    h = BT.dev_server(; port = port, agent_env = agent_env, kwargs...)
+    # Behind the real login proxy: Caddy and Authelia in front, the admin with a
+    # fresh password and authenticator secret, the worker through Caddy. Behind a
+    # tunnel (`tunnel = true`): the same login, asked by the server itself, and
+    # a stand-in for cloudflared in front.
+    login = proxy || tunnel
+    admin = login ? Login("admin", bytes2hex(rand(UInt8, 12)), base32(rand(UInt8, 20))) : nothing
+    bins = login ? proxy_binaries() : nothing
+    proxy_kw = login ? (; proxy = BT.DevProxy(; caddy_bin = bins.caddy, authelia_bin = bins.authelia,
+                                              admin = admin.user, password = admin.password,
+                                              totp_secret = admin.secret, tunnel)) : (;)
+    h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, proxy_kw..., kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
-    # Now publish the server URL + secret to the dispatcher so that
-    # `bt_eval` invocations can route the eval worker's dial-back to the
-    # right BonitoAgents instance.
-    SERVER_CONTEXT[] = (url = h.url, secret = h.secret, project_id = Ref(""))
-    # Clean slate for the MCP control dial-back (armed lazily on the first eval,
+    # Clean slate for the in-process MCP (armed lazily on the first MCP call,
     # see invoke_mcp) in case a prior test tore down without close().
-    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server bring-up)")
+    disarm_mcp!("server bring-up")
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
                        Ref{Any}(nothing), Ref(false),
-                       (browser_width, browser_height))
+                       (browser_width, browser_height), admin, Dict{String,Int}(),
+                       @NamedTuple{proc::Base.Process, worker_id::String, config::String}[])
 end
 
-# Dispatcher loop per mock-agent connection. Reads one `{"prompt": "..."}`
-# per session/prompt, invokes the agent function, streams the resulting
-# events back as line-delimited JSON. For high-level events that need
+# Dispatcher loop per mock-agent connection. Reads one `{"prompt": "...",
+# "mcp_env": {...}}` per session/prompt, invokes the agent function, streams the
+# resulting events back as line-delimited JSON. For high-level events that need
 # real MCP execution (`bt_eval`), the dispatcher runs the corresponding
-# BonitoMCP handler IN THIS PROCESS, then forwards the result blocks to
-# the mock as a `bt_eval_result` event the mock knows how to wrap as ACP
-# tool_call frames. This keeps the bt_* execution real (same Malt worker,
-# same env_path, same package resolution) without making the mock binary
-# itself an MCP client.
+# BonitoMCP handler IN THIS PROCESS, in the environment the chat's MCP launch
+# entry carries (`mcp_env`), then forwards the result blocks to the mock as a
+# `bt_eval_result` event the mock knows how to wrap as ACP tool_call frames.
+# This keeps the bt_* execution real (same Malt worker, same env_path, same
+# package resolution, the worker relay's real grant) without making the mock
+# binary itself an MCP client.
 function handle_client(client, agent_ref::Ref{Function})
     try
         while !eof(client)
@@ -685,6 +771,7 @@ function handle_client(client, agent_ref::Ref{Function})
                 continue
             end
             prompt = String(get(msg, "prompt", ""))
+            mcp_env = get(msg, "mcp_env", nothing)
             # On a resumed session the server prepends a transcript of the prior
             # conversation, with the user's real new message after a "My new
             # message:" divider. A real agent reads the transcript and replies to
@@ -705,7 +792,7 @@ function handle_client(client, agent_ref::Ref{Function})
                 [text("agent fn threw: $(sprint(showerror, e))"), end_turn()]
             end
             for ev in response
-                forward_event(client, ev)
+                forward_event(client, ev, mcp_env)
             end
         end
     catch e
@@ -718,10 +805,10 @@ end
 # Per-event dispatch — high-level events get rewritten into the lower-level
 # `bt_eval_result` event the mock knows how to map to ACP frames; everything
 # else is forwarded verbatim.
-function forward_event(client, ev::AbstractDict)
+function forward_event(client, ev::AbstractDict, mcp_env)
     t = String(get(ev, "type", ""))
     if t == "mcp_call"
-        invoke_mcp(client, ev)
+        invoke_mcp(client, ev, mcp_env)
     else
         println(client, JSON.json(ev)); flush(client)
     end
@@ -733,31 +820,41 @@ end
 # isError. We forward those to the mock as a structured event the mock
 # turns into ACP `tool_call` + `tool_call_update` frames carrying the
 # same content.
-# Point the eval worker's dial-back at OUR dev_server (url / secret / project_id)
-# for the duration of `f`, then restore. `bt_eval` needs this:
-# the worker inherits these env vars when `get_or_create!` spawns it, and
-# `ensure_eval_dialed!` uses them to (a) load `RemoteProxy` + build the bridge —
-# which is what makes `render_eval_html` available so the result renders to a LIVE
-# fragment instead of the text fallback — and (b) land the bridge in
-# `EVAL_WORKERS[project_id]`, the dict the chat looks up when mounting. Without
-# `BONITOAGENTS_SERVER_URL` the dial bails early (session.jl) and RemoteProxy
-# never loads. The project_id MUST match the chat's pid (the EVAL_WORKERS key).
-function with_bridge_env(ctx, f)
-    keys = ("BONITOAGENTS_SERVER_URL", "BONITOAGENTS_SECRET", "BONITOAGENTS_PROJECT_ID")
-    prev = map(k -> get(ENV, k, nothing), keys)
-    ENV["BONITOAGENTS_SERVER_URL"] = ctx.url
-    ENV["BONITOAGENTS_SECRET"]     = ctx.secret
-    isempty(ctx.project_id[]) || (ENV["BONITOAGENTS_PROJECT_ID"] = ctx.project_id[])
+#
+# Run `f` as the chat's MCP process would: in the environment its launch entry
+# carries, i.e. the worker relay's grant for that chat. With it the eval
+# worker's live-render bridge lands in `state.eval_workers[project_id]` (what the
+# chat looks up when mounting) and live stdout streams over the control channel.
+# In production each chat has its own MCP process; here one process stands in
+# for all of them, so a different grant than last time (another chat, a
+# restarted session, another server) re-arms its channels. The eval workers
+# stay warm; only their bridges re-dial.
+function with_mcp_env(f, env::AbstractDict)
+    rest = Dict{String,String}(String(k) => String(v) for (k, v) in env)
+    token = get(rest, "BONITOAGENTS_CONTROL_TOKEN", "")
+    token == ARMED_GRANT[] || (disarm_mcp!("new grant"); ARMED_GRANT[] = token)
+    # The grant goes to the MCP the way a real one keeps it, never into ENV:
+    # the eval workers this process starts must not inherit it.
+    BonitoMCP.take_relay_grant!(rest)
+    prev = Dict(k => get(ENV, k, nothing) for k in keys(rest))
+    for (k, v) in rest
+        ENV[k] = v
+    end
     try
+        # Armed, this process reports itself as the chat's MCP, so the chat's
+        # process record names the test process. The dev worker refuses to
+        # kill a process it runs under (BonitoWorker `runs_this_worker`);
+        # before it did, closing an eval chat killed the whole test run.
+        BonitoMCP.start_ctrl_dialback!()   # idempotent while armed
         return f()
     finally
-        for (k, v) in zip(keys, prev)
+        for (k, v) in prev
             v === nothing ? delete!(ENV, k) : (ENV[k] = v)
         end
     end
 end
 
-function invoke_mcp(client, ev::AbstractDict)
+function invoke_mcp(client, ev::AbstractDict, mcp_env)
     tool = String(get(ev, "tool", "bt_julia_eval"))
     # Everything besides the event bookkeeping IS the tool's argument dict —
     # `mcp_call` sugar (bt_eval / bt_continue) puts args at the top level.
@@ -773,37 +870,36 @@ function invoke_mcp(client, ev::AbstractDict)
         "type" => "bt_eval_open", "tool_id" => tool_id,
         "tool" => "mcp__btworker__" * tool,
         "code" => String(get(ev, "code", "")),
-        "env_path" => get(ev, "env_path", nothing))
+        "env_path" => get(ev, "env_path", nothing),
+        # The call's whole argument dict, as claude streams it into rawInput.
+        "args" => copy(args))
     haskey(ev, "timeout") && (open_ev["timeout"] = ev["timeout"])
     haskey(ev, "worker")  && (open_ev["worker"]  = ev["worker"])
     println(client, JSON.json(open_ev)); flush(client)
+    # What Claude Code sends with every `tools/call` (`_meta["claudecode/toolUseId"]`,
+    # which BonitoMCP's dispatch copies into the arguments): the card's own id.
+    args["_tool_use_id"] = tool_id
 
-    ctx = SERVER_CONTEXT[]
     # Dispatch by NAME through the registry, the way a real MCP process does.
     # This used to hardcode the two eval handlers and fall through to
     # `julia_eval_handler` for everything else — so `mcp_call("bt_wait")` ran the
     # eval handler with no `code` and came back "error: empty code" in
     # milliseconds. The test then measured a turn that was never blocked and had
     # no way to tell that from a broken tool. Any registered tool is callable now.
-    reg = BonitoMCP.available_tools()
-    hit = findfirst(t -> t.name == tool, reg)
-    runner() = hit === nothing ?
+    # `call_tool` reaches the server's app tools too (BonitoMCP tools/app_tools.jl),
+    # over the control channel `with_mcp_env` arms with this chat's grant.
+    runner() = something(BonitoMCP.call_tool(tool, args),
         Dict{String,Any}("content" => Any[Dict("type" => "text",
             "text" => "TestKit: no MCP tool named `$tool` (have: " *
-                      join((t.name for t in reg), ", ") * ")")],
-            "isError" => true) :
-        reg[hit].handler(args)
-    # Faithful MCP-process behaviour: arm the /mcp-ws control dial-back (idempotent)
-    # so the eval's live stdout streams over the REAL wire to the chat's tail, same
-    # as production. Env vars (incl. project_id) are set by with_bridge_env, which
-    # start_ctrl_dialback! reads synchronously; the async dial connects well before
-    # the worker's first print. reset_ctrl_dialback! (dev_server/close) re-points it.
-    armed() = (BonitoMCP.start_ctrl_dialback!(); runner())
+                      join((t.name for t in BonitoMCP.available_tools()), ", ") *
+                      " and the server's app tools)")],
+            "isError" => true))
     result = try
-        # `ctx === nothing` is the standalone case (no live bridge → text fallback,
-        # still a valid result). With a server context, wire the dial-back so the
-        # result renders to a LIVE Bonito fragment over the eval bridge.
-        ctx === nothing ? runner() : with_bridge_env(ctx, armed)
+        # No launch env is the standalone case (no live bridge → text fallback,
+        # still a valid result). With one, the eval's live stdout streams over
+        # the REAL control channel to the chat's tail and the result renders to
+        # a LIVE Bonito fragment over the eval bridge, same as production.
+        mcp_env === nothing ? runner() : with_mcp_env(runner, mcp_env)
     catch e
         Dict{String,Any}(
             "content" => Any[Dict("type" => "text",
@@ -826,44 +922,64 @@ function invoke_mcp(client, ev::AbstractDict)
 end
 
 """
-    add_worker!(s; name = "worker-extra") -> Base.Process
+    add_worker!(s; name = "worker-extra", credential = "", worker_id = ...) -> Base.Process
 
 Spawn an ADDITIONAL worker process against the same dev server (its own config
-dir + projects root, same server url + secret), exactly as a second machine
-running the installer would. Returns the worker process so the test can later
-`kill` it to simulate that machine going offline.
+dir + projects root), exactly as a second machine running the installer would.
+Behind the proxy it comes in like any worker there: through Caddy, with the
+`credential` "Add worker" issued (the one its install command carries),
+trusting Caddy's certificate authority. Returns the worker process so the test
+can later `kill` it to simulate that machine going offline; `close(s)` stops it
+(and the agents it started) in any case. `worker_id` defaults to a fresh id;
+set it explicitly for fixtures that depend on a stable machine identity.
 """
-function add_worker!(s::TestServer; name::AbstractString = "worker-extra")
+function add_worker!(s::TestServer; name::AbstractString = "worker-extra", credential::AbstractString = "",
+                     worker_id::AbstractString = "test-" * String(name) * "-" * string(time_ns(); base = 16))
     cfg  = mktempdir(prefix = "bonitoagents-test-wcfg2-")
     root = mktempdir(prefix = "bonitoagents-test-w2root-")
     prev = get(ENV, "BONITOAGENTS_CONFIG_DIR", nothing)
     ENV["BONITOAGENTS_CONFIG_DIR"] = cfg
-    # A distinct, pinned worker id so it registers as a separate worker.
-    write(joinpath(cfg, "worker_id"), "test-" * String(name) * "-" * string(rand(UInt32); base = 16))
-    BonitoWorker.write_config!(; server_url = s.h.url, secret = s.h.secret,
+    # A distinct, pinned worker id so it registers as a separate worker. Not
+    # `rand`: inside a `@testset` the RNG is reseeded, so two runs in one process
+    # would pick the same id.
+    write(joinpath(cfg, "worker_id"), worker_id)
+    rig = s.h.proxy
+    url = rig === nothing ? s.h.url : "https://127.0.0.1:$(s.h.state.auth.config.https_port)"
+    BonitoWorker.write_config!(; server_url = url, credential,
                                  projects_root = root, name = String(name))
-    proc, _ = BonitoWorker.spawn_worker()
+    proc, _ = rig === nothing ? BonitoWorker.spawn_worker() :
+        withenv(BonitoWorker.spawn_worker, "JULIA_SSL_CA_ROOTS_PATH" => rig.root_cert)
     prev === nothing ? delete!(ENV, "BONITOAGENTS_CONFIG_DIR") : (ENV["BONITOAGENTS_CONFIG_DIR"] = prev)
+    push!(s.extra_workers, (proc = proc, worker_id = worker_id, config = cfg))
     return proc
 end
 
 function Base.close(s::TestServer)
     s.closed[] && return s
     s.closed[] = true
-    # Tear down the MCP dial-backs this process armed for `s` (see invoke_mcp):
-    # the test process stands in for one MCP server per dev_server, so both its
-    # /mcp-ws control dial AND every eval worker's /eval-ws render dial must be
-    # re-pointed, not left dangling on this dead server. `reset_eval_dialback!`
-    # keeps the warm eval workers alive (just drops their bridge) so the NEXT
-    # dev_server re-dials fresh — this replaces the old `refresh_eval_session!`
-    # test hack, tying eval-session lifecycle to the dev_server like production
-    # ties it to the agent's MCP child.
-    reset_dialback_or_warn(BonitoMCP.reset_ctrl_dialback!, "ctrl (server teardown)")
-    reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server teardown)")
+    # Tear down the in-process MCP's channels armed for `s` (see with_mcp_env),
+    # rather than leave them retrying against this dead server's worker.
+    # `reset_eval_dialback!` keeps the warm eval workers alive (just drops their
+    # bridge) so the NEXT dev_server re-dials fresh.
+    disarm_mcp!("server teardown")
     ctx = s.browser[]
-    ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
+    ctx === nothing || close_browser(ctx)         # ECT.close is itself best-effort
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
     close(s.h)
+    # The workers `add_worker!` started go with the server, and so do the agents
+    # they started (their own process groups, see `close(::DevHandle)`). They used
+    # to be each test's job, done as its last step or not at all: every run left
+    # a few behind, reconnecting to a dead port at ~600 MB each.
+    for w in s.extra_workers
+        BT.stop_worker_proc!(w.proc)
+        BonitoWorker.reap_agents_owned_by(w.worker_id, w.config)
+    end
+    empty!(s.extra_workers)
+    # The mock knobs `BT.dev_server` wrote into ENV stay: another TestServer may
+    # still be up in this process (an item that includes its own TestKit cannot
+    # release the shared one), and without `BT_DEFAULT_PROVIDER` its next chat
+    # would start the REAL default agent. `dev_server` scrubs them on bring-up.
+    settle_mcp_evals!()   # last: if it throws, the stack is already down
     return s
 end
 
@@ -921,8 +1037,16 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
                        route::AbstractString = "/", offscreen::Bool = true)
     ensure_display!()
     old = s.browser[]
-    old === nothing || close(old)
-    url = "http://127.0.0.1:$(s.h.state.srv.port)$(route)"
+    old === nothing || close_browser(old)
+    url = s.h.url * route
+    # Behind the proxy the pages come with a certificate from Caddy's own CA, and
+    # each browser keeps cookies of its own: Electron's default profile is shared
+    # by every window, so a second browser would be logged in as the first.
+    # Without a GPU (CI) WebGL runs on SwiftShader, and Chromium warns about that
+    # fallback unless it was asked for. With a GPU the flag does nothing.
+    electron_args = String["--enable-unsafe-swiftshader"]
+    s.admin === nothing ||
+        append!(electron_args, ["--ignore-certificate-errors", "--user-data-dir=$(mktempdir())"])
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
     # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
     # capturePage on the headless (show=false) window stays fresh.
@@ -932,11 +1056,20 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     # Only pass the kwarg when actually requested: the CI/test env pins a git
     # ElectronCall that predates `offscreen`, so the default path must call the
     # old signature. OSR is opt-in and only resolves against the dev checkout.
-    ctx = offscreen ?
-        ECT.open_window(url; width = width, height = height, show = false, offscreen = true) :
-        ECT.open_window(url; width = width, height = height, show = false)
+    # Opened blank and loaded only once the console is captured: what the page
+    # logs while it boots (Bonito's session init) is exactly what matters.
+    # ELECTRON_DISABLE_SECURITY_WARNINGS: an unpackaged Electron warns about the
+    # page's CSP allowing eval (Bonito evaluates its js""). Browsers never print
+    # that, so it would fail every item without saying anything about the app.
+    ctx = withenv("ELECTRON_DISABLE_SECURITY_WARNINGS" => "true") do
+        offscreen ?
+            ECT.open_window(; width = width, height = height, show = false, offscreen = true, electron_args) :
+            ECT.open_window(; width = width, height = height, show = false, electron_args)
+    end
+    capture_console!(ctx)
+    follow_pane_scope!(ctx)
     s.browser[] = ctx
-    ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
+    ElectronCall.load(ctx.window, ElectronCall.URI(url))
     sleep(3.0)                     # let the dashboard mount + the chat session boot
     install_pane_scope!(s)
     return s
@@ -956,8 +1089,7 @@ end
 # selector, and the app's own JS already scopes `.bt-messages` per-pane
 # (`pane.querySelector`), so this never perturbs the product runtime. Installed
 # fresh on every `open_browser` (so a reconnect re-arms it).
-function install_pane_scope!(s::TestServer)
-    eval_js(s, raw"""(() => {
+const PANE_SCOPE_JS = raw"""(() => {
         if (window.__btPaneScopeInstalled) return true;
         window.__btPaneScopeInstalled = true;
         // NB: deliberately NOT scoping `.bt-embed`, `.bw-ws-panel`, `.bt-slot`
@@ -981,9 +1113,25 @@ function install_pane_scope!(s::TestServer)
         document.querySelector    = wrap(Document.prototype.querySelector,    false);
         document.querySelectorAll = wrap(Document.prototype.querySelectorAll, true);
         return true;
+    })()"""
+
+# Every page load of the test window gets the shim, from Electron's main
+# process. Installing it only in `open_browser`/`navigate` left it off after any
+# other reload (the connection guard's, `location.reload()` in a test), and the
+# items after that one counted hidden panes: the failures appeared only late in
+# a long shared-server run.
+function follow_pane_scope!(ctx::ECT.TestContext)
+    run(ctx.app, """(() => {
+        const wc = electron.BrowserWindow.fromId($(ctx.window.id)).webContents;
+        const shim = $(json(PANE_SCOPE_JS));
+        wc.on('dom-ready', () => wc.executeJavaScript(shim)
+            .catch(e => console.error('TestKit: pane-scope shim not installed on ' + wc.getURL() + ': ' + e)));
+        return true;
     })()""")
-    return s
+    return ctx
 end
+
+install_pane_scope!(s::TestServer) = (eval_js(s, PANE_SCOPE_JS); s)
 
 """
     eval_js(s, code) -> Any
@@ -1025,43 +1173,120 @@ function eval_js(s::TestServer, code::AbstractString; timeout::Real = 20)
     return res[]
 end
 
+# ── Browser console ─────────────────────────────────────────────────────────
+# Every warning and error a test browser logs, recorded by Electron's MAIN
+# process (the window's `console-message` event). The sink this replaces lived
+# inside the page and saw only uncaught exceptions: Bonito reports a failing
+# closure with console.error and a handler it could not attach with
+# console.warn, and every reload wiped the sink. The main process sees each
+# message of the window from before its first page load until it closes, and
+# answers even while the renderer is pegged.
+
+# The browsers this process has open, and what closed ones logged that no check
+# has seen yet. One per process because the per-item check runs after the item
+# and has no handle on the servers the item opened and closed.
+struct ConsoleLog
+    lock::ReentrantLock
+    open::Vector{ECT.TestContext}
+    unchecked::Vector{Any}
+end
+const CONSOLE = ConsoleLog(ReentrantLock(), ECT.TestContext[], Any[])
+
+function capture_console!(ctx::ECT.TestContext)
+    run(ctx.app, """(() => {
+        const wc = electron.BrowserWindow.fromId($(ctx.window.id)).webContents;
+        const log = global.__btConsole = [];
+        // One parameter: Electron warns when a listener takes the older
+        // positional arguments; everything is on the event.
+        wc.on('console-message', (e) => {
+            if (e.level !== 'warning' && e.level !== 'error') return;
+            // The GPU process's notes on the machine's graphics driver, not the
+            // page's: without a GPU (CI) every WebGL frame is read back for the
+            // software compositor, and Chromium says so ("GPU stall due to
+            // ReadPixels"). Driver errors still count.
+            if (/^\\[\\.WebGL-[^\\]]*\\]GL Driver Message \\([^,]*, Performance,/.test(e.message)) return;
+            log.push({type: e.level, message: String(e.message), source: String(e.sourceId ?? ''),
+                      line: e.lineNumber, page: wc.getURL(), time: Date.now()});
+        });
+        return true;
+    })()""")
+    lock(() -> push!(CONSOLE.open, ctx), CONSOLE.lock)
+    return ctx
+end
+
+# The window's logged warnings and errors; `take` also empties the log.
+function console_entries(ctx::ECT.TestContext; take::Bool = false)
+    v = run(ctx.app, take ? "global.__btConsole.splice(0)" : "global.__btConsole.slice()")
+    return v === nothing ? Any[] : collect(Any, v)
+end
+
+# Close a test browser's window, keeping what it logged for the next
+# `check_console!`. The browser (`ctx.app`) goes with its last window
+# (`another_tab` opens more).
+function close_browser(ctx::ECT.TestContext)
+    entries = if ctx.app.exists && isopen(ctx.window)
+        try
+            console_entries(ctx; take = true)
+        catch e
+            e isa ElectronCall.ElectronCallError || rethrow()
+            Any[Dict("type" => "error", "message" => "the browser's console log was unreadable at close: $(sprint(showerror, e))")]
+        end
+    else
+        Any[]
+    end
+    tabs_left = lock(CONSOLE.lock) do
+        filter!(c -> c !== ctx, CONSOLE.open)
+        append!(CONSOLE.unchecked, entries)
+        any(c -> c.app === ctx.app, CONSOLE.open)
+    end
+    if !tabs_left
+        close(ctx)
+    elseif isopen(ctx.window)
+        close(ctx.window)
+    end
+    return nothing
+end
+
 """
     js_errors(s) -> Vector
 
-JavaScript errors captured by the sink installed in `open_browser`
-(`window.onerror` + `unhandledrejection`), since the last `clear_js_errors`.
-Each entry has `type`/`message` (and maybe `filename`/`lineno`). A non-empty
-result means the UI threw during the run — a real bug, not test noise. The
-runner gates every suite on this being empty.
+Every warning and error the browser console logged since the last
+`clear_js_errors`, uncaught exceptions included. Each entry has `type`
+("warning" or "error"), `message`, `source` and `line`.
 """
-function js_errors(s::TestServer)
-    s.browser[] === nothing && return Any[]
-    # Route through the WATCHDOG eval_js, not ECT.js_errors (whose eval is
-    # unbounded): the gate runs right after a suite, and a suite that pegged the
-    # renderer (e.g. the 500-row flood) would otherwise hang the gate — and thus
-    # the whole runner — waiting for the paint to finish. Bounded: a pegged
-    # renderer makes this throw BridgeTimeout, which the runner treats as
-    # "couldn't sample, renderer busy" rather than a hang.
-    v = eval_js(s, "window.__errs || []"; timeout = 10)
-    return v === nothing ? Any[] : v
-end
+js_errors(s::TestServer) = s.browser[] === nothing ? Any[] : console_entries(s.browser[])
 
 """
     clear_js_errors(s)
 
-Reset the JS error sink. The runner calls this between suites so an error is
-attributed to the suite that actually caused it.
+Forget what the browser console logged so far.
 """
 function clear_js_errors(s::TestServer)
-    s.browser[] === nothing && return nothing
-    # Bounded + best-effort (same reasoning as js_errors): if the renderer is
-    # pegged the sink simply clears once it frees; never hang the runner on it.
-    try
-        eval_js(s, "window.__errs = []; true"; timeout = 10)
-    catch e
-        e isa BridgeTimeout || rethrow()
-    end
+    s.browser[] === nothing || console_entries(s.browser[]; take = true)
     return nothing
+end
+
+"""
+    check_console!() -> Vector{String}
+
+Every warning and error any browser of this process logged since the last
+check, open and closed browsers alike, one line each. The suite runs
+`@test isempty(check_console!())` after every item, so a page that logs a
+warning or an error fails the item that made it.
+"""
+function check_console!()
+    open = lock(() -> copy(CONSOLE.open), CONSOLE.lock)
+    entries = Any[]
+    for ctx in open
+        append!(entries, console_entries(ctx; take = true))
+    end
+    lock(CONSOLE.lock) do
+        prepend!(entries, CONSOLE.unchecked)
+        empty!(CONSOLE.unchecked)
+    end
+    return [string(e["type"], ": ", e["message"],
+                   isempty(get(e, "source", "")) ? "" : " ($(e["source"]):$(get(e, "line", "?")))")
+            for e in entries]
 end
 
 # (Removed `refresh_eval_session!`.) It `restart!`-ed the whole eval worker at
@@ -1073,13 +1298,15 @@ end
 # by project id). Tests never need to ask for it.
 
 """
-    wait_for(s, label, js_predicate; timeout = 8) -> Bool
+    wait_for(s, label, js_predicate; timeout = 8, describe = nothing) -> Bool
 
 Poll `js_predicate` (a JS expression returning truthy/falsy) until it's
 truthy or `timeout` seconds elapse. Returns the truthy value (or `false`).
+`describe`, a JS expression, says in the timeout error what the page showed.
 """
 function wait_for(s::TestServer, label::AbstractString, predicate::AbstractString;
-                   timeout::Real = 8, interval::Real = 0.1)
+                   timeout::Real = 8, interval::Real = 0.1,
+                   describe::Union{Nothing,AbstractString} = nothing)
     t0 = time()
     code = "(() => { try { return " * String(predicate) * "; } catch (e) { return false; } })()"
     # Per-poll bound is SHORT (≤5s): if the renderer is momentarily pinned (e.g.
@@ -1100,7 +1327,8 @@ function wait_for(s::TestServer, label::AbstractString, predicate::AbstractStrin
         v in (false, nothing) || return v
         sleep(interval)
     end
-    error("wait_for timed out after $(timeout)s: $label")
+    shown = describe === nothing ? "" : " (the page showed: $(repr(eval_js(s, describe))))"
+    error("wait_for timed out after $(timeout)s: $label$shown")
 end
 
 """
@@ -1126,6 +1354,108 @@ function click(s::TestServer, selector::AbstractString)
     })()""")
     ok === true || error("click: no element matched $sel")
     return s
+end
+
+"""
+    real_click(s, css_selector)
+
+Click the middle of the first visible match with TRUSTED mouse input
+(`sendInputEvent`), the way a person does: unlike `click`, it also does what the
+browser itself does on a click, such as selecting text.
+"""
+function real_click(s::TestServer, selector::AbstractString)
+    point = eval_js(s, """(() => {
+        const el = [...document.querySelectorAll($(json(String(selector))))].find(e => e.offsetParent !== null);
+        if (!el) return null;
+        el.scrollIntoView({block: 'center'});
+        const r = el.getBoundingClientRect();
+        return [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)];
+    })()""")
+    point === nothing && error("real_click: no visible element matched $selector")
+    x, y = point
+    ctx = s.browser[]
+    ECT.send_input(ctx, "{type: 'mouseMove', x: $x, y: $y}")
+    sleep(0.05)
+    ECT.send_input(ctx, "{type: 'mouseDown', x: $x, y: $y, button: 'left', clickCount: 1}")
+    sleep(0.05)
+    ECT.send_input(ctx, "{type: 'mouseUp', x: $x, y: $y, button: 'left', clickCount: 1}")
+    return s
+end
+
+"""
+    press_key!(s, key)
+
+Press and release `key` ("Home", "End", "PageUp", ...) with real keyboard
+input, delivered to whatever has focus, as a user's key press is.
+"""
+function press_key!(s::TestServer, key::AbstractString)
+    ctx = s.browser[]
+    ECT.send_input(ctx, "{type: 'keyDown', keyCode: $(json(String(key)))}")
+    ECT.send_input(ctx, "{type: 'keyUp', keyCode: $(json(String(key)))}")
+    return s
+end
+
+"""
+    drag_rail!(s, f; hold = 0.5) -> String
+
+Drag the visible chat's rail thumb (the scrollbar by message count) to fraction
+`f` of its track with real mouse input, hold it there `hold` seconds (a resting
+thumb jumps there) and let go. Returns the label the rail showed while held,
+e.g. "Message 150 of 300".
+"""
+function drag_rail!(s::TestServer, f::Real; hold::Real = 0.5)
+    pane = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    r = eval_js(s, """(() => { const rail = $pane?.querySelector('.bt-rail');
+        if (!rail || rail.classList.contains('bt-rail-hidden')) return null;
+        const t = rail.querySelector('.bt-rail-thumb').getBoundingClientRect(), b = rail.getBoundingClientRect();
+        return [t.left + t.width / 2, t.top + t.height / 2, b.top + t.height / 2, b.height - t.height]; })()""")
+    r === nothing && error("drag_rail!: the visible chat shows no rail")
+    x, y0, top, range = round(Int, r[1]), round(Int, r[2]), r[3], r[4]
+    y1 = round(Int, top + f * range)
+    ctx = s.browser[]
+    ECT.send_input(ctx, "{type: 'mouseMove', x: $x, y: $y0}")
+    ECT.send_input(ctx, "{type: 'mouseDown', x: $x, y: $y0, button: 'left', clickCount: 1}")
+    for k in 1:10
+        y = round(Int, y0 + (y1 - y0) * k / 10)
+        ECT.send_input(ctx, "{type: 'mouseMove', x: $x, y: $y, button: 'left'}")
+        sleep(0.02)
+    end
+    sleep(hold)
+    label = eval_js(s, "$pane.querySelector('.bt-rail-label').textContent")
+    ECT.send_input(ctx, "{type: 'mouseUp', x: $x, y: $y1, button: 'left', clickCount: 1}")
+    return String(label)
+end
+
+"""
+    wheel_into_view(s, scroller, target; step = 150) -> Bool
+
+Wheel `scroller` from its left padding until `target` is in view: its top, and
+its bottom unless it is taller than the view. A step that overshoots is halved.
+Both are JS expressions for an element; a `target` not on the page counts as
+above. Needs `ECT.install_cursor`.
+"""
+function wheel_into_view(s::TestServer, scroller::AbstractString, target::AbstractString;
+                         step::Real = 150, max_steps::Integer = 120)
+    ctx = s.browser[]
+    ECT.move_to(ctx, ECT.JS("(() => { const r = $(scroller).getBoundingClientRect(); " *
+                            "return [r.left + 3, r.top + r.height / 2]; })()"); duration = 0.05)
+    where() = eval_js(s, """(() => { const e = $(target); if (!e) return -1;
+        const r = e.getBoundingClientRect(), c = $(scroller).getBoundingClientRect();
+        if (r.top < c.top + 40) return -1;
+        return r.top > c.bottom - 80 || (r.bottom > c.bottom - 40 && r.height < c.height - 120) ? 1 : 0; })()""")
+    dy, last = Float64(step), 0
+    for _ in 1:max_steps
+        w = where()
+        w == 0 && return true
+        w == -last && (dy /= 2)
+        last = w
+        # Measured once the scroller's own listeners have seen the step.
+        eval_js(s, "(() => { window.__btWheeled = false; $(scroller).addEventListener('scroll', " *
+                   "() => { window.__btWheeled = true; }, {once: true}); return true; })()")
+        ECT.wheel(ctx, dy * w; steps = 1)
+        wait_for(s, "the wheel step scrolled", "window.__btWheeled"; timeout = 5)
+    end
+    return where() == 0
 end
 
 # Click the first visible `selector` repeatedly until `predicate` holds — rides
@@ -1155,15 +1485,468 @@ For routes that aren't direct URLs, prefer the high-level helpers
 (`new_chat`, `open_project`) below.
 """
 function navigate(s::TestServer, route::AbstractString)
-    base = "http://127.0.0.1:$(s.h.state.srv.port)"
+    base = s.h.url
     eval_js(s, "window.__btNavigationPending = true; location.href = $(json(base * String(route)))")
+    # `.bt-shell`, the app's root: `.bt-app` exists only while a chat is open,
+    # so a reload onto the dashboard never satisfied the wait.
     wait_for(s, "new document loaded",
-        "window.__btNavigationPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-app')";
+        "window.__btNavigationPending !== true && document.readyState === 'complete' && !!document.querySelector('.bt-shell')";
         timeout = 60)
     # Navigation replaces the document and its selector wrappers. Without
     # reinstalling these, the next suite can read a hidden chat's message
     # count instead of the active chat after a reload test.
     install_pane_scope!(s)
+    return s
+end
+
+# ── The login proxy ────────────────────────────────────────────────────────
+# `dev_server(proxy = true)` puts the real Caddy and Authelia in front, so a test
+# logs in the way a person does: Authelia's form, then a one-time code from an
+# authenticator app, which `totp` computes from the account's secret.
+
+"Caddy and Authelia for `dev_server(proxy = true)`, downloaded once and checksum-verified."
+proxy_binaries() = BT.fetch_proxy_binaries(joinpath(get(ENV, "XDG_CACHE_HOME", joinpath(homedir(), ".cache")),
+                                                    "bonitoagents-test", "proxy-bin"))
+
+const BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+function base32(bytes::AbstractVector{UInt8})
+    bits = join(string(b; base = 2, pad = 8) for b in bytes)
+    bits *= "0"^((5 - length(bits) % 5) % 5)
+    return join(BASE32[parse(Int, bits[i:i+4]; base = 2) + 1] for i in 1:5:length(bits))
+end
+
+function unbase32(text::AbstractString)
+    bits = join(string(findfirst(==(c), BASE32) - 1; base = 2, pad = 5) for c in text)
+    return [parse(UInt8, bits[i:i+7]; base = 2) for i in 1:8:(length(bits) - 7)]
+end
+
+"The RFC 6238 one-time code for `secret` in time step `step` (30 s steps, 6 digits, SHA-1)."
+function totp(secret::AbstractString, step::Integer)
+    h = SHA.hmac_sha1(unbase32(secret), reverse(reinterpret(UInt8, [UInt64(step)])))
+    o = h[end] & 0x0f
+    code = (UInt32(h[o+1] & 0x7f) << 24) | (UInt32(h[o+2]) << 16) | (UInt32(h[o+3]) << 8) | UInt32(h[o+4])
+    return lpad(string(code % UInt32(1_000_000)), 6, '0')
+end
+
+"The page's host: the dashboard's, or Authelia's portal (`auth.…`)."
+page_host(s::TestServer) = String(eval_js(s, "location.host"))
+
+const AUTHELIA_ERRORS = "[...document.querySelectorAll('[data-slot=toast][data-type=error]')]"
+
+# What Authelia logged last, bar the steady stream of "not logged in" redirects:
+# why it refused someone.
+function authelia_log_tail(s::TestServer; lines::Int = 15)
+    f = joinpath(s.h.proxy.dir, "authelia.log")
+    isfile(f) || return "(no Authelia log)"
+    kept = filter(l -> !occursin("is not authorized to user <anonymous>", l), readlines(f))
+    return "--- Authelia's log ---\n" * join(kept[max(1, end - lines + 1):end], "\n")
+end
+
+"""
+    login!(s, login = s.admin)
+
+Log in through Authelia from its portal, where `open_browser` lands behind the
+proxy: the form, then the one-time code. Returns once the dashboard is up.
+"""
+function login!(s::TestServer, login::Login = s.admin)
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
+    set_input(s, "#username-textfield", login.user)
+    set_input(s, "#password-textfield", login.password)
+    # Errors already on screen (a refusal just before) are not this attempt's.
+    before = eval_js(s, "$(AUTHELIA_ERRORS).length")
+    click(s, "#sign-in-button")
+    past = wait_for(s, "the one-time code form",
+        """(() => { if (document.querySelectorAll('input[autocomplete=off]').length >= 5) return 'code';
+                    const e = $(AUTHELIA_ERRORS);
+                    return e.length > $(before) ? e.map(x => x.textContent.trim()).join(' ') : false; })()""";
+        timeout = 30)
+    past == "code" || error("login!: Authelia refused $(login.user)'s password: $(past)\n" * authelia_log_tail(s))
+    enter_code!(s, login)
+    wait_for(s, "the dashboard after the login", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    install_pane_scope!(s)
+    return s
+end
+
+# The one-time code for `login` now. Authelia takes a code once: after one in
+# this 30 s step, this waits for the next.
+function next_code!(s::TestServer, login::Login)
+    step = floor(Int, time() / 30)
+    if get(s.otp_used, login.user, -1) >= step
+        sleep(30 * (step + 1) - time() + 0.5)
+        step = floor(Int, time() / 30)
+    end
+    s.otp_used[login.user] = step
+    return totp(login.secret, step)
+end
+
+"""
+    api_login!(s, login = s.admin)
+
+Log in through Authelia's API from the open page, without leaving it: what a
+login in another tab of the same browser does to this one.
+"""
+function api_login!(s::TestServer, login::Login = s.admin)
+    code = next_code!(s, login)
+    r = eval_js(s, """(async () => {
+        const post = (p, b) => fetch('/authelia/api/' + p, {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b)}).then(r => r.status);
+        const a = await post('firstfactor', {username: $(json(login.user)), password: $(json(login.password)),
+                                             keepMeLoggedIn: false});
+        if (a !== 200) return 'the password step answered ' + a;
+        const b = await post('secondfactor/totp', {token: $(json(code))});
+        return b === 200 ? true : 'the code step answered ' + b; })()""")
+    r === true || error("api_login!: $(r)\n" * authelia_log_tail(s))
+    return s
+end
+
+"""
+    enter_code!(s, login)
+
+Type the current one-time code for `login` into Authelia's code boxes, as an
+authenticator app's user does. Authelia takes a code once: after one in this
+30 s step, it waits for the next.
+"""
+function enter_code!(s::TestServer, login::Login)
+    code = next_code!(s, login)
+    # One digit per box, as typing does; the component gathers them and submits.
+    eval_js(s, """(() => {
+        const boxes = [...document.querySelectorAll('input[autocomplete=one-time-code], input[autocomplete=off]')]
+            .filter(e => !e.id.endsWith('hidden-input'));
+        const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        $(json(code)).split('').forEach((d, i) => {
+            boxes[i].focus(); set.call(boxes[i], d);
+            boxes[i].dispatchEvent(new Event('input', {bubbles: true})); });
+        return true; })()""")
+    return s
+end
+
+"""
+    invite_login(s, user) -> Login
+
+What a new account's invite page shows once, in browser `s`: its password and
+its authenticator (the `otpauth://` link a password manager takes), as the
+`Login` that signs in with them.
+"""
+function invite_login(s::TestServer, user::AbstractString)
+    password = String(wait_for(s, "the new password", "(document.querySelector('.pw') || {}).textContent || false";
+                               timeout = 30))
+    uri = String(wait_for(s, "the authenticator", "(document.querySelector('.uri') || {}).textContent || false";
+                          timeout = 30))
+    return Login(String(user), password, match(r"[?&]secret=([A-Z2-7]+)", uri)[1])
+end
+
+"""
+    add_passkey_device!(s) -> String
+
+Give browser `s` what keeps passkeys, as a password manager (Proton Pass) or a
+security key does: Chrome's virtual authenticator, which holds discoverable
+credentials and verifies its user. A passkey needs a page without certificate
+errors, so this browser also trusts the test CA's names (`*.localhost`,
+127.0.0.1), as a machine that installed the CA would. Returns the device's id.
+"""
+function add_passkey_device!(s::TestServer)
+    ctx = s.browser[]
+    return String(run(ctx.app, """(async () => {
+        const w = BrowserWindow.fromId($(ctx.window.id));
+        w.webContents.session.setCertificateVerifyProc((req, cb) =>
+            cb(/(^|\\.)localhost\$|^127\\.0\\.0\\.1\$/.test(req.hostname) ? 0 : -3));
+        await w.webContents.session.closeAllConnections();
+        const d = w.webContents.debugger;
+        if (!d.isAttached()) d.attach('1.3');
+        await d.sendCommand('WebAuthn.enable', {enableUI: false});
+        const r = await d.sendCommand('WebAuthn.addVirtualAuthenticator', {options: {
+            protocol: 'ctap2', transport: 'internal', hasResidentKey: true,
+            hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true}});
+        return r.authenticatorId; })()"""))
+end
+
+"The passkeys `device` (`add_passkey_device!`) of browser `s` holds, as `(rp, user)`."
+function passkeys(s::TestServer, device::AbstractString)
+    ctx = s.browser[]
+    creds = run(ctx.app, """(async () => {
+        const d = BrowserWindow.fromId($(ctx.window.id)).webContents.debugger;
+        const r = await d.sendCommand('WebAuthn.getCredentials', {authenticatorId: $(json(device))});
+        return r.credentials.filter(c => c.isResidentCredential).map(c => [c.rpId, c.userName]); })()""")
+    return [(String(c[1]), String(c[2])) for c in creds]
+end
+
+"""
+    add_passkey!(s; name = "Proton Pass")
+
+Add a passkey for whoever is signed in in browser `s`, as they would: the
+Passkeys part of their account card, a name, "Add a passkey", and the browser's
+device makes it (`add_passkey_device!` first). They stay on the dashboard.
+"""
+function add_passkey!(s::TestServer; name::AbstractString = "Proton Pass")
+    wait_for(s, "the Passkeys part of the account card", "!!document.querySelector('.bt-passkey-add')"; timeout = 30)
+    set_input(s, ".bt-passkey-name-input", name)
+    click(s, ".bt-passkey-add")
+    wait_for(s, "the passkey added", "document.querySelector('.bt-passkey-status').textContent.startsWith('passkey added')";
+             timeout = 30)
+    return s
+end
+
+"The passkeys the account card lists, by name (once its list has loaded)."
+listed_passkeys(s::TestServer) = String.(eval_js(s,
+    "[...document.querySelectorAll('.bt-passkey-row .bt-passkey-name')].map(e => e.textContent)"))
+
+"""
+    create_passkey_from_invite!(s)
+
+On a new account's page in browser `s`: "Create my passkey", which signs them in
+and has the browser's device make it (`add_passkey_device!` first). Returns once
+the dashboard is up.
+"""
+function create_passkey_from_invite!(s::TestServer)
+    click(s, "#create-passkey")
+    outcome = wait_for(s, "the dashboard after the passkey", """(() => {
+        if (document.querySelector('.bt-dash')) return true;
+        const t = (document.getElementById('passkey-status') || {}).textContent || '';
+        return t.startsWith('That did not work') ? t : false; })()"""; timeout = 60)
+    outcome === true || error("create_passkey_from_invite!: " * String(outcome))
+    install_pane_scope!(s)
+    return s
+end
+
+"""
+    passkey_login!(s)
+
+Sign in with a passkey alone: "Sign in with a passkey" on Authelia's login page,
+answered by the browser's device. Returns once the dashboard is up.
+"""
+function passkey_login!(s::TestServer)
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#passkey-sign-in-button')"; timeout = 30)
+    click(s, "#passkey-sign-in-button")
+    wait_for(s, "the dashboard after the passkey", "!!document.querySelector('.bt-dash')"; timeout = 60)
+    install_pane_scope!(s)
+    return s
+end
+
+"""
+    another_browser(s) -> TestServer
+
+A second browser on the same server, with cookies of its own: another person
+logged in at the same time (`login!` into it). Everything that takes a
+`TestServer` drives it. Close it with `close_browser!`, never `close`, which
+stops the server.
+"""
+function another_browser(s::TestServer)
+    b = TestServer(s.h, s.agent_fn, s.dispatcher_sock, s.dispatcher_port, s.dispatcher_task,
+                   Ref{Any}(nothing), Ref(false), s.browser_size, s.admin, s.otp_used, s.extra_workers)
+    open_browser(b)
+    return b
+end
+
+"""
+    another_tab(s; route = "/") -> TestServer
+
+A second tab of the browser `s` drives, on `route`: the same cookies, so the
+same login. Everything that takes a `TestServer` drives it. Close it with
+`close_browser!`, which closes only the tab.
+"""
+function another_tab(s::TestServer; route::AbstractString = "/")
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    # What `ECT.open_window` gives its window: hidden, painting, unthrottled.
+    win = ElectronCall.Window(ctx.app; show = false, width = s.browser_size[1], height = s.browser_size[2],
+                              webPreferences = Dict{String,Any}("offscreen" => true, "disableDialogs" => true,
+                                  "backgroundThrottling" => false, "paintWhenInitiallyHidden" => true))
+    ECT.keep_headless!(ctx.app, win)
+    tab = ECT.TestContext(ctx.app, win, false)
+    capture_console!(tab)
+    follow_pane_scope!(tab)
+    t = TestServer(s.h, s.agent_fn, s.dispatcher_sock, s.dispatcher_port, s.dispatcher_task,
+                   Ref{Any}(tab), Ref(false), s.browser_size, s.admin, s.otp_used, s.extra_workers)
+    ElectronCall.load(win, ElectronCall.URI(s.h.url * route))
+    return t
+end
+
+function close_browser!(s::TestServer)
+    ctx = s.browser[]
+    ctx === nothing || close_browser(ctx)
+    s.browser[] = nothing
+    return s
+end
+
+"""
+    login_refused(s, login) -> String
+
+Try to log in with `login` from Authelia's form and return what Authelia says
+when it refuses (a wrong password, a disabled or removed account). Throws if it
+lets them in instead.
+"""
+function login_refused(s::TestServer, login::Login)
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
+    set_input(s, "#username-textfield", login.user)
+    set_input(s, "#password-textfield", login.password)
+    # Authelia says why in a toast (the same words for a wrong password and a
+    # disabled account: it does not tell which). One from before is not this one.
+    before = eval_js(s, "$(AUTHELIA_ERRORS).length")
+    click(s, "#sign-in-button")
+    refusal = wait_for(s, "Authelia's refusal",
+        """(() => { if (document.querySelectorAll('input[autocomplete=off]').length >= 5 || document.querySelector('.bt-dash'))
+                        return 'LET IN';
+                    const e = $(AUTHELIA_ERRORS);
+                    return e.length > $(before) ? e.map(x => x.textContent.trim()).join(' ') : false; })()""";
+        timeout = 30, interval = 0.1)
+    refusal == "LET IN" && error("login_refused: Authelia let $(login.user) in")
+    # Authelia's page logs the refused request as an error. That refusal is
+    # what was asked for; anything else the console holds stays for the check.
+    run(s.browser[].app, """(() => { global.__btConsole = global.__btConsole.filter(e =>
+        !(e.message.includes('Request failed with status code 401') && e.source.includes('/static/js/portal')));
+        return true; })()""")
+    return String(refusal)
+end
+
+# A Settings section, by its heading: `expr` is JS run with `sec` bound to it.
+section_js(title::AbstractString, expr::AbstractString) = """(() => {
+    const h = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === $(json(title)));
+    const sec = h && h.closest('.bt-section').parentElement;
+    if (!sec) return false;
+    return $(expr); })()"""
+accounts_js(expr::AbstractString) = section_js("Accounts", expr)
+invites_js(expr::AbstractString) = section_js("Invites", expr)
+
+"Wait until the Accounts section's status line says `text`; returns the line."
+account_status(s::TestServer, text::AbstractString; timeout::Real = 30) =
+    wait_for(s, "account status '$(text)'",
+        accounts_js("sec.querySelector('.bt-admin-status').textContent.includes($(json(text))) && " *
+                    "sec.querySelector('.bt-admin-status').textContent"); timeout)
+
+"""
+    add_account_ui!(s, name; display_name = name, groups = "") -> Login
+
+Add an account the way an admin does: Settings, "Add account…", the form, and
+return what it shows once, the password and the authenticator, as the `Login`
+the admin passes on.
+"""
+function add_account_ui!(s::TestServer, name::AbstractString; display_name::AbstractString = name,
+                         groups::AbstractString = "")
+    to_settings(s)
+    eval_js(s, accounts_js("sec.querySelector('.bt-add-account').click() || true"))
+    wait_for(s, "the Add account form", accounts_js("!!sec.querySelector('.bt-modal-card .bt-add-account-submit')"); timeout = 10)
+    eval_js(s, accounts_js("""(() => {
+        const form = sec.querySelector('.bt-modal-card .bt-form');
+        const set = (label, v) => {
+            const el = [...form.querySelectorAll('label')].find(l => l.textContent.trim() === label).nextElementSibling;
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+            el.dispatchEvent(new Event('input', {bubbles: true})); };
+        set('Account', $(json(name))); set('Full name', $(json(display_name)));
+        return true; })()"""))
+    isempty(groups) || pick_groups!(s, accounts_js("sec.querySelector('.bt-modal-card .bt-group-pick')"),
+                                    strip.(split(groups, ','; keepempty = false)))
+    sleep(0.3)   # the inputs reach the server before the click that reads them
+    eval_js(s, accounts_js("sec.querySelector('.bt-add-account-submit').click() || true"))
+    account_status(s, "account $(name) added")
+    uri = String(wait_for(s, "the authenticator for $(name)",
+        accounts_js("(sec.querySelector('.bt-admin-secret .bt-admin-uri') || {}).textContent || false"); timeout = 30))
+    return Login(String(name), shown_password(s, name), match(r"[?&]secret=([A-Z2-7]+)", uri)[1])
+end
+
+# (`innerText`: the lines of what is shown stay apart, and the password ends
+# where its line does.)
+"The password the Accounts section shows for `name`, once."
+shown_password(s::TestServer, name::AbstractString) = String(wait_for(s, "the password for $(name)",
+    accounts_js("(sec.querySelector('.bt-admin-secret').innerText.match(/Password for $(name), shown only now: (\\S+)/) || [false, false])[1]");
+    timeout = 30))
+
+"Pick `label` (\"Disable\", \"Make admin\", …) from the ⋯ menu of `name`'s row in the Accounts table."
+function account_action!(s::TestServer, name::AbstractString, label::AbstractString)
+    to_settings(s)
+    ok = eval_js(s, accounts_js("""(() => {
+        const row = sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + ']');
+        if (!row) return 'no row';
+        row.querySelector('.bt-menu-trigger').click();
+        const b = [...row.querySelectorAll('.bt-menu-open .bt-menu-item')].find(x => x.textContent.trim() === $(json(label)));
+        if (!b) return 'no item';
+        window.confirm = () => true;   // "Remove" asks first
+        b.click(); return true; })()"""))
+    ok === true || error("account_action!: $(ok) for $(repr(label)) on $(name)'s row")
+    return s
+end
+
+"""
+    pick_groups!(s, picker_js, groups)
+
+Choose exactly `groups` in a group picker, the way a person does: open it, tick
+and untick, add the names that are not on the list through its field, and close
+it, which saves. `picker_js` is a JS expression for the picker (`.bt-group-pick`).
+"""
+function pick_groups!(s::TestServer, picker_js::AbstractString, groups::AbstractVector{<:AbstractString})
+    # The picker is a sub-session: on a slow machine its button is on the page
+    # before its click handler is, and a click then does nothing.
+    wait_for(s, "the group list open", """(() => { const m = $(picker_js);
+        if (!m) return false;
+        if (!m.classList.contains('bt-menu-open')) m.querySelector('.bt-group-trigger').click();
+        return m.classList.contains('bt-menu-open'); })()"""; timeout = 20)
+    ok = eval_js(s, """(() => {
+        const m = $(picker_js);
+        const want = $(json(collect(String, groups)));
+        for (const g of want) {
+            if ([...m.querySelectorAll('.bt-group-item input')].some(i => i.value === g)) continue;
+            const field = m.querySelector('.bt-group-new-name');
+            if (!field) return g + ' is not on the list, and there is no field for a new group';
+            field.value = g;
+            m.querySelector('.bt-group-add').click();
+        }
+        m.querySelectorAll('.bt-group-item input').forEach(i => { i.checked = want.includes(i.value); });
+        document.body.click();   // closing the list saves it
+        return true; })()""")
+    ok === true || error("pick_groups!: $(ok)")
+    return s
+end
+
+"Put `name` in exactly `groups` from its row of the Accounts table."
+function set_account_groups_ui!(s::TestServer, name::AbstractString, groups::AbstractVector{<:AbstractString})
+    to_settings(s)
+    pick_groups!(s, accounts_js("sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + '] .bt-group-pick')"),
+                 groups)
+    return s
+end
+
+"Share the (first) worker with exactly `groups` from its card, as its owner does."
+function share_worker_ui!(s::TestServer, groups::AbstractVector{<:AbstractString})
+    to_dashboard(s)
+    picker = "document.querySelector('.bt-worker-cell .bt-worker-sharing .bt-group-pick')"
+    wait_for(s, "the worker's sharing picker", "!!$(picker)"; timeout = 60)
+    pick_groups!(s, picker, groups)
+    wait_for(s, "the share saved", "document.querySelector('.bt-worker-sharing').textContent.includes('shared')";
+             timeout = 30, describe = "document.querySelector('.bt-worker-sharing')?.textContent")
+    return s
+end
+
+"""
+    reload!(s) -> :dashboard | :portal
+
+Load the dashboard's address again, as a person reloading does; returns where it
+lands: the dashboard, or Authelia's portal (not logged in, or refused).
+"""
+function reload!(s::TestServer)
+    eval_js(s, "location.href = $(json(s.h.url * "/")); true")
+    where = wait_for(s, "the dashboard or the login portal",
+        "document.querySelector('.bt-dash') ? 'dashboard' : document.querySelector('#username-textfield') ? 'portal' : false";
+        timeout = 30)
+    where == "dashboard" && install_pane_scope!(s)
+    return Symbol(where)
+end
+
+"Is the page's connection to the server gone (the server closed its session)?"
+dropped(s::TestServer) = eval_js(s, "document.body.textContent.includes('The link to the server dropped')") === true
+
+"The \"Signed in as …\" line of the account card."
+signed_in_as(s::TestServer) = String(wait_for(s, "the account card",
+    "([...document.querySelectorAll('.bt-card')].map(c => c.textContent).find(t => t.includes('Signed in as')) || '').match(/Signed in as [^.]*\\./)?.[0] || false";
+    timeout = 30))
+
+"The h2 section headings on the page."
+headings(s::TestServer) = String.(eval_js(s, "[...document.querySelectorAll('h2')].map(h => h.textContent.trim())"))
+
+"Log out through the account card's link; returns once Authelia's form is back."
+function logout!(s::TestServer)
+    eval_js(s, """(() => { const a = [...document.querySelectorAll('a')]
+        .find(a => (a.innerText||'').trim() === 'Log out'); a.click(); return true; })()""")
+    wait_for(s, "Authelia's login form", "!!document.querySelector('#username-textfield')"; timeout = 30)
     return s
 end
 
@@ -1236,6 +2019,16 @@ function set_input(s::TestServer, selector::AbstractString, value::AbstractStrin
         el.dispatchEvent(new Event('input', {bubbles: true}));
         return true; })()""")
     ok === true || error("set_input: no visible element for $(repr(selector))")
+    return s
+end
+
+"Go to the Settings page by clicking its entry in the sidebar."
+function to_settings(s::TestServer)
+    # By its view, not its label: the icon rail (collapsed, or a phone) hides the text.
+    eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\"settings\"]').click(); true")
+    wait_for(s, "the Settings page",
+        "(() => { const v = document.querySelector('.bt-view-settings'); return !!v && getComputedStyle(v).display !== 'none'; })()";
+        timeout = 10)
     return s
 end
 
@@ -1406,43 +2199,6 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
              timeout = 90)
     sleep(0.5)
     pid = current_chat_id(s)
-    # `SERVER_CONTEXT` is a single global, set by whichever `dev_server` ran
-    # LAST — but a suite can drive a server that isn't that one. `e2e:bt_eval`
-    # stands up (and closes) eight of its own servers; every later SharedServer
-    # item then hands the eval worker the URL of a server that no longer exists,
-    # and the dial dies with `connect: Connection refused` on `/eval-ws`. The
-    # embed still renders its snapshot, so the symptom is a live app that never
-    # updates — which is what took `e2e:eval_embed_park` down (13 failures) in a
-    # full-suite run while it passed alone. Point the context at the server we
-    # are actually driving, and drop the stale bridge so the next eval re-dials.
-    ctx = SERVER_CONTEXT[]
-    if ctx === nothing || ctx.url != s.h.url
-        SERVER_CONTEXT[] = (url = s.h.url, secret = s.h.secret, project_id = Ref(""))
-        ctx = SERVER_CONTEXT[]
-        reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (server changed)")
-    end
-    if ctx !== nothing
-        # Re-point the eval dial-back whenever the PROJECT changes — the same
-        # reason `Base.close(::TestServer)` re-points it when the SERVER changes.
-        #
-        # The server registers one eval bridge per PROJECT
-        # (`state.eval_workers[project_id]`, set when the worker's eval dials
-        # `/eval-ws` carrying that id). The MCP eval-session pool, though, is
-        # keyed by env_path and process-global, and `ensure_eval_dialed!`
-        # short-circuits on `s.dialed_back` — it never dials a second time. So a
-        # second chat that evals in the SAME env inherits the first chat's
-        # already-dialed session, no bridge is ever registered for the new
-        # project, and its live embeds render from their snapshot but have no
-        # browser↔worker route: they look right and are dead.
-        #
-        # In production each chat gets its own MCP process, so each dials once
-        # for its own project. Dropping the bridge here (the worker stays warm,
-        # so no compile cost) reproduces that per-chat dial in one test process.
-        if ctx.project_id[] != pid
-            ctx.project_id[] = pid
-            reset_dialback_or_warn(BonitoMCP.reset_eval_dialback!, "eval (new chat)")
-        end
-    end
     return pid
 end
 
@@ -1531,6 +2287,76 @@ function set_window_size(s::TestServer, w::Integer, h::Integer)
 end
 
 """
+    emulate_phone(f, s; width = 390, height = 844)
+
+Run `f()` with the page as a phone: a mobile viewport and touch input, so
+`(hover: none)` holds and [`tap`](@ref) / [`swipe`](@ref) arrive as touch. The
+window is a desktop again afterwards (the next item on a shared server expects one).
+"""
+function emulate_phone(f, s::TestServer; width::Integer = 390, height::Integer = 844)
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    wc = "electron.BrowserWindow.fromId($(ctx.window.id)).webContents"
+    run(ctx.app, """(async () => { const wc = $wc;
+        wc.enableDeviceEmulation({screenPosition: 'mobile', screenSize: {width: $width, height: $height},
+            viewSize: {width: $width, height: $height}, viewPosition: {x: 0, y: 0}, deviceScaleFactor: 3, scale: 1});
+        globalThis.__btPhoneAttached = !wc.debugger.isAttached();
+        if (globalThis.__btPhoneAttached) wc.debugger.attach('1.3');
+        await wc.debugger.sendCommand('Emulation.setTouchEmulationEnabled', {enabled: true, maxTouchPoints: 5});
+        return true; })()""")
+    try
+        return f()
+    finally
+        run(ctx.app, """(async () => { const wc = $wc;
+            await wc.debugger.sendCommand('Emulation.setTouchEmulationEnabled', {enabled: false});
+            if (globalThis.__btPhoneAttached) wc.debugger.detach();
+            wc.disableDeviceEmulation();
+            return true; })()""")
+    end
+end
+
+# A touch gesture through the page's debugger (attached by `emulate_phone`).
+touch(s::TestServer, events::AbstractString) = run(s.browser[].app, """(async () => {
+    const wc = electron.BrowserWindow.fromId($(s.browser[].window.id)).webContents;
+    const T = (type, x, y) => wc.debugger.sendCommand('Input.dispatchTouchEvent',
+        {type, touchPoints: type === 'touchEnd' ? [] : [{x, y}]});
+    $events
+    return true; })()""")
+
+"""
+    tap(s, selector)
+
+A touch tap on the centre of the first rendered element matching `selector`.
+Inside [`emulate_phone`](@ref).
+"""
+function tap(s::TestServer, selector::AbstractString)
+    xy = eval_js(s, """(() => { const e = [...document.querySelectorAll($(json(selector)))].find(e => e.getClientRects().length);
+        if (!e) return null; const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()""")
+    xy === nothing && error("tap: nothing rendered matches $(selector)")
+    # A finger lands only on what is on the screen.
+    w, h = eval_js(s, "[innerWidth, innerHeight]")
+    (0 <= xy[1] <= w && 0 <= xy[2] <= h) || error("tap: $(selector) is off the screen, at $(xy)")
+    touch(s, "await T('touchStart', $(xy[1]), $(xy[2])); await T('touchEnd');")
+    return s
+end
+
+"""
+    swipe(s, dy; x = 200, y = 450)
+
+A finger drag of `dy` pixels (positive moves the content down, scrolling up),
+in frames like a real one. The finger rests before it lifts, so no fling
+carries the page on afterwards. Inside [`emulate_phone`](@ref).
+"""
+function swipe(s::TestServer, dy::Real; x::Real = 200, y::Real = 450, steps::Integer = 12)
+    touch(s, """await T('touchStart', $x, $y);
+        for (let i = 1; i <= $steps; i++) { await T('touchMove', $x, $y + $dy * i / $steps); await new Promise(r => setTimeout(r, 16)); }
+        await new Promise(r => setTimeout(r, 200));
+        await T('touchMove', $x, $y + $dy);
+        await T('touchEnd');""")
+    return s
+end
+
+"""
     send_message(s, text)
 
 Type `text` into the chat composer and click send, the same path a user takes.
@@ -1559,17 +2385,30 @@ end
 """
     screenshot(s, path)
 
-Save a PNG of the current Electron window. Synchronous: blocks until the
-file lands on disk so the next `Read` call sees it.
+Save a PNG of the complete renderer viewport, including an emulated phone
+viewport taller than the host window. Blocks until the file lands on disk.
 """
 function screenshot(s::TestServer, path::AbstractString; timeout::Real = 8)
     ctx = s.browser[]
     ctx === nothing && error("open_browser first")
     path = abspath(String(path))
     mkpath(dirname(path))
-    # ECT.screenshot drives the main-process capturePage and writes the PNG
-    # synchronously before returning.
-    return ECT.screenshot(ctx; path = path)
+    # Phone emulation can exceed the host surface. Enlarge that surface
+    # before capture, then clip to the emulated viewport (no blank desktop).
+    # CDP captureBeyondViewport temporarily changes Electron's emulated layout.
+    run(ctx.app, """(async () => {
+        const win = electron.BrowserWindow.fromId($(ctx.window.id));
+        const wc = win.webContents;
+        const viewport = await wc.executeJavaScript('({width:innerWidth,height:innerHeight})');
+        const original = win.getContentSize();
+        try {
+            win.setContentSize(Math.max(original[0], viewport.width), Math.max(original[1], viewport.height));
+            await wc.executeJavaScript('new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))');
+            const shot = await wc.capturePage({x:0,y:0,width:viewport.width,height:viewport.height});
+            require('fs').writeFileSync($(json(path)), shot.toPNG());
+        } finally { win.setContentSize(...original); }
+    })()""")
+    return path
 end
 
 # Tiny JSON-encode helper (no JSON3 dep in the test module).

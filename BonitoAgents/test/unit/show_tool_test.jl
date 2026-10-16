@@ -19,29 +19,29 @@ using BonitoMCP
 using Bonito
 const BT = BonitoAgents
 
-# Classify what `render_show_file` produced without needing a live session.
-# Ordered most-specific first: a notebook contains a rendered markdown cell, so
-# the notebook wrapper has to be recognised before the markdown class.
+# Classify what `render_show_file` produced without needing a live session, by
+# the class of its root: printed without a session, a viewer's style sheet
+# (`FileViewStyles`) comes out as text naming every viewer's classes.
+root_class(node) = node isa Bonito.Hyperscript.Node ? get(Bonito.Hyperscript.attrs(node), "class", "") : ""
+
 function show_kind(node)
     nameof(typeof(node)) === :MonacoEditor && return :text
+    node isa BT.MeshViewer && return :mesh
+    cls = root_class(node)
+    for (c, kind) in ("bt-fv-notebook" => :notebook, "bt-fv-table-wrap" => :table,
+                      "bt-fv-markdown" => :markdown, "bt-fv-hex-wrap" => :binary,
+                      "bt-fv-frame-wrap" => :frame, "bt-fv-audio-wrap" => :audio,
+                      "bt-tool-empty" => :caption, "bt-tool-error" => :error)
+        occursin(c, cls) && return kind
+    end
     s = sprint(show, node)
-    occursin("bt-fv-notebook", s) && return :notebook
-    occursin("bt-mesh-view", s)   && return :mesh
-    occursin("bt-fv-table", s)    && return :table
-    occursin("bt-fv-markdown", s) && return :markdown
-    occursin("bt-fv-hex", s)      && return :binary
-    occursin("bt-fv-frame", s)    && return :frame
     occursin("<img", s)   && return :image
     occursin("<video", s) && return :video
-    occursin("<audio", s) && return :audio
-    occursin("bt-tool-empty", s) && return :caption
-    occursin("bt-tool-error", s) && return :error
     return :unknown
 end
 
 newstate() = BT.ServerState(; state_dir = mktempdir(),
-                              working_dir = mktempdir(),
-                              worker_secret = "x")
+                              working_dir = mktempdir())
 
 @testset "bt_show / ShowTool" begin
 
@@ -99,6 +99,22 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test_throws Exception BT.fetch_show_file(st_missing)
     end
 
+    @testset "media is a link to the worker's file, never a copy" begin
+        # A video whose worker does not answer: the card gets its link at once,
+        # without asking the worker or copying anything. It used to stat first
+        # and, when the worker was slow to answer, copy the whole file to the
+        # server; the video sat blank until that was done.
+        state = newstate()
+        cwd = mktempdir()
+        state.projects[]["p1"] = BT.ProjectInfo("p1", "media", "w-gone", cwd, "/home/w/proj", BT.now(BT.UTC))
+        st = BT.ShowTool(state, "p1", cwd, "renders/clip.mp4")
+        t0 = time()
+        src = BT.show_media_src(st)
+        @test time() - t0 < 1.0
+        @test src == BT.worker_file_url(state, "w-gone", "/home/w/proj/renders/clip.mp4")
+        @test !ispath(BT.show_server_path(st))            # nothing on the server
+    end
+
     # `file_kind` is the single decision point every renderer dispatches on —
     # pure, so it's worth pinning exactly. The interesting cases are the ones
     # that used to be lumped together as "not text": .ogg is AUDIO (not a video
@@ -119,7 +135,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test k("data.tsv") == :TableFile
         @test k("nb.ipynb") == :NotebookFile
         @test k("m.obj") == :MeshFile
-        @test k("m.glb") == :MeshFile
+        @test k("m.glb") == :MeshFile && k("m.gltf") == :MeshFile
         @test k("doc.pdf") == :PDFFile
         @test k("page.html") == :HTMLFile
         @test k("a.jl") == :TextFile

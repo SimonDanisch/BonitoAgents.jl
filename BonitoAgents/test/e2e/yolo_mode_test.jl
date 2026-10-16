@@ -12,8 +12,8 @@
 # `state.chat_models[pid]`, and assert on `msgs_store`. The mock `agent_fn` is a
 # scripted closure that replies per prompt KIND, which is what makes the two-step
 # protocol observable from outside.
-@testitem "e2e:yolo_mode" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:yolo_mode" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     TK = TestKit
     BA = TestKit.BT
 
@@ -142,7 +142,9 @@
 
             # The tool-answer turn must be followed by a further CONTINUE prompt:
             # that is the loop refusing the escape.
-            @test poll_until(() -> confirm_prompts(model) == base_k + 1; timeout = 30)
+            # `>=`: the loop does not pause, so a poll can miss this step. The
+            # exact totals are checked once it settles, below.
+            @test poll_until(() -> confirm_prompts(model) >= base_k + 1; timeout = 30)
             @test poll_until(() -> yolo_prompts(model) == base_c + 2; timeout = 30)
             @test poll_until(() -> confirm_prompts(model) == base_k + 2; timeout = 30)
             sleep(3.0)
@@ -277,7 +279,7 @@
                 "document.querySelector('.bt-send-btn').classList.contains('bt-send-btn-yolo')";
                 timeout = 10) == true
             @test TK.eval_js(server,
-                "(document.querySelector('.bt-text-input').getAttribute('placeholder')||'').includes('lock in')") == true
+                "(document.querySelector('.bt-text-input').getAttribute('placeholder')||'').includes('Press ✓ to save')") == true
             @test TK.wait_for(server, "yolo bar armed",
                 "document.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')";
                 timeout = 10) == true

@@ -130,8 +130,7 @@
         BT.save_projects!(state)
         reloaded = BT.ServerState(;
             state_dir     = state.state_dir,
-            working_dir   = state.working_dir,
-            worker_secret = state.worker_secret)
+            working_dir   = state.working_dir)
         @test haskey(reloaded.projects[], pid)
         @test reloaded.projects[][pid].auto_prompt === nothing
     end

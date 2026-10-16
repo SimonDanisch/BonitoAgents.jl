@@ -53,7 +53,8 @@ Every eval-family tool also accepts `worker = "name"`. Run code on another
 connected machine while its output and rich result remain in the current chat;
 use `bt_sync_folder` to send the code and data first. A laptop conversation can
 therefore drive a warm environment, dataset or GPU on another worker without
-moving the whole agent session.
+moving the whole agent session. This is off by default: an admin switches it on
+per chat with **Remote julia** in the chat's ⋯ menu.
 
 Read [Julia Tools & Live Apps](@ref) for the eval lifecycle, remote workers,
 output limits and live-value bridge.
@@ -70,6 +71,32 @@ the worker.
 This supports a complete loop for analyses, simulations, visualizations,
 reports and small interfaces: ask the agent to create the result, inspect the
 real artifact beside the conversation, then refine it without switching tools.
+
+## Share a report or a live app with a link
+
+A finished report or app often has to go to someone else. Ask the agent to
+share it, or use the share button on an eval result, on a file the agent showed
+you or on a file open in a tab. You get a link that opens in any browser, on a
+phone too, without an account.
+
+A markdown report opens as a web page with its images and videos. A Julia file
+that builds a Bonito app opens as the running app: a colleague moves the slider
+on their phone and the new result is computed on your worker, in the project's
+own environment. Each visitor gets their own copy of the app.
+
+```@raw html
+<img src="assets/screenshot-share-phone.png" alt="A shared Bonito app on a phone: the Lorenz attractor with a slider, computed on the worker that shared it"
+     style="display: block; width: 300px; max-width: 100%; margin: 16px auto; border-radius: 10px; border: 1px solid rgba(128,128,128,0.25);">
+```
+
+A CSV, a 3D model or a PDF opens in the same viewer the chat uses, with a
+download button. A link reaches only that file and what it embeds. You can add a
+password, and Settings lists your links so you can end any of them.
+
+A link works while its worker is online. Shared `.jl` files run again after a
+restart, so prefer them over sharing a result straight from the chat, which
+needs its Julia session to stay open. The details are in the `bt_share` section
+of [Julia Tools & Live Apps](@ref).
 
 ## Review the agent's changes
 

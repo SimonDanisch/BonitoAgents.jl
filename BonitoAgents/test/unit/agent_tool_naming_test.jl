@@ -10,6 +10,7 @@
 # here was a surprise.
 @testitem "unit:agent_tool_naming" tags = [:unit] begin
     import AgentClientProtocol
+    import BonitoAgents
     import JSON
     const ACP = AgentClientProtocol
 

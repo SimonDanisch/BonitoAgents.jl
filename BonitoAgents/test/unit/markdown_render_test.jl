@@ -98,3 +98,40 @@ end
     @test BT.defuse_table_rule(tbl) === tbl
 end
 end
+
+# A markdown FILE's pictures and clips are relative to the file; shown in the
+# dashboard they must point at that file on the worker, or the browser resolves
+# them against the dashboard's URL and they break. `markdown_html(text, link)`
+# hands every relative source to `link` and leaves the rest alone.
+@testitem "unit:markdown_file_links" tags = [:unit] begin
+    import BonitoAgents as BT
+    using Test
+
+    link(path) = startswith(path, "..") ? nothing : "/w/" * path
+    html = BT.markdown_html("""
+        ![plot](figs/plot.png) ![remote](https://example.com/a.png) ![abs](/etc/a.png)
+        ![data](data:image/png;base64,AAAA) ![out](../secret.png) [a link](notes.md)
+
+        ![clip](clips/run.mp4)
+
+        <img src="figs/raw.png" alt="raw"> <video src="v.webm"></video> <img src="#top">
+        """, link)
+    @test occursin("src=\"/w/figs/plot.png\"", html)
+    @test occursin("src=\"https://example.com/a.png\"", html)     # absolute: as written
+    @test occursin("src=\"/etc/a.png\"", html)
+    @test occursin("src=\"data:image/png;base64,AAAA\"", html)
+    @test occursin("src=\"../secret.png\"", html)                 # refused by `link`
+    @test occursin("href=\"notes.md\"", html)                     # a link is not a picture
+    # A clip written as an image is a video.
+    @test occursin("<video controls preload=\"metadata\" src=\"/w/clips/run.mp4\"", html)
+    @test occursin("<img src=\"/w/figs/raw.png\" alt=\"raw\">", html)
+    @test occursin("<video src=\"/w/v.webm\">", html)
+    @test occursin("<img src=\"#top\">", html)
+    # What `link` is handed: the path, unescaped, without query or fragment.
+    @test BT.relative_reference("figs/a%20b.png?v=2#x") == "figs/a b.png"
+    @test BT.relative_reference("https://x/a.png") === nothing
+    @test BT.relative_reference("/abs.png") === nothing
+    @test BT.relative_reference("#top") === nothing
+    # Without a file, a message renders as before.
+    @test !occursin("/w/", BT.markdown_html("![plot](figs/plot.png)"))
+end

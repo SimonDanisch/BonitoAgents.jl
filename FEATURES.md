@@ -10,15 +10,21 @@ enumerates.
 - Stable worker identity across reinstalls, reboots, and IP/hostname changes;
   UI renames persist server-side.
 - Copy-paste **worker install one-liner** (Linux/macOS `install.sh`, Windows
-  `install.ps1`) served by the dashboard itself: prereq checks (node, npm,
-  claude, claude-agent-acp), a shared `@bonito-agents` Julia env pinned to the
-  server's code revision, and a systemd user service on Linux. Re-run to
-  update.
+  `install.ps1`) served by the dashboard itself: a shared `@bonito-agents` Julia
+  env pinned to the server's code revision, and a systemd user service on
+  Linux. Re-run to update. Node and the agent adapters are the worker's to
+  install (see Managed agent adapters).
 - **Link liveness**: a server-to-worker heartbeat kills half-open "zombie"
   sockets (suspend, a Wi-Fi to LAN switch) and flips the worker offline within
   a minute; the worker watches for the server's pings, re-dials over the
   current network, and reaps agent sessions the server abandoned. Requests
   against an unreachable worker fail fast with a toast instead of hanging.
+- **A worker crash does not end a turn for good**: when a worker that crashed
+  mid-turn is back, exactly the chats it cut off get one automatic message to
+  carry on. The worker reports the crash itself (a pidfile a normal exit or a
+  deliberate stop removes, same boot only); stops, reboots, dropped connections,
+  and chats the user touched meanwhile are never continued, nor a continuation
+  that crashed again.
 - **Continue a chat on another worker** (the chat's ⋯ menu): the project's
   files move through the server, and so does the agent's own record of the
   conversation (for Claude Code: transcript, subagent transcripts, project
@@ -28,9 +34,12 @@ enumerates.
 - **Run Julia on another worker**: `bt_julia_eval(worker = "MacBook")` runs on
   that machine through a BonitoMCP eval host the server spawns there for the
   chat; the eval card wears the worker's name, stdout streams in, plots render
-  live. Off by default, per chat: a *remote julia* pill in the chat header next
-  to the permissions pill, enforced by the server. `bt_sync_folder` copies
+  live. Off by default, per chat: an admin switches it on with *Remote julia*
+  in the chat's ⋯ menu, and the server enforces it. `bt_sync_folder` copies
   code and data across first.
+- **Julia values between machines**: `r = remote_session("MacBook")` inside the
+  chat's session, then `r[:x] = x`, `y = r[:y]`, `r(f, x)`. Serialization,
+  streamed, any size; the Julia versions must match (checked).
 - librsync-based directory sync underneath (project import, the moves above,
   folder sync between workers); single-file transfers over a dedicated channel.
 
@@ -38,11 +47,11 @@ enumerates.
 
 - Create projects by **Discover** (scan a worker for existing Claude Code
   session folders and import with conversation history), **folder picker**
-  (any directory on the worker), or **From GitHub** (clone onto a worker) —
-  all three on the worker's own card, so the machine is picked before the
+  (any directory on the worker), or **From GitHub** (clone onto a worker).
+  All three are on the worker's own card, so the machine is picked before the
   folder.
 - **Copy project** snapshots a project's files onto another worker as a new
-  project (the cross-machine case; *Continue on* moves a live chat instead).
+  project (the cross-machine case; *Continue on* opens a new chat elsewhere that resumes this one).
 - Chat history persists server-side per project; reopening renders instantly
   from disk. Claude-side history is reconciled on open and after compaction
   (message-order invariant, no duplicates).
@@ -53,6 +62,17 @@ enumerates.
   the tab reconnects to the same session with observables intact.
 - Multiple chats and tabs open at once; state broadcasts to every connected
   view.
+
+## Apps
+
+- **Apps** are permanent parts of the server with a chat of their own: the app
+  lays out its chat's pane (from the chat's own widgets) and can add MCP tools to
+  every chat's agent. Opened from the dashboard's Apps card, pinned at the top of
+  the sidebar.
+- **To-do app**: one list for the whole server, pinned above its chat. Any
+  chat's agent can list, add and check off items (`todo_done` records which chat
+  and why). **Start chat** has the app chat's agent pick the project folder for
+  an item and start a chat there that knows which item it works on.
 
 ## Agents & providers
 
@@ -87,17 +107,21 @@ enumerates.
   a staleness badge).
 - **Background tasks** (long test runs, builds) stay pinned across turns with
   live line counts, monitored until their writer exits, with per-task stop.
-- Inline **images and videos** with hover copy/download and a click
-  **lightbox**; code blocks with hover copy/download.
+- Inline **images and videos** with copy/download buttons (on hover, always
+  shown on touch screens); an image opens in a **lightbox** that any tap closes,
+  a video goes fullscreen. Code blocks get the same copy/download buttons.
 - **Image attachments** on the way in: paste, drag-drop, or the composer's
   attach button, which on a phone opens the camera/gallery sheet. Queued
   images show as removable thumbnails and render inline in your own message
   (up to 10 per message, 5 MB each).
-- **Virtualized transcript**: only the visible window is in the DOM, history
-  backfills lazily in the background (paused for hidden panes), and the reading
-  position is content-anchored, so geometry churn, tab switches and reconnects
-  never move what you are reading. Follow-mode chases streaming output;
-  scrolling up disengages it with a "move to bottom" control.
+- **Transcript that opens at the end**: a chat opens on its newest messages
+  at once and loads older ones as you scroll up, keeping a bounded block in
+  the page. The reading position is content-anchored, so an image loading
+  above you, tab switches and reconnects never move what you are reading.
+  The scrollbar counts messages, not pixels: dragging it shows "Message 500
+  of 10,878" and goes there, and Home/End jump to the first and last
+  message. Follow-mode chases streaming output; scrolling up disengages it
+  with a "move to bottom" control.
 - **Search lens** over the transcript: type filters (`/` picker) and fuzzy
   text, with saved lenses.
 - Messages typed during agent restarts and reconnects are queued, never
@@ -105,10 +129,14 @@ enumerates.
 - If the BROWSER loses the server, a modal takes over the window and locks the
   composer, since anything typed then would be lost: a live "trying again for
   N s" counter, a reload button, and it lifts itself when the socket is back.
-  Sub-second reconnects, the usual case, never raise it.
+  Sub-second reconnects, the usual case, never raise it. A tab the server no
+  longer has a session for (it restarted, or the tab was away for over an hour)
+  reloads itself instead of retrying forever, unless that would lose a message
+  typed and not sent; then it asks. A phone tab coming back checks its socket and
+  replaces one that stays silent.
 - Every chat in the sidebar wears an **icon**: its own picture once it has
   shown one (a plot, a screenshot), an identicon coloured by its folder until
-  then, and a corner badge with the initials of the machine it runs on — so the
+  then, and a corner badge with the initials of the machine it runs on. The
   list reads as "which machine, which project" at a glance.
 
 ## Files & workspace
@@ -116,16 +144,19 @@ enumerates.
 - Sidebar **project file tree**: lazy directory loading, fuzzy full-index
   search (VSCode-style), download affordances.
 - **Rich file viewer**: clicking ANY file opens it as a workspace tab rendered
-  as what it is — images on a transparency checkerboard with their pixel size,
+  as what it is: images on a transparency checkerboard with their pixel size,
   range-streamed video and audio, rendered markdown, CSV/TSV as a sortable and
   filterable table with a sticky header, Jupyter notebooks with their outputs,
-  3D geometry (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in an interactive
-  WebGL view, PDF and HTML in a sandboxed frame, source in Monaco, and opaque
-  bytes as a hex dump. Anything text-backed (markdown, HTML, CSV, SVG) has a
+  3D models (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in one interactive
+  three.js view reading the original files: glTF with its textures, PBR
+  materials and animations, OBJ with its `.mtl` materials, PLY point clouds
+  (files a model names next to it are fetched from the worker), PDF and HTML
+  in a sandboxed frame, source in Monaco, and opaque bytes as a hex dump.
+  Anything text-backed (markdown, HTML, CSV, SVG) has a
   Preview/Source toggle over the same editor. Images and video sit centred on a
   stage and are fitted to it, so a portrait clip keeps its controls on screen.
 - Tabs are named to be **told apart**: a file is its basename until another open
-  file shares it, and then both grow leftwards until they differ — `a/types.jl`
+  file shares it, and then both grow leftwards until they differ: `a/types.jl`
   and `b/types.jl` rather than two tabs both reading `types.jl`. A tab with
   unsaved edits carries a dot; closing one discards the buffer without asking,
   so that dot is the warning.
@@ -139,9 +170,9 @@ enumerates.
   never clobbers unsaved edits.
 - File paths in tool pills and search hits are clickable and open in the viewer.
 - **Change review tab**: the project's git diff (including files the agent
-  created) with a comment affordance on every line, in two modes — *Ask* sends
+  created) with a comment affordance on every line, in two modes. *Ask* sends
   the question to the chat immediately with the code context attached, and
-  *Feedback* batches comments and delivers them as one numbered instruction —
+  *Feedback* batches comments and delivers them as one numbered instruction.
   Send counts what it will deliver and only looks like the primary action once
   it has something to say. Compare against the working tree or any branch, tag
   or commit. The diff is scoped to the PROJECT's folder, so a package inside a
@@ -156,8 +187,14 @@ enumerates.
   `bt_julia_continue`/`bt_julia_interrupt`/`bt_julia_restart` address a session
   that is still running, and every one of them takes `worker =` to run on
   another machine.
+- **Runs**: every eval is a run with an id (`r4`). `background = true` returns
+  at once, and `bt_julia_wait` blocks on several runs, on several workers, in
+  one call: a test suite on each machine from one chat. The run's card stays
+  live until the run ends, its task-bar row's ⊗ stops that run only, a
+  cancelled turn leaves background runs running, and the agent is told when
+  one it has not collected finishes.
 - **One tool for values and apps**: whatever the eval returns is rendered as
-  what it is — a Bonito app or a Makie figure comes back live in the card, with
+  what it is: a Bonito app or a Makie figure comes back live in the card, with
   interactions round-tripping to Julia in the worker's session. Embeds detach
   into tabs or floating windows and stay alive (WebGL context and sub-session
   kept, bounded by an LRU with park/resume). There is no separate "show the
@@ -170,22 +207,54 @@ enumerates.
   geometry) into the chat, through the same renderers the file viewer uses.
 - `bt_sync_folder`: copy a folder to another worker (through the server's
   mirror, so a second call moves only what changed).
-- `bt_wait`: the one way for an agent to be idle on purpose — a bounded block
+- `bt_share`: a link anyone can open while the worker is online: a markdown
+  file as a page with its images and videos, or a Julia file's Bonito app, live
+  from a share host on the worker. Optional password; listed and ended in
+  Settings.
+- `bt_wait`: the one way for an agent to be idle on purpose. A bounded block
   with an optional shell condition, so waiting on a long render costs one tool
   call instead of a turn-per-poll loop that leaves orphaned sleepers behind.
 
 ## Deployment
 
-- **Desktop**: `julia -m BonitoAgentsApp` runs the server and a local worker in
-  one process with a persistent platform data dir; AppBundler bundles (snap,
-  dmg, msix) are built by CI for every push and `v*` tag.
-- **Server**: `bonitoagents server` mode or the systemd installer
-  (`install_server.sh`), with persisted worker secret and public-URL handling.
+- **Desktop**: `bonito-agents` (or `julia -m BonitoAgentsApp` from a checkout)
+  runs the server and a local worker, with a persistent platform data dir. CI
+  builds a relocatable `.tar.gz` bundle per platform with AppBundler for every
+  push to main and every `v*` tag; `install.sh` and `install.ps1` install it and
+  update it when re-run.
+- **Server**: `bonito-agents server` mode (localhost only) or the systemd
+  installer (`install_server.sh`), which sets up Authelia (login with a second
+  factor) behind a tunnel that brings HTTPS (Cloudflare's, say: one host name,
+  one port, the server checks every request itself), or with Caddy in front
+  (HTTPS, checking DNS and ports before Let's Encrypt). It saves its answers
+  before any step can fail and offers them again on the next run.
 - Worker installs always match the server's running code revision (branch,
   sha, or the version's `v` tag for git-less release deployments);
   `BONITOAGENTS_INSTALL_REV` overrides for ops.
-- Shared-secret worker auth; the dashboard is designed to sit on localhost, a
-  VPN, or behind reverse-proxy auth.
+- Four ways to run a server: one machine (localhost, no login), a trusted
+  network (`--host 0.0.0.0`, no login, per-worker credentials the server checks
+  itself), behind a tunnel (login, the server's own gate before every route asks
+  Authelia; responses marked private so a CDN's cache keeps nothing), or behind
+  the login proxy (Caddy asks Authelia).
+- Accounts, owners and per-worker credentials: the server binds localhost and
+  takes identities from Authelia (through Caddy, with a key only Caddy and the
+  server share, or its own gate);
+  admins invite people by link and manage accounts and groups on the Settings
+  page (one-shot account actions in each row's ⋯ menu), and issue or revoke
+  worker credentials on the dashboard; members see what they own plus workers
+  shared with their groups. Passkeys first: an invite or setup link makes one in
+  a single step, the account card lists, adds and removes them (through
+  Authelia's API, on our own pages); a password and a server-registered
+  authenticator are the fallback. No mail anywhere; logins last a week idle
+  and four weeks at most, and an open tab keeps itself logged in.
+- **One login for all tabs**: when a login ends, every tab of the browser says
+  so and waits, and one login in any tab brings them all back, including a
+  chat opened meanwhile and a page that has to reload. No tab asks for a login
+  the browser already has, since each login replaces the session the others
+  use; behind a tunnel a login page left open moves on by itself.
+- Managed agent adapters: the server declares the ACP adapter versions (latest
+  or pinned), workers install them into a private Node + npm prefix when idle
+  and report their versions on the worker card.
 
 ## Development & QA
 
@@ -200,18 +269,18 @@ enumerates.
   `@testitem` names in the source, so the job list cannot drift from the suite,
   and compiles the stack in its own step so no test waits on a DOM while the
   machine is busy compiling.
-- **Debug BonitoAgents**: a one-click chat (dashboard worker picker + button, and
-  every chat header) whose working directory is a BonitoAgents source checkout on
-  the chosen worker — the checkout it runs from, or a `dev --local` clone into its
-  environment at the server's revision, so a worker restart runs the edits — and
-  the agent can read, edit and open a PR against the running application. It additionally gets
-  `bt_dev_*` tools that read the LIVE process — workers, projects, chats and
-  eval bridges, the log of ANY machine in the fleet (the server's ring, or the
-  server's and each worker's log file, which outlives restarts), memory and
-  per-registry leak
-  counters (with an optional GC and deep `summarysize` pass), the worker's
-  account of itself — plus orchestration ops (open a chat, send a message,
-  restart a session, move a project between machines). The tools are attached
-  by a persisted per-project flag, so no ordinary chat can see them.
+- **Debug BonitoAgents**: a one-click chat (the Settings page's worker picker,
+  and every chat's ⋯ menu) whose working directory is a BonitoAgents source
+  checkout on the chosen worker. That is the checkout the worker runs from, or a
+  `dev --local` clone into its environment at the server's revision, so a worker
+  restart runs the edits. The agent can read, edit and open a PR against the
+  running application. It also gets `bt_dev_*` tools that read the LIVE
+  process: workers, projects, chats and eval bridges, the log of ANY machine in
+  the fleet (the server's ring, or the server's and each worker's log file,
+  which outlives restarts), memory, open file descriptors and per-registry leak
+  counters (with an optional GC and deep `summarysize` pass), and the worker's
+  account of itself. Orchestration ops come with them: open a chat, send a
+  message, restart a session, continue a chat on another machine. The tools are
+  attached by a persisted per-project flag, so no ordinary chat can see them.
 - Recorded walkthrough (`examples/walkthrough.jl`) with an animated cursor.
 - Bonito-based documentation site (`docs/`).

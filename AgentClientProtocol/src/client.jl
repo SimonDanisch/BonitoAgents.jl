@@ -79,22 +79,7 @@ function coalesce_main!(conn::Connection, updates::Channel{Any},
     st = TurnState()
     try
         for u in updates
-            if u isa StreamFlush
-                # Seal the trailing bubble. A live tool normally SURVIVES a
-                # boundary (the next prompt must not kill a running eval) — but
-                # a span that resolved `cancelled` leaves its tools with no
-                # terminal frame coming, and the consumer blocks draining a
-                # channel nothing will close. Release those.
-                u.abandoned ? close_turn!(messages, st) : seal_message!(st)
-                put!(messages, u)      # ... then let the consumer catch up to here
-                continue
-            end
-            # Everything that reaches here is rendered. There is no cancel gate:
-            # frames the agent already sent are output it already produced, and
-            # discarding them here lost them for good (unparsed, so never stored
-            # either) — the user saw a dead chat and only got the backlog on a
-            # reload, which replays history from the agent.
-            parse_update!(messages, st, u)
+            coalesce!(messages, st, u)
         end
     finally
         close_turn!(messages, st)
@@ -102,6 +87,25 @@ function coalesce_main!(conn::Connection, updates::Channel{Any},
     end
     return nothing
 end
+
+# Seal the trailing bubble and let the consumer catch up. A cancelled span also
+# releases its live tools: no terminal frame is coming for them.
+function coalesce!(messages::Channel{Message}, st::TurnState, u::StreamFlush)
+    u.abandoned ? close_turn!(messages, st) : seal_message!(st)
+    put!(messages, u)
+    return nothing
+end
+
+# The agent starts a turn of its own: what came before is sealed, and the
+# consumer meets the turn ahead of anything it says.
+function coalesce!(messages::Channel{Message}, st::TurnState, u::TurnStarted)
+    seal_message!(st)
+    put!(messages, u)
+    return nothing
+end
+
+# Everything else is rendered, cancel or not: it is output the agent already produced.
+coalesce!(messages::Channel{Message}, st::TurnState, u::SessionUpdate) = parse_update!(messages, st, u)
 
 # Put a boundary on the main stream and hand back the marker to wait on, or
 # `nothing` if the stream is already gone. The CALLER waits (`take!(m.done)`),
@@ -243,7 +247,7 @@ struct ImageAttachment
     mime::String
 end
 
-# Send a user message. Returns the turn's `PromptSpan`; `wait_turn!` blocks on it
+# Send a user message. Returns the turn's `PromptTurn`; `wait_turn!` blocks on it
 # for the stopReason (`end_turn` / `cancelled`) and rethrows a `ConnectionClosed`
 # if the session died. `span.flush` is put on the main stream at the response
 # frame, so a renderer sees the turn's boundary exactly where the agent drew it.
@@ -271,7 +275,7 @@ end
 
 # Block until the turn settles; returns the stopReason result, throws on an rpc
 # error or a torn-down connection.
-function wait_turn!(span::PromptSpan)
+function wait_turn!(span::PromptTurn)
     result = take!(span.response)
     result isa Exception && throw(result)
     return result
@@ -341,56 +345,36 @@ function collect_replayed_updates(updates, response)
     return msgs, result
 end
 
-# Cancel the active turn (notification, non-blocking).
-#
-# Two things happen: (1) we flip the connection's `cancelling` flag so the
-# `prompt!` consumer stops coalescing/rendering and just drains the buffered
-# update backlog — otherwise the agent's `cancelled` response is stuck behind
-# that backlog in strict-FIFO order and the turn looks wedged; (2) we send the
-# `session/cancel` notification so the agent actually winds the turn down and
-# resolves the prompt with `stopReason: cancelled`.
 """
-    session_live(client) -> Bool
+    open_turns(client) -> Vector{Turn}
 
-Whether the agent has anything running that a cancel could reach.
-
-Cancel targets the SESSION, not one request, and there are two independent
-reasons the agent may be working: we asked it to (`active_prompts`), or it woke
-itself up after backgrounded work finished (`Unprompted`). Reading only the
-first is why stop used to be a no-op for the whole auto-wake window, while the
-user watched it run tools.
-
-Exposed separately from [`cancel!`] because the two callers need OPPOSITE
-information from the same fact. `cancel!` wants "is there something to send a
-cancel to". A UI wants "is my spinner telling the truth" — and if it isn't, the
-answer is to reconcile its own state, NOT to discard whatever the user has
-queued up behind a turn that already ended.
+The turns open right now (see `open_turns(::Connection)`): empty when the agent
+is not working.
 """
-session_live(client::Client) = is_working(session_activity(client.conn))
+open_turns(client::Client) = open_turns(client.conn)
 
+# Whether the client's connection can still carry a prompt. Not whether the
+# agent is working (`open_turns`): whether it is reachable.
+Base.isopen(client::Client) = isopen(client.conn)
+
+"""
+    cancel!(client) -> Vector{Turn}
+
+Ask the agent to stop: a `session/cancel`, which reaches every open turn, ours
+and the agent's own. Returns those turns; each is over when the agent says so,
+like any turn (`wait`, `wait_over`). Nothing open, nothing sent: the empty list.
+
+The frames the agent already sent are still delivered. Stamps `cancel_at` on
+the first cancel since the last request.
+"""
 function cancel!(client::Client)
     conn = client.conn
-    # A no-op when GENUINELY idle (A8) — no prompt open and no un-prompted work
-    # since the last request or cancel. That matters: `cancelling` gates the main
-    # thread, so latching it true over an idle gap would silently drop the
-    # agent's next burst of work until a new prompt cleared it.
-    session_live(client) || return false
-    # `Cancelling` is a state, not a mute: delivery is untouched (see
-    # `deliver_update!`). It ends when the turn it cancelled settles, or
-    # immediately if there was no prompt to settle — so cancelling un-prompted
-    # work cannot leave the session stuck the way the old latch did.
-    # This cancel CONSUMES the work it acted on. Without clearing the recency,
-    # `Idle` is not a stable state: `settle` reads a recent `last_work_at` and
-    # resurrects `Unprompted` on the next read, so a cancelled un-prompted
-    # episode would keep re-reporting itself as live for the whole quiet window.
-    # Frames that arrive after this stamp it afresh — an agent that ignores the
-    # cancel and keeps streaming is still, correctly, working.
-    @atomic conn.last_work_at = 0.0
-    @atomic conn.activity = Cancelling()
-    settle!(conn)
+    turns = open_turns(conn)
+    isempty(turns) && return turns
+    (@atomic conn.cancel_at) > 0 || (@atomic conn.cancel_at = time())
     send_notification(conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
-    return true
+    return turns
 end
 
 # Set one of the session's configurable options (model / mode / effort / …).

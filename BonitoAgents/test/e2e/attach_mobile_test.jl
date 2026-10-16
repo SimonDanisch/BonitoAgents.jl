@@ -2,8 +2,8 @@
 # once at 1280×820, and `open_browser` sizes the window at open time, so the
 # only way to see a phone layout is a window that was born one. See
 # attach_mobile.jl's header.
-@testitem "e2e:attach_mobile" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:attach_mobile" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     include(joinpath(@__DIR__, "attach_mobile.jl"))
     server = TestKit.dev_server()
     try

@@ -68,7 +68,7 @@ function initFrame(el) {
     if (src) el.src = src;
 }
 let driver = null;
-function install(meshLib) {
+function install(loadMeshLib) {
     if (driver) return driver;
     const initOne = (el)=>{
         if (el.dataset[READY] === "1") return;
@@ -78,7 +78,11 @@ function install(meshLib) {
             else if (el.classList.contains("bt-fv-table-wrap")) initTable(el);
             else if (el.classList.contains("bt-fv-frame")) initFrame(el);
             else if (el.classList.contains("bt-mesh-view")) {
-                meshLib.mount(el, el.dataset.meshUrl);
+                loadMeshLib().then((lib)=>lib.mount(el, el.dataset.meshUrl, el.dataset.meshFormat)).catch((err)=>{
+                    console.error("bt-fileview: 3D viewer failed to load", err);
+                    const status = el.querySelector(".bt-mesh-status");
+                    if (status) status.textContent = "3D viewer failed to load: " + (err && err.message || err);
+                });
             }
         } catch (err) {
             console.error("bt-fileview: init failed", el, err);

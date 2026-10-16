@@ -17,21 +17,25 @@ Each chat's header carries the agent's own settings as pills: the **permission
 mode** (how much it may do before asking), the **effort** or thinking level, and
 whatever else the provider reports, such as the model. The options come over ACP
 from the running agent, so the list always matches the provider. Change them for
-one chat in its header, or set fleet-wide starting points in the dashboard's
-*Session defaults* bar, which every new chat inherits.
+one chat in its header, or set fleet-wide starting points under *Defaults* on
+the Settings page, which every new chat inherits.
+
+## Managed adapters
+
+Claude Code and Codex reach ACP through adapter packages
+(`@agentclientprotocol/claude-agent-acp`, `@agentclientprotocol/codex-acp`).
+Each worker installs those itself, into a private Node and npm prefix that
+leaves the machine's own Node alone, at the versions the server declares. It
+updates them while no chat runs there, so a running agent never has its files
+replaced underneath it. Admins pick the versions, `latest` or a pinned one, and
+the Node release under *Agent adapters* on the Settings page. An explicit
+override such as `CLAUDE_AGENT_ACP` still wins.
 
 ## Claude Code
 
-The default provider. Prerequisites on each worker machine:
-
-```bash
-npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
-claude   # log in once
-```
-
-Node 20+ is required (the ACP adapter uses import attributes). The worker
-install one-liner checks all of this up front and tells you exactly what is
-missing.
+The default provider. Its adapter is managed (see above); what stays with each
+worker machine's user is the login. Install Claude Code there and run `claude`
+once to log in.
 
 Because Claude Code keeps its session files on the worker, **Discover** can
 list every folder you have ever used `claude` in and import it as a project,
@@ -44,27 +48,20 @@ the dashboard's rendering, file tree and live-app tooling on top.
 Descriptors for [MiMo](https://github.com/XiaomiMiMo),
 [OpenCode](https://github.com/sst/opencode) and
 [Kimi Code](https://github.com/MoonshotAI) ship in the registry (all three
-expose ACP under an `acp` subcommand). Select them per chat from the provider
-dropdown; switching providers mid-project starts the next turn under the new
-agent.
+expose ACP under an `acp` subcommand). They are not managed: the worker runs
+whichever binary its PATH has, so install them yourself on each worker that
+should run them. Select them per chat from the provider dropdown; switching
+providers mid-project starts the next turn under the new agent.
 
 ## Codex
 
 [Codex](https://github.com/openai/codex) speaks its own app-server protocol
-rather than ACP, so it plugs in through a separate adapter binary (like Claude
-Code does) that spawns Codex and translates:
-
-```bash
-npm install -g @agentclientprotocol/codex-acp @openai/codex
-codex login
-command -v codex-acp && codex-acp --version
-```
-
-Run these commands on **each worker that should run Codex**, as the same user
-that runs `btworker`. BonitoAgents starts `codex-acp` on that machine, not on the
-web-server machine. The separate Codex CLI provides the `codex login` command;
-instead, you can set `CODEX_API_KEY` or `OPENAI_API_KEY` in the worker's
-environment and restart the worker.
+rather than ACP, so it plugs in through a separate adapter, `codex-acp`, that
+spawns Codex and translates. The adapter is managed like Claude Code's. To log
+in, install the Codex CLI on **each worker that should run Codex**, as the user
+that runs the worker, and run `codex login` there. Instead, you can set
+`CODEX_API_KEY` or `OPENAI_API_KEY` in the worker's environment and restart the
+worker.
 
 The adapter also bundles a compatible Codex runtime; set `CODEX_PATH` to point
 it at a different one, or `CODEX_AGENT_ACP` to run a different adapter build.

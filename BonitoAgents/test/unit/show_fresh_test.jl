@@ -131,18 +131,8 @@ const BT = BonitoAgents
             @test getfile(["Range" => "bytes=599995-"]).body == payload[end-4:end]
             @test getfile(["Range" => "bytes=600000-"]).status == 416
 
-            # Older workers use the established transfer protocol. Seeking
-            # should reuse that mirror; rewriting the source must replace it.
-            copy_request = HTTP.Request("GET", url, ["Range" => "bytes=0-4"])
-            copy_response() = BT.worker_file_copy_response(st, copy_request, wid, special,
-                                                           BT.stat_worker_path(st, wid, special))
-            @test copy_response().body == payload[1:5]
-            key = BT.worker_file_token(st, wid, special)
-            cached = joinpath(st.state_dir, "worker-files", key, basename(special))
-            write(cached, "CACHE")
-            @test String(copy_response().body) == "CACHE"
-            write(special, "REGENERATED")
-            @test String(copy_response().body) == "REGEN"
+            # Served from the worker, never from a copy on the server.
+            @test !isdir(joinpath(st.state_dir, "worker-files"))
 
             # The same URL still works with no chat record, and changing bytes
             # under the same path cannot leave a cached proxy asset behind.
@@ -150,8 +140,7 @@ const BT = BonitoAgents
             try
                 write(special, "new bytes")
                 @test String(getfile().body) == "new bytes"
-                restored = BT.ServerState(state_dir=mktempdir(), working_dir=mktempdir(),
-                                          worker_secret=st.worker_secret)
+                restored = BT.ServerState(state_dir=st.state_dir, working_dir=mktempdir())
                 @test BT.worker_file_url(restored, wid, special) == url
             finally
                 st.projects[][pid] = saved
@@ -161,6 +150,44 @@ const BT = BonitoAgents
             @test HTTP.get(base * other; status_exception=false).status == 403
             rm(special)
             @test getfile().status == 404
+        end
+
+        @testset "a signed folder serves files by their paths relative to each other" begin
+            # A model and the texture it names, in a folder whose name needs
+            # escaping: what a glTF or an OBJ with its .mtl asks the browser for.
+            scene = joinpath(worker_dir, "scene #1 ü")
+            mkpath(joinpath(scene, "textures"))
+            write(joinpath(scene, "model.gltf"), "MODEL")
+            write(joinpath(scene, "textures", "wood.png"), "WOOD")
+            write(joinpath(worker_dir, "secret.txt"), "SECRET")
+            base = "http://127.0.0.1:$(st.srv.port)"
+            fetch(url) = HTTP.get(base * url; status_exception = false)
+            model = BT.worker_folder_url(st, wid, scene, "model.gltf")
+            @test String(fetch(model).body) == "MODEL"
+            # The browser resolves `textures/wood.png` against the model's URL.
+            stem = model[1:end - length("model.gltf")]
+            @test String(fetch(stem * "textures/wood.png").body) == "WOOD"
+            @test fetch(stem * "textures/nothing.png").status == 404
+            # Nothing outside the folder, however the way out is spelled.
+            for escape in ("../secret.txt", "%2e%2e/secret.txt", "..%2fsecret.txt",
+                           "%2F" * HTTP.escapeuri(joinpath(worker_dir, "secret.txt")[2:end]))
+                r = fetch(stem * escape)
+                @test r.status == 403 && String(r.body) != "SECRET"
+            end
+            # The grant is the folder the token signs, and only that.
+            token = BT.worker_folder_token(st, wid, scene)
+            @test fetch(replace(model, token => reverse(token))).status == 403
+            hex = bytes2hex(codeunits(scene))
+            @test fetch(replace(model, hex => bytes2hex(codeunits(worker_dir)))).status == 403
+            # A token for one FILE does not open the folder of the same name.
+            @test BT.worker_file_token(st, wid, scene) != token
+            @test fetch(replace(model, token => BT.worker_file_token(st, wid, scene))).status == 403
+
+            # A model's folder is its project, so `../textures/` reaches; outside
+            # any project it is the model's own folder.
+            proj = st.projects[][pid]
+            @test BT.reference_folder(proj, joinpath(scene, "model.gltf")) == worker_dir
+            @test BT.reference_folder(proj, "/elsewhere/models/m.obj") == "/elsewhere/models"
         end
     finally
         close(h)

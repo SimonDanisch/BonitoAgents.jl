@@ -186,8 +186,9 @@ function _basis_copy_cb_impl(opaque::Ptr{Cvoid}, pos::Clonglong,
     requested = Int(unsafe_load(len_ptr))
     try
         seek(ctx.io, pos)
-        length(ctx.buf) < requested && resize!(ctx.buf, requested)
-        n = readbytes!(ctx.io, ctx.buf, requested)
+        # librsync permits a short callback result and asks again for the rest.
+        # A COPY instruction may span the whole basis; keep its buffer bounded.
+        n = readbytes!(ctx.io, ctx.buf, min(requested, length(ctx.buf)))
         unsafe_store!(len_ptr, Csize_t(n))
         unsafe_store!(buf_ptr, pointer(ctx.buf))
         return RS_DONE

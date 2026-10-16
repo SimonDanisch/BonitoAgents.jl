@@ -8,7 +8,7 @@
     const BT = BonitoAgents
     using Test
 
-    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     path = "/sim/VulkanDev"
     for pid in ("old-thread", "new-thread")
         state.projects[][pid] = BT.ProjectInfo(pid, "VulkanDev", "w1", joinpath(state.working_dir, pid),
@@ -18,8 +18,7 @@
     @test a.project_id == "new-thread"
 
     # An agent built without its chat cannot start; guessing from the folder is
-    # exactly the bug. The check comes before any dial.
-    state.worker_control_ws["w1"] = nothing
+    # exactly the bug. The check comes first, before the worker is even asked.
     nameless = BT.WorkerAgent(state, "w1", path)
     err = try BT.start!(nameless); nothing catch e; e end
     @test err isa ErrorException

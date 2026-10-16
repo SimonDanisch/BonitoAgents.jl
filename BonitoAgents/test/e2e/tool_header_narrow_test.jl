@@ -14,8 +14,8 @@
 #
 # ISOLATED (its own dev_server + browser): it resizes the window, which every
 # other item on the shared runner would inherit.
-@testitem "e2e:tool_header_narrow" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:tool_header_narrow" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     const ECT = TK.ECT   # ElectronCall.Testing — real window resizing

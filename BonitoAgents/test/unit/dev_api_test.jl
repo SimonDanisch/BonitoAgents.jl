@@ -49,12 +49,13 @@ end
 
 @testset "log ring" begin
     BT.install_log_ring!()      # idempotent; serve() already did it if it ran
-    marker = "unit-dev-api-probe-$(rand(UInt32))"
+    # Not `rand`: `@testset` reseeds the RNG, so the marker repeated on every run
+    # in one process, and the ring still held the previous run's record.
+    marker = "unit-dev-api-probe-$(time_ns())"
     @info marker answer = 42 who = "tester"
     @warn "$(marker)-warning"
 
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                          worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     got = BT.dev_request(st, "logs", Dict("limit" => 500, "contains" => marker))
     @test got["matched"] >= 2
     recs = got["records"]
@@ -115,7 +116,7 @@ end
             w = only(ws)
             @test w["worker_id"] == wid
             @test w["online"] === true
-            @test w["control_ws"] === true      # the actual socket, not the flag
+            @test w["link"] == "connected"      # the actual link, not the flag
             @test !isempty(w["projects_root"])
             @test w["update_state"] == "current"
             @test haskey(w, "update_message")
@@ -206,16 +207,14 @@ end
             @test occursin(wname, err) && occursin("server", err)
         end
 
-        @testset "the MCP launch command is the stable launcher, not a versioned binary" begin
+        @testset "the MCP launch command is `julia` from PATH" begin
             # The hello frame carries what claude-agent-acp execs for every
-            # chat's `bt_*` tools. It used to be `Sys.BINDIR`'s julia — a path
-            # `juliaup update` deletes, and the one thing a re-install under a
-            # different default Julia never refreshed while the old worker lived.
+            # chat's `bt_*` tools. A baked path (it once was `Sys.BINDIR`'s
+            # julia, then a probed launcher) breaks when juliaup or a package
+            # manager moves it, and stays broken until the worker restarts.
             w = st.workers[][wid]
-            @test isfile(w.mcp_path)
-            launcher = BonitoWorker.julia_launcher()
-            @test w.mcp_path == BonitoWorker.mcp_exe(launcher)
-            @test w.mcp_args == BonitoWorker.mcp_args(launcher)
+            @test w.mcp_path == "julia"
+            @test w.mcp_args == BonitoWorker.mcp_args()
             # The worker reports the same pair about itself — what it SAID, so
             # the two can be compared, not a fresh probe.
             me = BT.dev_request(st, "inspect", Dict("section" => "worker", "worker_id" => wid))
@@ -244,11 +243,11 @@ end
             # The registries that have historically grown without bound are all
             # present — that list IS the point of the tool.
             for k in ("chat_models", "messages_total", "eval_bridges", "eval_parked_bytes",
-                      "pending_rpcs", "worker_control_ws", "show_mirror_stamps",
+                      "pending_rpcs", "worker_links", "show_mirror_stamps",
                       "bound_lru", "log_records")
                 @test haskey(r, k)
             end
-            @test r["worker_control_ws"] == 1
+            @test r["worker_links"] == 1
             @test BonitoAgents.JSON.json(m) isa String
 
             deep = BT.dev_request(st, "memory", Dict("deep" => true))
@@ -279,8 +278,10 @@ end
 
             chat = BT.dev_request(st, "inspect",
                 Dict("section" => "chats", "project_id" => pid))
-            @test chat["agent_provider"] == "ClaudeCode"
-            @test chat["session_activity"] == "Idle"
+            # The agent's own provider: the default is ENV-driven, and a mock
+            # server earlier in the same process sets it to MockCode.
+            @test chat["agent_provider"] == BT.provider_name(agent)
+            @test chat["open_turns"] == String[]
             @test chat["client_alive"] === false
             @test chat["restart_inflight"] === false
             @test chat["rendering"] === nothing
@@ -318,10 +319,10 @@ end
             @test_throws Exception BT.dev_request(st, "control", Dict("op" => "not_an_op"))
             @test_throws Exception BT.dev_request(st, "control",
                 Dict("op" => "send_message", "project_id" => pid, "text" => "   "))
-            # move_project refuses a same-worker move rather than doing something
-            # surprising.
+            # continue_project refuses the worker the chat is already on rather
+            # than doing something surprising.
             @test_throws Exception BT.dev_request(st, "control",
-                Dict("op" => "move_project", "project_id" => pid, "worker_id" => wid))
+                Dict("op" => "continue_project", "project_id" => pid, "worker_id" => wid))
         end
 
         @testset "the debug project is created once and gated correctly" begin
@@ -355,7 +356,7 @@ end
                 @test me["source_checkout"] == root
 
                 # `dev_mode` is the ONLY thing that hands out the tools…
-                @test haskey(BT.eval_dialback_env(st, p.id), "BONITOAGENTS_DEV_TOOLS")
+                @test haskey(BT.mcp_env(st, p.id), "BONITOAGENTS_DEV_TOOLS")
                 @test occursin("Debugging BonitoAgents itself",
                                BT.agents_prompt_appendix(st, p.id))
 
@@ -365,14 +366,14 @@ end
                 other = BT.ProjectInfo("plain-at-root", "BonitoAgents", wid,
                                        mktempdir(), root, BT.now(BT.UTC))
                 st.projects[]["plain-at-root"] = other
-                @test !haskey(BT.eval_dialback_env(st, "plain-at-root"), "BONITOAGENTS_DEV_TOOLS")
+                @test !haskey(BT.mcp_env(st, "plain-at-root"), "BONITOAGENTS_DEV_TOOLS")
                 @test !occursin("Debugging BonitoAgents itself",
                                 BT.agents_prompt_appendix(st, "plain-at-root"))
             end
         end
 
         @testset "a restart re-derives the MCP env, it does not reuse the old one" begin
-            # The bug this pins: `WorkerAgent` stored the env `eval_dialback_env`
+            # The bug this pins: `WorkerAgent` stored the env `mcp_env`
             # produced at its FIRST bring-up, and a restart re-`start!`s that
             # same object. So flipping "Dev mode" (which persists the flag and
             # restarts) composed the briefing into the system prompt — that is
@@ -386,7 +387,7 @@ end
             stale = [BT.AgentClientProtocol.MCPServer(
                          BT.INJECTED_MCP_NAME, "/usr/bin/julia";
                          args = ["-e", "using BonitoMCP"],
-                         env  = BT.eval_dialback_env(st, "baked-env"))]
+                         env  = BT.mcp_env(st, "baked-env"))]
             @test !haskey(only(stale).env, "BONITOAGENTS_DEV_TOOLS")
 
             BT.set_dev_mode!(st, "baked-env", true)
@@ -426,7 +427,7 @@ end
             # has to persist — and must default to OFF for entries that predate it.
             BT.save_projects!(st)
             fresh = BT.ServerState(; state_dir = st.state_dir,
-                                     working_dir = mktempdir(), worker_secret = "x")
+                                     working_dir = mktempdir())
             devs = [p for p in values(fresh.projects[]) if p.dev_mode]
             plain = [p for p in values(fresh.projects[]) if !p.dev_mode]
             @test BT.bonitoagents_repo_root() === nothing || length(devs) == 1
@@ -443,7 +444,7 @@ end
               "created": "2026-01-01T00:00:00"}]
             """)
             legacy = BT.ServerState(; state_dir = old_dir,
-                                      working_dir = mktempdir(), worker_secret = "x")
+                                      working_dir = mktempdir())
             lp = get(legacy.projects[], "legacy01", nothing)
             @test lp !== nothing            # the entry loaded at all
             @test lp.dev_mode === false     # …and defaulted OFF, not to a throw
@@ -458,13 +459,13 @@ end
             hand = BT.ProjectInfo("hand-enabled", "SomeApp", wid,
                                   mktempdir(), mktempdir(), BT.now(BT.UTC))
             st.projects[]["hand-enabled"] = hand
-            @test !haskey(BT.eval_dialback_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
+            @test !haskey(BT.mcp_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
 
             @test BT.set_dev_mode!(st, "hand-enabled", true).dev_mode
-            @test haskey(BT.eval_dialback_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
+            @test haskey(BT.mcp_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
 
             @test !BT.set_dev_mode!(st, "hand-enabled", false).dev_mode
-            @test !haskey(BT.eval_dialback_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
+            @test !haskey(BT.mcp_env(st, "hand-enabled"), "BONITOAGENTS_DEV_TOOLS")
 
             # Idempotent (the toggle can be clicked repeatedly), and it names a
             # project it can't find rather than quietly doing nothing — a silent

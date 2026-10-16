@@ -6,8 +6,7 @@
     using Bonito
     const BT = BonitoAgents
 
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                          worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     # No worker behind the agent: the session restart fails fast and is
     # swallowed by `restart_chat_session!` (the chat object survives), which is
     # all the switch's bookkeeping needs.

@@ -15,8 +15,8 @@
 # Two real worker processes (TestKit's `add_worker!`), the real dev_server, the
 # mock agent only where the agent's decisions would be. ISOLATED: it spawns a
 # second worker, so it gets its own throwaway dev_server + browser.
-@testitem "e2e:remote_eval" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:remote_eval" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     real_eval(code; kw...) = TK.bt_eval(code; real_process = true, kw...)
@@ -162,8 +162,8 @@
             @test TK.wait_for(server, "the eval ran on worker B",
                 card_shows("re-on", "host=" * worker_b.worker_id); timeout = 420) == true
             @test TK.eval_js(server, card_badge("re-on")) == "⇢ worker-b"
-            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
-            @test all(last(pair) isa BT.WorkerMCPChannel for pair in BT.eval_hosts_of(state, pid))
+            @test BT.mcp_ctrl_for(state, pid) isa BT.MCPChannel
+            @test all(last(pair) isa BT.MCPChannel for pair in BT.eval_hosts_of(state, pid))
             @test length(BT.eval_hosts_of(state, pid)) == 1
             @test first(BT.eval_hosts_of(state, pid))[1] == worker_b.worker_id
 
@@ -180,8 +180,12 @@
             server.agent_fn[] = _ -> [real_eval("relay_value = 41; sleep(60); relay_value";
                 worker = "worker-b", timeout = 0.1, id = "re-running"), TK.end_turn()]
             TK.send_message(server, "start a long remote eval")
-            @test TK.wait_for(server, "remote eval checkpoint",
-                card_shows("re-running", "still running"); timeout = 60) == true
+            # The call returns at its checkpoint, the eval does not: the card
+            # follows the RUN, live, until it ends (eval_runs.jl).
+            @test TK.wait_for(server, "remote eval checkpointed, its card still live",
+                "$(card("re-running"))?.classList.contains('bt-tool-live') === true && " *
+                "($(card("re-running"))?.querySelector('.bt-tool-summary')?.textContent || '').includes('· running')";
+                timeout = 60) == true
             # Eager expansion and the fast checkpoint must share one body
             # mount, including while the first render is still in flight.
             renders = BT.shared(state.chat_models[pid]).tool_renders
@@ -192,6 +196,10 @@
             TK.send_message(server, "interrupt the remote eval")
             @test TK.wait_for(server, "remote interrupt result",
                 card_shows("re-interrupt", "InterruptException"); timeout = 60) == true
+            # …and the run's own card ends with it.
+            @test TK.wait_for(server, "the run's card ends interrupted",
+                "($(card("re-running"))?.querySelector('.bt-tool-summary')?.textContent || '').includes('✗ interrupted')";
+                timeout = 60) == true
             server.agent_fn[] = _ -> [real_eval("relay_value + 1";
                 worker = "worker-b", id = "re-after-interrupt"), TK.end_turn()]
             TK.send_message(server, "reuse the remote session")
@@ -229,7 +237,7 @@
             TK.send_message(server, "remote eval after resuming the agent")
             @test TK.wait_for(server, "resumed agent launches a working MCP",
                 card_shows("re-resumed", "42"); timeout = 120) == true
-            @test BT.mcp_ctrl_for(state, pid) isa BT.WorkerMCPChannel
+            @test BT.mcp_ctrl_for(state, pid) isa BT.MCPChannel
             @test BT.mcp_ctrl_for(state, pid) !== old_channel
 
             # ── 5. off again: the host goes, the refusal is back ─────────────

@@ -118,8 +118,10 @@ body_shows(text) = "(document.querySelector('.bt-tool-msg .bt-tool-body')?.inner
         @test snap["tool_count"] >= 1
         @test snap["status"] == "completed"
         # `42` MUST appear in the rendered body — that's the literal output
-        # of `1 + 41` formatted by BonitoMCP's content blocks.
-        @test occursin("42", snap["body_text_snippet"])
+        # of `1 + 41` formatted by BonitoMCP's content blocks. Anywhere in it:
+        # a cold package cache puts precompile lines ahead of the result, past
+        # the probe's 300-character snippet.
+        @test TK.eval_js(s, body_shows("42")) === true
 
         TK.screenshot(s, shot("bt_eval-simple.png"))
     finally
@@ -426,11 +428,16 @@ end
         card1 = ".bt-tool-msg[data-msg-id*=\"tc-1\"]"
         card2 = ".bt-tool-msg[data-msg-id*=\"tc-2\"]"
 
-        # The eval checkpoints: completed with the "still running" footer.
-        @test TK.wait_for(s, "eval checkpointed",
+        # The eval checkpoints and its call returns, but its RUN goes on: the
+        # card follows the run to its end and then shows the whole output,
+        # what came after the checkpoint included (eval_runs.jl). It used to
+        # freeze at the checkpoint with a "still running" footer.
+        @test TK.wait_for(s, "the eval card follows its run to the end",
             """(() => { const c = document.querySelector('$card1');
-                return !!(c && c.querySelector('.bt-tool-status')?.textContent === 'completed' &&
-                    (c.querySelector('.bt-tool-body')?.innerText || '').includes('still running')); })()""";
+                if (!c) return false;
+                const t = (c.querySelector('.bt-tool-body')?.innerText || '');
+                return (c.querySelector('.bt-tool-summary')?.textContent || '').includes('✓ passed') &&
+                       t.includes('before checkpoint') && t.includes('after checkpoint'); })()""";
             timeout = 120) == true
         # The continue card completes with the tail of the output + result.
         @test TK.wait_for(s, "continue delivered output + result",

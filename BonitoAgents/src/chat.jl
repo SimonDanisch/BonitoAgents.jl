@@ -1,8 +1,11 @@
-# bonitoagents.js is now an ES6 module — see `ChatLib` further down. It's
-# loaded lazily by the `Bonito.ES6Module(...).then(...)` interpolation
-# inside ChatModel's jsrender, NOT injected as a classic <script> tag.
-# Loading it as a classic script would syntax-error on the `export`
-# statements.
+# bonitoagents.js is an ES6 module, loaded lazily by the
+# `$(ChatLib).then(lib => ...)` interpolation inside ChatModel's jsrender (same
+# pattern as BonitoBook's MonacoEditor), NOT injected as a classic <script> tag.
+# Loading it as a classic script would syntax-error on the `export` statements.
+# `connect(node, comm)` is called by the inline init JS in `jsrender(::ChatModel)`.
+# Defined first: top-level `js"""` consts further down (LIGHTBOX_OPEN_JS, ...)
+# interpolate it at include time, so it must exist before them.
+const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoagents.js"))
 
 # Message types. `ChatModel` is defined FIRST so each message can hold a `chat`
 # back-ref — its emit/persist sink, used by `send!`/`append!`/`close` (the
@@ -52,11 +55,59 @@ end
 
 # ── ChatModel ──────────────────────────────────────────────────────────────
 # Shared per project, lifetime = project's lifetime. One instance lives in
+# A Julia RUN (BonitoMCP's runs.jl: one `bt_julia_eval`, id `r4`) as the chat
+# knows it — what the chat's MCP, or an eval host on another worker, announced
+# about it — and the eval card that started it. The behaviour is in
+# eval_runs.jl; the type lives here because the chat holds its runs.
+mutable struct ChatRun
+    const id::String
+    tool_use_id::String            # the id of the call that started it, when the agent named it ("" if not)
+    worker_id::String              # "" = the chat's own worker
+    route::String                  # the eval session's stream route, keyed like the stream sinks
+    env_path::String               # "" = temp session
+    background::Bool
+    started::Float64
+    status::String                 # "running" | "passed" | "failed" | "interrupted" | "lost"
+    finished::Float64
+    summary::String                # a failure's first line
+    collected::Bool                # the agent has been handed the result
+    notified::Bool                 # the agent was told that it finished
+    content::Vector{Any}           # the finished run's output + result, as the card shows it
+    card::Any                      # its `JuliaEvalToolMsg` (typed there); nothing until bound
+    known::Bool                    # `started` is its process's own (a status frame came)
+    seen::Float64                  # when its process last spoke about it
+end
+ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
+        summary, collected, notified, content, card) =
+    ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
+            summary, collected, notified, content, card, false, time())
+
+# The chat's runs, and the task that tells the agent when ones it has not
+# collected finish (at most one at a time). `runs` holds each id's newest run.
+# Ids count per MCP process and a chat outlives its MCP's restarts, so an id
+# comes back: `older` keeps a run that still runs after a newer one took its id,
+# by (id, start time).
+mutable struct RunBook
+    const runs::Dict{String,ChatRun}
+    const older::Dict{Tuple{String,Float64},ChatRun}
+    const lock::ReentrantLock
+    notifier::Union{Task,Nothing}
+end
+RunBook() = RunBook(Dict{String,ChatRun}(), Dict{Tuple{String,Float64},ChatRun}(), ReentrantLock(), nothing)
+
 # `state.chat_models[project_id]`; every browser tab viewing the project gets
 # a per-session view via `Base.copy(::ChatModel)`. The shared bits — message
 # store, ACP client, persistent chat session, the user-message queue — are
 # shared across sessions; the Observable fields are per-session connected
 # children so their JS bridges GC cleanly when the tab closes.
+# A chat's tool bodies as the browser last rendered them: tool id => the body's
+# height at each width it was measured at, newest last (measured_sizes.jl).
+struct BodyHeights
+    heights::Dict{String,Vector{NTuple{2,Int}}}
+    lock::ReentrantLock
+end
+BodyHeights() = BodyHeights(Dict{String,Vector{NTuple{2,Int}}}(), ReentrantLock())
+
 mutable struct ChatModel
     # Convention: lock first. Now only a guard around `msgs_store` for the
     # read-only comm handlers (msgs.request / tool.render) that read it
@@ -79,21 +130,10 @@ mutable struct ChatModel
     agent::AgentProvider
     mcp_servers::Vector{AgentClientProtocol.MCPServer}
 
-    # The user's turns. The browser send handler `put!`s a `UserMessage`; the
-    # `run_chat!` task is the SOLE consumer (one turn at a time). Shared across
-    # per-session views so every tab feeds the same queue.
+    # Wakeups for the sole turn-completion consumer. The outbox below holds
+    # pending submissions and any steering spans awaiting completion.
     user_messages::Channel{UserMessage}
-
-    # User bubbles pushed into `msgs_store` whose prompt has NOT reached the
-    # agent yet (FIFO mirror of `user_messages`, tracking the rendered bubble
-    # objects). `send_message!` pushes; `begin_turn` pops once `prompt!`
-    # actually delivered the text. `reconcile_replay!` needs this to tell the
-    # user's FRESH messages (which the agent can't know about, so they must
-    # stay at the store's END and must never anchor the replay merge) apart
-    # from history the agent has seen. Guarded by `lock` (the msgs_store lock);
-    # shared across per-session views. The type is `Any` only to dodge the
-    # UserMsg-not-yet-defined ordering here; every element is a UserMsg.
-    pending_sends::Vector{Any}
+    pending_sends::Vector{Any}     # PendingSend (defined after UserMsg)
 
     # The task rendering the agent session's MAIN THREAD (`ACP.Client.messages`)
     # into this chat, for the life of that session. One stream, one renderer:
@@ -112,30 +152,10 @@ mutable struct ChatModel
     # stream); `nothing` before the first bind. Guarded by the shared lock.
     main_consumer::Ref{Any}
 
-    # Is an AUTO-WAKE episode in progress — the agent talking with no prompt of
-    # ours open, after backgrounded work finished?
-    #
-    # It has a real start (the first un-prompted frame) and, on providers that
-    # tag it, a real end: claude-agent-acp marks an autonomous cycle's result
-    # with `_meta["_claude/origin"].kind` (see `AUTONOMOUS_ORIGINS`). Both ends
-    # matter — an episode that can start and never end is a latch, and that is
-    # exactly what made the spinner run forever over an idle chat. On a provider
-    # that doesn't tag it (`reports_autonomous_origin`) we don't track episodes
-    # at all rather than start something we can't stop.
-    # The `SessionActivity` this chat has already reacted to. NOT a copy of the
-    # truth — the connection owns that, and `session_activity` re-derives it on
-    # read — but the edge detector: crossing INTO `Unprompted` starts the pills
-    # waiting on an autonomous cycle, crossing OUT retires them. Storing the
-    # last-seen value is what turns a level into an edge; storing the level
-    # itself is what made this a latch.
-    activity_seen::Ref{AgentClientProtocol.SessionActivity}
-
-    # One live `Timer` while an `Unprompted` episode is open, `nothing`
-    # otherwise. `Unprompted` ends on QUIET — which means no frame arrives to
-    # announce it, so nothing would republish `busy_active` and the spinner
-    # would keep running over an agent that stopped talking. A field, not a
-    # module-level table keyed by chat: per-object state belongs on the object.
-    activity_timer::Ref{Any}
+    # The turns the last Stop reached (`AgentClientProtocol.cancel!`). A new
+    # prompt waits until they are over: the agent settles a prompt that reaches
+    # it while it winds a cancel down without ever running it.
+    cancelled_turns::Ref{Vector{AgentClientProtocol.Turn}}
 
     # What `main_consumer!` is rendering right now: `(kind, started_at)`, or
     # `nothing` between messages. Pure diagnostics — the render barrier reports
@@ -228,9 +248,11 @@ mutable struct ChatModel
     # globals: `restart_gen` (the old global was bumped per restart and NEVER
     # deleted → it pinned every restarted chat's model forever) and
     # `restart_inflight` (one bring-up worker at a time) live and die with the
-    # chat. `restart_lock` guards the brief read-test-set (held only there, never
-    # across the seconds-long bring-up). See `restart_chat_session!`.
-    restart_inflight::Base.RefValue{Bool}
+    # chat. `restart_inflight` is the running bring-up's latch, closed when it is
+    # done (`nothing`: none runs). `restart_lock` guards the brief read-test-set
+    # (held only there, never across the seconds-long bring-up). See
+    # `restart_chat_session!`.
+    restart_inflight::Base.RefValue{Union{Channel{Nothing},Nothing}}
     restart_gen::Base.RefValue{Int}
     restart_lock::ReentrantLock
 
@@ -248,6 +270,13 @@ mutable struct ChatModel
     # PlotPane handle (window-scoped; set per session view, not shared).
     plotpane::Any
 
+    # Whom this view serves (window-scoped, like `plotpane`): the window's own
+    # state, which knows the person behind it. `state` above is the chat's, shared
+    # by every tab, so it acts as the server itself; what one person may see or
+    # do in the chat (the workers it can continue on, the admins' switches) asks
+    # this instead. The shared instance's is its own `state`.
+    viewer::ServerState
+
     # Live todo list for the taskbar (shared via parent).
     live_todo::Ref{Any}
 
@@ -256,16 +285,12 @@ mutable struct ChatModel
     turn_seq::Ref{Int}
 
     # Is the consumer inside a turn? NOT a question about the agent — that one is
-    # `session_activity`, and the two differ at both ends: we hold this while
-    # bringing a session up (before any span exists) and while rendering the
-    # turn's tail (after the span resolved and ACP is already `Idle`).
+    # `open_turns`, and the two differ at both ends: we hold this while bringing a
+    # session up (before any turn exists) and while rendering the turn's tail
+    # (after the agent answered and the turn is over).
     #
-    # A Bool, not the count it used to be. `run_chat!` is the sole consumer and
-    # AWAITS each turn, so there is never more than one — true since 15e1f76 made
-    # the drain awaited instead of spawned, though the counter and its
-    # `last_turn` branch (unconditionally true) outlived that by weeks. Verified
-    # by instrumenting the claim across the unit suite and the cancel / queued /
-    # restart e2e items: never above one.
+    # One consumer awaits turns serially. Steering can have a successor on the
+    # wire already; `open_turns` has it.
     #
     # Set and cleared by `while_busy` ONLY — see there.
     turn_in_flight::Ref{Bool}
@@ -303,6 +328,13 @@ mutable struct ChatModel
     # latest generation at its turn skips entirely. Guarded by `model.lock`
     # for the get!/increment; entries are few (one per rendered tool).
     tool_renders::Dict{String, Tuple{ReentrantLock, Ref{Int}}}
+
+    # The chat's Julia runs (eval_runs.jl). Shared across session views.
+    runs::RunBook
+
+    # How tall each tool body last rendered, so the next render reserves its
+    # space before the body arrives (measured_sizes.jl). Shared across views.
+    body_heights::BodyHeights
 end
 
 # The provider tracked by the `provider` observable: the singleton descriptor the
@@ -357,10 +389,9 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         actual_agent,
         collect(AgentClientProtocol.MCPServer, mcp_servers),
         Channel{UserMessage}(64),
-        Any[],                      # pending_sends (user bubbles not yet prompted)
+        Any[],                      # pending_sends (outbox)
         Ref{Any}(nothing),          # main_consumer (bound with the ACP session)
-        Ref{AgentClientProtocol.SessionActivity}(AgentClientProtocol.Idle()),  # activity_seen
-        Ref{Any}(nothing),          # activity_timer
+        Ref(AgentClientProtocol.Turn[]),  # cancelled_turns
         Ref{Any}(nothing),          # rendering
         Ref(""),                    # pending_history_replay
         Dict{String,Vector{Any}}(), # pending_subagent (activity ahead of its parent Task)
@@ -377,12 +408,13 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(AgentClientProtocol.CommandInfo[]),  # available_commands
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
         Ref{Union{Task,Nothing}}(nothing),   # poller_task
-        Ref(false),                 # restart_inflight
+        Ref{Union{Channel{Nothing},Nothing}}(nothing),  # restart_inflight
         Ref(0),                     # restart_gen
         ReentrantLock(),            # restart_lock
         nothing,                    # parent: this is the shared instance itself
         Dict{String,Vector}(),      # tool_content_cache
         nothing,                    # plotpane: window-scoped, set per session view
+        state,                      # viewer: the server itself, until a tab's view
         Ref{Any}(nothing),          # live_todo
         Ref(0),                     # turn_seq
         Ref(false),                 # turn_in_flight
@@ -393,7 +425,10 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         String[],                              # tool_cache_order (LRU for the cache)
         TaskBar(),                             # live-task board (owns its poll loop)
         Dict{String, Tuple{ReentrantLock, Ref{Int}}}(),  # tool_renders (serialize + latest-wins)
+        RunBook(),                             # runs
+        load_body_heights(chat_dir),           # body_heights
     )
+    load_pending_sends!(model)
     # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
     # with `chat = nothing` (the model doesn't exist yet while parsing), but
     # the wire form needs the back-ref to resolve the project's /attachment
@@ -414,12 +449,17 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         m isa ToolMsg && m.message.chat === nothing && (m.message.chat = model)
     end
     # Turn boundaries → `turn_signal` (see the note at `busy_active` above).
-    # Deduped against the last value we ACTED on, because `refresh_activity!`
+    # Deduped against the last value we ACTED on, because `publish_busy!`
     # writes `busy_active` unconditionally — that re-broadcast is deliberate
     # (it repairs a tab whose bridge missed an update) but it means the raw
     # observable fires many times per turn, and every fire here would rebuild
     # the overview grid. A transition is what "a turn started / finished"
     # actually is.
+    # The bar's ⊗, once for the chat. Every tab used to add its own listener to
+    # this one shared observable, so a click stopped the task once per open tab.
+    on(model.taskbar.stop_request) do id
+        isempty(id) || handle_command!(model, nothing, StopToolCommand(id))
+    end
     busy_seen = Ref(busy_active[])
     on(busy_active) do b
         b == busy_seen[] && return
@@ -451,7 +491,7 @@ end
 # user-message queue, etc. with the parent. Observable fields are bridged via
 # `map(identity, session, obs)` so each tab gets its own connected child
 # (auto-GC'd on session close).
-function Base.copy(m::ChatModel, session::Bonito.Session)
+function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = m.viewer)
     lock(m.lock) do
         ChatModel(
             m.lock,
@@ -460,10 +500,9 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.chat_session, m.msgs_store,
             m.agent, m.mcp_servers,
             m.user_messages,           # shared queue → all sessions feed one consumer
-            m.pending_sends,           # shared → reconcile sees every tab's unsent bubbles
+            m.pending_sends,           # shared outbox across tabs
             m.main_consumer,           # shared → one main-thread renderer per chat
-            m.activity_seen,           # shared → one edge detector per chat
-            m.activity_timer,          # shared → one quiet-check per chat
+            m.cancelled_turns,         # shared → one Stop per chat
             m.rendering,               # shared → one renderer per chat
             m.pending_history_replay,
             m.pending_subagent,        # shared → one activity buffer per chat
@@ -486,6 +525,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m,    # parent → the shared instance we copied from
             m.tool_content_cache,      # shared Dict; per-tab views see same RAM cache
             nothing,                   # plotpane: per WINDOW — ChatPaneRef sets it
+            viewer,                    # per WINDOW too: whom this tab serves
             m.live_todo,               # shared Ref — one live list per chat
             m.turn_seq,                # shared counter
             m.turn_in_flight,          # shared → one turn at a time per chat
@@ -494,6 +534,8 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
             m.taskbar,                 # shared → one live-task board per chat
             m.tool_renders,            # shared → renders serialize across every tab
+            m.runs,                    # shared → one run book per chat
+            m.body_heights,            # shared → one record per chat
         )
     end
 end
@@ -507,6 +549,13 @@ shared(m::ChatModel) = m.parent === nothing ? m : m.parent
 # per-session view — `shared(model)` resolves the right target.
 chat_emit(model::ChatModel, event::AbstractDict) =
     (shared(model).comm[] = Dict{String,Any}(event); nothing)
+
+# To the tab that asked, and to no other: `view` is that tab's copy (see
+# `copy(::ChatModel, ::Session)`), and its `comm` the tab's own child of the
+# shared channel. Transcript ranges used to go out through `chat_emit`, so one
+# tab loading its history pushed every byte of it into each other open tab too.
+reply!(view::ChatModel, event::AbstractDict) =
+    (view.comm[] = Dict{String,Any}(event); nothing)
 
 # ── Concrete message types (carry the `chat` back-ref) ──────────────────────
 mutable struct UserMsg <: ChatMsg
@@ -576,6 +625,10 @@ mutable struct AgentMsg <: ChatMsg
     # `close` idempotent: re-close on an already-final bubble is a no-op
     # instead of double-appending to chat.md.
     in_flight::Bool
+    # Streamed chunks go out as one render per `stream_chunk!` interval: when the
+    # last one went, and whether one is waiting for its turn.
+    flushed_at::Float64
+    flush_pending::Bool
 end
 # Cache starts empty in BOTH paths (history-load/replay-adopt AND streaming):
 # `ensure_html!` populates on first request, then every subsequent fetch is free.
@@ -585,9 +638,9 @@ end
 # History-load / replay-adopt: `in_flight = false` (text is already final).
 # Streaming construction: `in_flight = true`, flipped in `close(::AgentMsg)`.
 AgentMsg(id::AbstractString, text::AbstractString) =
-    AgentMsg(String(id), String(text), "", nothing, false)
+    AgentMsg(String(id), String(text), "", nothing, false, 0.0, false)
 AgentMsg(chat::ChatModel, text::AbstractString) =
-    AgentMsg(string(uuid4()), String(text), "", chat, true)
+    AgentMsg(string(uuid4()), String(text), "", chat, true, 0.0, false)
 
 # Lazy cache populate. Used by `msg_to_dict` / `wire_final`. Atomic under
 # MARKDOWN_LOCK against `append!` (see the lock's doc near its definition).
@@ -752,6 +805,20 @@ function apply_input!(m::ReadToolMsg, raw::AbstractDict)
     fp isa AbstractString && !isempty(fp) && (m.file_path = String(fp))
     return nothing
 end
+# The file a Read or Edit call names. Live, `apply_input!` fills it from the
+# streamed arguments. A call restored from chat.md comes back without them; they
+# are stored next to the chat (`tools/<id>.json`), read here on first use and
+# kept. Without this a reopened chat's Read pictures lost their worker file:
+# shown from inline base64, without "Set as chat icon", never the chat's icon.
+function tool_file_path(m::Union{ReadToolMsg,EditToolMsg})
+    chat = m.message.chat
+    if isempty(m.file_path) && chat !== nothing
+        raw = stored_raw_input(chat.chat_dir, tool_id(m))
+        raw === nothing || apply_input!(m, raw)
+    end
+    return m.file_path
+end
+
 function apply_input!(m::EditToolMsg, raw::AbstractDict)
     # `file_path` (claude) vs `path` (kimi) — see `apply_input!(::ReadToolMsg, …)`.
     # kimi's `Edit`/`Write` otherwise diff correctly but against a nameless file.
@@ -797,11 +864,10 @@ end
 #                                                 signal (`work_done`: a bash's
 #                                                 output-file fd-close, a
 #                                                 subagent's transcript end_turn)
-#   AwaitingReport  finished; the agent hasn't  → the first frame of an auto-wake
-#                   said anything about it yet.   episode
-#   Reporting       the agent is telling you    → the episode's end marker (a
-#                   about it.                     usage_update tagged with an
-#                                                 autonomous origin), or the next
+#   AwaitingReport  finished; the agent hasn't  → the agent starts a turn of its
+#                   said anything about it yet.   own (`TurnStarted`)
+#   Reporting       the agent is telling you    → that turn is over (ACP ends it
+#                   about it.                     at its result), or the next
 #                                                 user turn
 #   Reported        done; leaves the bar.
 abstract type BgPhase end
@@ -822,8 +888,8 @@ struct Reported       <: BgPhase end
 # Sized off the real wire: in the captured trace the agent auto-woke ~19s after
 # the backgrounded work finished, so this is a bit over twice the observed
 # latency. If the agent DOES start reporting inside the window the pill moves to
-# `Reporting`, which this bound does not apply to — the episode's own end marker
-# governs from there.
+# `Reporting`, which this bound does not apply to: the agent's turn governs from
+# there.
 const REPORT_WAIT_SECONDS = 45.0
 
 # How long `wait_rendered!` waits for the renderer to pass a stream marker before
@@ -833,16 +899,25 @@ const REPORT_WAIT_SECONDS = 45.0
 # turns one stalled renderer into a permanently unusable chat.
 const RENDER_BARRIER_SECONDS = 10.0
 
-# How often an open `Unprompted` episode re-checks whether it has gone quiet.
-# Well under `AgentClientProtocol.QUIET_SECONDS` so the spinner clears promptly
-# once the episode expires, rather than a whole quiet window later.
-const QUIET_CHECK_SECONDS = 5.0
 
 # The one-line stage description a pill shows next to its elapsed clock.
 phase_note(::Executing)      = ""
 phase_note(::AwaitingReport) = "finished — waiting for the agent"
 phase_note(::Reporting)      = "agent reporting back"
 phase_note(::Reported)       = ""
+
+# A worker following a background task's output file for the chat (BonitoWorker
+# file_watch.jl): new bytes and the end arrive when they happen, where the
+# TaskBar's loop used to ask the worker every second and the worker scanned every
+# process for each answer.
+mutable struct BgWatch
+    channel::Union{Nothing,WorkerLink.LinkChannel}
+    active::Bool          # a watch runs, or is being opened
+    done::Bool            # the writer closed the file / the subagent ended its turn
+    ended_on::UInt        # objectid of the worker link a watch could not run on; 0 if none
+    write_pending::Bool   # the output reaches disk within a second
+end
+BgWatch() = BgWatch(nothing, false, false, UInt(0), false)
 
 mutable struct BashToolMsg <: ToolMsg
     message::Message
@@ -868,12 +943,13 @@ mutable struct BashToolMsg <: ToolMsg
     task_bar::Union{TaskBar,Nothing}
     # Which of the three stages this task is in — see `BgPhase`.
     phase::BgPhase
+    watch::BgWatch
 end
 
 BashToolMsg(message::Message; command = "", description = nothing,
             is_background = false) =
     BashToolMsg(message, command, description, is_background, "", 0, "",
-                nothing, Executing())
+                nothing, Executing(), BgWatch())
 
 # What the pill/taskbar shows for a bash: the human-readable description
 # when claude sent one, else the ACP title (usually the raw command).
@@ -943,13 +1019,14 @@ mutable struct TaskToolMsg <: ToolMsg
     # Which of the three stages this task is in — see `BgPhase`. Guarded by the
     # shared chat lock, like the rest of the message's mutable state.
     phase::BgPhase
+    watch::BgWatch
 end
 
 TaskToolMsg(message::Message; description = "", is_background = false,
             task_name = nothing) =
     TaskToolMsg(message, description, is_background, task_name,
                 TaskActivityEntry[], Dict{String,Int}(), 0, time(), false, "", 0,
-                nothing, Executing())
+                nothing, Executing(), BgWatch())
 
 # MCP tool calls (`mcp__<server>__<tool>`). One TYPE per BonitoMCP tool, so all
 # behavior dispatches on the type — the raw `tool_name` is consulted in exactly
@@ -996,15 +1073,32 @@ mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     # section is MOUNTED ONCE and updated in place — see `eval_body_dom`.
     stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
+    # Taken by both writers of `stream_text`, the tail (`append_tail!`, on its
+    # own thread) and the complete output (`eval_result!`), so that the complete
+    # output is the last word.
+    stream_lock::ReentrantLock
     # What the terminal result IS, `nothing` until it lands: a DESCRIPTION
     # (`(kind = :ref | :upgrade | :outdated, …)`, see `eval_result!`), never a
     # node — the message is shared by every tab and each builds its own
     # (`eval_result_node`). Its own slot so the body never re-renders to grow one.
     result::Observable{Any}
+    # `bt_julia_eval(background = true)`: the call returns at once and its own
+    # result is only the start notice; the run's output arrives later.
+    background::Bool
+    # The run this eval started (eval_runs.jl), once the chat heard of it. A run
+    # keeps its card live past the tool call: `is_live`, the task bar and the
+    # live output tail all follow the run, not the call.
+    run::Union{ChatRun,Nothing}
+    # The chat's TaskBar while the run is in it (membership IS liveness, as for
+    # a background bash); `nothing` otherwise.
+    task_bar::Union{TaskBar,Nothing}
+    # Persisted to chat.md already: a run's card can be closed by its tool call
+    # and again when the run ends, and history must hold it once.
+    closed::Bool
 end
 JuliaEvalToolMsg(message::Message, server) =
     JuliaEvalToolMsg(message, server, "", "", nothing, "",
-                     Observable(""), nothing, Observable{Any}(nothing))
+                     Observable(""), nothing, ReentrantLock(), Observable{Any}(nothing), false, nothing, nothing, false)
 
 mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     message::Message
@@ -1015,20 +1109,23 @@ mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
     worker::String
     stream_text::Observable{String}
     stream_task::Union{Task,Nothing}
+    stream_lock::ReentrantLock
     result::Observable{Any}
+    run::String                   # the run it continues (`run = "r4"`); "" ⇒ by env
 end
 JuliaContinueToolMsg(message::Message, server) =
     JuliaContinueToolMsg(message, server, "", "", nothing, "",
-                         Observable(""), nothing, Observable{Any}(nothing))
+                         Observable(""), nothing, ReentrantLock(), Observable{Any}(nothing), "")
 
 mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
     message::Message
     server::String
     env_path::String              # which session it SIGINTs; "" ⇒ the active one
     worker::String                # on which worker; "" ⇒ the chat's own
+    run::String                   # the run it stops (`run = "r4"`); "" ⇒ by env
 end
 JuliaInterruptToolMsg(message::Message, server) =
-    JuliaInterruptToolMsg(message, server, "", "")
+    JuliaInterruptToolMsg(message, server, "", "", "")
 
 mutable struct JuliaRestartToolMsg <: MCPToolMsg     # bt_julia_restart
     message::Message
@@ -1044,6 +1141,14 @@ mutable struct JuliaListSessionsToolMsg <: MCPToolMsg # bt_julia_list_sessions
     server::String
 end
 
+mutable struct JuliaWaitToolMsg <: MCPToolMsg         # bt_julia_wait
+    message::Message
+    server::String
+    runs::Vector{String}          # the runs it waits on; empty ⇒ every open run
+    until::String                 # "all" | "any"
+end
+JuliaWaitToolMsg(message::Message, server) = JuliaWaitToolMsg(message, server, String[], "all")
+
 # Streamed-argument parsing for the typed MCP variants (see `apply_input!` above).
 function apply_input!(m::GenericMCPToolMsg, raw::AbstractDict)
     merge!(m.raw_input, raw)
@@ -1054,7 +1159,13 @@ function apply_input!(m::ShowToolMsg, raw::AbstractDict)
     p isa AbstractString && !isempty(p) && (m.path = String(p))
     return nothing
 end
-function apply_input!(m::JuliaEvalCall, raw::AbstractDict)
+apply_input!(m::JuliaEvalCall, raw::AbstractDict) = apply_eval_input!(m, raw)
+function apply_input!(m::JuliaEvalToolMsg, raw::AbstractDict)
+    apply_eval_input!(m, raw)
+    get(raw, "background", false) === true && (m.background = true)
+    return nothing
+end
+function apply_eval_input!(m::JuliaEvalCall, raw::AbstractDict)
     c = get(raw, "code", nothing)
     c isa AbstractString && !isempty(c) && (m.code = String(c))
     e = get(raw, "env_path", nothing)
@@ -1063,6 +1174,19 @@ function apply_input!(m::JuliaEvalCall, raw::AbstractDict)
     t isa Real && (m.timeout = Float64(t))
     w = get(raw, "worker", nothing)
     w isa AbstractString && !isempty(strip(w)) && (m.worker = String(strip(w)))
+    return nothing
+end
+function apply_input!(m::JuliaContinueToolMsg, raw::AbstractDict)
+    apply_eval_input!(m, raw)
+    r = get(raw, "run", nothing)
+    r isa AbstractString && !isempty(strip(r)) && (m.run = String(strip(r)))
+    return nothing
+end
+function apply_input!(m::JuliaWaitToolMsg, raw::AbstractDict)
+    r = get(raw, "runs", nothing)
+    r isa AbstractVector && (m.runs = [String(x) for x in r if x isa AbstractString])
+    u = get(raw, "until", nothing)
+    u isa AbstractString && (m.until = String(u))
     return nothing
 end
 function apply_input!(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}, raw::AbstractDict)
@@ -1081,6 +1205,7 @@ const MCP_MSG_TYPES = Dict{String,DataType}(
     "bt_julia_interrupt"     => JuliaInterruptToolMsg,
     "bt_julia_restart"       => JuliaRestartToolMsg,
     "bt_julia_list_sessions" => JuliaListSessionsToolMsg,
+    "bt_julia_wait"          => JuliaWaitToolMsg,
     "bt_show"                => ShowToolMsg,
 )
 mcp_msg_type(tool_name::AbstractString) = get(MCP_MSG_TYPES, tool_name, GenericMCPToolMsg)
@@ -1283,21 +1408,28 @@ is_pinned(chat::ChatModel, id::AbstractString) =
 
 # Enter the bar (become live): add to the live set, mark membership, make sure
 # the bar's poll loop is running.
-function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
+function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg})
+    added = false
     lock(bar.lock) do
-        any(t -> t === m, bar.items[]) || (bar.items[] = push!(copy(bar.items[]), m))
+        if !any(t -> t === m, bar.items[])
+            bar.items[] = push!(copy(bar.items[]), m)
+            added = true
+        end
     end
     m.task_bar = bar
+    added && log_task_lifecycle(m, "added", "launched")
     ensure_running!(bar)
     return m
 end
 
 # Leave the bar (become done): finalize the bubble (persist + emit, per type),
 # then drop from the live set and clear membership. Idempotent.
-function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
+function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg}; reason::String = "finished")
     bar = m.task_bar
     bar === nothing && return nothing
     m.task_bar = nothing
+    stop_watch!(m)
+    log_task_lifecycle(m, "removed", reason)
     try
         finalize!(m)
     catch e
@@ -1317,32 +1449,19 @@ taskbar_item_for(m::TodoListMsg) = todo_taskbar_item(m)
 # background tasks are ever IN the bar (see `is_taskbar_item`), so these read the
 # per-type DETERMINISTIC completion signal — never `is_background`, never a
 # `task_running`/`bg_running` flag (membership is the one liveness truth).
-# A todo list is done when the agent has WORKED it done — every entry terminal —
-# or when the EPISODE that owns it is over, whichever comes first. The second arm
-# is not a nicety: the protocol has no "plan ended" frame, so a list the agent
-# ABANDONS (turn cancelled, agent moved on, worker gone) never reaches all-
-# terminal and, on entries alone, stays live forever. That is the `Todos 0/4`
-# pill that was still counting 35 hours later.
-#
-# Asked, not announced. `session_activity` re-derives itself on read (an
-# `Unprompted` episode expires on QUIET — nothing arrives to announce that), and
-# this runs on the bar's own 1 Hz poll, so there is no exit path anyone has to
-# remember to wire up. Its predecessor was the opposite: `finish_live_todo!`
-# called at three hand-picked turn boundaries, and the one nobody thought of —
-# the worker disconnect, which is not a turn boundary — is the bug.
+# A todo list is done when every entry is terminal or no turn is open (asked of
+# `open_turns`): there is no "plan ended" frame, so an abandoned list never gets
+# all-terminal.
 function isdone(m::TodoListMsg)
     all(e -> !(e.status in ("pending", "in_progress")), m.entries) && return true
     chat = m.chat
     chat === nothing && return false        # a replayed card: no session to ask
     c = client(chat.agent)
-    # NOT `session_activity(chat)`, which reports `Idle` for "no session bound"
-    # as well as "the session finished". Those are different answers to this
-    # question: an unbound chat has no episode to have ENDED, so nothing here is
-    # over. (A session that dies is covered without this — the connection's
-    # teardown seals the plan in ACP, which is immediate rather than waiting on
-    # `Unprompted`'s quiet expiry.)
+    # An unbound chat has no turn to have ENDED, so nothing here is over. (A
+    # session that dies is covered without this: the connection's teardown seals
+    # the plan in ACP.)
     c === nothing && return false
-    return !AgentClientProtocol.session_live(c)
+    return isempty(AgentClientProtocol.open_turns(c))
 end
 
 # For a BACKGROUND task, leaving the bar is the end of a three-stage story, not
@@ -1352,7 +1471,39 @@ end
 # turns it into the phase change; `isdone` is only true once the whole story is
 # over. See `BgPhase`.
 const BackgroundMsg = Union{BashToolMsg,TaskToolMsg}
+taskbar_dismiss_only(::TaskToolMsg) = true
 isdone(m::BackgroundMsg) = (advance!(m); m.phase isa Reported)
+
+function log_task_lifecycle(m, event::String, reason::String)
+    chat = m isa ToolMsg ? tool_chat(m) : m.chat
+    project_id = chat === nothing ? "" : chat.project_id
+    worker_id = chat === nothing ? nothing : bg_worker_id(chat.state, chat)
+    consumer = chat === nothing ? nothing : shared(chat).main_consumer[]
+    cli = consumer === nothing ? (chat === nothing ? nothing : client(chat.agent)) : consumer.client
+    session_id = cli === nothing ? "" : cli.session_id
+    connection_id = cli === nothing ? "" : string(objectid(cli))
+    @info "task lifecycle" project_id worker_id session_id connection_id task_id = msg_id(m) kind = nameof(typeof(m)) event reason
+    return nothing
+end
+
+# Background launch requests have already completed, so ACP closing its live
+# requests cannot finish these. End them when their owning session ends, after
+# its buffered tool updates have drained. A detached WorkerLink keeps that
+# session open and deliberately does not take this path.
+function interrupt_background_tasks!(chat::ChatModel; reason::String = "agent_session_ended")
+    bar = chat_taskbar(chat)
+    tasks = lock(() -> copy(bar.items[]), bar.lock)
+    for m in tasks
+        m isa BackgroundMsg || continue
+        if m.phase isa Executing
+            m.message.status = "failed"
+            m.message.summary = "Interrupted: agent session ended"
+        end
+        m.phase = Reported()
+        finished!(m; reason)
+    end
+    return nothing
+end
 
 # The one transition function. Only ever moves forward, so a late poll can't
 # rewind a pill, and a task whose work finishes while the agent is ALREADY
@@ -1369,14 +1520,14 @@ function advance!(m::BackgroundMsg)
     m.phase isa Executing || return m.phase
     work_done(m) || return m.phase
     chat = tool_chat(m)
-    reporting = chat !== nothing && autowake_active(chat)
+    reporting = chat !== nothing && agent_turn_open(chat)
     m.phase = reporting ? Reporting(time()) : AwaitingReport(time())
     return m.phase
 end
 
-# The auto-wake episode began: everything already waiting to be reported on is
-# now being reported on. We do NOT claim WHICH task the agent is talking about —
-# the wire doesn't say (the episode's prose carries no tool id), and guessing by
+# The agent started a turn of its own: everything already waiting to be reported
+# on is now being reported on. We do NOT claim WHICH task the agent is talking
+# about: the wire doesn't say (its prose carries no tool id), and guessing by
 # counting live tasks is exactly the heuristic this codebase removed. The stage
 # describes the CHAT's relationship to its background work.
 function report_started!(m::BackgroundMsg)
@@ -1384,7 +1535,7 @@ function report_started!(m::BackgroundMsg)
     return m.phase
 end
 
-# The episode ended (or a new user turn drew a boundary): anything past its own
+# The agent's turn ended (or a new user turn drew a boundary): anything past its own
 # work is finished for good and leaves the bar on the next poll.
 function report_finished!(m::BackgroundMsg)
     (m.phase isa AwaitingReport || m.phase isa Reporting) && (m.phase = Reported())
@@ -1395,8 +1546,7 @@ end
 # No file yet ⇒ still launching (stay) unless it already reached a terminal
 # status (a failed/inline launch that produced no file) ⇒ done.
 work_done(m::BashToolMsg) =
-    isempty(m.bg_output_path) ? (tool_status(m) in ("completed", "failed")) :
-    poll_output_file!(m; stream = true)
+    isempty(m.bg_output_path) ? (tool_status(m) in ("completed", "failed")) : output_done(m)
 # A background subagent is done ONLY on a signal we can trust — no timeouts, no
 # staleness heuristic, no guessing. Verified against a live claude-agent-acp agent:
 #   • the parent tool_call goes `completed` ~1s after launch (the launch ACK,
@@ -1412,70 +1562,110 @@ work_done(m::BashToolMsg) =
 # missing / still-streaming file, or a feed mid-tool-loop, has no end_turn ⇒ the
 # pill stays live (until end_turn or ⊗ stop). No `outputFile` at all ⇒ no wire
 # done-signal ⇒ stays until ⊗ stop.
-work_done(m::TaskToolMsg) = !isempty(m.bg_output_path) && subagent_transcript_done(m)
+work_done(m::TaskToolMsg) = !isempty(m.bg_output_path) && output_done(m)
 
-# Read the subagent's transcript and report whether it has reached its final,
-# natural turn-end. `end_turn` appears once, on the FINAL assistant message (a
-# pure text response with no tool_use closes the subagent's turn) — so its
-# presence anywhere in the transcript is the deterministic "subagent finished".
+# ── Following the output file ────────────────────────────────────────────────
+# The chat's worker follows the file and says when it changes and when the task
+# ended (BgWatch), so done is a field read here.
+function output_done(m::BackgroundMsg)
+    m.watch.done && return true
+    watch_output!(m)
+    return false
+end
+
+# A subagent ends its turn with this on its final message: `end_turn` appears
+# once, so its presence in the transcript is the deterministic "finished".
 const SUBAGENT_DONE_MARKER = "\"stop_reason\":\"end_turn\""
-function subagent_transcript_done(m::TaskToolMsg)
+
+watch_header(m::BashToolMsg) = Dict{String,Any}("kind" => "watch_file", "path" => m.bg_output_path,
+                                                "offset" => m.bg_offset, "until" => "closed")
+watch_header(m::TaskToolMsg) = Dict{String,Any}("kind" => "watch_file", "path" => m.bg_output_path,
+                                                "offset" => m.bg_offset, "until" => "marker",
+                                                "marker" => SUBAGENT_DONE_MARKER)
+
+"""
+    watch_output!(m)
+
+Have the chat's worker follow `m`'s output file, unless a watch runs already.
+While the worker is offline the bar's next look tries again. A watch that ended
+without the end, or a worker too old to watch, is tried again only on the
+worker's next link (`BgWatch.ended_on`): asking the same link again would fail
+the same way, every second.
+"""
+function watch_output!(m::BackgroundMsg)
+    w = m.watch
+    w.active && return nothing
     chat = tool_chat(m)
-    chat === nothing && return false
+    chat === nothing && return nothing
     state = chat.state
-    wid   = bg_worker_id(state, chat)
-    wid === nothing && return false
-    # Read the whole transcript (bounded) from the top each poll: `end_turn` sits
-    # at the END, and reading forward from a rolling offset could split the marker
-    # across two reads. Transcripts are small; the poll is 1 Hz and stops once done.
-    r = try
-        tail_worker_file(state, wid, m.bg_output_path; offset = 0,
-                         max_bytes = 4_000_000, timeout = 10.0)
-    catch e
-        @debug "subagent transcript read failed (will retry)" id = tool_id(m) exception = e
-        return false
+    wid = bg_worker_id(state, chat)
+    wid === nothing && return nothing
+    worker = get(state.workers[], wid, nothing)
+    (worker !== nothing && isopen(worker)) || return nothing
+    link = lock(() -> get(state.worker_links, wid, nothing), state.lock)
+    (link === nothing || objectid(link) == w.ended_on) && return nothing
+    if !can(worker, "watch_file")
+        w.ended_on = objectid(link)
+        @warn "background task: its worker runs a build without watch_file; it stays in the bar until it is stopped or the worker updates" worker = worker.name id = tool_id(m)
+        return nothing
     end
-    return r.exists && occursin(SUBAGENT_DONE_MARKER, r.chunk)
+    w.active = true
+    Base.errormonitor(@async follow_output!(m, chat, wid, objectid(link)))
+    return nothing
 end
 
-# Tail a background task's output file on the worker: stream new bytes (bash),
-# advance the read cursor, and report whether the writer's fd has closed — the
-# deterministic done-signal for BOTH a background shell and an async subagent
-# (its transcript `outputFile`).
-function poll_output_file!(m::ToolMsg; stream::Bool)
-    chat = tool_chat(m)
-    chat === nothing && return false
-    state = chat.state
-    wid   = bg_worker_id(state, chat)
-    wid === nothing && return false
-    r = try
-        tail_worker_file(state, wid, m.bg_output_path; offset = m.bg_offset, timeout = 10.0)
+function follow_output!(m::BackgroundMsg, chat::ChatModel, wid::AbstractString, link_id::UInt)
+    w = m.watch
+    ended = "the worker closed the watch"
+    try
+        ch = open_worker_channel(chat.state, wid, watch_header(m); priority = 2)
+        w.channel = ch
+        # A task that left the bar while the channel opened.
+        m.task_bar === nothing && return close(ch)
+        for frame in ch
+            msg = decode_control(frame)
+            haskey(msg, "chunk") && output_arrived!(m, chat, String(msg["chunk"]), Int(msg["offset"]))
+            if get(msg, "done", false) === true
+                m.bg_offset = Int(get(msg, "offset", m.bg_offset))
+                w.done = true
+            end
+        end
     catch e
-        @debug "taskbar tail failed (will retry)" id = tool_id(m) exception = e
-        return false
+        # The link died, or the worker could not open the watch.
+        (e isa WebSockets.WebSocketError || e isa WorkerUnreachableError ||
+         e isa WorkerLink.LinkDead || e isa ErrorException) || rethrow()
+        ended = sprint(showerror, e)
+    finally
+        w.channel = nothing
+        w.active = false
     end
-    if r.exists && r.offset > m.bg_offset
-        stream && m isa BashToolMsg && (m.bg_text *= r.chunk; stream_bg_update!(chat, m))
-        m.bg_offset = r.offset
+    if !w.done && m.task_bar !== nothing
+        w.ended_on = link_id
+        @warn "background task: the worker stopped following its output; following it again on the worker's next link" id = tool_id(m) path = m.bg_output_path reason = ended
     end
-    # Done ONLY when the file EXISTS and its writer fd has closed (Linux /proc
-    # scan) — the subagent / shell created its output, wrote it, and exited. A
-    # MISSING file is NEVER done: it either hasn't been created yet (the launch
-    # race — the `outputFile` path lands on the wire BEFORE the file is on disk,
-    # and finalizing on `!exists` would kill the pill a tick after launch) or was
-    # removed externally; absence is not a completion signal we can trust. When
-    # fd state is unknowable (non-Linux worker, `open_known == false`) we can't
-    # confirm a close either, so the pill stays until ⊗ stop rather than guess.
-    return r.exists && r.open_known && !r.open
+    return nothing
 end
+
+function output_arrived!(m::BashToolMsg, chat::ChatModel, chunk::String, offset::Int)
+    m.bg_text *= chunk
+    m.bg_offset = offset
+    stream_bg_update!(chat, m)
+    return nothing
+end
+output_arrived!(::TaskToolMsg, ::ChatModel, ::String, ::Int) = nothing
+
+# The task left the bar: the worker can stop following it.
+function stop_watch!(m::BackgroundMsg)
+    ch = m.watch.channel
+    ch === nothing || close(ch)
+    return nothing
+end
+stop_watch!(::Any) = nothing
 
 # ── finalize!: persist + emit the final bubble state as a task leaves the bar ─
-# The subagent reached `end_turn` (or was ⊗-stopped) — it ENDED. We don't get its
-# exit status, so "completed" is the honest terminal. `close` stamps the feed's
-# "N steps" trace + persists; we then EMIT the real terminal `tool_update` so the
-# bubble flips from the in-progress state (the launch-ack `completed` was HIDDEN
-# while it ran, see `process_update!`) to completed. `request_tool_stop!` overrides
-# this with "stopped" right after.
+# Persist and emit the terminal state, preserving interruption failures and
+# explicit dismissal summaries. The launch acknowledgement alone says nothing
+# about whether the background work finished.
 function finalize!(m::TaskToolMsg)
     h = m.message
     h.status in ("completed", "failed") || (h.status = "completed")
@@ -1490,17 +1680,18 @@ function finalize!(m::BashToolMsg)
     h = m.message
     model = h.chat
     model === nothing && return nothing
-    h.status = "completed"
+    h.status == "failed" || (h.status = "completed")
     h.finished_at === nothing && (h.finished_at = time())
+    n = bg_line_count(m)
+    h.status == "failed" || (h.summary = "done · $n line$(n == 1 ? "" : "s")")
     write_bg_content!(model.chat_dir, m)
     try
         append_tool(model.chat_session, m)
     catch e
         @warn "append_tool for finished bg task failed" id = h.id exception = e
     end
-    n = bg_line_count(m)
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => h.id,
-        "status" => "completed", "summary" => "done · $n line$(n == 1 ? "" : "s")",
+        "status" => h.status, "summary" => h.summary,
         "finished_at" => h.finished_at))
     return nothing
 end
@@ -1528,6 +1719,7 @@ end
 # deliberately NOT here either: it blocks the agent, it is not detached work.)
 
 taskbar_label(b::ToolMsg)     = first(pretty_tool_title(tool_title(b)))
+taskbar_icon(b::ToolMsg)      = tool_icon(tool_kind(b))
 taskbar_label(b::BashToolMsg) = first(pretty_tool_title(bash_display_title(b)))
 
 # Live slot label (taskbar.jl calls this per clock tick): re-derive from the
@@ -1569,7 +1761,7 @@ function tool_taskbar_item(chat::ChatModel, b::ToolMsg)
         i = findfirst(m -> m === b, s.msgs_store)
         i === nothing ? -1 : i - 1
     end
-    TaskbarItem(tool_id(b), :tool, tool_icon(tool_kind(b)), taskbar_label(b);
+    TaskbarItem(tool_id(b), :tool, taskbar_icon(b), taskbar_label(b);
                 started = tool_started_at(b), stoppable = true, msg_index = idx,
                 source = b)
 end
@@ -1755,6 +1947,7 @@ tool_key(::JuliaContinueToolMsg)     = "bt_julia_continue"
 tool_key(::JuliaInterruptToolMsg)    = "bt_julia_interrupt"
 tool_key(::JuliaRestartToolMsg)      = "bt_julia_restart"
 tool_key(::JuliaListSessionsToolMsg) = "bt_julia_list_sessions"
+tool_key(::JuliaWaitToolMsg)         = "bt_julia_wait"
 
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
     pretty_title, server = pretty_tool_title(tool_title(m))
@@ -1815,6 +2008,7 @@ end
 function augment_header!(d::Dict, m::TaskToolMsg, chat_dir::AbstractString)
     m.is_background && (d["background"] = true)
     d["stoppable"] = true
+    d["dismiss_only"] = true
     m.task_name === nothing || (d["task_name"] = m.task_name)
     # Subagent-feed snapshot: a remounted / scrolled-back bubble rebuilds its
     # activity section from the header alone (live growth rides the
@@ -1834,7 +2028,10 @@ end
 # Mirrors BonitoMCP's DEFAULT_TIMEOUT / Pkg auto-disable (session.jl) so the
 # badge shows what the server will actually do when no explicit timeout rides
 # on the call.
-function eval_timeout_label(m::JuliaEvalCall)
+# A background eval returns at once: there is no checkpoint to show.
+eval_timeout_label(m::JuliaEvalToolMsg) = m.background ? nothing : checkpoint_label(m)
+eval_timeout_label(m::JuliaContinueToolMsg) = checkpoint_label(m)
+function checkpoint_label(m::JuliaEvalCall)
     m.timeout === nothing ||
         return m.timeout > 0 ? "$(round(Int, m.timeout))s" : "no timeout"
     return occursin(r"\bPkg\.", m.code) ? "no timeout" : "30s"
@@ -1854,7 +2051,8 @@ function eval_extras!(d::Dict, m::JuliaEvalCall)
     # Ship the code being executed so the client paints a compact preview while
     # the eval runs (the post-completion body renders the same code in Monaco).
     isempty(m.code) || (d["code"] = m.code)       # `continue` has none — that's fine
-    d["timeout_s"] = eval_timeout_label(m)
+    lbl = eval_timeout_label(m)
+    lbl === nothing || (d["timeout_s"] = lbl)
     d["stoppable"] = true                         # a JuliaEvalCall holds an eval in flight
     # Running on ANOTHER worker: the card wears its name as a badge.
     isempty(m.worker) || (d["worker"] = m.worker)
@@ -1862,6 +2060,8 @@ function eval_extras!(d::Dict, m::JuliaEvalCall)
     # edit-tool mechanism): the body stays mounted, collapse is a HEIGHT cap
     # (~4 code lines) — so the "preview" is the real Monaco Code editor.
     d["compact_body"] = true
+    # A run going on past its call keeps the card live (eval_runs.jl).
+    run_header_extras!(d, m)
     return d
 end
 
@@ -1872,13 +2072,18 @@ executed_preview(::MCPToolMsg) = nothing
 mcp_env(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}) =
     (isempty(m.env_path) ? "the active session" : m.env_path) *
     (isempty(m.worker) ? "" : " on " * m.worker)
-executed_preview(m::JuliaInterruptToolMsg)   = "interrupt (SIGINT) " * mcp_env(m)
+executed_preview(m::JuliaInterruptToolMsg)   =
+    isempty(m.run) ? "interrupt (SIGINT) " * mcp_env(m) : "interrupt run " * m.run
 executed_preview(m::JuliaRestartToolMsg)     = "restart (fresh process) " * mcp_env(m)
 executed_preview(::JuliaListSessionsToolMsg) = "list active Julia sessions"
+executed_preview(m::JuliaWaitToolMsg) =
+    "wait for " * (isempty(m.runs) ? "every open run" : join(m.runs, ", ")) *
+    (m.until == "any" ? " (the first to finish)" : "")
 
 # Both (1) and (2), for the header build AND every later snap.
 function mcp_input_extras!(d::Dict, m::MCPToolMsg)
     eval_extras!(d, m)
+    jump_extras!(d, m)
     ex = executed_preview(m)
     ex === nothing || (d["command"] = ex)
     return d
@@ -2055,11 +2260,11 @@ function msg_to_dict(m::UserMsg, _chat_dir::AbstractString="")
     d = Dict{String,Any}("type" => "user", "text" => m.text,
                          "queued" => m.queued, "queue_pos" => m.queue_pos,
                          "auto" => m.auto)
-    # Attached images render INLINE in the bubble: swap the raw suffix block
-    # for an `attachments` list the JS gallery understands. The full text (with
-    # the suffix) still goes to the agent prompt and chat.md untouched — only
-    # the wire/display form is split. Files the route can't serve (foreign
-    # extension) stay in the text form.
+    # Attachments render in the bubble, images inline and other files as chips:
+    # swap the raw suffix block for an `attachments` list the JS gallery
+    # understands. The full text (with the suffix) still goes to the agent
+    # prompt and chat.md untouched; only the wire/display form is split. A
+    # message naming something that is not an attachment stays in text form.
     m.chat === nothing && return d
     pid = m.chat.project_id
     isempty(pid) && return d
@@ -2067,11 +2272,12 @@ function msg_to_dict(m::UserMsg, _chat_dir::AbstractString="")
     atts = Any[]
     for rel in rels
         bn = basename(rel)
+        is_attachment_name(bn) || continue
         mime = get(ATTACHMENT_MIME_BY_EXT, lowercase(lstrip(splitext(bn)[2], '.')), nothing)
-        mime === nothing && continue
+        # An image shows inline; any other file is a chip that opens it.
         push!(atts, Dict{String,Any}(
             "url"  => "/attachment/$(pid)?file=$(HTTP.escapeuri(bn))",
-            "name" => bn, "mime" => mime))
+            "name" => bn, "mime" => something(mime, ""), "kind" => mime === nothing ? "file" : "image"))
     end
     if !isempty(atts) && length(atts) == length(rels)
         d["text"] = display
@@ -2161,8 +2367,8 @@ const EDIT_BODY_EXPANDED_PX = 2000
 # Tool-body rendering (Bonito DOM tree, includes BonitoBook MonacoEditor /
 # DiffEditor instances). Called only when the user clicks expand; output is
 # shipped to JS via Bonito.dom_in_js, which mounts the sub-DOM (Monaco etc.)
-# inside the placeholder. Collapse on the JS side just empties the placeholder
-# and lets the browser GC the editor instances.
+# inside the placeholder. Collapse on the JS side empties the placeholder; the
+# sub-session ends with it, and BonitoBook disposes its editors then.
 
 function detect_language(path::AbstractString)
     ext = lowercase(splitext(path)[2])
@@ -2206,45 +2412,19 @@ const MONACO_RESIZE_INIT = js"""(monacoEditor) => {
             editor.layout({ width: w, height: h });
         };
         fit();
-        // Resizing from INSIDE a ResizeObserver callback is what makes the
-        // browser report "ResizeObserver loop completed with undelivered
-        // notifications" — `fit` changes the editor's box, which resizes the
-        // very element being observed, so delivery spills into the next frame.
-        // The size-unchanged guard above can't prevent it (the first real
-        // resize legitimately re-lays-out). Deferring to the next animation
-        // frame breaks the synchronous loop: the observer callback returns
-        // immediately and the layout happens outside the delivery cycle. The
-        // pending flag coalesces a burst of notifications into ONE layout.
+        // `fit` from inside the observer would resize what it observes ("ResizeObserver
+        // loop completed with undelivered notifications"): the next frame instead,
+        // one layout per burst.
         let pending = false;
         const ro = new ResizeObserver(() => {
             if (pending) return;
             pending = true;
-            requestAnimationFrame(() => { pending = false; fit(); });
+            requestAnimationFrame(() => { pending = false; if (!monacoEditor.disposed) fit(); });
         });
         ro.observe(div.parentElement || div);
-        // The clamped `.bt-subsection-body` around us owns the scroll (the editor
-        // is sized to full content height). Monaco swallows the wheel by default,
-        // and BonitoBook doesn't reliably forward `scrollbar.handleMouseWheel`, so
-        // drive the nearest scroll container ourselves — capture phase, i.e. BEFORE
-        // Monaco sees the event — since the editor never needs its own scroll.
-        let sc = div.parentElement;
-        while (sc && !/(auto|scroll)/.test(getComputedStyle(sc).overflowY)) sc = sc.parentElement;
-        if (sc) div.addEventListener('wheel', (e) => {
-            sc.scrollTop += e.deltaY; sc.scrollLeft += e.deltaX; e.preventDefault();
-        }, { capture: true, passive: false });
-        // Tear the observers down when the editor is removed from its parent.
-        // Scope the observer to the PARENT's direct children (NOT document.body /
-        // subtree — that fires on every DOM mutation, and one per editor turns a
-        // page full of code blocks into an O(editors × mutations) storm). An
-        // ancestor-level removal detaches the whole cycle (parent↔ro↔mo) with no
-        // live ref, so GC reclaims it.
-        const parent = div.parentElement;
-        if (parent) {
-            const mo = new MutationObserver(() => {
-                if (!div.isConnected) { ro.disconnect(); mo.disconnect(); }
-            });
-            mo.observe(parent, { childList: true });
-        }
+        // Disposed with its session (BonitoBook's `on_free`). The wheel is
+        // BonitoBook's too (`pass_wheel_unless_scrollable`).
+        div.addEventListener('monaco-editor-disposed', () => ro.disconnect(), { once: true });
     });
 }"""
 
@@ -2257,10 +2437,8 @@ function monaco_readonly(text::AbstractString, lang::AbstractString)
         scrollBeyondLastLine=false,
         lineNumbers="off",
         minimap=Dict(:enabled => false),
-        # Width fit + wheel-to-scroll-container are handled in MONACO_RESIZE_INIT
-        # (BonitoBook doesn't reliably forward `scrollbar.*` to monaco.editor.create,
-        # so the option-based approaches — `alwaysConsumeMouseWheel`/`handleMouseWheel`
-        # — didn't take; the init drives the scroll container itself instead).
+        # Width fit is handled in MONACO_RESIZE_INIT; the wheel by BonitoBook,
+        # which hands it to the page unless the editor can scroll itself.
         # Force light Monaco. BonitoBook's "default" theme follows the host OS
         # `prefers-color-scheme` (dark here), which clashed with the light app.
         theme=Observable("vs"),
@@ -2514,8 +2692,9 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     # result embed — and that second render detached the Code section's Monaco
     # container while its async `create` was still resolving, which surfaced as
     # an unhandled "Cannot read properties of null (reading 'parentNode')".
-    # `eval_result!` fills both observables when the call completes.
-    eval_result!(m, content)
+    # `eval_result!` fills both observables when the call completes — or, for
+    # a run that outlived its call, when the RUN ends (`result_content`).
+    eval_result!(m, result_content(m, content))
     # The Output section: a `pin_end` Collapsable whose body owns the scrollbar
     # and stays pinned to the newest line, streaming AND done — same widget,
     # same chrome, no styling jump on completion.
@@ -2569,6 +2748,7 @@ Every other text block IS the terminal output, verbatim. Zero content sniffing.
 A checkpoint / `nothing` result simply has no descriptor.
 """
 function eval_result!(m::JuliaEvalCall, content)
+    content === nothing && return nothing       # a run still going: nothing final yet
     chat = tool_chat(m)
     chat === nothing && return nothing
     tool_status(m) in ("completed", "failed") || return nothing
@@ -2583,7 +2763,7 @@ function eval_result!(m::JuliaEvalCall, content)
     output = join(String[c.text for c in content[begin:stop]
                          if c isa AgentClientProtocol.TextContent &&
                             bonito_upgrade_descriptor(c.text) === nothing], "\n")
-    isempty(strip(output)) || set_once!(m.stream_text, output)
+    isempty(strip(output)) || lock(() -> set_once!(m.stream_text, output), m.stream_lock)
     # Deprecation guard: an outdated worker's output is a ```julia code echo with
     # no v3 descriptor. Surface the hint instead of a silently-mangled card (the
     # raw output above is kept, so nothing is hidden).
@@ -2615,8 +2795,16 @@ function eval_result_node(m::JuliaEvalCall, v)
         u = v.upgrade
         return BonitoUpgradeCard(chat, u.current, u.need, u.env, u.add)
     end
-    return wrap_for_detach(tool_id(m),
-        remote_result(chat.state, v.payload, chat.project_id))
+    desc = result_descriptor(v.payload)
+    controls = desc === nothing || desc.errored ? () :
+        (ShareControl(; hint = "Share this live result with anyone who has the link. " *
+                          "It lasts until the result is closed or its Julia session ends. " *
+                          "Manage passwords and end links in Settings.",
+                      progress = chat.plotpane === nothing ? nothing : chat.plotpane.progress) do
+            share_result!(chat.state, chat.project_id, v.payload)
+        end,)
+    return wrap_for_detach(tool_id(m), DOM.div(controls...,
+        remote_result(chat.state, v.payload, chat.project_id)))
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
@@ -2844,7 +3032,12 @@ function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
         DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
             class = "bt-tool-error")
     end
-    return Bonito.jsrender(session, body)
+    controls = isempty(st.project_id) ? () :
+        (ShareControl(; hint = "Share this file with anyone who has the link while its worker is online. " *
+                                     "Manage passwords and end links in Settings.") do
+            share_project_file!(st.state, st.project_id, st.path)
+        end,)
+    return Bonito.jsrender(session, DOM.div(controls..., body))
 end
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
@@ -3016,55 +3209,73 @@ const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
 const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
     ".avif", ".ico")
 
-# Click-to-enlarge. Clones the media into a fullscreen overlay (Esc or backdrop
-# click closes). Self-contained so there's no global-JS dependency or load-order
-# coupling; shared by bt_show previews and inline Read-tool images.
+# Images use the shared viewer without copying thumbnail sizing or handlers.
+# Videos enter fullscreen in the click handler to retain user activation;
+# cloning a video would download it again and restart playback.
 const LIGHTBOX_OPEN_JS = js"""
 event => {
     event.stopPropagation();
     const wrap = event.currentTarget.closest('.bt-media-wrap');
     const media = wrap && wrap.querySelector('.bt-media');
     if (!media) return;
-    const overlay = document.createElement('div');
-    overlay.className = 'bt-lightbox-overlay';
-    const big = media.cloneNode(true);
-    big.classList.add('bt-lightbox-media');
-    if (big.tagName === 'VIDEO') { big.controls = true; big.autoplay = true; }
-    overlay.appendChild(big);
-    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
-    const onkey = e => { if (e.key === 'Escape') close(); };
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
-    document.addEventListener('keydown', onkey);
-    document.body.appendChild(overlay);
+    if (media.tagName === 'VIDEO') {
+        // iPhones only have the webkit call
+        if (media.requestFullscreen) media.requestFullscreen().catch(e => console.warn('fullscreen refused', e));
+        else if (media.webkitEnterFullscreen) media.webkitEnterFullscreen();
+        return;
+    }
+    $(ChatLib).then(lib => lib.openLightbox(media));
 }
 """
 
-# Copy the image to the clipboard (Signal-style). PNG copies cleanly; other
-# types are re-encoded to PNG via a canvas so `ClipboardItem` accepts them.
+# Copy the image to the clipboard (Signal-style) as PNG, the one image type every
+# clipboard takes, drawn from the <img> already on screen. The item is made during
+# the click with a promised blob: Safari refuses a clipboard write after an await.
 const COPY_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
-    const wrap = event.currentTarget.closest('.bt-media-wrap');
-    const media = wrap && wrap.querySelector('.bt-media');
-    const srcEl = media && (media.tagName === 'VIDEO' ? media.querySelector('source') : media);
-    const src = srcEl && (srcEl.currentSrc || srcEl.src || srcEl.getAttribute('src'));
-    if (!src || !navigator.clipboard || !window.ClipboardItem) return;
-    fetch(src).then(r => r.blob()).then(blob => {
-        if (blob.type === 'image/png') {
-            return navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
-        }
-        return createImageBitmap(blob).then(bmp => {
-            const cv = document.createElement('canvas');
-            cv.width = bmp.width; cv.height = bmp.height;
-            cv.getContext('2d').drawImage(bmp, 0, 0);
-            return new Promise(res => cv.toBlob(res, 'image/png'));
-        }).then(png => navigator.clipboard.write([new ClipboardItem({'image/png': png})]));
-    }).catch(() => {});
+    const btn = event.currentTarget;
+    const img = btn.closest('.bt-media-wrap')?.querySelector('img.bt-media');
+    const say = t => { btn.textContent = t; setTimeout(() => { btn.textContent = '⧉'; }, 1200); };
+    if (!img || !img.complete || !navigator.clipboard?.write || !window.ClipboardItem) return say('✕');
+    const png = new Promise((resolve, reject) => {
+        const cv = document.createElement('canvas');
+        cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+        cv.getContext('2d').drawImage(img, 0, 0);
+        cv.toBlob(b => b ? resolve(b) : reject(new Error('could not encode the image')), 'image/png');
+    });
+    navigator.clipboard.write([new ClipboardItem({'image/png': png})]).then(() => say('✓'), () => say('✕'));
 }
 """
 
 # Download the media file. Uses the wrap's `data-filename` (the source path's
 # basename) when present, else a generic name.
+# A picture or clip that does not load because the worker did not deliver it.
+# The card only links to the file (`show_media_src`) and nothing asks the worker
+# first, so this is where a deleted file (or a worker that is offline) shows:
+# said in its place, not left as a broken-image icon. A file the browser cannot
+# DECODE raises the same event; asking for its first byte tells the two apart,
+# and one that is there is left as it is.
+const MEDIA_MISSING_JS = js"""
+event => {
+    const el = event.currentTarget;
+    const wrap = el.closest('.bt-media-wrap');
+    if (!wrap || wrap.dataset.missing) return;
+    const src = el.src || el.getAttribute('src');
+    const missing = () => {
+        if (wrap.dataset.missing) return;
+        wrap.dataset.missing = '1';
+        const note = document.createElement('div');
+        note.className = 'bt-tool-error bt-media-missing';
+        note.textContent = "Can't show " + (wrap.dataset.filename || 'this file') +
+            ': the worker did not deliver it (the file is gone, or the worker is offline).';
+        wrap.replaceChildren(note);
+    };
+    if (!src) return missing();
+    fetch(src, {headers: {Range: 'bytes=0-0'}}).then(r => { r.ok || missing(); }, missing);
+}
+"""
+
 const DOWNLOAD_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
@@ -3083,11 +3294,16 @@ event => {
 # A media element (image / video) with click-to-enlarge. `src` can be a streamed
 # proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
 # an <img>/<video> src. `mime` only matters for the <video><source> type. Images
-# enlarge on click; videos keep native controls for clicks and enlarge via the ⤢
-# button (so a frame click still plays/pauses). `worker_path` names the file on
+# enlarge on click; videos keep native controls for clicks and go fullscreen via
+# the ⤢ button (so a frame click still plays/pauses). `worker_path` names the file on
 # the worker; a picture that has one can be made the chat's icon (chat_icons.jl).
+# `size` is the file's natural `(width, height)` when the browser measured it
+# before (measured_sizes.jl): as the element's `width`/`height` it lays out at
+# its size before the bytes arrive, so nothing below it moves when they do.
 function media_element(src, mime::AbstractString, is_video::Bool;
-                       filename::AbstractString = "", worker_path::AbstractString = "")
+                       filename::AbstractString = "", worker_path::AbstractString = "",
+                       size::Union{NTuple{2,Int},Nothing} = nothing)
+    dims = size === nothing ? (;) : (; width = size[1], height = size[2])
     inner = is_video ?
         # `playsinline` is not cosmetic: without it iOS Safari force-enters its
         # own fullscreen the moment you press play, so every tap on a video went
@@ -3095,11 +3311,11 @@ function media_element(src, mime::AbstractString, is_video::Bool;
         # straight into the bug where the render window detached the node under
         # it. Inline is the right default anyway; fullscreen stays available from
         # the native controls, as a choice.
-        DOM.video(DOM.source(; src, type = mime); controls = true, class = "bt-media",
-            playsinline = true,
-            style = Styles("max-width" => "100%", "display" => "block")) :
-        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS,
-            style = Styles("max-width" => "100%", "display" => "block", "cursor" => "zoom-in"))
+        DOM.video(DOM.source(; src, type = mime, onerror = MEDIA_MISSING_JS); controls = true,
+            class = "bt-media", playsinline = true, dims...,
+            style = Styles("max-width" => "100%", "height" => "auto", "display" => "block")) :
+        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS, onerror = MEDIA_MISSING_JS, dims...,
+            style = Styles("max-width" => "100%", "height" => "auto", "display" => "block", "cursor" => "zoom-in"))
     # Hover action row (Signal-style): enlarge · copy · download. Copy is
     # image-only (no clipboard-image for video). All revealed on wrap hover.
     actions = DOM.div(
@@ -3109,31 +3325,46 @@ function media_element(src, mime::AbstractString, is_video::Bool;
             (DOM.button("⧉"; class = "bt-media-action bt-media-copy", type = "button",
                 title = "Copy image", onclick = COPY_MEDIA_JS),))...,
         DOM.button("⤓"; class = "bt-media-action bt-media-download", type = "button",
-            title = "Download", onclick = DOWNLOAD_MEDIA_JS);
+            title = "Download", onclick = DOWNLOAD_MEDIA_JS),
+        (!is_video && !isempty(worker_path) ?
+            (DOM.button("▣"; class = "bt-media-action bt-media-chat-icon", type = "button",
+                title = "Set as chat icon", var"aria-label" = "Set as chat icon"),) : ())...;
         class = "bt-media-actions")
-    return DOM.div(inner, actions;
+    # The error can come before its handler is attached: the session that
+    # attaches it starts once its payload is fetched, and a missing file's 404
+    # can be back sooner, leaving a broken image where the note belongs. So a
+    # media element that already failed gets the event again, after the
+    # handler (rendered before this). The handler checks the file before it
+    # says anything, so an image without intrinsic size costs one byte request.
+    replay_error = js"""(el => {
+        const failed = el.tagName === 'IMG' ? el.complete && el.naturalWidth === 0
+                                            : el.networkState === HTMLMediaElement.NETWORK_NO_SOURCE;
+        if (failed) (el.tagName === 'IMG' ? el : el.querySelector('source')).dispatchEvent(new Event('error'));
+    })($(inner))"""
+    # Its own styles, so it renders the same outside the dashboard (a shared
+    # link's page, an app of your own).
+    return DOM.div(MediaStyles, inner, actions, replay_error;
         class = "bt-media-wrap",
         (isempty(filename) ? (;) : (; dataFilename = String(filename)))...,
         (isempty(worker_path) ? (;) : (; dataWorkerPath = String(worker_path)))...)
 end
 
-# Disk media belongs to the worker, not the chat's eval process. Its signed URL
-# remains valid after chat teardown/reload; the HTTP route reads the current file
-# through the worker control connection and revalidates on every browser request.
+# Disk media is a LINK to the worker's file, never a copy. The signed URL stays
+# valid after the chat closes or reloads, and its route streams the current
+# bytes from the worker whenever the browser asks (`serve_worker_file`). Nothing
+# is fetched or even stat'd to show it: a video costs nothing until it plays,
+# and a file that is gone answers 404 then. It used to stat first and, when the
+# worker was slow to answer, copy the whole file to the server instead.
 function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     proj = get(st.state.projects[], st.project_id, nothing)
-    if proj !== nothing
-        info = try
-            stat_worker_path(st.state, proj.worker_id, show_worker_path(st))
-        catch e
-            e isa WorkerUnreachableError || rethrow()
-            nothing
-        end
-        if info !== nothing
-            info.isfile || error("file no longer exists on worker: $(st.path)")
-            return worker_file_url(st.state, proj.worker_id, info.path)
-        end
-    end
+    proj === nothing && return mirror_src(st, session)
+    return worker_file_url(st.state, proj.worker_id, show_worker_path(st))
+end
+
+# A chat with no project has no worker to link to: the server's copy, fetched
+# if it can be, else the last one mirrored. The `?v=` busts the browser's cache
+# when a later fetch replaces it.
+function mirror_src(st::ShowTool, session::Union{Bonito.Session,Nothing})
     local_path = fetch_show_file(st)
     asset = Bonito.Asset(local_path)
     session === nothing && return asset
@@ -3162,8 +3393,8 @@ end
 
 function read_image_element(state::ServerState, project_id::AbstractString,
                             m::ToolMsg, c::ImageContent)
-    fp = m isa Union{EditToolMsg,ReadToolMsg} && !isempty(m.file_path) ?
-        m.file_path : nothing
+    named = m isa Union{EditToolMsg,ReadToolMsg} ? tool_file_path(m) : ""
+    fp = isempty(named) ? nothing : named
     fname = fp === nothing ? "" : basename(String(fp))
     # kimi's ReadMediaFile also ships VIDEO as an ImageContent-shaped block
     # (recovered from its rawOutput parts); a video mime in an <img> renders
@@ -3176,7 +3407,8 @@ function read_image_element(state::ServerState, project_id::AbstractString,
             info = stat_worker_path(state, proj.worker_id, show_worker_path(st))
             if info.isfile
                 return media_element(worker_file_url(state, proj.worker_id, info.path),
-                    c.mime_type, is_video; filename = fname, worker_path = info.path)
+                    c.mime_type, is_video; filename = fname, worker_path = info.path,
+                    size = media_size(state, proj.worker_id, info.path))
             end
         catch e
             e isa InterruptException && rethrow()
@@ -3393,7 +3625,7 @@ function save_editor!(fe::FileEditor, content::AbstractString)
     proj = get(fe.state.projects[], fe.project_id, nothing)
     proj === nothing &&
         error("no project bound to this view — can't push $(basename(fe.worker_path)) to a worker")
-    haskey(fe.state.worker_control_ws, proj.worker_id) &&
+    reachable(fe.state, proj.worker_id) &&
         return (send_file_to_worker!(fe.state, proj.worker_id, fe.server_path, fe.worker_path;
                                      handoff_timeout = 15.0); true)
     error("worker '$(proj.worker_id)' is not connected — $(basename(fe.worker_path)) was NOT saved")
@@ -3405,8 +3637,9 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     content = tool_content_for_render(m, chat_dir)
     # Live tool whose content hasn't arrived yet (user expanded mid-stream
     # before any snap with content reached us). Render a quiet placeholder
-    # instead of the alarming "details not persisted" message — the next
-    # tool_update will trigger a fresh render with real content.
+    # instead of the alarming "details not persisted" message — the client asks
+    # again on the next tool_update while the placeholder is showing
+    # (`onToolUpdate`), which renders the real content.
     #
     # …unless the message can already draw itself from its own INPUT. That is
     # the Edit card's normal case, not a rare one: `auto_expand_body` opens an
@@ -3591,8 +3824,40 @@ function Base.append!(m::AgentMsg, t::AbstractString)
         m.text *= t
         m.html = ""
     end
-    chat_emit(m.chat, wire_chunk(m, t))
+    stream_chunk!(m)
     return m
+end
+
+# Each chunk on the wire is the bubble's WHOLE text rendered (see `wire_chunk`),
+# and the browser swaps the bubble's html for it. Per chunk, that was a parse of
+# everything so far, here and as DOM there: quadratic in the reply, and current
+# agents stream chunks of a few characters (a median of 4, up to 62 per bubble).
+# So chunks go out at most once per `every` seconds: the first of a burst at
+# once, what follows it with the next due one. `close` sends the final render
+# right away, and a pending flush then has nothing left to say.
+function stream_chunk!(m::AgentMsg; every::Real = 0.05)
+    wait_s = lock(MARKDOWN_LOCK) do
+        m.flush_pending && return nothing
+        wait_s = m.flushed_at + every - time()
+        wait_s > 0 && (m.flush_pending = true)
+        wait_s
+    end
+    wait_s === nothing && return nothing
+    if wait_s > 0
+        Timer(_ -> flush_chunk!(m), wait_s)
+    else
+        flush_chunk!(m)
+    end
+    return nothing
+end
+
+function flush_chunk!(m::AgentMsg)
+    lock(MARKDOWN_LOCK) do
+        m.flush_pending = false
+        m.flushed_at = time()
+    end
+    m.in_flight && chat_emit(m.chat, wire_chunk(m, ""))
+    return nothing
 end
 Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wire_chunk(m, t)); m)
 # Summaries arrive whole on replay; live they can stream through `process_update!`
@@ -3717,6 +3982,58 @@ markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
     inner = sprint(io -> CM.html(io, MARKDOWN_PARSER(defuse_table_rule(String(text)))))
     "<div class=\"markdown-body\">" * inner * "</div>"
 end
+
+# The same for a markdown FILE, whose pictures and clips are relative to it:
+# every relative source (an image's destination, the `src` of a raw
+# `<img>`/`<video>`/`<source>`/`<audio>`) becomes `link(path)`, `path` being it
+# unescaped and without query or fragment; `nothing` leaves one as written.
+# `![clip](clip.mp4)` becomes a video, as in a shared page. `raw_html = false`
+# leaves out the HTML written into the text, and links to a `javascript:` url.
+function markdown_html(text::AbstractString, link::Function; raw_html::Bool = true)
+    inner = lock(MARKDOWN_LOCK) do
+        ast = MARKDOWN_PARSER(defuse_table_rule(String(text)))
+        for (node, entering) in ast
+            entering || continue
+            # `{onclick=…}` attributes survive `safe`: without raw HTML, none at all.
+            raw_html || (node.meta = nothing)
+            if node.t isa CM.Image
+                url = linked_source(node.t.destination, link)
+                url === nothing || (node.t.destination = url)
+            elseif node.t isa CM.HtmlInline || node.t isa CM.HtmlBlock
+                node.literal = replace(node.literal, RAW_MEDIA_TAG => tag -> relink_tag(tag, link))
+            end
+        end
+        sprint(io -> CM.html(io, ast; safe = !raw_html))
+    end
+    inner = replace(inner, VIDEO_IMAGE_RE => s"<video controls preload=\"metadata\" src=\"\1\" title=\"\2\"></video>")
+    return "<div class=\"markdown-body\">" * inner * "</div>"
+end
+
+const RAW_MEDIA_TAG = r"<(?:img|video|source|audio)\b[^>]*\bsrc=\"[^\"]*\""i
+const VIDEO_IMAGE_RE = r"<img src=\"([^\"]+\.(?:mp4|webm|m4v|mov|ogv))\" alt=\"([^\"]*)\"\s*/?>"i
+
+function relink_tag(tag::AbstractString, link::Function)
+    m = match(r"\bsrc=\"([^\"]*)\""i, tag)
+    url = linked_source(m.captures[1], link)
+    url === nothing && return tag
+    return replace(tag, m.match => "src=\"$(url)\""; count = 1)
+end
+
+"""
+    relative_reference(url) -> Union{String,Nothing}
+
+The local path a link in a markdown file names, unescaped and without its query
+or fragment; `nothing` for one that is not relative (a scheme, a leading `/`)
+or empty.
+"""
+function relative_reference(url::AbstractString)
+    u = String(first(split(first(split(url, '#'; limit = 2)), '?'; limit = 2)))
+    (isempty(u) || startswith(u, '/') || occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", u)) && return nothing
+    return HTTP.unescapeuri(u)
+end
+
+linked_source(url::AbstractString, link::Function) =
+    (path = relative_reference(url); path === nothing ? nothing : link(path))
 
 # ── Working around CommonMark's GFM table rule ───────────────────────────────
 # `CommonMark.TableRule` DELETES TEXT. `gfm_table` runs
@@ -3928,20 +4245,16 @@ end
 
 # Context/cost telemetry (after every assistant message): pure header
 # metadata, no bubble, no persistence — the next turn refreshes it.
+#
+# While the model thinks, recent models stream no thinking text: the updates
+# that come instead carry Claude Code's estimate of the tokens thought so far,
+# and the chat shows it under the last message, so a long think reads as
+# progress and not as a stalled agent.
 function process!(chat::ChatModel, m::AgentClientProtocol.UsageUpdate)
-    # claude-agent-acp tags a cycle's RESULT `usage_update` with its origin;
-    # `task-notification` and friends mean the model did that work on its own, so
-    # the episode this closes is over. A HINT, not the contract: the adapter
-    # emits this conditionally, and treating it as the only way out is what left
-    # the spinner running over an idle agent. `Unprompted` expires on quiet
-    # regardless; this just ends it promptly when the agent does say so.
-    if AgentClientProtocol.is_autonomous_origin(m.origin_kind)
-        c = client(chat.agent)
-        c === nothing || (@atomic c.conn.last_work_at = 0.0)
-        refresh_activity!(chat)
-    end
     shared(chat).usage[] = (used = m.used, size = m.size,
                             cost = m.cost_amount, origin = m.origin_kind)
+    m.thinking_tokens === nothing ||
+        chat_emit(chat, Dict{String,Any}("type" => "thinking_tokens", "tokens" => m.thinking_tokens))
     return nothing
 end
 
@@ -4155,9 +4468,10 @@ end
 # (`snap_summary`, dispatch on type): `env_path` rides the STREAMED rawInput, so
 # it isn't known at construction — once `update_from_snap!` merged the args, the
 # next summary derivation shows the env.
-eval_env_summary(m::JuliaEvalCall) =
+eval_env_label(m::JuliaEvalCall) =
     "env " * (isempty(m.env_path) ? "<temp>" : m.env_path) *
     (isempty(m.worker) ? "" : " · on " * m.worker)
+eval_env_summary(m::JuliaEvalCall) = eval_env_label(m)
 
 snap_summary(::ToolMsg, snap)         = content_summary(builtin_msg_type(snap.kind, tool_call_name(snap)), snap.content)
 # A search's most useful line is the query, not just how many hits it got — and
@@ -4168,6 +4482,18 @@ function snap_summary(b::SearchToolMsg, snap)
     return isempty(hits) ? "\"$(b.pattern)\"" : "\"$(b.pattern)\" · $hits"
 end
 snap_summary(b::JuliaEvalCall, snap)  = eval_env_summary(b)
+# The wait says what it waits on, then how that went: its result's first line
+# ("waited 12.3s (until all): 2 of 3 runs finished; still running: r6 …"),
+# from the colon on.
+function snap_summary(b::JuliaWaitToolMsg, snap)
+    for c in snap.content
+        c isa AgentClientProtocol.TextContent || continue
+        first_line = first(split(c.text, '\n'))
+        i = findfirst(": ", first_line)
+        return String(strip(i === nothing ? first_line : first_line[last(i)+1:end]))
+    end
+    return "waiting for " * (isempty(b.runs) ? "every open run" : join(b.runs, ", "))
+end
 
 # Default: stream the message's text deltas into the bubble, then finalize.
 function process_update!(b::ChatMsg, m::AgentClientProtocol.Message; from::Int = 0)
@@ -4232,6 +4558,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
              haskey(d0, "editable") || haskey(d0, "live_embed")) &&
                 chat_emit(h.chat, d0)
         end
+        shown_running = Ref(false)
         AgentClientProtocol.each_update(m) do snap
             prev_status = h.status
             h.status = snap.status
@@ -4276,8 +4603,10 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
             # (so the compact Monaco preview shows up under the header without a
             # click). `auto_expand_body` dispatches on the type + content
             # presence — no content sniffing inline here.
-            (auto_expand_body(b, snap.content) || has_show_reference(snap.content)) &&
+            (auto_expand_body(b, snap.content) || has_show_reference(snap.content) ||
+             opens_as_finished_run(b, shown_running[])) &&
                 (d["expand"] = true)
+            shown_running[] |= h.status in ("pending", "in_progress")
             auto_expand_full(b, snap.content) && (d["expand_full"] = true)
             live_result_embed(b, snap.content) && (d["live_embed"] = true)
             # A running eval starts its live stdout tail (idempotent). The real
@@ -4339,6 +4668,15 @@ auto_expand_body(m::JuliaEvalCall, snap_content) =
     (tool_status(m) == "completed" &&
      (outdated_worker_content(snap_content) ||
       bonito_upgrade_content(snap_content) !== nothing))
+
+# An eval opens while it runs (above). One whose first state to come through is
+# already its end opens the same way: a tool is one object updated in place, so
+# a quick call can be over before the chat first sees it, already "completed"
+# (e2e:codex_wire on CI). Not one shown running: it opened then, and may have
+# been closed since. History never comes through here (`reconcile_replay!`).
+opens_as_finished_run(::ToolMsg, shown_running::Bool) = false
+opens_as_finished_run(m::JuliaEvalCall, shown_running::Bool) =
+    !shown_running && !isempty(m.code)
 
 # The tool holds a LIVE result embed: a worker-parked value the body mounts
 # via `RemoteRef` (values AND errors — both are parked refs rendered live).
@@ -4415,7 +4753,10 @@ end
 # appear — there is no second render to carry it (see `eval_body_dom`).
 function update_from_snap!(b::JuliaEvalCall, snap)
     snap isa AgentClientProtocol.MCPCall && apply_input!(b, snap.raw_input)
-    eval_result!(b, snap.content)
+    # The run may have been announced before this card existed: the run's
+    # frames and the call's travel separate roads (eval_runs.jl).
+    adopt_run!(b)
+    eval_result!(b, result_content(b, snap.content))
     return nothing
 end
 function update_from_snap!(b::BuiltinToolMsg, snap)
@@ -4529,27 +4870,10 @@ function parse_bg_output_path(content)
     return nothing
 end
 
-# ── Background-task output poller ───────────────────────────────────────────
-# ONE server-wide loop streams every live background bash. The agent backgrounds
-# the shell and only returns a file path (it does NOT stream), so we tail that
-# file ourselves. Per task we back off 0.5s → 1 → 2 → 4 → 5s (responsive while
-# fresh, cheap once settled). "Done" is the output file's fd closing — the shell
-# exited (see the worker's `file_held_open`); a non-Linux worker falls back to
-# output quiescence.
-# Non-Linux fallback: if the worker can't report `open_known` on the
-# output file's fd, we infer "the shell exited" from "no growth in 20 s".
-const BG_QUIESCE_SECS = 20.0
-
-# Per-chat background-output poller. Spawned on `start_chat_client!`,
-# torn down when the chat closes. The task IS the taskbar's bookkeeping
-# loop from the server's side: every second it walks THIS chat's live
-# bg items (the same set the JS `_refreshTaskbar` paints) and tails
-# their output. No global loop walking every model's msgs_store; no
-# global cadence constant — the 1 s sleep is inline, the task's
-# lifetime is the chat's, and a closed chat takes its poller with it.
-#
-# (`start_background_poller!` / `background_poll_loop` are gone — the TaskBar
-# owns its own poll loop now, started lazily on the first `push!`.)
+# ── Background-task output ──────────────────────────────────────────────────
+# The agent backgrounds a shell and only returns the path of its output file;
+# the chat's worker follows that file (`watch_output!`), and these keep the
+# bubble and its persisted content in step.
 
 bg_worker_id(state::ServerState, model::ChatModel) =
     let pid = model.project_id
@@ -4567,8 +4891,20 @@ end
 
 bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
 
+# The whole output is rewritten on each write, so a chatty task writes at most
+# once a second while it runs; `finalize!` writes the last of it.
+function write_bg_content_soon!(model::ChatModel, m::BashToolMsg)
+    m.watch.write_pending && return nothing
+    m.watch.write_pending = true
+    Timer(1.0) do _
+        m.watch.write_pending = false
+        write_bg_content!(model.chat_dir, m)
+    end
+    return nothing
+end
+
 # ── Live stdout tail for a RUNNING bt_julia_eval ─────────────────────────────
-# The MCP forwards the eval worker's stdout/stderr live over /mcp-ws (no on-disk
+# The MCP forwards the eval worker's stdout/stderr live over its channel (no on-disk
 # log, no polling — see BonitoMCP.stream_forward_loop!). Each chunk lands in a
 # per-eval sink channel (registered here, drained below) and we write it into the
 # card's `stream_text` Observable, which the Output section is bound to. A fresh
@@ -4588,7 +4924,7 @@ eval_route_key(m::JuliaEvalCall) =
     isempty(m.env_path) ? BonitoMCP.TEMP_KEY : abspath(m.env_path)
 
 # An eval on ANOTHER worker streams through that worker's eval host, whose
-# chunks the server keys under the worker id (`handle_mcp_ctrl_ws`), so a local
+# chunks the server keys under the worker id (`accept_worker_channel`), so a local
 # session on the same env_path can't be confused with it. The tool names the
 # worker as the user does (display name, or id); resolve it the same way the
 # server does.
@@ -4617,14 +4953,17 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
     state = chat.state
     key = eval_sink_key(chat.project_id, eval_route_key(state, m))
     ch = Channel{String}(Inf)
-    lock(state.lock) do
+    held = lock(state.lock) do
         # A stale sink from a prior eval on the same route can only linger if its
         # loop died without cleanup; overwrite it (the MCP routes to the newest).
         state.eval_stream_sinks[key] = ch
+        # What its run printed before this tail listened.
+        pop!(state.eval_stream_pending, key, "")
     end
+    isempty(held) || append_tail!(m, held)
     deadline = time() + 4 * 3600      # hard stop for a wedged status
     try
-        while tool_status(m) in ("pending", "in_progress") && time() < deadline
+        while eval_streaming(m) && time() < deadline
             if isready(ch)
                 # Drain everything queued this tick, then emit ONCE — the MCP
                 # already coalesced + capped each chunk, so this just merges a
@@ -4633,10 +4972,7 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
                 while isready(ch)
                     write(buf, take!(ch))
                 end
-                # Straight into the Observable the Output section is bound to —
-                # no `stream_tail` wire message, no DOM poke from JS.
-                m.stream_text[] = last(m.stream_text[] * strip_ansi_codes(String(take!(buf))),
-                                       EVAL_STREAM_KEEP_CHARS)
+                append_tail!(m, String(take!(buf)))
             else
                 sleep(EVAL_STREAM_IDLE_S)
             end
@@ -4648,12 +4984,32 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
                 delete!(state.eval_stream_sinks, key)
         end
         close(ch)
+        # A run that goes on after its call may restart the tail (eval_runs.jl).
+        m.stream_task = nothing
+    end
+    return nothing
+end
+
+# Whether an eval's live tail should keep listening: while its call is open, and
+# for as long as a run it started is still going.
+eval_streaming(m::JuliaEvalCall) = tool_status(m) in ("pending", "in_progress")
+
+# A burst of the live tail, straight into the Observable the Output section is
+# bound to (no `stream_tail` wire message, no DOM poke from JS). Only while the
+# eval still runs, checked under the lock `eval_result!` writes the complete
+# output under: the call can end between the loop's check and this write, and a
+# tail appended after that replaced the colored complete output with the
+# stripped tail (`Pkg.status()` came out without color now and then).
+function append_tail!(m::JuliaEvalCall, chunk::AbstractString)
+    lock(m.stream_lock) do
+        eval_streaming(m) || return
+        m.stream_text[] = last(m.stream_text[] * strip_ansi_codes(chunk), EVAL_STREAM_KEEP_CHARS)
     end
     return nothing
 end
 
 function stream_bg_update!(model::ChatModel, m::BashToolMsg)
-    write_bg_content!(model.chat_dir, m)
+    write_bg_content_soon!(model, m)
     n = bg_line_count(m)
     m.message.summary = "running… $n line$(n == 1 ? "" : "s")"
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tool_id(m),
@@ -4661,12 +5017,6 @@ function stream_bg_update!(model::ChatModel, m::BashToolMsg)
         "background" => true, "taskbar" => true))
     return nothing
 end
-
-# (The old `finalize_bg_task!` / `poll_background_task!` / `poll_subagent_done!`
-# / `finalize_subagent!` / `background_poll_loop` are gone: the TaskBar owns its
-# poll loop now, and `isdone`/`poll_output_file!`/`finalize!` (above) replace
-# them. `bg_worker_id`, `write_bg_content!`, `bg_line_count`, `stream_bg_update!`
-# stay — they're used by `poll_output_file!` and `finalize!`.)
 
 # Todos are one-shot snapshots — nothing to stream, just finalize (persist).
 process_update!(b::TodoListMsg, ::AgentClientProtocol.Plan; from::Int = 0) = (close(b); nothing)
@@ -4693,13 +5043,7 @@ process!(::ChatModel, ::AgentClientProtocol.TodoWriteCall) = nothing
 # away, the connection was torn down. There is nothing to update and nothing to
 # decide here; the list leaves the bar with the statuses it had.
 #
-# This is the half no consumer can work out for itself. The other half — an
-# episode that simply ENDS, which is the ordinary case — needs no message at all:
-# `isdone` asks the session what it is doing (see there). Between them there is no
-# exit path left for anyone to forget, which is the point: the predecessor was
-# `finish_live_todo!` called at three hand-picked turn boundaries, and the one
-# nobody thought of (a worker disconnect is not a turn boundary) is why todo pills
-# were still counting 35 hours later.
+# A list whose turn simply ends needs no message: `isdone` asks the open turns.
 function process!(chat::ChatModel, m::AgentClientProtocol.Plan)
     m.live || return seal_live_todo!(chat)
     return process_todo!(chat, m.entries)
@@ -4819,44 +5163,15 @@ plan_update_dict(m::TodoListMsg) = merge(msg_to_dict(m),
     Dict{String,Any}("type" => "plan_update"))
 
 # ── The chat consumer loop ──────────────────────────────────────────────────
-# ONE task per ChatModel drains `user_messages` and drives one prompt turn at a
-# time. ALL chat-state mutation (`send!`/`append!`/`close`) happens on THIS
-# task, so there is no funnel lock and the "user-submit lands mid agent-chunk"
-# race cannot occur. Started in `start_chat_client!`; ends when `user_messages`
-# is closed (chat teardown).
-# Each turn runs in its OWN task — the consumer does NOT wait for one turn
-# to resolve before sending the next prompt. Two reasons (both validated
-# against the real agent on the raw wire):
-#
-#   1. STEERING. claude-agent-acp officially supports a `session/prompt`
-#      while one is running (`promptQueueing: true` in its initialize
-#      capabilities): the new user message is injected into the live turn,
-#      and when the SDK replays it, the FIRST prompt resolves end_turn and
-#      the stream hands off to the second. Serializing client-side would
-#      forfeit that and turn every mid-turn message into a dead wait.
-#   2. BACKGROUND SHELLS. While a background shell lives, the SDK never goes
-#      idle, so the prompt that launched it NEVER resolves on its own —
-#      the held-open turn is how the SDK delivers the shell's completion
-#      notification later. The next prompt (handoff) is the only thing that
-#      releases it. With a serializing consumer the user is locked out of
-#      the chat for as long as the shell runs — the bug this fixes.
-#
-# Update ordering stays strict, and needs no arbitration to do so: every
-# session/update is the session's main thread talking, they arrive in wire order
-# on ONE stream, and one consumer renders them in that order. Which prompt gets
-# credited with a given message is not a question anyone has to answer — a prompt
-# is a span over the stream, ended by a marker the dispatcher stamps at its
-# response frame.
+# One consumer owns turn completion. Steering can open another prompt at an
+# assistant boundary; its already-open span is completed before any queued turn.
 function run_chat!(chat::ChatModel)
-    # One turn at a time, AWAITED rather than spawned. Spawning let the loop come
-    # straight back around and start the next message while this turn was still
-    # streaming — so every queued bubble was promoted (and its prompt put on the
-    # wire) within milliseconds of being typed. That is why the queued badge never
-    # appeared, why two quick sends both claimed "next up", and why stop could not
-    # drain a queue: there wasn't one on our side, only the agent's own
-    # promptQueueing.
-    for user_msg in chat.user_messages
-        run_turn!(chat, user_msg)
+    for _ in chat.user_messages
+        while true
+            entry = next_submission(chat)
+            entry === nothing && break
+            run_submission!(chat, entry) || break   # agent unreachable: wait for a wakeup
+        end
     end
     return nothing
 end
@@ -4934,12 +5249,6 @@ function Base.close(model::ChatModel)
     # Stop the TaskBar's own poll loop and drop its live tasks — otherwise the
     # 1 Hz loop spins forever, pinning the model (and its tasks) past teardown.
     close(s.taskbar)
-    # And the quiet-check `Timer`, which RE-ARMS itself while an episode is
-    # open. An unclosed libuv timer is not just a leak: Julia refuses to finish
-    # PRECOMPILATION while an event source is alive, so one left behind by the
-    # `@compile_workload` stalls the build with "waiting for IO to finish"
-    # until it expires.
-    cancel_quiet_check!(model)
     return nothing
 end
 
@@ -5075,26 +5384,8 @@ function main_consumer!(chat::ChatModel, messages)
             AgentClientProtocol.signal_rendered!(m)
             continue
         end
-        # The connection already decided what the session is doing (the
-        # dispatcher settles it as each frame lands). All this does is react to
-        # the EDGE and republish the spinner — the renderer never invents
-        # liveness of its own, which is what let it be turned on and never off.
-        refresh_activity!(chat)
-        # NB the renderer deliberately does NOT touch `busy_active` directly. It reads
-        # "a prompt of ours is in flight", which is a fact with both an
-        # unambiguous start and an unambiguous end (see `begin_turn` /
-        # `finish_turn!`).
-        #
-        # Deriving it from arriving frames instead was a latch with no key: an
-        # auto-wake episode has no terminator on the wire — it is prose and
-        # tools that simply stop — so "the agent is working" could be turned on
-        # and never off. The spinner then span forever over an idle chat, and
-        # because `note_bound!` skips busy chats, BIND_CAP quietly stopped
-        # capping live agents too.
-        #
-        # Un-prompted work is still perfectly visible: it streams into the
-        # transcript as it arrives, and its background task sits in the taskbar.
-        # What we stop doing is claiming knowledge of when it ENDED.
+        # The renderer never decides whether the agent is working: turns do
+        # (`busy`), and a turn of the agent's own arrives here as `TurnStarted`.
         # One bad message must not end the chat's rendering for good. A live turn
         # used to abort on a throw (`finish_turn!` caught it, showed an error
         # bubble and gave up on the rest), which was survivable when the consumer
@@ -5108,12 +5399,14 @@ function main_consumer!(chat::ChatModel, messages)
                 push!(inflight, (Base.errormonitor(@async begin
                     try
                         process_update!(b, m)
+                        deliver_boundary_message!(chat)
                     catch e
                         @error "rendering a tool update failed" project_id = chat.project_id exception = (e, catch_backtrace())
                     end
                 end), m))
             else
                 process!(chat, m)
+                m isa AgentClientProtocol.AgentMessage && deliver_boundary_message!(chat)
             end
         catch e
             @error "rendering an agent message failed" project_id = chat.project_id exception = (e, catch_backtrace())
@@ -5124,7 +5417,11 @@ function main_consumer!(chat::ChatModel, messages)
         filter!(((t, _),) -> !istaskdone(t), inflight)   # reap, so this can't grow
     end
     # The stream ended: let every tool render finish before the consumer does.
-    foreach(((t, _),) -> wait(t), inflight)
+    try
+        foreach(((t, _),) -> wait(t), inflight)
+    finally
+        interrupt_background_tasks!(chat)
+    end
     return nothing
 end
 
@@ -5169,180 +5466,88 @@ function start_main_consumer!(chat::ChatModel, cli)
     return nothing
 end
 
-# Mark a boundary on the main stream and WAIT until everything before it has been
-# rendered. Two callers, both needing the same thing:
-#
-#   * end of turn — the agent's `stopReason` says the turn is over, but the
-#     messages are still in flight down the stream. Cleanup that inspects the
-#     store (empty-turn detection, Yolo's "what did it reply", the orphan sweep)
-#     has to run after they land, not before.
-#   * start of turn — any auto-wake episode since the last turn has no end_turn
-#     of its own, so this is where its trailing bubble gets sealed and its
-#     messages persisted, BEFORE the new turn's first message (store order).
-#
-# `close(TurnState)` happens on the coalescer as the marker passes, which is what
-# seals a trailing text bubble and force-fails a tool the agent never resolved.
-#
-# Returns as a no-op if there is no session yet, or if the stream is being torn
-# down — `bind` makes a dead consumer close the marker instead of hanging us.
 """
-    session_activity(chat) -> SessionActivity
+    open_turns(chat) -> Vector{Turn}
 
-What this chat's agent is doing, straight from the connection (which re-derives
-it on read). `Idle` when there is no session yet — a chat with no agent bound is
-not working.
+The turns of the chat's agent open right now: our prompts it has not answered,
+and its own turn if one runs. Empty when no session is bound.
 """
-function session_activity(chat::ChatModel)
+function AgentClientProtocol.open_turns(chat::ChatModel)
     c = client(chat.agent)
-    c === nothing && return AgentClientProtocol.Idle()
-    return AgentClientProtocol.session_activity(c.conn)
+    c === nothing && return AgentClientProtocol.Turn[]
+    return AgentClientProtocol.open_turns(c)
 end
 
-"""
-    busy(chat) -> Bool
-
-Whether to claim the agent is working. DERIVED, never stored: a turn of ours is
-open, or the connection says the agent is doing something on its own.
-
-`turn_in_flight` is not redundant with `Prompted`, and the interesting half is
-the TAIL, not the head. `register_prompt!` runs before the wire send, so the gap
-at the start is microseconds. The gap at the end is not: the span resolves (ACP
-goes `Idle` at once — the dispatcher zeroes `last_work_at` when the last span
-goes) while we are still waiting on the render barrier and running end-of-turn
-cleanup. Dropping this term would report the chat as free while its single
-consumer is still occupied, so a message sent into that window would render
-without the queued badge and then sit behind the turn anyway.
-
-A turn ends when the ANSWER is done, not when everything it started is: the agent
-settles the turn with `end_turn` at the result and deliberately does not hold it
-open for detached background work (verified in claude-agent-acp). Such work lives
-in the taskbar, so there is no mid-turn dimming to do here.
-"""
+# Busy: the consumer holds a turn of ours (`turn_in_flight`, which also covers
+# bring-up and the render tail) or the agent has a turn open. Background work
+# outlives turns; it lives in the taskbar.
 busy(chat::ChatModel) =
     lock(() -> shared(chat).turn_in_flight[], shared(chat).lock) ||
-    AgentClientProtocol.is_working(session_activity(chat))
+    !isempty(AgentClientProtocol.open_turns(chat))
+
+# At every turn edge. Unconditional: the re-broadcast repairs a tab that missed
+# an update.
+function publish_busy!(chat::ChatModel)
+    shared(chat).busy_active[] = busy(chat)
+    return nothing
+end
+
+# Block until the chat is not busy, or `timeout` passes; whether it is idle.
+function wait_idle(chat::ChatModel; timeout::Real = Inf)
+    s = shared(chat)
+    idle = Channel{Nothing}(0)            # a latch: closed once idle is seen
+    listener = on(b -> b || close(idle), s.busy_active)
+    s.busy_active[] || close(idle)
+    try
+        AgentClientProtocol.wait_closed(idle; timeout)
+    finally
+        Bonito.Observables.off(listener)
+        close(idle)                       # ends wait_closed's helper on a timeout
+    end
+    return !s.busy_active[]
+end
 
 # Run `f` with the chat marked as working, publishing the spinner on both edges.
 #
-# ONE lexical scope owns the flag, so no path out of `f` — an early return from
-# `begin_turn`, a throw, a cancel, a closed channel — can leave it set and the
-# chat stuck reporting "working" forever. It used to be a counter raised where
-# the turn started and dropped in a `finally` two functions away: correct for the
-# two callers that existed, but a contract BETWEEN two functions is the shape
-# that eventually gets a third caller who doesn't know about it.
-#
-# `begin_turn` is the only caller in the app. It stays a function of its own so
-# the unit tests can enter it and watch both edges, which needs no agent, no
-# prompt and no session.
+# One lexical scope owns the flag, so no way out of `f` (a return, a throw, a
+# cancel) can leave it set. A function of its own so unit tests can watch both
+# edges without an agent.
 function while_busy(f, chat::ChatModel)
     s = shared(chat)
     lock(() -> (s.turn_in_flight[] = true), s.lock)
-    # `refresh_activity!` writes unconditionally, which is the point: every write
-    # re-broadcasts to every open tab, and that is what repairs a tab whose bridge
-    # missed an update. A guarded write never can — the value is already what we
-    # would set, so nothing ships and the tab stays wrong through every message
-    # you send. That is the "stuck on Waiting for your next instruction" shape.
-    refresh_activity!(chat)
+    publish_busy!(chat)
     try
         return f()
     finally
         lock(() -> (s.turn_in_flight[] = false), s.lock)
-        refresh_activity!(chat)
+        publish_busy!(chat)
     end
 end
 
-# An auto-wake episode is now just `Unprompted`, so "is the agent reporting back
-# on its own" is a question about the session, not a flag of ours.
-autowake_active(chat::ChatModel) = session_activity(chat) isa AgentClientProtocol.Unprompted
+# Whether the agent is running a turn of its own (reporting back on background
+# work it finished).
+agent_turn_open(chat::ChatModel) =
+    any(t -> t isa AgentClientProtocol.AgentTurn, AgentClientProtocol.open_turns(chat))
 
-"""
-    refresh_activity!(chat) -> SessionActivity
-
-Re-read the session's activity, run whatever the EDGE calls for, and republish
-`busy_active`. The single writer — this is what replaced four call sites each
-assigning the spinner from its own idea of the state.
-
-`busy_active` stays an Observable because the UI subscribes to it, but it is a
-CACHE of `busy(chat)`, never an independent fact. Written unconditionally, not
-set-if-changed: every write re-broadcasts to every open tab, which is what
-repairs a tab whose bridge missed an update — a guarded write can never fix one,
-because the value is already what we would set.
-"""
-function refresh_activity!(chat::ChatModel)
-    s   = shared(chat)
-    act = session_activity(chat)
-    was = lock(() -> s.activity_seen[], s.lock)
-    lock(() -> (s.activity_seen[] = act), s.lock)
-
-    entered_unprompted = act isa AgentClientProtocol.Unprompted &&
-                         !(was isa AgentClientProtocol.Unprompted)
-    left_unprompted    = was isa AgentClientProtocol.Unprompted &&
-                         !(act isa AgentClientProtocol.Unprompted)
-    entered_unprompted && enter_unprompted!(chat)
-    left_unprompted    && leave_unprompted!(chat)
-
-    s.busy_active[] = busy(chat)
-    act isa AgentClientProtocol.Unprompted ? schedule_quiet_check!(chat) :
-                                             cancel_quiet_check!(chat)
-    return act
-end
-
-# Re-check an open `Unprompted` episode after it can have gone quiet.
-#
-# Nothing else will: the episode ends because frames STOP, so there is no frame
-# to react to. Without this the spinner keeps running over an agent that has
-# finished — the exact complaint that started this refactor. One timer per chat,
-# replaced rather than stacked; it re-arms itself only while the episode is
-# still open, so it stops on its own.
-function schedule_quiet_check!(chat::ChatModel)
-    s = shared(chat)
-    lock(s.lock) do
-        t = s.activity_timer[]
-        t isa Timer && isopen(t) && return nothing        # one is already pending
-        s.activity_timer[] = Timer(QUIET_CHECK_SECONDS) do _
-            # `refresh_activity!` re-settles, runs the leave-edge if the episode
-            # is over, and schedules the next check if it is not.
-            refresh_activity!(chat)
-        end
-        return nothing
-    end
-    return nothing
-end
-
-function cancel_quiet_check!(chat::ChatModel)
-    s = shared(chat)
-    lock(s.lock) do
-        t = s.activity_timer[]
-        t isa Timer && isopen(t) && close(t)
-        s.activity_timer[] = nothing
-        return nothing
-    end
-    return nothing
-end
-
-# The agent started talking with no prompt of ours open: every task waiting to be
-# reported on moves to "agent reporting back".
-function enter_unprompted!(chat::ChatModel)
+# The agent started a turn of its own: waiting pills move to Reporting until it
+# is over (`report_started!`).
+function process!(chat::ChatModel, m::AgentClientProtocol.TurnStarted)
     for t in chat_taskbar(chat).items[]
         t isa BashToolMsg || t isa TaskToolMsg || continue
         report_started!(t)
     end
+    publish_busy!(chat)
+    Base.errormonitor(@async begin
+        wait(m.turn)
+        retire_reporting!(chat)
+        publish_busy!(chat)
+    end)
     return nothing
 end
 
-"""
-    retire_reporting!(chat)
-
-Every pill that was waiting to be reported on is finished for good.
-
-A BOUNDARY action, not an edge one — it must run whether or not an episode
-actually opened. A background task can finish and be followed by no auto-wake at
-all (the agent had nothing to add), and its pill must not outlive the boundary
-either; making this edge-only left such a pill stuck at `AwaitingReport`
-forever. A task still EXECUTING is untouched: background work outlives turns,
-which is the whole point of it. `report_finished!` is a guarded transition, so
-running this twice over one boundary is a no-op.
-"""
+# Every pill waiting on a report is finished. Runs when the agent's own turn
+# ends and at every turn of ours, since a finished task may get no report.
+# Executing tasks are untouched; idempotent.
 function retire_reporting!(chat::ChatModel)
     for t in chat_taskbar(chat).items[]
         t isa BashToolMsg || t isa TaskToolMsg || continue
@@ -5351,16 +5556,22 @@ function retire_reporting!(chat::ChatModel)
     return nothing
 end
 
-# The episode ended: retire its pills.
+# Mark a boundary on the main stream and WAIT until everything before it has been
+# rendered. Two callers, both needing the same thing:
 #
-# It does NOT finalize the episode's todo list, though it used to. That list goes
-# when `isdone` next asks the session what it is doing and hears `Idle` — an
-# answer this edge does not have to deliver, and which is equally available on
-# paths that never reach here (a dead worker, a quiet episode nobody ends).
-function leave_unprompted!(chat::ChatModel)
-    retire_reporting!(chat)
-    return nothing
-end
+#   * end of turn: the agent's `stopReason` says the turn is over, but the
+#     messages are still in flight down the stream. Cleanup that inspects the
+#     store (empty-turn detection, Yolo's "what did it reply", the orphan sweep)
+#     has to run after they land, not before.
+#   * start of turn: anything the agent said on its own since the last turn
+#     gets its trailing bubble sealed and its messages persisted here, BEFORE
+#     the new turn's first message (store order).
+#
+# `close(TurnState)` happens on the coalescer as the marker passes, which is what
+# seals a trailing text bubble and force-fails a tool the agent never resolved.
+#
+# Returns as a no-op if there is no session yet, or if the stream is being torn
+# down: `bind` makes a dead consumer close the marker instead of hanging us.
 
 function flush_main!(chat::ChatModel)
     s = shared(chat)
@@ -5385,11 +5596,7 @@ function wait_rendered!(chat::ChatModel, marker::AgentClientProtocol.StreamFlush
     mc === nothing && return nothing
     bind(marker.done, mc.task)   # renderer gone → we're woken, not stranded
     # `signal_rendered!` CLOSES the latch, so "rendered" is exactly a closed
-    # `done`, and `bind` closes it too if the renderer dies. Polling that one
-    # predicate needs no task of its own: an earlier cut spawned an `@async`
-    # waiter per boundary purely to have something to poll for completion, and
-    # that reliably blew the stack in `e2e:subagent_feed` (3/3, against 0/3
-    # without it). Waiting is not worth a task.
+    # `done`, and `bind` closes it too if the renderer dies.
     #
     # BOUNDED, because `bind` only covers a renderer that DIED. One that is alive
     # but not draining strands this wait forever — and `begin_turn` waits here
@@ -5398,13 +5605,12 @@ function wait_rendered!(chat::ChatModel, marker::AgentClientProtocol.StreamFlush
     # start, the spinner never clears, and stop can't reach an agent that isn't
     # running. Observed live as a 53-minute wedge.
     #
-    # The barrier is an ORDERING nicety (an auto-wake episode's messages persist
+    # The barrier is an ORDERING nicety (the agent's own turn's messages persist
     # before the turn's), so giving up on it costs store order in a case that is
     # already broken. Blocking the chat forever costs the chat. It is normally
     # sub-second — the wait is draining frames already in hand — so tripping this
     # means a genuinely stuck renderer, and the warning is how we find out which.
-    if timedwait(() -> !isopen(marker.done), RENDER_BARRIER_SECONDS;
-                 pollint = 0.01) !== :ok
+    if !AgentClientProtocol.wait_closed(marker.done; timeout = RENDER_BARRIER_SECONDS)
         # Name what it is stuck ON. A stalled renderer is parked inside a single
         # `process!`, so the message kind plus how long it has been there points
         # straight at the blocking call instead of leaving "not draining" as the
@@ -5435,22 +5641,21 @@ the spot without ever running. Observed exactly that: a Write was stopped, the
 user immediately typed a correction, and it came back as an empty turn with the
 instruction silently dropped. The agent never saw it.
 
-`Cancelling` ends when the turn it cancelled settles, so this is a wait on a
-state with a real exit, not a sleep. Bounded anyway — if the agent never honors,
-starting the turn is still better than swallowing it, and `finish_turn!`'s
-escalation path owns the wedged-agent case.
+It waits on the turns the Stop reached, which end when the agent settles them.
+Bounded anyway: if the agent never honors, starting the turn is still better
+than swallowing it, and the re-cancel escalation owns the wedged-agent case.
 """
 function await_cancel_settled!(chat::ChatModel)
-    c = client(chat.agent)
-    c === nothing && return nothing
-    AgentClientProtocol.session_activity(c.conn) isa AgentClientProtocol.Cancelling ||
-        return nothing
-    ok = timedwait(CANCEL_SETTLE_SECONDS; pollint = 0.05) do
-        !(AgentClientProtocol.session_activity(c.conn) isa AgentClientProtocol.Cancelling)
-    end
-    ok === :ok || @warn "cancel did not settle before the next prompt; sending anyway" project_id = chat.project_id
+    cancelled = lock(() -> shared(chat).cancelled_turns[], shared(chat).lock)
+    AgentClientProtocol.wait_over(cancelled; timeout = CANCEL_SETTLE_SECONDS) ||
+        @warn "cancel did not settle before the next prompt; delivery remains paused" project_id = chat.project_id
     return nothing
 end
+
+# Whether a Stop is still winding down: a turn it reached is not over yet.
+cancelling(chat::ChatModel) =
+    any(t -> !AgentClientProtocol.isover(t),
+        lock(() -> shared(chat).cancelled_turns[], shared(chat).lock))
 
 # One-line, length-capped feed label: subagent text chunks carry newlines and
 # stream long; the feed rows / taskbar line are single-line.
@@ -5518,36 +5723,20 @@ const TASK_FEED_WIRE_LIMIT = 300
 
 # Open one turn for `user_msg` and hand its span to `f`.
 #
-# Runs IN the consumer so prompts hit the wire in user order: promote the queued
-# bubble, wait out anything in the way, then SEND the prompt (`prompt!` registers
-# + writes the frame synchronously; only the stream coalescer inside it is a
-# task). The user bubble is already on screen and persisted — `send_message!` did
-# that when the user hit send — so there is nothing to render here.
-#
-# A do-block rather than a function returning a span: the three ways this bails
-# before a prompt exists — chat closed, restart never settled, no client — just
-# return, and `f` never runs. No `nothing` to check and no "you must remember to
-# finish this" contract between two functions.
-#
-# The chat is busy across the WHOLE thing, bring-up included. That is deliberate:
-# the user has pressed send, and a spinner that only lights once the agent is up
-# reads as "Waiting for your next instruction" through the entire bind.
-function begin_turn(f, chat::ChatModel, user_msg::UserMessage)
+# Bind/restart/cancel barriers precede the handoff. A pending submission is
+# appended to history only after prompt! writes it, while holding the store
+# lock so the reply cannot overtake its user message.
+function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothing)
     s = shared(chat)
     return while_busy(chat) do
-        promote_queued_user_bubble!(chat)
         await_cancel_settled!(chat)
-        # A new prompt is the boundary of any auto-wake episode that streamed
+        # A new prompt is a boundary for whatever the agent said on its own
         # since the last turn: seal it and wait, so its messages persist +
         # finalize before the turn's own messages (store order).
         flush_main!(chat)
-        # A boundary the agent cannot omit: whatever the episode did or didn't
-        # report, a new turn of ours ends it. `refresh_activity!` runs the
-        # leave-EDGE and republishes the spinner; `retire_reporting!` is the
-        # BOUNDARY half, and runs even when no episode was ever open — a task can
-        # finish with the agent having nothing to say about it, and its pill
-        # still has to go.
-        refresh_activity!(chat)
+        # A boundary the agent cannot omit: a task can finish with the agent
+        # having nothing to say about it, or with its report folded into this
+        # turn, and its pill still has to go.
         retire_reporting!(chat)
         # A turn can still be popped off the channel AFTER the chat is closed:
         # `close(::ChatModel)` shuts `user_messages`, but the consumer keeps
@@ -5565,42 +5754,72 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage)
         # report as a failed turn, losing the user's (already-rendered) message
         # with no reply. Wait, bounded, for the bring-up to settle so we prompt on
         # the LIVE client. Mirrors the non-worker wait in `restart_chat_session!`.
-        if lock(() -> s.restart_inflight[], s.restart_lock)
-            deadline = time() + 25.0
-            while time() < deadline && lock(() -> s.restart_inflight[], s.restart_lock)
-                sleep(0.02)
-            end
+        restarting = lock(() -> s.restart_inflight[], s.restart_lock)
+        if restarting !== nothing
+            AgentClientProtocol.wait_closed(restarting; timeout = 25.0)
             isopen(s.user_messages) || return nothing
         end
-        cli = client(chat.agent)
-        if cli === nothing
+        turn = nothing
+        # Two attempts: the connection can still close between the liveness
+        # check and the write. A throwing prompt! never reached the agent, so
+        # sending again on a fresh session cannot duplicate it.
+        for attempt in 1:2
+            cli = live_client!(chat, submission)
+            cli === nothing && return nothing
+            # Ship the turn's sequence number — a stop-click echoes it back so the
+            # cancel can be scoped to THIS turn (see CancelCommand).
+            seq = (s.turn_seq[] += 1)
+            chat_emit(chat, Dict{String,Any}("type" => "turn_begin", "seq" => seq))
+            # The turn's CONTENT does not come back from here — it is the main thread
+            # talking, and `main_consumer!` is already rendering it. What we get is
+            # the span: a one-shot response channel that settles with the stopReason.
             try
-                start_chat_client!(chat)   # LAZY ACP: bind the agent on the first turn
+                turn = lock(s.lock) do
+                    submission !== nothing && submission.status != :sending && return nothing
+                    cancelling(chat) &&
+                        error("The agent is still stopping; message has not been sent.")
+                    span = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
+                        images=user_msg.images)
+                    submission === nothing || submission_sent!(s, submission, span)
+                    span
+                end
+                break
             catch e
-                @error "lazy ACP bind failed" project_id = chat.project_id exception = (e, catch_backtrace())
+                (attempt == 1 && !isopen(cli) && is_session_dead_error(innermost_cause(e))) || rethrow()
+                @warn "agent connection closed while sending; starting a new session" project_id = chat.project_id
             end
-            cli = client(chat.agent)
         end
-        cli === nothing && return nothing
-        # Ship the turn's sequence number — a stop-click echoes it back so the
-        # cancel can be scoped to THIS turn (see CancelCommand).
-        seq = (s.turn_seq[] += 1)
-        chat_emit(chat, Dict{String,Any}("type" => "turn_begin", "seq" => seq))
-        # The turn's CONTENT does not come back from here — it is the main thread
-        # talking, and `main_consumer!` is already rendering it. What we get is
-        # the span: a one-shot response channel that settles with the stopReason.
-        turn = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
-            images=user_msg.images)
-        # The prompt is registered + on the wire: the oldest pending bubble
-        # (FIFO — matches the channel order under `send_message!`, same pairing
-        # `promote_queued_user_bubble!` relies on) has now been SEEN by the
-        # agent, so it stops counting as a fresh/unsent message for reconciles.
-        # A throw above leaves the bubble pending — the agent never got it.
-        lock(s.lock) do
-            isempty(s.pending_sends) || popfirst!(s.pending_sends)
-        end
+        turn === nothing && return nothing
         return f(turn)
     end
+end
+
+"""
+    live_client!(chat, submission = nothing) -> Union{ACP.Client,Nothing}
+
+The client a prompt goes out on. Every send runs through here, so a send to a
+chat whose session is gone brings it up first: the lazy first bind when there
+never was a client, a restart when its connection closed (the agent exited,
+the worker link dropped). `nothing` only when the agent cannot be brought up;
+`last_error` says why.
+"""
+function live_client!(chat::ChatModel, submission = nothing)
+    isopen(chat.agent) && return client(chat.agent)
+    s = shared(chat)
+    starting_session!(s, submission)
+    if client(chat.agent) === nothing
+        try
+            start_chat_client!(chat)
+        catch e
+            s.session_alive[] = false
+            s.last_error[] = sprint(showerror, innermost_cause(e))
+            @error "starting the agent session failed" project_id = chat.project_id exception = (e, catch_backtrace())
+        end
+    else
+        @info "agent session ended; restarting it for the next message" project_id = chat.project_id
+        restart_chat_session!(chat)
+    end
+    return isopen(chat.agent) ? client(chat.agent) : nothing
 end
 
 # ── Yolo mode (autonomous auto-continue) ────────────────────────────────────
@@ -5690,8 +5909,8 @@ $(YOLO_DONE_SENTINEL) and nothing else. Otherwise pick the next concrete thing \
 and do it."""
 
 # Composer placeholder while Yolo is armed — the message input doubles as the
-# reminders editor then (see `chat_input_area`).
-const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Enter to lock in"
+# reminders editor then (see `chat_composer`).
+const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Press ✓ to save"
 
 # The sentinel on a line of its own (leading/trailing markdown punctuation and
 # whitespace tolerated, since agents like to bold or bullet a final line). A
@@ -5893,9 +6112,9 @@ said_something(chat::ChatModel, o::TurnOutcome) =
 # The chores are in a `finally` because they have to run for a turn that broke as
 # much as for one that ended: a chat whose spinner never stops and whose
 # permission cards never resolve is worse than the error that caused it.
-function finish_turn!(chat::ChatModel, turn)
+function finish_turn!(chat::ChatModel, turn;
+                      nstore0::Int=lock(() -> length(shared(chat).msgs_store), shared(chat).lock))
     s = shared(chat)
-    nstore0 = lock(() -> length(s.msgs_store), s.lock)
     errored = false
     # The agent's own word for how the turn ended. Read it off the response
     # rather than inferring it from `conn.cancelling`: that latch is dropped the
@@ -5929,7 +6148,7 @@ function finish_turn!(chat::ChatModel, turn)
         # session-scoped child (parent→child only), so writing that one left the
         # parent stuck true and every other tab/reload rendering "working"
         # forever.
-        refresh_activity!(chat)
+        publish_busy!(chat)
         # The turn added messages (agent reply, tools, …) → refresh the lens
         # autocomplete vocabulary so new tool/type keys are suggestable. (Emitted
         # on mount too, but that's before any messages exist.)
@@ -5945,9 +6164,13 @@ function finish_turn!(chat::ChatModel, turn)
         # otherwise wait out its full timeout and the card would linger on
         # screen. Resolve this chat's pending asks now (the reply lands on a dead
         # request id, which the agent ignores).
-        sweep_pending_asks!(chat)
-        report_silent_turn!(chat, outcome)
-        continue_yolo!(chat, outcome)
+        # A steering handoff can have its successor already on the wire.
+        # The older span must not dismiss the successor's questions or nudge it.
+        if isempty(AgentClientProtocol.open_turns(chat))
+            sweep_pending_asks!(chat)
+            report_silent_turn!(chat, outcome)
+            continue_yolo!(chat, outcome)
+        end
     end
     return nothing
 end
@@ -6089,6 +6312,21 @@ is_session_dead_error(::Exception) = false
 # forever — after this we fall back to the old auto-allow default.
 const PERMISSION_TIMEOUT = 600.0
 
+# The answer put on `ch`, or `default` once `timeout` seconds pass without one.
+# The timeout closes `ch`, which wakes the wait; an answer that is already there
+# is still taken, and a late one meets a closed channel (`resolve_pending_ask!`).
+function take_within(ch::Channel, timeout::Real, default)
+    timer = Timer(_ -> close(ch), timeout)
+    try
+        return take!(ch)
+    catch e
+        e isa InvalidStateException || rethrow()
+        return default
+    finally
+        close(timer)
+    end
+end
+
 struct ChatPermissionHandler <: AgentClientProtocol.Handler
     fs::AgentClientProtocol.FSRequestHandler
     chat::ChatModel                      # the SHARED parent model
@@ -6145,7 +6383,7 @@ function handle_permission_request(chat::ChatModel, params)
         "question" => permission_question_text(tc),
         "options"  => opts))
     picked = try
-        Base.timedwait(() -> isready(ch), PERMISSION_TIMEOUT) === :ok ? take!(ch) : ""
+        take_within(ch, PERMISSION_TIMEOUT, "")
     finally
         let s = shared(chat); lock(s.lock) do; delete!(s.pending_asks, key); end; end
         # Tell every tab to drop the card (the one that answered already
@@ -6226,7 +6464,7 @@ function handle_elicitation_request(chat::ChatModel, params)
         "message" => String(get(params, "message", "The agent has a question")),
         "fields"  => fields))
     answer = try
-        Base.timedwait(() -> isready(ch), PERMISSION_TIMEOUT) === :ok ? take!(ch) : :skip
+        take_within(ch, PERMISSION_TIMEOUT, :skip)
     finally
         let s = shared(chat); lock(s.lock) do; delete!(s.pending_asks, key); end; end
         chat_emit(chat, Dict{String,Any}("type" => "question_done", "key" => key))
@@ -6363,6 +6601,8 @@ function start_chat_client!(model::ChatModel)
     record_bound_session!(model, new_session_id)
     shared(model).session_alive[] = true
     note_bound!(model.state, model.project_id)
+    # Messages held while no session could be brought up go out now.
+    wake_outbox!(model)
     return nothing
 end
 
@@ -6419,17 +6659,14 @@ function bring_up_once!(model::ChatModel)
             # the new client emit chunks against the same comm while the old
             # finally is still running — undefined wire ordering. Bounded so a
             # wedged consumer can't block us forever.
-            deadline = time() + 2.0
-            while s.busy_active[] && time() < deadline
-                sleep(0.02)
-            end
+            wait_idle(s; timeout = 2.0)
+            # Everything the old session ran ends with it, on every worker, and
+            # its task bar empties: nothing of it outlives the restart.
+            end_chat_session!(s, "the chat was restarted")
         end
-        # The old session is gone, so nothing it was doing counts any more.
-        # Forget the edge we last saw with it — otherwise the next session's
-        # first `Unprompted` would look like a continuation of the dead one's
-        # episode and skip the enter-edge.
-        lock(() -> (s.activity_seen[] = AgentClientProtocol.Idle()), s.lock)
-        refresh_activity!(s)
+        # The old session is gone, and its turns with it.
+        lock(() -> (s.cancelled_turns[] = AgentClientProtocol.Turn[]), s.lock)
+        publish_busy!(s)
         chat_emit(s, Dict{String,Any}("type" => "thinking", "active" => false))
         # (No orphan sweep. Closing the old client ends its stream, and ACP's
         # teardown force-fails every live tool + seals the plan on the way out;
@@ -6461,20 +6698,14 @@ function restart_chat_session!(model::ChatModel)
     # finishing — and wait (bounded) for it to settle. Otherwise WE are the
     # worker. Concurrent restarts must never both `close(old)`/`start_chat_client!`
     # (lost client / consumer-lock deadlock), so exactly one worker runs at a time.
-    iam_worker = lock(s.restart_lock) do
+    running = lock(s.restart_lock) do
         s.restart_gen[] += 1
-        if s.restart_inflight[]
-            false
-        else
-            s.restart_inflight[] = true
-            true
-        end
+        r = s.restart_inflight[]
+        r === nothing && (s.restart_inflight[] = Channel{Nothing}(0))
+        r
     end
-    if !iam_worker
-        deadline = time() + 20.0
-        while time() < deadline && lock(() -> s.restart_inflight[], s.restart_lock)
-            sleep(0.02)
-        end
+    if running !== nothing
+        AgentClientProtocol.wait_closed(running; timeout = 20.0)
         return nothing
     end
     try
@@ -6485,73 +6716,44 @@ function restart_chat_session!(model::ChatModel)
             target = lock(() -> s.restart_gen[], s.restart_lock)
             bring_up_once!(model)
             done = lock(s.restart_lock) do
-                if s.restart_gen[] == target
-                    s.restart_inflight[] = false
-                    true
-                else
-                    false   # a newer request arrived mid-restart — run again
-                end
+                s.restart_gen[] == target || return false   # a newer request arrived mid-restart: run again
+                restart_done!(s)
+                true
             end
             done && break
         end
     catch
-        # Defensive: never leave the in-flight flag stuck (would wedge all future
+        # Defensive: never leave the in-flight latch open (would wedge all future
         # restarts). bring_up_once! already swallows bring-up errors, so this only
         # fires on something truly unexpected.
-        lock(() -> (s.restart_inflight[] = false), s.restart_lock)
+        lock(() -> restart_done!(s), s.restart_lock)
         rethrow()
     end
     return nothing
 end
 
-# Single-entry "user submitted a message" path. Every call site (input area,
-# auto-prompt, scripted hooks) goes through here. We render + persist the user
-# bubble synchronously so the message appears the instant the user hits send —
-# previously the bubble was created inside `run_turn!`, which meant messages
-# submitted while an earlier turn was still running stayed invisible (queued
-# silently on the channel) until that turn finished. Now they show up as
-# "queued" bubbles immediately; `promote_queued_user_bubble!` clears the
-# `queued` flag when `run_turn!` actually picks them up.
-#
-# `images` are sent to the agent as multimodal content blocks; the caller is
-# responsible for embedding any file-path reference into `msg.text` so display
-# + replay see what claude does.
-function send_message!(model::ChatModel, msg::UserMsg;
-    images=AgentClientProtocol.ImageAttachment[])
-    s = shared(model)
-    # If there's a turn in flight, the bubble joins the queue (visually dim).
-    bubble = UserMsg(model, msg.text)
-    bubble.auto = msg.auto   # preserve the Yolo auto-continue marker for dim styling
-    # A REAL user message clears the stuck-loop guards: the streak and the
-    # repeat check are about the agent going round on its own, and anything you
-    # type is new input that deserves a fresh budget.
-    msg.auto || reset!(s.yolo_state)
-    # Queue state + position + enqueue in ONE critical section, and counted off
-    # `pending_sends` — the bubbles whose prompt hasn't reached the agent yet,
-    # i.e. the queue itself. Counting `msgs_store` in a separate lock let two
-    # near-simultaneous sends both observe zero waiting bubbles and both stamp
-    # position 1, so both rendered "next up".
-    #
-    # `pending_sends` also tracks the bubble as "not yet seen by the agent" until
-    # `begin_turn` delivers its prompt — a reconcile landing in between (the
-    # lazy bind on this very send) must keep it at the store's END and never
-    # anchor on it.
-    lock(model.lock) do
-        bubble.queued = s.busy_active[]
-        bubble.queue_pos = bubble.queued ? length(s.pending_sends) + 1 : 0
-        push!(s.pending_sends, bubble)
-    end
-    close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
-    # Refresh the lens vocabulary NOW that a user message exists, rather than
-    # waiting for end-of-turn (finish_turn!'s emit_lens_vocab). Otherwise the
-    # `/user_message` key isn't suggestable until the agent's reply lands — the
-    # user can't lens-filter their own just-sent message mid-turn.
-    emit_lens_vocab(model)
-    put!(s.user_messages,
-        UserMessage(msg.text, collect(AgentClientProtocol.ImageAttachment, images)))
-    backfill_project_title!(model, msg.text)
+# The running bring-up is done: release whoever waits on it. Under `restart_lock`.
+function restart_done!(s::ChatModel)
+    r = s.restart_inflight[]
+    s.restart_inflight[] = nothing
+    r === nothing || close(r)
     return nothing
 end
+
+# Pending submissions live outside history; see chat_queue.jl.
+function send_message!(model::ChatModel, msg::UserMsg;
+    images=AgentClientProtocol.ImageAttachment[], mode::Symbol=:done)
+    enqueue_message!(model, msg; images, mode)
+end
+
+"""
+    send_message!(view, text; mode = :done)
+
+Send `text` to the chat as the user's message, as the composer does: queued
+until the agent is done with its turn by default.
+"""
+send_message!(model::ChatModel, text::AbstractString; kw...) =
+    send_message!(shared(model), UserMsg(String(text)); kw...)
 
 const TITLE_MAX_CHARS = 80
 
@@ -6571,23 +6773,6 @@ function meaningful_title(provider::AgentProvider, raw::AbstractString)
     isempty(s) && return nothing
     return length(s) > TITLE_MAX_CHARS ?
         String(first(s, TITLE_MAX_CHARS - 1)) * "…" : String(s)
-end
-
-# Set `p.title` from the user's first meaningful prompt — what makes the
-# sidebar / project card read `[DT] resume the build refactor` instead of
-# `[DT] ClaudeExperiments`. Idempotent: only fires while `title` is still the
-# default (a user edit pins it forever). No-op for projects whose
-# state.projects[] entry is gone (project removed mid-send).
-function backfill_project_title!(model::ChatModel, prompt::AbstractString)
-    pid = model.project_id
-    isempty(pid) && return
-    haskey(model.state.projects[], pid) || return
-    p = model.state.projects[][pid]
-    titled(p) && return
-    t = meaningful_title(agent_kind(model.agent), prompt)
-    t === nothing && return
-    p.title[] = t      # persists + reaches every tab through the title hook
-    return nothing
 end
 
 # Persist the agent-assigned session id onto the project so the thread becomes
@@ -6611,80 +6796,6 @@ function record_bound_session!(model::ChatModel, session_id::AbstractString)
         @warn "record_bound_session!: persist failed" exception=e
     end
     notify_projects!(model.state)
-    return nothing
-end
-
-# `run_turn!` calls this right before driving the agent prompt for a popped
-# `UserMessage`. Finds the oldest UserMsg in `msgs_store` still marked queued
-# (FIFO matches the channel order under `send_message!`) and emits a
-# `user_unqueue` event so the browser drops the "queued" class. No-op when
-# the chat was idle — the just-pushed bubble was never queued.
-"""
-    drop_queued_sends!(chat) -> Int
-
-Discard every user message still waiting to be prompted, and relabel its bubble
-"not sent". Called by stop.
-
-The text is KEPT — silently deleting what someone typed is worse than not
-sending it — so the bubble stays dimmed and badged, and re-sending is a copy
-away. Returns how many were dropped.
-
-Drains `user_messages` (what the consumer would pick up) and `pending_sends`
-(the bubbles mirroring it) together, under the shared lock, so the two can't
-disagree about what is still queued.
-"""
-function drop_queued_sends!(chat::ChatModel)
-    s = shared(chat)
-    dropped = lock(s.lock) do
-        # Non-blocking drain: `isready` is false the moment the queue is empty,
-        # so this never waits on a producer.
-        while isready(s.user_messages)
-            take!(s.user_messages)
-        end
-        stuck = [(i - 1, m) for (i, m) in enumerate(s.msgs_store)
-                 if m isa UserMsg && m.queued]
-        for (_, m) in stuck
-            m.queued = false      # no longer waiting on us
-            m.queue_pos = 0
-        end
-        empty!(s.pending_sends)
-        stuck
-    end
-    isempty(dropped) && return 0
-    # Keep `.bt-queued` (dimmed) and swap the position badge for a plain reason:
-    # `user_unqueue` would clear the class and leave the bubble looking sent.
-    chat_emit(chat, Dict{String,Any}(
-        "type"  => "user_requeue",
-        "items" => [Dict{String,Any}("idx" => i, "label" => "not sent")
-                    for (i, _) in dropped]))
-    return length(dropped)
-end
-
-function promote_queued_user_bubble!(chat::ChatModel)
-    idx, moved = lock(chat.lock) do
-        found = nothing
-        for (i, m) in enumerate(chat.msgs_store)
-            m isa UserMsg && m.queued || continue
-            if found === nothing
-                m.queued = false; m.queue_pos = 0
-                found = i
-            else
-                m.queue_pos = max(1, m.queue_pos - 1)   # everyone behind moves up
-            end
-        end
-        # Store index (0-based for JS) + the new positions of those still waiting.
-        return (found, [(i - 1, m.queue_pos) for (i, m) in enumerate(chat.msgs_store)
-                        if m isa UserMsg && m.queued])
-    end
-    idx === nothing && return nothing
-    isempty(moved) || chat_emit(chat, Dict{String,Any}(
-        "type" => "user_requeue",
-        "items" => [Dict{String,Any}("idx" => i, "pos" => p) for (i, p) in moved]))
-    # Ship the store index (0-based for JS): the client must clear the badge
-    # on the CACHED node at that index — a DOM-only lookup misses bubbles
-    # that are virtually scrolled out, leaving a stale QUEUED badge that
-    # makes the whole chat read as wedged.
-    chat_emit(chat, Dict{String,Any}("type" => "user_unqueue", "idx" => idx - 1))
     return nothing
 end
 
@@ -6992,20 +7103,13 @@ end
 function reconcile_replay!(model::ChatModel, replay)
     candidates = filter(keep_in_history, replay)
     # Mutate under the lock; collect what to EMIT and emit after (listeners —
-    # the JS bridges — must never run while we hold the lock).
+    # the JS bridges — must never run while we hold the lock). Every tab's
+    # requests for this chat wait meanwhile, hence `locked_s` in the log.
+    t0 = time()
     event, adopted_n = lock(model.lock) do
         existing = model.msgs_store
-        # Trailing store messages that are fresh user bubbles the agent hasn't
-        # seen (`pending_sends`, pushed by `send_message!`, popped once
-        # `begin_turn` delivered the prompt). They never anchor the merge and
-        # adopted history must land BEFORE them — the user's just-typed message
-        # stays the LAST message even when the bind-triggered reconcile floods
-        # in hundreds of adopted turns.
+        # Pending submissions are outside history and cannot anchor a replay.
         npending = 0
-        for m in Iterators.reverse(existing)
-            any(p -> p === m, model.pending_sends) || break
-            npending += 1
-        end
         plan = plan_reconcile(existing, candidates, npending)
         plan.mode == :noop && return (nothing, 0)
         adopted = ChatMsg[replayed_to_msg(model, m) for m in plan.adopt]
@@ -7046,12 +7150,13 @@ function reconcile_replay!(model::ChatModel, replay)
                     length(adopted))
         end
     end
+    locked = time() - t0
     # Stamp even on a no-op: "we checked against the session at time X" is the
     # watermark `session_advanced_since_sync` compares the jsonl mtime against.
     mark_history_synced!(model)
     event === nothing && return nothing
     chat_emit(model, event)
-    @info "reconciled claude history" project_id = model.project_id adopted = adopted_n mode = event["type"]
+    @info "reconciled claude history" project_id = model.project_id adopted = adopted_n mode = event["type"] locked_s = round(locked; digits = 1)
     return nothing
 end
 
@@ -7277,8 +7382,11 @@ end
 # Long-running actions report through `header_status` (the muted line left of
 # the controls) and outcomes through toasts — a button's label is never
 # rewritten to carry a result.
+# The DOM of a `ChatHeader`.
 function chat_header(session::Bonito.Session, model::ChatModel)
     state = model.state
+    # Whom this tab serves: what the menu offers is theirs to use.
+    viewer = model.viewer
     project_id = model.project_id
     cwd = model.cwd
     # The folder shown to the user is the project's path ON THE WORKER — where the
@@ -7403,8 +7511,10 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         # redundant second bring-up — which tears down the just-revived session
         # and drops the next prompt. Ignore a click while a restart is running.
         sh = shared(model)
-        lock(() -> sh.restart_inflight[], sh.restart_lock) && return
+        lock(() -> sh.restart_inflight[], sh.restart_lock) === nothing || return
         restart_status[] = "Restarting…"
+        # A restart the user asked for replaces whatever a worker crash cut off.
+        forget_interrupted_turn!(model.state, model.project_id)
         @async begin
             try
                 restart_chat_session!(model)
@@ -7441,12 +7551,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     menu_pick = Observable("")
     # Picking an item closes whatever holds it: the popover on wide panes, and
     # on narrow panes the expanded ⋯ panel the items are laid out in.
-    close_menu_js = """
-        const m = event.currentTarget.closest('.bt-menu');
-        if (m) {
-            m.classList.remove('bt-menu-open');
-            if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
-        }
+    close_menu_js = MENU_CLOSE_JS * """
         const more = event.currentTarget.closest('.bt-header')?.querySelector('.bt-header-more-check');
         if (more) more.checked = false;"""
     menu_item(text, action; class = "", title = "") = DOM.button(text;
@@ -7457,22 +7562,23 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             $(menu_pick).notify($(action));
         }""")
 
-    # "Continue on <worker>": the whole chat — its files, its history and the
-    # agent's own memory — moves to another machine and picks up there. One item
-    # per OTHER online worker, following the worker list; the group disappears
-    # when there is nowhere else to go. See `start!` for the move itself.
+    # "Continue on <worker>": a NEW chat on another machine that picks up here,
+    # with the project's files and the agent's own memory. This chat stays as it
+    # is. One item per OTHER online worker, following the worker list; the group
+    # disappears when there is nowhere else to go. See `continue_on!`.
     continue_pick = Observable("")
     continue_items = map(session, state.workers) do workers
         cur = isempty(project_id) ? nothing : get(state.projects[], project_id, nothing)
         cur === nothing && return DOM.div(; class = "bt-menu-group bt-hidden")
-        others = sort([w for w in values(workers) if isopen(w) && w.worker_id != cur.worker_id];
+        others = sort([w for w in values(workers)
+                       if isopen(w) && w.worker_id != cur.worker_id && visible(viewer, w)];
                       by = w -> w.name)
         isempty(others) && return DOM.div(; class = "bt-menu-group bt-hidden")
         DOM.div(
             DOM.div("Continue on"; class = "bt-menu-title"),
             (DOM.button(w.name;
                 class = "bt-menu-item bt-menu-continue",
-                title = "Move this chat, its files and the agent's memory to $(w.name) and carry on there",
+                title = "Open a new chat on $(w.name) that picks up here: the files and the agent's memory. This chat stays as it is.",
                 onclick = js"""event => {
                     $(Bonito.JSString(close_menu_js))
                     $(continue_pick).notify($(w.worker_id));
@@ -7487,22 +7593,19 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         p = get(state.projects[], project_id, nothing)
         p === nothing && return
         w = get(state.workers[], wid, nothing)
-        (w === nothing || !isopen(w)) && (problem("That worker is offline"); return)
+        # Not one this person may use: as if it did not exist.
+        (w === nothing || !visible(viewer, w)) && (problem("There is no such worker"); return)
+        isopen(w) || (problem("That worker is offline"); return)
         wid == p.worker_id && return
-        # A turn in flight would be cut off mid-answer by the session stop: the
-        # user stops it (or waits) first, knowingly.
+        # The new chat resumes the conversation as it is when this starts. Mid-turn
+        # that would be half an answer: finish (or stop) the turn first.
         sh = shared(model)
         if lock(() -> sh.turn_in_flight[], sh.lock)
             problem("Wait for the current turn to finish, or stop it, before continuing on $(w.name)")
             return
         end
-        # The move stops this chat's session first, which evicts its ChatModel
-        # and prunes THIS pane (sidebar.jl) — so from that moment on nothing in
-        # this header exists to show progress in. It all goes to the WINDOW's one
-        # progress card, which outlives the pane: one card that stays up for the
-        # whole move and updates in place (this used to flash a fresh 3.2 s toast
-        # per transferred FILE, which is why a move looked like a popup loop that
-        # never got anywhere).
+        # Copying a big project takes a while; it reports into the WINDOW's one
+        # progress card, which stays up for the whole of it and updates in place.
         prog = pane === nothing ? nothing : pane.progress
         if prog !== nothing && is_busy_running(prog[])
             problem("Something else is already running in this window — wait for it to finish")
@@ -7510,28 +7613,16 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         end
         prog === nothing || busy_start!(prog, "Continuing on $(w.name)")
         Base.errormonitor(@async try
-            safe_set!(header_status, "Continuing on $(w.name)…")
-            start!(state, p, wid; progress = (stage, info) ->
+            new_p = continue_on!(state, p, wid; progress = (stage, info) ->
                 prog === nothing || busy_event!(prog, stage, info))
-            # The chat pane is rebuilt around the new session (sidebar.jl revives
-            # the current view on the model's re-add); say what the agent knows.
-            prog === nothing || busy_done!(prog, p.resume_session_id === nothing ?
-                "Continued on $(w.name). The agent starts fresh there; the messages above stay." :
-                "Continued on $(w.name). The agent kept its memory.")
-            pane === nothing || (pane.navigate[] = p.id)
+            prog === nothing || busy_done!(prog, new_p.resume_session_id === nothing ?
+                "New chat on $(w.name). The agent starts fresh there; this chat stays as it is." :
+                "New chat on $(w.name), with the agent's memory. This chat stays as it is.")
+            pane === nothing || (pane.navigate[] = new_p.id)
         catch e
             bt = catch_backtrace()
             @warn "continue on worker failed" project = p.name target = w.name exception = (e, bt)
             problem("Could not continue on $(w.name)", error_detail(e, bt))
-            # The session was already stopped for the move; bring the chat back
-            # on the worker it is still bound to, so a failed move is not a
-            # closed chat.
-            try
-                ensure_project_session!(state, p)
-                pane === nothing || (pane.navigate[] = p.id)
-            catch e2
-                @warn "could not bring the chat back after a failed move" project = p.name exception = (e2, catch_backtrace())
-            end
         end)
     end
 
@@ -7687,6 +7778,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             # The restart IS the switch as far as the agent is concerned: the
             # tools ride the MCP process's environment, which is rebuilt on
             # bring-up (`refresh_injected_env`).
+            forget_interrupted_turn!(state, project_id)
             restart_chat_session!(model)
             safe_set!(header_status, "")
         end;
@@ -7701,6 +7793,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 "Restarts the session.")
     devmode_item = dev.item
     devmode_on   = dev.is_on
+    # Both reach past this chat (other workers; the whole server): admins only.
+    is_admin(viewer) || (remote_item = DOM.div(); devmode_item = DOM.div())
 
     menu_trigger_class = map(session, devmode_on) do on
         on ? "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger bt-menu-trigger-danger" :
@@ -7709,21 +7803,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     menu_trigger = DOM.button("⋯";
         class = menu_trigger_class,
         title = "More actions",
-        onclick = js"""event => {
-            event.stopPropagation();
-            const m = event.currentTarget.parentElement;
-            if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
-            const open = m.classList.toggle('bt-menu-open');
-            if (open) {
-                m.__close = (ev) => {
-                    if (m.contains(ev.target)) return;
-                    m.classList.remove('bt-menu-open');
-                    document.removeEventListener('click', m.__close, true);
-                    m.__close = null;
-                };
-                document.addEventListener('click', m.__close, true);
-            }
-        }""")
+        onclick = MENU_TOGGLE_JS)
     # In the ⋯ menu with every other one-shot action, not as a lone button in
     # the strip. The strip is for what the user READS continuously (the context
     # meter) and for the pickers that describe the session; a verb parked next
@@ -7756,7 +7836,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             class = "bt-menu-list");
         class = "bt-menu bt-header-menu")
 
-    # (The Yolo toggle lives in the composer — see `chat_input_area` — not in
+    # (The Yolo toggle lives in the composer — see `chat_composer` — not in
     # the header: it repurposes the message input as the reminders editor, so
     # the control sits next to what it changes.)
 
@@ -7945,6 +8025,8 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
     # id rather than reopening with (say) Claude's UUID next time.
     project === nothing || (project.resume_session_id = nothing)
 
+    # Another agent now: whatever a worker crash cut off stays cut off.
+    forget_interrupted_turn!(model.state, model.project_id)
     restart_chat_session!(model)
     if s.session_alive[]
         # Commit only after the worker spawned the provider and ACP completed
@@ -8022,7 +8104,8 @@ icon_img(asset, alt) = DOM.img(src=asset, alt=alt, draggable="false",
     style=Styles("pointer-events" => "none",
         "user-select" => "none"))
 
-function chat_input_area(session::Session, model::ChatModel)
+# The DOM of a `ChatComposer`.
+function chat_composer(session::Session, model::ChatModel)
     # The input widgets are JS-owned: `BonitoChat` (assets/bonitoagents.js →
     # `setupInputs`) attaches capture-phase click + Enter listeners, reads
     # the textarea on submit, posts a `{type: 'send', text, attachments}`
@@ -8045,17 +8128,12 @@ function chat_input_area(session::Session, model::ChatModel)
     text_input = DOM.textarea(
         model.yolo[] ? model.yolo_reminders[] : "";
         placeholder = map(y -> y ? YOLO_INPUT_PLACEHOLDER : "Message…", model.yolo),
-        title = map(y -> y ? "Enter to lock in the reminders" :
-                             "Enter to send  ·  Shift+Enter for newline", model.yolo),
+        title = "Write a message",
+        enterkeyhint = "enter",
         class = map(y -> y ? "bt-text-input bt-text-input-yolo" : "bt-text-input",
                     model.yolo),
-        rows = 1,
-        oninput=js"""event => {
-            event.target.style.height = 'auto';
-            event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
-        }""")
-    # Yolo toggle bar: a wide-and-short strip spanning the button column,
-    # right above the send/stop pair. Reads the per-session bridged child
+        rows = 1)
+    # Yolo toggle in the composer controls. Reads the per-session bridged child
     # (`model.yolo`) for label/class; WRITES through the shared source of
     # truth (`shared(model).yolo[]`) so every tab flips.
     yolo_click = Observable("")
@@ -8081,31 +8159,24 @@ function chat_input_area(session::Session, model::ChatModel)
             model.yolo);
         type = "button",
         class = map(y -> y ? "bt-send-btn bt-send-btn-yolo" : "bt-send-btn", model.yolo),
-        title = map(y -> y ? "Lock in reminders (Enter)" : "Send (Enter)", model.yolo))
+        title = map(y -> y ? "Lock in reminders" : "Send", model.yolo))
     stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
-        class="bt-stop-btn", title="Stop generation")
-    # Attaching an image had exactly two ways in: paste and drag-drop. Neither
-    # exists on a phone, so the feature was desktop-only by accident. A file
-    # input is the one affordance a mobile browser turns into the native
-    # camera/gallery sheet — hence `accept="image/*"` (what the pipeline
-    # supports: `attachAddBlob` reads a data URL for the thumbnail strip).
+        class="bt-stop-btn", title="Stop generation and pause queued messages")
+    # Attaching had exactly two ways in: paste and drag-drop. Neither exists on
+    # a phone, so the feature was desktop-only by accident. A file input is the
+    # affordance a mobile browser turns into its camera/gallery/files sheet.
+    # Any file: an image the agent can see goes inline, anything else (a PDF, a
+    # video, an image type not stored inline) is uploaded and copied to the
+    # worker for the agent to open (`attachAdd` in bonitoagents.js). No
+    # `accept`: it is what would narrow the sheet to the gallery.
     #
     # The input is hidden and driven by the button, because a raw file input
     # can't be styled to match and reads as a form control in a chat composer.
-    #
-    # `image/*` rather than the exact list in `ATTACHMENT_EXTENSIONS`: the wide
-    # form is what mobile browsers recognise as "offer the camera/gallery
-    # sheet", and narrowing it can leave an HEIF-shooting phone staring at an
-    # empty gallery. The cost is that a format the server doesn't store (HEIC
-    # off some Android pickers — iOS Safari transcodes to JPEG for `image/*`,
-    # so it doesn't arise there) queues a thumbnail and is refused on send with
-    # a mime message, rather than being unselectable. A late clear error beats
-    # an empty picker.
-    attach_input = DOM.input(; type = "file", accept = "image/*", multiple = true,
+    attach_input = DOM.input(; type = "file", multiple = true,
                                class = "bt-attach-input", tabindex = "-1",
                                ariaHidden = "true")
     attach_btn = DOM.button(icon_img(attach_icon(), "Attach"); type = "button",
-        class = "bt-attach-btn", title = "Attach an image")
+        class = "bt-attach-btn", title = "Attach files")
     # Prefill/draft swap for Yolo mode. Runs as an inline script child (the
     # ES6Module/init-script idiom): `$(text_input)` is a direct node ref, the
     # interpolated observables are live proxies. Toggle ON stashes the user's
@@ -8120,8 +8191,7 @@ function chat_input_area(session::Session, model::ChatModel)
             const yolo = $(model.yolo);
             const reminders = $(model.yolo_reminders);
             const resize = () => {
-                input.style.height = 'auto';
-                input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+                input.dispatchEvent(new Event('bt-composer-resize'));
             };
             yolo.on(on => {
                 if (on) {
@@ -8138,22 +8208,33 @@ function chat_input_area(session::Session, model::ChatModel)
             });
         })();
     """
+    send_mode = DOM.div(
+        DOM.button(DOM.span("Queue when done"; class="bt-send-mode-label"); type="button",
+            class="bt-btn bt-btn-ghost bt-send-mode-trigger",
+            title="Queue for when done", var"aria-label"="Queue for when done",
+            var"aria-haspopup"="menu", var"aria-expanded"="false"),
+        DOM.div(
+            [DOM.button(label; type="button", role="menuitemradio",
+                class="bt-btn bt-btn-ghost bt-send-mode-option",
+                var"data-send-mode"=mode, var"aria-checked"=mode == "done" ? "true" : "false")
+             for (mode, label) in (("done", "Queue for when done"),
+                 ("next", "Queue after current message"), ("interrupt", "Interrupt + send"))]...;
+            class="bt-send-mode-menu", role="menu", hidden=true),
+        class="bt-send-mode")
     DOM.div(
+        DOM.div(; class="bt-message-queue", role="region", var"aria-label"="Pending messages"),
+        DOM.div(; class="bt-queue-delivery", role="status", var"aria-live"="polite"),
         DOM.div(
             attach_btn, attach_input,
             text_input,
             DOM.div(
                 yolo_bar,
-                DOM.div(send_btn, stop_btn; class="bt-input-btn-row"),
+                DOM.div(send_mode, stop_btn, send_btn; class="bt-input-btn-row"),
                 class="bt-input-controls"),
             class="bt-input-row"),
         yolo_mode_js;
         class="bt-input-area")
 end
-
-# JS counterpart. `connect(node, comm)` is called by the inline init JS in
-# `jsrender(::ChatModel)` below — same pattern as BonitoBook's MonacoEditor.
-const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoagents.js"))
 
 # ── Image attachments ─────────────────────────────────────────────────────
 # The JS input area collects pasted / dropped images locally and ships them
@@ -8228,7 +8309,7 @@ function push_attachment_to_worker(model::ChatModel, rel_path::AbstractString)
     isempty(pid) && return
     proj = get(model.state.projects[], pid, nothing)
     proj === nothing && return
-    haskey(model.state.worker_control_ws, proj.worker_id) || return
+    reachable(model.state, proj.worker_id) || return
     src = joinpath(model.cwd, rel_path)
     dst = joinpath(proj.worker_path, rel_path)
     try
@@ -8240,9 +8321,11 @@ function push_attachment_to_worker(model::ChatModel, rel_path::AbstractString)
     return
 end
 
-# Parse JS-side attachment payloads ({mime, data, filename?}) into a
-# (display_text_suffix, [ImageAttachment]) pair. `attachments` may be
-# empty (no-op). Each entry's base64 `data` field is decoded once.
+# Parse JS-side attachment payloads into a (display_text_suffix,
+# [ImageAttachment]) pair. `attachments` may be empty (no-op). An image comes
+# inline ({mime, data, filename?}, base64 decoded once) and is also shown to
+# the agent; any other file was uploaded beforehand (`attachment_upload`) and
+# comes as {kind: "file", path, on_worker}: the agent gets its path only.
 function process_attachments!(model::ChatModel, attachments)
     attachments isa AbstractVector || return ("", AgentClientProtocol.ImageAttachment[])
     isempty(attachments) && return ("", AgentClientProtocol.ImageAttachment[])
@@ -8251,6 +8334,17 @@ function process_attachments!(model::ChatModel, attachments)
     blocks = AgentClientProtocol.ImageAttachment[]
     for a in attachments
         a isa AbstractDict || continue
+        if get(a, "kind", "image") == "file"
+            rel = String(get(a, "path", ""))
+            name = basename(rel)
+            (rel == joinpath(ATTACHMENT_DIR_NAME, name) && is_attachment_name(name) &&
+             isfile(joinpath(model.cwd, rel))) || error("Attachment not found on the server: $(rel)")
+            # The upload copies it to the worker; one whose worker was out of
+            # reach then goes now.
+            get(a, "on_worker", false) === true || push_attachment_to_worker(model, rel)
+            push!(suffix_lines, "  - $(rel)")
+            continue
+        end
         mime = String(get(a, "mime", ""))
         b64 = String(get(a, "data", ""))
         (isempty(mime) || isempty(b64)) && continue
@@ -8281,16 +8375,19 @@ struct LensQueryCommand <: ChatCommand;  query::String;  end
 struct LensSaveCommand   <: ChatCommand;  query::String;  end
 struct LensDeleteCommand <: ChatCommand;  query::String;  end
 
-# Wire `{type: "msgs.request", range: [s, e], epoch}` — JS virtual-scroll
-# wants messages [s..e] (zero-based, inclusive) for the visible window.
-# `epoch` is the client's reload generation, echoed verbatim on the
-# `msgs.range` reply so a reply computed BEFORE a `msgs.reload` (indices
-# shifted by a reconcile splice) is dropped client-side instead of caching
-# old-world messages at new-world positions. -1 = absent (older client).
+# Wire `{type: "msgs.request", range: [s, e] | indices: [...], epoch, req}`:
+# the transcript wants messages [s..e] (zero-based, inclusive) or, under a
+# search lens, exactly the listed indices. `epoch` is the client's reload
+# generation and `req` its request id; both are echoed on the `msgs.range`
+# reply, so a reply from before a `msgs.reload` (indices shifted by a
+# reconcile splice) or for a block the tab has since replaced is dropped
+# client-side. -1 = absent.
 struct MsgsRequestCommand <: ChatCommand
     s::Int
     e::Int
+    indices::Union{Vector{Int},Nothing}
     epoch::Int
+    req::Int
 end
 
 # Wire `{type: "tool.render", id: <tool_id>}` — user expanded the tool
@@ -8379,18 +8476,31 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
     if type == "init"
         return InitCommand()
     elseif type == "msgs.request"
+        ep  = get(msg, "epoch", -1)
+        req = get(msg, "req", -1)
+        ep  = ep isa Number ? Int(ep) : -1
+        req = req isa Number ? Int(req) : -1
+        ids = get(msg, "indices", nothing)
+        if ids isa AbstractVector
+            all(i -> i isa Number, ids) || return UnknownCommand()
+            return MsgsRequestCommand(0, -1, Int[Int(i) for i in ids], ep, req)
+        end
         rng = get(msg, "range", nothing)
         rng isa AbstractVector && length(rng) == 2 || return UnknownCommand()
-        ep = get(msg, "epoch", -1)
-        return MsgsRequestCommand(Int(rng[1]), Int(rng[2]), ep isa Number ? Int(ep) : -1)
+        return MsgsRequestCommand(Int(rng[1]), Int(rng[2]), nothing, ep, req)
     elseif type == "tool.render"
         return ToolRenderCommand(String(get(msg, "id", "")))
+    elseif type == "media.size" || type == "tool.size"
+        return parse_size_command(msg, type)    # measured_sizes.jl
     elseif type == "thought.render"
         return ThoughtRenderCommand(String(get(msg, "id", "")))
     elseif type == "send"
         atts = get(msg, "attachments", Any[])
-        return SendCommand(String(get(msg, "text", "")),
-            atts isa AbstractVector ? collect(atts) : Any[])
+        return SendModeCommand(SendCommand(String(get(msg, "text", "")),
+            atts isa AbstractVector ? collect(atts) : Any[]),
+            send_mode(get(msg, "mode", "done")))
+    elseif type == "queue.action"
+        return QueueActionCommand(String(get(msg, "id", "")), String(get(msg, "action", "")))
     elseif type == "cancel"
         return CancelCommand(Int(get(msg, "seq", -1)))
     elseif type == "stop_tool"
@@ -8439,13 +8549,31 @@ handle_command!(::ChatModel, ::Session, ::UnknownCommand) = nothing
 
 # (The TaskBar needs no init handshake: it's an Observable component — a
 # tab joining mid-turn renders the current pin-board state on mount.)
+"""
+    transcript_tail(model; count = 40) -> Dict
+
+The newest `count` messages as the transcript renders them, with the total:
+`{n, start, msgs}`, `start` being the store index of the first one.
+"""
+function transcript_tail(model::ChatModel; count::Int = 40)
+    n, s, slice = lock(model.lock) do
+        store = model.msgs_store
+        n = length(store)
+        s = max(0, n - count)
+        (n, s, store[(s+1):n])
+    end
+    return Dict{String,Any}("n" => n, "start" => s,
+                            "msgs" => [row_dict(model, m) for m in slice])
+end
+
 function handle_command!(model::ChatModel, ::Session, ::InitCommand)
-    chat_emit(model, Dict{String,Any}(
-        "type" => "msgs.count", "n" => length(model.msgs_store)))
+    reply!(model, Dict{String,Any}(
+        "type" => "msgs.count", "n" => lock(() -> length(model.msgs_store), model.lock)))
     # Seed the lens UI: the chat-derived autocomplete vocabulary + the global
     # saved lenses. Broadcasts are fine — every tab of this chat shares the
     # same vocabulary, and saved lenses are global favorites.
     emit_lens_vocab(model)
+    emit_queue!(model)
     emit_saved_lenses(model, load_saved_lenses())
     return nothing
 end
@@ -8465,19 +8593,26 @@ function handle_command!(model::ChatModel, ::Session, cmd::MsgsRequestCommand)
         # Empty store: clamp(x, 0, -1) inverts the bounds and `store[0:0]`
         # throws — a stale request right after a reset must be a no-op.
         n == 0 && return nothing
-        s = clamp(cmd.s, 0, n - 1)
-        e = clamp(cmd.e, 0, n - 1)
-        s > e && return nothing
-        (s, store[(s+1):(e+1)])
+        if cmd.indices !== nothing
+            ids = filter(i -> 0 <= i < n, cmd.indices)
+            isempty(ids) ? nothing : (ids, store[ids .+ 1])
+        else
+            s = clamp(cmd.s, 0, n - 1)
+            e = clamp(cmd.e, 0, n - 1)
+            s > e ? nothing : (s, store[(s+1):(e+1)])
+        end
     end
     batch === nothing && return nothing
-    s, slice = batch
-    msgs = [msg_to_dict(m, model.chat_dir) for m in slice]
-    reply = Dict{String,Any}("type" => "msgs.range", "start" => s, "msgs" => msgs)
-    # Echo the client's reload generation (see MsgsRequestCommand) so a reply
-    # that raced a msgs.reload is dropped instead of mis-cached.
+    where, slice = batch
+    msgs = [row_dict(model, m) for m in slice]
+    reply = Dict{String,Any}("type" => "msgs.range", "msgs" => msgs)
+    where isa Int ? (reply["start"] = where) : (reply["indices"] = where)
+    # Echo the client's reload generation and request id (see
+    # MsgsRequestCommand), so a reply that raced a reload or a replaced block is
+    # dropped instead of mis-placed.
     cmd.epoch >= 0 && (reply["epoch"] = cmd.epoch)
-    chat_emit(model, reply)
+    cmd.req >= 0 && (reply["req"] = cmd.req)
+    reply!(model, reply)
     return nothing
 end
 
@@ -8528,17 +8663,17 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
             # render, every other tool type the generic `jsrender(::ToolMsg)`
             # bridge → `render_tool_body`. `dom_in_js` wraps a non-Node through
             # `render_subsession`, so handing it the message is fine.
-            # `toolSlot` (a ChatLib module export — no window.* global) also
-            # finds slots on nodes the virtual scroll holds DETACHED (cache
-            # window / prefetch) — a plain document.querySelector misses those
-            # and the body would be stuck on "loading…".
+            # `toolSlot` (a ChatLib module export, no window.* global) finds
+            # the slot through the chats' own row maps, not only the document.
+            # `bodyMounted`: the row may be far from the view by now, and is
+            # freed again at once if so (bonitoagents.js `freeBody`).
             Bonito.dom_in_js(
                 session,
                 msg,
                 js"""(elem) => {
     $(ChatLib).then(lib => {
         const slot = lib.toolSlot($(cmd.tool_id));
-        if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+        if (slot) { slot.innerHTML = ''; slot.appendChild(elem); lib.bodyMounted(slot); }
     });
 }"""
             )
@@ -8589,7 +8724,11 @@ function handle_command!(model::ChatModel, ::Session, cmd::ThoughtRenderCommand)
     return nothing
 end
 
-function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
+function handle_command!(model::ChatModel, session, cmd::SendCommand)
+    return handle_send!(model, cmd, :done)
+end
+
+function handle_send!(model::ChatModel, cmd::SendCommand, mode::Symbol)
     # (Session arg is unused — typed `::Any` so the send path is unit-testable
     # without a Bonito.Session, like the CancelCommand handler.)
     #
@@ -8598,6 +8737,8 @@ function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
     # the UI — no user message can slip through while the autonomous loop runs.
     # The loop's own auto-continue calls `send_message!` directly (never
     # SendCommand), so it is unaffected by this guard.
+    # Whatever a worker crash cut off here, the user carries on themselves.
+    forget_interrupted_turn!(model.state, model.project_id)
     if shared(model).yolo[]
         shared(model).yolo_reminders[] = String(strip(cmd.text))
         return nothing
@@ -8613,24 +8754,24 @@ function handle_command!(model::ChatModel, ::Any, cmd::SendCommand)
             "type" => "attach_error", "error" => sprint(showerror, e)))
         return nothing
     end
-    display_text = isempty(strip(cmd.text)) && !isempty(blocks) ?
-                   "(image attached)" * suffix :
-                   cmd.text * suffix
+    display_text = !isempty(strip(cmd.text)) || isempty(suffix) ? cmd.text * suffix :
+                   (isempty(blocks) ? "(file attached)" : "(image attached)") * suffix
     # No server-side ack — JS already cleared the input optimistically on
     # submit. Errors (attachment-rejection above, or ACP send failures
     # surfaced by `send_message!`'s downstream code) flow back through
     # their own events.
-    send_message!(model, UserMsg(display_text); images=blocks)
+    send_message!(model, UserMsg(display_text); images=blocks, mode)
     return nothing
 end
 
 function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
+    # A stop is a stop, also for a turn a worker crash cut off: never continue it.
+    forget_interrupted_turn!(model.state, model.project_id)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
     # `client(model.agent)` is a single-field read. (Session arg is unused here —
     # typed `::Any` so the cancel path is unit-testable without a Bonito.Session.)
     c = client(model.agent)
-    c === nothing && return nothing
     s = shared(model)
     # Turn-scoped: a cancel aimed at a turn that already ended is DROPPED —
     # it must not kill whatever turn happens to be running now.
@@ -8639,35 +8780,13 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
         return nothing
     end
 
-    # Nothing to cancel means the indicator is LYING, and the honest response is
-    # to fix the indicator — not to punish the user for believing it.
-    #
-    # The stuck shape: an auto-wake episode opens `busy_active` off arriving
-    # frames, and its only end markers are a `usage_update` the agent tags with
-    # an autonomous origin (claude-agent-acp emits it conditionally, so it can
-    # simply be absent) and `begin_turn`. When the tag never comes, the sole
-    # remaining exit is a new turn — and `busy_active` is exactly what makes the
-    # composer queue instead of send. Stop was the one control left, and it ran
-    # `drop_queued_sends!` unconditionally: it deleted the message that would
-    # have released the chat, then cancelled nothing, leaving the spinner up. No
-    # user-reachable way out; observed live as a 53-minute wedge over an agent
-    # that had been idle the whole time.
-    #
-    # So stop is also the RECONCILE: the user telling us it is not running is
-    # ground truth we can check, and `session_live` checks it. Queued messages
-    # are KEPT — the consumer is free to pick them up, which is what the user
-    # wanted when they typed them.
-    if !AgentClientProtocol.session_live(c)
-        refresh_activity!(model)
+    # Stop pauses the outbox even during lazy connection setup or while
+    # offline. A stale turn-scoped click above is the only exception.
+    drop_queued_sends!(model)
+    if c === nothing || isempty(AgentClientProtocol.open_turns(c))
+        publish_busy!(model)
         return nothing
     end
-
-    # Stop means stop the CHAT, not just this turn. Anything still waiting would
-    # otherwise start a fresh turn the moment the cancelled one ends — the user
-    # presses stop and the agent keeps answering. Drop the waiting prompts (the
-    # bubbles stay, relabelled) BEFORE cancelling, so the consumer can't pick one
-    # up in the window between the cancel landing and the turn winding down.
-    drop_queued_sends!(model)
 
     # A graceful `session/cancel` makes ACP close the active turn's update
     # channel; the `prompt!` loop ends, `run_turn!`'s `finally` clears
@@ -8688,9 +8807,11 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # 20 s is well past the worst observed cold-start honor latency (warm ≈ 0.1s,
     # cold-fresh ≈ 3.9s, cold-resumed ≈ 6–18s), so an impatient double-click never
     # force-closes a turn that's about to honor.
-    escalate = first_at > 0 && (now - first_at) ≥ 20.0 && s.busy_active[]
-    first_at > 0 || (@atomic c.conn.cancel_at = now)   # stamp the first cancel
-    AgentClientProtocol.cancel!(c)                      # graceful (idempotent re-send)
+    escalate = first_at > 0 && (now - first_at) ≥ 20.0
+    # Graceful, an idempotent re-send. The turns it reaches are recorded first:
+    # a prompt sent in between must see them winding down (`await_cancel_settled!`).
+    lock(() -> (s.cancelled_turns[] = AgentClientProtocol.open_turns(c)), s.lock)
+    AgentClientProtocol.cancel!(c)
     if escalate
         @warn "deliberate re-cancel: agent not honoring — force-closing" project_id = model.project_id
         s.last_error[] = "The agent didn't respond to cancel; session stopped. Click Restart to reconnect."
@@ -8783,15 +8904,14 @@ function request_tool_stop!(model::ChatModel, t::BashToolMsg)
     return nothing
 end
 
-# Background subagent Task: same story (no ACP kill, completion via
-# task-notification). We can't fd-target a subagent, so the honest action is
-# to finalize the pill — the user sees it stop, and the subagent's eventual
-# task-notification lands as its own turn.
+# ACP has no per-subagent cancellation here. This control only dismisses the
+# entry; its label and persisted summary must not claim to stop execution.
 function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
     in_taskbar(t) || return nothing   # in the bar ⇒ a live background subagent
-    finished!(t)   # finalize! (close → feed trace) + drop from the bar
+    t.message.summary = "Dismissed (execution not cancelled)"
+    finished!(t; reason = "dismissed_without_cancellation")
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tool_id(t),
-        "status" => "completed", "summary" => "stopped"))
+        "status" => "completed", "summary" => "Dismissed (execution not cancelled)"))
     return nothing
 end
 
@@ -8804,6 +8924,9 @@ end
 # unlike the chat-level cancel which kills the whole turn.
 function request_tool_stop!(model::ChatModel, t::JuliaEvalCall)
     is_live(t) || return nothing
+    # A card whose run the chat knows stops exactly that run, wherever it runs
+    # (eval_runs.jl). What follows is for cards from before runs.
+    stop_run!(model, t) && return nothing
     tid      = tool_id(t)
     env_path = isempty(t.env_path) ? nothing : t.env_path
     # Immediate visual ack; the result itself arrives with the eval's next
@@ -8887,13 +9010,16 @@ file_panel_content(state::ServerState, project_id::AbstractString,
 open_guard_reject_reason(model::ChatModel, path::AbstractString) =
     open_guard_reject_reason(model.state, model.project_id, path)
 
-function open_guard_reject_reason(state::ServerState, project_id::AbstractString,
-                                  path::AbstractString)
-    name = basename(String(path))
+open_guard_reject_reason(state::ServerState, project_id::AbstractString, path::AbstractString) =
+    open_guard_reject_reason(open_guard_stat(state, project_id, path), path)
+
+# The worker's stat of `path`, or what to do without one: `nothing` lets the fetch
+# try, a String is already the refusal.
+function open_guard_stat(state::ServerState, project_id::AbstractString, path::AbstractString)
     proj = get(state.projects[], project_id, nothing)
     proj === nothing && return nothing      # no worker to stat → let the fetch try
     worker_src = isabspath(path) ? String(path) : joinpath(proj.worker_path, path)
-    info = try
+    return try
         stat_worker_path(state, proj.worker_id, worker_src)
     catch e
         # Fail CLOSED when the worker itself is unreachable (not connected, or
@@ -8903,10 +9029,17 @@ function open_guard_reject_reason(state::ServerState, project_id::AbstractString
         # Any other stat error is a genuine worker-side hiccup → keep the old
         # fail-open behavior and let the fetch report.
         e isa WorkerUnreachableError &&
-            return "Can't open $name — worker not responding"
+            return "Can't open $(basename(String(path))) — worker not responding"
         @warn "open-guard stat failed; allowing the fetch to try" path exception = e
-        return nothing                      # worker hiccup → don't block; fetch reports
+        nothing                             # worker hiccup → don't block; fetch reports
     end
+end
+
+open_guard_reject_reason(::Nothing, path::AbstractString) = nothing
+open_guard_reject_reason(reason::String, path::AbstractString) = reason
+
+function open_guard_reject_reason(info::NamedTuple, path::AbstractString)
+    name = basename(String(path))
     info.exists || return "Can't open $name — not found on the worker"
     info.isdir  && return "Can't open $name — it's a folder"
     info.isfile || return "Can't open $name — not a regular file"
@@ -8970,25 +9103,9 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
     # ONE file — you edit in one, save, and the other quietly holds the old text.
     # Worse, tab disambiguation then dresses the pair up as `uxprobe/notes.md`
     # and `notes.md`, which reads as two genuinely different files.
-    path = show_worker_path(ShowTool(state, String(project_id), String(server_cwd), String(path)))
-    id = file_tab_id(path)
-    existing = findfirst(p -> p.id == id, ws.panels[])
-    if existing !== nothing
-        BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
-        # The content was loaded when the panel first opened; the agent may have
-        # edited the file on the worker since (#34). Async — the activation must
-        # not wait on a worker round-trip.
-        panel = ws.panels[][existing].content
-        panel isa FilePanel && Base.errormonitor(@async try
-            # Same worker-liveness gate as a fresh open; an unreachable /
-            # invalid target just keeps showing what we already have.
-            open_guard_reject_reason(state, project_id, path) === nothing &&
-                refresh_file_panel!(panel)
-        catch e
-            @warn "file panel refresh-on-activate failed" path exception = e
-        end)
-        return nothing
-    end
+    given = String(path)
+    path = show_worker_path(ShowTool(state, String(project_id), String(server_cwd), given))
+    activate_file_tab!(ws, state, project_id, path) && return nothing
     # Fetch (worker transfer — can take seconds) off the event task, then add the
     # panel as the workspace panel's DIRECT content. NOT via a placeholder +
     # reactive `DOM.div(Observable)` swap: that inserts auto-height
@@ -9000,21 +9117,30 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         # window's progress card and opens NO panel, instead of streaming bytes
         # into an empty view (the worker stat is the gate — see
         # open_guard_reject_reason).
-        reason = open_guard_reject_reason(state, project_id, path)
+        target = path
+        info = open_guard_stat(state, project_id, target)
+        found = info isa NamedTuple && !info.exists && !isabspath(given) ?
+                project_file_ending_in(state, project_id, given) : nothing
+        if found !== nothing
+            target = found
+            activate_file_tab!(ws, state, project_id, target) && return
+            info = open_guard_stat(state, project_id, target)
+        end
+        reason = open_guard_reject_reason(info, target)
         if reason !== nothing
             show_problem!(pane, reason)
             return
         end
         elem = try
-            file_panel_content(state, project_id, server_cwd, path)
+            file_panel_content(state, project_id, server_cwd, target)
         catch e
-            @warn "file open failed" path exception = e
-            show_problem!(pane, "Can't open $(basename(String(path))) — $(open_error_brief(e))",
+            @warn "file open failed" path = target exception = e
+            show_problem!(pane, "Can't open $(basename(target)) — $(open_error_brief(e))",
                           error_detail(e))
             return
         end
-        BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
-            label = basename(path), closable = true))
+        BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(file_tab_id(target), elem;
+            label = basename(target), closable = true))
         relabel_file_tabs!(ws)
         # Mark the tab while the buffer differs from what was last saved. Closing
         # a tab discards it WITHOUT asking, so this dot is the only warning you
@@ -9025,6 +9151,46 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         end
     end)
     return nothing
+end
+
+# Focus the tab already showing worker file `path`; `false` when there is none.
+function activate_file_tab!(ws, state::ServerState, project_id::AbstractString,
+                            path::AbstractString)
+    id = file_tab_id(path)
+    existing = findfirst(p -> p.id == id, ws.panels[])
+    existing === nothing && return false
+    BonitoWidgets.activate_panel!(ws, id)
+    # The content was loaded when the panel first opened; the agent may have
+    # edited the file on the worker since (#34). Async — the activation must
+    # not wait on a worker round-trip.
+    panel = ws.panels[][existing].content
+    panel isa FilePanel && Base.errormonitor(@async try
+        # Same worker-liveness gate as a fresh open; an unreachable /
+        # invalid target just keeps showing what we already have.
+        open_guard_reject_reason(state, project_id, path) === nothing &&
+            refresh_file_panel!(panel)
+    catch e
+        @warn "file panel refresh-on-activate failed" path exception = e
+    end)
+    return true
+end
+
+# The agent's relative paths are relative to the project root, but not always: it
+# wrote `Mantle/docs/examples.jl` for `dev/Mantle/docs/examples.jl`. When the
+# path isn't there, the one project file whose path ends in it is what was meant.
+# `nothing` for no match or several (the caller then reports "not found").
+function project_file_ending_in(state::ServerState, project_id::AbstractString,
+                                given::AbstractString)
+    proj = get(state.projects[], project_id, nothing)
+    (proj === nothing || !reachable(state, proj.worker_id)) && return nothing
+    task = ensure_project_file_index!(state, proj)
+    task === nothing || wait(task)
+    # A Windows worker lists its files with backslashes.
+    slashed(p) = replace(p, '\\' => '/')
+    suffix = "/" * slashed(normpath(given))
+    matches = filter(f -> endswith("/" * slashed(f), suffix), project_index_files(proj))
+    length(matches) == 1 || return nothing
+    return joinpath(proj.worker_path, only(matches))
 end
 
 # Is this panel's editor holding unsaved edits right now?
@@ -9052,7 +9218,8 @@ function relabel_file_tabs!(ws)
     return nothing
 end
 
-function session_notice_view(session::Bonito.Session, model::ChatModel)
+# The DOM of a `ChatNotice`.
+function chat_notice(session::Bonito.Session, model::ChatModel)
     box = DOM.div(
         DOM.div(DOM.strong(; class="bt-session-notice-label"),
                 DOM.div(; class="bt-session-notice-text")),
@@ -9082,8 +9249,23 @@ end
 # `session::Session` closure binding flows through unchanged because
 # `handle_command!(::Any, ::Any, ::ToolRenderCommand)` needs it for
 # `dom_in_js`.
-chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict) =
+# Runs on the tab's message task (Bonito handles a tab's messages one at a
+# time), so a command that waits holds up everything else in that tab: every
+# chat in it stays as it is while the page looks connected. Slow ones are
+# logged with the tab (`tab_id`; "tab opened" says whose it is).
+function chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict)
+    t0 = time()
     handle_command!(model, session, parse_chat_command(msg))
+    took = time() - t0
+    took > SLOW_COMMAND_S &&
+        @warn "slow chat command: its tab waited on it" project_id = model.project_id type = get(msg, "type", "?") took_s = round(took; digits = 1) tab = tab_id(session)
+    return nothing
+end
+
+const SLOW_COMMAND_S = 1.0
+
+"A browser tab, short, as the log names it (see \"tab opened\")."
+tab_id(session::Session) = first(Bonito.root_session(session).id, 8)
 
 # `ChatModel` is a Bonito component. Per the convention, the shared instance
 # (the one in `state.chat_models[pid]`) should never be rendered directly —
@@ -9091,6 +9273,12 @@ chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict) =
 # session. The shared bits (msgs_store, ACP client, lock) are still shared
 # (sessions cooperate); the Observable `comm` is a connected child so each
 # tab's JS bridge GC's cleanly when the tab closes.
+#
+# What the pane shows is `chat_pane`: the ordinary chat, or the layout of the
+# app the chat belongs to (apps.jl). Either way it sits in the one root that
+# ties the widgets to this chat (`.bt-app`: the chat's browser code finds the
+# composer, lens bar and taskbar by searching it from the message list), and
+# the commands from this tab reach the chat through one dispatcher.
 function Bonito.jsrender(session::Session, m::ChatModel)
     # `model` is the per-session view: its `comm`, `session_alive`, and
     # `last_error` are connected children of the shared parent's, so the JS
@@ -9108,7 +9296,72 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     on(session, model.comm) do msg
         chat_dispatch!(model, session, msg)
     end
+    app = chat_app(model)
+    # NOTE: there is deliberately NO mount curtain here. The dashboard's load
+    # overlay (`ChatWaitingView`, sidebar.jl) covers this pane from the moment
+    # the user clicks until the chat module shows its first rows (the
+    # `bt-chat-settled` event from `markReady` in bonitoagents.js): one loading
+    # surface, gone as soon as there is something to read.
+    Bonito.jsrender(session, DOM.div(pane_nodes(chat_pane(app, model))...;
+                                     class = "bt-app", dataApp = app === nothing ? "" : app_id(app)))
+end
 
+# What `chat_pane` returned, as the root's children: several nodes, or one.
+pane_nodes(nodes::Union{Tuple,AbstractVector}) = nodes
+pane_nodes(node) = (node,)
+
+"""
+    chat_pane(app, view) -> DOM node(s)
+
+The open chat pane of one tab: what `view` (that tab's copy of the chat's
+model) shows, for a chat of `app`, or `nothing` for an ordinary chat. An app
+implements its own method to lay its chat out. What it returns, one node or a
+tuple of them, is placed in the chat's root: a flex column filling the pane,
+with `data-app` set to the app's id for its styles.
+
+The pieces it can use are the ordinary chat's, as components:
+[`ChatHeader`](@ref), [`ChatNotice`](@ref), [`ChatTranscript`](@ref),
+[`ChatComposer`](@ref) and [`ChatToolbar`](@ref). Each can appear once per
+pane, nested as deep as the layout wants.
+"""
+chat_pane(::Nothing, view::ChatModel) =
+    (ChatHeader(view), ChatNotice(view), ChatTranscript(view), ChatComposer(view), ChatToolbar())
+
+"The chat's header: title, folder, session pills, menu and the lens bar."
+struct ChatHeader
+    view::ChatModel
+end
+
+"The provider's warnings and errors about the chat's session, hidden until there is one."
+struct ChatNotice
+    view::ChatModel
+end
+
+"""
+The message list: the transcript with its rail, the busy, thinking and waiting
+lines under the last message, and the taskbar floating over it. Takes the
+space its parent gives it (a flex child that grows).
+"""
+struct ChatTranscript
+    view::ChatModel
+end
+
+"The composer: the message input with its attachments, send modes, queue, Stop and Send."
+struct ChatComposer
+    view::ChatModel
+end
+
+"The row below the composer, filled by the chat module."
+struct ChatToolbar end
+
+Bonito.jsrender(session::Session, w::ChatHeader)     = Bonito.jsrender(session, chat_header(session, w.view))
+Bonito.jsrender(session::Session, w::ChatNotice)     = Bonito.jsrender(session, chat_notice(session, w.view))
+Bonito.jsrender(session::Session, w::ChatTranscript) = Bonito.jsrender(session, chat_transcript(session, w.view))
+Bonito.jsrender(session::Session, w::ChatComposer)   = Bonito.jsrender(session, chat_composer(session, w.view))
+Bonito.jsrender(session::Session, ::ChatToolbar)     = Bonito.jsrender(session, DOM.div(class = "bt-chat-toolbar"))
+
+# The DOM of a `ChatTranscript`.
+function chat_transcript(session::Session, model::ChatModel)
     # Spinner class follows the shared busy_active observable so the
     # `bt-busy-active` class is set correctly on remount — the comm
     # `busy_start` / `busy_end` events only forward to FUTURE bridges,
@@ -9116,22 +9369,17 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
 
     # The chat's single live-task board (taskbar.jl) — the shared source of
-    # truth. Its KeyedList bridges the shared `items` per session; its ⊗ routes
-    # through the same per-tool stop dispatch.
+    # truth. Its KeyedList bridges the shared `items` per session; its ⊗ is
+    # handled once for the chat (`ChatModel` constructor), not per tab.
     taskbar = shared(model).taskbar
-    on(session, taskbar.stop_request) do id
-        isempty(id) || handle_command!(model, session, StopToolCommand(id))
-    end
 
     messages_container = DOM.div(
-        DOM.div(class="bt-spacer-top"),
-        DOM.div(class="bt-spacer-bottom"),
+        # Message rows go in before this marker (bonitoagents.js `insertRows`).
+        DOM.div(class="bt-rows-end"),
         # Busy dots + transient "reasoning…" indicator live INSIDE the
-        # scroll content, after the bottom spacer (message nodes insert
-        # before it) and before the overscroll tail — so they show up
-        # directly under the last message, not below the tail's empty
-        # space down by the composer. Like the tail, they're plain
-        # content the virtual-scroll geometry never tracks.
+        # scroll content, after the rows and before the overscroll tail, so
+        # they show up directly under the last message, not below the tail's
+        # empty space down by the composer.
         DOM.div(DOM.div(class="bt-busy-dot"),
             DOM.div(class="bt-busy-dot"),
             DOM.div(class="bt-busy-dot");
@@ -9151,42 +9399,27 @@ function Bonito.jsrender(session::Session, m::ChatModel)
         # last message (~30% of the pane; JS sizes it from clientHeight).
         DOM.div(class="bt-messages-tail");
         class="bt-messages",
-        # Right-click on a picture offers to make it the chat's icon.
-        oncontextmenu = chat_icon_contextmenu(session, model))
+        onclick = chat_icon_click(session, model))
 
     # Init snapshot: comm events fired before this tab connected are gone, so
     # bake the CURRENT slash-command set into the connect call (a tab opened
     # after the session's first turn would otherwise have no autocomplete
     # until the next available_commands_update).
+    # The last messages ride along too, so the transcript shows them the moment
+    # the pane mounts instead of after two more round trips (count, then range).
     init_snapshot = Dict{String,Any}(
-        "commands" => commands_event(shared(model).available_commands[])["items"])
+        "commands" => commands_event(shared(model).available_commands[])["items"],
+        "tail"     => transcript_tail(model))
+    # The chat module looks for the other widgets once it is connected, on a
+    # microtask: by then the whole pane is in the document, wherever the layout
+    # put them.
     init_script = js"""
         $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm),
                                            $(init_snapshot)))
     """
-
-    Bonito.jsrender(session, DOM.div(
-        chat_header(session, model),
-        session_notice_view(session, model),
-        # The messages area + the taskbar share a positioning context so the
-        # taskbar floats over the MESSAGES, anchored below the (variable-
-        # height) header instead of on top of it.
-        DOM.div(
-            messages_container,
-            taskbar;
-            class = "bt-messages-wrap"),
-        init_script,
-        chat_input_area(session, model),
-        # Toolbar below the composer. Populated entirely client-side by
-        # BonitoChat (`noteType`): one show/hide checkbox per message type the
-        # first time that type occurs. Sized to host future controls too.
-        DOM.div(class = "bt-chat-toolbar"),
-        # NOTE: there is deliberately NO mount curtain here. The dashboard's
-        # load overlay (`chat_waiting_view`, sidebar.jl) covers this pane
-        # from the moment the user clicks until the chat module reports the
-        # geometry settled (`bt-chat-settling` / `bt-chat-settled` events
-        # from `startSettle` in bonitoagents.js) — one continuous loading
-        # surface instead of the old bring-up pane → bare gap → per-chat
-        # curtain relay.
-        class="bt-app"))
+    # The messages area + the taskbar share a positioning context so the
+    # taskbar floats over the MESSAGES, anchored below the (variable-height)
+    # header instead of on top of it. The rail positions itself in it too.
+    return DOM.div(messages_container, taskbar, init_script; class = "bt-messages-wrap")
 end
+

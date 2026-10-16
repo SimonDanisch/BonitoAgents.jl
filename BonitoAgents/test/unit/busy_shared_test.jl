@@ -8,7 +8,7 @@
     using Bonito
     const BT = BonitoAgents
 
-    state = BT.serve(; host = "127.0.0.1", port = 0, worker_secret = "x",
+    state = BT.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mktempdir(), working_dir = mktempdir())
     parent = BT.ChatModel(state, mktempdir(); project_id = "proj",
                           agent = BT.WorkerAgent(state, "w1", "/p"))
@@ -21,7 +21,7 @@
     # response, then on the render barrier, and with no ACP session bound the
     # barrier is a no-op (there is no renderer to wait for).
     const ACP = BT.AgentClientProtocol
-    span = ACP.PromptSpan(1)
+    span = ACP.PromptTurn(1)
     put!(span.response, Dict{String,Any}("stopReason" => "end_turn"))
     BT.while_busy(tab) do
         # Claimed through the TAB, but the flag and the spinner are the parent's.

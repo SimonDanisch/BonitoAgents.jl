@@ -13,7 +13,7 @@
     badge(h) = match(r"class=\"bt-proj-tag\">([^<]*)<", h)[1]
     title(h) = match(r"title=\"([^\"]*)\"", h)[1]
 
-    tile = html(BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "L", "Laptop"))
+    tile = html(BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "L", "Laptop"; color = BT.worker_color(0)))
     @test occursin("class=\"bt-proj-icon\"", tile)
     @test occursin("src=\"data:image/svg+xml;base64,", tile)      # the identicon is an image too
     @test badge(tile) == "L"
@@ -22,7 +22,7 @@
     dir = mktempdir()
     pic = joinpath(dir, "icon.svg")
     write(pic, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"/>")
-    picture = html(BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "L", "Laptop"; image = Bonito.Asset(pic)))
+    picture = html(BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "L", "Laptop"; image = Bonito.Asset(pic), color = BT.worker_color(0)))
     @test occursin("class=\"bt-proj-icon bt-proj-icon-img\"", picture)
     @test badge(picture) == "L"
     @test title(picture) == "Laptop · VulkanDev"
@@ -31,13 +31,13 @@
     @test strip_src(tile) == strip_src(picture)
 
     # No stand-ins: an icon without its worker is a programming error, not "VU".
-    @test_throws ArgumentError BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "", "Laptop")
-    @test_throws ArgumentError BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "L", "")
+    @test_throws ArgumentError BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "", "Laptop"; color = BT.worker_color(0))
+    @test_throws ArgumentError BT.project_icon_for("p1", "VulkanDev", "VulkanDev", "L", ""; color = BT.worker_color(0))
 
     # The label comes from the worker record; a worker the server does not know
     # is named by its id, never by the folder.
-    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), worker_secret = "x")
-    state.workers[]["w-lap"] = BT.WorkerInfo("w-lap", "Laptop", "ws://x", "x", nothing, "host", "/home/u",
+    state = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
+    state.workers[]["w-lap"] = BT.WorkerInfo("w-lap", "Laptop", nothing, "host", "/home/u",
                                              "julia", String[], "/sim", :online, BT.now(BT.UTC))
     state.workers[]["w-lap"].initials = "L"
     p = BT.ProjectInfo("p1", "VulkanDev", "w-lap", joinpath(state.working_dir, "p1"), "/sim/VulkanDev", BT.now(BT.UTC))

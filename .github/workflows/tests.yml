@@ -166,6 +166,10 @@ jobs:
         # Guards the close-vs-tail race that production file-open relies on.
         run: julia --project=BonitoAgents RemoteSync/test/runtests.jl
 
+      - name: WorkerLink tests (resume, flow control, wedged peers)
+        # Also a path [source] of BonitoAgents; its test deps are HTTP and stdlibs.
+        run: julia --project=BonitoAgents WorkerLink/test/runtests.jl
+
   # ── E2E suite — sharded across parallel jobs ──────────────────────────────
   e2e:
     name: 'E2E ${{ matrix.shard }}/8'

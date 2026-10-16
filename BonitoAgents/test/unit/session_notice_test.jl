@@ -41,3 +41,21 @@
     @test ACP.text(take!(out)) == "After"
     close(st.current_message)
 end
+
+# claude-agent-acp takes any client announcing `_meta.jetbrains.air` for JetBrains
+# AIR, and then leaves the `outputFile` out of an async subagent's launch (checked
+# against 0.84.0): the card of a background agent could never finish. The
+# extension goes only to the agents that use it: codex-acp and the mocks for it.
+@testitem "unit:client_meta" tags = [:unit] begin
+    using BonitoAgents
+    const BT = BonitoAgents
+    air(p) = get(BT.client_meta(p), "jetbrains", nothing)
+    for p in BT.current_providers()
+        name = BT.provider_name(p)
+        if name in ("Codex", "MockCode", "MockCode2")
+            @test "sessionFailure" in air(p)["air"]["capabilities"]
+        else
+            @test air(p) === nothing
+        end
+    end
+end

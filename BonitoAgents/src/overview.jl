@@ -74,11 +74,9 @@ past work, and opening a dismissed chat un-dismisses it.
 function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
     candidates = Tuple{Float64,ProjectInfo}[]
     for (_, p) in state.projects[]
-        # New-style storage only (state_dir/chats/<pid>); computed directly so
-        # listing the dashboard never mkpaths a dir for chat-less projects.
-        f = joinpath(state.state_dir, "chats", p.id, "chat.md")
-        isfile(f) || continue
-        push!(candidates, (mtime(f), p))
+        visible(state, p) || continue
+        t = last_active(state, p)
+        t == 0 || push!(candidates, (t, p))
     end
     sort!(candidates; by = first, rev = true)
     cards = ChatCardData[]
@@ -96,6 +94,25 @@ function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
     return cards
 end
 
+"""
+    last_active(state, p) -> Float64
+
+When chat `p` was last active, as unix time: its transcript's mtime, bumped on
+every persisted message, live or not. 0 for a chat with no messages yet.
+"""
+function last_active(state::ServerState, p::ProjectInfo)
+    # New-style storage only (state_dir/chats/<pid>); computed directly so
+    # listing never mkpaths a dir for chat-less projects.
+    f = joinpath(state.state_dir, "chats", p.id, "chat.md")
+    return isfile(f) ? mtime(f) : 0.0
+end
+
+"""
+    relative_time_label(t) -> String
+
+How long ago unix time `t` was, for a label: "just now", "5m ago", "3h ago",
+"2d ago".
+"""
 function relative_time_label(t::Float64)
     d = max(0.0, time() - t)
     d < 90      && return "just now"

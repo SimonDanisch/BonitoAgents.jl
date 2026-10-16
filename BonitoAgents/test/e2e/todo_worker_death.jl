@@ -18,6 +18,12 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
+# How long the server waits for a vanished worker. A killed worker looks like a
+# dropped connection, and a dropped connection is kept for the worker's return:
+# only once this runs out is the worker dead and its streams ended. Production
+# waits minutes; the contract is the same at a few seconds.
+const GRACE = 15.0
+
 const PLAN = [(content = "write the thing", status = "in_progress"),
               (content = "check it",        status = "pending")]
 
@@ -39,7 +45,7 @@ function run_suite(server)
     server.agent_fn[] = agent_script
 
     @testset "a dead worker takes its live todo pill with it" begin
-        TK.new_chat(server; title = "Wedged")     # no space: TK.new_chat hangs on spaced titles
+        TK.new_chat(server)
         TK.send_message(server, "make a plan")
 
         @testset "the pill is live while the worker is" begin
@@ -50,13 +56,28 @@ function run_suite(server)
             # Nothing is finalized yet — this is what "live" means here, and it is
             # what makes the assertions after the kill meaningful.
             @test TK.eval_js(server, "document.querySelectorAll('.bt-plan-msg').length") == 0
+            @test TK.wait_for(server, "background task has an honest dismiss control",
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"] button')?.title === 'Dismiss task entry (does not stop the agent)'"; timeout = 10) == true
+        end
+
+        @testset "a transient disconnect preserves live background work" begin
+            TK.drop_worker_connection!(server)
+            @test TK.wait_for(server, "worker temporarily offline",
+                "!document.querySelector('.bt-worker-cell .bt-dot-online')"; timeout = 5) == true
+            @test TK.wait_for(server, "worker reconnected",
+                "!!document.querySelector('.bt-worker-cell .bt-dot-online')"; timeout = 25) == true
+            @test TK.eval_js(server,
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') !== null") == true
+            @test TK.eval_js(server,
+                "document.querySelector('.bt-taskbar-todo') !== null") == true
         end
 
         @testset "killing the worker retires it" begin
             # SIGKILL, not SIGTERM: a machine going offline is abrupt and gets no
             # chance to say anything. That is the whole difficulty — there is no
-            # frame to react to, so the seal has to come from the stream ending.
-            kill(server.h.worker_proc, Base.SIGKILL)
+            # frame to react to, so the seal has to come from the stream ending,
+            # which it does once the worker's link outlives its grace period.
+            TK.kill_worker!(server)
 
             @test TK.wait_for(server, "pin dropped",
                 "document.querySelector('.bt-taskbar-todo') === null"; timeout = 30) == true
@@ -77,21 +98,21 @@ function run_suite(server)
                 ".map(e => e.textContent).join('')") == "▶○"
         end
 
-        # OBSERVATION, not yet a contract — see the note in the summary. A
-        # backgrounded subagent's liveness is deliberately NOT the stream's to
-        # decide (its output file outlives the turn, and the worker may come
-        # back), so the pill is expected to stay. Recorded here so the choice is
-        # visible and a future change to it fails loudly.
-        @testset "a backgrounded subagent's pill is NOT dropped by the death" begin
-            @test TK.eval_js(server,
-                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') !== null") == true
+        @testset "background subagent interrupted, not left counting" begin
+            @test TK.wait_for(server, "background pin removed",
+                "document.querySelector('.bt-taskbar-slot[data-task-id=\"task-BG\"]') === null"; timeout = 20) == true
+            @test TK.wait_for(server, "interrupted task remains in history",
+                "Array.from(document.querySelectorAll('.bt-tool-msg')).some(e => e.textContent.includes('Interrupted: agent session ended') && e.textContent.includes('failed'))";
+                timeout = 10) == true
+            TK.screenshot(server, "/tmp/worker-death-taskbar.png")
         end
+
     end
     return server
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    server = TK.dev_server(agent = agent_script)
+    server = TK.dev_server(agent = agent_script, worker_link_grace = GRACE)
     try
         TK.open_browser(server)
         run_suite(server)

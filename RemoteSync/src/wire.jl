@@ -12,6 +12,20 @@ const TAG_DELTA       = 0x03    # sender → receiver: delta payload for one fil
 const TAG_DONE        = 0x04    # sender → receiver: end-of-stream
 const TAG_OK          = 0x05    # receiver → sender: file applied OK
 const TAG_PROGRESS    = 0x06    # either direction: human-readable status string
+const TAG_LITERAL     = 0x07    # small new file: rel + literal bytes
+const TAG_STREAM      = 0x08    # streamed file starts: rel (action comes from plan)
+const TAG_DATA        = 0x09    # bounded literal / librsync delta chunk
+const TAG_END         = 0x0a    # streamed file ends
+
+# Old decoders stop after the declared entry count, so a trailer negotiates an
+# extension without making old peers parse a new message type. A new sender
+# uses streaming ONLY when the receiver echoes this capability in its plan.
+const STREAM_FEATURE = UInt32(0x31535242)
+
+function has_stream_feature(io::IOBuffer)
+    bytesavailable(io) == sizeof(UInt32) || return false
+    return ltoh(read(io, UInt32)) == STREAM_FEATURE
+end
 # Single-file streaming protocol (used by send_file/receive_file). Independent
 # of the manifest/delta protocol so a transport carries either one transfer or
 # the other, never mixed.
@@ -81,7 +95,7 @@ struct ManifestEntry
     mtime :: Float64
 end
 
-function encode_manifest(entries::Vector{ManifestEntry})
+function encode_manifest(entries::Vector{ManifestEntry}; streaming::Bool = false)
     io = IOBuffer()
     write(io, htol(UInt32(length(entries))))
     for e in entries
@@ -91,10 +105,11 @@ function encode_manifest(entries::Vector{ManifestEntry})
         write(io, htol(e.size))
         write(io, htol(reinterpret(UInt64, e.mtime)))
     end
+    streaming && write(io, htol(STREAM_FEATURE))
     return take!(io)
 end
 
-function decode_manifest(payload::AbstractVector{UInt8})
+function decode_manifest(payload::AbstractVector{UInt8}; with_features::Bool = false)
     io = IOBuffer(payload)
     n = Int(ltoh(read(io, UInt32)))
     # The entry count is attacker-controlled; each entry consumes >= 4 bytes, so
@@ -110,7 +125,7 @@ function decode_manifest(payload::AbstractVector{UInt8})
         mtime   = reinterpret(Float64, ltoh(read(io, UInt64)))
         out[i]  = ManifestEntry(rel, size, mtime)
     end
-    return out
+    return with_features ? (out, has_stream_feature(io)) : out
 end
 
 # ── Plan encoding ──────────────────────────────────────────────────────────
@@ -123,7 +138,7 @@ struct PlanEntry
     sig    :: Vector{UInt8}    # only populated when action == ACTION_PATCH
 end
 
-function encode_plan(entries::Vector{PlanEntry})
+function encode_plan(entries::Vector{PlanEntry}; streaming::Bool = false)
     io = IOBuffer()
     write(io, htol(UInt32(length(entries))))
     for e in entries
@@ -134,10 +149,11 @@ function encode_plan(entries::Vector{PlanEntry})
         write(io, htol(UInt32(length(e.sig))))
         isempty(e.sig) || write(io, e.sig)
     end
+    streaming && write(io, htol(STREAM_FEATURE))
     return take!(io)
 end
 
-function decode_plan(payload::AbstractVector{UInt8})
+function decode_plan(payload::AbstractVector{UInt8}; with_features::Bool = false)
     io = IOBuffer(payload)
     n = Int(ltoh(read(io, UInt32)))
     n > bytesavailable(io) &&
@@ -151,7 +167,7 @@ function decode_plan(payload::AbstractVector{UInt8})
         sig     = sig_len == 0 ? UInt8[] : read(io, sig_len)
         out[i]  = PlanEntry(rel, action, sig)
     end
-    return out
+    return with_features ? (out, has_stream_feature(io)) : out
 end
 
 # ── Delta envelope ─────────────────────────────────────────────────────────

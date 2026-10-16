@@ -8,8 +8,9 @@
 # lives on — a re-mounted embed whose fragment references already-shipped
 # cached objects gets DOM (it rides in the html) with every cached payload
 # silently missing: interaction dead, a WGLMakie canvas black forever. Ours
-# closes this structurally: proxied roots opt out of dedup entirely (dev
-# Bonito `dedup_cached_objects`), and every RemoteRef mount renders a FRESH
+# closes this structurally: every browser tab gets its own proxied page root
+# on the worker (`open_page_root!`) with its own object cache, closed when the
+# tab's root session closes, and every RemoteRef mount renders a FRESH
 # disposable subsession of the worker-held value (`update_session_dom!`), so
 # a remount always ships full values against the blank page. The interaction
 # round trip below is therefore THE assertion: it only passes if the remount

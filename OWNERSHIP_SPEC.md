@@ -93,8 +93,9 @@ The agent talks on it inside a prompt and between prompts; both are the same
 voice, so both go to the same coalescer and the same renderer.
 
 **A prompt is a span, not a container.** `prompt!` sends the frame and returns a
-`PromptSpan` — an id, a response channel, and an end marker. `wait_turn!` blocks
-on the response for the stopReason. The turn's *content* never comes back
+`PromptTurn`: an id, a response channel, an end marker and an `over` latch the
+connection closes at the answer. `wait_turn!` blocks on the response for the
+stopReason. The turn's *content* never comes back
 through it.
 
 **A boundary is a marker on the stream.** `StreamFlush` travels the stream like
