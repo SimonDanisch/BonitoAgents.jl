@@ -13,17 +13,21 @@
     @test TK.wait_for(s, "agent idle", "!document.querySelector($(TK.json(P * ".bt-busy-active")))")
     ctx = s.browser[]
     wc = "electron.BrowserWindow.fromId($(ctx.window.id)).webContents"
-    # Begin editing as soon as the composer mounts, before background loading
-    # starts. Observe the actual offscreen measurement DOM, not chat internals.
+    # Begin editing as soon as the composer mounts, and count every row put
+    # into the transcript from then on: the pane arrives with its newest rows
+    # and loads more only when the reader scrolls, so typing a draft or holding
+    # a selection meets a transcript that nobody rebuilds. (The old design
+    # downloaded the whole history in the background, in 64-row batches that
+    # had to wait for editing to finish.)
     probe_source = """
             window.__historyBatches=[];
             const ready=setInterval(()=>{
                 const t=document.querySelector($(TK.json(P * ".bt-text-input")));
-                const m=document.querySelector($(TK.json(P * ".bt-measure")));
-                if(!t?.offsetParent || !m)return;
+                const m=document.querySelector($(TK.json(P * ".bt-messages")));
+                if(!t?.offsetParent || !m?.__bt_chat || !m.__bt_chat.order.length)return;
                 clearInterval(ready);t.focus();
                 window.__historyObserver=new MutationObserver(es=>{
-                    const n=es.reduce((sum,e)=>sum+e.addedNodes.length,0);
+                    const n=es.reduce((sum,e)=>sum+e.addedNodes.length+e.removedNodes.length,0);
                     if(n)window.__historyBatches.push(n);
                 });
                 window.__historyObserver.observe(m,{childList:true});
@@ -51,13 +55,13 @@
                 TK.set_input(s, P * ".bt-text-input", "Keep this draft responsive")
             end
             sleep(1.2)
-            # Visible-range measurements can still occur; 64-row background
-            # batches must wait for editing/selection to finish.
-            @test TK.eval_js(s, "window.__historyBatches.every(n=>n<50)")
+            @test TK.eval_js(s, "window.__historyBatches.length") == 0
             @test TK.eval_js(s, selecting ? "!getSelection().isCollapsed" :
                 "document.activeElement.value==='Keep this draft responsive'")
+            # Nor once the editing ends: nothing was waiting for it.
             TK.eval_js(s, "document.activeElement.blur();getSelection().removeAllRanges();true")
-            @test TK.wait_for(s, "background loading resumes", "window.__historyBatches.some(n=>n>=50)"; timeout=10)
+            sleep(1)
+            @test TK.eval_js(s, "window.__historyBatches.length") == 0
             TK.eval_js(s, "window.__historyObserver.disconnect();true")
         end
     finally

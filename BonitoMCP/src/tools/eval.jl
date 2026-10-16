@@ -73,6 +73,11 @@ end
 # the host's tool result back verbatim, so the agent sees exactly what a local
 # eval would have shown.
 
+# A tool's text answer and its error, as the agent reads them. The server's app
+# tools answer in the same shapes (BonitoAgents apps.jl).
+tool_text(text::AbstractString) =
+    Dict{String,Any}("content" => [Dict("type" => "text", "text" => String(text))],
+                     "isError" => false)
 tool_error(msg::AbstractString) =
     Dict{String,Any}("content" => [Dict("type" => "text", "text" => "error: " * msg)],
                      "isError" => true)

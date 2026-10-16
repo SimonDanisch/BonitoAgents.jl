@@ -342,11 +342,8 @@ function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::
 
     on(session, create_btn.value) do clicked
         clicked || return
-        # `is_busy_running`, not `is_busy_idle`: the progress card parks on the
-        # LAST outcome (:ok / :err) so the user can read it, and a guard that
-        # demanded :idle would refuse every click after the first operation for
-        # the rest of the window's life.
-        refuse_if_busy(c.busy, c.error_obs, "Can't create a chat right now") && return
+        # A second click while this one runs is dropped by `do_import`'s latch,
+        # and a later import of the same folder reuses its chat.
         # The path field IS the selection — nothing else to resolve. A path that
         # doesn't exist yet ("type /newname to create it") is created on the
         # WORKER here (mkpath) before import; `do_import` itself stays strict
@@ -487,9 +484,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
                        nothing : String(prov_raw)
         pick[] = Dict{String,Any}()              # reset so the same row can re-fire
         isempty(w_name) && return
-        # Drop double-clicks while a start is in flight (see create_btn above
-        # for why this asks "running?" and not "idle?").
-        refuse_if_busy(c.busy, c.error_obs, "Can't open that chat right now") && return
+        # Double-clicks: `do_import` drops a second one while the first runs.
         c.do_import(w_name, path; resume_session_id = resume_session_id,
                     provider = provider)
     end

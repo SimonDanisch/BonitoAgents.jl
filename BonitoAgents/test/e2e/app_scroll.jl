@@ -81,6 +81,22 @@ function bump_live(s, prev; timeout = 40)
     return TK.eval_js(s, pred) === true    # a Bool, so @test can read it
 end
 
+# The app's output once it holds still. `bump_live` may land more than one
+# click, and a later one can still be on its way when the predicate first
+# holds: a value read right then went up by one more click afterwards (21 → 28
+# in a run), and the "state kept" check compared against the earlier one.
+function steady_out(s; settle = 1.0, timeout = 20)
+    t0 = time()
+    last = app_out(s)
+    while time() - t0 < timeout
+        sleep(settle)
+        now = app_out(s)
+        now == last && return now
+        last = now
+    end
+    error("app output never held still: $(last)")
+end
+
 # Only the FIRST detach retries: the button's handler may still be wiring up on
 # a cold render. Every later move is one click + a state poll.
 function detach_until_float(s; timeout = 15)
@@ -118,7 +134,7 @@ function run_suite(server)
         # Liveness WHILE FLOATING, before any dock — isolates whether the tab
         # path specifically breaks the round-trip.
         @test bump_live(server, "SVAL=0")          # live while floating
-        floating_val = app_out(server)
+        floating_val = steady_out(server)
 
         # DOCK must not move the chat: the embed is already out of the message
         # list, so docking the float as a tab changes nothing in it.
@@ -134,7 +150,7 @@ function run_suite(server)
         # Live as a tab: a click round-trips to its Julia map.
         @test click_activate(server); sleep(0.3)
         @test bump_live(server, floating_val)      # live as a docked tab
-        tab_val = app_out(server)
+        tab_val = steady_out(server)
 
         # CLOSE returns the embed below the user (content grows). Scroll must
         # hold or follow down — never collapse toward the top.

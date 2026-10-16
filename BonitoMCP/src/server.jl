@@ -67,11 +67,13 @@ function dispatch!(out, req::AbstractDict)
     elseif method == "notifications/initialized"
         # Notification, no response
     elseif method == "tools/list"
-        tools = [Dict(
+        tools = Dict{String,Any}[Dict{String,Any}(
             "name" => t.name,
             "description" => t.description,
             "inputSchema" => t.input_schema,
         ) for t in available_tools()]
+        # The server's apps add theirs (tools/app_tools.jl).
+        append!(tools, app_tool_specs())
         send_response!(out, id, Dict("tools" => tools))
     elseif method == "tools/call"
         tool_name = get(params, "name", "")
@@ -83,32 +85,29 @@ function dispatch!(out, req::AbstractDict)
         meta = get(params, "_meta", nothing)
         tuid = meta isa AbstractDict ? get(meta, "claudecode/toolUseId", nothing) : nothing
         tuid isa AbstractString && !isempty(tuid) && (args["_tool_use_id"] = String(tuid))
-        # `available_tools()` and not `TOOLS`: a gated-off tool must be as absent
-        # to a caller that guessed its name as it is to `tools/list`.
-        tools = available_tools()
-        idx = findfirst(t -> t.name == tool_name, tools)
-        if idx === nothing
-            send_error!(out, id, -32602, "Unknown tool: $tool_name")
-        else
-            # Record requestId → env_path for the eval family so a later
-            # `notifications/cancelled` can target just this session (M9).
-            track = tool_name in EVAL_TOOL_NAMES
-            track && note_inflight_request!(id, get(args, "env_path", nothing))
-            try
-                result = tools[idx].handler(args)
+        # `call_tool` looks in `available_tools()` and not `TOOLS`: a gated-off
+        # tool must be as absent to a caller that guessed its name as it is to
+        # `tools/list`. A name that isn't ours goes to the server's apps.
+        # Record requestId → env_path for the eval family so a later
+        # `notifications/cancelled` can target just this session (M9).
+        track = tool_name in EVAL_TOOL_NAMES
+        track && note_inflight_request!(id, get(args, "env_path", nothing))
+        try
+            result = call_tool(tool_name, args)
+            result === nothing ?
+                send_error!(out, id, -32602, "Unknown tool: $tool_name") :
                 send_response!(out, id, result)
-            catch e
-                bt = sprint(showerror, e, catch_backtrace())
-                # Tool execution errors come back as a successful response with
-                # isError=true so the agent can react to it (per MCP spec).
-                send_response!(out, id, Dict(
-                    "content" => [Dict("type" => "text",
-                                       "text" => "tool handler threw:\n$bt")],
-                    "isError" => true,
-                ))
-            finally
-                track && clear_inflight_request!(id)
-            end
+        catch e
+            bt = sprint(showerror, e, catch_backtrace())
+            # Tool execution errors come back as a successful response with
+            # isError=true so the agent can react to it (per MCP spec).
+            send_response!(out, id, Dict(
+                "content" => [Dict("type" => "text",
+                                   "text" => "tool handler threw:\n$bt")],
+                "isError" => true,
+            ))
+        finally
+            track && clear_inflight_request!(id)
         end
     elseif method === nothing
         # Malformed; ignore

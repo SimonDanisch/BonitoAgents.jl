@@ -748,6 +748,9 @@ include("test_agent_reaping.jl")
 # from the writer's close. Real writer processes over a memory link pair.
 include("test_file_watch.jl")
 
+# The thinking-progress patch on claude-agent-acp, against a fixture of its code.
+include("test_adapter_patches.jl")
+
 # The managed agent adapters, installed for real from nodejs.org and npm into a
 # cache, then started and asked for an ACP initialize. Skipped without a network.
 include("test_managed_adapters.jl")

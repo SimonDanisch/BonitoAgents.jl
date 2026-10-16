@@ -391,8 +391,6 @@ function dispatch_command(w::Worker, ws, cmd::AbstractDict)
         @async handle_read_file_range(ws, cmd)
     elseif t == "list_project_files"
         @async handle_list_project_files(ws, cmd)
-    elseif t == "inspect_path"
-        @async handle_inspect_path(ws, cmd)
     elseif t == "kill_file_writers"
         @async handle_kill_file_writers(ws, cmd)
     elseif t == "scan_sessions"

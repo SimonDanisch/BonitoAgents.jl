@@ -202,6 +202,11 @@ function sync_harnesses!(spec::HarnessSpec; root::AbstractString = harness_root(
         @info "BonitoWorker: installing agent adapter" package = pkg version = target
         npm(root, nodedir, `install --prefix $prefix $pkg@$target`, "installing $(pkg)@$(target)"; log)
     end
+    # What a release cannot do yet (adapter_patches.jl), on whatever is installed.
+    if haskey(spec.packages, "@agentclientprotocol/claude-agent-acp")
+        patch_thinking_tokens!(root) == :unchanged &&
+            @warn "BonitoWorker: this claude-agent-acp has no spot for the thinking-progress patch; its chats show no thinking estimate" version = installed_version(root, "@agentclientprotocol/claude-agent-acp")
+    end
     return installed_harnesses(root, keys(spec.packages))
 end
 

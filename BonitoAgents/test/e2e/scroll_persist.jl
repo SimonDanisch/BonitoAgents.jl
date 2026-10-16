@@ -87,15 +87,28 @@ function run_suite(server)
             sleep(0.6)   # let the fill's final scroll-to-bottom chase settle
             # Park off-bottom as a real user scroll would (followMode false);
             # cancel any pending chase so it can't snap us back to the bottom.
+            # Parked a few screens up from the bottom: the block holds the
+            # newest rows, and near its top older rows would load meanwhile.
             TK.eval_js(server, """(() => {
                 const c = document.querySelector('.bt-messages').__bt_chat;
                 c.setFollowMode(false);
                 if (c.cancelPendingScroll) c.cancelPendingScroll();
                 c.lastUserInputT = performance.now();
-                c.container.scrollTop = 200;
+                const el = c.container;
+                el.scrollTop = el.scrollHeight - el.clientHeight - 3 * el.clientHeight;
+                el.dispatchEvent(new Event('scroll'));
                 return true; })()""")
-            sleep(0.4)   # let the park's own scroll event settle
-            @test TK.eval_js(server, "Math.abs(document.querySelector('.bt-messages').scrollTop - 200) < 60") == true
+            sleep(0.6)   # let the park's own scroll event (and any load) settle
+            # The row being read, by its text: what the switch must bring back.
+            READ = """(() => { const c = document.querySelector('.bt-messages');
+                for (const n of c.querySelectorAll('.bt-user-msg,.bt-agent-msg,.bt-tool-msg')) {
+                    if (n.offsetParent === null) continue;
+                    if (n.offsetTop + n.offsetHeight > c.scrollTop + 4) return (n.innerText || '').slice(0, 40);
+                }
+                return null; })()"""
+            reading = TK.eval_js(server, READ)
+            @test reading !== nothing
+            @test TK.eval_js(server, "document.querySelector('.bt-messages').__bt_chat.atBottom()") == false
             # Arm the NEXT scroll event (the imminent display:none collapse) as
             # user-driven — deterministic regardless of nav round-trip latency,
             # which is exactly the condition under which the bug bites.
@@ -104,18 +117,11 @@ function run_suite(server)
             TK.to_dashboard(server)
             TK.open_chat(server, pid)
             sleep(0.5)   # cover onShown's 0/raf/50/200ms restore cascade
-            # followMode must NOT have flipped, and the pane must NOT be pinned to
-            # the bottom — it should sit back at roughly where we parked it.
+            # followMode must NOT have flipped, the pane must NOT be chased to
+            # the bottom, and the row being read is the one at the top again.
             @test TK.eval_js(server, "document.querySelector('.bt-messages').__bt_chat.followMode") == false
-            # Stayed up near where we parked it (top region) — NOT chased down to
-            # the bottom. (Exact-pixel restore drifts under virtual-scroll height
-            # re-measurement; the bug we guard is the jump-to-bottom, so we assert
-            # it stayed well within the top of a very tall history.)
-            top  = TK.eval_js(server, "document.querySelector('.bt-messages').scrollTop")
-            maxs = TK.eval_js(server, "(() => { const c=document.querySelector('.bt-messages'); return c.scrollHeight - c.clientHeight; })()")
-            @info "scroll after switch" top maxs
-            @test isa(maxs, Number) && maxs > 5000        # genuinely long history
-            @test isa(top, Number) && top < 0.1 * maxs    # parked near top, not chased to bottom
+            @test TK.eval_js(server, "document.querySelector('.bt-messages').__bt_chat.atBottom()") == false
+            @test TK.eval_js(server, READ) == reading
 
             # Restore the default follow-at-bottom state for the next testset.
             TK.eval_js(server, "(() => { const c=document.querySelector('.bt-messages').__bt_chat; c.setFollowMode(true); c.scrollToBottom(); return true; })()")

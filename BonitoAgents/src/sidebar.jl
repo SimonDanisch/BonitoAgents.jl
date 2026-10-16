@@ -191,6 +191,9 @@ struct SidebarChat
     # separate signals, which then found each row by a DOM lookup —
     # a global re-broadcast plus a DOM lookup to undo it.
     status  :: Observable{Symbol}
+    # The label of the group this row opens ("Active", "Other chats"), or ""
+    # for every row but the first of a group (`sidebar_groups`).
+    group   :: Observable{String}
     # Persistent image identity, shared with the dashboard.
     image   :: Observable{Any}
     tree    :: Union{Nothing,WorkerFileTree}
@@ -218,7 +221,9 @@ function Bonito.jsrender(session::Bonito.Session, c::SidebarChat)
         class = "bt-side-item" * (c.active0 ? " bt-side-active" : ""),
         title = c.tooltip,
         dataProjectId = c.pid)
-    c.tree === nothing && return Bonito.jsrender(session, DOM.div(item; class = "bt-side-chat"))
+    group = DOM.div(c.group;
+        class = map(session, c.group) do g; isempty(g) ? "bt-side-group bt-hidden" : "bt-side-group" end)
+    c.tree === nothing && return Bonito.jsrender(session, DOM.div(group, item; class = "bt-side-chat"))
     # The hint toggles `.bt-tree-open` on the row in JS and flips the tree's
     # `active` on first open (the lazy worker scan). Pure JS, so it survives
     # every list update — which is the whole point of the row being stable.
@@ -235,6 +240,7 @@ function Bonito.jsrender(session::Bonito.Session, c::SidebarChat)
             if (open) $(c.tree.active).notify(true);
         }""")
     return Bonito.jsrender(session, DOM.div(
+        group,
         DOM.div(item, hint; class = "bt-side-chat-row"),
         DOM.div(c.tree; class = "bt-side-tree-wrap");
         class = "bt-side-chat"))
@@ -262,7 +268,7 @@ function set_row!(obs::Observable, value::Bonito.Asset)
 end
 
 """
-    refresh!(state, c, p, label, tooltip, tag, status)
+    refresh!(state, c, p, label, tooltip, tag, wname, color, status, group)
 
 Bring an existing row up to date WITHOUT rebuilding it — THE writer for
 everything a row derives from server state, called from exactly one place (the
@@ -276,13 +282,14 @@ field now means adding a line here and nowhere else.
 function refresh!(state::ServerState, c::SidebarChat, p::ProjectInfo,
                   label::AbstractString, tooltip::AbstractString,
                   tag::AbstractString, wname::AbstractString, color::AbstractString,
-                  status::Symbol)
+                  status::Symbol, group::AbstractString)
     set_row!(c.label,   String(label))
     set_row!(c.tooltip, String(tooltip))
     set_row!(c.tag,     String(tag))
     set_row!(c.wname,   String(wname))
     set_row!(c.color,   String(color))
     set_row!(c.status,  status)
+    set_row!(c.group,   String(group))
     set_row!(c.image,   chat_icon_image(state, p))
     return c
 end
@@ -355,6 +362,30 @@ function chat_status(state::ServerState, p::ProjectInfo)
     m === nothing && return :online
     return m.busy_active[] ? :active : :online
 end
+
+"""
+    sidebar_groups(order) -> Dict{String,String}
+
+The group labels of a sidebar order, `pid => group` per row in the order shown:
+`:app` (the apps' chats, pinned first), `:active` (a turn in flight), then
+`:other`. The first row of each group gets its label, unless every row is an
+other chat: one group needs no name.
+"""
+function sidebar_groups(order::AbstractVector{Pair{String,Symbol}})
+    labels = Dict{String,String}()
+    all(e -> last(e) === :other, order) && return labels
+    for (group, label) in ((:app, "Apps"), (:active, "Active"), (:other, "Other chats"))
+        i = findfirst(e -> last(e) === group, order)
+        i === nothing || (labels[first(order[i])] = label)
+    end
+    return labels
+end
+
+"Where a chat goes in the sidebar (see `sidebar_groups`)."
+sidebar_group(p::ProjectInfo, status::Symbol) =
+    !isempty(p.app) ? :app : status === :active ? :active : :other
+
+const SIDEBAR_GROUP_RANK = Dict(:app => 0, :active => 1, :other => 2)
 
 # Per-PROCESS boot id scoping the sidebar's localStorage last-route memory:
 # a route saved by one server process must not navigate a fresh one. Lazy
@@ -441,12 +472,30 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     #
     # So there is no second per-row update pass hanging off these same signals,
     # and no way for the two to disagree about a row.
+    #
+    # The apps' chats come first, under "Apps". Then the chats with a turn in
+    # flight, under "Active": those are the ones you switch between, and they
+    # used to be scattered through a list sorted by name. The rest follow by
+    # name. While the mouse is over the
+    # sidebar (`hovering`) the rows keep their places: a chat whose turn starts
+    # or ends moves once the pointer leaves, never out from under a click.
     rows = Dict{String,SidebarChat}()
+    hovering = Observable(false)
+    shown = Ref(Pair{String,Symbol}[])   # the order on screen: pid => its group
     entries_obs = map(session, state.chat_signal, state.turn_signal,
-                      state.projects, state.workers) do _, _, projects, workers
+                      state.projects, state.workers, hovering) do _, _, projects, workers, hover
         active_pid = current_view[]
         open_projs = open_chat_projects(state, projects)
-        sort!(open_projs; by = p -> lowercase(p.name))
+        status = Dict(p.id => chat_status(state, p) for p in open_projs)
+        if hover && Set(first.(shown[])) == Set(keys(status))
+            place = Dict(first(e) => i for (i, e) in enumerate(shown[]))
+            sort!(open_projs; by = p -> place[p.id])
+        else
+            group = Dict(p.id => sidebar_group(p, status[p.id]) for p in open_projs)
+            sort!(open_projs; by = p -> (SIDEBAR_GROUP_RANK[group[p.id]], lowercase(p.name)))
+            shown[] = [p.id => group[p.id] for p in open_projs]
+        end
+        groups = sidebar_groups(shown[])
         keep = Set(p.id for p in open_projs)
         filter!(kv -> kv.first in keep, rows)
 
@@ -455,17 +504,17 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         map(open_projs) do p
             t, wn = worker_label(workers, p)
             label = p.title[]
-            st = chat_status(state, p)
+            st = status[p.id]
             col = worker_color(workers, p.worker_id)
             tooltip = "$(wn) [$t] · $label · folder: $(p.name) · $(st)"
             row = get!(rows, p.id) do
                 SidebarChat(p.id, p.name, folder_hue_key(p),
                             Observable(label), Observable(tooltip), Observable(t), Observable(wn),
-                            Observable(col), Observable(st), Observable{Any}(nothing),
+                            Observable(col), Observable(st), Observable(""), Observable{Any}(nothing),
                             pane === nothing ? nothing : WorkerFileTree(state, p.id, pane),
                             active_pid == p.id)
             end
-            refresh!(state, row, p, label, tooltip, t, wn, col, st)
+            refresh!(state, row, p, label, tooltip, t, wn, col, st, get(groups, p.id, ""))
         end
     end
 
@@ -531,6 +580,12 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     Bonito.onload(session, aside, js"""(el) => {
         const LAST_PID_KEY = 'bt-last-pid';
         const boot = el.dataset.bootId || '';
+        // The rows hold still under the mouse (see `hovering`). A mouse only:
+        // a tap has no "leave", and it lands before anything could move.
+        let over = false;
+        const hover = (on) => { if (on !== over) { over = on; $(hovering).notify(on); } };
+        el.addEventListener('pointerenter', e => { if (e.pointerType === 'mouse') hover(true); });
+        el.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') hover(false); });
         el.addEventListener('click', e => {
             const close = e.target.closest('.bt-side-close');
             if (close) {
@@ -665,6 +720,15 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-sidebar.bt-collapsed .bt-side-name", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-item", "justify-content" => "center"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-section", "display" => "none"),
+    # The group labels ("Active", "Other chats") over the first row of each
+    # group. In the icon rail a label becomes a hairline between the groups.
+    CSS(".bt-side-group",
+        "font-size" => "11px", "font-weight" => "600", "letter-spacing" => "0.04em",
+        "text-transform" => "uppercase", "color" => "var(--bt-text-muted)",
+        "padding" => "10px 12px 4px", "user-select" => "none"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-group",
+        "font-size" => "0", "padding" => "0", "height" => "1px",
+        "margin" => "6px 12px", "background" => "var(--bt-border)"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-empty", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-header", "justify-content" => "center", "padding" => "0 0 6px"),
     CSS(".bt-side-item",
@@ -703,17 +767,23 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-icon-wrap",
         "position" => "relative", "flex-shrink" => "0",
         "display" => "flex", "line-height" => "0"),
-    # From nothing to a hairline of status green about 3px wide and back: a
-    # heartbeat at the icon's edge, not a cloud around it. The hairline is drawn
-    # once on a layer of its own and only its opacity animates, which the
-    # compositor does without repainting the sidebar every frame.
+    # A turn in flight: a steady ring of status green, there in every frame,
+    # and around it a glow that breathes between faint and full. The glow is
+    # drawn once on a layer of its own and only its opacity animates, which the
+    # compositor does without repainting the sidebar. Stepped, as every endless
+    # animation must be (e2e:animation_budget: a smooth one keeps the browser at
+    # 60 frames a second), but in small steps that never reach zero. It used to
+    # go from nothing to full in four steps: that read as a flicker, and its
+    # bottom step held "nothing" for a third of a second, an idle-looking icon.
+    CSS(".bt-glow-active .bt-proj-icon",
+        "box-shadow" => "0 0 0 1.5px var(--bt-status-active)"),
     CSS(".bt-glow-active .bt-proj-icon::after",
         "content" => "\"\"", "position" => "absolute", "inset" => "0",
         "border-radius" => "inherit", "pointer-events" => "none",
-        "box-shadow" => "0 0 2px 1px var(--bt-status-active)",
-        "animation" => "bt-icon-glow 1.4s steps(4, jump-none) infinite"),
+        "box-shadow" => "0 0 5px 2px var(--bt-status-active)",
+        "animation" => "bt-icon-glow 1.6s steps(6, jump-none) infinite"),
     CSS("@keyframes bt-icon-glow",
-        CSS("0%, 100%", "opacity" => "0"),
+        CSS("0%, 100%", "opacity" => "0.3"),
         CSS("50%",      "opacity" => "1")),
     # Worker down: the picture greys out under a steady red edge.
     CSS(".bt-glow-offline .bt-proj-icon",
@@ -910,6 +980,10 @@ const SidebarStyles = Bonito.Styles(
         # section is purely a visual divider; with names hidden, there's no
         # group to label anyway. Drop it on mobile.
         CSS(".bt-side-section", "display" => "none"),
+        # The group labels as hairlines, as in the collapsed rail.
+        CSS(".bt-side-group",
+            "font-size" => "0", "padding" => "0", "height" => "1px",
+            "margin" => "6px 12px", "background" => "var(--bt-border)"),
         # Same story for the "No open chats yet — open one from the
         # dashboard" empty state: a 56px column has no room for a sentence.
         # The dashboard view that text refers to is already visible to the
@@ -1185,24 +1259,19 @@ function project_loading_view(state::ServerState, pid::String,
     return DOM.div(DOM.div(spinner, body; class = "bt-loading"); class = "bt-loading-wrap")
 end
 
-# Phases 2+3 of the load screen: the card for a chat whose ChatModel IS
-# cached but whose pane hasn't finished mounting and settling yet. Before
-# this existed the overlay vanished the instant the model landed server-side
-# — but the pane's DOM still had to ship, mount, and settle, so the user saw
-# bring-up card → ~1s of bare background → a separate per-chat curtain.
-# Now ONE card (identical classes/geometry to `project_loading_view`'s) stays
-# up from click to settle and only its sub-text changes:
+# Phase 2 of the load screen: the card for a chat whose ChatModel IS cached
+# but whose pane hasn't shown its first rows yet. ONE card (identical
+# classes/geometry to `project_loading_view`'s) stays up from click to the
+# first rows, and only its sub-text changes:
 #
-#   "Connecting to <worker>…"   project_loading_view, while session/load runs
+#   "Connecting to <worker>…"   project_loading_view, while the model is built
 #   "Loading the chat…"         this card, pane DOM shipping + mounting
-#   "Rendering messages…"       chat module mounted, settle watch running
 #
-# The chat module drives the hand-offs: `startSettle` (bonitoagents.js)
-# dispatches `bt-chat-settling` / `bt-chat-settled` window events carrying
-# the pane pid, and mirrors them as `data-bt-settling` / `data-bt-settled`
-# flags on the `.bt-chatpane` so a card that mounts AFTER an event fired
-# (kept-alive revisit, rapid navigation) can read the current state
-# synchronously instead of waiting for the next event.
+# The chat module ends it: `markReady` (bonitoagents.js) dispatches a
+# `bt-chat-settled` window event carrying the pane pid once the transcript
+# shows its rows (the pane arrives with them), and mirrors it as a
+# `data-bt-settled` flag on the `.bt-chatpane`, so a card that mounts AFTER
+# the event (kept-alive revisit, rapid navigation) reads it synchronously.
 #
 # A struct + jsrender (not a plain function) for the same reason as
 # ChatPaneRef below: `Bonito.onload` must register against the SUBSESSION
@@ -1230,33 +1299,24 @@ function Bonito.jsrender(session::Bonito.Session, v::ChatWaitingView)
         dataWaitingFor = v.pid)
     Bonito.onload(session, wrap, js"""(wrap) => {
         const pid = wrap.dataset.waitingFor;
-        const sub = wrap.querySelector('.bt-loading-sub');
         const pane = document.querySelector(
             '.bt-chatpane[data-pane-pid="' + pid + '"]');
-        const phase3 = () => { if (sub) sub.textContent = 'Rendering messages…'; };
         let cap = null;
-        const cleanup = () => {
-            window.removeEventListener('bt-chat-settling', onSettling);
-            window.removeEventListener('bt-chat-settled',  onSettled);
-            if (cap) clearTimeout(cap);
-        };
         const hide = () => {
-            cleanup();
+            window.removeEventListener('bt-chat-settled', onSettled);
+            if (cap) clearTimeout(cap);
             wrap.classList.add('bt-loading-hide');
             setTimeout(() => { wrap.style.display = 'none'; }, 250);
         };
-        const onSettling = (e) => { if (e.detail === pid) phase3(); };
-        const onSettled  = (e) => { if (e.detail === pid) hide(); };
+        const onSettled = (e) => { if (e.detail === pid) hide(); };
         if (pane && pane.dataset.btSettled) {       // kept-alive revisit
             wrap.style.display = 'none';
             return;
         }
         wrap.classList.remove('bt-loading-pending');
-        if (pane && pane.dataset.btSettling) phase3();  // mounted mid-settle
-        window.addEventListener('bt-chat-settling', onSettling);
-        window.addEventListener('bt-chat-settled',  onSettled);
+        window.addEventListener('bt-chat-settled', onSettled);
         // Failsafe: a pane that dies during render must not leave an opaque
-        // overlay forever. The chat's own settle watch hard-caps at 5s, so
+        // overlay forever. The chat shows its rows as soon as it mounts, so
         // this only fires when something is genuinely broken.
         cap = setTimeout(hide, 15000);
     }""")

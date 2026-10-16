@@ -248,8 +248,9 @@ file_viewer(::MeshFile, url, path::AbstractString, mode::ViewMode = InlineView()
 
 # A picture in a bubble at its own size; `worker_path` lets it become the chat's
 # icon (chat_icons.jl).
-file_viewer(::ImageFile, url, path::AbstractString, ::InlineView = InlineView(); worker_path = "") =
-    media_element(url, "", false; filename = basename(path), worker_path)
+file_viewer(::ImageFile, url, path::AbstractString, ::InlineView = InlineView();
+            worker_path = "", size = nothing) =
+    media_element(url, "", false; filename = basename(path), worker_path, size)
 
 # Filling a box, it gets a stage: a checkerboard so transparency reads as
 # transparency, and the picture shrunk to fit. The driver reports its pixel size
@@ -258,12 +259,14 @@ file_viewer(::ImageFile, url, path::AbstractString, ::PanelView) =
     DOM.div(FileViewStyles, FileViewDriver(), media_element(url, "", false; filename = basename(path));
             class = "bt-fv-image-stage")
 
-video_viewer(url, path::AbstractString) =
+video_viewer(url, path::AbstractString; worker_path = "", size = nothing) =
     media_element(url, get(SHOW_VIDEO_MIME, lowercase(splitext(path)[2]), "video/mp4"), true;
-                  filename = basename(path))
+                  filename = basename(path), worker_path, size)
 
 # In a chat bubble the video belongs in the message flow, at its own size.
-file_viewer(::VideoFile, url, path::AbstractString, ::InlineView = InlineView()) = video_viewer(url, path)
+file_viewer(::VideoFile, url, path::AbstractString, ::InlineView = InlineView();
+            worker_path = "", size = nothing) =
+    video_viewer(url, path; worker_path, size)
 
 # Filling a box it needs a stage, like a picture does. Without one the element
 # sits at its intrinsic size in the top-left corner of an otherwise empty tab, and
@@ -287,9 +290,11 @@ render_file(kind::FileKind, mode::ViewMode, fv::FileView, session) =
 view_input(::StreamedKind, fv::FileView, session) = show_media_src(fv.file, session)
 view_input(::ParsedKind, fv::FileView, session) = FileContent(last(view_bytes(fv)); link = file_link(fv))
 
-render_file(::ImageFile, ::InlineView, fv::FileView, session) =
-    file_viewer(ImageFile(), view_input(ImageFile(), fv, session), view_path(fv), InlineView();
-                worker_path = show_worker_path(fv.file))
+# In a bubble a picture or a clip knows its worker file: the picture can become
+# the chat's icon, and both take the size the browser measured for that file.
+render_file(kind::Union{ImageFile,VideoFile}, ::InlineView, fv::FileView, session) =
+    file_viewer(kind, view_input(kind, fv, session), view_path(fv), InlineView();
+                worker_path = show_worker_path(fv.file), size = media_size(fv.file))
 
 # ── markdown ────────────────────────────────────────────────────────────────
 # The SAME renderer the chat uses for agent messages (`markdown_html`), so a

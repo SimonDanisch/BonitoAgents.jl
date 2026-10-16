@@ -109,7 +109,8 @@ end
     kill_processes_on_worker(state, worker_id, procs; timeout) -> Dict{Int,String}
 
 Have `worker_id` kill `procs` (see `kill_processes` in BonitoWorker): each pid's
-outcome, "killed" or "gone".
+outcome, "killed", "gone", or "refused" (the worker itself, or a process it
+runs under).
 """
 function kill_processes_on_worker(state::ServerState, worker_id::AbstractString,
                                   procs::Vector{ChatProcess}; timeout::Real = 20.0)

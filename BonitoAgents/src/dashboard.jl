@@ -15,15 +15,20 @@ The claim is persisted to projects.json so it survives a server restart,
 and the matching project card shows a "locked by …" badge in the UI.
 """
 function claim_project!(state::ServerState, p::ProjectInfo, worker_id::String)
-    lock(state.lock) do
+    # Every chat open lands here. When the worker holds the claim already, the
+    # usual case, nothing changes: rewriting projects.json and re-rendering the
+    # project list in every tab (53 messages per tab) was pure cost per open.
+    changed = lock(state.lock) do
         if p.locked_by !== nothing && p.locked_by != worker_id
             error("Project '$(p.name)' is claimed by worker '$(p.locked_by)'")
         end
+        p.locked_by == worker_id && return false
         p.locked_by = worker_id
         p.locked_at = now(UTC)
         save_projects!(state)
+        return true
     end
-    notify_projects!(state)
+    changed && notify_projects!(state)
     return p
 end
 
@@ -460,7 +465,9 @@ function maybe_resync_on_open!(state::ServerState, p::ProjectInfo, model)
     last = lock(() -> get(state.last_scan, p.worker_id, 0.0), state.lock)
     time() - last < RESCAN_ON_OPEN_AFTER && return nothing
     Base.errormonitor(@async try
-        scan_and_store!(state, p.worker_id)
+        # A Claude chat's session is in the session files: no agent needs to
+        # start for it. Another agent's is known only by asking the agents.
+        scan_and_store!(state, p.worker_id; agents = !(project_provider(p) isa ClaudeCodeAgent))
         # Re-ask now that the scan is current; bind only if it actually moved.
         session_advanced_since_sync(state, p) && restart_chat_session!(model)
     catch e
@@ -587,6 +594,8 @@ function continue_on!(state::ServerState, p::ProjectInfo, target_worker_id::Abst
     new_p.provider = p.provider
     new_p.desired_config = copy(p.desired_config)
     new_p.title[] = p.title[]
+    # An app's chat continues as the app's chat (`app_chat` takes the newest).
+    new_p.app = p.app
     add_project!(state, new_p; new_chat = false)
     @info "chat continued on another worker" source = p.id new = new_id target = target_w.name carried
     return new_p
@@ -2003,23 +2012,25 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # longer treated as a decision — each worker gets its own project with
     # its own server_path mirror. The "merge / move" decision only matters
     # at sync-time and is handled separately.
+    #
+    # Creating a chat is opening a chat: no progress card of its own. The view
+    # moves to the new chat as soon as the worker has confirmed the folder, and
+    # the chat's loading spinner (`project_loading_view`, then the transcript's)
+    # is the one thing on screen, the same as for a chat that already existed.
+    # It used to run through the window's progress card, "Importing X" and then
+    # "Imported X" for 4.5 s, on top of the new chat's own header controls.
+    # A failure still lands in that card: it is the one place an error can be
+    # read and copied.
+    #
+    # `importing` is the double-click latch (T16): two imports of one folder at
+    # once would make two chats. Set synchronously, before anything yields.
+    importing = Ref(false)
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
                         resume_session_id::Union{Nothing,String} = nothing,
                         provider::Union{Nothing,String} = nothing)
-        # In-flight guard (T16): a double-click (or two import affordances firing
-        # at once) had no guard here and would run two concurrent imports of the
-        # same folder. Bail synchronously if a long-op is already running; the
-        # synchronous `busy_start!` just below then latches this one.
-        refuse_if_busy(busy, error_obs, "Can't create a chat right now") && return nothing
-        # Label for the busy card only — `busy_start!` has to run SYNCHRONOUSLY
-        # (it is the double-click latch), and the authoritative name can't be
-        # derived until the worker has confirmed the path below.
-        proj_name = name !== nothing ? name : project_name_from_path(path)
-        title = resume_session_id === nothing ?
-            "Importing $(proj_name)" :
-            "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
-        busy_start!(busy, title)
+        importing[] && return nothing
+        importing[] = true
         @async begin
             try
                 @info "do_import: starting" worker=w_name path resume=resume_session_id
@@ -2039,19 +2050,19 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                     name = pname,
                     resume_session_id = resume_session_id,
                     provider = provider,
-                    start_session = false,
-                    progress = (stage, info) -> busy_event!(busy, stage, info))
+                    start_session = false)
                 @info "do_import: registered project, flipping view" id=p.id
                 error_obs[]      = ""
                 discover_state[] = ""
                 picker_state[]   = ""
-                busy_done!(busy, "Imported $(p.name)")
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 # Never swallow silently: surface to the UI AND the server log.
                 bt = catch_backtrace()
                 @warn "do_import failed" worker=w_name path resume=resume_session_id exception=(e, bt)
-                busy_fail!(busy, "Failed to import", error_detail(e, bt))
+                busy_fail!(busy, "Failed to create the chat", error_detail(e, bt))
+            finally
+                importing[] = false
             end
         end
     end
@@ -2073,7 +2084,10 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                     progress    = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 gh_state[]  = ""
-                busy_done!(busy, "Opened $(p.name) from GitHub")
+                # The clone needed the card (it takes a while, and no chat
+                # exists yet to show a spinner in). The chat opening is its
+                # result: the card goes, and the chat's own spinner takes over.
+                busy_clear!(busy)
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 bt = catch_backtrace()
@@ -2177,6 +2191,9 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             title = "Defaults, agent instructions, accounts",
             onclick = js"event => $(current_view).notify($(SETTINGS_VIEW))")
 
+    apps = apps_section(session, state, current_view, busy)
+    apps_header = apps === nothing ? nothing : DOM.div(DOM.h2("Apps"); class = "bt-section")
+
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
     DOM.div(
@@ -2197,6 +2214,10 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             class = "bt-header"),
         stats_strip,
         error_block,
+
+        # The server's apps (apps.jl): one row each, opening the app's chat.
+        apps_header,
+        apps,
 
         DOM.div(DOM.h2("Workers"); class = "bt-section"),
         worker_list;

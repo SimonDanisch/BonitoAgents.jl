@@ -420,7 +420,13 @@ struct UsageUpdateNotif <: SessionUpdate
     cost_amount::Union{Float64,Nothing}
     cost_currency::Union{String,Nothing}
     origin_kind::Union{String,Nothing}
+    # Claude Code's estimate of the tokens the model has thought so far in this
+    # response (`_meta["_claude/thinkingTokens"]`), on the updates
+    # claude-agent-acp sends while the model thinks; `nothing` on every other.
+    thinking_tokens::Union{Int,Nothing}
 end
+UsageUpdateNotif(used, size, cost_amount, cost_currency, origin_kind) =
+    UsageUpdateNotif(used, size, cost_amount, cost_currency, origin_kind, nothing)
 
 # One slash command (`available_commands_update`): pushed at session start
 # and re-pushed whenever claude's command set changes. `hint` is the
@@ -878,12 +884,14 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
         meta = get(params, "_meta", nothing)
         origin = meta isa AbstractDict ? get(meta, "_claude/origin", nothing) : nothing
         okind = origin isa AbstractDict ? get(origin, "kind", nothing) : nothing
+        thinking = meta isa AbstractDict ? get(meta, "_claude/thinkingTokens", nothing) : nothing
         return UsageUpdateNotif(
             round(Int, get(params, "used", 0)),
             round(Int, get(params, "size", 0)),
             cost isa AbstractDict ? Float64(get(cost, "amount", 0.0)) : nothing,
             cost isa AbstractDict ? String(get(cost, "currency", "USD")) : nothing,
-            okind isa AbstractString ? String(okind) : nothing)
+            okind isa AbstractString ? String(okind) : nothing,
+            thinking isa Real && isfinite(thinking) ? round(Int, thinking) : nothing)
     elseif kind == "available_commands_update"
         cmds = CommandInfo[]
         for c in get(params, "availableCommands", [])

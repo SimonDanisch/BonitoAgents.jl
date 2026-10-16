@@ -44,8 +44,15 @@
             });
         })()""")
         @test TK.wait_for(s, "paste queued", "!!$(q(".bt-attachment-thumb"))")
+        # Back up to the earlier pictures with the wheel, as a reader would:
+        # the transcript leaves the bottom, and stops following it.
+        ctx = s.browser[]
+        TK.ECT.install_cursor(ctx)
+        TK.ECT.move_to(ctx, TK.ECT.JS("(() => { const r = $(q(".bt-messages")).getBoundingClientRect(); return [r.left + 3, r.top + r.height / 2]; })()"); duration = 0.05)
+        TK.ECT.wheel(ctx, -400; steps = 2)
+        @test TK.wait_for(s, "reading above the bottom",
+            "(() => { const c = $(q(".bt-messages")); return c.scrollHeight - c.clientHeight - c.scrollTop > 50; })()")
         TK.send_message(s, "pasted image")
-        # Inspecting the earlier pictures leaves the transcript in reading mode.
         # Use the UI's jump-to-latest control to reveal the new attachment.
         @test TK.wait_for(s, "new message indicator", "!!$(q(".bt-new-msg-pill-visible"))")
         TK.click(s, P * ".bt-new-msg-pill-visible")

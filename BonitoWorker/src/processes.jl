@@ -10,7 +10,8 @@
 #  -> {type:"kill_processes_response", request_id, results:[{pid, outcome}]}
 #
 # `outcome` is "killed", or "gone" for a process that ended already, or whose pid
-# another process has taken since.
+# another process has taken since, or "refused" for this worker and the processes
+# it runs under (`runs_this_worker`).
 
 """
     process_started(pid) -> Union{Float64,Nothing}
@@ -90,11 +91,55 @@ function kill_recorded!(pid::Integer, pgid::Integer)
     return nothing
 end
 
+"""
+    parent_pid(pid) -> Int
+
+The parent of process `pid`, or 0 when there is no such process.
+"""
+function parent_pid(pid::Integer)
+    if Sys.islinux()
+        stat = try
+            read("/proc/$pid/stat", String)
+        catch e
+            (e isa SystemError || e isa Base.IOError) || rethrow()
+            return 0
+        end
+        # After the command name (see `process_started`): state, then ppid.
+        return parse(Int, split(stat[findlast(')', stat) + 2:end])[2])
+    end
+    out = strip(read(ignorestatus(pipeline(`ps -o ppid= -p $pid`; stderr = devnull)), String))
+    return something(tryparse(Int, out), 0)
+end
+
+"""
+    runs_this_worker(pid) -> Bool
+
+Whether `pid` is this worker or a process it runs under: killing one ends the
+worker too. A record names one when an MCP runs INSIDE a process the worker
+descends from and reports that process as its own. TestKit's in-process MCP
+does: the test process started this worker, and closing a chat from the record
+took the test process down with everything it ran.
+"""
+function runs_this_worker(pid::Integer)
+    pid == getpid() && return true
+    Sys.iswindows() && return false
+    p = Int(ccall(:getppid, Cint, ()))
+    seen = Set{Int}()
+    while p > 1 && !(p in seen)
+        p == pid && return true
+        push!(seen, p)
+        p = parent_pid(p)
+    end
+    return false
+end
+
 function kill_processes(processes::AbstractVector)
     return map(processes) do p
         pid  = Int(p["pid"])
         pgid = Int(get(p, "pgid", 0))
-        outcome = if recorded_alive(pid, Float64(p["recorded_at"]))
+        outcome = if runs_this_worker(pid)
+            "refused"
+        elseif recorded_alive(pid, Float64(p["recorded_at"]))
             kill_recorded!(pid, pgid)
             "killed"
         elseif orphaned_group(pid, pgid)

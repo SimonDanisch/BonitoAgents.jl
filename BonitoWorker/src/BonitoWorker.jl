@@ -15,6 +15,7 @@ import WorkerLink
 import FileWatching
 include("mcp_relay.jl")
 include("harnesses.jl")
+include("adapter_patches.jl")
 include("worker.jl")
 include("processes.jl")
 include("file_watch.jl")
@@ -1705,37 +1706,6 @@ function handle_list_project_files(ws, cmd::AbstractDict)
     end
 end
 
-# Inspect a path for "which side is fresher" comparison on project-name
-# collision. Cheap walk: file count + total bytes + latest mtime + top-N
-# most-recently-modified files, plus per-subrepo git summary (HEAD, dirty
-# count, last commit time). Excludes the contents of .git/ from the file
-# walk so commit churn doesn't drown out source-edit recency; the git
-# summary block reports commit activity separately so nothing is lost.
-const INSPECT_RECENT_LIMIT = 10
-
-function handle_inspect_path(ws, cmd::AbstractDict)
-    request_id = String(get(cmd, "request_id", ""))
-    raw_path   = String(get(cmd, "path", ""))
-
-    response = try
-        isempty(raw_path) && error("path is empty")
-        isdir(raw_path)   || error("not a directory: $raw_path")
-        Dict("type"       => "inspect_path_response",
-             "request_id" => request_id,
-             "path"       => abspath(raw_path),
-             "summary"    => inspect_path_summary(raw_path))
-    catch e
-        Dict("type"       => "inspect_path_response",
-             "request_id" => request_id,
-             "error"      => sprint(showerror, e))
-    end
-    try
-        send_control(ws, response)
-    catch e
-        @warn "inspect_path response failed" exception=e
-    end
-end
-
 # Every OTHER process holding `path` open — for a background shell that's
 # the shell itself (its `>> output` redirect stays open until exit). Used
 # both for the "still running" signal (file_watch.jl) and for `kill_file_writers`:
@@ -1873,84 +1843,6 @@ function handle_kill_file_writers(ws, cmd::AbstractDict)
         @warn "kill_file_writers response failed" exception=e
     end
     return nothing
-end
-
-function inspect_path_summary(root::AbstractString)
-    total_files  = 0
-    total_bytes  = 0
-    latest_mtime = 0.0
-    # Collect (rel, size, mtime) so we can sort for the recent-files list.
-    files = NamedTuple{(:rel, :size, :mtime), Tuple{String, Int, Float64}}[]
-    git_dirs = String[]   # abs paths of directories that contain a .git entry
-    for (dir, dirs, names) in walkdir(String(root); topdown = true,
-                                       follow_symlinks = false)
-        if ".git" in dirs || ".git" in names
-            push!(git_dirs, dir)
-            # Don't recurse into .git/: counts huge object trees as "files
-            # the user edited", which would mask actual source-edit recency.
-            filter!(d -> d != ".git", dirs)
-        end
-        for n in names
-            full = joinpath(dir, n)
-            islink(full) && continue
-            st = try stat(full) catch; continue end
-            sz = Int(st.size)
-            mt = Float64(st.mtime)
-            total_files += 1
-            total_bytes += sz
-            mt > latest_mtime && (latest_mtime = mt)
-            push!(files, (rel = relpath(full, String(root)),
-                          size = sz, mtime = mt))
-        end
-    end
-    sort!(files; by = f -> f.mtime, rev = true)
-    n_recent = min(INSPECT_RECENT_LIMIT, length(files))
-    recent = [Dict("path"  => f.rel,
-                   "size"  => f.size,
-                   "mtime" => f.mtime) for f in files[1:n_recent]]
-    return Dict(
-        "total_files"  => total_files,
-        "total_bytes"  => total_bytes,
-        "latest_mtime" => latest_mtime,
-        "recent_files" => recent,
-        "git_subrepos" => [inspect_git_subrepo(d, String(root)) for d in git_dirs],
-    )
-end
-
-function inspect_git_subrepo(abs_dir::AbstractString, root::AbstractString)
-    rel        = relpath(String(abs_dir), String(root))
-    head_sha   = ""
-    head_time  = 0.0
-    dirty_count = 0
-    branch     = ""
-    # `git_capture`, not `try … catch end`. These four calls have real expected
-    # failures — an unborn HEAD, a directory that stopped being a repo — and the
-    # bare catch answered ALL of them the same way, including the ones that are
-    # bugs (git missing, a permission error) and the one that is a user:
-    # `InterruptException` was swallowed too, so Ctrl-C during a scan did
-    # nothing. `git_capture` already draws that line correctly for the rest of
-    # this file: a non-zero exit is an ANSWER, anything else propagates.
-    let r = git_capture(abs_dir, `rev-parse HEAD`)
-        r.ok && (head_sha = strip(r.out))
-    end
-    let r = git_capture(abs_dir, `log -1 --format=%ct HEAD`)   # %ct = committer Unix time
-        # Present but unparseable is not the same as absent; `tryparse` keeps the
-        # 0.0 default without inventing a number.
-        r.ok && (head_time = something(tryparse(Float64, strip(r.out)), 0.0))
-    end
-    let r = git_capture(abs_dir, `status --porcelain`)          # line-per-change
-        r.ok && (dirty_count = count(!isempty, split(r.out, '\n')))
-    end
-    let r = git_capture(abs_dir, `rev-parse --abbrev-ref HEAD`)
-        r.ok && (branch = strip(r.out))
-    end
-    return Dict(
-        "path"        => rel,
-        "head_sha"    => head_sha,
-        "head_time"   => head_time,
-        "dirty_count" => dirty_count,
-        "branch"      => branch,
-    )
 end
 
 # Clone a GitHub repo into `dst_path` (must not exist yet). For PRs we then
@@ -2856,7 +2748,11 @@ end
 
 function handle_scan_sessions(ws, cmd::AbstractDict)
     request_id = String(get(cmd, "request_id", ""))
-    sessions = scan_sessions()
+    # `agents = false`: the session files alone. Asking the agents starts one
+    # process per installed agent (seconds each), which a chat being opened has
+    # no use for: it only checks its own Claude session.
+    sessions = get(cmd, "agents", true) === false ?
+        scan_sessions(; acp = Dict{String,Any}[]) : scan_sessions()
     try
         send_control(ws, Dict(
             "type"       => "scan_sessions_result",

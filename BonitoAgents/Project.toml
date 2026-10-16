@@ -43,7 +43,7 @@ WorkerLink = {path = "../WorkerLink"}
 [compat]
 Colors = "0.12, 0.13"
 HTTP = "2"
-JSON = "0.21, 1"
+JSON = "1"
 MsgPack = "1"
 
 [extras]

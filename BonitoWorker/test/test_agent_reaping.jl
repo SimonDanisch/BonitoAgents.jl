@@ -269,6 +269,21 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 r = BW.kill_processes([Dict("pid" => 999_999_999, "pgid" => 0, "recorded_at" => time())])
                 @test only(r)["outcome"] == "gone"
             end
+
+            # TestKit's in-process MCP reported the TEST process as a chat's MCP;
+            # the dev worker it started killed it from the record when the chat
+            # closed. Asked as a predicate for the parent, never by killing it.
+            @testset "never a process this worker runs under" begin
+                @test BW.runs_this_worker(getpid())
+                @test BW.runs_this_worker(Int(ccall(:getppid, Cint, ())))
+                @test BW.parent_pid(getpid()) == Int(ccall(:getppid, Cint, ()))
+                r = BW.kill_processes([Dict("pid" => getpid(), "pgid" => 0, "recorded_at" => time())])
+                @test only(r)["outcome"] == "refused"
+                proc = open(detach(`sleep 300`), "r")
+                sleep(0.2)
+                @test !BW.runs_this_worker(Int(getpid(proc)))
+                kill(proc, Base.SIGKILL)
+            end
         end
     end
 

@@ -57,302 +57,117 @@
         c.dispatchEvent(new Event('scroll', {bubbles: true}));
     })()"""); sleep(0.8))
 
-    # The real-world churn: heights in the TOP SPACER region (above the
-    # rendered window) get set LARGER than their estimate — prefetch
-    # measurement and EST_HEIGHT adaptation only ever touch UNRENDERED
-    # indices; the ResizeObserver keeps every rendered node's map entry
-    # equal to its DOM pixels, so inflating rendered rows would fabricate a
-    # map/DOM contradiction production cannot reach. Returns the number of
-    # inflated entries.
-    # Returns the inflated count PLUS what the churn's own `updateDOM` decided,
-    # sampled right after `refresh()`: `anchorDebugGeneric` is written by every
-    # `captureAnchor`, so a value that still reads `st: 0` proves the capture
-    # never ran for this churn (initialLoad / a live sticky key-anchor both skip
-    # it) — which is a different bug from "captured and restored wrongly", and
-    # the failure message could not tell them apart.
-    INFLATE = """(() => {
-        const ch = $CH;
-        if (ch.rendered.size === 0) return {inflated: 0};
-        const winStart = Math.min(...ch.rendered);
-        let inflated = 0;
-        for (let i = 0; i < winStart; i++) {
-            const h = ch.heights.get(i) ?? ch.EST_HEIGHT;
-            ch.heights.set(i, h + 900);  // large media rows replace short estimates
-            inflated++;
-        }
-        ch.refresh();
-        return {inflated,
-                dbg:         JSON.stringify(ch.anchorDebugGeneric ?? null),
-                initialLoad: !!ch.initialLoad,
-                sticky:      !!ch.keyAnchor,
-                winStart,
-                scrollTop:   Math.round(ch.container.scrollTop)};
-    })()"""
+    # Poll until the top marker is STABLE (the row observer's correction lands
+    # before the next paint, but loads and mounts can follow), then return it.
+    function settled_top()
+        prev = nothing; now = nothing
+        for _ in 1:40
+            sleep(0.05)
+            now = TK.eval_js(s, TOP_PROBE)
+            prev !== nothing && now !== nothing && now["text"] == prev["text"] &&
+                abs(Int(now["off"]) - Int(prev["off"])) <= 1 && break
+            prev = now
+        end
+        return now
+    end
 
-    @testset "height churn above the viewport must not move the view" begin
-        # Churn heights above the rendered window with a media-sized correction
-        # to exercise anchor eviction and temporary scroll clamping, rather than
-        # relying on previous suites' layout to exceed the overscan. When the
-        # map-based visibleRange() shifts off the
-        # DOM's real top-visible node the anchor gets EVICTED, and restoreAnchor
-        # then used a cumHeight() virtual position that omitted the container
-        # padding + gap-after-spacer, landing ~a row short — so the follow-up
-        # refresh re-anchored the NEIGHBOUR and the view jumped ~1 row (stuck).
+    @testset "rows growing above the viewport must not move the view" begin
+        # The real-world churn: images, editors and bodies above the reader
+        # reach their real size after the rows are in the page. Grow every row
+        # above the viewport by a media-sized amount, in the same synchronous
+        # step as the probe, and the reading row has to stay where it was.
+        TK.eval_js(s, "(() => { const ch = $CH; ch.setFollowMode(false); ch.cancelPendingScroll(); return true; })()")
         scroll_frac!(0.55)
-        # Wait for the virtual-scroll geometry to SETTLE first: under
-        # full-suite load, range fetches + estimate→real corrections keep
-        # shifting the transcript for a while after the scroll, and probing
-        # mid-settle compares against a state the anchor never saw (the
-        # filter_scroll one-row-drift disease, here worth many rows).
-        @test TK.wait_for(s, "geometry settled before churn", """(() => {
-            const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
-            const key = c.scrollHeight + '|' + Math.round(c.scrollTop);
-            window.__saN = (window.__saPrev === key) ? (window.__saN || 0) + 1 : 0;
-            window.__saPrev = key;
-            return window.__saN >= 4;
-        })()"""; timeout = 30, interval = 0.25) == true
-        # Probe + churn ATOMICALLY (one synchronous JS execution): the
-        # invariant is "the compensation preserves the view AS OF THE CHURN
-        # INSTANT" — a probe taken a round-trip earlier measures settle
-        # noise, not the compensation.
+        settled_top()
         r = TK.eval_js(s, """(() => {
             const probe = $TOP_PROBE;
-            const inflated = $INFLATE;
-            return { probe, inflated };
+            const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
+            let grown = 0;
+            for (const n of c.querySelectorAll('.bt-user-msg,.bt-agent-msg,.bt-tool-msg')) {
+                if (n.offsetParent === null || n.offsetTop + n.offsetHeight > c.scrollTop) continue;
+                n.style.minHeight = (n.offsetHeight + 300) + 'px';
+                grown++;
+            }
+            return { probe, grown };
         })()""")
         before = r["probe"]
-        churn  = r["inflated"]           # the INFLATE probe's own report
         @test before !== nothing
-        @test Int(churn["inflated"]) > 3     # the churn genuinely hit rows above
-        # Poll until the top marker STABILISES (the compensation is a synchronous
-        # bump plus a few async correction passes; all settle well under 1s even
-        # under load), then assert the view didn't move. No fixed-sleep gamble —
-        # and because the drift landed on a STABLE wrong row, waiting for
-        # stability still catches a regression.
-        prev = nothing; after = nothing
-        for _ in 1:40          # up to ~2s
-            sleep(0.05)
-            after = TK.eval_js(s, TOP_PROBE)
-            if prev !== nothing && after !== nothing &&
-               after["text"] == prev["text"] && abs(Int(after["off"]) - Int(prev["off"])) <= 1
-                break
-            end
-            prev = after
-        end
+        @test Int(r["grown"]) > 3                # the churn genuinely hit rows above
+        after = settled_top()
         @test after !== nothing
-        ok = after !== nothing && after["text"] == before["text"] &&
-             abs(Int(after["off"]) - Int(before["off"])) <= 3
-        ok || @info "scroll_anchor churn FAILED" before after churn anchor_now =
-            TK.eval_js(s, "JSON.stringify(($CH).anchorDebugGeneric ?? null)")
         @test after["text"] == before["text"]
         @test abs(Int(after["off"]) - Int(before["off"])) <= 3
     end
 
-    @testset "evicted-anchor restore lands the node at its offset (#32)" begin
-        # Deterministic (no load/timing) guard for the coordinate bug: force the
-        # EVICT branch of restoreAnchor and require the anchored node to end up
-        # exactly at the requested offset once the queued refresh re-materialises
-        # it. Pre-fix, the virtual restore used cumHeight() WITHOUT PAD_TOP +
-        # ITEM_GAP, so scrollTop landed ~a row short (node ~26px off) → the
-        # follow-up refresh re-anchored the neighbour (the stuck ~1-row jump).
-        idx = TK.eval_js(s, "(() => { const ch=$CH; " *
-            "const r=[...ch.rendered].sort((a,b)=>a-b); return r[Math.floor(r.length/2)]; })()")
-        @test idx !== nothing
-        TK.eval_js(s, """(() => {
+    @testset "rows dropped above the reader must not move the view" begin
+        # A block grown past its cap drops rows on the side away from the
+        # viewport. Dropping them ABOVE the reader takes their height with them,
+        # which the scroll position has to absorb.
+        scroll_frac!(0.85)
+        before = settled_top()
+        @test before !== nothing
+        dropped = TK.eval_js(s, """(() => {
             const ch = $CH;
-            ch.rendered.delete($idx);          // simulate the re-window eviction
-            ch.restoreAnchor({idx: $idx, off: -20});
-            return true; })()""")
-        @test TK.wait_for(s, "evicted anchor restored to off=-20",
-            """(() => {
-                const ch = $CH;
-                const n = ch.cache.get($idx);
-                if (!n || !n.isConnected || !ch.rendered.has($idx)) return false;
-                return Math.abs((n.offsetTop - ch.container.scrollTop) - (-20)) <= 2;
-            })()"""; timeout = 3) == true
-        TK.eval_js(s, "(() => { ($CH).refresh(); })()")   # settle state for the next testset
+            const n0 = ch.order.length;
+            ch.MAX_WINDOW = 20; ch.CHUNK = 10;     // force a trim right here
+            ch.trimBlock();
+            return n0 - ch.order.length;
+        })()""")
+        @test Int(dropped) > 0
+        after = settled_top()
+        @test after["text"] == before["text"]
+        @test abs(Int(after["off"]) - Int(before["off"])) <= 3
+        TK.eval_js(s, "(() => { const ch = $CH; ch.MAX_WINDOW = 160; ch.CHUNK = 40; ch.ensureWindow(); return true; })()")
     end
 
-    @testset "a PARKED anchor must not pin the pane to the very top" begin
-        # `rendered` is NOT "has a layout box". A live-app embed that leaves the
-        # window is PARKED rather than removed — display:none, kept in
-        # `rendered` so its Bonito sub-session and WebGL context survive (see
-        # e2e:eval_embed_park). `offsetTop` on a boxless node reads 0, so
-        # restoreAnchor asked for scrollTop ≈ 0 and the transcript jumped to the
-        # very FIRST message. Reported from a chat whose history is mostly live
-        # eval embeds: "scroll slowly upward and you suddenly land at the top",
-        # every time.
-        #
-        # Driven through the scroller's own park + restore, like the eviction
-        # above: production needs an eviction and a parked row in the SAME pass,
-        # which is a coincidence in a text chat and the norm in an eval-heavy
-        # one. `captureAnchor` and `restoreKeyAnchor` already skip display:none
-        # rows; this is the path that did not.
-        # Park the pane mid-history and PROVE it stayed there: the preceding
-        # testsets leave their own anchors and churned heights behind, and a
-        # probe that starts at the top proves nothing about a pin to the top.
-        SCROLL_MID = """(() => {
-            const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
-            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
-            c.scrollTop = Math.round((c.scrollHeight - c.clientHeight) * 0.5);
-            c.dispatchEvent(new Event('scroll', {bubbles: true}));
-            return Math.round(c.scrollTop);
-        })()"""
-        mid = nothing
-        for _ in 1:10
-            mid = TK.eval_js(s, SCROLL_MID)
-            sleep(0.8)
-            mid = TK.eval_js(s, "Math.round(($CH).container.scrollTop)")
-            Int(mid) > 400 && break
-        end
-        Int(mid) > 400 || @info "scroll_anchor park: pane would not hold mid-history" state =
-            TK.eval_js(s, """(() => { const ch = $CH; const c = ch.container;
-                return JSON.stringify({scrollTop: Math.round(c.scrollTop),
-                    scrollHeight: c.scrollHeight, clientHeight: c.clientHeight,
-                    rendered: ch.rendered.size, total: ch.totalCount,
-                    follow: !!ch.followMode, pending: JSON.stringify(ch.pendingAnchor)}); })()""")
-        @test Int(mid) > 400
-        r = TK.eval_js(s, """(() => {
+    @testset "a reply for a block that is gone is not placed" begin
+        # The splice race, simulated at the seam: a msgs.range reply stamped with
+        # a stale epoch, and one answering no request of ours, must both be
+        # dropped instead of inserted among the wrong rows.
+        ghost = TK.eval_js(s, """(() => {
             const ch = $CH;
-            const a = ch.captureAnchor();
-            if (!a) return null;
-            const before = Math.round(ch.container.scrollTop);
-            ch.parked.add(a.idx);         // exactly what updateDOM's park
-            ch.applyVisibility(a.idx);    // branch does to a data-bt-app row
-            ch.restoreAnchor(a);
-            return {idx: a.idx, off: a.off, before,
-                    after:   Math.round(ch.container.scrollTop),
-                    boxless: ch.cache.get(a.idx).offsetParent === null};
+            const ghost = {type: 'user', text: 'STALE-EPOCH-GHOST'};
+            ch.onRange({start: 0, msgs: [ghost], epoch: ch.epoch - 1, req: ch.reqSeq});
+            ch.onRange({start: 0, msgs: [ghost], epoch: ch.epoch, req: 987654});
+            return ch.container.innerText.includes('STALE-EPOCH-GHOST');
         })()""")
-        @test r !== nothing
-        @test r["boxless"] == true              # parking really took the box away
-        @test Int(r["before"]) > 400            # mid-history, not already at the top
-        Int(r["after"]) > div(Int(r["before"]), 2) ||
-            @info "scroll_anchor park FAILED" r
-        @test Int(r["after"]) > div(Int(r["before"]), 2)   # pre-fix: 0 (first message)
-        # ...and the reading row comes back: the queued refresh un-parks it and
-        # the next pin is exact again, at the offset it was captured at.
-        idx = Int(r["idx"]); off = Float64(r["off"])   # px, fractional and often negative
-        @test TK.wait_for(s, "parked reading row re-materialised at its offset",
-            """(() => {
-                const ch = $CH;
-                const n = ch.cache.get($idx);
-                if (!n || !n.isConnected || n.offsetParent === null) return false;
-                return Math.abs((n.offsetTop - ch.container.scrollTop) - ($off)) <= 3;
-            })()"""; timeout = 8) == true
-        TK.eval_js(s, """(() => { const ch = $CH;
-            ch.parked.delete($idx); ch.applyVisibility($idx); ch.refresh(); })()""")
+        @test ghost == false
     end
 
-    @testset "a msgs.range reply from before a reload must not be cached" begin
-        # The splice race, simulated at the seam: an UNCACHED index receives a
-        # reply stamped with the pre-reload epoch. It must be dropped.
-        ghost_cached = TK.eval_js(s, """(() => {
+    @testset "an idle pane downloads nothing" begin
+        # The block loads only what the viewport nears: a pane left alone sends
+        # no requests at all (the old scroller trickled the entire history in).
+        sleep(1)
+        n = TK.eval_js(s, """(() => new Promise(resolve => {
             const ch = $CH;
-            const idx = 3;
-            ch.cache.get(idx)?.remove();
-            ch.cache.delete(idx); ch.rendered.delete(idx);
-            const stale = (ch.epoch ?? 0) - 1;
-            ch.onRange({start: idx, msgs: [{type: 'user', text: 'STALE-EPOCH-GHOST'}], epoch: stale});
-            return ch.cache.has(idx) &&
-                   (ch.cache.get(idx).innerText || '').includes('STALE-EPOCH-GHOST');
-        })()""")
-        @test ghost_cached == false
-        sleep(0.3)
-        # The evicted real row refetches on the next refresh (sanity).
-        TK.eval_js(s, "(() => { ($CH).refresh(); })()")
-    end
-
-    @testset "hidden panes stop backfilling the transcript" begin
-        # Prior testsets' fetch cascades (forced refresh + refetch above) can
-        # still be in flight under load — their msgs.request would be counted
-        # against startPrefetch (the intermittent `116 == 0`). Wait for
-        # REQUEST QUIESCENCE (no msgs.request for 800ms) before hooking.
-        quiesced = TK.eval_js(s, """(() => new Promise(resolve => {
-            const ch = $CH;
-            const orig = ch.comm.notify.bind(ch.comm);
-            let last = performance.now();
-            const t0 = last;
-            ch.comm.notify = (m) => {
-                if (m && m.type === 'msgs.request') last = performance.now();
-                return orig(m);
-            };
-            const tick = setInterval(() => {
-                const idle = performance.now() - last > 800;
-                if (idle || performance.now() - t0 > 15000) {
-                    clearInterval(tick);
-                    ch.comm.notify = orig;
-                    resolve(idle);
-                }
-            }, 100);
-        }))()""")
-        @test quiesced == true
-        # Stash the chat object + poke holes in its cache (so a running
-        # prefetcher WOULD have rows to fetch), then REALLY hide the pane by
-        # navigating to the dashboard — the product drives onHidden itself.
-        # Manually faking ch.onHidden() on a still-visible pane was a
-        # synthetic state: any product-side visibility resync — e.g. the
-        # chat-LRU eviction (cap 8) updating the sidebar, which only happens
-        # once the full soak has accumulated enough chats — flipped it back
-        # to shown MID-COUNT, the backfill legitimately resumed (the
-        # intermittent `188 == 0`), and by the explicit onShown phase it had
-        # already finished (its `0 > 0` twin).
-        TK.eval_js(s, """(() => {
-            const ch = $CH;
-            window.__saBf = ch;
-            for (const k of [...ch.cache.keys()]) if (k % 2 === 0) { ch.cache.get(k)?.remove(); ch.cache.delete(k); ch.rendered.delete(k); }
-            ch.prefetchStarted = false; ch.prefetchCursor = null;
-            return true;
-        })()""")
-        TK.to_dashboard(s)
-        sleep(0.5)
-        n_requests = TK.eval_js(s, """(() => new Promise(resolve => {
-            const ch = window.__saBf;
             let n = 0;
             const orig = ch.comm.notify.bind(ch.comm);
-            ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') n++; return orig(m); };
-            ch.startPrefetch();
-            setTimeout(() => { ch.comm.notify = orig; resolve(n); }, 1500);
+            ch.comm.notify = (m, ...rest) => { if (m && m.type === 'msgs.request') n++; return orig(m, ...rest); };
+            setTimeout(() => { ch.comm.notify = orig; resolve(n); }, 2000);
         }))()""")
-        @test Int(n_requests) == 0
-        # Navigate back: the pane shows for real and the backfill resumes.
-        TK.eval_js(s, """(() => {
-            const ch = window.__saBf;
-            window.__saBfN = 0;
-            const orig = ch.comm.notify.bind(ch.comm);
-            window.__saBfRestore = () => { ch.comm.notify = orig; };
-            ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') window.__saBfN++; return orig(m); };
-            return true;
-        })()""")
-        TK.open_chat(s, pid)
-        @test TK.wait_for(s, "backfill resumes once shown",
-            "window.__saBfN > 0"; timeout = 15) == true
-        TK.eval_js(s, "window.__saBfRestore(); delete window.__saBf; true")
-        sleep(1.5)   # let the resumed backfill settle
+        @test Int(n) == 0
     end
 
     @testset "saved position is content-true across hide/show height churn" begin
         scroll_frac!(0.35)
-        before = TK.eval_js(s, TOP_PROBE)
+        before = settled_top()
         @test before !== nothing
-        # The REAL race: pixels move right AFTER showing (post-show
-        # re-measure corrections re-space the pane) while the restore
-        # cascade (0/rAF/50/200ms) is still re-writing the SAVED value. A
-        # pixel restore then lands on a different message; a content anchor
-        # lands on the one the user was reading. We hide/show, then inject
-        # the correction churn INSIDE the cascade window (~80ms, between the
-        # 50ms and 200ms applies).
+        # The REAL race: pixels move right AFTER showing (rows reaching their
+        # size) while the restore cascade (0/rAF/50/200ms) is still re-writing
+        # the saved position. A pixel restore then lands on a different
+        # message; a content anchor lands on the one the user was reading. We
+        # hide/show, then grow every row INSIDE the cascade window (~80ms).
         TK.eval_js(s, """(() => {
             const ch = $CH;
             ch.onHidden();
             ch.onShown();
             setTimeout(() => {
-                for (const [i, h] of [...ch.heights]) ch.heights.set(i, h + 70);
-                ch.refresh();                            // re-space: pixels move
+                for (const n of ch.container.querySelectorAll('.bt-user-msg,.bt-agent-msg,.bt-tool-msg'))
+                    n.style.minHeight = (n.offsetHeight + 70) + 'px';
             }, 80);
         })()""")
         sleep(0.8)   # past the 200ms apply + settle
-        after = TK.eval_js(s, TOP_PROBE)
+        after = settled_top()
         @test after !== nothing
         @test after["text"] == before["text"]
     end

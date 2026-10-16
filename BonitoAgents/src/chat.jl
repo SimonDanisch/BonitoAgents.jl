@@ -100,6 +100,14 @@ RunBook() = RunBook(Dict{String,ChatRun}(), Dict{Tuple{String,Float64},ChatRun}(
 # store, ACP client, persistent chat session, the user-message queue — are
 # shared across sessions; the Observable fields are per-session connected
 # children so their JS bridges GC cleanly when the tab closes.
+# A chat's tool bodies as the browser last rendered them: tool id => the body's
+# height at each width it was measured at, newest last (measured_sizes.jl).
+struct BodyHeights
+    heights::Dict{String,Vector{NTuple{2,Int}}}
+    lock::ReentrantLock
+end
+BodyHeights() = BodyHeights(Dict{String,Vector{NTuple{2,Int}}}(), ReentrantLock())
+
 mutable struct ChatModel
     # Convention: lock first. Now only a guard around `msgs_store` for the
     # read-only comm handlers (msgs.request / tool.render) that read it
@@ -323,6 +331,10 @@ mutable struct ChatModel
 
     # The chat's Julia runs (eval_runs.jl). Shared across session views.
     runs::RunBook
+
+    # How tall each tool body last rendered, so the next render reserves its
+    # space before the body arrives (measured_sizes.jl). Shared across views.
+    body_heights::BodyHeights
 end
 
 # The provider tracked by the `provider` observable: the singleton descriptor the
@@ -414,6 +426,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         TaskBar(),                             # live-task board (owns its poll loop)
         Dict{String, Tuple{ReentrantLock, Ref{Int}}}(),  # tool_renders (serialize + latest-wins)
         RunBook(),                             # runs
+        load_body_heights(chat_dir),           # body_heights
     )
     load_pending_sends!(model)
     # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
@@ -522,6 +535,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = 
             m.taskbar,                 # shared → one live-task board per chat
             m.tool_renders,            # shared → renders serialize across every tab
             m.runs,                    # shared → one run book per chat
+            m.body_heights,            # shared → one record per chat
         )
     end
 end
@@ -535,6 +549,13 @@ shared(m::ChatModel) = m.parent === nothing ? m : m.parent
 # per-session view — `shared(model)` resolves the right target.
 chat_emit(model::ChatModel, event::AbstractDict) =
     (shared(model).comm[] = Dict{String,Any}(event); nothing)
+
+# To the tab that asked, and to no other: `view` is that tab's copy (see
+# `copy(::ChatModel, ::Session)`), and its `comm` the tab's own child of the
+# shared channel. Transcript ranges used to go out through `chat_emit`, so one
+# tab loading its history pushed every byte of it into each other open tab too.
+reply!(view::ChatModel, event::AbstractDict) =
+    (view.comm[] = Dict{String,Any}(event); nothing)
 
 # ── Concrete message types (carry the `chat` back-ref) ──────────────────────
 mutable struct UserMsg <: ChatMsg
@@ -784,6 +805,20 @@ function apply_input!(m::ReadToolMsg, raw::AbstractDict)
     fp isa AbstractString && !isempty(fp) && (m.file_path = String(fp))
     return nothing
 end
+# The file a Read or Edit call names. Live, `apply_input!` fills it from the
+# streamed arguments. A call restored from chat.md comes back without them; they
+# are stored next to the chat (`tools/<id>.json`), read here on first use and
+# kept. Without this a reopened chat's Read pictures lost their worker file:
+# shown from inline base64, without "Set as chat icon", never the chat's icon.
+function tool_file_path(m::Union{ReadToolMsg,EditToolMsg})
+    chat = m.message.chat
+    if isempty(m.file_path) && chat !== nothing
+        raw = stored_raw_input(chat.chat_dir, tool_id(m))
+        raw === nothing || apply_input!(m, raw)
+    end
+    return m.file_path
+end
+
 function apply_input!(m::EditToolMsg, raw::AbstractDict)
     # `file_path` (claude) vs `path` (kimi) — see `apply_input!(::ReadToolMsg, …)`.
     # kimi's `Edit`/`Write` otherwise diff correctly but against a nameless file.
@@ -3262,8 +3297,13 @@ event => {
 # enlarge on click; videos keep native controls for clicks and go fullscreen via
 # the ⤢ button (so a frame click still plays/pauses). `worker_path` names the file on
 # the worker; a picture that has one can be made the chat's icon (chat_icons.jl).
+# `size` is the file's natural `(width, height)` when the browser measured it
+# before (measured_sizes.jl): as the element's `width`/`height` it lays out at
+# its size before the bytes arrive, so nothing below it moves when they do.
 function media_element(src, mime::AbstractString, is_video::Bool;
-                       filename::AbstractString = "", worker_path::AbstractString = "")
+                       filename::AbstractString = "", worker_path::AbstractString = "",
+                       size::Union{NTuple{2,Int},Nothing} = nothing)
+    dims = size === nothing ? (;) : (; width = size[1], height = size[2])
     inner = is_video ?
         # `playsinline` is not cosmetic: without it iOS Safari force-enters its
         # own fullscreen the moment you press play, so every tap on a video went
@@ -3272,10 +3312,10 @@ function media_element(src, mime::AbstractString, is_video::Bool;
         # it. Inline is the right default anyway; fullscreen stays available from
         # the native controls, as a choice.
         DOM.video(DOM.source(; src, type = mime, onerror = MEDIA_MISSING_JS); controls = true,
-            class = "bt-media", playsinline = true,
-            style = Styles("max-width" => "100%", "display" => "block")) :
-        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS, onerror = MEDIA_MISSING_JS,
-            style = Styles("max-width" => "100%", "display" => "block", "cursor" => "zoom-in"))
+            class = "bt-media", playsinline = true, dims...,
+            style = Styles("max-width" => "100%", "height" => "auto", "display" => "block")) :
+        DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS, onerror = MEDIA_MISSING_JS, dims...,
+            style = Styles("max-width" => "100%", "height" => "auto", "display" => "block", "cursor" => "zoom-in"))
     # Hover action row (Signal-style): enlarge · copy · download. Copy is
     # image-only (no clipboard-image for video). All revealed on wrap hover.
     actions = DOM.div(
@@ -3353,8 +3393,8 @@ end
 
 function read_image_element(state::ServerState, project_id::AbstractString,
                             m::ToolMsg, c::ImageContent)
-    fp = m isa Union{EditToolMsg,ReadToolMsg} && !isempty(m.file_path) ?
-        m.file_path : nothing
+    named = m isa Union{EditToolMsg,ReadToolMsg} ? tool_file_path(m) : ""
+    fp = isempty(named) ? nothing : named
     fname = fp === nothing ? "" : basename(String(fp))
     # kimi's ReadMediaFile also ships VIDEO as an ImageContent-shaped block
     # (recovered from its rawOutput parts); a video mime in an <img> renders
@@ -3367,7 +3407,8 @@ function read_image_element(state::ServerState, project_id::AbstractString,
             info = stat_worker_path(state, proj.worker_id, show_worker_path(st))
             if info.isfile
                 return media_element(worker_file_url(state, proj.worker_id, info.path),
-                    c.mime_type, is_video; filename = fname, worker_path = info.path)
+                    c.mime_type, is_video; filename = fname, worker_path = info.path,
+                    size = media_size(state, proj.worker_id, info.path))
             end
         catch e
             e isa InterruptException && rethrow()
@@ -4204,9 +4245,16 @@ end
 
 # Context/cost telemetry (after every assistant message): pure header
 # metadata, no bubble, no persistence — the next turn refreshes it.
+#
+# While the model thinks, recent models stream no thinking text: the updates
+# that come instead carry Claude Code's estimate of the tokens thought so far,
+# and the chat shows it under the last message, so a long think reads as
+# progress and not as a stalled agent.
 function process!(chat::ChatModel, m::AgentClientProtocol.UsageUpdate)
     shared(chat).usage[] = (used = m.used, size = m.size,
                             cost = m.cost_amount, origin = m.origin_kind)
+    m.thinking_tokens === nothing ||
+        chat_emit(chat, Dict{String,Any}("type" => "thinking_tokens", "tokens" => m.thinking_tokens))
     return nothing
 end
 
@@ -5861,7 +5909,7 @@ $(YOLO_DONE_SENTINEL) and nothing else. Otherwise pick the next concrete thing \
 and do it."""
 
 # Composer placeholder while Yolo is armed — the message input doubles as the
-# reminders editor then (see `chat_input_area`).
+# reminders editor then (see `chat_composer`).
 const YOLO_INPUT_PLACEHOLDER = "Reminders attached to every auto-continue · Press ✓ to save"
 
 # The sentinel on a line of its own (leading/trailing markdown punctuation and
@@ -6698,6 +6746,15 @@ function send_message!(model::ChatModel, msg::UserMsg;
     enqueue_message!(model, msg; images, mode)
 end
 
+"""
+    send_message!(view, text; mode = :done)
+
+Send `text` to the chat as the user's message, as the composer does: queued
+until the agent is done with its turn by default.
+"""
+send_message!(model::ChatModel, text::AbstractString; kw...) =
+    send_message!(shared(model), UserMsg(String(text)); kw...)
+
 const TITLE_MAX_CHARS = 80
 
 """
@@ -7325,6 +7382,7 @@ end
 # Long-running actions report through `header_status` (the muted line left of
 # the controls) and outcomes through toasts — a button's label is never
 # rewritten to carry a result.
+# The DOM of a `ChatHeader`.
 function chat_header(session::Bonito.Session, model::ChatModel)
     state = model.state
     # Whom this tab serves: what the menu offers is theirs to use.
@@ -7778,7 +7836,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             class = "bt-menu-list");
         class = "bt-menu bt-header-menu")
 
-    # (The Yolo toggle lives in the composer — see `chat_input_area` — not in
+    # (The Yolo toggle lives in the composer — see `chat_composer` — not in
     # the header: it repurposes the message input as the reminders editor, so
     # the control sits next to what it changes.)
 
@@ -8046,7 +8104,8 @@ icon_img(asset, alt) = DOM.img(src=asset, alt=alt, draggable="false",
     style=Styles("pointer-events" => "none",
         "user-select" => "none"))
 
-function chat_input_area(session::Session, model::ChatModel)
+# The DOM of a `ChatComposer`.
+function chat_composer(session::Session, model::ChatModel)
     # The input widgets are JS-owned: `BonitoChat` (assets/bonitoagents.js →
     # `setupInputs`) attaches capture-phase click + Enter listeners, reads
     # the textarea on submit, posts a `{type: 'send', text, attachments}`
@@ -8316,16 +8375,19 @@ struct LensQueryCommand <: ChatCommand;  query::String;  end
 struct LensSaveCommand   <: ChatCommand;  query::String;  end
 struct LensDeleteCommand <: ChatCommand;  query::String;  end
 
-# Wire `{type: "msgs.request", range: [s, e], epoch}` — JS virtual-scroll
-# wants messages [s..e] (zero-based, inclusive) for the visible window.
-# `epoch` is the client's reload generation, echoed verbatim on the
-# `msgs.range` reply so a reply computed BEFORE a `msgs.reload` (indices
-# shifted by a reconcile splice) is dropped client-side instead of caching
-# old-world messages at new-world positions. -1 = absent (older client).
+# Wire `{type: "msgs.request", range: [s, e] | indices: [...], epoch, req}`:
+# the transcript wants messages [s..e] (zero-based, inclusive) or, under a
+# search lens, exactly the listed indices. `epoch` is the client's reload
+# generation and `req` its request id; both are echoed on the `msgs.range`
+# reply, so a reply from before a `msgs.reload` (indices shifted by a
+# reconcile splice) or for a block the tab has since replaced is dropped
+# client-side. -1 = absent.
 struct MsgsRequestCommand <: ChatCommand
     s::Int
     e::Int
+    indices::Union{Vector{Int},Nothing}
     epoch::Int
+    req::Int
 end
 
 # Wire `{type: "tool.render", id: <tool_id>}` — user expanded the tool
@@ -8414,12 +8476,22 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
     if type == "init"
         return InitCommand()
     elseif type == "msgs.request"
+        ep  = get(msg, "epoch", -1)
+        req = get(msg, "req", -1)
+        ep  = ep isa Number ? Int(ep) : -1
+        req = req isa Number ? Int(req) : -1
+        ids = get(msg, "indices", nothing)
+        if ids isa AbstractVector
+            all(i -> i isa Number, ids) || return UnknownCommand()
+            return MsgsRequestCommand(0, -1, Int[Int(i) for i in ids], ep, req)
+        end
         rng = get(msg, "range", nothing)
         rng isa AbstractVector && length(rng) == 2 || return UnknownCommand()
-        ep = get(msg, "epoch", -1)
-        return MsgsRequestCommand(Int(rng[1]), Int(rng[2]), ep isa Number ? Int(ep) : -1)
+        return MsgsRequestCommand(Int(rng[1]), Int(rng[2]), nothing, ep, req)
     elseif type == "tool.render"
         return ToolRenderCommand(String(get(msg, "id", "")))
+    elseif type == "media.size" || type == "tool.size"
+        return parse_size_command(msg, type)    # measured_sizes.jl
     elseif type == "thought.render"
         return ThoughtRenderCommand(String(get(msg, "id", "")))
     elseif type == "send"
@@ -8477,9 +8549,26 @@ handle_command!(::ChatModel, ::Session, ::UnknownCommand) = nothing
 
 # (The TaskBar needs no init handshake: it's an Observable component — a
 # tab joining mid-turn renders the current pin-board state on mount.)
+"""
+    transcript_tail(model; count = 40) -> Dict
+
+The newest `count` messages as the transcript renders them, with the total:
+`{n, start, msgs}`, `start` being the store index of the first one.
+"""
+function transcript_tail(model::ChatModel; count::Int = 40)
+    n, s, slice = lock(model.lock) do
+        store = model.msgs_store
+        n = length(store)
+        s = max(0, n - count)
+        (n, s, store[(s+1):n])
+    end
+    return Dict{String,Any}("n" => n, "start" => s,
+                            "msgs" => [row_dict(model, m) for m in slice])
+end
+
 function handle_command!(model::ChatModel, ::Session, ::InitCommand)
-    chat_emit(model, Dict{String,Any}(
-        "type" => "msgs.count", "n" => length(model.msgs_store)))
+    reply!(model, Dict{String,Any}(
+        "type" => "msgs.count", "n" => lock(() -> length(model.msgs_store), model.lock)))
     # Seed the lens UI: the chat-derived autocomplete vocabulary + the global
     # saved lenses. Broadcasts are fine — every tab of this chat shares the
     # same vocabulary, and saved lenses are global favorites.
@@ -8504,19 +8593,26 @@ function handle_command!(model::ChatModel, ::Session, cmd::MsgsRequestCommand)
         # Empty store: clamp(x, 0, -1) inverts the bounds and `store[0:0]`
         # throws — a stale request right after a reset must be a no-op.
         n == 0 && return nothing
-        s = clamp(cmd.s, 0, n - 1)
-        e = clamp(cmd.e, 0, n - 1)
-        s > e && return nothing
-        (s, store[(s+1):(e+1)])
+        if cmd.indices !== nothing
+            ids = filter(i -> 0 <= i < n, cmd.indices)
+            isempty(ids) ? nothing : (ids, store[ids .+ 1])
+        else
+            s = clamp(cmd.s, 0, n - 1)
+            e = clamp(cmd.e, 0, n - 1)
+            s > e ? nothing : (s, store[(s+1):(e+1)])
+        end
     end
     batch === nothing && return nothing
-    s, slice = batch
-    msgs = [msg_to_dict(m, model.chat_dir) for m in slice]
-    reply = Dict{String,Any}("type" => "msgs.range", "start" => s, "msgs" => msgs)
-    # Echo the client's reload generation (see MsgsRequestCommand) so a reply
-    # that raced a msgs.reload is dropped instead of mis-cached.
+    where, slice = batch
+    msgs = [row_dict(model, m) for m in slice]
+    reply = Dict{String,Any}("type" => "msgs.range", "msgs" => msgs)
+    where isa Int ? (reply["start"] = where) : (reply["indices"] = where)
+    # Echo the client's reload generation and request id (see
+    # MsgsRequestCommand), so a reply that raced a reload or a replaced block is
+    # dropped instead of mis-placed.
     cmd.epoch >= 0 && (reply["epoch"] = cmd.epoch)
-    chat_emit(model, reply)
+    cmd.req >= 0 && (reply["req"] = cmd.req)
+    reply!(model, reply)
     return nothing
 end
 
@@ -8567,17 +8663,17 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
             # render, every other tool type the generic `jsrender(::ToolMsg)`
             # bridge → `render_tool_body`. `dom_in_js` wraps a non-Node through
             # `render_subsession`, so handing it the message is fine.
-            # `toolSlot` (a ChatLib module export — no window.* global) also
-            # finds slots on nodes the virtual scroll holds DETACHED (cache
-            # window / prefetch) — a plain document.querySelector misses those
-            # and the body would be stuck on "loading…".
+            # `toolSlot` (a ChatLib module export, no window.* global) finds
+            # the slot through the chats' own row maps, not only the document.
+            # `bodyMounted`: the row may be far from the view by now, and is
+            # freed again at once if so (bonitoagents.js `freeBody`).
             Bonito.dom_in_js(
                 session,
                 msg,
                 js"""(elem) => {
     $(ChatLib).then(lib => {
         const slot = lib.toolSlot($(cmd.tool_id));
-        if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+        if (slot) { slot.innerHTML = ''; slot.appendChild(elem); lib.bodyMounted(slot); }
     });
 }"""
             )
@@ -9122,7 +9218,8 @@ function relabel_file_tabs!(ws)
     return nothing
 end
 
-function session_notice_view(session::Bonito.Session, model::ChatModel)
+# The DOM of a `ChatNotice`.
+function chat_notice(session::Bonito.Session, model::ChatModel)
     box = DOM.div(
         DOM.div(DOM.strong(; class="bt-session-notice-label"),
                 DOM.div(; class="bt-session-notice-text")),
@@ -9176,6 +9273,12 @@ tab_id(session::Session) = first(Bonito.root_session(session).id, 8)
 # session. The shared bits (msgs_store, ACP client, lock) are still shared
 # (sessions cooperate); the Observable `comm` is a connected child so each
 # tab's JS bridge GC's cleanly when the tab closes.
+#
+# What the pane shows is `chat_pane`: the ordinary chat, or the layout of the
+# app the chat belongs to (apps.jl). Either way it sits in the one root that
+# ties the widgets to this chat (`.bt-app`: the chat's browser code finds the
+# composer, lens bar and taskbar by searching it from the message list), and
+# the commands from this tab reach the chat through one dispatcher.
 function Bonito.jsrender(session::Session, m::ChatModel)
     # `model` is the per-session view: its `comm`, `session_alive`, and
     # `last_error` are connected children of the shared parent's, so the JS
@@ -9193,7 +9296,72 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     on(session, model.comm) do msg
         chat_dispatch!(model, session, msg)
     end
+    app = chat_app(model)
+    # NOTE: there is deliberately NO mount curtain here. The dashboard's load
+    # overlay (`ChatWaitingView`, sidebar.jl) covers this pane from the moment
+    # the user clicks until the chat module shows its first rows (the
+    # `bt-chat-settled` event from `markReady` in bonitoagents.js): one loading
+    # surface, gone as soon as there is something to read.
+    Bonito.jsrender(session, DOM.div(pane_nodes(chat_pane(app, model))...;
+                                     class = "bt-app", dataApp = app === nothing ? "" : app_id(app)))
+end
 
+# What `chat_pane` returned, as the root's children: several nodes, or one.
+pane_nodes(nodes::Union{Tuple,AbstractVector}) = nodes
+pane_nodes(node) = (node,)
+
+"""
+    chat_pane(app, view) -> DOM node(s)
+
+The open chat pane of one tab: what `view` (that tab's copy of the chat's
+model) shows, for a chat of `app`, or `nothing` for an ordinary chat. An app
+implements its own method to lay its chat out. What it returns, one node or a
+tuple of them, is placed in the chat's root: a flex column filling the pane,
+with `data-app` set to the app's id for its styles.
+
+The pieces it can use are the ordinary chat's, as components:
+[`ChatHeader`](@ref), [`ChatNotice`](@ref), [`ChatTranscript`](@ref),
+[`ChatComposer`](@ref) and [`ChatToolbar`](@ref). Each can appear once per
+pane, nested as deep as the layout wants.
+"""
+chat_pane(::Nothing, view::ChatModel) =
+    (ChatHeader(view), ChatNotice(view), ChatTranscript(view), ChatComposer(view), ChatToolbar())
+
+"The chat's header: title, folder, session pills, menu and the lens bar."
+struct ChatHeader
+    view::ChatModel
+end
+
+"The provider's warnings and errors about the chat's session, hidden until there is one."
+struct ChatNotice
+    view::ChatModel
+end
+
+"""
+The message list: the transcript with its rail, the busy, thinking and waiting
+lines under the last message, and the taskbar floating over it. Takes the
+space its parent gives it (a flex child that grows).
+"""
+struct ChatTranscript
+    view::ChatModel
+end
+
+"The composer: the message input with its attachments, send modes, queue, Stop and Send."
+struct ChatComposer
+    view::ChatModel
+end
+
+"The row below the composer, filled by the chat module."
+struct ChatToolbar end
+
+Bonito.jsrender(session::Session, w::ChatHeader)     = Bonito.jsrender(session, chat_header(session, w.view))
+Bonito.jsrender(session::Session, w::ChatNotice)     = Bonito.jsrender(session, chat_notice(session, w.view))
+Bonito.jsrender(session::Session, w::ChatTranscript) = Bonito.jsrender(session, chat_transcript(session, w.view))
+Bonito.jsrender(session::Session, w::ChatComposer)   = Bonito.jsrender(session, chat_composer(session, w.view))
+Bonito.jsrender(session::Session, ::ChatToolbar)     = Bonito.jsrender(session, DOM.div(class = "bt-chat-toolbar"))
+
+# The DOM of a `ChatTranscript`.
+function chat_transcript(session::Session, model::ChatModel)
     # Spinner class follows the shared busy_active observable so the
     # `bt-busy-active` class is set correctly on remount — the comm
     # `busy_start` / `busy_end` events only forward to FUTURE bridges,
@@ -9206,14 +9374,12 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     taskbar = shared(model).taskbar
 
     messages_container = DOM.div(
-        DOM.div(class="bt-spacer-top"),
-        DOM.div(class="bt-spacer-bottom"),
+        # Message rows go in before this marker (bonitoagents.js `insertRows`).
+        DOM.div(class="bt-rows-end"),
         # Busy dots + transient "reasoning…" indicator live INSIDE the
-        # scroll content, after the bottom spacer (message nodes insert
-        # before it) and before the overscroll tail — so they show up
-        # directly under the last message, not below the tail's empty
-        # space down by the composer. Like the tail, they're plain
-        # content the virtual-scroll geometry never tracks.
+        # scroll content, after the rows and before the overscroll tail, so
+        # they show up directly under the last message, not below the tail's
+        # empty space down by the composer.
         DOM.div(DOM.div(class="bt-busy-dot"),
             DOM.div(class="bt-busy-dot"),
             DOM.div(class="bt-busy-dot");
@@ -9239,35 +9405,21 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     # bake the CURRENT slash-command set into the connect call (a tab opened
     # after the session's first turn would otherwise have no autocomplete
     # until the next available_commands_update).
+    # The last messages ride along too, so the transcript shows them the moment
+    # the pane mounts instead of after two more round trips (count, then range).
     init_snapshot = Dict{String,Any}(
-        "commands" => commands_event(shared(model).available_commands[])["items"])
+        "commands" => commands_event(shared(model).available_commands[])["items"],
+        "tail"     => transcript_tail(model))
+    # The chat module looks for the other widgets once it is connected, on a
+    # microtask: by then the whole pane is in the document, wherever the layout
+    # put them.
     init_script = js"""
         $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm),
                                            $(init_snapshot)))
     """
-
-    Bonito.jsrender(session, DOM.div(
-        chat_header(session, model),
-        session_notice_view(session, model),
-        # The messages area + the taskbar share a positioning context so the
-        # taskbar floats over the MESSAGES, anchored below the (variable-
-        # height) header instead of on top of it.
-        DOM.div(
-            messages_container,
-            taskbar;
-            class = "bt-messages-wrap"),
-        init_script,
-        chat_input_area(session, model),
-        # Toolbar below the composer. Populated entirely client-side by
-        # BonitoChat (`noteType`): one show/hide checkbox per message type the
-        # first time that type occurs. Sized to host future controls too.
-        DOM.div(class = "bt-chat-toolbar"),
-        # NOTE: there is deliberately NO mount curtain here. The dashboard's
-        # load overlay (`chat_waiting_view`, sidebar.jl) covers this pane
-        # from the moment the user clicks until the chat module reports the
-        # geometry settled (`bt-chat-settling` / `bt-chat-settled` events
-        # from `startSettle` in bonitoagents.js) — one continuous loading
-        # surface instead of the old bring-up pane → bare gap → per-chat
-        # curtain relay.
-        class="bt-app"))
+    # The messages area + the taskbar share a positioning context so the
+    # taskbar floats over the MESSAGES, anchored below the (variable-height)
+    # header instead of on top of it. The rail positions itself in it too.
+    return DOM.div(messages_container, taskbar, init_script; class = "bt-messages-wrap")
 end
+

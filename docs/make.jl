@@ -72,6 +72,7 @@ makedocs(
             "Workers & Machines" => "workers.md",
             "Agent Providers" => "providers.md",
             "Julia Tools & Live Apps" => "mcp-tools.md",
+            "Apps" => "apps.md",
         ],
         "Development" => "development.md",
         "API" => "api.md",

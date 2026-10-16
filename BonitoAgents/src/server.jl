@@ -59,6 +59,8 @@ desktop app) turn it on.
 
 `state_dir`   overrides where workers.json / projects.json are persisted
               (default: `~/.local/share/bonitoagents-server`).
+`apps`        the apps the server runs, by type (`(BonitoTodo.TodoApp, MyApp)`;
+              see apps.jl). Default: the ones BonitoAgents ships (`BUILTIN_APPS`).
 `working_dir` overrides where canonical project copies live on the server.
               Each project lives at `<working_dir>/<name>` and is mirrored
               onto the worker at `<worker.projects_root>/<name>`.
@@ -75,7 +77,8 @@ function serve(; host::String        = "127.0.0.1",
                  heartbeat_deadline::Real = 45.0,
                  worker_link_grace::Real = 300.0,
                  scan_on_connect::Bool = true,
-                 log_file::Union{String,Nothing} = nothing)
+                 log_file::Union{String,Nothing} = nothing,
+                 apps = BUILTIN_APPS)
     check_host(auth, host)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
@@ -113,7 +116,7 @@ function serve(; host::String        = "127.0.0.1",
                           heartbeat_interval = heartbeat_interval,
                           heartbeat_deadline = heartbeat_deadline,
                           worker_link_grace = worker_link_grace,
-                          scan_on_connect = scan_on_connect)
+                          scan_on_connect = scan_on_connect, apps)
 
     # Mark all loaded workers offline; they'll flip online when they re-dial.
     for w in values(state.workers[])

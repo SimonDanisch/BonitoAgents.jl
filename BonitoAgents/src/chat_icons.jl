@@ -38,6 +38,12 @@ function chat_icon_candidates(state, p, msgs, chat_dir)
             path === nothing && continue
             lowercase(splitext(path)[2]) in SHOW_IMAGE_EXTS || continue
             push!(candidates, (true, show_worker_path(ShowTool(state, p.id, p.server_path, path))))
+        elseif m isa ReadToolMsg
+            # A picture the agent opened with Read: the file it names.
+            path = tool_file_path(m)
+            isempty(path) && continue
+            lowercase(splitext(path)[2]) in SHOW_IMAGE_EXTS || continue
+            push!(candidates, (true, show_worker_path(ShowTool(state, p.id, p.server_path, path))))
         end
     end
     return unique(candidates)

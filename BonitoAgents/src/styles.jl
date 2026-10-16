@@ -1604,25 +1604,52 @@ const ChatStyles = Bonito.Styles(
     # right scrollbar and the shell border. Individual bubbles still cap their
     # own width (see `.bt-user-msg`/`.bt-agent-msg` `max-width: min(…)`) so a
     # very wide viewport doesn't sprawl any single message.
-    # overflow-anchor: NONE — the virtual scroller owns scroll anchoring.
-    # With the browser's native anchoring on, message nodes were anchor
-    # candidates: every spacer resize / node insert made Chromium adjust
-    # scrollTop on its own, concurrently with the scroller's bottom-pin and
-    # spacer compensation — two systems correcting the same scroll position
-    # is jumpy and makes geometry bugs non-deterministic.
+    # overflow-anchor: NONE — the transcript owns scroll anchoring (rows
+    # loaded above the reader, rows changing height above the viewport).
+    # With the browser's native anchoring on as well, two systems would
+    # correct the same scroll position: jumpy, and not deterministic.
+    # No native scrollbar: it only knows the loaded block of messages. The
+    # rail below stands in for it, by message count over the whole chat.
     CSS(".bt-messages",
         "flex" => "1 1 0", "min-height" => "0",
         "overflow-y" => "auto", "overflow-x" => "hidden",
         "-webkit-overflow-scrolling" => "touch",
         "overscroll-behavior-y" => "contain",
         "overflow-anchor" => "none",
+        "scrollbar-width" => "none",
         "padding" => "16px",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "10px",
         "width" => "100%",
         "box-sizing" => "border-box"),
-    CSS(".bt-spacer-top, .bt-spacer-bottom",
-        "flex-shrink" => "0", "overflow-anchor" => "none"),
+    CSS(".bt-messages::-webkit-scrollbar", "display" => "none"),
+    CSS(".bt-rows-end", "flex-shrink" => "0", "overflow-anchor" => "none"),
+    # The rail (bonitoagents.js `setupRail`): a thin thumb at the right edge of
+    # the messages, wider while hovered or dragged, with a label naming the
+    # message a drag would land on. The hit area is wider than the thumb, for
+    # a finger on a phone.
+    CSS(".bt-rail",
+        "position" => "absolute", "top" => "6px", "bottom" => "6px", "right" => "0",
+        "width" => "16px", "z-index" => "5",
+        "touch-action" => "none", "cursor" => "pointer", "user-select" => "none"),
+    CSS(".bt-rail.bt-rail-hidden", "display" => "none"),
+    CSS(".bt-rail-thumb",
+        "position" => "absolute", "top" => "0", "right" => "4px",
+        "width" => "6px", "height" => "40px",
+        "border-radius" => "3px",
+        "background" => "var(--bt-border-strong)",
+        "transition" => "width 120ms ease, background 120ms ease"),
+    CSS(".bt-rail:hover .bt-rail-thumb, .bt-rail.bt-rail-active .bt-rail-thumb",
+        "width" => "9px", "background" => "var(--bt-text-faint)"),
+    CSS(".bt-rail-label",
+        "position" => "absolute", "top" => "8px", "right" => "20px",
+        "white-space" => "nowrap", "font-size" => "12px",
+        "padding" => "4px 8px", "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+        "border" => "1px solid var(--bt-border)", "box-shadow" => "var(--bt-shadow-sm)",
+        "font-variant-numeric" => "tabular-nums",
+        "pointer-events" => "none", "opacity" => "0", "transition" => "opacity 120ms ease"),
+    CSS(".bt-rail.bt-rail-active .bt-rail-label", "opacity" => "1"),
 
     # Rubberband for the grab-to-pan handler (bonitoagents.js): when the
     # user drags past either edge, JS accumulates an overscroll distance
@@ -1653,7 +1680,7 @@ const ChatStyles = Bonito.Styles(
     # max-width caps the bubble at a comfortable reading width on wide screens.
     # `flex-shrink: 0` is defensive (see .bt-tool-msg note) — even though
     # this rule has no `overflow` today, future styling shouldn't be able to
-    # make message bubbles collapse under spacer pressure.
+    # make message bubbles collapse when the column is over-full.
     CSS(".bt-user-msg",
         "flex-shrink" => "0",
         "align-self" => "flex-end",
@@ -1723,12 +1750,16 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-user-attachments",
         "display" => "flex", "flex-wrap" => "wrap", "gap" => "6px",
         "margin-top" => "8px"),
+    # One height for every thumbnail, known before the picture loads: the row
+    # has its final height from the start (a max-height grew it from 40 px to
+    # the picture's height when the bytes arrived, under the reader's feet).
+    # Only the width follows the picture. `scale-down` shows a tiny one (a
+    # pasted icon) at its own size, centered, never stretched.
     CSS(".bt-user-att-img",
-        "max-width" => "220px", "max-height" => "180px",
-        # Floor keeps a tiny image (a pasted icon) visible and clickable as a
-        # chip; object-fit centers it without stretching.
-        "min-width" => "40px", "min-height" => "40px",
-        "object-fit" => "contain",
+        "box-sizing" => "border-box",     # the same box as the fallback below
+        "height" => "120px", "width" => "auto", "max-width" => "220px",
+        "min-width" => "40px",
+        "object-fit" => "scale-down",
         "background" => "rgba(255,255,255,0.15)",
         "border-radius" => "8px",
         "border" => "1px solid rgba(255,255,255,0.35)",
@@ -1737,6 +1768,10 @@ const ChatStyles = Bonito.Styles(
     # Fallback when the file is gone (project moved / cleaned): the name in
     # small type instead of a broken-image icon.
     CSS(".bt-user-att-missing",
+        "display" => "inline-flex", "align-items" => "center", "box-sizing" => "border-box",
+        "height" => "120px", "max-width" => "220px", "padding" => "0 10px",
+        "border-radius" => "8px", "border" => "1px dashed rgba(255,255,255,0.35)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
         "font-size" => "11px", "opacity" => "0.8",
         "font-family" => "ui-monospace, monospace"),
     # A file that is not an image: its name as a link on the bubble.
@@ -1815,9 +1850,10 @@ const ChatStyles = Bonito.Styles(
     # NOTE: `flex-shrink: 0` is load-bearing. `.bt-messages` is a flex column
     # container, and per the CSS Flexbox spec, a flex item with any
     # `overflow` keyword set has its default `min-height` switch from `auto`
-    # (content height) to `0`. Combined with the virtual-scroll spacer-top
-    # whose height runs into the thousands of px, that lets every tool card
-    # shrink down to a 1px slit (border only). Same trap would catch any
+    # (content height) to `0`. Combined with a scroll container whose content
+    # outgrows it (the old virtual scroll's spacer ran into the thousands of
+    # px), that lets every tool card shrink down to a 1px slit (border only).
+    # Same trap would catch any
     # other bubble that grows an `overflow: hidden`, so we apply the same
     # `flex-shrink: 0` to the other message types defensively below.
     CSS(".bt-tool-msg",
@@ -2948,38 +2984,19 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-messages-tail",
         "flex-shrink" => "0", "overflow-anchor" => "none"),
 
-    # Off-screen measuring host (`measureNodes`): prefetched message nodes
-    # are laid out here — same width as the messages content box — to get
-    # real heights before they're ever rendered. Hidden but NOT display:none
-    # (children must lay out); zero own height so it never affects the page.
-    # Same formatting context as `.bt-messages` (flex column, same gap):
-    # bubbles are flex items there (`align-self` ⇒ fit-content width); in a
-    # plain block host they'd be measured at fill-width instead. Heights
-    # mostly coincide thanks to the max-width caps, but the contexts must
-    # match so off-screen measurements can never diverge from the live layout.
-    CSS(".bt-measure",
-        "position" => "absolute", "left" => "0", "top" => "0",
-        "height" => "0", "overflow" => "hidden",
-        "visibility" => "hidden",
-        "pointer-events" => "none",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "10px",
-        "z-index" => "-1"),
-
     # (The per-chat mount curtain used to live here — the dashboard's load
-    # overlay now covers the pane until settle; see `chat_waiting_view` in
-    # sidebar.jl and `startSettle` in bonitoagents.js.)
+    # overlay now covers the pane until its first rows show; see
+    # `ChatWaitingView` in sidebar.jl and `markReady` in bonitoagents.js.)
 
     # ── Busy indicator ───────────────────────────────────────────────────────
-    # Lives inside `.bt-messages` (between the bottom spacer and the
-    # overscroll tail) so it shows directly under the last message. The
-    # container already pads 16px, so no own horizontal padding; opted out
-    # of scroll anchoring like the spacers/tail (the chase owns scrollTop).
-    # margin-top -10px cancels the flex row gap that precedes each of the
-    # three indicator children (zero-height or not, every flex item costs a
-    # gap slot — three indicators after the bottom spacer would push the
-    # visible one 30px under the last message). Safe: indicators are plain
-    # content the virtual-scroll height math never tracks.
+    # Lives inside `.bt-messages` (after the rows, before the overscroll
+    # tail) so it shows directly under the last message. The container
+    # already pads 16px, so no own horizontal padding; opted out of scroll
+    # anchoring like the tail (the chase owns scrollTop). margin-top -10px
+    # cancels the flex row gap that precedes each of the three indicator
+    # children (zero-height or not, every flex item costs a gap slot: three
+    # indicators after the rows would push the visible one 30px under the
+    # last message).
     CSS(".bt-busy",
         "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
         "overflow-anchor" => "none", "margin-top" => "-10px",

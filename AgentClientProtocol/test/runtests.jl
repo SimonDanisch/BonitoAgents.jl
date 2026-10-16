@@ -1258,6 +1258,23 @@ end
     @test ACP.parse_session_update(later).tool_name === nothing
 end
 
+# While the model thinks, claude-agent-acp (patched by BonitoWorker until a
+# release has it) sends usage updates carrying Claude Code's estimate of the
+# tokens thought so far. Read it, and only on those updates.
+@testset "usage_update carries the thinking-token estimate" begin
+    u(meta) = ACP.parse_session_update(Dict{String,Any}("sessionUpdate" => "usage_update",
+        "used" => 24361, "size" => 1000000, "_meta" => meta))
+    thinking = u(Dict("_claude/thinkingTokens" => 1100, "_claude/model" => "claude-opus-5-5"))
+    @test thinking isa ACP.UsageUpdateNotif
+    @test thinking.thinking_tokens == 1100 && thinking.used == 24361
+    @test thinking.origin_kind === nothing          # not a cycle's end
+    @test u(Dict("_claude/model" => "claude-opus-5-5")).thinking_tokens === nothing
+    @test u(Dict("_claude/thinkingTokens" => "many")).thinking_tokens === nothing
+    out = Channel{Any}(4)
+    ACP.parse_update!(out, ACP.TurnState(), thinking)
+    @test take!(out).thinking_tokens == 1100
+end
+
 # Cancelling work the agent streams outside any request (the counterpart to
 # "A8 cancel is a no-op when idle" above: idle must stay a no-op, but
 # unregistered-and-working must not).

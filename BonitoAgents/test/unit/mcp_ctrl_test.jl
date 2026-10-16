@@ -153,6 +153,44 @@ const BT = BonitoAgents
                     @test !any(t -> t.name == "bt_dev_inspect", BonitoMCP.available_tools())
                 end
             end
+            # ── the apps' tools: listed next to ours, calls forwarded ────────
+            # What an agent's MCP client sends, through the dispatcher, over the
+            # real channel: the server knows the caller from the channel
+            # (`ctrl-proj`, an ordinary chat), so it lists the tools every chat
+            # gets and not the To-do app chat's own.
+            @testset "app tools over the wire (tools/list, tools/call)" begin
+                # An app's tools are for its users' chats: this one is the
+                # admin's, as every chat made through the UI has an owner.
+                state.projects[]["ctrl-proj"].owner = BT.default_owner(state.auth)
+                out = IOBuffer()
+                rpc(method, params) = begin
+                    BonitoMCP.dispatch!(out, Dict{String,Any}("jsonrpc" => "2.0", "id" => 7,
+                                                              "method" => method, "params" => params))
+                    BT.JSON.parse(String(take!(out)))
+                end
+                names = [t["name"] for t in rpc("tools/list", Dict{String,Any}())["result"]["tools"]]
+                @test "bt_julia_eval" in names
+                @test all(in(names), ("todo_list", "todo_add", "todo_done"))
+                @test !("todo_start_chat" in names)
+
+                call(tool, args) = rpc("tools/call", Dict{String,Any}("name" => tool, "arguments" => args,
+                                       "_meta" => Dict("claudecode/toolUseId" => "toolu_1")))
+                r = call("todo_add", Dict("text" => "From the wire"))["result"]
+                @test r["isError"] == false
+                @test r["content"][1]["text"] == "Added to-do #1."
+                t = only(state.apps["todo"].todos[])
+                @test (t.text, t.added_by) == ("From the wire", "ctrl-proj")
+
+                bad = call("todo_done", Dict("todo_id" => 99))["result"]
+                @test bad["isError"] == true
+                @test bad["content"][1]["text"] == "error: there is no to-do #99"
+                # Not this chat's tool, and not anyone's: the same unknown tool.
+                for name in ("todo_start_chat", "no_such_tool")
+                    e = call(name, Dict{String,Any}())
+                    @test e["error"]["code"] == -32602
+                    @test e["error"]["message"] == "Unknown tool: $name"
+                end
+            end
         finally
             # Stop the loop first, so it doesn't reconnect into the closing relay.
             BonitoMCP.reset_ctrl_dialback!()

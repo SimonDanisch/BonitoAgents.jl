@@ -1,14 +1,14 @@
 # A LIVE eval-result embed gets `bt_show_app`'s output handling, end to end:
 #
-#   • Keep-alive parking: scrolling the card out of the virtual-scroll window
-#     must NOT remove its DOM (removal closes the Bonito sub-session and
-#     disposes a WGLMakie WebGL context — the plot comes back dead). Cards
-#     whose completed eval holds a live result embed are flagged
-#     `live_embed` (typed, from the result descriptor) → `data-bt-app` → the
-#     client PARKS them display:none in place. THE assertion is instance
-#     identity: a counter clicked to 11 before scrolling away still reads 11
-#     when scrolled back (a re-render would reset it to 0), and it still
-#     round-trips clicks through the eval bridge afterwards.
+#   • Keep-alive: scrolling the card out of view must NOT remove its DOM
+#     (removal closes the Bonito sub-session and disposes a WGLMakie WebGL
+#     context, so the plot comes back dead). Cards whose completed eval holds
+#     a live result embed are flagged `live_embed` (typed, from the result
+#     descriptor) → `data-bt-app`; such a row stays in the page while it is in
+#     the transcript's loaded block, out of view or not. THE assertion is
+#     instance identity: a counter clicked to 13 before scrolling away still
+#     reads 13 when scrolled back (a re-render would reset it to 0), and it
+#     still round-trips clicks through the eval bridge afterwards.
 #   • ⤢ Detach: the header button pops the embed into its own workspace
 #     panel — the SAME live DOM node is adopted (no re-render, counter keeps
 #     its value, clicks still round-trip inside the panel); closing the
@@ -27,7 +27,7 @@ const PARK_ENV = abspath(joinpath(@__DIR__, "..", "evalenv"))
 # The clicker app (see app_reload.jl): output = 13×clicks computed in the
 # Malt worker, so a correct value proves the browser→worker round trip.
 # FILLER messages after the eval overflow the transcript so scrolling to the
-# bottom pushes the eval card out of the virtual-scroll render window.
+# bottom pushes the eval card out of view.
 function park_agent(prompt::AbstractString)
     occursin("app", lowercase(prompt)) || return [TK.text("Echo: $(prompt)")]
     appcode = """using Bonito
@@ -39,12 +39,10 @@ function park_agent(prompt::AbstractString)
             DOM.div(DOM.span("PARK-APP "), DOM.span(out; class="park-out"),
                     btn; style="padding:16px")
         end"""
-    # Filler must be many separate MESSAGES (the virtual scroll windows per
-    # message): consecutive `text` events coalesce into ONE streamed AgentMsg,
-    # which left a 4-message transcript where nothing was ever evicted — so
-    # interleave a tool row per line (same trick as filter_scroll's seed).
-    # 50 messages ≈ far past viewport + overscan (8×EST_HEIGHT): scrolling to
-    # the bottom must evict (= park) the eval card.
+    # Filler must be many separate MESSAGES: consecutive `text` events
+    # coalesce into ONE streamed AgentMsg, so interleave a tool row per line
+    # (same trick as filter_scroll's seed). 50 rows are screens of them, so
+    # the bottom is far from the eval card.
     evs = Any[TK.text("here is the app:"),
               TK.bt_eval(appcode; env_path = PARK_ENV, id = "park-app")]
     for i in 1:25
@@ -90,19 +88,20 @@ function run_suite(server)
         @test click_until(server, "PARKAPP=13")
     end
 
-    @testset "scroll-off parks the embed alive (never re-rendered)" begin
-        # Scroll to the BOTTOM (the filler) so the eval card leaves the render
-        # window, then wait until the card is actually PARKED: still connected
-        # to the document (display:none) — not removed. Removal would close
-        # the sub-session; parking is the whole point.
+    @testset "scrolled out of view, the embed stays alive (never re-rendered)" begin
+        # Scroll to the BOTTOM (the filler) so the eval card leaves the view,
+        # then check it is still in the page with its app: removal would
+        # close the sub-session.
         TK.eval_js(server, """(() => {
             const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
             c.scrollTop = c.scrollHeight;
             c.dispatchEvent(new Event('scroll', {bubbles:true}));
         })()""")
-        @test TK.wait_for(server, "card parked (connected but hidden)",
-            """(() => { const n = document.querySelector('$CARD');
-                return !!(n && n.isConnected && n.offsetParent === null &&
+        @test TK.wait_for(server, "card out of view, still in the page",
+            """(() => { const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
+                const n = document.querySelector('$CARD');
+                return !!(c && n && n.isConnected && n.offsetParent !== null &&
+                          n.offsetTop + n.offsetHeight <= c.scrollTop &&
                           n.querySelector('.park-btn')); })()"""; timeout = 30) == true
 
         # Scroll back: the SAME instance re-appears — the counter still reads

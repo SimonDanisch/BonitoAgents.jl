@@ -22,7 +22,7 @@ function share_handler(args::AbstractDict)
     text = "shared $(get(reply, "path", path)) as a $(get(reply, "kind", "page")): $(get(reply, "url", "?"))" *
            (get(reply, "password", false) === true ? "\n(protected by the password given)" : "") *
            (get(reply, "kind", "") == "app" ? "\nruns in " * (isempty(env) ? "a temporary environment" : env) : "")
-    return Dict{String,Any}("content" => [Dict("type" => "text", "text" => text)], "isError" => false)
+    return tool_text(text)
 end
 
 register!(

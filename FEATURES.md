@@ -63,6 +63,17 @@ enumerates.
 - Multiple chats and tabs open at once; state broadcasts to every connected
   view.
 
+## Apps
+
+- **Apps** are permanent parts of the server with a chat of their own: the app
+  lays out its chat's pane (from the chat's own widgets) and can add MCP tools to
+  every chat's agent. Opened from the dashboard's Apps card, pinned at the top of
+  the sidebar.
+- **To-do app**: one list for the whole server, pinned above its chat. Any
+  chat's agent can list, add and check off items (`todo_done` records which chat
+  and why). **Start chat** has the app chat's agent pick the project folder for
+  an item and start a chat there that knows which item it works on.
+
 ## Agents & providers
 
 - Pluggable **ACP providers**: Claude Code (default), MiMo, OpenCode, Kimi Code,
@@ -103,11 +114,14 @@ enumerates.
   attach button, which on a phone opens the camera/gallery sheet. Queued
   images show as removable thumbnails and render inline in your own message
   (up to 10 per message, 5 MB each).
-- **Virtualized transcript**: only the visible window is in the DOM, history
-  backfills lazily in the background (paused for hidden panes), and the reading
-  position is content-anchored, so geometry churn, tab switches and reconnects
-  never move what you are reading. Follow-mode chases streaming output;
-  scrolling up disengages it with a "move to bottom" control.
+- **Transcript that opens at the end**: a chat opens on its newest messages
+  at once and loads older ones as you scroll up, keeping a bounded block in
+  the page. The reading position is content-anchored, so an image loading
+  above you, tab switches and reconnects never move what you are reading.
+  The scrollbar counts messages, not pixels: dragging it shows "Message 500
+  of 10,878" and goes there, and Home/End jump to the first and last
+  message. Follow-mode chases streaming output; scrolling up disengages it
+  with a "move to bottom" control.
 - **Search lens** over the transcript: type filters (`/` picker) and fuzzy
   text, with saved lenses.
 - Messages typed during agent restarts and reconnects are queued, never

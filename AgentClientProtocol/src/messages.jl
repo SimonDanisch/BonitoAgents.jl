@@ -320,7 +320,10 @@ struct UsageUpdate <: Message
     cost_amount::Union{Float64,Nothing}
     cost_currency::Union{String,Nothing}
     origin_kind::Union{String,Nothing}
+    thinking_tokens::Union{Int,Nothing}    # see `UsageUpdateNotif`
 end
+UsageUpdate(used, size, cost_amount, cost_currency, origin_kind) =
+    UsageUpdate(used, size, cost_amount, cost_currency, origin_kind, nothing)
 # The agent's slash-command set (complete state, re-pushed on change).
 struct CommandsUpdate <: Message
     commands::Vector{CommandInfo}
@@ -789,7 +792,8 @@ function parse_update!(out, st, u::SessionNoticeNotif)
 end
 parse_update!(out, st, u::CurrentModeUpdateNotif)  = (put!(out, ModeUpdate(u.mode_id)); nothing)
 parse_update!(out, st, u::UsageUpdateNotif) =
-    (put!(out, UsageUpdate(u.used, u.size, u.cost_amount, u.cost_currency, u.origin_kind)); nothing)
+    (put!(out, UsageUpdate(u.used, u.size, u.cost_amount, u.cost_currency, u.origin_kind,
+                           u.thinking_tokens)); nothing)
 parse_update!(out, st, u::AvailableCommandsUpdateNotif) =
     (put!(out, CommandsUpdate(u.commands)); nothing)
 

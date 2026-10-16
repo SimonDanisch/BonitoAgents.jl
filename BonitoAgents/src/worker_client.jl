@@ -693,7 +693,6 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
                 elseif t in ("list_dir_response", "make_dir_response", "ensure_dir_response",
                              "stat_path_response", "read_file_range_response",
                              "list_project_files_response", "clone_repo_response",
-                             "inspect_path_response",
                              "kill_file_writers_response", "git_diff_response",
                              "find_repos_response", "worker_state_response",
                              "read_log_response", "debug_checkout_response",
@@ -1280,47 +1279,6 @@ project_index_files(proj::ProjectInfo) = lock(proj.file_index.lock) do
     copy(proj.file_index.files)
 end
 
-"""
-    inspect_worker_path(state, worker_name, path; timeout=30.0) -> Dict
-
-Ask the worker for a "what's in this directory" summary used by the
-collision-aware import flow: file count, total bytes, latest mtime,
-top-N most-recently-modified files, and a per-subrepo git block.
-Path must exist and be a directory on the worker. Raises on missing
-worker / timeout / worker-side error.
-
-Returned dict shape:
-
-    Dict("total_files"  => Int,
-         "total_bytes"  => Int,
-         "latest_mtime" => Float64,       # Unix seconds
-         "recent_files" => Vector{Dict},  # {path,size,mtime}
-         "git_subrepos" => Vector{Dict})  # {path,head_sha,head_time,
-                                          #  dirty_count,branch}
-"""
-function inspect_worker_path(state::ServerState, worker_name::String,
-                              path::AbstractString;
-                              timeout::Real = 30.0)
-    reachable(state, worker_name) ||
-        error("Worker '$worker_name' is not connected")
-    rid, ch = register_rpc!(state)
-    resp = try
-        send_command(state, worker_name, Dict(
-            "type"       => "inspect_path",
-            "request_id" => rid,
-            "path"       => String(path),
-        ))
-        take_pending!(state, ch, rid, timeout, "inspect_path on '$worker_name'")
-    finally
-        unregister_rpc!(state, rid)   # T10
-    end
-    resp isa AbstractDict || error("inspect_path: unexpected response shape")
-    haskey(resp, "error") && error("inspect_path on '$worker_name': $(resp["error"])")
-    summary = get(resp, "summary", nothing)
-    summary isa AbstractDict || error("inspect_path: missing summary")
-    return Dict{String,Any}(summary)
-end
-
 # SIGTERM every process holding `path` open on the worker — the direct stop
 # for a background shell (the SDK gives no ACP kill primitive, but the shell
 # keeps its `>> output` redirect open until it exits). Returns the killed
@@ -1345,19 +1303,24 @@ function kill_worker_file_writers(state::ServerState, worker_id::AbstractString,
 end
 
 # Is a project's `worker_path` DEFINITIVELY gone on a connected worker? True only
-# when the worker explicitly reports the path isn't a directory; a timeout /
-# disconnect / any other error is UNCERTAIN → false. We never prune on doubt —
-# that would delete a perfectly valid project.
+# when the worker reports no folder there. A worker that cannot answer right now
+# (gone, timed out) is UNCERTAIN → false. We never prune on doubt — that would
+# delete a perfectly valid project.
+#
+# A `stat`, and nothing more: this runs for every project of a worker each time
+# it connects. It used to be `inspect_path`, which walks the whole tree (file
+# counts, sizes, git state): on a large checkout that outlasted its timeout, and
+# the walks starved the worker's link while they ran.
 function worker_path_missing(state::ServerState, worker_id::AbstractString,
                               path::AbstractString)::Bool
     reachable(state, worker_id) || return false
-    try
-        inspect_worker_path(state, worker_id, path; timeout = 10.0)
-        return false                       # path exists
+    st = try
+        stat_worker_path(state, String(worker_id), path; timeout = 10.0)
     catch e
-        msg = sprint(showerror, e)
-        return occursin("not a directory", msg) || occursin("path is empty", msg)
+        e isa WorkerUnreachableError || rethrow()
+        return false
     end
+    return !st.isdir
 end
 
 # Drop this worker's registered projects whose `worker_path` no longer exists
@@ -1392,19 +1355,21 @@ function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
 end
 
 """
-    scan_worker_sessions(state, worker_name; timeout=15.0) → Vector{Dict{String,Any}}
+    scan_worker_sessions(state, worker_name; timeout = 15.0, agents = true) → Vector{Dict{String,Any}}
 
-Ask the named worker to scan for existing Claude Code sessions (running processes
-+ ~/.claude/projects/ history) and return the results. Blocks until the worker
-replies or `timeout` seconds elapse.
+Ask the named worker to scan for existing agent sessions (Claude Code's running
+processes + ~/.claude/projects/ history, and with `agents` every installed
+agent that can list its own, one process each) and return the results. Blocks
+until the worker replies or `timeout` seconds elapse.
 """
 function scan_worker_sessions(state::ServerState, worker_name::String;
-                                timeout::Real = 15.0)
+                                timeout::Real = 15.0, agents::Bool = true)
     reachable(state, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
-        send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
+        send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid,
+                                              "agents" => agents))
         take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
     finally
         unregister_rpc!(state, rid)   # T10
@@ -1413,20 +1378,49 @@ function scan_worker_sessions(state::ServerState, worker_name::String;
 end
 
 """
-    scan_and_store!(state, worker_id) -> Vector{Dict}
+    scan_and_store!(state, worker_id; agents = true) -> Vector{Dict}
 
-Scan a worker for Claude Code sessions and persist the result into
+Scan a worker for agent sessions and persist the result into
 `state.discovered[worker_id]` (→ `discovered.json`), then notify so the
 dashboard's folder→threads browser updates. A scan error is stored as a
 single `{"error" => …}` entry (the panel surfaces it) rather than thrown, so
 this is safe to call from a connect handler or a Rescan click. Returns the
 stored vector.
+
+`agents = false` scans Claude Code's session files alone and keeps the other
+agents' sessions from the last full scan: the cheap form, for opening a chat.
+One scan of each form runs per worker at a time; callers that come while it
+runs get its result (tabs opening chats together used to start a scan each,
+and the worker, starting every agent for each of them, answered none in time).
 """
-function scan_and_store!(state::ServerState, worker_id::AbstractString)
-    wid = String(worker_id)
+function scan_and_store!(state::ServerState, worker_id::AbstractString; agents::Bool = true)
+    key = (String(worker_id), agents)
+    task, own = lock(state.lock) do
+        running = get(state.scan_inflight, key, nothing)
+        running === nothing || return (running, false)
+        t = @task store_scan!(state, key...)
+        state.scan_inflight[key] = t
+        return (t, true)
+    end
+    if own
+        schedule(task)
+        try
+            wait(task)
+        finally
+            lock(() -> get(state.scan_inflight, key, nothing) === task && delete!(state.scan_inflight, key),
+                 state.lock)
+        end
+    end
+    return fetch(task)
+end
+
+function store_scan!(state::ServerState, wid::String, agents::Bool)
     norm = try
-        Dict{String,Any}[Dict{String,Any}(r) for r in scan_worker_sessions(state, wid)]
+        fresh = Dict{String,Any}[Dict{String,Any}(r) for r in scan_worker_sessions(state, wid; agents)]
+        agents || keep_agent_rows!(fresh, get(state.discovered[], wid, Dict{String,Any}[]))
+        fresh
     catch e
+        e isa InterruptException && rethrow()
         # A failed scan says so NEXT TO what the last good one found. Storing the
         # error alone emptied the worker's project list ("projects (0)"), and it
         # stayed empty, on disk, until some later scan got through.
@@ -1442,6 +1436,17 @@ function scan_and_store!(state::ServerState, worker_id::AbstractString)
     safe_notify!(state.discovered)
     # A scan never renames an existing chat. Its title is user-controlled.
     return norm
+end
+
+# A scan of the session files alone: the agents' own sessions (rows with a
+# `provider`) come from the last full scan, unless the worker sent them anyway
+# (one that predates `agents = false`).
+function keep_agent_rows!(fresh::Vector{Dict{String,Any}}, previous)
+    seen = Set(String(get(r, "session_id", "")) for r in fresh)
+    for r in previous
+        haskey(r, "provider") && !(String(get(r, "session_id", "")) in seen) && push!(fresh, r)
+    end
+    return fresh
 end
 
 # A title is "broken" if the current `meaningful_title` would change it —

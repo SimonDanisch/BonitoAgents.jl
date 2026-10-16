@@ -44,9 +44,6 @@ function dev_result(value)
                             "isError" => false)
 end
 
-dev_error(msg::AbstractString) =
-    Dict{String,Any}("content" => [Dict("type" => "text", "text" => "error: $msg")],
-                     "isError" => true)
 
 # One place where a failed server call becomes a tool error. The message is the
 # server's verbatim — "worker 'x' is not connected" is exactly what the agent
@@ -56,7 +53,7 @@ function dev_call(op::AbstractString; timeout::Real = 30.0, kw...)
         return dev_result(call_server(op; timeout, kw...))
     catch e
         e isa InterruptException && rethrow()
-        return dev_error(sprint(showerror, e))
+        return tool_error(sprint(showerror, e))
     end
 end
 
@@ -109,7 +106,7 @@ register!("bt_dev_inspect", DEV_INSPECT_DESCRIPTION,
     function (args::AbstractDict)
         section = String(get(args, "section", "overview"))
         section in DEV_INSPECT_SECTIONS ||
-            return dev_error("unknown section '$section'; expected one of " *
+            return tool_error("unknown section '$section'; expected one of " *
                              join(DEV_INSPECT_SECTIONS, ", "))
         return dev_call("inspect"; section = section,
                         project_id = String(get(args, "project_id", "")),
@@ -284,7 +281,7 @@ register!("bt_dev_control", DEV_CONTROL_DESCRIPTION,
     function (args::AbstractDict)
         op = String(get(args, "op", ""))
         op in DEV_CONTROL_OPS ||
-            return dev_error("unknown op '$op'; expected one of " * join(DEV_CONTROL_OPS, ", "))
+            return tool_error("unknown op '$op'; expected one of " * join(DEV_CONTROL_OPS, ", "))
         # A cross-worker copy moves a whole project tree over the network; the
         # default 30s would time out on anything real.
         timeout = op == "continue_project" ? 900.0 : 60.0

@@ -56,6 +56,7 @@ include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
+include("measured_sizes.jl")   # body heights + media sizes the browser measured, sent with later renders
 include("chat_queue.jl")       # pending submissions and delivery modes
 include("file_view.jl")        # FileView / FilePanel — the one rich file renderer (bt_show + file tabs)
 include("review.jl")           # change-review tab: git diff + per-line ask / batched feedback
@@ -77,6 +78,8 @@ include("file_tree.jl")        # WorkerFileTree — lazy, searchable project fil
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
+include("apps.jl")             # apps: permanent server parts with a chat, a pane and MCP tools of their own
+include("apps/BonitoTodo/BonitoTodo.jl")  # the To-do app, written like an app package: public API only
 include("remote_eval.jl")      # bt_julia_eval(worker = …): eval hosts on other workers, the per-chat switch
 include("remote_values.jl")    # remote_session(…): Julia values between a chat's session and another worker's
 include("processes.jl")        # the record of every process a chat runs; a restart ends them all
@@ -85,12 +88,28 @@ include("crash_recovery.jl")   # continue the chats a worker crash cut off mid-t
 include("server.jl")           # serve()
 include("dev.jl")              # dev_server() — self-contained dev rig
 
+"The apps a server runs unless told otherwise (`serve(; apps)`)."
+const BUILTIN_APPS = (BonitoTodo.TodoApp,)
+
 export serve, dev_server
 export AgentProvider, BinAgent, WorkerAgent
 export ClaudeCodeAgent, MiMoAgent, OpenCodeAgent, KimiAgent, CodexAgent, MockAgent
 export start!, stop!, client, switch_provider!
 # Viewers that render in any Bonito session (a chat, a shared page, your own app).
 export MeshViewer, media_element
+# The app interface (apps.jl): what an app implements, the chat widgets its pane
+# is built from, and what it can do with the server. An app package uses these
+# names and nothing else.
+public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, in_scope,
+       AppCall, AppError,
+       app_id, app_title, app_description, app_tools, call_tool, chat_pane, app_briefing,
+       app_allowed,
+       ChatHeader, ChatNotice, ChatTranscript, ChatComposer, ChatToolbar,
+       ServerState, ProjectInfo, WorkerInfo, User, ChatFolder,
+       caller_user, app_chat, chat_title, chat_folders, find_worker, start_chat!,
+       show_chat!, send_message!,
+       atomic_write_json, load_json_tolerant, relative_time_label,
+       BUILTIN_APPS
 
 # Bake the real browser-driven paths captured from the e2e suite: literal
 # `precompile(...)` calls (see BonitoAgentsApp/precompile/) that run during

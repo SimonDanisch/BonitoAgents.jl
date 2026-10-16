@@ -181,8 +181,10 @@ jsonable(x) = string(x)
 # `remote_eval` / `remote_workers` / `sync_folder` are not dev tools: every
 # chat's MCP may ask them (remote_eval.jl). They share this channel and this
 # allow-list because it is the one request/reply path an MCP process has.
+# `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl).
 const DEV_OPS          = (:inspect, :logs, :memory, :control,
-                          :remote_eval, :remote_workers, :sync_folder, :share)
+                          :remote_eval, :remote_workers, :sync_folder, :share,
+                          :app_tools, :app_call)
 const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
                           :rescan_worker, :continue_project, :set_title)
@@ -320,6 +322,8 @@ function project_report(p::ProjectInfo)
         # to read back.
         "dev_mode"          => p.dev_mode,
         "remote_eval"       => p.remote_eval,
+        # The app this chat belongs to (apps.jl), "" for an ordinary chat.
+        "app"               => p.app,
         "locked_by"         => jsonable(p.locked_by),
         "desired_config"    => jsonable(p.desired_config),
         "file_index"        => Dict{String,Any}("files" => nfiles,
@@ -937,16 +941,17 @@ function set_dev_mode!(state::ServerState, project_id::AbstractString, on::Bool)
 end
 
 """
-    debug_project_worker(state, preferred = "") -> worker_id
+    chat_worker(state, preferred = ""; needed_by = "a debug chat") -> worker_id
 
-Which worker the debug chat runs on: `preferred` (the dashboard picker's choice,
-or the worker of the chat the button was pressed in) when it is connected, else
-the first connected worker by name. Errors — naming the worker — when the
+Which worker a chat the server sets up runs on (the debug chat, an app's chat):
+`preferred` (the dashboard picker's choice, or the worker of the chat the button
+was pressed in) when it is connected, else the first connected worker by name. Errors — naming the worker — when the
 preferred one is unknown or offline, and when there is none at all: the chat
 has to run somewhere, and quietly picking another machine than the one the user
 chose is worse than saying so.
 """
-function debug_project_worker(state::ServerState, preferred::AbstractString = "")
+function chat_worker(state::ServerState, preferred::AbstractString = "";
+                     needed_by::AbstractString = "a debug chat")
     workers = state.workers[]
     if !isempty(preferred)
         w = get(workers, String(preferred), nothing)
@@ -955,7 +960,7 @@ function debug_project_worker(state::ServerState, preferred::AbstractString = ""
         return String(preferred)
     end
     online = sort([w for w in values(workers) if isopen(w)]; by = w -> w.name)
-    isempty(online) && error("no worker is connected — a debug chat needs one to run on")
+    isempty(online) && error("no worker is connected — $needed_by needs one to run on")
     return first(online).worker_id
 end
 
@@ -973,7 +978,7 @@ sized for that. Throws — with a message meant for the user — when no worker 
 connected or the worker could not set the checkout up.
 """
 function ensure_debug_project!(state::ServerState; worker_id::AbstractString = "")
-    wid  = debug_project_worker(state, worker_id)
+    wid  = chat_worker(state, worker_id)
     root = debug_checkout_on_worker(state, wid; repo = WORKER_REPO_URL,
                                     rev = current_repo_rev(),
                                     packages = WORKER_REPO_PACKAGES)

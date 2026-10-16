@@ -431,8 +431,11 @@ function emit_usage(ev::AbstractDict)
                               "size" => get(ev, "size", 0))
     haskey(ev, "cost") && (fields["cost"] =
         Dict("amount" => ev["cost"], "currency" => "USD"))
-    haskey(ev, "origin") && (fields["_meta"] =
-        Dict("_claude/origin" => Dict("kind" => String(ev["origin"]))))
+    meta = Dict{String,Any}()
+    haskey(ev, "origin") && (meta["_claude/origin"] = Dict("kind" => String(ev["origin"])))
+    # claude-agent-acp's estimate while the model thinks (patched, or upstream).
+    haskey(ev, "thinking_tokens") && (meta["_claude/thinkingTokens"] = ev["thinking_tokens"])
+    isempty(meta) || (fields["_meta"] = meta)
     upd("usage_update", fields)
     return nothing
 end

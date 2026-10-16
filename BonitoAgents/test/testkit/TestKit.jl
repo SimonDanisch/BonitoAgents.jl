@@ -372,18 +372,22 @@ todo(entries::AbstractVector) = Dict("type" => "todo",
                        "priority"  => String(get(e, :priority, "medium"))) for e in entries])
 
 """
-    usage(used, size; cost = nothing, origin = nothing) -> Dict
+    usage(used, size; cost = nothing, origin = nothing, thinking_tokens = nothing) -> Dict
 
 Agent event that emits a `usage_update` SessionUpdate (context/cost
 telemetry, the shape claude-agent-acp ≥ 0.44 sends after every assistant
 message). Drives the header context meter. `origin` tags it the way the agent
 tags a cycle's result (`_meta["_claude/origin"].kind`): `"task-notification"`
 at the end of a cycle the agent ran on its own, which is where that turn ends.
+`thinking_tokens` is the estimate claude-agent-acp sends while the model thinks
+(`_meta["_claude/thinkingTokens"]`), shown on the chat's reasoning line.
 """
-function usage(used::Integer = 0, size::Integer = 0; cost = nothing, origin = nothing)
+function usage(used::Integer = 0, size::Integer = 0; cost = nothing, origin = nothing,
+               thinking_tokens = nothing)
     ev = Dict{String,Any}("type" => "usage", "used" => used, "size" => size)
     cost === nothing || (ev["cost"] = Float64(cost))
     origin === nothing || (ev["origin"] = String(origin))
+    thinking_tokens === nothing || (ev["thinking_tokens"] = Int(thinking_tokens))
     return ev
 end
 
@@ -837,6 +841,10 @@ function with_mcp_env(f, env::AbstractDict)
         ENV[k] = v
     end
     try
+        # Armed, this process reports itself as the chat's MCP, so the chat's
+        # process record names the test process. The dev worker refuses to
+        # kill a process it runs under (BonitoWorker `runs_this_worker`);
+        # before it did, closing an eval chat killed the whole test run.
         BonitoMCP.start_ctrl_dialback!()   # idempotent while armed
         return f()
     finally
@@ -878,14 +886,14 @@ function invoke_mcp(client, ev::AbstractDict, mcp_env)
     # eval handler with no `code` and came back "error: empty code" in
     # milliseconds. The test then measured a turn that was never blocked and had
     # no way to tell that from a broken tool. Any registered tool is callable now.
-    reg = BonitoMCP.available_tools()
-    hit = findfirst(t -> t.name == tool, reg)
-    runner() = hit === nothing ?
+    # `call_tool` reaches the server's app tools too (BonitoMCP tools/app_tools.jl),
+    # over the control channel `with_mcp_env` arms with this chat's grant.
+    runner() = something(BonitoMCP.call_tool(tool, args),
         Dict{String,Any}("content" => Any[Dict("type" => "text",
             "text" => "TestKit: no MCP tool named `$tool` (have: " *
-                      join((t.name for t in reg), ", ") * ")")],
-            "isError" => true) :
-        reg[hit].handler(args)
+                      join((t.name for t in BonitoMCP.available_tools()), ", ") *
+                      " and the server's app tools)")],
+            "isError" => true))
     result = try
         # No launch env is the standalone case (no live bridge → text fallback,
         # still a valid result). With one, the eval's live stdout streams over
@@ -1372,6 +1380,50 @@ function real_click(s::TestServer, selector::AbstractString)
     sleep(0.05)
     ECT.send_input(ctx, "{type: 'mouseUp', x: $x, y: $y, button: 'left', clickCount: 1}")
     return s
+end
+
+"""
+    press_key!(s, key)
+
+Press and release `key` ("Home", "End", "PageUp", ...) with real keyboard
+input, delivered to whatever has focus, as a user's key press is.
+"""
+function press_key!(s::TestServer, key::AbstractString)
+    ctx = s.browser[]
+    ECT.send_input(ctx, "{type: 'keyDown', keyCode: $(json(String(key)))}")
+    ECT.send_input(ctx, "{type: 'keyUp', keyCode: $(json(String(key)))}")
+    return s
+end
+
+"""
+    drag_rail!(s, f; hold = 0.5) -> String
+
+Drag the visible chat's rail thumb (the scrollbar by message count) to fraction
+`f` of its track with real mouse input, hold it there `hold` seconds (a resting
+thumb jumps there) and let go. Returns the label the rail showed while held,
+e.g. "Message 150 of 300".
+"""
+function drag_rail!(s::TestServer, f::Real; hold::Real = 0.5)
+    pane = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    r = eval_js(s, """(() => { const rail = $pane?.querySelector('.bt-rail');
+        if (!rail || rail.classList.contains('bt-rail-hidden')) return null;
+        const t = rail.querySelector('.bt-rail-thumb').getBoundingClientRect(), b = rail.getBoundingClientRect();
+        return [t.left + t.width / 2, t.top + t.height / 2, b.top + t.height / 2, b.height - t.height]; })()""")
+    r === nothing && error("drag_rail!: the visible chat shows no rail")
+    x, y0, top, range = round(Int, r[1]), round(Int, r[2]), r[3], r[4]
+    y1 = round(Int, top + f * range)
+    ctx = s.browser[]
+    ECT.send_input(ctx, "{type: 'mouseMove', x: $x, y: $y0}")
+    ECT.send_input(ctx, "{type: 'mouseDown', x: $x, y: $y0, button: 'left', clickCount: 1}")
+    for k in 1:10
+        y = round(Int, y0 + (y1 - y0) * k / 10)
+        ECT.send_input(ctx, "{type: 'mouseMove', x: $x, y: $y, button: 'left'}")
+        sleep(0.02)
+    end
+    sleep(hold)
+    label = eval_js(s, "$pane.querySelector('.bt-rail-label').textContent")
+    ECT.send_input(ctx, "{type: 'mouseUp', x: $x, y: $y1, button: 'left', clickCount: 1}")
+    return String(label)
 end
 
 """

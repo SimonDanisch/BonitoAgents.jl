@@ -4,11 +4,15 @@
 
 ## The transcript
 
-Agent turns stream live. The transcript is a virtualized scroller, so
-month-long conversations stay smooth: only the visible window is in the DOM,
-history backfills lazily in the background, and your reading position is
-anchored to *content*, so it survives tab switches, reconnects, and messages
-growing above the viewport.
+Agent turns stream live. A chat opens on its newest messages and loads older
+ones as you scroll up, so a month-long conversation opens as fast as a new
+one. Your reading position is anchored to *content*: it survives tab
+switches, reconnects, and messages growing above the viewport.
+
+The scrollbar counts messages instead of pixels, so its thumb moves by
+message, under the wheel or a swipe too. Dragging it names the message it
+would land on ("Message 500 of 10,878") and goes there when you pause or let
+go. Home and End jump to the first and the last message.
 
 - **Prose** renders as CommonMark with syntax-highlighted code blocks. Code
   blocks and images grow buttons for copy and download (on hover; always shown

@@ -62,6 +62,7 @@ include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
 include("tools/dev.jl")        # bt_dev_* — server introspection; only in a debug chat
 include("tools/wait.jl")       # bt_wait  — the one way to actually pause a turn
 include("tools/share.jl")      # bt_share — a link to a markdown page or an app, for anyone
+include("tools/app_tools.jl")  # the tools the server's apps add, listed + forwarded over the control channel
 include("apps.jl")             # Apps — the App/Context interface apps implement
 
 # `RemoteProxy.jl` is NOT included here — it references `Bonito.*` types and

@@ -1,9 +1,10 @@
-# Editors live as long as their rows are on the page. A row that leaves the
-# virtual window ends its body's session, and BonitoBook disposes the editors
-# then; Monaco kept every one before (350 diffs, 214 MB after one scroll).
-# Asserted: Monaco's registry holds only what is on the page (the one inspection
-# besides the DOM: a leak has none), and a row that comes back is rendered again,
-# still expanded, with no dead diff left even after a fast scroll.
+# Editors live as long as their rows are on the page. A row the transcript's
+# bounded block drops ends its body's session, and BonitoBook disposes the
+# editors then; Monaco kept every one before (350 diffs, 214 MB after one
+# scroll). Asserted: Monaco's registry holds only what is on the page (the one
+# inspection besides the DOM: a leak has none), and a row that comes back is
+# rendered again, still expanded, with no dead diff left even after a fast
+# scroll.
 @testitem "e2e:editor_dispose" setup = [SharedServer] tags = [:e2e] begin
     S = SharedServer
     s = S.server()
@@ -20,6 +21,12 @@
             push!(evs, TK.text("after edit $(i): " * "lorem ipsum dolor sit amet "^8))
             push!(evs, TK.edit("/p/f$(i).jl", "a = $(i)\nb = 2", "a = $(i)\nb = 3"; id = "ed-$(i)"))
         end
+        # Cheap rows after them, past what the block holds (160 rows): at the
+        # bottom it has dropped the edits at the top.
+        for i in 1:75
+            push!(evs, TK.text("filler $(i)"))
+            push!(evs, TK.tool(kind = "read", title = "filler tool $(i)", id = "ed-fill-$(i)"))
+        end
         push!(evs, TK.end_turn())
         return evs
     end
@@ -31,13 +38,14 @@
     card(id) = "$VP.querySelector('.bt-tool-msg[data-msg-id*=\"$(id)\"]')"
     diff(id) = "$(card(id))?.querySelector('.monaco-diff-editor-div')"
     @test TK.wait_for(s, "the agent done", "!document.querySelector('.bt-busy.bt-busy-active')"; timeout = 240) == true
-    @test TK.wait_for(s, "the last diff mounted", "!!$(card("ed-30"))?.querySelector('.monaco-diff-editor .view-line')"; timeout = 60) == true
+    @test TK.wait_for(s, "the last row in", "!!$(card("ed-fill-75"))"; timeout = 60) == true
 
     ctx = s.browser[]
     ECT.install_cursor(ctx)
     gutter = ECT.JS("(() => { const r = $(chat).getBoundingClientRect(); return [r.left + 3, r.top + r.height / 2]; })()")
     wheel_to(sel) = TK.wheel_into_view(s, chat, sel; step = 400)
-    at_bottom() = TK.eval_js(s, "(() => { const c = $(chat); return c.scrollHeight - c.clientHeight - c.scrollTop < 2; })()")
+    # The bottom of the conversation, not just of the block loaded so far.
+    at_bottom() = TK.eval_js(s, "(() => { const c = $(chat); return !!$(card("ed-fill-75")) && c.scrollHeight - c.clientHeight - c.scrollTop < 2; })()")
 
     # Monaco's own registry, through the module BonitoBook imported (the same
     # URL is the same module instance).
@@ -58,8 +66,8 @@
     @test TK.wait_for(s, "the long edit expanded", "($(diff("ed-long"))?.getBoundingClientRect().height || 0) > 500"; timeout = 20) == true
     h = expanded()
 
-    # Far away, to the bottom: the long edit leaves the page, and its editor
-    # with it.
+    # Far away, to the bottom: the block drops the long edit, and its editor
+    # goes with it.
     ECT.move_to(ctx, gutter; duration = 0.05)
     for _ in 1:120
         at_bottom() && break

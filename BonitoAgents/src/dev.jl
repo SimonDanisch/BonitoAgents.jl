@@ -92,6 +92,9 @@ the server checks itself), still on localhost.
 `manage_harnesses = true` has the server declare the agent adapters, which the
 worker then installs (off by default, so a dev server's worker downloads no Node).
 
+`apps` are the apps the server runs, by type, as for `serve`: an app package in
+development runs with `dev_server(; apps = (BonitoAgents.BUILTIN_APPS..., MyApp))`.
+
 If `claude-agent-acp` isn't on PATH the dashboard still works (worker
 registration, sidebar, project import, file pickers); only opening a
 chat session against the worker will fail at the agent spawn step.
@@ -122,7 +125,8 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                       dir::Union{String,Nothing}           = nothing,
                       proxy::Union{DevProxy,Nothing}       = nothing,
                       network::Bool                        = false,
-                      manage_harnesses::Bool               = false)
+                      manage_harnesses::Bool               = false,
+                      apps                                 = BUILTIN_APPS)
     (network && proxy !== nothing) &&
         error("dev_server: `network` and `proxy` are two different setups; pick one")
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
@@ -152,7 +156,7 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # Stable worker identity for a persistent rig: reuse the pinned id so
     # projects.json's worker_id foreign keys stay valid across relaunches.
     id_file   = joinpath(worker_config, "worker_id")
-    worker_id = isfile(id_file) ? strip(read(id_file, String)) :
+    worker_id = isfile(id_file) ? String(strip(read(id_file, String))) :
                                   "dev-" * randstring(8)
     # Route through `default_worker_name` so a machine whose
     # `friendly_hostname()` is empty (no `hostnamectl --pretty` configured,
@@ -174,7 +178,8 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                     heartbeat_interval = heartbeat_interval,
                     heartbeat_deadline = heartbeat_deadline,
                     worker_link_grace  = worker_link_grace,
-                    scan_on_connect    = scan_on_connect)
+                    scan_on_connect    = scan_on_connect,
+                    apps)
     # Behind the proxy the worker goes through Caddy, like any other, with a
     # credential (issued first, so Caddy starts out knowing it): under 127.0.0.1
     # (the proxy's `worker_address`), since only browsers resolve `.localhost`.
