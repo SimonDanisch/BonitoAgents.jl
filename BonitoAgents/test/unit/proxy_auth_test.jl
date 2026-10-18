@@ -746,7 +746,7 @@ end
     # (an open websocket is never checked again), and nobody else's.
     function open_tab(name)
         s = Bonito.Session()
-        BT.register_user_session!(st, s, BT.User(name, "", name, String[]))
+        BT.register_tab!(st, s, BT.User(name, "", name, String[]), "test client", Observable(""))
         return s
     end
     closed(s) = s.status == Bonito.CLOSED
@@ -761,9 +761,9 @@ end
     d = open_tab(member)
     BT.remove_account!(st, member)
     @test closed(d) && !closed(bobs)
-    # A tab that closes on its own is forgotten.
+    # A tab that closes on its own leaves the open tabs.
     close(bobs)
-    @test all(s -> s !== bobs, get(st.user_sessions, "bob", Bonito.Session[]))
+    @test !haskey(st.tabs.open, bobs.id)
 end
 
 @testitem "unit:worker retries quietly, and belongs to whoever issued its credential" tags = [:unit] begin

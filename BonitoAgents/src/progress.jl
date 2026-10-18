@@ -15,15 +15,16 @@
 #   :file_done, :file_chunk, :wait_manifest, :walk_start — informational, ignored by the UI
 #
 # Callbacks have signature `(stage::Symbol, info::NamedTuple) -> Any`.
-# Errors raised from inside the callback are swallowed so a UI hiccup
-# (e.g. a stale browser observable update) can never abort the transfer.
+# A callback that throws must not abort the transfer: a tab that closed is
+# dropped quietly, anything else is logged.
 
 notify_progress(::Nothing, ::Symbol, ::NamedTuple) = nothing
 function notify_progress(cb, stage::Symbol, info::NamedTuple)
     try
         cb(stage, info)
     catch err
-        @debug "progress callback threw" stage exception=err
+        is_stale_session_error(err) ||
+            @warn "progress callback threw" stage exception = (err, catch_backtrace())
     end
     return nothing
 end

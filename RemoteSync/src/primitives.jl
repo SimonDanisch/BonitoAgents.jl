@@ -78,6 +78,10 @@ function apply_patch(basis::IO, delta_in::IO, new_out::IO;
         job = patch_begin(BASIS_COPY_CB_PTR[], opaque)
         try
             drive!(job, delta_in, new_out; bufsize)
+        catch
+            # librsync reports a failed basis read as an IO error; the read's
+            # own exception says what went wrong.
+            ctx.failure === nothing ? rethrow() : throw(ctx.failure)
         finally
             job_free(job)
         end

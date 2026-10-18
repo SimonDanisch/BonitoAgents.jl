@@ -31,7 +31,8 @@ mutable struct IdleTransport <: ACP.Transport
 end
 IdleTransport() = IdleTransport(Channel{Nothing}(0))
 ACP.send(::IdleTransport, ::AbstractString) = nothing
-ACP.recv(t::IdleTransport) = (try take!(t.gate) catch end; "")
+# Blocks until `close` (take! on a closed channel is the InvalidStateException).
+ACP.recv(t::IdleTransport) = (try take!(t.gate) catch e; e isa InvalidStateException || rethrow() end; "")
 ACP.transport_eof(t::IdleTransport) = !isopen(t.gate)
 Base.close(t::IdleTransport) = (isopen(t.gate) && close(t.gate); nothing)
 

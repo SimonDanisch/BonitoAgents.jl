@@ -51,20 +51,19 @@ function probe_agent(prompt)
     return [TK.text("echo")]
 end
 
-rss_mb() = try parse(Int, split(read("/proc/self/statm", String))[2]) * 4096 / 1e6 catch; -1.0 end
-sumf(f, xs) = try sum(f, xs; init = 0) catch; -1 end
+rss_mb() = isfile("/proc/self/statm") ? parse(Int, split(read("/proc/self/statm", String))[2]) * 4096 / 1e6 : -1.0
+sumf(f, xs) = sum(f, xs; init = 0)
+# A container this version no longer has reads as `missing`, not as an empty one.
+count_of(x, f) = hasproperty(x, f) ? length(getproperty(x, f)) : missing
 
 # Every accumulating server-side container (host process — where the leak is).
 function sample(state)
     ms = collect(values(state.chat_models))
-    sh(m) = try BT.shared(m) catch; m end
-    getn(m, f) = try length(getfield(sh(m), f)) catch
-        try length(getfield(m, f)) catch; 0 end
-    end
+    getn(m, f) = count_of(BT.shared(m), f)
     pc = tp = 0
     for eb in values(state.eval_workers)
-        pc += try length(eb.page_conns) catch; 0 end
-        tp += try length(eb.tab_prefix) catch; 0 end
+        pc += count_of(eb, :page_conns)
+        tp += count_of(eb, :tab_prefix)
     end
     return (; rss = round(rss_mb(); digits = 1),
               chat_models = length(ms),
@@ -74,8 +73,8 @@ function sample(state)
               tool_render = sumf(m -> getn(m, :tool_renders), ms),
               pend_subag  = sumf(m -> getn(m, :pending_subagent), ms),
               pend_asks   = sumf(m -> getn(m, :pending_asks), ms),
-              pending_rpc = try length(state.pending_rpcs) catch; -1 end,
-              bound_lru   = try length(state.bound_lru) catch; -1 end,
+              pending_rpc = count_of(state, :pending_rpcs),
+              bound_lru   = count_of(state, :bound_lru),
               eval_workers = length(state.eval_workers),
               page_conns = pc, tab_prefix = tp)
 end
@@ -107,7 +106,11 @@ function main()
                 pred = MODE == "plot" ?
                     "!!document.querySelector('.bt-tool-msg[data-msg-id*=\"lp-$(i)\"] canvas')" :
                     "document.body.innerText.includes('LEAKPROBE$(i)=')"
-                try TK.wait_for(server, "embed $i", pred; timeout = 120) catch; end
+                try
+                    TK.wait_for(server, "embed $i", pred; timeout = 120)
+                catch e
+                    @warn "leak probe: embed $i did not render; sampling anyway" exception = e
+                end
                 if MODE == "reload"
                     TK.eval_js(server, "location.reload(); true"); sleep(2)
                     TK.wait_for(server, "up", "!!document.querySelector('.bt-sidebar')"; timeout = 30)

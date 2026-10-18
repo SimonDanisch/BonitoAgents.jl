@@ -16,9 +16,14 @@ capture time.
   transitively, so no extra deps). `BonitoAgents.jl` `include`s it at module end, so
   the calls run during precompilation and land in the pkgimage. A stale statement
   errors **loudly** at build instead of being swallowed.
-- `precompile/capture.sh` — runs `BonitoAgents/test/e2e/run_all.jl` under
-  `--trace-compile`, tracing the **server** process (and the spawned **worker** via
-  `BONITOAGENTS_TRACE_DIR`, which `worker_command` honours). Raw traces → `precompile/traces/`.
+- `precompile/capture.sh` — runs a representative set of the e2e items (`ITEMS`, a
+  regex over item names; the whole suite takes hours) under `--trace-compile`, in
+  the traced process itself (`nworkers = 0`), where the dev server runs. Raw
+  traces → `precompile/traces/`. It used to run `test/e2e/run_all.jl`, which went
+  away with the move to ReTestItems; the statements then went stale from
+  2026-09-25 on, and every server restart compiled the new paths on the first
+  page, starving the thread every tab and worker link runs on (a 17 s stall on
+  2026-10-16).
 - `precompile/generate.jl` — runs **in the BonitoAgents env** (`--project=BonitoAgents`),
   loads the stack, binds every referenced module, then **runs each candidate
   `precompile(...)` and keeps only the ones that resolve and return `true`** — so the

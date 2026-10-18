@@ -412,7 +412,7 @@ end
                                    headers = ["Connection" => "close"],
                                    downloader = Downloads.Downloader(; grace = 0))
             catch e
-                @debug "precompile workload: dashboard fetch failed" exception = e
+                @warn "precompile workload: dashboard fetch failed; the page path stays uncompiled" exception = (e, catch_backtrace())
             end
             # The libcurl GET above compiles the HTML serve path but never runs
             # the client JS, so the LIVE path a browser drives stays cold — the
@@ -425,7 +425,7 @@ end
             try
                 Bonito.serve_workload(BonitoAgents.dashboard_app(state))
             catch e
-                @debug "precompile workload: serve_workload failed" exception = e
+                @warn "precompile workload: serve_workload failed; the live page path stays uncompiled" exception = (e, catch_backtrace())
             end
             # End the worker BEFORE closing the server: a connected worker
             # DEADLOCKS the server's WS-handler drain (the worker only leaves

@@ -402,8 +402,19 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # ── Stop the services before any change ───────────────────────────────────────
+# Not Authelia: it keeps every login in memory, so a stop logs every browser out.
+# An open tab carries on over its live connection and cannot get back in once
+# that drops: it looked like a hung server after every update. Authelia is
+# restarted below only when what it runs changed (`authelia_state`).
 step "Stop existing services"
-for svc in "$UNIT_CADDY" "$UNIT_AUTHELIA" "$UNIT_SERVER"; do
+# Authelia's binary, unit and configuration, as one digest. A first install has
+# none of them yet: that digest is just as good (Authelia isn't running then).
+authelia_state() {
+    { sudo cat "$BIN_DIR/authelia" "/etc/systemd/system/$UNIT_AUTHELIA.service" \
+          "$AUTHELIA_DIR/configuration.yml" 2> /dev/null || true; } | sha256sum
+}
+AUTHELIA_BEFORE="$(authelia_state)"
+for svc in "$UNIT_CADDY" "$UNIT_SERVER"; do
     if sudo systemctl is-active --quiet "$svc" 2>/dev/null; then
         sudo systemctl stop "$svc"
         ok "stopped $svc"
@@ -490,6 +501,11 @@ else
     (cd "$TMP" && grep " $f\$" authelia.sums | sha256sum -c --status) ||
         fail "Authelia v$AUTHELIA_VERSION: $f does not match its published checksum"
     tar -xzf "$TMP/$f" -C "$TMP" authelia
+    # A new version needs a restart anyway, and a running binary is not replaced.
+    if sudo systemctl is-active --quiet "$UNIT_AUTHELIA" 2>/dev/null; then
+        sudo systemctl stop "$UNIT_AUTHELIA"
+        ok "stopped $UNIT_AUTHELIA for its new version"
+    fi
     sudo install -d -m 755 "$BIN_DIR"
     sudo install -m 755 "$TMP/authelia" "$BIN_DIR/authelia"
     ok "v$AUTHELIA_VERSION installed (checksum verified)"
@@ -733,15 +749,20 @@ ok "installed + enabled: ${UNITS[*]}"
 
 # ── Start: the server first, it renders the login's configuration ─────────────
 step "Start $UNIT_SERVER"
-RENDERED=("$AUTHELIA_DIR/users.yml" "$AUTHELIA_DIR/configuration.yml")
+RENDERED=("$AUTHELIA_DIR/configuration.yml")
 [[ "$TLS" == tunnel ]] || RENDERED+=("$CADDY_DIR/Caddyfile")
-# Set the previous renders aside, so the wait below sees this start's.
+# Set the previous renders aside, so the wait below sees this start's. The
+# server writes them on every start, users.yml only when it changed: that one
+# stays where it is, since a running Authelia watches it.
 for f in "${RENDERED[@]}"; do
     sudo test -f "$f" && sudo mv "$f" "$f.previous"
 done
 sudo systemctl start "$UNIT_SERVER"
 printf "    wait : the server renders the login's configuration (a first start precompiles, minutes)"
-rendered() { for f in "${RENDERED[@]}"; do sudo test -s "$f" || return 1; done; }
+rendered() {
+    sudo test -s "$AUTHELIA_DIR/users.yml" || return 1
+    for f in "${RENDERED[@]}"; do sudo test -s "$f" || return 1; done
+}
 for _ in $(seq 1 600); do
     rendered && break
     sudo systemctl is-active --quiet "$UNIT_SERVER" ||
@@ -767,7 +788,12 @@ else
 fi
 
 step "Start ${UNITS[*]:1}"
-sudo systemctl start "${UNITS[@]:1}"
+if sudo systemctl is-active --quiet "$UNIT_AUTHELIA" && [[ "$(authelia_state)" == "$AUTHELIA_BEFORE" ]]; then
+    ok "$UNIT_AUTHELIA keeps running (nothing of it changed): every login stays"
+else
+    sudo systemctl restart "$UNIT_AUTHELIA"
+fi
+if (( ${#UNITS[@]} > 2 )); then sudo systemctl start "${UNITS[@]:2}"; fi
 sleep 3
 for svc in "${UNITS[@]:1}"; do
     sudo systemctl is-active --quiet "$svc" || fail "$svc failed to start: journalctl -u $svc -e"

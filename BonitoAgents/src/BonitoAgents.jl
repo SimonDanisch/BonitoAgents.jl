@@ -78,6 +78,7 @@ include("file_tree.jl")        # WorkerFileTree — lazy, searchable project fil
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
+include("diagnostics.jl")      # timings, browser tabs and their consoles, for the dev tools
 include("apps.jl")             # apps: permanent server parts with a chat, a pane and MCP tools of their own
 include("apps/BonitoTodo/BonitoTodo.jl")  # the To-do app, written like an app package: public API only
 include("remote_eval.jl")      # bt_julia_eval(worker = …): eval hosts on other workers, the per-chat switch
@@ -102,7 +103,7 @@ export MeshViewer, media_element
 # names and nothing else.
 public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, in_scope,
        AppCall, AppError,
-       app_id, app_title, app_description, app_tools, call_tool, chat_pane, app_briefing,
+       app_id, app_title, app_description, app_icon, app_tools, call_tool, chat_pane, app_briefing,
        app_allowed,
        ChatHeader, ChatNotice, ChatTranscript, ChatComposer, ChatToolbar,
        ServerState, ProjectInfo, WorkerInfo, User, ChatFolder,

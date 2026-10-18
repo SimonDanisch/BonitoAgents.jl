@@ -653,28 +653,6 @@ function share_worker!(state::ServerState, worker_id::AbstractString, groups::Ve
 end
 
 # Live browser sessions by user, so disabling an account can end them.
-function register_user_session!(state::ServerState, session::Bonito.Session, user::User)
-    root = root_state(state)
-    lock(root.lock) do
-        push!(get!(Vector{Bonito.Session}, root.user_sessions, user.name), session)
-    end
-    on(session.on_close) do closed
-        closed || return
-        lock(root.lock) do
-            list = get(root.user_sessions, user.name, nothing)
-            list === nothing || filter!(s -> s !== session, list)
-        end
-    end
-    return nothing
-end
-
-function close_user_sessions!(state::ServerState, name::AbstractString)
-    root = root_state(state)
-    sessions = lock(() -> pop!(root.user_sessions, String(name), Bonito.Session[]), root.lock)
-    foreach(close, sessions)
-    return length(sessions)
-end
-
 # ── Agent adapters ───────────────────────────────────────────────────────────
 
 """

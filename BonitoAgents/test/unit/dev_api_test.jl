@@ -489,6 +489,7 @@ end
             @test !occursin("working directory is the **BonitoAgents source checkout**", txt)
             # It still gets the tool documentation — only the WHERE differs.
             @test occursin("bt_dev_control", txt)
+            @test occursin("bt_dev_timings", txt) && occursin("bt_dev_console", txt)
 
             root = BT.bonitoagents_repo_root()
             if root !== nothing
@@ -517,7 +518,8 @@ end
 
 @testset "the MCP side only offers the tools when the server enabled them" begin
     names() = [t.name for t in BonitoMCP.available_tools()]
-    dev = ("bt_dev_inspect", "bt_dev_logs", "bt_dev_memory", "bt_dev_control")
+    dev = ("bt_dev_inspect", "bt_dev_logs", "bt_dev_memory", "bt_dev_control",
+           "bt_dev_timings", "bt_dev_console")
     had = get(ENV, "BONITOAGENTS_DEV_TOOLS", nothing)
     try
         delete!(ENV, "BONITOAGENTS_DEV_TOOLS")

@@ -29,7 +29,10 @@ window.btPasskeys = window.btPasskeys || (() => {
             headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
             body: body === undefined ? undefined : JSON.stringify(body)});
         let data = null;
-        try { data = await r.json(); } catch (e) { data = null; }
+        // A body that is not JSON (an error page from something in between)
+        // leaves `data` empty; the status below says what happened.
+        try { data = await r.json(); }
+        catch (error) { if (!(error instanceof SyntaxError)) throw error; }
         if (!r.ok || (data && data.status === 'KO'))
             throw new Error((data && data.message) || ('the login service answered ' + r.status));
         return data ? data.data : null;

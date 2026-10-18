@@ -173,7 +173,13 @@ function set_chat_icon!(state::ServerState, p::ProjectInfo, worker::Bool, path::
     end
 end
 
-function chat_icon_image(state::ServerState, p::ProjectInfo)
+# An app's chat wears the app's logo: the chat is the app.
+chat_icon_image(state::ServerState, p::ProjectInfo) =
+    page_phase(() -> chat_icon_asset(state, p), :chat_icons)
+
+function chat_icon_asset(state::ServerState, p::ProjectInfo)
+    app = app_of(state, p)
+    app === nothing || return app_icon_src(app)
     icon = chat_icon_state(state, p)
     request_chat_icon!(state, p)
     path = lock(() -> icon.path, state.lock)

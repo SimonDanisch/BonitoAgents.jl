@@ -325,9 +325,10 @@ function receive_directory(root::AbstractString, transport::IO;
         if haskey(by_rel, srel)
             try
                 touch_mtime(dst, by_rel[srel].mtime)
-            catch
-                # touch_mtime is a best-effort optimisation; failing it
-                # only costs us an extra rsync round-trip next time.
+            catch e
+                # Only costs an extra rsync round-trip next time, but a file
+                # we just wrote refusing its mtime is not expected.
+                @warn "RemoteSync: could not set the mtime" dst exception = e
             end
         end
 
@@ -453,8 +454,9 @@ function receive_file(dst::AbstractString, transport::IO;
 
     try
         touch_mtime(dst, mtime)
-    catch
-        # best-effort; mtime mismatch only costs a directory-resync round-trip.
+    catch e
+        # Only costs a directory-resync round-trip, but not expected.
+        @warn "RemoteSync: could not set the mtime" dst exception = e
     end
     notify_progress(on_progress, :file_done, (size = received,))
     return (size = received, mtime = mtime)

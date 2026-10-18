@@ -100,12 +100,55 @@ function run_suite(server)
         @test occursin("reload", TK.eval_js(server, "$(modal).querySelector('.bt-conn-title').textContent"))
         @test TK.eval_js(server, "$(composer).value") == "half a message"
         # The full storage is reported once in the console; that is this test's doing.
-        @test any(e -> occursin("Could not save the chat draft", e["message"]), TK.js_errors(server))
+        @test any(e -> occursin("browser storage refused (bt-draft:", e["message"]), TK.js_errors(server))
         TK.clear_js_errors(server)
         # The card's button is the way out.
         TK.eval_js(server, "$(modal).querySelector('.bt-conn-reload').click(); true")
         @test TK.wait_for(server, "the reload",
             "window.__before_reload === undefined && $(led)?.dataset.status === 'connected'"; timeout = 60) == true
+    end
+    # A page whose socket never comes up looks loaded and takes clicks that go
+    # nowhere: a chat opened from the sidebar showed an empty area, since the
+    # server renders its loading card. Seen on a phone after a server restart,
+    # reloaded three times. The socket hangs the way it does behind a proxy that
+    # holds the upgrade: a WebSocket that never opens, installed before the
+    # page's own scripts run.
+    @testset "a page that never connects says so" begin
+        ctx = server.browser[]
+        wc = "electron.BrowserWindow.fromId($(ctx.window.id)).webContents"
+        hang = "window.WebSocket = class { constructor(url) { this.url = url; this.readyState = 0; } " *
+               "send() { return false; } close() {} }; " *
+               "Object.assign(window.WebSocket, {CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3});"
+        script = TK.run(ctx.app, """(async () => { const wc = $wc;
+            if (!wc.debugger.isAttached()) wc.debugger.attach('1.3');
+            await wc.debugger.sendCommand('Page.enable');
+            return (await wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument',
+                {source: $(TK.json(hang))})).identifier; })()""")
+        try
+            TK.navigate(server, "/")
+            @test TK.wait_for(server, "the card, with no first connection",
+                "$(modal)?.classList.contains('bt-conn-open') && getComputedStyle($(modal)).opacity === '1'";
+                timeout = 15) == true
+            @test TK.eval_js(server, "$(led).dataset.status") == "connecting"
+            @test TK.eval_js(server, "$(modal).querySelector('.bt-conn-title').textContent") == "Connecting to the server"
+            # The sidebar is under it: no click lands on a chat that cannot open.
+            @test TK.eval_js(server, """(() => {
+                const b = [...document.querySelectorAll('.bt-side-item')].find(e => e.offsetParent); if (!b) return 'no row';
+                const r = b.getBoundingClientRect();
+                const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                return hit && hit.closest('.bt-conn-modal') ? 'covered' : 'exposed'; })()""") == "covered"
+            # Bonito gives up on it: the card says so.
+            TK.eval_js(server, "Bonito.on_connection_close(); true")
+            @test TK.wait_for(server, "the card after giving up",
+                "$(modal).querySelector('.bt-conn-title').textContent === 'Could not reach the server'"; timeout = 5) == true
+        finally
+            TK.run(ctx.app, """(async () => { const wc = $wc;
+                await wc.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument', {identifier: $(TK.json(script))});
+                wc.debugger.detach(); return true; })()""")
+        end
+        TK.navigate(server, "/")
+        @test TK.wait_for(server, "connected again, no card",
+            "$(led)?.dataset.status === 'connected' && !$(modal).classList.contains('bt-conn-open')"; timeout = 60) == true
     end
     return server
 end

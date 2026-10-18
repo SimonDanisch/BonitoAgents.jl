@@ -26,8 +26,11 @@ function recv_frame(cws)
     HTTP.WebSockets.isclosed(cws) && return nothing
     try
         return String(HTTP.WebSockets.receive(cws))
-    catch
-        return nothing            # WS closed/errored → EOF for the scenario loop
+    catch e
+        # A closed peer is EOF for the scenario loop; anything else is a mock bug.
+        e isa HTTP.WebSockets.WebSocketError || e isa EOFError || e isa Base.IOError ||
+            @warn "acp mock: receive failed" exception = (e, catch_backtrace())
+        return nothing
     end
 end
 

@@ -239,7 +239,7 @@ function atomic_write_text(f, path::AbstractString)
         try
             rm(tmp; force = true)
         catch cleanup_err
-            @debug "atomic_write_text: could not remove temp file" tmp exception = cleanup_err
+            @warn "atomic_write_text: could not remove temp file" tmp exception = cleanup_err
         end
         rethrow()
     end

@@ -54,8 +54,8 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 BW.kill_process_group!(proc)
                 @test timedwait(() -> !alive(parent) && !alive(grandchild), 5.0) === :ok
             finally
-                try; kill(proc, Base.SIGKILL); catch; end
-                try; close(proc); catch; end
+                kill(proc, Base.SIGKILL)   # a no-op once it exited
+                close(proc)
             end
         end
 
@@ -70,8 +70,8 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 sleep(0.5)
                 @test alive(getpid(proc))          # untouched, and so are we
             finally
-                try; kill(proc, Base.SIGKILL); catch; end
-                try; close(proc); catch; end
+                kill(proc, Base.SIGKILL)   # a no-op once it exited
+                close(proc)
             end
         end
 
@@ -105,7 +105,7 @@ probe_provider(bin, args; env = Dict{String,String}()) =
             proc = open(detach(Cmd(`true`)), "r+")
             sleep(0.3)
             @test BW.kill_process_group!(proc) === nothing   # no throw
-            try; close(proc); catch; end
+            close(proc)
         end
 
         if isdir("/proc")
@@ -167,9 +167,9 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                     @test alive(cpid)              # our id, another install: NOT touched
                 finally
                     for p in (marked, other, copied)
-                        try; BW.kill_process_group!(p); catch; end
-                        try; kill(p, Base.SIGKILL); catch; end
-                        try; close(p); catch; end
+                        BW.kill_process_group!(p)  # tolerates a dead proc (tested above)
+                        kill(p, Base.SIGKILL)
+                        close(p)
                     end
                 end
             end
@@ -262,6 +262,15 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 r = BW.kill_processes([Dict("pid" => leader, "pgid" => leader, "recorded_at" => time())])
                 @test only(r)["outcome"] == "killed"
                 @test timedwait(() -> !alive(child), 5.0) === :ok
+            end
+
+            # macOS and Windows ask `ps`/PowerShell, which exit non-zero for a
+            # pid that is gone. That threw a MethodError on every MacBook kill
+            # (`ignorestatus` wrapped the pipeline, not the command); Linux reads
+            # /proc instead, so nothing here ever ran that path.
+            @testset "a command that fails is no answer, not an error" begin
+                @test BW.command_output(`ps -o ppid= -p 999999999`) == ""
+                @test BW.command_output(`sh -c 'echo " 42 "; echo noise >&2; exit 3'`) == "42"
             end
 
             @testset "never this worker" begin

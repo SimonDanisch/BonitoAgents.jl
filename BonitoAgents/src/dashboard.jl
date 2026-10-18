@@ -1353,7 +1353,7 @@ const DashboardStyles = Bonito.Styles(
         CSS("from", "transform" => "rotate(0deg)"),
         CSS("to", "transform" => "rotate(360deg)")),
 
-    # ── Chat loading screen (project_loading_view) ───────────────────────────
+    # ── Chat loading screen (ChatLoadingView) ───────────────────────────
     # Centered in the main panel while a chat's ACP session is brought up, or
     # to explain that the project's worker is offline.
     CSS(".bt-loading",
@@ -1735,7 +1735,10 @@ function refresh_picker!(p::RemoteFolderPicker; debounce_ms::Int = 300)
         try
             st = stat_worker_path(p.state, p.worker_name, path)
             ex = st.exists ? (st.isdir ? :dir : :file) : :missing
-        catch
+        catch e
+            # An offline worker is the picker's to show; a failing stat is not.
+            e isa WorkerUnreachableError ||
+                @warn "folder picker: could not check the path" path worker = p.worker_name exception = e
             ex = :error
         end
         my_id == p.fetch_id[] || return
@@ -2015,7 +2018,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     #
     # Creating a chat is opening a chat: no progress card of its own. The view
     # moves to the new chat as soon as the worker has confirmed the folder, and
-    # the chat's loading spinner (`project_loading_view`, then the transcript's)
+    # the chat's loading spinner (`ChatLoadingView`, then the transcript's)
     # is the one thing on screen, the same as for a chat that already existed.
     # It used to run through the window's progress card, "Importing X" and then
     # "Imported X" for 4.5 s, on top of the new chat's own header controls.
@@ -2043,7 +2046,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 # `start_session=false` so the registration finishes fast and we
                 # can flip `current_view` early — the chat bring-up itself
                 # (ensure_project_session!) is then driven by
-                # `project_loading_view`, which shows a full-panel spinner while
+                # `ChatLoadingView`, which shows a full-panel spinner while
                 # it runs. Otherwise the user stares at the dashboard for ~10s
                 # of ACP `session/load` with only a tiny pill at the top.
                 p = create_project_from_worker!(state, w_name, real;
@@ -2191,7 +2194,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             title = "Defaults, agent instructions, accounts",
             onclick = js"event => $(current_view).notify($(SETTINGS_VIEW))")
 
-    apps = apps_section(session, state, current_view, busy)
+    apps = page_phase(() -> apps_section(session, state, current_view, busy), :apps)
     apps_header = apps === nothing ? nothing : DOM.div(DOM.h2("Apps"); class = "bt-section")
 
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
@@ -2254,10 +2257,10 @@ function settings_dom(session::Bonito.Session, state::ServerState;
             debug_section(session, state, current_view);
             class = "bt-card bt-settings"),
         agents_md_section(session, state),
-        shares_section(session, state),
+        page_phase(() -> shares_section(session, state), :shares),
         # Your account behind the proxy; accounts, invites and agent adapter
         # versions for admins.
-        account_sections(session, state),
+        page_phase(() -> account_sections(session, state), :accounts),
         copy_ui.modal;
         class = "bt-dash bt-settings-page")
 end

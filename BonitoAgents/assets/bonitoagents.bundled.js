@@ -6,6 +6,39 @@ if (typeof document !== 'undefined') {
     const vp = document.querySelector('meta[name="viewport"]');
     if (vp && !vp.content.includes('interactive-widget')) vp.content += ', interactive-widget=resizes-content';
 }
+const storage = (()=>{
+    const refused = (error, key)=>{
+        if (!(error instanceof DOMException) || ![
+            'SecurityError',
+            'QuotaExceededError'
+        ].includes(error.name)) throw error;
+        console.warn(`browser storage refused (${key}):`, error.message);
+    };
+    return {
+        get (key) {
+            try {
+                return localStorage.getItem(key);
+            } catch (e) {
+                refused(e, key);
+                return null;
+            }
+        },
+        set (key, value) {
+            try {
+                localStorage.setItem(key, value);
+            } catch (e) {
+                refused(e, key);
+            }
+        },
+        remove (key) {
+            try {
+                localStorage.removeItem(key);
+            } catch (e) {
+                refused(e, key);
+            }
+        }
+    };
+})();
 function formatTokens(n) {
     if (n < 1000) return String(Math.round(n));
     if (n < 10000) return (n / 1000).toFixed(1) + 'k';
@@ -92,13 +125,7 @@ class Collapsable {
         });
     }
     showPlaceholder() {
-        this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
-        const h = this.reserve ? this.reserve() : 0;
-        if (h > 0) {
-            const ph = this.body.firstElementChild;
-            ph.style.boxSizing = 'border-box';
-            ph.style.height = h + 'px';
-        }
+        showLoading(this.body, this.reserve ? this.reserve() : null);
     }
     fill(html) {
         if (html != null) this.body.innerHTML = html;
@@ -113,6 +140,12 @@ function formatBytes(n) {
     if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
     if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
     return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+function showLoading(body, shape) {
+    body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+    if (shape) Object.assign(body.firstElementChild.style, {
+        boxSizing: 'border-box'
+    }, shape);
 }
 class BonitoChat {
     constructor(container, comm, init = {}){
@@ -421,7 +454,9 @@ class BonitoChat {
                 p.lastT = performance.now();
                 try {
                     this.container.setPointerCapture(e.pointerId);
-                } catch (_) {}
+                } catch (error) {
+                    if (error.name !== 'NotFoundError') throw error;
+                }
                 this.container.classList.add('bt-messages-grabbing');
                 this.lastUserInputT = performance.now();
                 this.cancelPendingScroll();
@@ -460,9 +495,7 @@ class BonitoChat {
             const vel = p.velocity;
             this.panState = null;
             if (!engaged) return;
-            try {
-                this.container.releasePointerCapture(e.pointerId);
-            } catch (_) {}
+            if (this.container.hasPointerCapture(e.pointerId)) this.container.releasePointerCapture(e.pointerId);
             this.container.classList.remove('bt-messages-grabbing');
             if (Math.abs(vel) > 0.10) {
                 this.momentumRaf = requestAnimationFrame(()=>momentumStep(vel));
@@ -634,8 +667,9 @@ class BonitoChat {
         if (this.destroyed) return;
         try {
             this.destroy();
-        } catch (_) {}
-        CHAT_INSTANCES.delete(this);
+        } finally{
+            CHAT_INSTANCES.delete(this);
+        }
     }
     dispatch(msg) {
         if (typeof msg.n === 'number' && msg.n > this.totalCount) {
@@ -1073,7 +1107,6 @@ class BonitoChat {
             return;
         }
         this.setFollowMode(false);
-        this.cancelPendingScroll();
         const node = this.cache.get(this.seqIndex(p));
         if (node && p >= this.plo && p <= this.phi && node.offsetParent !== null) {
             this.container.scrollTop = Math.max(0, node.offsetTop - offset);
@@ -1144,15 +1177,28 @@ class BonitoChat {
             if (node) node.__btH = node.getBoundingClientRect().height;
         }
     }
+    bodyReserve(node) {
+        if (!node.collapsable) return null;
+        const map = node.__btBodyH;
+        const w = this.bodyWidth();
+        if (map) {
+            for (const [k, h] of Object.entries(map))if (Math.abs(+k - w) <= 2) return {
+                height: h + 'px'
+            };
+        }
+        const m = node.__btMedia;
+        if (m && m[0] > 0 && m[1] > 0) return {
+            boxSizing: 'content-box',
+            padding: (node.__btMediaExtra || 0) + 'px 0 0',
+            width: m[0] + 'px',
+            maxWidth: '100%',
+            aspectRatio: m[0] + ' / ' + m[1],
+            overflow: 'hidden'
+        };
+        return null;
+    }
     bodyWidth() {
         return Math.round(this.container.clientWidth);
-    }
-    bodyReserve(node) {
-        const map = node.__btBodyH;
-        if (!map || !node.collapsable) return 0;
-        const w = this.bodyWidth();
-        for (const [k, h] of Object.entries(map))if (Math.abs(+k - w) <= 2) return h;
-        return 0;
     }
     scheduleBodyReport(node) {
         clearTimeout(node.__btBodyTimer);
@@ -1165,7 +1211,8 @@ class BonitoChat {
         const id = node.dataset.msgId;
         if (!id || !body || body.offsetParent === null || body.childElementCount === 0) return;
         if (body.querySelector(':scope > .bt-collapsable-loading')) return;
-        const h = Math.round(this.bodyContentHeight(body));
+        const content = this.bodyContentHeight(body);
+        const h = Math.round(content);
         const w = this.bodyWidth();
         if (w < 1 || h < 1) return;
         const map = node.__btBodyH || {};
@@ -1176,11 +1223,15 @@ class BonitoChat {
         }
         map[w] = h;
         node.__btBodyH = map;
+        const pics = body.querySelectorAll('.bt-media-wrap');
+        const extra = pics.length === 1 ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
+        node.__btMediaExtra = extra;
         this.comm.notify({
             type: 'tool.size',
             id,
             w,
-            h
+            h,
+            extra
         });
     }
     bodyContentHeight(body) {
@@ -1400,7 +1451,10 @@ class BonitoChat {
         if (canvas) {
             try {
                 dataUrl = canvas.toDataURL('image/png');
-            } catch (_) {}
+            } catch (error) {
+                if (error.name !== 'SecurityError') throw error;
+                console.warn('app snapshot refused:', error.message);
+            }
         }
         if (slot) {
             const h = Math.max(40, slot.offsetHeight);
@@ -1438,11 +1492,9 @@ class BonitoChat {
         const id = node.dataset.msgId;
         const body = node.querySelector('.bt-tool-body');
         if (body) {
-            const h = body.offsetHeight;
-            body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
-            const ph = body.firstElementChild;
-            ph.style.boxSizing = 'border-box';
-            ph.style.height = h + 'px';
+            showLoading(body, {
+                height: body.offsetHeight + 'px'
+            });
         }
         if (id) this.comm.notify({
             type: 'tool.render',
@@ -1475,7 +1527,7 @@ class BonitoChat {
             if (node.collapsable && !node.collapsable.loaded) {
                 node.collapsable.loaded = true;
                 const body = node.collapsable.body;
-                if (body.childElementCount === 0 && this.bodyReserve(node) > 0) node.collapsable.showPlaceholder();
+                if (body.childElementCount === 0 && this.bodyReserve(node)) node.collapsable.showPlaceholder();
                 this.requestBody(node);
             }
         }
@@ -2158,6 +2210,8 @@ class BonitoChat {
                     if (msg.compact_body === true) div.dataset.compactBody = '1';
                     div.addEventListener('monaco-editor-disposed', ()=>this.bodyDied(div));
                     div.__btBodyH = msg.body_h || null;
+                    div.__btMedia = msg.media || null;
+                    div.__btMediaExtra = msg.media_extra || 0;
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
                         editMode: compactBody,
@@ -2335,13 +2389,13 @@ class BonitoChat {
     setupLiveTicker() {
         this.taskbarEl = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-taskbar');
         if (this.taskbarEl) {
-            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const storedTodo = storage.get('bt-todo-collapsed');
             const paneW = this.container.closest('.bt-chatpane')?.clientWidth ?? window.innerWidth;
             this.taskbarEl.classList.toggle('bt-todo-collapsed', storedTodo != null ? storedTodo === '1' : paneW < 660);
             this.onTaskbarClick = (ev)=>{
                 if (ev.target.closest('.bt-taskbar-todo-toggle')) {
                     const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
-                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    storage.set('bt-todo-collapsed', c ? '1' : '0');
                     return;
                 }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
@@ -3063,10 +3117,7 @@ class BonitoChat {
         if (pid) {
             const key = 'bt-draft:' + pid;
             const yolo = ()=>this.textInput.classList.contains('bt-text-input-yolo');
-            let saved = null;
-            try {
-                saved = localStorage.getItem(key);
-            } catch (_) {}
+            const saved = storage.get(key);
             if (saved && !this.textInput.value && !yolo()) {
                 this.textInput.value = saved;
                 this.textInput.dispatchEvent(new Event('input', {
@@ -3078,15 +3129,7 @@ class BonitoChat {
                 if (this.pendingDraft === undefined) return;
                 const text = this.pendingDraft;
                 this.pendingDraft = undefined;
-                try {
-                    text.trim() ? localStorage.setItem(key, text) : localStorage.removeItem(key);
-                } catch (error) {
-                    if (!(error instanceof DOMException) || ![
-                        'QuotaExceededError',
-                        'SecurityError'
-                    ].includes(error.name)) throw error;
-                    console.warn('Could not save the chat draft:', error.message);
-                }
+                text.trim() ? storage.set(key, text) : storage.remove(key);
             };
             this.onDraftInput = ()=>{
                 if (yolo()) return;
@@ -3569,10 +3612,7 @@ class BonitoChat {
     applyUserScroll(prevTop) {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
         const atBot = this.atBottom();
-        if (this.followMode && !atBot) {
-            this.setFollowMode(false);
-            this.cancelPendingScroll();
-        }
+        if (this.followMode && !atBot) this.setFollowMode(false);
         if (this.followMode) return;
         if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
             this.setFollowMode(true);
@@ -3587,6 +3627,8 @@ class BonitoChat {
         if (on) {
             this.unreadCount = 0;
             this.hideNewMessagePill();
+        } else {
+            this.cancelPendingScroll();
         }
     }
     cancelPendingScroll() {
@@ -3731,35 +3773,37 @@ function decorateCodeBlocks(rootEl) {
         wrap.appendChild(actions);
     });
 }
+function decodePath(text) {
+    try {
+        return decodeURIComponent(text);
+    } catch (error) {
+        if (!(error instanceof URIError)) throw error;
+        return text;
+    }
+}
 function markdownWorkerPath(anchor) {
     const raw = (anchor.getAttribute('href') || '').trim();
     if (!raw || raw.startsWith('#') || raw.startsWith('?')) return null;
     if (/^(mailto|tel|data|blob|javascript):/i.test(raw)) return null;
     let path = raw;
+    let url = null;
     try {
-        const url = new URL(raw, window.location.href);
-        if (url.protocol === 'file:') {
-            path = decodeURIComponent(url.pathname);
-        } else if (url.protocol === 'http:' || url.protocol === 'https:') {
-            if (url.origin !== window.location.origin) return null;
-            path = decodeURIComponent(url.pathname);
-        } else {
-            return null;
-        }
-    } catch (_) {
-        try {
-            path = decodeURIComponent(raw);
-        } catch (_) {
-            path = raw;
-        }
+        url = new URL(raw, window.location.href);
+    } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+    }
+    if (url === null) {
+        path = decodePath(raw);
+    } else if (url.protocol === 'file:') {
+        path = decodePath(url.pathname);
+    } else if (url.protocol === 'http:' || url.protocol === 'https:') {
+        if (url.origin !== window.location.origin) return null;
+        path = decodePath(url.pathname);
+    } else {
+        return null;
     }
     if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(raw)) {
-        const clean = raw.split(/[?#]/, 1)[0];
-        try {
-            path = decodeURIComponent(clean);
-        } catch (_) {
-            path = clean;
-        }
+        path = decodePath(raw.split(/[?#]/, 1)[0]);
     }
     return path || null;
 }
@@ -3927,11 +3971,9 @@ function connect(node, comm, init = {}) {
     if (parent) {
         const mo = new MutationObserver(()=>{
             if (!node.isConnected) {
-                try {
-                    chat.destroy();
-                } catch (_) {}
-                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
+                CHAT_INSTANCES.delete(chat);
+                if (!chat.destroyed) chat.destroy();
             }
         });
         mo.observe(parent, {

@@ -182,10 +182,10 @@ jsonable(x) = string(x)
 # chat's MCP may ask them (remote_eval.jl). They share this channel and this
 # allow-list because it is the one request/reply path an MCP process has.
 # `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl).
-const DEV_OPS          = (:inspect, :logs, :memory, :control,
+const DEV_OPS          = (:inspect, :logs, :memory, :control, :timings, :console,
                           :remote_eval, :remote_workers, :sync_folder, :share,
                           :app_tools, :app_call)
-const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings)
+const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings, :tabs)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
                           :rescan_worker, :continue_project, :set_title)
 
@@ -217,8 +217,9 @@ function dev_op(state::ServerState, ::Val{:inspect}, args::AbstractDict)
     section = known_or_throw(Symbol(String(get(args, "section", "overview"))),
                              DEV_SECTIONS, "section")
     # One narrowing argument, whose meaning is the section's: a project id for
-    # the per-chat sections, a worker id for `:worker`.
+    # the per-chat sections, a worker id for `:worker`, a tab for `:tabs`.
     target = section === :worker ? String(get(args, "worker_id", "")) :
+             section === :tabs   ? String(get(args, "tab", "")) :
                                    String(get(args, "project_id", ""))
     return dev_section(state, Val(section), target)
 end
@@ -233,6 +234,8 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
     chat_ids, bound = lock(state.lock) do
         (collect(keys(state.chat_models)), copy(state.bound_lru))
     end
+    tabs = root_state(state).tabs
+    open_tabs = lock(() -> [r.session for r in values(tabs.open) if r.session !== nothing], tabs.lock)
     return Dict{String,Any}(
         "pid"          => getpid(),
         "julia"        => string(VERSION),
@@ -253,6 +256,11 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
             "mcp_channels"    => lock(() -> length(state.mcp_ctrl), state.lock),
             "pending_rpcs"    => lock(() -> length(state.pending_rpcs), state.lock),
             "pending_chunks"  => lock(() -> length(state.pending_chunks), state.lock),
+            # Browser tabs the server serves, and those whose socket is gone but
+            # which are still served (and queue what they're sent).
+            "tabs"            => length(open_tabs),
+            "tabs_dropped"    => count(s -> s.status == Bonito.SOFT_CLOSED, open_tabs),
+            "queued_messages" => sum((length(s.message_queue) for s in open_tabs); init = 0),
         ),
         "bound_lru"    => bound,
         "chat_models"  => chat_ids,

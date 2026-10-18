@@ -82,6 +82,7 @@ BonitoAgents.app_id(::Type{TodoApp}) = "todo"
 BonitoAgents.app_title(::TodoApp) = "To-do"
 BonitoAgents.app_description(::TodoApp) =
     "One to-do list for every chat: agents check items off, and its chat starts a chat for an item in the right project."
+BonitoAgents.app_icon(::TodoApp) = joinpath(@__DIR__, "todo.svg")
 
 # ── the list ────────────────────────────────────────────────────────────────
 

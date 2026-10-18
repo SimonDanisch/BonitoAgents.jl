@@ -46,8 +46,18 @@ app_id(app::AgentApp) = app_id(typeof(app))
 "What the app is called in the UI. Defaults to its id."
 app_title(app::AgentApp) = app_id(app)
 
-"One line about the app, for the dashboard's Apps card."
+"A few lines about the app: its tile's details on the dashboard, and the setup dialog."
 app_description(::AgentApp) = ""
+
+"""
+    app_icon(app) -> String | nothing
+
+The app's logo: the path of a square picture file that ships with the app (an
+SVG or a PNG, e.g. `joinpath(@__DIR__, "logo.svg")`), shown on its dashboard
+tile and as its chat's icon. `nothing` (the default) gives a tile with the first
+letter of its title.
+"""
+app_icon(::AgentApp) = nothing
 
 "The tools the app adds to agents' MCP: a `Vector` of [`AppTool`](@ref)."
 app_tools(::AgentApp) = AppTool[]
@@ -220,9 +230,31 @@ function start_apps!(server::ServerState, apps)
     for A in apps
         id = app_id(A)
         haskey(server.apps, id) && error("two apps with the id '$id'")
-        server.apps[id] = A(AppContext(server, joinpath(server.state_dir, "apps", id)))::AgentApp
+        app = A(AppContext(server, joinpath(server.state_dir, "apps", id)))::AgentApp
+        icon = app_icon(app)
+        icon === nothing || isfile(icon) || error("the icon of app '$id' is not a file: $icon")
+        server.apps[id] = app
     end
     return server
+end
+
+# What an <img> shows as the app's logo: its file, or a tile with a letter.
+app_icon_src(app::AgentApp) = app_icon_src(app_icon(app), app)
+app_icon_src(path::AbstractString, ::AgentApp) = Bonito.Asset(path)
+app_icon_src(::Nothing, app::AgentApp) =
+    "data:image/svg+xml;base64," * base64encode(letter_icon_svg(app_title(app), app_id(app)))
+
+# The first letter or digit of `title` on a rounded square, coloured by `key`.
+function letter_icon_svg(title::AbstractString, key::AbstractString)
+    i = findfirst(c -> isletter(c) || isdigit(c), title)
+    letter = i === nothing ? "?" : uppercase(string(title[i]))
+    hue = hash(key) % 360
+    return string(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64' viewBox='0 0 64 64'>",
+        "<rect width='64' height='64' rx='14' fill='hsl(", hue, ", 55%, 48%)'/>",
+        "<text x='32' y='33' text-anchor='middle' dominant-baseline='central' ",
+        "font-family='system-ui, sans-serif' font-size='32' font-weight='600' fill='#fff'>",
+        letter, "</text></svg>")
 end
 
 "The app `p` is the chat of, or `nothing` for an ordinary chat (or an app this server doesn't run)."
@@ -465,10 +497,10 @@ end
 """
     apps_section(session, state, current_view, busy) -> DOM | nothing
 
-The dashboard's card of apps: one row each, what it is and the button that
-opens its chat. Before the chat exists the row offers a worker to run it on,
-since its agent needs one; after, the button just opens it. Opening reports
-into `busy`, the window's progress card.
+The dashboard's apps, as a grid of tiles: logo and title, with the details on
+hover. A click opens the app's chat. Before the chat exists a dialog asks first
+which worker it runs its agent on; after, the click just opens it. Opening
+reports into `busy`, the window's progress card.
 """
 function apps_section(session::Bonito.Session, state::ServerState,
                       current_view::Union{Observable{String},Nothing}, busy::Observable)
@@ -477,67 +509,213 @@ function apps_section(session::Bonito.Session, state::ServerState,
     allowed(app) = state.user === nothing || app_allowed(app, state.user)
     apps = [state.apps[id] for id in sort!(collect(keys(state.apps))) if allowed(state.apps[id])]
     isempty(apps) && return nothing
-    rows = [app_row(session, state, app, current_view, busy) for app in apps]
-    return DOM.div(AppsStyles, rows...; class = "bt-card bt-apps")
+    tiles = [app_tile(session, state, app, current_view, busy) for app in apps]
+    # The dialogs outside the grid: a tile's hover state must not reach them.
+    return DOM.div(AppsStyles,
+                   DOM.div(first.(tiles)...; class = "bt-apps"),
+                   last.(tiles)...)
 end
 
-function app_row(session::Bonito.Session, state::ServerState, app::AgentApp,
-                 current_view::Observable{String}, busy::Observable)
-    # The worker picked for a chat yet to be made; "" is the first connected one
-    # by name (`chat_worker`), which is also what the pill shows until the user
-    # picks.
-    chosen = Observable("")
-    pick = Observable{Any}(["", ""])          # `msearchSelect` posts `[id, value]`
-    on(session, pick) do v
-        (v isa AbstractVector && length(v) == 2) || return
-        chosen[] = String(v[2])
+# One app's tile and its setup dialog.
+function app_tile(session::Bonito.Session, state::ServerState, app::AgentApp,
+                  current_view::Observable{String}, busy::Observable)
+    title = app_title(app)
+    # The worker its chat runs on, by name, or "" before it has one.
+    runs_on = map(session, state.projects, state.workers) do _, workers
+        p = app_chat(state, app)
+        p === nothing ? "" : last(worker_label(workers, p))
     end
-    picker = map(session, state.workers, state.projects, chosen) do workers, _, wid
-        app_chat(state, app) === nothing || return DOM.span(; class = "bt-hidden")
-        online = sort([w for w in values(workers) if isopen(w) && visible(state, w)]; by = w -> w.name)
-        isempty(online) && return DOM.span("no worker connected"; class = "bt-app-noworker")
-        i = something(findfirst(w -> w.worker_id == wid, online), 1)
-        items = [(label = w.name, value = w.worker_id, current = k == i,
-                  title = "Run $(app_title(app))'s chat on $(w.name)")
-                 for (k, w) in enumerate(online)]
-        return dropdown_pill("worker", online[i].name, items,
-            v -> js"""event => { const t = event.currentTarget;
-                    $(ChatLib).then(lib => lib.msearchSelect(t, $(pick), 'worker', $(v))); }""";
-            tooltip = "The worker $(app_title(app))'s chat runs its agent on",
-            extra_class = "bt-app-worker")
+    status = map(w -> isempty(w) ? "Not set up" : "on $w", session, runs_on)
+
+    setting_up = Observable(false)
+    chosen = Observable("")   # the dialog's worker; "" is the first connected one by name
+    clicked = Observable(false)
+    on(session, clicked) do _
+        if app_chat(state, app) === nothing
+            chosen[] = ""
+            setting_up[] = true
+        else
+            launch_app!(state, app, current_view, busy)
+        end
     end
-    click = Observable(false)
-    btn = DOM.button("Open"; class = "bt-btn bt-btn-secondary bt-app-open",
-                     onclick = js"event => $(click).notify(true)")
-    on(session, click) do _
-        busy_start!(busy, "Opening $(app_title(app))…")
-        Base.errormonitor(@async try
-            open_app_chat!(state, app, current_view; worker_id = chosen[])
-            # Its chat on screen is the outcome.
-            busy_clear!(busy)
-        catch e
-            e isa InterruptException && rethrow()
-            @warn "opening an app's chat failed" app = app_id(app) exception = (e, catch_backtrace())
-            busy_fail!(busy, "Could not open $(app_title(app))", error_detail(e, catch_backtrace()))
-        end)
+    start = Observable(false)
+    on(session, start) do _
+        setting_up[] = false
+        launch_app!(state, app, current_view, busy; worker_id = chosen[])
     end
+    dialog = modal(session, setting_up, "Set up $title") do
+        app_setup(session, state, app, chosen, start, setting_up)
+    end
+
+    tile = DOM.div(
+        DOM.button(
+            DOM.img(; src = app_icon_src(app), alt = "", class = "bt-app-logo", draggable = "false"),
+            DOM.span(title; class = "bt-app-title"),
+            DOM.span(status; class = "bt-app-status");
+            type = "button", class = "bt-app-launch",
+            onclick = js"event => $(clicked).notify(true)"),
+        app_details(session, app, runs_on);
+        class = "bt-app-tile", dataApp = app_id(app),
+        # Near the window's right edge the details open leftwards.
+        onmouseenter = js"""event => {
+            const t = event.currentTarget, d = t.querySelector('.bt-app-details');
+            t.classList.toggle('bt-app-flip',
+                t.getBoundingClientRect().left + d.offsetWidth > document.documentElement.clientWidth - 8);
+        }""")
+    return tile => dialog
+end
+
+# What the tile tells on hover: the app's description, the tools it gives
+# agents, and where its chat runs.
+function app_details(session::Bonito.Session, app::AgentApp, runs_on::Observable{String})
+    parts = Any[DOM.div(app_title(app); class = "bt-app-details-title")]
+    desc = app_description(app)
+    isempty(desc) || push!(parts, DOM.p(desc; class = "bt-app-details-desc"))
+    tools = app_tools(app)
+    isempty(tools) || push!(parts,
+        DOM.div(DOM.div("Tools for agents"; class = "bt-app-details-label"),
+                DOM.div((DOM.code(String(t.name)) for t in tools)...; class = "bt-app-details-tools")))
+    push!(parts, DOM.div(map(session, runs_on) do w
+        isempty(w) ? "Not set up yet: a click picks the worker its chat runs on." :
+                     "Its chat runs on $w."
+    end; class = "bt-app-details-where"))
+    return DOM.div(parts...; class = "bt-app-details", role = "tooltip")
+end
+
+# The setup dialog: what the app is, and the worker its chat will run on.
+function app_setup(session::Bonito.Session, state::ServerState, app::AgentApp,
+                   chosen::Observable{String}, start::Observable{Bool}, setting_up::Observable{Bool})
+    title = app_title(app)
+    online(workers) = sort([w for w in values(workers) if isopen(w) && visible(state, w)]; by = w -> w.name)
+    choices = map(session, state.workers, chosen) do workers, wid
+        ws = online(workers)
+        isempty(ws) && return DOM.div("No worker is connected. Connect one to set up $title.";
+                                      class = "bt-app-noworker")
+        i = something(findfirst(w -> w.worker_id == wid, ws), 1)
+        DOM.div((DOM.button(DOM.span(w.name; class = "bt-app-choice-name"),
+                            DOM.span(w.hostname; class = "bt-app-choice-host");
+                            type = "button", class = k == i ? "bt-app-choice bt-on" : "bt-app-choice",
+                            var"aria-pressed" = string(k == i),
+                            onclick = js"event => $(chosen).notify($(w.worker_id))")
+                 for (k, w) in enumerate(ws))...;
+                class = "bt-app-choices", role = "group", var"aria-label" = "Worker")
+    end
+    none_online = map(ws -> isempty(online(ws)), session, state.workers)
+    desc = app_description(app)
     return DOM.div(
-        DOM.div(DOM.div(app_title(app); class = "bt-app-title"),
-                DOM.div(app_description(app); class = "bt-app-desc");
-                class = "bt-app-text"),
-        DOM.div(picker, btn; class = "bt-app-controls");
-        class = "bt-app-row", dataApp = app_id(app))
+        DOM.div(DOM.img(; src = app_icon_src(app), alt = "", class = "bt-app-logo", draggable = "false"),
+                DOM.div(DOM.div(title; class = "bt-app-setup-title"),
+                        (isempty(desc) ? () : (DOM.p(desc; class = "bt-app-setup-desc"),))...);
+                class = "bt-app-setup-head"),
+        DOM.div("Its chat runs an agent, on the worker you pick:"; class = "bt-app-setup-label"),
+        choices,
+        DOM.div("It stays there. From then on a click on its tile opens it."; class = "bt-app-setup-note"),
+        DOM.div(DOM.button("Cancel"; type = "button", class = "bt-btn bt-btn-secondary",
+                           onclick = js"event => $(setting_up).notify(false)"),
+                DOM.button("Set up and open"; type = "button", class = "bt-btn bt-app-start",
+                           disabled = none_online, onclick = js"event => $(start).notify(true)");
+                class = "bt-form-actions");
+        class = "bt-app-setup")
+end
+
+# Open the app's chat (made first, on `worker_id`, if it has none) with the
+# window's progress card up meanwhile.
+function launch_app!(state::ServerState, app::AgentApp, current_view::Observable{String},
+                     busy::Observable; worker_id::AbstractString = "")
+    busy_start!(busy, "Opening $(app_title(app))…")
+    Base.errormonitor(@async try
+        open_app_chat!(state, app, current_view; worker_id)
+        # Its chat on screen is the outcome.
+        busy_clear!(busy)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "opening an app's chat failed" app = app_id(app) exception = (e, catch_backtrace())
+        busy_fail!(busy, "Could not open $(app_title(app))", error_detail(e, catch_backtrace()))
+    end)
+    return nothing
 end
 
 const AppsStyles = Styles(
-    CSS(".bt-app-row", "display" => "flex", "align-items" => "center",
-        "justify-content" => "space-between", "gap" => "var(--bt-space-3)"),
-    CSS(".bt-app-row + .bt-app-row", "border-top" => "1px solid var(--bt-border)",
-        "padding-top" => "var(--bt-space-2)"),
-    CSS(".bt-app-text", "min-width" => "0"),
-    CSS(".bt-app-title", "font-weight" => "600"),
-    CSS(".bt-app-desc", "color" => "var(--bt-text-muted)", "font-size" => "var(--bt-text-sm)"),
-    CSS(".bt-app-controls", "display" => "flex", "align-items" => "center",
-        "gap" => "var(--bt-space-2)", "flex-shrink" => "0"),
-    CSS(".bt-app-noworker", "color" => "var(--bt-text-muted)", "font-size" => "var(--bt-text-sm)"),
+    # Tiles of one size, as many as fit a row; on a phone two or three.
+    CSS(".bt-apps", "display" => "grid",
+        "grid-template-columns" => "repeat(auto-fill, minmax(116px, 1fr))",
+        "gap" => "var(--bt-space-3)"),
+    CSS(".bt-app-tile", "position" => "relative", "min-width" => "0"),
+    CSS(".bt-app-launch",
+        "appearance" => "none", "font" => "inherit", "color" => "inherit",
+        "width" => "100%", "height" => "100%",
+        "display" => "flex", "flex-direction" => "column", "align-items" => "center",
+        "gap" => "6px", "padding" => "16px 8px 12px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius)",
+        "box-shadow" => "var(--bt-shadow-sm)", "cursor" => "pointer",
+        "transition" => "box-shadow 120ms ease, border-color 120ms ease, transform 120ms ease"),
+    CSS(".bt-app-launch:hover",
+        "border-color" => "var(--bt-border-strong)", "box-shadow" => "var(--bt-shadow-md)",
+        "transform" => "translateY(-1px)"),
+    CSS(".bt-app-launch:focus-visible",
+        "outline" => "2px solid var(--bt-accent)", "outline-offset" => "2px"),
+    CSS(".bt-app-logo", "width" => "52px", "height" => "52px", "flex-shrink" => "0",
+        "border-radius" => "12px", "object-fit" => "contain", "user-select" => "none"),
+    CSS(".bt-app-title, .bt-app-status",
+        "max-width" => "100%", "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap"),
+    CSS(".bt-app-title", "font-weight" => "600", "font-size" => "13px", "margin-top" => "4px"),
+    CSS(".bt-app-status", "font-size" => "11px", "color" => "var(--bt-text-muted)"),
+
+    # The details: under the tile, after a short pause so a passing pointer
+    # doesn't flash them; not on touch screens, which have no hover (the setup
+    # dialog says the same).
+    CSS(".bt-app-details",
+        "position" => "absolute", "top" => "calc(100% + 6px)", "left" => "0", "z-index" => "30",
+        "width" => "min(300px, calc(100vw - 32px))", "box-sizing" => "border-box",
+        "padding" => "12px 14px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border-strong)", "border-radius" => "var(--bt-radius)",
+        "box-shadow" => "var(--bt-shadow-md)",
+        "font-size" => "12px", "line-height" => "1.45",
+        "opacity" => "0", "visibility" => "hidden", "pointer-events" => "none",
+        "transition" => "opacity 120ms ease, visibility 0s linear 120ms"),
+    CSS(".bt-app-tile:hover .bt-app-details, .bt-app-tile:focus-within .bt-app-details",
+        "opacity" => "1", "visibility" => "visible",
+        "transition" => "opacity 120ms ease 300ms, visibility 0s linear 300ms"),
+    CSS(".bt-app-flip .bt-app-details", "left" => "auto", "right" => "0"),
+    CSS("@media (hover: none)", CSS(".bt-app-details", "display" => "none")),
+    CSS(".bt-app-details-title", "font-weight" => "600", "font-size" => "13px"),
+    CSS(".bt-app-details-desc", "margin" => "4px 0 0", "color" => "var(--bt-text)"),
+    CSS(".bt-app-details-label", "margin-top" => "8px", "color" => "var(--bt-text-muted)",
+        "font-size" => "11px"),
+    CSS(".bt-app-details-tools", "display" => "flex", "flex-wrap" => "wrap", "gap" => "4px",
+        "margin-top" => "3px"),
+    CSS(".bt-app-details-tools code",
+        "font-size" => "11px", "padding" => "1px 5px", "border-radius" => "4px",
+        "background" => "var(--bt-surface-2)", "border" => "1px solid var(--bt-border)"),
+    CSS(".bt-app-details-where", "margin-top" => "8px", "color" => "var(--bt-text-muted)"),
+
+    # The setup dialog.
+    CSS(".bt-app-setup", "display" => "flex", "flex-direction" => "column",
+        "gap" => "var(--bt-space-3)", "padding-top" => "12px"),
+    CSS(".bt-app-setup-head", "display" => "flex", "gap" => "var(--bt-space-3)",
+        "align-items" => "flex-start"),
+    CSS(".bt-app-setup-title", "font-weight" => "600", "font-size" => "15px"),
+    CSS(".bt-app-setup-desc", "margin" => "4px 0 0", "color" => "var(--bt-text-muted)",
+        "font-size" => "13px", "line-height" => "1.45"),
+    CSS(".bt-app-setup-label", "font-size" => "13px"),
+    CSS(".bt-app-setup-note", "font-size" => "12px", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-app-choices", "display" => "flex", "flex-direction" => "column", "gap" => "6px"),
+    CSS(".bt-app-choice",
+        "appearance" => "none", "font" => "inherit", "color" => "inherit", "text-align" => "left",
+        "display" => "flex", "align-items" => "baseline", "gap" => "8px",
+        "padding" => "10px 12px", "cursor" => "pointer",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border-strong)", "border-radius" => "var(--bt-radius-sm)"),
+    CSS(".bt-app-choice:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-app-choice.bt-on",
+        "border-color" => "var(--bt-accent)", "box-shadow" => "0 0 0 1px var(--bt-accent)"),
+    CSS(".bt-app-choice-name", "font-weight" => "600", "font-size" => "13px"),
+    CSS(".bt-app-choice-host", "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
+        "min-width" => "0"),
+    CSS(".bt-app-noworker", "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+    CSS(".bt-app-start:disabled", "opacity" => "0.5", "cursor" => "not-allowed"),
 )

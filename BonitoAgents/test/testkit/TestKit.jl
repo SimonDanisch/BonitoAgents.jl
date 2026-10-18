@@ -96,7 +96,7 @@ export TestServer, dev_server, add_worker!, drop_worker_connection!,
        kimi_tool, codex_mcp_tool, codex_shell, codex_image, REPLAY_FN,
        post_turn,
        sub_text, sub_tool,
-       diff_block, text_block, error_reply, crash, end_turn,
+       diff_block, text_block, image_block, error_reply, crash, end_turn,
        mcp_call, bt_eval, bt_continue,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, emulate_phone, tap, swipe,
@@ -180,10 +180,13 @@ bt_continue(; env_path = nothing, timeout = nothing, id = nothing) =
 # Content-block specs for the generic `tool` event. `diff_block` renders as a
 # Monaco DiffEditor; `text_block` as a tool text block (grep-style lines render
 # as search rows; `"<label>:\n<body>"` with label in stdout/result/error/stderr
-# renders as a bt_julia_eval section).
+# renders as a bt_julia_eval section); `image_block` as the picture a Read of an
+# image file returns, its bytes in the content.
 diff_block(path, old, new) = Dict("type" => "diff", "path" => String(path),
                                   "old" => String(old), "new" => String(new))
 text_block(s::AbstractString) = Dict("type" => "text", "text" => String(s))
+image_block(bytes::AbstractVector{UInt8}, mime::AbstractString) =
+    Dict("type" => "image", "data" => base64encode(bytes), "mimeType" => String(mime))
 
 """
     kimi_tool(name; kind, args, content, status, id, human_title) -> Dict
@@ -659,7 +662,12 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     disp_port = Sockets.getsockname(sock)[2]
     dispatcher_task = Base.errormonitor(@async begin
         while isopen(sock)
-            client = try accept(sock) catch; break end
+            client = try
+                accept(sock)
+            catch e
+                e isa Base.IOError || rethrow()   # the listener closed at teardown
+                break
+            end
             Base.errormonitor(@async handle_client(client, agent_ref))
         end
     end)
@@ -752,7 +760,7 @@ end
 function handle_client(client, agent_ref::Ref{Function})
     try
         while !eof(client)
-            line = try readline(client) catch; break end
+            line = readline(client)   # a closed client is the IOError below
             isempty(line) && continue
             msg = JSON.parse(line)
             # session/load replay request: serve the scripted history for this
@@ -798,7 +806,7 @@ function handle_client(client, agent_ref::Ref{Function})
     catch e
         e isa Base.IOError || @warn "TestKit dispatcher client crashed" exception=e
     finally
-        try close(client) catch end
+        close(client)   # idempotent
     end
 end
 
@@ -1102,12 +1110,10 @@ const PANE_SCOPE_JS = raw"""(() => {
             return panes.find(p => p.offsetParent !== null) || null;
         };
         const wrap = (orig, all) => function(sel) {
-            try {
-                if (typeof sel === 'string' && MSG.test(sel)) {
-                    const p = visiblePane();
-                    if (p) return all ? p.querySelectorAll(sel) : p.querySelector(sel);
-                }
-            } catch (e) {}
+            if (typeof sel === 'string' && MSG.test(sel)) {
+                const p = visiblePane();
+                if (p) return all ? p.querySelectorAll(sel) : p.querySelector(sel);
+            }
             return orig.call(this, sel);
         };
         document.querySelector    = wrap(Document.prototype.querySelector,    false);
@@ -2074,8 +2080,8 @@ function worker_log_tail(s::TestServer; lines::Int = 40)
         "RUNNING (so: wedged, not dead)"
     else
         p = s.h.worker_proc
-        sig = try p.termsignal catch; 0 end
-        code = try p.exitcode catch; -1 end
+        sig = p.termsignal
+        code = p.exitcode
         signalled = sig != 0
         signalled ? "killed by signal $sig" : "exited with code $code"
     end

@@ -960,7 +960,8 @@ function Bonito.jsrender(session::Session, p::FilePanel)
             if (m.startsWith('link:')) {
                 const url = m.slice(5);
                 s.textContent = 'shared: ' + url;
-                ($(COPY_TEXT_JS))(url).then(() => { s.textContent = 'link copied: ' + url; }, () => {});
+                ($(COPY_TEXT_JS))(url).then(() => { s.textContent = 'link copied: ' + url; },
+                                            () => { s.textContent = 'shared (copy it from here): ' + url; });
             } else {
                 s.textContent = 'not shared: ' + m.slice(6);
             }

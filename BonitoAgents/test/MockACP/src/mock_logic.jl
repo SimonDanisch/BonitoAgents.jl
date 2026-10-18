@@ -175,18 +175,23 @@ todo_write(entries::Vector; id = "todo1", status = "completed") = upd("tool_call
          "content"    => todo_write_content(entries)))
 
 # Pack the dispatcher's content specs into ACP content blocks. A `diff` spec
-# becomes a DiffContent; everything else a text block in the `type:"content"`
-# envelope (TextContent). Used by the generic `tool` / `tool_update` events.
-pack_tool_content(items) = Any[
-    let t = String(get(c, "type", "text"))
-        t == "diff" ?
-            Dict{String,Any}("type" => "diff", "path" => String(c["path"]),
-                             "oldText" => String(get(c, "old", "")),
-                             "newText" => String(get(c, "new", ""))) :
-            Dict{String,Any}("type" => "content",
-                             "content" => Dict("type" => "text",
-                                               "text" => String(c["text"])))
-    end for c in items]
+# becomes a DiffContent, an `image` one an ImageContent (base64 bytes, the shape
+# claude-agent-acp ships for a Read of a picture), everything else a text block
+# in the `type:"content"` envelope (TextContent). Used by the generic `tool` /
+# `tool_update` events.
+pack_tool_content(items) = Any[pack_block(Val(Symbol(get(c, "type", "text"))), c) for c in items]
+
+pack_block(::Val{:diff}, c) =
+    Dict{String,Any}("type" => "diff", "path" => String(c["path"]),
+                     "oldText" => String(get(c, "old", "")),
+                     "newText" => String(get(c, "new", "")))
+pack_block(::Val{:image}, c) =
+    Dict{String,Any}("type" => "content",
+                     "content" => Dict("type" => "image", "data" => String(c["data"]),
+                                       "mimeType" => String(c["mimeType"])))
+pack_block(::Val, c) =
+    Dict{String,Any}("type" => "content",
+                     "content" => Dict("type" => "text", "text" => String(c["text"])))
 
 # The `_meta` envelope claude-agent-acp stamps on every forwarded SUBAGENT
 # update: the parent Task's tool_use id. Used by the sub_text / sub_tool
@@ -486,9 +491,9 @@ function run_dispatcher_replay()
     flush(sock)
     next_tool_id = 1
     while !eof(sock)
-        line = try readline(sock) catch; break end
+        line = try readline(sock) catch e; e isa Base.IOError || rethrow(); break end   # TestKit hung up
         isempty(line) && continue
-        ev = try JSON.parse(line) catch; continue end
+        ev = JSON.parse(line)
         et = String(get(ev, "type", ""))
         if et == "user"
             user_chunk(String(ev["text"]))
@@ -549,16 +554,16 @@ function run_dispatcher_prompt(prompt_id)
         if cancelled[] && !IGNORE_CANCEL
             stop_reason = "cancelled"
             while !eof(sock)
-                tail = try readline(sock) catch; break end
+                tail = try readline(sock) catch e; e isa Base.IOError || rethrow(); break end
                 isempty(tail) && continue
-                tev = try JSON.parse(tail) catch; continue end
+                tev = JSON.parse(tail)
                 String(get(tev, "type", "")) == "end" && break
             end
             break
         end
-        line = try readline(sock) catch; break end
+        line = try readline(sock) catch e; e isa Base.IOError || rethrow(); break end   # TestKit hung up
         isempty(line) && continue
-        ev = try JSON.parse(line) catch; continue end
+        ev = JSON.parse(line)
         et = String(get(ev, "type", ""))
         if et == "text"
             agent_chunk(String(ev["text"]))
@@ -1017,9 +1022,16 @@ end
 # when stdin EOFs (parent closed our stdin → time to die).
 function dispatch_loop()
     while !eof(stdin)
-        line = try readline(stdin) catch; break end
+        line = readline(stdin)
         isempty(line) && continue
-        msg = try JSON.parse(line) catch; continue end
+        msg = try
+            JSON.parse(line)
+        catch e
+            # Not JSON: ArgumentError from JSON 1, ErrorException from 0.21.
+            e isa ArgumentError || e isa ErrorException || rethrow()
+            @warn "MockACP: a frame from the client is not JSON" line exception = e
+            continue
+        end
         method = String(get(msg, "method", ""))
         id     = get(msg, "id", nothing)
         if method == "initialize" && id !== nothing

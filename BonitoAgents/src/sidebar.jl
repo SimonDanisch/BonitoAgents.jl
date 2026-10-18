@@ -200,7 +200,7 @@ struct SidebarChat
     active0 :: Bool        # first paint only; the nav handler owns it afterwards
 end
 
-function Bonito.jsrender(session::Bonito.Session, c::SidebarChat)
+function render_part(session::Bonito.Session, c::SidebarChat)   # timed: diagnostics.jl
     # Liveness is the icon's glow. Its state rides the wrapper's CLASS, not
     # `data-status`: Bonito attribute updates assign a JS property, so `data-*`
     # freezes at its initial value — which is exactly why the old code had to
@@ -551,8 +551,12 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         class = "bt-side-collapse", title = "Toggle sidebar (Ctrl/⌘+B)",
         onclick = js"""event => {
             const aside = event.currentTarget.closest('.bt-sidebar');
+            // A phone has no room for the full sidebar beside the page: there
+            // it opens OVER the page (`bt-side-open`), for one visit, and the
+            // icon rail stays what it is.
+            if (matchMedia($(PHONE_MEDIA)).matches) { aside.classList.toggle('bt-side-open'); return; }
             const collapsed = aside.classList.toggle('bt-collapsed');
-            try { localStorage.setItem('bt-sidebar-collapsed', collapsed ? '1' : '0'); } catch (_) {}
+            ($(STORAGE_JS)).set('bt-sidebar-collapsed', collapsed ? '1' : '0');
         }""")
     header = DOM.div(collapse_btn; class = "bt-side-header")
 
@@ -595,18 +599,19 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                 return;
             }
             const item = e.target.closest('.bt-side-item');
-            if (item) $(current_view).notify(item.dataset.projectId || '');
+            if (!item) return;
+            $(current_view).notify(item.dataset.projectId || '');
+            el.classList.remove('bt-side-open');   // the drawer was for picking it
         });
         // Restore the collapsed/expanded sidebar state from a previous visit.
-        try { if ((localStorage.getItem('bt-sidebar-collapsed') || '0') === '1') el.classList.add('bt-collapsed'); } catch (_) {}
+        const store = $(STORAGE_JS);
+        if ((store.get('bt-sidebar-collapsed') || '0') === '1') el.classList.add('bt-collapsed');
         // ...and the width the user dragged it to (see `.bt-side-resize`). Out
         // of range or unparseable ⇒ leave the per-breakpoint default alone.
-        try {
-            const w = parseFloat(localStorage.getItem('bt-sidebar-width') || '');
-            if (w >= 150 && w <= 560) el.style.setProperty('--bt-side-w', Math.round(w) + 'px');
-        } catch (_) {}
+        const w = parseFloat(store.get('bt-sidebar-width') || '');
+        if (w >= 150 && w <= 560) el.style.setProperty('--bt-side-w', Math.round(w) + 'px');
         // Restore last route on fresh sessions (when soft_close didn't catch us).
-        const saved = localStorage.getItem(LAST_PID_KEY) || '';
+        const saved = store.get(LAST_PID_KEY) || '';
         const sep = saved.indexOf('|');
         if (sep > 0 && saved.slice(0, sep) === boot) {
             const pid = saved.slice(sep + 1);
@@ -649,11 +654,9 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         document.querySelectorAll('.bt-sidebar .bt-side-item').forEach(el => {
             el.classList.toggle('bt-side-active', el.dataset.projectId === pid);
         });
-        try {
-            const aside = document.querySelector('.bt-sidebar');
-            const boot = aside ? (aside.dataset.bootId || '') : '';
-            localStorage.setItem('bt-last-pid', boot + '|' + (pid || ''));
-        } catch (e) {}
+        const aside = document.querySelector('.bt-sidebar');
+        const boot = aside ? (aside.dataset.bootId || '') : '';
+        ($(STORAGE_JS)).set('bt-last-pid', boot + '|' + (pid || ''));
     }""")
 
     return aside
@@ -662,6 +665,10 @@ end
 # CSS for the sidebar + icons. Mobile (≤640px) collapses to icons-only at
 # 56px wide; desktop expands to 200px with the project name to the right
 # of each icon.
+# Where the sidebar is an icon rail that opens over the page (the CSS below and
+# the toggle's JS read the same query).
+const PHONE_MEDIA = "(max-width: 640px)"
+
 const SidebarStyles = Bonito.Styles(
     CSS(".bt-sidebar",
         # Normal flex child of `.bt-shell` rather than `position: fixed`. The
@@ -968,33 +975,64 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-sidebar.bt-collapsed .bt-side-tree-wrap", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-tree-hint", "display" => "none"),
 
-    # Mobile: collapse to icon-only sidebar.
-    CSS("@media (max-width: 640px)",
+    # Only for the phone's open sidebar (below).
+    CSS(".bt-side-backdrop", "display" => "none"),
+
+    # Phone: the icon rail, for switching chats only. No ✕ on it: a phone keeps
+    # `:hover` on what was tapped last, so the ✕ showed on the icon itself, and
+    # every few taps closed (and shut down) the chat meant to be opened. The
+    # sidebar's toggle opens the whole sidebar over the page instead
+    # (`bt-side-open`), where each row has its name and a ✕ of its own.
+    CSS("@media $(PHONE_MEDIA)",
         CSS(".bt-sidebar",  "width" => "56px"),
         CSS(".bt-side-resize", "display" => "none"),
-        CSS(".bt-side-name", "display" => "none"),
-        CSS(".bt-side-item", "justify-content" => "center"),
-        # `RUNNING ON WORKER` is ~68px wide at the chosen font/letter-spacing
-        # but the icons-only sidebar is 56px — the text wraps to three lines
-        # (`RUNNI` / `ON` / `WORKE`) and pushes the layout sideways. The
-        # section is purely a visual divider; with names hidden, there's no
-        # group to label anyway. Drop it on mobile.
-        CSS(".bt-side-section", "display" => "none"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-name", "display" => "none"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-item", "justify-content" => "center"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-close", "display" => "none"),
         # The group labels as hairlines, as in the collapsed rail.
-        CSS(".bt-side-group",
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-group",
             "font-size" => "0", "padding" => "0", "height" => "1px",
             "margin" => "6px 12px", "background" => "var(--bt-border)"),
         # Same story for the "No open chats yet — open one from the
         # dashboard" empty state: a 56px column has no room for a sentence.
-        # The dashboard view that text refers to is already visible to the
-        # right; hide on mobile so the sidebar stays purely icons.
-        CSS(".bt-side-empty", "display" => "none"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-empty", "display" => "none"),
         # The per-chat "▾ files" affordance is absolutely positioned at the
         # row's bottom-right; in the 56px icon rail it overlays the chat icon.
         # The explicit `.bt-collapsed` path hides it (above) — the responsive
         # 56px path must too, or a narrow window shows the menu over the icon.
         CSS(".bt-side-tree-hint", "display" => "none"),
-        CSS(".bt-side-tree-wrap", "display" => "none")),
+        CSS(".bt-side-tree-wrap", "display" => "none"),
+
+        # The open sidebar, over the page. The rail's 56px stay in the layout,
+        # so nothing behind it moves. These come after the `.bt-collapsed`
+        # rules on purpose: a phone that once collapsed the sidebar still gets
+        # the whole one here.
+        CSS(".bt-sidebar.bt-side-open",
+            "position" => "fixed", "top" => "0", "bottom" => "0", "left" => "0",
+            "width" => "min(300px, 85vw)", "z-index" => "900",
+            "box-shadow" => "var(--bt-shadow-lg, 0 8px 32px rgba(0,0,0,0.25))"),
+        # The rail's place: its 56px and its 1px border.
+        CSS(".bt-shell:has(> .bt-sidebar.bt-side-open)", "padding-left" => "57px"),
+        CSS(".bt-sidebar.bt-side-open ~ .bt-side-backdrop",
+            "display" => "block", "position" => "fixed", "inset" => "0", "z-index" => "899",
+            "background" => "rgba(15,23,42,0.35)"),
+        CSS(".bt-sidebar.bt-side-open .bt-side-header",
+            "justify-content" => "flex-end", "padding" => "0 8px 2px"),
+        CSS(".bt-sidebar.bt-side-open .bt-side-name", "display" => "-webkit-box"),
+        # Room on the right for the ✕, so a long title never runs under it.
+        CSS(".bt-sidebar.bt-side-open .bt-side-item",
+            "justify-content" => "flex-start", "padding-right" => "44px"),
+        CSS(".bt-sidebar.bt-side-open .bt-side-group",
+            "font-size" => "11px", "padding" => "10px 12px 4px", "height" => "auto",
+            "margin" => "0", "background" => "none"),
+        CSS(".bt-sidebar.bt-side-open .bt-side-empty", "display" => "block"),
+        # A finger-sized ✕ at the row's right edge, away from the icon.
+        CSS(".bt-sidebar.bt-side-open .bt-side-close",
+            "display" => "block", "top" => "50%", "right" => "6px", "transform" => "translateY(-50%)",
+            "font-size" => "14px", "padding" => "9px 11px")),
+    # No hover on a touch screen: in the open sidebar the ✕ is simply there.
+    CSS("@media $(PHONE_MEDIA) and (hover: none)",
+        CSS(".bt-sidebar.bt-side-open .bt-side-close", "opacity" => "1", "pointer-events" => "auto")),
 )
 
 # ── Unified App ────────────────────────────────────────────────────────────
@@ -1185,21 +1223,26 @@ settled!(ls::LoadingState) = safe_set!(ls.settled, ls.settled[] + 1)
 #                            would be a tight failure loop)
 #   a task is in flight   → spinner
 #   otherwise             → spawn ONE bring-up task, show spinner
-function project_loading_view(state::ServerState, pid::String,
-                               current_view::Observable{String},
-                               ls::LoadingState)
-    # Wrap the reactive body in a DOM.div: unified_main's outer
-    # `map(current_view) do pid ... end` expects each branch to return a
-    # Node, not an Observable{Node}. Returning the bare `map(state.workers)`
-    # threw `MethodError: Cannot convert Observable{Node} to Node` and the
-    # loading view never appeared while the bring-up ran.
+struct ChatLoadingView
+    state        :: ServerState
+    pid          :: String
+    current_view :: Observable{String}
+    ls           :: LoadingState
+end
+
+# A component, so the card's `map(session, state.workers)` belongs to the
+# subsession the overlay renders it in, and ends when the overlay re-renders: a
+# plain function's map lived on the tab's session, one more listener on every
+# worker change for each render.
+function Bonito.jsrender(session::Bonito.Session, v::ChatLoadingView)
+    (; state, pid, current_view, ls) = v
     # The spinner is a STABLE sibling, rendered once OUTSIDE the reactive `body`
     # below. If it lived inside the `map`, every `state.workers` notify during
     # bring-up would recreate the element and restart its CSS rotation from 0° —
     # the classic "the spinner doesn't spin". Offline/error branches tag their
     # content `.bt-loading-msg`, and CSS (`:has`) hides the spinner for them.
     spinner = DOM.div(class = "bt-loading-spinner")
-    body = map(state.workers) do workers
+    body = map(session, state.workers) do workers
         p = get(state.projects[], pid, nothing)
         p === nothing && return DOM.div("Unknown project: $pid";
                                         class = "bt-empty bt-loading-msg",
@@ -1227,12 +1270,11 @@ function project_loading_view(state::ServerState, pid::String,
                         onclick = js"() => $(ls.retry).notify($(pid))");
                 class = "bt-loading-msg")
         end
-        # Gate the bring-up on the chat still being the one on screen (T5). This
-        # `map(state.workers)` body is NOT session-scoped, so it survives the
-        # user navigating away (or closing the chat via ✕) and re-runs on the
-        # next workers-notify. Without this gate that stale re-run would respawn
-        # the claude subprocess for a chat the user already closed. T1's funnel
-        # also collapses genuine duplicate bring-ups, but this stops the spurious
+        # Gate the bring-up on the chat still being the one on screen (T5): a
+        # worker change can re-run this after the user navigated away (or closed
+        # the chat via ✕), and that re-run must not respawn the claude
+        # subprocess for a chat the user already closed. T1's funnel also
+        # collapses genuine duplicate bring-ups, but this stops the spurious
         # kick at the source.
         if current_view[] == pid &&
            !(pid in ls.inflight) && !haskey(state.chat_models, pid)
@@ -1256,15 +1298,16 @@ function project_loading_view(state::ServerState, pid::String,
                     class = "bt-loading-sub");
             class = "bt-loading-text")
     end
-    return DOM.div(DOM.div(spinner, body; class = "bt-loading"); class = "bt-loading-wrap")
+    return Bonito.jsrender(session,
+        DOM.div(DOM.div(spinner, body; class = "bt-loading"); class = "bt-loading-wrap"))
 end
 
 # Phase 2 of the load screen: the card for a chat whose ChatModel IS cached
 # but whose pane hasn't shown its first rows yet. ONE card (identical
-# classes/geometry to `project_loading_view`'s) stays up from click to the
+# classes/geometry to `ChatLoadingView`'s) stays up from click to the
 # first rows, and only its sub-text changes:
 #
-#   "Connecting to <worker>…"   project_loading_view, while the model is built
+#   "Connecting to <worker>…"   ChatLoadingView, while the model is built
 #   "Loading the chat…"         this card, pane DOM shipping + mounting
 #
 # The chat module ends it: `markReady` (bonitoagents.js) dispatches a
@@ -1396,12 +1439,12 @@ function unified_main(session::Bonito.Session, state::ServerState,
     # ── Dashboard pane: rendered ONCE, mounted forever ──────────────────────
     progress = pane === nothing ? nothing : pane.progress
     dash_pane = DOM.div(
-        dashboard_dom(session, state; current_view = current_view, progress = progress);
+        page_phase(() -> dashboard_dom(session, state; current_view = current_view, progress = progress), :dashboard);
         class = "bt-view bt-view-dash")
     # The Settings page, the same way: rendered once, shown while
     # `current_view == SETTINGS_VIEW`.
     settings_pane = DOM.div(
-        settings_dom(session, state; current_view = current_view, progress = progress);
+        page_phase(() -> settings_dom(session, state; current_view = current_view, progress = progress), :settings);
         class = "bt-view bt-view-settings")
 
     # ── Chat panes: one per opened chat, DOM-preserved via KeyedList ────────
@@ -1419,9 +1462,9 @@ function unified_main(session::Bonito.Session, state::ServerState,
                          class = "bt-view bt-view-chats")
 
     # ── Overlay: the single, continuous load screen ──────────────────────────
-    # Model not cached yet → `project_loading_view` (kicks the bring-up and
-    # re-notifies `current_view` on success → we re-enter). Model cached →
-    # `chat_waiting_view`: cached ≠ pixels ready — the pane still has to
+    # Model not cached yet → `ChatLoadingView` (kicks the bring-up and bumps
+    # `ls.settled` when it is done → we re-enter). Model cached →
+    # `ChatWaitingView`: cached ≠ pixels ready — the pane still has to
     # ship, mount, and settle, and the overlay must hold the SAME card up
     # until the chat module's settle events dismiss it. (It used to go
     # display:none here, exposing ~1s of bare background before the
@@ -1441,7 +1484,8 @@ function unified_main(session::Bonito.Session, state::ServerState,
             DOM.div(ChatWaitingView(state, pid);
                     style = Styles("height" => "100%"))
         elseif haskey(state.projects[], pid)
-            project_loading_view(state, pid, current_view, ls)
+            DOM.div(ChatLoadingView(state, pid, current_view, ls);
+                    style = Styles("height" => "100%"))
         else
             DOM.div("Unknown project: $pid"; class = "bt-empty",
                     style = Styles("padding" => "40px"))
@@ -1475,6 +1519,16 @@ function unified_main(session::Bonito.Session, state::ServerState,
         cv = current_view[]
         (!isempty(cv) && haskey(state.chat_models, cv) && !(cv in keep)) && push!(keep, cv)
         keep == cur || (alive[] = keep)
+        # The chat on screen lost its model while this tab showed it: its pane is
+        # gone, and the overlay still holds the hidden card of a settled pane, so
+        # without this the view stayed blank until the next click. Closed with ✕
+        # (in another tab; this one's ✕ already went home): home, like there.
+        # Closed by the server (the cap on live agents, `note_bound!`): the
+        # overlay again, whose loading card brings it back up.
+        if cv in cur && !haskey(state.chat_models, cv)
+            p = get(state.projects[], cv, nothing)
+            p !== nothing && p.dismissed ? (current_view[] = "") : settled!(ls)
+        end
     end
 
     container = DOM.div(dash_pane, settings_pane, chats_host, overlay_pane; class = "bt-main-views")
@@ -1575,6 +1629,7 @@ function side_resizer(session::Bonito.Session)
         const aside = el.closest('.bt-shell')?.querySelector('.bt-sidebar');
         if (!aside) return;
         const MIN = 150, MAX = 560;
+        const store = $(STORAGE_JS);
         let dragging = false;
         const apply = (w) => aside.style.setProperty('--bt-side-w', Math.round(w) + 'px');
         el.addEventListener('pointerdown', (e) => {
@@ -1582,7 +1637,9 @@ function side_resizer(session::Bonito.Session)
             dragging = true;
             // Capture so the drag survives the pointer leaving the 5px strip —
             // which it does immediately, since the strip moves with the edge.
-            try { el.setPointerCapture(e.pointerId); } catch (_) {}
+            // A pointer that is not live (a scripted event) can't be captured.
+            try { el.setPointerCapture(e.pointerId); }
+            catch (error) { if (error.name !== 'NotFoundError') throw error; }
             el.classList.add('bt-side-resize-active');
             document.body.style.cursor = 'col-resize';
             document.body.style.userSelect = 'none';
@@ -1596,20 +1653,18 @@ function side_resizer(session::Bonito.Session)
         const end = (e) => {
             if (!dragging) return;
             dragging = false;
-            try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+            if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
             el.classList.remove('bt-side-resize-active');
             document.body.style.cursor = '';
             document.body.style.userSelect = '';
             const w = parseFloat(aside.style.getPropertyValue('--bt-side-w'));
-            try {
-                if (w >= MIN && w <= MAX) localStorage.setItem('bt-sidebar-width', String(Math.round(w)));
-            } catch (_) {}
+            if (w >= MIN && w <= MAX) store.set('bt-sidebar-width', String(Math.round(w)));
         };
         el.addEventListener('pointerup', end);
         el.addEventListener('pointercancel', end);
         el.addEventListener('dblclick', () => {
             aside.style.removeProperty('--bt-side-w');
-            try { localStorage.removeItem('bt-sidebar-width'); } catch (_) {}
+            store.remove('bt-sidebar-width');
         });
     }""")
     return el
@@ -1623,81 +1678,94 @@ depending on `current_view`. Replaces the old per-project `/p/<id>` routes.
 """
 function unified_app(state::ServerState)
     App(; title = "BonitoAgents") do session, request
-        # Who this tab serves (identity.jl): the local user, or whoever the proxy
-        # authenticated. Behind the proxy a request without an identity did not
-        # come through Authelia, and gets nothing.
-        user = request_user(state.auth, request)
-        user === nothing && return DOM.div(
-            "This server answers only through its login proxy. Open it at its public address.";
-            style = "padding: 2em; font-family: sans-serif")
-        register_user_session!(state, session, user)
-        # Which device a tab is: the log's slow-command lines name tabs only.
-        @info "tab opened" tab = tab_id(session) user = user.name client = client_address(request)
-        # Per-session view of the shared state. `copy(state, session, user)`
-        # shares the workers/projects/chat_models tables and the lock, but gives
-        # this session its OWN connected child of each version Observable (via
-        # `map(identity, session, ...)` — auto-deregisters on tab close).
-        # `current_view` is per-session (transient navigation state).
-        view = copy(state, session, user)
-        current_view = Observable("")
-        # Per-session bring-up bookkeeping for the loading view (see
-        # LoadingState / project_loading_view). The retry handler clears the
-        # recorded error and re-renders, which re-spawns the bring-up task.
-        ls = LoadingState()
-        on(session, ls.retry) do retry_pid
-            isempty(retry_pid) && return
-            delete!(ls.errors, retry_pid)
-            settled!(ls)
-        end
-        # The window's PlotPane handle wraps a BonitoWidgets.Workspace. Created
-        # BEFORE the sidebar + unified_main so it can be passed down to the chat
-        # panes (ChatPaneRef sets it on each per-session ChatModel view) AND to
-        # the sidebar's per-chat file trees (which open files into it); the
-        # Workspace itself is built AFTER, with the chat panel as its first member.
-        pane = PlotPane()
-        sidebar = project_sidebar(session, view, current_view, pane)
-        main_panel = unified_main(session, view, current_view, ls, pane)
-        # The whole stage is the Workspace: the chat/dashboard is the "chat"
-        # panel; opened files and detached `bt_show_app` embeds become more
-        # panels the user can tab / split / float (VSCode-style).
-        stage, glue_js, _ =
-            install_workspace!(session, view, current_view, pane, main_panel)
-        shell = DOM.div(
-            # MarkdownCSS FIRST: it's the base sheet our styles override.
-            # Stylesheet order breaks specificity ties — with MarkdownCSS
-            # last, its `.markdown-body pre` light-gray background beat the
-            # chat's dark code blocks (see ChatStyles' agent-pre comment).
-            Bonito.MarkdownCSS,
-            UnifiedShellStyles,
-            DashboardStyles,
-            ChatStyles,
-            SidebarStyles,
-            WorkspaceStageStyles,
-            connection_guard(session),
-            login_guard(session, state.auth),
-            sidebar,
-            # Adjacent sibling on purpose: `.bt-sidebar.bt-collapsed + .bt-side-resize`
-            # hides the handle for the icon rail.
-            side_resizer(session),
-            stage,
-            # The window's ONE progress card (position:fixed, top-centered).
-            # Every long-running operation and every outcome in this window
-            # reports into `pane.progress` and renders HERE — the dashboard no
-            # longer carries its own pill, and nothing flashes a toast over the
-            # composer any more. See progress.jl::progress_overlay.
-            progress_overlay(session, pane.progress),
-            # Window-level file-viewer driver: gives every rendered file body its
-            # behaviour (image dimensions, table sort, 3D mount) no matter how it
-            # was delivered — a chat bubble's bt_show preview, a workspace panel,
-            # or a node the workspace moved between them. See `file_view_driver`.
-            file_view_driver(session);
-            class = "bt-shell")
-        # Wire the bt_show_app detach controller once the shell is in the DOM:
-        # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all
-        # descendants of the shell, guaranteed present by onload.
-        Bonito.onload(session, shell, glue_js)
-        # Favicon (SVG + PNG fallback) — injected into <head> on load.
-        favicon_onload(session, shell)
-        shell
+        page_phase(() -> unified_page(state, session, request), :handler)
     end
+end
+
+function unified_page(state::ServerState, session::Bonito.Session, request)
+    # Who this tab serves (identity.jl): the local user, or whoever the proxy
+    # authenticated. Behind the proxy a request without an identity did not
+    # come through Authelia, and gets nothing.
+    user = request_user(state.auth, request)
+    user === nothing && return DOM.div(
+        "This server answers only through its login proxy. Open it at its public address.";
+        style = "padding: 2em; font-family: sans-serif")
+    current_view = Observable("")
+    register_tab!(state, session, user, client_address(request), current_view)
+    request.context[:tab] = tab_id(session)     # for the page's timing (`timed_page`)
+    # Which device a tab is: the log's slow-command lines name tabs only.
+    @info "tab opened" tab = tab_id(session) user = user.name client = client_address(request)
+    # Per-session view of the shared state. `copy(state, session, user)`
+    # shares the workers/projects/chat_models tables and the lock, but gives
+    # this session its OWN connected child of each version Observable (via
+    # `map(identity, session, ...)` — auto-deregisters on tab close).
+    # `current_view` is per-session (transient navigation state).
+    view = copy(state, session, user)
+    # Per-session bring-up bookkeeping for the loading view (see
+    # LoadingState / ChatLoadingView). The retry handler clears the
+    # recorded error and re-renders, which re-spawns the bring-up task.
+    ls = LoadingState()
+    on(session, ls.retry) do retry_pid
+        isempty(retry_pid) && return
+        delete!(ls.errors, retry_pid)
+        settled!(ls)
+    end
+    # The window's PlotPane handle wraps a BonitoWidgets.Workspace. Created
+    # BEFORE the sidebar + unified_main so it can be passed down to the chat
+    # panes (ChatPaneRef sets it on each per-session ChatModel view) AND to
+    # the sidebar's per-chat file trees (which open files into it); the
+    # Workspace itself is built AFTER, with the chat panel as its first member.
+    pane = PlotPane()
+    sidebar = page_phase(() -> project_sidebar(session, view, current_view, pane), :sidebar)
+    main_panel = unified_main(session, view, current_view, ls, pane)
+    # The whole stage is the Workspace: the chat/dashboard is the "chat"
+    # panel; opened files and detached `bt_show_app` embeds become more
+    # panels the user can tab / split / float (VSCode-style).
+    stage, glue_js, _ = page_phase(:workspace) do
+        install_workspace!(session, view, current_view, pane, main_panel)
+    end
+    shell = DOM.div(
+        # First, so the console is kept from the page's first line of code on.
+        console_capture(session),
+        # MarkdownCSS FIRST: it's the base sheet our styles override.
+        # Stylesheet order breaks specificity ties — with MarkdownCSS
+        # last, its `.markdown-body pre` light-gray background beat the
+        # chat's dark code blocks (see ChatStyles' agent-pre comment).
+        Bonito.MarkdownCSS,
+        UnifiedShellStyles,
+        DashboardStyles,
+        ChatStyles,
+        SidebarStyles,
+        WorkspaceStageStyles,
+        connection_guard(session),
+        login_guard(session, state.auth),
+        page_load_report(session),
+        sidebar,
+        # Adjacent sibling on purpose: `.bt-sidebar.bt-collapsed + .bt-side-resize`
+        # hides the handle for the icon rail.
+        side_resizer(session),
+        # Behind the phone's open sidebar: a tap beside it closes it, and
+        # lands on nothing else.
+        DOM.div(; class = "bt-side-backdrop",
+                onclick = js"() => document.querySelector('.bt-sidebar')?.classList.remove('bt-side-open')"),
+        stage,
+        # The window's ONE progress card (position:fixed, top-centered).
+        # Every long-running operation and every outcome in this window
+        # reports into `pane.progress` and renders HERE — the dashboard no
+        # longer carries its own pill, and nothing flashes a toast over the
+        # composer any more. See progress.jl::progress_overlay.
+        progress_overlay(session, pane.progress),
+        # Window-level file-viewer driver: gives every rendered file body its
+        # behaviour (image dimensions, table sort, 3D mount) no matter how it
+        # was delivered — a chat bubble's bt_show preview, a workspace panel,
+        # or a node the workspace moved between them. See `file_view_driver`.
+        file_view_driver(session);
+        class = "bt-shell")
+    # Wire the bt_show_app detach controller once the shell is in the DOM:
+    # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all
+    # descendants of the shell, guaranteed present by onload.
+    Bonito.onload(session, shell, glue_js)
+    # Favicon (SVG + PNG fallback) — injected into <head> on load.
+    favicon_onload(session, shell)
+    shell
 end

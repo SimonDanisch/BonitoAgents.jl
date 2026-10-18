@@ -63,6 +63,7 @@ function is_portal_target(target::AbstractString)
 end
 
 function Bonito.HTTPServer.gate_request(g::TunnelGate, request::HTTP.Request)
+    request.context[:gate_t0] = time()      # for `log_slow_request`
     foreach(h -> HTTP.removeheader(request, h), IDENTITY_HEADERS)
     target = request.target
     startswith(target, "/") || return gate_answer(400, "bad request target\n")
@@ -72,8 +73,51 @@ function Bonito.HTTPServer.gate_request(g::TunnelGate, request::HTTP.Request)
     return admit!(g, request)
 end
 
-Bonito.HTTPServer.gate_response(::TunnelGate, request, response) =
-    (HTTP.setheader(response, "Cache-Control" => private_cache(HTTP.header(response, "Cache-Control", ""))); response)
+function Bonito.HTTPServer.gate_response(::TunnelGate, request, response)
+    HTTP.setheader(response, "Cache-Control" => private_cache(HTTP.header(response, "Cache-Control", "")))
+    log_slow_request(request, response)
+    return response
+end
+
+# A request the server took long to answer: from its arrival at the gate to the
+# answer leaving its route (a streamed body's transfer comes after), with the
+# part of it spent waiting for Authelia. A browser left waiting this long looks
+# like a hung server, and nothing else said where the time went.
+function log_slow_request(request::HTTP.Request, response::HTTP.Response; slow::Real = 2.0)
+    t0 = get(request.context, :gate_t0, nothing)
+    t0 === nothing && return nothing
+    took = time() - t0
+    took < slow && return nothing
+    phases = phase_summary(get(request.context, :page_phases, Dict{Symbol,Float64}()))
+    @warn "slow request: the browser waited on the server" target = first(request.target, 120) status = response.status seconds = round(took; digits = 1) login_seconds = round(get(request.context, :login_s, 0.0); digits = 1) phases client = client_address(request)
+    return nothing
+end
+
+# The timed parts of a page, slowest first: "render=13.2s handler=0.1s …", the
+# ones under `min_s` left out. Parts nest (the handler holds the dashboard), so
+# they don't add up. `render` is what Bonito spent after the handler returned:
+# rendering the components to HTML and serializing them.
+phase_summary(phases::AbstractDict; min_s::Real = 0.05) =
+    join(("$(k)=$(round(v; digits = 3))s" for (k, v) in sort!(collect(phases); by = last, rev = true) if v >= min_s), " ")
+
+"""
+    page_phase(f, name) -> f()
+
+Add the time `f` takes to the current page request's `name` (shown by the slow
+request warning). Outside a page request it just calls `f`. A phone waited
+minutes on the page, and a desktop 14 s for its HTML, with no line saying
+where the server spent it.
+"""
+function page_phase(f, name::Symbol)
+    phases = get(task_local_storage(), :bt_page_phases, nothing)
+    phases === nothing && return f()
+    t0 = time()
+    try
+        return f()
+    finally
+        phases[name] = get(phases, name, 0.0) + (time() - t0)
+    end
+end
 
 # `public` becomes `private`, and a response that says nothing says `private`.
 # One that is `private` or `no-store` already stays as it is.
@@ -94,7 +138,9 @@ redirect to the login page.
 function admit!(g::TunnelGate, request::HTTP.Request)
     headers = authelia_headers(g.auth, request)
     push!(headers, "X-Forwarded-Method" => request.method, "X-Forwarded-URI" => request.target)
+    asked = time()
     answer = ask_authelia(g.auth, "GET", PORTAL_PATH * "/api/authz/forward-auth", headers, UInt8[])
+    request.context[:login_s] = time() - asked
     name = HTTP.header(answer, "Remote-User", "")
     cookies = session_cookies(request)
     client = client_address(request)

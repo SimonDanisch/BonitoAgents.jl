@@ -47,7 +47,7 @@ end
         @test :code in propertynames(r)
         @test occursin("partial", r.code)
     finally
-        try M.interrupt!(s) catch end
+        s.in_flight === nothing || M.interrupt!(s)
         M.kill_session!(s)
     end
 end

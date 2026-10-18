@@ -67,8 +67,9 @@ enumerates.
 
 - **Apps** are permanent parts of the server with a chat of their own: the app
   lays out its chat's pane (from the chat's own widgets) and can add MCP tools to
-  every chat's agent. Opened from the dashboard's Apps card, pinned at the top of
-  the sidebar.
+  every chat's agent. The dashboard shows them as tiles with their logos and the
+  details on hover; the first click sets one up in a dialog (the worker its chat
+  runs on), later clicks open it. Pinned at the top of the sidebar.
 - **To-do app**: one list for the whole server, pinned above its chat. Any
   chat's agent can list, add and check off items (`todo_done` records which chat
   and why). **Start chat** has the app chat's agent pick the project folder for

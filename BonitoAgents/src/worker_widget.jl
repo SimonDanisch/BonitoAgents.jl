@@ -92,7 +92,7 @@ function worker_update_badge(online::Bool, state::Symbol, message::AbstractStrin
     )
 end
 
-function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
+function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnostics.jl
     state, wid = c.state, c.worker_id
     # A worker shared with someone's group (`share_worker!`) shows them its name
     # and lets them start chats on it; renaming, updating, sharing, removing it

@@ -43,6 +43,23 @@ if (typeof document !== 'undefined') {
 //     triggered from `createNode` so the user sees the compact diff under the
 //     header immediately. Implies !fetchEachExpand && !discardOnCollapse.
 // A token count the way a reader takes it in: 950, 1.2k, 48k, 1.3M.
+// localStorage for what the page only keeps for convenience (drafts, the todo
+// card's state). Storage can be off (SecurityError) or full
+// (QuotaExceededError): those warn and act as "nothing stored", anything else
+// throws. styles.jl's STORAGE_JS is the same for the server-rendered pieces.
+const storage = (() => {
+    const refused = (error, key) => {
+        if (!(error instanceof DOMException) ||
+            !['SecurityError', 'QuotaExceededError'].includes(error.name)) throw error;
+        console.warn(`browser storage refused (${key}):`, error.message);
+    };
+    return {
+        get(key) { try { return localStorage.getItem(key); } catch (e) { refused(e, key); return null; } },
+        set(key, value) { try { localStorage.setItem(key, value); } catch (e) { refused(e, key); } },
+        remove(key) { try { localStorage.removeItem(key); } catch (e) { refused(e, key); } },
+    };
+})();
+
 function formatTokens(n) {
     if (n < 1000) return String(Math.round(n));
     if (n < 10000) return (n / 1000).toFixed(1) + 'k';
@@ -180,17 +197,11 @@ export class Collapsable {
         });
     }
 
-    // "loading…" until the body arrives, at the height the body last had:
-    // the row is its final size from the start, and nothing below it moves
-    // when the body replaces the placeholder (the reply empties the slot).
+    // "loading…" until the body arrives, in the shape the body will have
+    // (`reserve`): the row is its final size from the start, and nothing
+    // below it moves when the body replaces the placeholder.
     showPlaceholder() {
-        this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
-        const h = this.reserve ? this.reserve() : 0;
-        if (h > 0) {
-            const ph = this.body.firstElementChild;
-            ph.style.boxSizing = 'border-box';
-            ph.style.height = h + 'px';
-        }
+        showLoading(this.body, this.reserve ? this.reserve() : null);
     }
 
     // Owner finished loading the lazy body: set its html + mark loaded so a
@@ -224,6 +235,13 @@ function formatBytes(n) {
     if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
     if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
     return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+// A body waiting for its render: "loading…", in `shape` (styles for the
+// placeholder) when the body's size is known. The reply empties the slot.
+function showLoading(body, shape) {
+    body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+    if (shape) Object.assign(body.firstElementChild.style, {boxSizing: 'border-box'}, shape);
 }
 
 class BonitoChat {
@@ -732,7 +750,9 @@ class BonitoChat {
                 p.engaged = true;
                 p.lastY = e.clientY;
                 p.lastT = performance.now();
-                try { this.container.setPointerCapture(e.pointerId); } catch (_) {}
+                // A pointer that is not live (a scripted event) can't be captured.
+                try { this.container.setPointerCapture(e.pointerId); }
+                catch (error) { if (error.name !== 'NotFoundError') throw error; }
                 this.container.classList.add('bt-messages-grabbing');
                 // Pan acts like a wheel: cancels pending chase + marks
                 // user input so the scroll handler treats subsequent
@@ -783,7 +803,7 @@ class BonitoChat {
             const vel     = p.velocity;
             this.panState = null;
             if (!engaged) return;
-            try { this.container.releasePointerCapture(e.pointerId); } catch (_) {}
+            if (this.container.hasPointerCapture(e.pointerId)) this.container.releasePointerCapture(e.pointerId);
             this.container.classList.remove('bt-messages-grabbing');
             if (Math.abs(vel) > PAN_FLING_THRESHOLD) {
                 this.momentumRaf = requestAnimationFrame(() => momentumStep(vel));
@@ -1007,8 +1027,7 @@ class BonitoChat {
     // next global event instead of reacting forever.
     lazyDestroy() {
         if (this.destroyed) return;
-        try { this.destroy(); } catch (_) { /* already half-gone */ }
-        CHAT_INSTANCES.delete(this);
+        try { this.destroy(); } finally { CHAT_INSTANCES.delete(this); }
     }
 
     // Single dispatch table. Julia sends `{type, ...}`; we route here.
@@ -1432,7 +1451,6 @@ class BonitoChat {
             return;
         }
         this.setFollowMode(false);
-        this.cancelPendingScroll();
         const node = this.cache.get(this.seqIndex(p));
         if (node && p >= this.plo && p <= this.phi && node.offsetParent !== null) {
             this.container.scrollTop = Math.max(0, node.offsetTop - offset);
@@ -1515,20 +1533,37 @@ class BonitoChat {
         }
     }
 
-    // The height this row's body rendered at, at the transcript's width now
-    // (within 2 px), or 0: what the server sent with the row (`body_h`) and
-    // what the row reported since. Keyed by the transcript's width, not the
-    // body's: a body can shrink to fit its content (native media), so its own
-    // width before the content arrives says nothing.
-    bodyWidth() { return Math.round(this.container.clientWidth); }
-
+    // The shape of this row's body placeholder (`showLoading`), or null. The
+    // height the body rendered at, at the transcript's width now (within
+    // 2 px): what the server sent with the row (`body_h`) and what the row
+    // reported since. Keyed by the transcript's width, not the body's: a body
+    // can shrink to fit its content (native media), so its own width before
+    // the content arrives says nothing.
+    //
+    // Not measured at this width, but one picture of known size (`media`):
+    // the picture's shape, laid out like `media_element` lays out the picture
+    // (its width, at most the body's, and its aspect ratio), so even a chat
+    // opened for the first time holds the row's size when the picture
+    // arrives. Not a height computed here: a native row shrinks to fit its
+    // body, so before the picture is in it nothing here knows the width it
+    // will get. Above it, as padding, what the body holds besides the picture
+    // (`media_extra`, a bt_show's Share row), as measured at another width.
+    // `overflow: hidden` drops the automatic minimum height, so "loading…"
+    // can't stretch a small picture's placeholder.
     bodyReserve(node) {
+        if (!node.collapsable) return null;
         const map = node.__btBodyH;
-        if (!map || !node.collapsable) return 0;
         const w = this.bodyWidth();
-        for (const [k, h] of Object.entries(map)) if (Math.abs(+k - w) <= 2) return h;
-        return 0;
+        if (map) for (const [k, h] of Object.entries(map))
+            if (Math.abs(+k - w) <= 2) return {height: h + 'px'};
+        const m = node.__btMedia;
+        if (m && m[0] > 0 && m[1] > 0)
+            return {boxSizing: 'content-box', padding: (node.__btMediaExtra || 0) + 'px 0 0',
+                    width: m[0] + 'px', maxWidth: '100%', aspectRatio: m[0] + ' / ' + m[1], overflow: 'hidden'};
+        return null;
     }
+
+    bodyWidth() { return Math.round(this.container.clientWidth); }
 
     // A tool row changed size: once it holds still, its body reports the
     // height it settled at, for the placeholder of the next render. An exact
@@ -1545,7 +1580,8 @@ class BonitoChat {
         const id = node.dataset.msgId;
         if (!id || !body || body.offsetParent === null || body.childElementCount === 0) return;
         if (body.querySelector(':scope > .bt-collapsable-loading')) return;
-        const h = Math.round(this.bodyContentHeight(body));
+        const content = this.bodyContentHeight(body);
+        const h = Math.round(content);
         const w = this.bodyWidth();
         if (w < 1 || h < 1) return;
         const map = node.__btBodyH || {};
@@ -1556,7 +1592,12 @@ class BonitoChat {
         }
         map[w] = h;
         node.__btBodyH = map;
-        this.comm.notify({type: 'tool.size', id, w, h});
+        // Of that, what is not its one picture (`bodyReserve`).
+        const pics = body.querySelectorAll('.bt-media-wrap');
+        const extra = pics.length === 1
+            ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
+        node.__btMediaExtra = extra;
+        this.comm.notify({type: 'tool.size', id, w, h, extra});
     }
 
     // A body's CONTENT box height: what a placeholder inside it has to fill
@@ -1839,7 +1880,15 @@ class BonitoChat {
         let dataUrl = null;
         // preserveDrawingBuffer is on, so toDataURL returns the last rendered
         // frame even when the app is off-screen.
-        if (canvas) { try { dataUrl = canvas.toDataURL('image/png'); } catch (_) {} }
+        if (canvas) {
+            // A canvas that drew a cross-origin picture is tainted and can't be
+            // read: the app is then frozen without a snapshot.
+            try { dataUrl = canvas.toDataURL('image/png'); }
+            catch (error) {
+                if (error.name !== 'SecurityError') throw error;
+                console.warn('app snapshot refused:', error.message);
+            }
+        }
         if (slot) {
             // The snapshot takes the app's place at the app's size: the row
             // keeps its height, so nothing around it moves when an app out of
@@ -1890,11 +1939,7 @@ class BonitoChat {
         if (body) {
             // At the snapshot's height until the app is back, like any body
             // waiting for its render (`showPlaceholder`).
-            const h = body.offsetHeight;
-            body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
-            const ph = body.firstElementChild;
-            ph.style.boxSizing = 'border-box';
-            ph.style.height = h + 'px';
+            showLoading(body, {height: body.offsetHeight + 'px'});
         }
         if (id) this.comm.notify({ type: 'tool.render', id });
     }
@@ -1946,7 +1991,7 @@ class BonitoChat {
             if (node.collapsable && !node.collapsable.loaded) {
                 node.collapsable.loaded = true;
                 const body = node.collapsable.body;
-                if (body.childElementCount === 0 && this.bodyReserve(node) > 0)
+                if (body.childElementCount === 0 && this.bodyReserve(node))
                     node.collapsable.showPlaceholder();
                 this.requestBody(node);
             }
@@ -2953,6 +2998,10 @@ class BonitoChat {
                 // The heights its body rendered at, by width (`body_h`,
                 // measured_sizes.jl), updated as it reports new ones.
                 div.__btBodyH = msg.body_h || null;
+                // A body that is one picture of known size (`media`, [w, h]):
+                // what its placeholder reserves until a height is measured.
+                div.__btMedia = msg.media || null;
+                div.__btMediaExtra = msg.media_extra || 0;
                 div.collapsable = new Collapsable(
                     div.querySelector('.bt-tool-header'),
                     div.querySelector('.bt-tool-body'),
@@ -3251,7 +3300,7 @@ class BonitoChat {
             // every tick. Default: collapsed on narrow panes (a long plan
             // card buried the whole chat on phones), expanded elsewhere; the
             // ▾ toggle persists the user's choice browser-wide.
-            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const storedTodo = storage.get('bt-todo-collapsed');
             const paneW = this.container.closest('.bt-chatpane')?.clientWidth
                        ?? window.innerWidth;
             this.taskbarEl.classList.toggle('bt-todo-collapsed',
@@ -3259,7 +3308,7 @@ class BonitoChat {
             this.onTaskbarClick = (ev) => {
                 if (ev.target.closest('.bt-taskbar-todo-toggle')) {
                     const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
-                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    storage.set('bt-todo-collapsed', c ? '1' : '0');
                     return;
                 }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
@@ -3775,9 +3824,9 @@ class BonitoChat {
             // delay (typically one task ≪ 50 ms, generous for slow
             // devices) without locking out chase for the steady-state
             // stream-while-at-bottom case. But follow mode SURVIVING to
-            // this point means nothing disengaged or cancelled us (a
-            // scroll-away lands in applyUserScroll's disengage, which
-            // cancels through cancelPendingScroll) — the chase must still
+            // this point means nothing disengaged or cancelled us (every
+            // disengage goes through setFollowMode(false), which cancels
+            // the pending chase) — the chase must still
             // land, e.g. after a downward re-engage mid-gesture. Re-arm
             // until the input window lapses instead of dropping.
             if ((performance.now() - this.lastUserInputT) < 100) {
@@ -4162,8 +4211,7 @@ class BonitoChat {
         if (pid) {
             const key = 'bt-draft:' + pid;
             const yolo = () => this.textInput.classList.contains('bt-text-input-yolo');
-            let saved = null;
-            try { saved = localStorage.getItem(key); } catch (_) {}
+            const saved = storage.get(key);
             if (saved && !this.textInput.value && !yolo()) {
                 this.textInput.value = saved;
                 this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
@@ -4175,13 +4223,7 @@ class BonitoChat {
                 if (this.pendingDraft === undefined) return;
                 const text = this.pendingDraft;
                 this.pendingDraft = undefined;
-                try {
-                    text.trim() ? localStorage.setItem(key, text) : localStorage.removeItem(key);
-                } catch (error) {
-                    if (!(error instanceof DOMException) ||
-                        !['QuotaExceededError', 'SecurityError'].includes(error.name)) throw error;
-                    console.warn('Could not save the chat draft:', error.message);
-                }
+                text.trim() ? storage.set(key, text) : storage.remove(key);
             };
             this.onDraftInput = () => {
                 if (yolo()) return;
@@ -4724,10 +4766,7 @@ class BonitoChat {
     applyUserScroll(prevTop) {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
         const atBot = this.atBottom();
-        if (this.followMode && !atBot) {
-            this.setFollowMode(false);
-            this.cancelPendingScroll();
-        }
+        if (this.followMode && !atBot) this.setFollowMode(false);
         if (this.followMode) return;
         if (atBot || (scrollTop > prevTop &&
                       scrollHeight - scrollTop - clientHeight < clientHeight &&
@@ -4760,6 +4799,11 @@ class BonitoChat {
         if (on) {
             this.unreadCount = 0;
             this.hideNewMessagePill();
+        } else {
+            // A chase queued while following has nothing left to follow: a
+            // jump, a lens or a restore that ends following must not be
+            // pulled back to the bottom on the next frame.
+            this.cancelPendingScroll();
         }
     }
 
@@ -4944,37 +4988,41 @@ function decorateCodeBlocks(rootEl) {
 // cannot serve. Same-origin absolute URLs are the same failure after the
 // browser has resolved the href, so accept those too. Real web links remain
 // ordinary anchors.
+// A malformed percent escape is still a valid Unix filename: keep it as written.
+function decodePath(text) {
+    try { return decodeURIComponent(text); }
+    catch (error) { if (!(error instanceof URIError)) throw error; return text; }
+}
+
 function markdownWorkerPath(anchor) {
     const raw = (anchor.getAttribute('href') || '').trim();
     if (!raw || raw.startsWith('#') || raw.startsWith('?')) return null;
     if (/^(mailto|tel|data|blob|javascript):/i.test(raw)) return null;
 
     let path = raw;
-    try {
-        const url = new URL(raw, window.location.href);
-        if (url.protocol === 'file:') {
-            path = decodeURIComponent(url.pathname);
-        } else if (url.protocol === 'http:' || url.protocol === 'https:') {
-            // An explicitly external URL is a web link. A same-dashboard URL
-            // is what a leading worker path becomes in the browser.
-            if (url.origin !== window.location.origin) return null;
-            path = decodeURIComponent(url.pathname);
-        } else {
-            return null;
-        }
-    } catch (_) {
-        // Keep the raw relative path; the server resolves it against the
-        // project's worker cwd. A malformed percent escape is still a valid
-        // Unix filename and should not disable the opener.
-        try { path = decodeURIComponent(raw); } catch (_) { path = raw; }
+    let url = null;
+    try { url = new URL(raw, window.location.href); }
+    catch (error) { if (!(error instanceof TypeError)) throw error; }
+    if (url === null) {
+        // Not a URL: keep the raw relative path; the server resolves it
+        // against the project's worker cwd.
+        path = decodePath(raw);
+    } else if (url.protocol === 'file:') {
+        path = decodePath(url.pathname);
+    } else if (url.protocol === 'http:' || url.protocol === 'https:') {
+        // An explicitly external URL is a web link. A same-dashboard URL
+        // is what a leading worker path becomes in the browser.
+        if (url.origin !== window.location.origin) return null;
+        path = decodePath(url.pathname);
+    } else {
+        return null;
     }
 
     // For relative hrefs URL() above resolves against the dashboard origin;
     // preserve the relative spelling so media/clip.mp4 resolves against the
     // PROJECT rather than becoming /media/clip.mp4 on the worker.
     if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(raw)) {
-        const clean = raw.split(/[?#]/, 1)[0];
-        try { path = decodeURIComponent(clean); } catch (_) { path = clean; }
+        path = decodePath(raw.split(/[?#]/, 1)[0]);
     }
     return path || null;
 }
@@ -5222,9 +5270,9 @@ export function connect(node, comm, init = {}) {
     if (parent) {
         const mo = new MutationObserver(() => {
             if (!node.isConnected) {
-                try { chat.destroy(); } catch (_) {}
-                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
+                CHAT_INSTANCES.delete(chat);
+                if (!chat.destroyed) chat.destroy();
             }
         });
         mo.observe(parent, { childList: true });

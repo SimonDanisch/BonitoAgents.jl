@@ -372,6 +372,51 @@ struct MediaSizes
 end
 MediaSizes() = MediaSizes(Dict{Tuple{String,String},NTuple{2,Int}}(), ReentrantLock())
 
+# What a browser tab's console said, as the page reported it (diagnostics.jl).
+struct ConsoleEntry
+    t     :: Float64     # unix time, by the browser's clock
+    level :: String      # "debug" | "log" | "info" | "warn" | "error"
+    text  :: String
+end
+
+# One browser tab the server serves (diagnostics.jl): who, from where, since when,
+# what it shows, and what its console sent before it went quiet. A closed tab
+# keeps its record for a while, without its session.
+mutable struct TabRecord
+    const id     :: String                           # the root session's id
+    const user   :: String
+    const client :: String
+    const opened :: Float64
+    session      :: Union{Nothing,Bonito.Session}    # `nothing` once closed
+    view         :: Union{Nothing,Observable{String}}  # the tab's `current_view`
+    last_view    :: String                           # its value when the tab closed
+    closed       :: Float64                          # 0 while the session lives
+    visibility   :: String                           # as the page last said ("" = never)
+    visibility_t :: Float64
+    console      :: Vector{ConsoleEntry}             # what the page sent, oldest first
+end
+
+struct TabRegistry
+    open   :: Dict{String,TabRecord}   # by the root session's id
+    closed :: Vector{TabRecord}        # the last tabs that closed, oldest first
+    lock   :: ReentrantLock
+end
+TabRegistry() = TabRegistry(Dict{String,TabRecord}(), TabRecord[], ReentrantLock())
+
+# How long one piece of work took (diagnostics.jl `record_timing!`).
+struct TimingEntry
+    t       :: Float64             # when it finished (unix time)
+    seconds :: Float64
+    detail  :: Dict{String,Any}
+end
+
+# The last timings of each kind of work (`:page`, `:worker_rpc`, …).
+struct Timings
+    kinds :: Dict{Symbol,Vector{TimingEntry}}
+    lock  :: ReentrantLock
+end
+Timings() = Timings(Dict{Symbol,Vector{TimingEntry}}(), ReentrantLock())
+
 # The worker build this server offers (`current_worker_update_spec`), as last
 # resolved. Resolving asks GitHub (`git ls-remote`), which takes as long as the
 # network does: a worker's handshake that resolved it itself went unanswered
@@ -583,9 +628,13 @@ mutable struct ServerState
     shares             :: ShareRegistry
     # Turns a worker crash cut off, to continue when it is back (crash_recovery.jl).
     crash_watch        :: CrashWatch
-    # Live browser sessions by user name, so disabling an account closes them: an
-    # open websocket is not re-checked by Authelia.
-    user_sessions      :: Dict{String,Vector{Bonito.Session}}
+    # Every browser tab the server serves (diagnostics.jl): for the dev tools,
+    # and so disabling an account closes its tabs (an open websocket is not
+    # re-checked by Authelia).
+    tabs               :: TabRegistry
+    # How long pages, chat commands, worker requests, scans and notifications
+    # took (diagnostics.jl), for the dev tools.
+    timings            :: Timings
     # The agent adapters workers keep installed (the worker's harnesses.jl):
     # `Dict("node" => "lts", "packages" => Dict(pkg => "latest"|version))`, sent
     # with every hello acknowledgement. `nothing`: workers manage none (dev and
@@ -689,7 +738,8 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,Invite}()),        # invites
         ShareRegistry(),                          # shares
         CrashWatch(),                             # crash_watch
-        Dict{String,Vector{Bonito.Session}}(),    # user_sessions
+        TabRegistry(),                            # tabs
+        Timings(),                                # timings
         Observable{Union{Nothing,Dict{String,Any}}}(nothing),  # harness_spec (load_settings! below)
         WorkerBuild(),                            # worker_build (resolved by serve())
         ProxyWriter(),                            # proxy_writer
@@ -768,7 +818,8 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.invites,
             s.shares,                  # shared registry
             s.crash_watch,
-            s.user_sessions,
+            s.tabs,                    # shared registry
+            s.timings,                 # shared registry
             s.harness_spec,
             s.worker_build,
             s.proxy_writer,
@@ -1003,7 +1054,17 @@ which opens a chat on the checkout.
 const DEV_MODE_TOOLS = """
 You have `bt_dev_*` tools that read the **running process**:
 
-- `bt_dev_inspect` — live workers, projects, chats and eval bridges.
+- `bt_dev_inspect` — live workers, projects, chats and eval bridges, and with
+  `section="tabs"` every browser tab the server serves: connected, or socket gone
+  but still served (`SOFT_CLOSED`, queueing what it is sent), since when, how
+  many queued messages and subsessions, hidden or not.
+- `bt_dev_timings` — how long the server's work took: page builds (with the parts
+  of the page that took the time), pages' own load reports, chat commands,
+  worker requests, change fan-outs to every tab, worker scans. Percentiles, the
+  slowest and the latest of each.
+- `bt_dev_console` — a browser tab's JavaScript console: asked live when the tab
+  is connected, else what the page sent when it was hidden or left (a phone that
+  went to sleep).
 - `bt_dev_logs` — logs from ANY machine in the fleet. You are running on ONE
   worker and nothing but the server runs on the server host, so every other
   machine's log is reachable only through this tool: `source="server"` for the
@@ -1150,20 +1211,15 @@ exactly which chats are open.
 chat_in_sidebar(p::ProjectInfo) =
     !p.dismissed && (titled(p) || p.resume_session_id !== nothing)
 
-# Setting an Observable propagates to the browser via Bonito's WebSocket;
-# if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
-# after a redeploy), Bonito surfaces that as a JSException from the
-# observable update. We don't want a stale UI tab to break server-side
-# operations, so we swallow + log via these helpers instead of letting the
-# JSException unwind a server thread.
-
-# Best-effort `obs[] = val`. Use for plain Observable updates.
+# `obs[] = val` for a value the browser shows: one tab failing must not unwind
+# the server task that set it. Listeners run through `safe_notify!` (below), so a
+# dead tab is dropped and a real failure is an error in the log. This used to
+# catch everything at `@debug`: a file tab whose body never arrived stayed on
+# "loading…" and the log had nothing.
 function safe_set!(obs::Observable, val)
-    try
-        obs[] = val
-    catch e
-        @debug "safe_set!: observable propagation failed (likely stale browser session)" exception=e
-    end
+    obs.ignore_equal_values && isequal(obs[], val) && return nothing
+    Bonito.Observables.setexcludinghandlers!(obs, val)
+    safe_notify!(obs)
     return nothing
 end
 
@@ -1256,14 +1312,14 @@ end
 # bridges are one-way (root → child), so notifying a session view would reach
 # only that one session — the old behaviour, which left every OTHER tab (and any
 # tab opened later) stale until an unrelated global event.
-notify_chats!(s::ServerState) = safe_notify!(root_state(s).chat_signal)
+notify_chats!(s::ServerState) = timed(() -> safe_notify!(root_state(s).chat_signal), s, :notify; signal = "chats")
 
 # Signal that an open chat's CONTENT changed (a turn started or finished). Same
 # root-routing rule as `notify_chats!`, different audience: this one must NOT
 # rebuild the chat list, only the views that read a chat's messages (overview
 # cards) or its status (sidebar LEDs). See `turn_signal`'s field doc for why the
 # two are separate.
-notify_turn!(s::ServerState) = safe_notify!(root_state(s).turn_signal)
+notify_turn!(s::ServerState) = timed(() -> safe_notify!(root_state(s).turn_signal), s, :notify; signal = "turn")
 
 # The projects / workers tables changed (a title, a bound session, a rename, a
 # worker's status). Same root-routing rule: the table itself is ONE shared Dict,
@@ -1271,8 +1327,8 @@ notify_turn!(s::ServerState) = safe_notify!(root_state(s).turn_signal)
 # notifying the view a caller happened to hold reached that tab alone, which is
 # how a header rename showed "HOTS" while the same tab's homebar (listening on
 # its own child) kept the auto-title. Every writer goes through these.
-notify_projects!(s::ServerState) = safe_notify!(root_state(s).projects)
-notify_workers!(s::ServerState)  = safe_notify!(root_state(s).workers)
+notify_projects!(s::ServerState) = timed(() -> safe_notify!(root_state(s).projects), s, :notify; signal = "projects")
+notify_workers!(s::ServerState)  = timed(() -> safe_notify!(root_state(s).workers), s, :notify; signal = "workers")
 
 # The one door into the projects table. Every project — created, imported,
 # copied, or loaded back from projects.json — enters through here, which is
@@ -1344,7 +1400,7 @@ function atomic_write(write_to::Function, path::AbstractString; mode::Union{Inte
         try
             rm(tmp; force = true)
         catch cleanup_err
-            @debug "atomic_write: could not remove temp file" tmp exception = cleanup_err
+            @warn "atomic_write: could not remove temp file" tmp exception = cleanup_err
         end
         rethrow()
     end

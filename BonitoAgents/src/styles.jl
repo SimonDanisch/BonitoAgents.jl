@@ -10,6 +10,24 @@
 #   • one-shot actions go into a `.bt-menu` popover, not into a row of buttons;
 #   • outcomes are reported by a toast, never by rewriting a button's label;
 #   • spacing from the `--bt-space-*` scale, radii from `--bt-radius(-sm)`.
+# The browser's localStorage, for what a page only keeps for convenience (the
+# sidebar's width, the route to restore, drafts). Storage can be switched off
+# (SecurityError) or full (QuotaExceededError): those warn in the console and act
+# as "nothing stored". Anything else throws. Interpolate it:
+# `const store = $(STORAGE_JS);`.
+const STORAGE_JS = js"""(() => {
+    const refused = (error, key) => {
+        if (!(error instanceof DOMException) ||
+            !['SecurityError', 'QuotaExceededError'].includes(error.name)) throw error;
+        console.warn(`browser storage refused (${key}):`, error.message);
+    };
+    return {
+        get(key) { try { return localStorage.getItem(key); } catch (e) { refused(e, key); return null; } },
+        set(key, value) { try { localStorage.setItem(key, value); } catch (e) { refused(e, key); } },
+        remove(key) { try { localStorage.removeItem(key); } catch (e) { refused(e, key); } },
+    };
+})()"""
+
 # `text` onto the clipboard: resolves once it is there, rejects when it is not.
 # The async clipboard needs a secure context; a LAN http:// page falls back to a
 # selected textarea (iOS ignores `select()` without `setSelectionRange`, and
@@ -128,8 +146,11 @@ sub-second reconnect on a healthy link does not flash a modal. Anything typed
 or sent while Bonito is reconnecting is at risk, so a small dot changing colour
 was not a warning, it was a way to lose work. "connecting" is the retry phase,
 shown as reconnecting; "disconnected" is Bonito giving up after its retries,
-shown with a reload button. Before the first successful connection nothing is
-shown: the page is still loading then. "expired" is final: the server has no
+shown with a reload button. Before the first successful connection the page
+looks loaded and takes clicks that go nowhere (a chat opened from the sidebar
+shows an empty area: the server renders its loading card), so the card shows
+then too, once the first connection has taken longer than `first_connect`
+seconds or Bonito gave up on it. "expired" is final: the server has no
 session for this page (it restarted, or dropped the page after an hour away), so
 the page reloads itself, or asks first when a reload would lose unsent text (text
 kept as a chat's draft comes back after the reload, so it does not count).
@@ -138,7 +159,7 @@ NOT the same signal as the in-chat status dot: that one is the AGENT session's
 liveness, this one is whether this browser tab can still talk to the server at
 all. Both matter, and they fail independently.
 """
-function connection_guard(session::Bonito.Session)
+function connection_guard(session::Bonito.Session; first_connect::Real = 4)
     css = Styles(
         CSS(".bt-conn-led",
             "position" => "fixed", "bottom" => "10px", "left" => "10px",
@@ -227,6 +248,10 @@ function connection_guard(session::Bonito.Session)
                         disconnected: 'Disconnected from the server', no_connection: 'No server connection',
                         expired: 'This page has to be reloaded'};
         const copy = {
+            first:        ['Connecting to the server',
+                           'This page has not reached the server yet, so nothing on it works until it does. It keeps trying; reloading often helps.'],
+            first_failed: ['Could not reach the server',
+                           'This page never reached the server, so nothing on it works. Reload it to try again.'],
             connecting:   ['Reconnecting to the server',
                            'The link to the server dropped. The composer is locked until it is back, so nothing you type is lost.'],
             disconnected: ['Connection lost',
@@ -239,9 +264,10 @@ function connection_guard(session::Bonito.Session)
         // per chat in localStorage and puts it back after a reload, unless the
         // storage is full or off). What the page rendered into it (the yolo
         // reminders) the server keeps.
+        const store = $(STORAGE_JS);
         const draftOf = t => {
             const pid = t.closest('.bt-chatpane')?.dataset.panePid;
-            try { return pid ? localStorage.getItem('bt-draft:' + pid) : null; } catch (_) { return null; }
+            return pid ? store.get('bt-draft:' + pid) : null;
         };
         const unsent = () => Array.from(document.querySelectorAll('textarea.bt-text-input'))
             .some(t => t.value.trim() !== '' && t.value !== t.defaultValue && t.value !== draftOf(t));
@@ -266,9 +292,11 @@ function connection_guard(session::Bonito.Session)
                 : st === 'disconnected' ? 'Gave up after ' + s + ' s'
                 : (s < 1 ? 'Trying again…' : 'Trying again for ' + s + ' s');
         }
-        function setBlocked(on, status) {
+        // `key` picks the words (the first connection has its own), `status`
+        // the look.
+        function setBlocked(on, status, key = status) {
             modal.dataset.status = status;
-            if (on && copy[status]) { title.textContent = copy[status][0]; msg.textContent = copy[status][1]; }
+            if (on && copy[key]) { title.textContent = copy[key][0]; msg.textContent = copy[key][1]; }
             if (on === blocking) { on && tick(); return; }
             blocking = on;
             modal.classList.toggle('bt-conn-open', on);
@@ -285,14 +313,42 @@ function connection_guard(session::Bonito.Session)
                 document.removeEventListener('paste', swallow, true);
             }
         }
+        // A connection that does not come back may be a login that ended: the
+        // login gate turns the websocket away, which a browser reports as
+        // nothing but a failed connection, and the card said "Reconnecting"
+        // forever, a hung server to anyone looking. Asked once per drop, after a
+        // moment (a blip is back by then): if so, the login card says so, over
+        // this one, and the page goes on once the login is back.
+        // Back from the login, the page reconnects at once. Bonito ignores that
+        // while its own retries still run, and they can run out before their
+        // next attempt: one more round when they give up.
+        let loginAsked = false, reviveOnGiveUp = false;
+        const revive = () => window.WEBSOCKET && window.WEBSOCKET.retry_connection();
+        const askLogin = () => {
+            if (loginAsked) return;
+            loginAsked = true;
+            setTimeout(() => {
+                if (!blocking) return;
+                $(LoginLib).then(login => login.check().then(s => s === 'ended' &&
+                    login.logged_in().then(() => { reviveOnGiveUp = true; revive(); })));
+            }, 2000);
+        };
+        // The first connection is normally up well within a second.
+        const firstWait = setTimeout(() => { if (!wasConnected) { setBlocked(true, 'connecting', 'first'); askLogin(); } },
+                                     $(round(Int, 1000 * first_connect)));
         Bonito.register_connection_indicator({ onStatusChange(status) {
             led.dataset.status = status; led.title = titles[status] || titles.disconnected;
-            if (status === 'connected') { wasConnected = true; setBlocked(false, status); return; }
-            if (status === 'no_connection') { setBlocked(false, status); return; }
+            if (status === 'connected') {
+                wasConnected = true; loginAsked = false; reviveOnGiveUp = false;
+                clearTimeout(firstWait); setBlocked(false, status); return;
+            }
+            if (status === 'disconnected' && reviveOnGiveUp) { reviveOnGiveUp = false; revive(); return; }
+            if (status === 'no_connection') { clearTimeout(firstWait); setBlocked(false, status); return; }
             // The server has no session for this page (Bonito: close code 4404).
             // Nothing will reconnect it, and before the first connection too:
             // a page restored from the back/forward cache never connects at all.
             if (status === 'expired') {
+                clearTimeout(firstWait);          // it has its own way out
                 $(ChatLib).then(lib => {
                     lib.flushDrafts();            // text typed just now counts as kept
                     if (unsent()) { setBlocked(true, status); return; }
@@ -306,11 +362,65 @@ function connection_guard(session::Bonito.Session)
                 });
                 return;
             }
-            if (!wasConnected) return;            // first load: the page is still coming up
+            if (!wasConnected) {
+                // Still loading: `firstWait` shows the card if it takes too long,
+                // and giving up shows it at once.
+                if (status === 'disconnected') { clearTimeout(firstWait); setBlocked(true, status, 'first_failed'); askLogin(); }
+                return;
+            }
             setBlocked(true, status);
+            askLogin();
         }});
     }""")
     return root
+end
+
+# Where a page reports how its load went (`page_load_report`).
+const PAGE_TIMING_ROUTE = "/page-timing"
+
+"""
+    page_load_report(session) -> Node
+
+The page's own account of its load, for the server log (`PAGE_TIMING_ROUTE`):
+when its HTML arrived, its scripts ran, its connection came up and the chat it
+opened showed its rows, and its slowest downloads. Sent once the page is usable,
+or after `give_up` seconds if it never gets there, as a plain HTTP request, which
+gets through when the page's own connection does not. A phone that took minutes
+left no trace on the server before.
+"""
+function page_load_report(session::Bonito.Session; give_up::Real = 60)
+    node = DOM.div(; class = "bt-page-load-report", style = "display:none")
+    Bonito.onload(session, node, js"""() => {
+        const t = {hidden: document.visibilityState !== 'visible'};
+        const mark = k => { if (!(k in t)) { t[k] = Math.round(performance.now()); check(); } };
+        let sent = false;
+        const send = why => {
+            if (sent) return;
+            sent = true;
+            const n = performance.getEntriesByType('navigation')[0];
+            const slow = performance.getEntriesByType('resource')
+                .filter(e => e.duration > 1000).sort((a, b) => b.duration - a.duration).slice(0, 5)
+                .map(e => [e.name.replace(location.origin, '').slice(0, 100), Math.round(e.duration), Math.round(e.transferSize / 1024)]);
+            navigator.sendBeacon($(PAGE_TIMING_ROUTE), JSON.stringify(Object.assign({
+                why, view: document.querySelector('.bt-main-views')?.dataset.activeView || '',
+                html: Math.round(n ? n.responseEnd : 0), scripts: Math.round(n ? n.domContentLoadedEventEnd : 0),
+                waited: Math.round(performance.now()),
+                status: document.querySelector('.bt-conn-led')?.dataset.status || '', slow}, t)));
+        };
+        // Usable: connected, and a chat on screen shows its rows.
+        const check = () => {
+            const view = document.querySelector('.bt-main-views')?.dataset.activeView || '';
+            const onChat = view !== '' && view !== $(SETTINGS_VIEW);
+            if ('connected' in t && (!onChat || 'chat_settled' in t)) send('ready');
+        };
+        const led = document.querySelector('.bt-conn-led');
+        const watch = () => led && led.dataset.status === 'connected' && mark('connected');
+        led && new MutationObserver(watch).observe(led, {attributes: true, attributeFilter: ['data-status']});
+        window.addEventListener('bt-chat-settled', () => mark('chat_settled'));
+        watch();
+        setTimeout(() => send('gave_up'), $(round(Int, 1000 * give_up)));
+    }""")
+    return node
 end
 
 # Answers only through the login: what `login_guard` asks.
@@ -849,8 +959,12 @@ const MEDIA_CSS = [
     # Media (bt_show / Read image & video) + click-to-enlarge lightbox. The wrap
     # is the hover target for the ⤢ button; the fullscreen overlay holds a clone
     # of the media and closes on backdrop click or Esc.
+    # `vertical-align: top`: an inline-block sits on the text baseline, with the
+    # descender gap of the line below it; at the top the line is the picture's
+    # height exactly, the height a placeholder reserves for it (`bodyReserve`).
     CSS(".bt-media-wrap",
-        "position" => "relative", "display" => "inline-block", "max-width" => "100%"),
+        "position" => "relative", "display" => "inline-block", "max-width" => "100%",
+        "vertical-align" => "top"),
     # Hover action row (enlarge · copy · download), top-right of the media.
     CSS(".bt-media-actions",
         "position" => "absolute", "top" => "6px", "right" => "6px",

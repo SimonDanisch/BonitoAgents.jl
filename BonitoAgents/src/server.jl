@@ -136,7 +136,9 @@ function serve(; host::String        = "127.0.0.1",
 
     # Single-page app: sidebar + dashboard/chat swap. No per-project routes.
     # Behind a tunnel every request passes the login gate first (tunnel.jl).
-    srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".", gate = server_gate(auth, state.shares))
+    app = unified_app(state)
+    srv = Bonito.Server(context -> timed_page(state, app, context), host, port;
+                        proxy_url = ".", gate = server_gate(auth, state.shares))
     state.srv = srv
 
     # online_url uses the post-start srv.port — handles port=0 → ephemeral
@@ -157,6 +159,8 @@ function serve(; host::String        = "127.0.0.1",
     add_share_routes!(srv, state)
     # Nothing to say: reaching it is the answer (`login_guard`).
     Bonito.route!(srv, LOGIN_CHECK_ROUTE => _ -> HTTP.Response(204))
+    Bonito.route!(srv, PAGE_TIMING_ROUTE => context -> page_timing_response(state, context.request))
+    Bonito.route!(srv, CONSOLE_ROUTE => context -> console_beacon_response(state, context.request))
     Bonito.route!(srv, LOGIN_SCRIPT_ROUTE => _ -> HTTP.Response(200,
         ["Content-Type" => "text/javascript; charset=utf-8", "Cache-Control" => "no-cache"], read(LOGIN_JS)))
 
@@ -1067,4 +1071,59 @@ function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
     # eval workers are all channels on this link (worker_client.jl).
     Bonito.HTTPServer.websocket_route!(srv, "/w" => (ctx, ws) ->
         handle_worker_link(state, ws, ctx.request))
+end
+
+"""
+    timed_page(state, app, context) -> HTTP.Response
+
+The page (`app`), its build recorded as a `:page` timing with the parts
+`page_phase` measured. Bonito renders the page in this task, so the parts land
+in the table this sets up.
+"""
+function timed_page(state::ServerState, app::App, context)
+    request = context.request
+    phases = task_local_storage(:bt_page_phases, Dict{Symbol,Float64}())
+    request.context[:page_phases] = phases      # the gate's slow-request warning prints them
+    t0 = time()
+    try
+        return Bonito.HTTPServer.apply_handler(app, context)
+    finally
+        took = time() - t0
+        phases[:render] = took - get(phases, :handler, 0.0)
+        record_timing!(state, :page, took; target = first(request.target, 120),
+                       tab = get(request.context, :tab, ""), client = client_address(request),
+                       phases = phase_summary(phases; min_s = 0.001))
+        delete!(task_local_storage(), :bt_page_phases)
+    end
+end
+
+"""
+    page_timing_response(state, request; slow_ms = 5000) -> HTTP.Response
+
+Log what a page reports about its own load (`page_load_report`), as a warning
+when it took longer than `slow_ms` to become usable or never did, and keep it as
+a `:browser_load` timing.
+"""
+function page_timing_response(state::ServerState, request::HTTP.Request; slow_ms::Integer = 5000)
+    request.method == "POST" || return plain_response(405, "POST a page's load report")
+    body = request_bytes(request.body)
+    length(body) <= 16_384 || return plain_response(413, "a load report is small")
+    report = JSON.parse(String(body))
+    report isa AbstractDict || return plain_response(400, "a load report is a JSON object")
+    ms(k) = (v = get(report, k, nothing); v isa Real ? round(Int, v) : nothing)
+    usable = something(ms("chat_settled"), ms("connected"), Some(nothing))
+    fields = (; client = client_address(request), why = string(get(report, "why", "")),
+              view = string(get(report, "view", "")), html_ms = ms("html"), scripts_ms = ms("scripts"),
+              connected_ms = ms("connected"), chat_ms = ms("chat_settled"),
+              status = string(get(report, "status", "")), hidden = get(report, "hidden", nothing) === true,
+              slowest = get(report, "slow", Any[]))
+    if usable === nothing || usable > slow_ms
+        @warn "slow page load" fields...
+    else
+        @info "page load" fields...
+    end
+    # Never usable: the time it waited before giving up (`why = "gave_up"`).
+    waited = something(usable, ms("waited"), Some(0)) / 1000
+    record_timing!(state, :browser_load, waited; fields...)
+    return HTTP.Response(204)
 end

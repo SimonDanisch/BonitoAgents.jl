@@ -51,17 +51,14 @@ function b_wait(ctx, predicate; timeout = 30)
     while time() - t0 < timeout
         try
             ECT.eval_js(ctx, predicate) === true && return true
-        catch
+        catch e
+            e isa TK.ElectronCall.JSExecutionError || rethrow()   # page not there yet
         end
         sleep(0.3)
     end
     return false
 end
-b_out(ctx) = try
-    ECT.eval_js(ctx, "(() => { const e=document.querySelector('.two-out'); return e ? e.innerText : ''; })()")
-catch
-    ""
-end
+b_out(ctx) = ECT.eval_js(ctx, "(() => { const e=document.querySelector('.two-out'); return e ? e.innerText : ''; })()")
 function b_click_wait(ctx, want)
     ECT.eval_js(ctx, "(() => { const b=document.querySelector('.two-btn'); if(b){b.click();return true} return false })()")
     return b_wait(ctx, out_pred(want); timeout = 10)

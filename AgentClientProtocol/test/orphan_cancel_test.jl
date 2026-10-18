@@ -54,7 +54,7 @@ end
 
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
         put!(ws_ch, ws)
-        try take!(hold) catch end
+        try take!(hold) catch e; e isa InvalidStateException || rethrow() end   # closed at teardown
     end
 
     agent = @async try
@@ -199,7 +199,7 @@ end
     seen  = Channel{String}(64); ready = Channel{Nothing}(1)
 
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
-        put!(ws_ch, ws); try take!(hold) catch end
+        put!(ws_ch, ws); try take!(hold) catch e; e isa InvalidStateException || rethrow() end   # closed at teardown
     end
 
     agent = @async try
@@ -294,7 +294,7 @@ end
     settled = Channel{Nothing}(1)
 
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
-        put!(ws_ch, ws); try take!(hold) catch end
+        put!(ws_ch, ws); try take!(hold) catch e; e isa InvalidStateException || rethrow() end   # closed at teardown
     end
 
     agent = @async try

@@ -1,5 +1,7 @@
-# The To-do app, the way a user meets it: opened from the dashboard's Apps card,
-# its chat shows the server-wide list pinned above the conversation. An item
+# The To-do app, the way a user meets it: a tile on the dashboard (its logo, the
+# details on hover), set up once in a dialog that picks the worker its chat runs
+# on, opened at once after that. Its chat shows the server-wide list pinned
+# above the conversation. An item
 # added there is checked off by ANOTHER chat's agent through its MCP (a real
 # BonitoMCP process, forwarding the app's tool to the server), and the list
 # shows who did it. "Start chat" asks the app chat's agent, which picks the
@@ -34,21 +36,46 @@
         TK.open_browser(s)
         TK.to_dashboard(s)
 
-        # ── the Apps card opens the app's chat ──────────────────────────────
-        ROW = "document.querySelector('.bt-app-row[data-app=\"todo\"]')"
-        # The worker pill shows once this server's worker is online.
-        @test TK.wait_for(s, "the To-do row with its worker",
-            "!!$ROW?.querySelector('.bt-app-open') && !!$ROW?.querySelector('.bt-app-worker .bt-msearch-value')";
+        # ── the Apps tile: logo, details on hover, a setup dialog first ────
+        TILE = "document.querySelector('.bt-app-tile[data-app=\"todo\"]')"
+        @test TK.wait_for(s, "the To-do tile with its logo",
+            "(i => !!i && i.complete && i.naturalWidth > 0)($TILE?.querySelector('img.bt-app-logo'))";
             timeout = 60) == true
-        @test TK.eval_js(s, "$ROW.querySelector('.bt-app-title').textContent") == "To-do"
-        # The worker it will run on, as the pill names it.
-        worker[] = TK.eval_js(s, "$ROW.querySelector('.bt-app-worker .bt-msearch-value').textContent")
+        @test occursin("todo.svg", TK.eval_js(s, "$TILE.querySelector('.bt-app-logo').getAttribute('src')"))
+        @test TK.eval_js(s, "$TILE.querySelector('.bt-app-title').textContent") == "To-do"
+        @test TK.eval_js(s, "$TILE.querySelector('.bt-app-status').textContent") == "Not set up"
+        # Hovered (a real pointer): what it is, the tools it gives agents.
+        x, y = TK.eval_js(s, "(() => { const r = $TILE.querySelector('.bt-app-launch').getBoundingClientRect(); return [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)]; })()")
+        TK.ECT.send_input(s.browser[], "{type: 'mouseMove', x: $x, y: $y}")
+        @test TK.wait_for(s, "the details on hover",
+            "getComputedStyle($TILE.querySelector('.bt-app-details')).opacity === '1'"; timeout = 5) == true
+        details = TK.eval_js(s, "$TILE.querySelector('.bt-app-details').textContent")
+        @test contains(details, "One to-do list for every chat") && contains(details, "todo_done")
+        TK.ECT.send_input(s.browser[], "{type: 'mouseMove', x: 2, y: 2}")
+        # A phone: tiles side by side, nothing cut off, no hover details.
+        phone = TK.emulate_phone(s) do
+            sleep(0.5)
+            TK.eval_js(s, """(() => { const t = $TILE, l = t.querySelector('.bt-app-launch').getBoundingClientRect(),
+                    name = t.querySelector('.bt-app-title');
+                return [l.width >= 100 && l.right <= innerWidth, name.scrollWidth <= name.clientWidth,
+                        getComputedStyle(t.querySelector('.bt-app-details')).display]; })()""")
+        end
+        @test phone == [true, true, "none"]
+
+        # A click asks first where its chat runs.
+        TK.click(s, ".bt-app-tile[data-app=\"todo\"] .bt-app-launch")
+        SETUP = "document.querySelector('.bt-modal-overlay .bt-app-setup')"
+        @test TK.wait_for(s, "the setup dialog with this worker",
+            "!!$SETUP?.querySelector('.bt-app-choice.bt-on .bt-app-choice-name')"; timeout = 15) == true
+        worker[] = TK.eval_js(s, "$SETUP.querySelector('.bt-app-choice.bt-on .bt-app-choice-name').textContent")
         @test !isempty(worker[])
-        TK.screenshot(s, joinpath(tempdir(), "todo_app_dashboard.png"))
-        TK.click(s, ".bt-app-row[data-app=\"todo\"] .bt-app-open")
+        @test TK.eval_js(s, "$SETUP.querySelector('.bt-app-start').disabled") == false
+        TK.screenshot(s, joinpath(tempdir(), "todo_app_setup.png"))
+        TK.click(s, ".bt-app-setup .bt-app-start")
         @test TK.wait_for(s, "the app chat with its list",
             "!!$VP?.querySelector('.bt-todo') && !!$VP?.querySelector('.bt-text-input')";
             timeout = 60) == true
+        @test TK.eval_js(s, "!document.querySelector('.bt-modal-overlay')") == true
         # The ordinary chat widgets are all there, the list above the messages.
         @test TK.eval_js(s, """(() => { const p = $VP, t = p.querySelector('.bt-todo'),
             m = p.querySelector('.bt-messages');
@@ -56,11 +83,20 @@
                    t.getBoundingClientRect().bottom <= m.getBoundingClientRect().top + 1; })()""") == true
         @test TK.eval_js(s, "$VP.querySelector('.bt-todo-empty').textContent") == "Nothing to do yet."
         app_pid = TK.eval_js(s, "$APP.dataset.panePid")
-        # Pinned in the sidebar, under its own heading.
+        # Pinned in the sidebar, under its own heading, wearing the app's logo.
         @test TK.wait_for(s, "the app chat under Apps", """(() => {
             const r = document.querySelector('.bt-side-chat .bt-side-item[data-project-id="$(app_pid)"]')?.closest('.bt-side-chat');
             const g = r?.querySelector('.bt-side-group');
-            return !!g && !g.classList.contains('bt-hidden') && g.textContent === 'Apps'; })()"""; timeout = 20) == true
+            return !!g && !g.classList.contains('bt-hidden') && g.textContent === 'Apps' &&
+                   (r.querySelector('img.bt-proj-thumb')?.getAttribute('src') || '').includes('todo.svg'); })()"""; timeout = 20) == true
+
+        # Set up, the tile says where it runs and opens the chat at once.
+        TK.to_dashboard(s)
+        @test TK.wait_for(s, "the tile set up",
+            "$TILE?.querySelector('.bt-app-status')?.textContent === $(TK.json("on " * worker[]))"; timeout = 20) == true
+        TK.click(s, ".bt-app-tile[data-app=\"todo\"] .bt-app-launch")
+        @test TK.wait_for(s, "the app chat again", "$VP?.dataset.panePid === $(TK.json(app_pid))"; timeout = 30) == true
+        @test TK.eval_js(s, "!document.querySelector('.bt-modal-overlay')") == true
 
         # ── the user adds items in the pane ─────────────────────────────────
         function add!(text)

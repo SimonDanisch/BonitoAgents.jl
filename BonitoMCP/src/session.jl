@@ -48,7 +48,7 @@ function _find_bonito_path()
         src = deps[BONITO_UUID].source
         src isa AbstractString && isdir(src) ? String(src) : nothing
     catch e
-        @debug "_find_bonito_path failed" exception = e
+        @warn "BonitoMCP: could not read the active project's dependencies; temp eval envs get their own Bonito" exception = e
         nothing
     end
 end

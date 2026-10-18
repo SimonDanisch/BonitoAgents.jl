@@ -34,15 +34,20 @@ function process_started(pid::Integer)
         return linux_boot_time() + parse(Int, fields[20]) / linux_clock_ticks()
     elseif Sys.iswindows()
         cmd = `powershell -NoProfile -Command "\$p = Get-Process -Id $pid -ErrorAction SilentlyContinue; if (\$p) { [DateTimeOffset]::new(\$p.StartTime).ToUnixTimeMilliseconds() }"`
-        ms = tryparse(Int, strip(read(ignorestatus(pipeline(cmd; stderr = devnull)), String)))
+        ms = tryparse(Int, command_output(cmd))
         return ms === nothing ? nothing : ms / 1000
     else
         # macOS and the BSDs: the elapsed time since it started, [[dd-]hh:]mm:ss.
-        out = strip(read(ignorestatus(pipeline(`ps -o etime= -p $pid`; stderr = devnull)), String))
+        out = command_output(`ps -o etime= -p $pid`)
         isempty(out) && return nothing
         return time() - etime_seconds(out)
     end
 end
+
+# What `cmd` prints, stripped, whatever its exit status: `ps` exits non-zero for
+# a pid that is gone, which here just means "no answer". Its stderr is dropped.
+# `ignorestatus` takes the command itself, not the pipeline around it.
+command_output(cmd::Cmd) = strip(read(pipeline(ignorestatus(cmd); stderr = devnull), String))
 
 linux_boot_time() = parse(Int, last(split(only(filter(startswith("btime "), readlines("/proc/stat"))))))
 linux_clock_ticks() = Int(ccall(:sysconf, Clong, (Cint,), 2))   # _SC_CLK_TCK
@@ -107,7 +112,7 @@ function parent_pid(pid::Integer)
         # After the command name (see `process_started`): state, then ppid.
         return parse(Int, split(stat[findlast(')', stat) + 2:end])[2])
     end
-    out = strip(read(ignorestatus(pipeline(`ps -o ppid= -p $pid`; stderr = devnull)), String))
+    out = command_output(`ps -o ppid= -p $pid`)
     return something(tryparse(Int, out), 0)
 end
 

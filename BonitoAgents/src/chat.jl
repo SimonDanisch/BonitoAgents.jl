@@ -101,12 +101,14 @@ RunBook() = RunBook(Dict{String,ChatRun}(), Dict{Tuple{String,Float64},ChatRun}(
 # shared across sessions; the Observable fields are per-session connected
 # children so their JS bridges GC cleanly when the tab closes.
 # A chat's tool bodies as the browser last rendered them: tool id => the body's
-# height at each width it was measured at, newest last (measured_sizes.jl).
+# height at each width it was measured at, newest last, `(width, height,
+# extra)` with `extra` the part of the height that is not its picture
+# (measured_sizes.jl).
 struct BodyHeights
-    heights::Dict{String,Vector{NTuple{2,Int}}}
+    heights::Dict{String,Vector{NTuple{3,Int}}}
     lock::ReentrantLock
 end
-BodyHeights() = BodyHeights(Dict{String,Vector{NTuple{2,Int}}}(), ReentrantLock())
+BodyHeights() = BodyHeights(Dict{String,Vector{NTuple{3,Int}}}(), ReentrantLock())
 
 mutable struct ChatModel
     # Convention: lock first. Now only a guard around `msgs_store` for the
@@ -2132,6 +2134,10 @@ function augment_generic_header!(d::Dict, chat_dir::AbstractString)
         has_show_reference(content) && (d["expand"] = true)
         mime = tool_media_mime(content)
         mime === nothing || (d["show_mime"] = mime)
+        # A picture whose bytes are in the content: its size, for the body's
+        # placeholder before the body arrives (measured_sizes.jl).
+        size = tool_media_size(content)
+        size === nothing || (d["media"] = [size...])
         # Path-link affordance: a file the plotpane Monaco editor can open
         # (the tool title renders as a clickable link). The in-RAM path
         # hint (live ToolMsg raw_input) takes precedence; the persisted one
@@ -3406,16 +3412,20 @@ function read_image_element(state::ServerState, project_id::AbstractString,
             st = ShowTool(state, String(project_id), proj.server_path, String(fp))
             info = stat_worker_path(state, proj.worker_id, show_worker_path(st))
             if info.isfile
+                # Measured by the browser, or else read from the bytes the
+                # content holds: the element has its size before it loads.
+                size = something(media_size(state, proj.worker_id, info.path),
+                                 image_size(c), Some(nothing))
                 return media_element(worker_file_url(state, proj.worker_id, info.path),
-                    c.mime_type, is_video; filename = fname, worker_path = info.path,
-                    size = media_size(state, proj.worker_id, info.path))
+                    c.mime_type, is_video; filename = fname, worker_path = info.path, size)
             end
         catch e
             e isa InterruptException && rethrow()
             @warn "read image: worker file unavailable; inlining base64" exception = (e, catch_backtrace())
         end
     end
-    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, is_video; filename = fname)
+    return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, is_video;
+                         filename = fname, size = image_size(c))
 end
 
 # The inline (chat-bubble) body of a `bt_show`. Delegates to the SAME per-kind
@@ -3631,6 +3641,36 @@ function save_editor!(fe::FileEditor, content::AbstractString)
     error("worker '$(proj.worker_id)' is not connected — $(basename(fe.worker_path)) was NOT saved")
 end
 
+# The worker file a tool's content shows instead of carrying it, or `nothing`.
+#
+# bt_show output: a "shown: <path>" reference block (scanned across all text
+# blocks, since captured stdout can precede it). The rendered file lives on the
+# worker; the chat fetches it lazily and renders a collapsible preview without
+# putting the bytes through claude.
+#
+# codex's image view ships a `resource_link` to a file ON THE WORKER instead of
+# the image bytes (see `ResourceLink`). That is the same job bt_show does, so it
+# goes to the same widget: `ShowTool` mirrors the file over the control WS,
+# dispatches on `file_kind`, and degrades to a visible error node if the fetch
+# fails. Media only: a link to a .txt belongs in the text body, not a preview
+# pane.
+function shown_file(state::ServerState, project_id::AbstractString,
+                    cwd::AbstractString, content)
+    show_text = find_show_reference(content)
+    if show_text !== nothing
+        path = parse_show_path(show_text)
+        path === nothing || return ShowTool(state, String(project_id), String(cwd), path)
+    end
+    for c in content
+        c isa AgentClientProtocol.ResourceLink || continue
+        path = AgentClientProtocol.resource_link_path(c)
+        path === nothing && continue
+        resource_media_mime(path) === nothing && continue
+        return ShowTool(state, String(project_id), String(cwd), path)
+    end
+    return nothing
+end
+
 function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     chat_dir::AbstractString=cwd;
     project_id::AbstractString="")
@@ -3651,29 +3691,8 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     isempty(content) && !renders_from_input(m) &&
         return DOM.div("(loading…)"; class = "bt-tool-empty bt-tool-loading")
 
-    # bt_show output: a "shown: <path>" reference block (scanned across all text
-    # blocks, since captured stdout can precede it). The rendered file lives on
-    # the worker; the chat fetches it lazily and renders a collapsible preview
-    # without putting the bytes through claude.
-    show_text = find_show_reference(content)
-    if show_text !== nothing
-        path = parse_show_path(show_text)
-        path === nothing || return ShowTool(state, project_id, String(cwd), path)
-    end
-
-    # codex's image view ships a `resource_link` to a file ON THE WORKER instead
-    # of the image bytes (see `ResourceLink`). That is the same job bt_show
-    # does, so route it to the same widget: `ShowTool` mirrors the file over the
-    # control WS, dispatches on `file_kind`, and degrades to a visible error
-    # node if the fetch fails. Media only — a link to a .txt belongs in the text
-    # body, not a preview pane.
-    for c in content
-        c isa AgentClientProtocol.ResourceLink || continue
-        path = AgentClientProtocol.resource_link_path(c)
-        path === nothing && continue
-        resource_media_mime(path) === nothing && continue
-        return ShowTool(state, project_id, String(cwd), path)
-    end
+    st = shown_file(state, project_id, cwd, content)
+    st === nothing || return st
 
     # Per-type body. Dispatched on the message TYPE (EditToolMsg / SearchToolMsg
     # / ReadToolMsg / BashToolMsg / …), never a `kind ==` string test.
@@ -8697,10 +8716,10 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     });
 }""")
         catch fallback_e
-            # The fallback render itself failed — almost always the tab's session
-            # went away mid-render. Log instead of swallowing (T20); there's no
-            # further recovery (the slot is gone with the page).
-            @debug "tool render fallback failed (session likely gone)" tool_id = cmd.tool_id exception = fallback_e
+            # The fallback render itself failed. A tab that closed mid-render has
+            # no slot left to fill; anything else is a bug in the fallback.
+            is_stale_session_error(fallback_e) ||
+                @warn "tool render fallback failed" tool_id = cmd.tool_id exception = (fallback_e, catch_backtrace())
         end
     end)
     return nothing
@@ -8982,7 +9001,7 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
         @warn "edit_file: no plotpane bound to this chat view (rendered outside the unified shell?)" path
         return nothing
     end
-    open_file!(pane, model, path)
+    open_file!(pane, model, path; tab = tab_id(session))
 end
 
 # Build the workspace-tab view of `path` — a `FilePanel`, which picks the right
@@ -9081,8 +9100,8 @@ unsaved edits, since the Workspace renders it once and only ever moves its node
 — and refreshes it from the worker. A refusal or a failed fetch flashes a toast
 and opens NO panel; the user clicked a link and must see SOMETHING happen.
 """
-open_file!(pane::PlotPane, model::ChatModel, path::AbstractString) =
-    open_project_file!(pane, model.state, model.project_id, model.cwd, path)
+open_file!(pane::PlotPane, model::ChatModel, path::AbstractString; tab::AbstractString = "") =
+    open_project_file!(pane, model.state, model.project_id, model.cwd, path; tab)
 
 """
     open_project_file!(pane, state, project_id, server_cwd, path)
@@ -9091,11 +9110,19 @@ Core of [`open_file!`](@ref), parameterized by `(state, project_id, server_cwd)`
 instead of a `ChatModel` so the sidebar file-tree can open files even when the
 chat's ACP session isn't up. Guards (worker stat) → fetches → adds the panel; a
 refusal or fetch failure flashes a toast and opens NO panel.
+
+Every open is logged with its outcome and `tab` (the window that asked, as
+"tab opened" names it): a phone reported a markdown file that never showed, and
+the server had no line saying whether it had opened it.
 """
 function open_project_file!(pane::PlotPane, state::ServerState, project_id::AbstractString,
-                            server_cwd::AbstractString, path::AbstractString)
+                            server_cwd::AbstractString, path::AbstractString;
+                            tab::AbstractString = "")
     ws = pane.workspace[]
-    ws === nothing && return nothing
+    if ws === nothing
+        @warn "file not opened: this window has no workspace" path project_id tab
+        return nothing
+    end
     # Identify the tab by the file's absolute WORKER path, never by the string we
     # were handed. The two ways in disagree: the file tree passes an absolute
     # path, a tool pill passes whatever the agent printed (usually relative to
@@ -9105,7 +9132,11 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
     # and `notes.md`, which reads as two genuinely different files.
     given = String(path)
     path = show_worker_path(ShowTool(state, String(project_id), String(server_cwd), given))
-    activate_file_tab!(ws, state, project_id, path) && return nothing
+    if activate_file_tab!(ws, state, project_id, path)
+        @info "file tab shown again" path project_id tab
+        return nothing
+    end
+    t0 = time()
     # Fetch (worker transfer — can take seconds) off the event task, then add the
     # panel as the workspace panel's DIRECT content. NOT via a placeholder +
     # reactive `DOM.div(Observable)` swap: that inserts auto-height
@@ -9128,13 +9159,14 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         end
         reason = open_guard_reject_reason(info, target)
         if reason !== nothing
+            @info "file not opened" path = target reason project_id tab
             show_problem!(pane, reason)
             return
         end
         elem = try
             file_panel_content(state, project_id, server_cwd, target)
         catch e
-            @warn "file open failed" path = target exception = e
+            @warn "file open failed" path = target project_id tab exception = e
             show_problem!(pane, "Can't open $(basename(target)) — $(open_error_brief(e))",
                           error_detail(e))
             return
@@ -9142,6 +9174,7 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(file_tab_id(target), elem;
             label = basename(target), closable = true))
         relabel_file_tabs!(ws)
+        @info "file tab opened" path = target bytes = elem.size_bytes seconds = round(time() - t0; digits = 1) project_id tab
         # Mark the tab while the buffer differs from what was last saved. Closing
         # a tab discards it WITHOUT asking, so this dot is the only warning you
         # get that unsaved work is about to go.
@@ -9255,10 +9288,15 @@ end
 # logged with the tab (`tab_id`; "tab opened" says whose it is).
 function chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict)
     t0 = time()
-    handle_command!(model, session, parse_chat_command(msg))
-    took = time() - t0
-    took > SLOW_COMMAND_S &&
-        @warn "slow chat command: its tab waited on it" project_id = model.project_id type = get(msg, "type", "?") took_s = round(took; digits = 1) tab = tab_id(session)
+    type = string(get(msg, "type", "?"))
+    try
+        handle_command!(model, session, parse_chat_command(msg))
+    finally
+        took = time() - t0
+        record_timing!(model.state, :chat_command, took; type, project_id = model.project_id, tab = tab_id(session))
+        took > SLOW_COMMAND_S &&
+            @warn "slow chat command: its tab waited on it" project_id = model.project_id type took_s = round(took; digits = 1) tab = tab_id(session)
+    end
     return nothing
 end
 

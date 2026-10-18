@@ -280,7 +280,8 @@ end
                               d.dataset.pinEnd === '1' &&
                               sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 4); })()""";
                 timeout = 180) == true
-        catch
+        catch e
+            @info "stream wait failed" exception = e
             false
         end
         stream_ok || @info "stream dump" pane = TK.eval_js(s,

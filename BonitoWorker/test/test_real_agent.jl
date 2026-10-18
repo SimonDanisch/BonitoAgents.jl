@@ -154,11 +154,7 @@ end
                        wait = false)
     println("[real-agent] worker pid=", getpid(worker_proc))
 
-    function show_log()
-        try
-            "--- worker log ---\n" * read(worker_log, String)
-        catch; "(no log)" end
-    end
+    show_log() = isfile(worker_log) ? "--- worker log ---\n" * read(worker_log, String) : "(no log)"
 
     try
         # ── Step 1: the worker's hello on /w ─────────────────────────────────

@@ -75,6 +75,8 @@ checks
 check "the first install prints the admin's setup link" grep -qE "$ORIGIN/invite/[0-9a-f]{64}" "$log1"
 check "…which the server filed with the invites" sudo test ! -e "$STATE/setup_link.json"
 before="$(secrets_digest)"
+authelia_pid() { systemctl show "$NAME-authelia" -p MainPID --value; }
+authelia_before="$(authelia_pid)"
 
 echo "==> 2. install again (an update)"
 log2="$(mktemp)"
@@ -82,6 +84,9 @@ if ! install 2>&1 | tee "$log2"; then echo "  FAIL  the second install"; failure
 checks
 check "secrets and accounts are kept" test "$(secrets_digest)" = "$before"
 check "no new setup link" bash -c "! grep -q '/invite/' $log2"
+# Authelia keeps every login in memory: an update that restarted it logged out
+# every browser, and their open tabs could not reconnect.
+check "Authelia kept running through the update (every login stays)" test "$(authelia_pid)" = "$authelia_before"
 
 removed() {
     for unit in server authelia caddy; do

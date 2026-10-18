@@ -40,7 +40,8 @@ All of it dispatched on the app's type:
 ```julia
 app_id(::Type{MyApp})  # required: a short lowercase word, the chat's `app` field
 app_title(app)         # what the app is called in the UI (default: the id)
-app_description(app)   # one line, for the dashboard's Apps card
+app_description(app)   # a few lines: its tile's details, its setup dialog
+app_icon(app)          # path of its logo file (square SVG/PNG), or nothing for a letter tile
 app_tools(app)         # Vector{AppTool}: the MCP tools it adds
 call_tool(app, Val(:name), call::AppCall) -> String | Dict   # one call of one of them
 chat_pane(app, view) -> DOM node(s)                          # its chat's open pane
@@ -53,9 +54,11 @@ app_allowed(app, user) # who may use it (default: admins)
 The app's chat is an ordinary chat: a project in a folder of its own on a
 worker (`<projects root>/bonitoagents-apps/<id>`), with an agent, a transcript
 and everything else a chat has. `ProjectInfo.app` marks it; it is persisted and
-never derived from the folder, like `dev_mode`. The dashboard's Apps card
-creates it on first use (the user picks the worker) and opens it after; the
-sidebar pins app chats first, under "Apps". "Continue on" carries the mark, and
+never derived from the folder, like `dev_mode`. The dashboard shows each app as a
+tile (its logo, the details on hover); the first click opens a dialog that
+picks the worker and creates the chat, every later click opens it. The chat
+wears the app's logo as its icon; the sidebar pins app chats first, under
+"Apps". "Continue on" carries the mark, and
 `app_chat` takes the newest chat with it.
 
 ### Its pane is DOM it returns

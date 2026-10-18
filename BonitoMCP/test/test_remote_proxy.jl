@@ -38,7 +38,8 @@ Base.close(ws::CapWS) = (ws.closed = true; close(ws.inbound); nothing)
 function Base.iterate(ws::CapWS, st = nothing)
     try
         return (take!(ws.inbound), nothing)
-    catch
+    catch e
+        e isa InvalidStateException || rethrow()
         return nothing      # channel closed → end the loop
     end
 end
@@ -188,12 +189,9 @@ end
         # A genuinely malformed control request (here: missing `key`) MUST reply with
         # an `err` (so the host's call_ctrl fails fast instead of a 30s hang) BEFORE
         # rethrowing — the rethrow is by design (serve_bridge's @async wrapper logs
-        # the trace), so here we swallow it and assert the err reply went out first.
-        try
-            RP.handle_control(b, Dict{String,Any}("op"=>"asset_read","id"=>4,
-                "start"=>0,"stop"=>1))
-        catch
-        end
+        # the trace), so here it is expected and the err reply must have gone out first.
+        @test_throws KeyError RP.handle_control(b, Dict{String,Any}("op"=>"asset_read","id"=>4,
+            "start"=>0,"stop"=>1))
         err_reply = only(filter(d -> get(d,"op","")=="reply" && get(d,"id",0)==4, ctrl_frames(cap)))
         @test haskey(err_reply, "err")
     end

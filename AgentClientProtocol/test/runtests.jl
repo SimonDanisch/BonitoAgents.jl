@@ -30,13 +30,13 @@ struct Mock
 end
 
 peer_alive(m::Mock) = !istaskdone(m.task)
-kill_peer!(m::Mock) = (w = m.peer_ws[]; w === nothing || (try close(w) catch end); nothing)
+kill_peer!(m::Mock) = (w = m.peer_ws[]; w === nothing || close(w); nothing)   # close is idempotent
 # Release the loopback server handler + close the server. Idempotent. Every test
 # calls this once it's done with the mock (the old subprocess mock had no server
 # to reap; the WS relay does).
 function relay_close!(m::Mock)
     isopen(m.hold) && close(m.hold)
-    try close(m.server) catch end
+    close(m.server)   # idempotent
     return nothing
 end
 
@@ -58,7 +58,8 @@ function spawn_mock(scenario::AbstractString; n::Integer = 0,
     peer_ws = Ref{Any}(nothing)
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
         put!(ws_ch, ws)
-        try take!(hold) catch end     # keep the handler (and ws) alive until teardown
+        # keep the handler (and ws) alive until teardown closes `hold`
+        try take!(hold) catch e; e isa InvalidStateException || rethrow() end
     end
     task = @async try
         HTTP.WebSockets.open("ws://127.0.0.1:$port") do cws

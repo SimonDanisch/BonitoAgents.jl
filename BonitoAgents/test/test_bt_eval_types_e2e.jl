@@ -233,7 +233,8 @@ geo_probe(id) =
             # actually runs (an exception would skip straight past it).
             ok = try
                 TK.wait_for(s, "$id rendered", predicate; timeout = 40) == true
-            catch
+            catch e
+                @info "case wait failed" id exception = e
                 false
             end
             ok || @info "case body dump" id body = TK.eval_js(s,

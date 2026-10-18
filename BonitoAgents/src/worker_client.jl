@@ -181,7 +181,10 @@ end
 # Take from a pending-RPC channel with a bounded wait. If `timeout` seconds
 # elapse without the worker replying, evict the entry (so a late reply gets
 # "unknown id") and surface a clear error to the caller.
-function take_pending!(state::ServerState, ch::Channel, key::String,
+take_pending!(state::ServerState, ch::Channel, key::String, timeout::Real, op_name::AbstractString) =
+    timed(() -> wait_pending!(state, ch, key, timeout, op_name), state, :worker_rpc; op = String(op_name))
+
+function wait_pending!(state::ServerState, ch::Channel, key::String,
                        timeout::Real, op_name::AbstractString)
     # Fire the timeout from a `Timer` rather than an `@async sleep(timeout)`
     # task (T15): the old design left one sleeping task alive for the FULL
@@ -1414,7 +1417,10 @@ function scan_and_store!(state::ServerState, worker_id::AbstractString; agents::
     return fetch(task)
 end
 
-function store_scan!(state::ServerState, wid::String, agents::Bool)
+store_scan!(state::ServerState, wid::String, agents::Bool) =
+    timed(() -> scan_and_save!(state, wid, agents), state, :scan; worker_id = wid, agents)
+
+function scan_and_save!(state::ServerState, wid::String, agents::Bool)
     norm = try
         fresh = Dict{String,Any}[Dict{String,Any}(r) for r in scan_worker_sessions(state, wid; agents)]
         agents || keep_agent_rows!(fresh, get(state.discovered[], wid, Dict{String,Any}[]))
@@ -1433,7 +1439,8 @@ function store_scan!(state::ServerState, wid::String, agents::Bool)
         state.last_scan[wid] = time()
         save_discovered!(state)
     end
-    safe_notify!(state.discovered)
+    # Every tab's worker cards rebuild their session lists from this.
+    timed(() -> safe_notify!(state.discovered), state, :notify; signal = "discovered", rows = length(norm))
     # A scan never renames an existing chat. Its title is user-controlled.
     return norm
 end

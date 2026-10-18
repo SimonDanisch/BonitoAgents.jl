@@ -254,10 +254,7 @@ function claim_pidfile!(path::AbstractString = pidfile_path(); instance::Abstrac
     atexit() do
         # Only remove if it's still ours — a successor that took over the slot
         # must keep its own claim.
-        try
-            read_pidfile(path) == getpid() && rm(path; force = true)
-        catch
-        end
+        read_pidfile(path) == getpid() && rm(path; force = true)
     end
     return nothing
 end
@@ -302,18 +299,14 @@ function friendly_hostname()
     @static if Sys.isapple()
         # macOS System Settings → General → About → Name. Includes spaces /
         # apostrophes (e.g. "Sebastian's MacBook Pro"). `scutil` ships on
-        # every macOS install — no Homebrew dependency.
-        try
-            name = strip(read(`scutil --get ComputerName`, String))
-        catch
-        end
+        # every macOS install — no Homebrew dependency. Prints nothing (and
+        # fails) when no name is set.
+        name = command_output(`scutil --get ComputerName`)
     elseif Sys.islinux()
         # `hostnamectl --pretty` prints the user-set pretty hostname if
-        # configured, otherwise empty. systemd ships it on most distros.
-        try
-            name = strip(read(`hostnamectl --pretty`, String))
-        catch
-        end
+        # configured, otherwise empty, and fails where systemd-hostnamed does
+        # not run (containers). Not every distro ships systemd.
+        Sys.which("hostnamectl") === nothing || (name = command_output(`hostnamectl --pretty`))
     end
     isempty(name) && (name = gethostname())
     # `localhost` is the universal placeholder, not a useful display name —
@@ -385,12 +378,8 @@ service_unit_path() = joinpath(systemd_user_dir(), SERVICE_NAME)
 function systemd_user_available()
     Sys.islinux() || return false
     Sys.which("systemctl") === nothing && return false
-    try
-        return success(pipeline(`systemctl --user show-environment`;
-                                stdout = devnull, stderr = devnull))
-    catch
-        return false
-    end
+    return success(pipeline(`systemctl --user show-environment`;
+                            stdout = devnull, stderr = devnull))
 end
 
 # A stop the service manager requests (`systemctl stop`/`restart`, a shutdown)
@@ -456,8 +445,12 @@ service_installed() = isfile(service_unit_path())
 # the service still runs while logged in — so we warn, not error.
 function enable_linger!()
     user = get(ENV, "USER", "")
-    isempty(user) && (user = try strip(read(`whoami`, String)) catch; "" end)
-    isempty(user) && return false
+    isempty(user) && (user = command_output(`whoami`))
+    if isempty(user)
+        @warn "BonitoWorker: could not tell which user this is, so linger stays off " *
+              "(the service won't auto-start at boot without an active session)"
+        return false
+    end
     try
         run(pipeline(`loginctl enable-linger $user`; stdout = devnull, stderr = devnull))
         return true
@@ -503,30 +496,23 @@ end
     # `taskkill` ships in every Windows install; PID-targeted form is the
     # closest WinAPI-free analogue of `kill -TERM`. `/T` includes child
     # processes, so a worker that spawned subagents takes them with it.
-    function signal_worker_graceful(pid::Integer)
-        try
-            run(pipeline(`taskkill /PID $(pid) /T`, devnull, devnull); wait = false)
-        catch
-        end
-    end
-    function signal_worker_force(pid::Integer)
-        try
-            run(pipeline(`taskkill /F /PID $(pid) /T`, devnull, devnull); wait = false)
-        catch
-        end
-    end
+    # taskkill failing because the worker exited meanwhile is what we wanted;
+    # the caller polls `pid_running` for the outcome.
+    signal_worker_graceful(pid::Integer) =
+        run(pipeline(`taskkill /PID $(pid) /T`, devnull, devnull); wait = false)
+    signal_worker_force(pid::Integer) =
+        run(pipeline(`taskkill /F /PID $(pid) /T`, devnull, devnull); wait = false)
 else
-    function signal_worker_graceful(pid::Integer)
-        try
-            ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(15))   # SIGTERM
-        catch
-        end
-    end
-    function signal_worker_force(pid::Integer)
-        try
-            ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(9))    # SIGKILL
-        catch
-        end
+    signal_worker_graceful(pid::Integer) = signal_worker(pid, 15)   # SIGTERM
+    signal_worker_force(pid::Integer) = signal_worker(pid, 9)       # SIGKILL
+    # `kill` reports through errno and never throws. A worker that is already
+    # gone is what stopping it wanted; anything else is said.
+    function signal_worker(pid::Integer, signal::Integer)
+        ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(signal)) == 0 && return true
+        err = Libc.errno()
+        err == Libc.ESRCH ||
+            @warn "BonitoWorker: could not signal the old worker" pid signal error = Libc.strerror(err)
+        return false
     end
 end
 
@@ -602,7 +588,9 @@ end
 function prompt_tty(question::AbstractString; timeout::Real = 120)
     tty = try
         open("/dev/tty", "r")
-    catch
+    catch e
+        # No controlling terminal (ENXIO) or no such device: nobody to ask.
+        e isa SystemError || rethrow()
         return nothing
     end
     try
@@ -611,8 +599,10 @@ function prompt_tty(question::AbstractString; timeout::Real = 120)
         result = Ref{Union{String,Nothing}}(nothing)
         task = @async try
             result[] = strip(readline(tty))
-        catch
+        catch e
             # `close(tty)` below unblocks a pending readline → lands here.
+            e isa Base.IOError || e isa EOFError ||
+                @warn "BonitoWorker: reading the answer failed" exception = (e, catch_backtrace())
         end
         if timedwait(() -> istaskdone(task), float(timeout)) !== :ok
             println("\n(no response in $(round(Int, timeout))s; using the default)")
@@ -1754,11 +1744,8 @@ end
 # `lsof -t -- <path>`: the pids with the file open, one per line. `-t`
 # terse-mode prints bare pids. Missing lsof / no holders → empty.
 function lsof_pids(path::AbstractString, me::Int)::Vector{Int}
-    out = try
-        read(pipeline(`lsof -t -- $path`; stderr = devnull), String)
-    catch
-        return Int[]                     # lsof absent or exit≠0 (no holders)
-    end
+    Sys.which("lsof") === nothing && return Int[]
+    out = command_output(`lsof -t -- $path`)   # exits 1 when nobody holds it
     pids = Int[]
     for tok in split(out)
         p = tryparse(Int, tok)
@@ -1777,12 +1764,15 @@ function child_pids(pid::Int)::Vector{Int}
     isdir(taskdir) || return kids
     for tid in readdir(taskdir)
         f = joinpath(taskdir, tid, "children")
-        try
-            for tok in split(read(f, String))
-                isempty(tok) || push!(kids, parse(Int, tok))
-            end
-        catch
-            # children file absent / process vanished — skip
+        text = try
+            read(f, String)
+        catch e
+            # The thread or the process ended since `readdir`.
+            e isa SystemError || rethrow()
+            continue
+        end
+        for tok in split(text)
+            push!(kids, parse(Int, tok))
         end
     end
     return kids
@@ -2527,7 +2517,10 @@ function scan_jsonl_metadata(jsonl::AbstractString)
                 isempty(line) && continue
                 rec = try
                     JSON.parse(line)
-                catch
+                catch e
+                    # A line the agent is still writing (JSON 1 throws
+                    # ArgumentError, 0.21 ErrorException).
+                    e isa ArgumentError || e isa ErrorException || rethrow()
                     continue
                 end
                 if cwd === nothing
@@ -2541,7 +2534,8 @@ function scan_jsonl_metadata(jsonl::AbstractString)
             end
         end
     catch e
-        @debug "scan_jsonl_metadata: read failed" jsonl exception=e
+        # Deleted since the folder was listed: nothing to describe.
+        e isa SystemError || @warn "scan_jsonl_metadata: read failed" jsonl exception = (e, catch_backtrace())
     end
     return (cwd, preview)
 end
@@ -2619,7 +2613,7 @@ function entry_from_jsonl(jsonl::AbstractString, pid_map::Dict{String,Int})
                 at = get(meta, "agentType", nothing)
                 at isa AbstractString && (agent_type = String(at))
             catch e
-                @debug "entry_from_jsonl: meta read failed" meta_path exception=e
+                @warn "entry_from_jsonl: subagent meta unreadable; its type stays unknown" meta_path exception = e
             end
         end
     end
@@ -2678,7 +2672,7 @@ function load_sessions_pid_map(; home::String = homedir())
             (isempty(sid) || pid === nothing) && continue
             out[sid] = Int(pid)
         catch e
-            @debug "load_sessions_pid_map: skip" file=f exception=e
+            @warn "load_sessions_pid_map: skipping an unreadable session file" file = f exception = e
         end
     end
     return out
@@ -2712,16 +2706,13 @@ end
     end
 else
     function pid_running(pid::Integer)
-        try
-            r = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0))
-            r == 0 && return true
-            err = Libc.errno()
-            err == Libc.ESRCH && return false   # No such process
-            err == Libc.EPERM && return true    # Process exists, no signal perm
-            return false
-        catch
-            return nothing
-        end
+        r = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0))
+        r == 0 && return true
+        err = Libc.errno()
+        err == Libc.ESRCH && return false   # No such process
+        err == Libc.EPERM && return true    # Process exists, no signal perm
+        @warn "pid_running: kill(0) failed" pid error = Libc.strerror(err)
+        return nothing
     end
 end
 

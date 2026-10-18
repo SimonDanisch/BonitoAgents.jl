@@ -6,6 +6,7 @@
 @testitem "unit:app_platform" tags = [:unit] begin
     using BonitoAgents
     using Dates
+    using Base64
     const BT = BonitoAgents
 
     # An app package, as small as one gets. Everything it touches is public.
@@ -46,6 +47,17 @@
             (app.notes[] = String[]; "cleared")
     end
 
+    # An app whose logo isn't there.
+    module BrokenPkg
+        import BonitoAgents
+        using BonitoAgents: AgentApp, AppContext
+        struct Broken <: AgentApp
+            ctx::AppContext
+        end
+        BonitoAgents.app_id(::Type{Broken}) = "broken"
+        BonitoAgents.app_icon(::Broken) = "/no/such/logo.svg"
+    end
+
     state_dir = mktempdir()
     server = BT.ServerState(; state_dir, working_dir = mktempdir(), apps = (NotesPkg.NotesApp,))
     server.workers[]["w"] = BT.WorkerInfo("w", "Desk", nothing, "h", "/home/u", "julia", String[],
@@ -71,6 +83,27 @@
         # Two apps with one id is a mistake to say out loud.
         @test_throws ErrorException BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
                                                      apps = (NotesPkg.NotesApp, NotesPkg.NotesApp))
+    end
+
+    @testset "a logo: the app's file, or its first letter" begin
+        app = server.apps["notes"]
+        @test BT.app_icon(app) === nothing
+        prefix = "data:image/svg+xml;base64,"
+        src = BT.app_icon_src(app)
+        @test startswith(src, prefix)
+        @test occursin(">N</text>", String(base64decode(src[(length(prefix) + 1):end])))
+        @test occursin(">3</text>", BT.letter_icon_svg(" 3d viewer", "x"))
+        @test occursin(">?</text>", BT.letter_icon_svg("--", "x"))
+        todo = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir()).apps["todo"]
+        @test isfile(BT.app_icon(todo))
+        @test BT.app_icon_src(todo) isa BT.Bonito.Asset
+        # A logo that isn't there is a mistake to say out loud, at start.
+        @test_throws ErrorException BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
+                                                     apps = (BrokenPkg.Broken,))
+        # The app's chat wears it.
+        chat = BT.ProjectInfo("c9", "notes", "w", mktempdir(), "/home/u/p/notes-app", now(UTC))
+        chat.app = "notes"
+        @test BT.chat_icon_image(server, chat) == src
     end
 
     @testset "a scope of the app's own" begin

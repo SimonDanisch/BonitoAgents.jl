@@ -54,6 +54,31 @@
             TK.close_browser!(tab)
         end
 
+        @testset "a connection that drops after the login ended says so" begin
+            # Seen 2026-10-17: an update restarted Authelia, which keeps logins in
+            # memory; the open tab worked on over its websocket, and when that
+            # dropped the gate turned every reconnect away. The card said
+            # "Reconnecting to the server" forever: a hung server, to the user.
+            @test logout!(z) == 200
+            TK.eval_js(z, "window.WEBSOCKET.close(); true")
+            @test TK.wait_for(z, "the login card, not reconnecting", "!!$card"; timeout = 30) == true
+            # The user logs in in a new tab; this one reconnects by itself.
+            tab = new_tab()
+            login_page(tab)
+            TK.login!(tab)
+            @test TK.wait_for(z, "connected again, no card", """$(led)?.dataset.status === 'connected' &&
+                !$card && !document.querySelector('.bt-conn-modal.bt-conn-open')"""; timeout = 60,
+                describe = """JSON.stringify({led: $(led)?.dataset.status, card: !!$card,
+                    open: [...document.querySelectorAll('.bt-conn-modal.bt-conn-open')].map(m => m.dataset.status),
+                    ws: !!window.WEBSOCKET && window.WEBSOCKET.isopen(), path: location.pathname})""") == true
+            TK.close_browser!(tab)
+            # The turned-away reconnects are in the console (the browser's own
+            # words for a refused websocket); that is this test's doing.
+            errs = TK.js_errors(z)
+            @test all(e -> occursin("WebSocket", e["message"]), errs)
+            TK.clear_js_errors(z)
+        end
+
         @testset "a page the server no longer has waits for the login, then reloads" begin
             # The server restarted with Authelia: the page's session and its
             # login are gone. Reloaded at once, it would land on the login page.

@@ -24,9 +24,13 @@
         cmd = size_cmd(("type" => "media.size", "path" => "/w/a.png", "w" => 640, "h" => 480))
         @test cmd isa BT.MediaSizeCommand && cmd.path == "/w/a.png" && (cmd.w, cmd.h) == (640, 480)
         cmd = size_cmd(("type" => "tool.size", "id" => "t1", "w" => 600.4, "h" => 311.6))
-        @test cmd isa BT.BodyHeightCommand && cmd.tool_id == "t1" && (cmd.w, cmd.h) == (600, 312)
+        @test cmd isa BT.BodyHeightCommand && cmd.tool_id == "t1" && (cmd.w, cmd.h, cmd.extra) == (600, 312, 0)
+        cmd = size_cmd(("type" => "tool.size", "id" => "t1", "w" => 600, "h" => 312, "extra" => 26.2))
+        @test cmd isa BT.BodyHeightCommand && cmd.extra == 26
         for bad in (("w" => 0, "h" => 5), ("w" => 5,), ("w" => "5", "h" => 5),
-                    ("w" => 5, "h" => 1e9), ("w" => NaN, "h" => 5))
+                    ("w" => 5, "h" => 1e9), ("w" => NaN, "h" => 5),
+                    ("w" => 5, "h" => 5, "extra" => -1), ("w" => 5, "h" => 5, "extra" => 6),
+                    ("w" => 5, "h" => 5, "extra" => "2"))
             @test size_cmd(("type" => "tool.size", "id" => "t1", bad...)) isa BT.UnknownCommand
         end
         @test size_cmd(("type" => "media.size", "w" => 5, "h" => 5)) isa BT.UnknownCommand
@@ -74,12 +78,12 @@
         id = BT.tool_id(m)
         @test !haskey(BT.row_dict(model, m), "body_h")
 
-        BT.handle_command!(model, session, BT.BodyHeightCommand(id, 600, 312))
+        BT.handle_command!(model, session, BT.BodyHeightCommand(id, 600, 312, 0))
         @test BT.row_dict(model, m)["body_h"] == Dict("600" => 312)
-        BT.handle_command!(model, session, BT.BodyHeightCommand(id, 601, 300))   # the same width
+        BT.handle_command!(model, session, BT.BodyHeightCommand(id, 601, 300, 0))   # the same width
         @test BT.row_dict(model, m)["body_h"] == Dict("601" => 300)
         for w in (320, 800, 1024, 1280)
-            BT.handle_command!(model, session, BT.BodyHeightCommand(id, w, w ÷ 2))
+            BT.handle_command!(model, session, BT.BodyHeightCommand(id, w, w ÷ 2, 0))
         end
         want = Dict("320" => 160, "800" => 400, "1024" => 512, "1280" => 640)   # the oldest went
         @test BT.row_dict(model, m)["body_h"] == want
@@ -94,5 +98,74 @@
         tab = copy(model, Bonito.Session())                  # every tab shares one record
         @test BT.body_heights(tab, id) == want
         @test BT.body_heights(chat(state), id) == want       # and it comes back with the chat
+
+        # A file written before `extra` was measured: its heights, nothing else.
+        old = mktempdir()
+        write(joinpath(old, "body_heights.json"), JSON.json(Dict("t9" => [[600, 312]])))
+        @test only(BT.load_body_heights(old).heights["t9"]) == (600, 312, 0)
     end
+
+    @testset "a bt_show picture: its measured size and its Share row come with its row" begin
+        pic = joinpath(root, "shown.png")
+        tc = ACP.GenericTool("show-1", "other", "bt_show", "completed",
+                             ACP.ToolContent[ACP.TextContent("shown: $(pic) (image/png, 4KB)")],
+                             ACP.MessageStream{ACP.ToolCall}())
+        BT.persist_tool_content!(model.chat_dir, tc)
+        m = BT.GenericToolMsg(BT.Message("show-1", "other", "", "bt_show", "completed", "", 0.0, 0.0, nothing))
+        push!(model.msgs_store, m)
+        d = BT.row_dict(model, m)
+        @test d["show_mime"] == "image/png"
+        @test !haskey(d, "media")                            # never shown
+        BT.handle_command!(model, session, BT.MediaSizeCommand(pic, 1200, 600))
+        @test BT.row_dict(model, m)["media"] == [1200, 600]
+        @test !haskey(BT.row_dict(model, m), "media_extra")
+        BT.handle_command!(model, session, BT.BodyHeightCommand(BT.tool_id(m), 800, 426, 26))
+        d = BT.row_dict(model, m)
+        @test d["media_extra"] == 26 && d["body_h"] == Dict("800" => 426)
+        @test BT.media_extra(chat(state), BT.tool_id(m)) == 26  # kept with the heights
+    end
+end
+
+# A picture the agent read carries its bytes, so its size is known before any
+# browser saw it: read from the header, for each format pictures come in.
+@testitem "unit:image_size" tags = [:unit] begin
+    using BonitoAgents
+    using Base64
+    import AgentClientProtocol
+    const BT = BonitoAgents
+    const ACP = AgentClientProtocol
+
+    be32(n) = UInt8[(n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]
+    le16(n) = UInt8[n & 0xff, (n >> 8) & 0xff]
+    le24(n) = UInt8[n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff]
+    png(w, h) = vcat(b"\x89PNG\r\n\x1a\n", be32(13), b"IHDR", be32(w), be32(h), UInt8[8, 6, 0, 0, 0])
+    gif(w, h) = vcat(b"GIF89a", le16(w), le16(h), UInt8[0, 0, 0])
+    # SOI, an APP1 segment of 300 bytes (EXIF comes first in a photo), then SOF2.
+    jpeg(w, h) = vcat(UInt8[0xff, 0xd8, 0xff, 0xe1], UInt8[0x01, 0x2e], zeros(UInt8, 300),
+                      UInt8[0xff, 0xc2, 0x00, 0x11, 0x08, h >> 8, h & 0xff, w >> 8, w & 0xff, 0x03])
+    riff(chunk, payload) = vcat(b"RIFF", zeros(UInt8, 4), b"WEBP", chunk, zeros(UInt8, 4), payload)
+    webp_lossy(w, h) = riff(b"VP8 ", vcat(UInt8[0, 0, 0, 0x9d, 0x01, 0x2a], le16(w), le16(h)))
+    webp_lossless(w, h) = riff(b"VP8L", vcat(UInt8[0x2f],
+        let bits = (w - 1) | (h - 1) << 14; UInt8[bits & 0xff, (bits >> 8) & 0xff, (bits >> 16) & 0xff, (bits >> 24) & 0xff] end))
+    webp_extended(w, h) = riff(b"VP8X", vcat(zeros(UInt8, 4), le24(w - 1), le24(h - 1)))
+
+    @test BT.image_size(png(1920, 1080)) == (1920, 1080)
+    @test BT.image_size(gif(320, 200)) == (320, 200)
+    @test BT.image_size(jpeg(4032, 3024)) == (4032, 3024)
+    @test BT.image_size(webp_lossy(800, 600)) == (800, 600)
+    @test BT.image_size(webp_lossless(1000, 750)) == (1000, 750)
+    @test BT.image_size(webp_extended(4096, 2160)) == (4096, 2160)
+
+    # Not a picture, or cut short: no size, rather than a wrong one.
+    @test BT.image_size(Vector{UInt8}(b"%PDF-1.7 and so on")) === nothing
+    @test BT.image_size(png(10, 10)[1:20]) === nothing
+    @test BT.image_size(jpeg(10, 10)[1:200]) === nothing
+    @test BT.image_size(UInt8[]) === nothing
+
+    # From an image content's base64, and as the tool's content gives it.
+    c = ACP.ImageContent(base64encode(vcat(png(640, 480), rand(UInt8, 100_000))), "image/png")
+    @test BT.image_size(c) == (640, 480)
+    @test BT.tool_media_size(Any[ACP.TextContent("read it"), c]) == (640, 480)
+    @test BT.tool_media_size(Any[ACP.TextContent("no picture")]) === nothing
+    @test BT.image_size(ACP.ImageContent("not base64 at all!", "image/png")) === nothing
 end

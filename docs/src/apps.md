@@ -92,9 +92,11 @@ BonitoAgents.serve(; apps = (BonitoAgents.BUILTIN_APPS..., NotesApp.Notes))
 # or, while developing it: BonitoAgents.dev_server(; apps = (NotesApp.Notes,))
 ```
 
-What else an app can define, all optional: `app_description` (the dashboard's
-line), `app_briefing` (added to its chat agent's system prompt), `app_allowed`
-(who may use it; admins by default). A tool's `scope` can also be a
+What else an app can define, all optional: `app_description` (its tile's
+details and setup dialog), `app_icon` (the path of its logo, a square SVG or PNG
+that ships with the package, e.g. `joinpath(@__DIR__, "logo.svg")`; without one
+its tile shows the first letter of its title), `app_briefing` (added to its chat
+agent's system prompt), `app_allowed` (who may use it; admins by default). A tool's `scope` can also be a
 `ToolScope` of the app's own, with a method of `in_scope`.
 
 The chat widgets are components: `ChatHeader(view)`, `ChatNotice(view)`,

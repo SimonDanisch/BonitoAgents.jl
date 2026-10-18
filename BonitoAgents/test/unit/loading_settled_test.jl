@@ -27,7 +27,9 @@
     ls = BT.LoadingState()
     seen = String[]
     on(v -> push!(seen, v), current_view)
-    BT.unified_main(session, st, current_view, ls)
+    # Rendered, as a page does: the loading card (`ChatLoadingView`) starts the
+    # bring-up when the overlay renders it.
+    Bonito.jsrender(session, BT.unified_main(session, st, current_view, ls))
 
     current_view[] = "p1"    # the loading overlay spawns the bring-up
     current_view[] = ""      # …and the user goes Home while it runs

@@ -152,6 +152,8 @@ const OverviewStyles = Bonito.Styles(
     CSS(".bt-ov-thumb img.bt-ov-img",
         "width" => "100%", "height" => "100%", "object-fit" => "cover",
         "display" => "block"),
+    CSS(".bt-ov-thumb img.bt-ov-logo",
+        "width" => "56px", "height" => "56px", "border-radius" => "12px", "display" => "block"),
     CSS(".bt-ov-body",
         "padding" => "9px 11px 10px",
         "display" => "flex", "flex-direction" => "column", "gap" => "5px",
@@ -188,7 +190,11 @@ const OverviewStyles = Bonito.Styles(
 
 function overview_card_dom(state::ServerState, c::ChatCardData)
     p = get(state.projects[], c.pid, nothing)
-    thumb = if c.image !== nothing
+    app = p === nothing ? nothing : app_of(state, p)
+    thumb = if app !== nothing
+        # An app's chat shows the app's logo whole, not cropped to the strip.
+        DOM.img(; src = app_icon_src(app), alt = "", class = "bt-ov-logo")
+    elseif c.image !== nothing
         DOM.img(; src = c.image, alt = "", class = "bt-ov-img", loading = "lazy")
     elseif p !== nothing
         project_icon(state, p)                # identicon placeholder
@@ -226,7 +232,7 @@ end
 function recent_chats_dom(session::Bonito.Session, state::ServerState,
                           current_view::Union{Observable{String},Nothing})
     grid = map(state.chat_signal, state.turn_signal, state.projects) do _, _turn, _projects
-        cards = recent_chat_cards(state)
+        cards = page_phase(() -> recent_chat_cards(state), :overview_cards)
         isempty(cards) && return DOM.div("No chats yet — create a project below.";
                                           class = "bt-ov-empty")
         DOM.div((overview_card_dom(state, c) for c in cards)...; class = "bt-ov-grid")

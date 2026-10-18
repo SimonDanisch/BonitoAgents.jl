@@ -260,7 +260,9 @@ function julia_eval_handler(args::AbstractDict)
     try
         ensure_eval_dialed!(s)
     catch e
-        @debug "bt_julia_eval: eval bridge unavailable; result will render text-only" exception = e
+        # Without a server `ensure_eval_dialed!` returns at once, so this is a
+        # bridge that should be there and is not.
+        @warn "bt_julia_eval: eval bridge unavailable; result will render text-only" exception = (e, catch_backtrace())
     end
 
     given = get(args, "run_id", nothing)      # set when this process hosts another worker's chat

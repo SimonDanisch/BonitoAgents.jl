@@ -58,7 +58,7 @@ function dev_call(op::AbstractString; timeout::Real = 30.0, kw...)
 end
 
 const DEV_INSPECT_SECTIONS = ("overview", "workers", "worker", "projects", "chats",
-                              "evals", "settings")
+                              "evals", "settings", "tabs")
 
 const DEV_INSPECT_DESCRIPTION = """
 Inspect the LIVE state of the BonitoAgents server this chat is running inside.
@@ -83,8 +83,18 @@ Sections:
                 control requests. This is where "the plot never rendered" lives.
   • settings  — server-wide session-config defaults and the last reported config
                 options.
+  • tabs      — every browser tab the server serves, and the ones that closed
+                lately: user, client, what it shows, `connected` (its socket is
+                live), Bonito's `status` (`SOFT_CLOSED`: socket gone but still
+                served for the cleanup time, queueing everything it is sent;
+                `OPEN` or `DISPLAYED` otherwise: a connected page can stay
+                `DISPLAYED`), seconds since the socket dropped, queued
+                messages, subsessions, and whether the page last said it was
+                hidden. The `tab` is the 8 characters the log's "tab opened"
+                lines print.
 
-Pass `project_id` to narrow `projects` / `chats` / `evals` to one chat.
+Pass `project_id` to narrow `projects` / `chats` / `evals` to one chat, `tab` to
+narrow `tabs` to one tab.
 
 This reads the real objects in the running process — it is not a file on disk and
 not a snapshot. Two calls a few minutes apart are the intended way to see drift.
@@ -100,6 +110,8 @@ register!("bt_dev_inspect", DEV_INSPECT_DESCRIPTION,
                               "description" => "Optional: restrict the report to one chat/project."),
             "worker_id" => Dict("type" => "string",
                               "description" => "Optional: for section=worker, which worker to ask."),
+            "tab" => Dict("type" => "string",
+                              "description" => "Optional: for section=tabs, a tab id or its start."),
         ),
         "required" => ["section"],
     ),
@@ -110,7 +122,8 @@ register!("bt_dev_inspect", DEV_INSPECT_DESCRIPTION,
                              join(DEV_INSPECT_SECTIONS, ", "))
         return dev_call("inspect"; section = section,
                         project_id = String(get(args, "project_id", "")),
-                        worker_id  = String(get(args, "worker_id", "")))
+                        worker_id  = String(get(args, "worker_id", "")),
+                        tab        = String(get(args, "tab", "")))
     end;
     available = dev_tools_enabled)
 
@@ -290,5 +303,92 @@ register!("bt_dev_control", DEV_CONTROL_DESCRIPTION,
                         worker_id  = String(get(args, "worker_id", "")),
                         text       = String(get(args, "text", "")),
                         title      = String(get(args, "title", "")))
+    end;
+    available = dev_tools_enabled)
+
+const DEV_TIMINGS_DESCRIPTION = """
+How long the server's work took, kept for the last 500 of each kind:
+
+  • page          — building a page's HTML (what a browser waits for before it
+                    sees anything), with `phases`: the timed parts (handler,
+                    sidebar, dashboard, settings, overview_cards, chat_icons,
+                    apps, accounts, shares, workspace) and `render` (Bonito
+                    rendering the components to HTML after the handler
+                    returned), slowest first, down to 1 ms. They nest, so they
+                    don't add up.
+  • browser_load  — what pages reported about their own load: html, scripts,
+                    connected and chat_ms in ms, `why` = ready | gave_up.
+  • chat_command  — each command a tab sent a chat (`type`), which the tab
+                    waits on.
+  • worker_rpc    — each request to a worker (`op` names it and the worker).
+  • notify        — a change fanned out to every tab (`signal`: chats, turn,
+                    projects, workers, discovered): its cost grows with the open
+                    tabs, closed-but-kept ones included.
+  • scan          — scanning a worker for agent sessions.
+
+Each kind answers with a `summary` (count, p50, p95, max, total), its 5 `slowest`
+and its `recent` entries (newest first). `kind` picks one, `min_seconds` keeps
+the recent list to the slow ones, `limit` caps it (default 20). Times are the
+server's local time, like its log.
+"""
+
+register!("bt_dev_timings", DEV_TIMINGS_DESCRIPTION,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "kind"        => Dict("type" => "string",
+                                  "description" => "One kind: page, browser_load, chat_command, worker_rpc, notify, scan. Omit for all."),
+            "min_seconds" => Dict("type" => "number",
+                                  "description" => "Only list recent entries at least this slow."),
+            "limit"       => Dict("type" => "integer",
+                                  "description" => "Max recent entries per kind (default 20)."),
+        ),
+    ),
+    function (args::AbstractDict)
+        kw = Dict{Symbol,Any}(:kind => String(get(args, "kind", "")))
+        haskey(args, "min_seconds") && (kw[:min_seconds] = Float64(args["min_seconds"]))
+        haskey(args, "limit") && (kw[:limit] = Int(args["limit"]))
+        return dev_call("timings"; kw...)
+    end;
+    available = dev_tools_enabled)
+
+const DEV_CONSOLE_DESCRIPTION = """
+The JavaScript console of a browser tab: what the page logged, warned and threw
+(`console.*`, uncaught errors, unhandled promise rejections), as the page kept it.
+
+  • without `tab` — the tabs, open and recently closed, with their status and how
+    many entries they sent the server.
+  • with `tab`    — that tab's console (`tab` = the id or its start, as
+    `bt_dev_inspect section=tabs` and the log's "tab opened" lines show it).
+    A connected tab is asked live (`source: "live"`: its last 1000 entries). A
+    tab that is gone, asleep (a phone in the background) or asked with
+    `live = false` answers with what it beaconed whenever it was hidden, shown
+    or left (`source: "beacons"`).
+
+Filters: `level` (minimum: debug, log, info, warn, error), `contains`
+(case-insensitive), `limit` (the newest N, default 200). A page loaded before the
+console capture existed has none; reloading it starts one.
+"""
+
+register!("bt_dev_console", DEV_CONSOLE_DESCRIPTION,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "tab"      => Dict("type" => "string", "description" => "A tab id or its start. Omit to list the tabs."),
+            "level"    => Dict("type" => "string", "enum" => ["debug", "log", "info", "warn", "error"],
+                               "description" => "Minimum level."),
+            "contains" => Dict("type" => "string", "description" => "Case-insensitive substring filter."),
+            "limit"    => Dict("type" => "integer", "description" => "The newest N entries (default 200)."),
+            "live"     => Dict("type" => "boolean",
+                               "description" => "Ask a connected tab (default true); false reads what it beaconed."),
+        ),
+    ),
+    function (args::AbstractDict)
+        kw = Dict{Symbol,Any}(:tab => String(get(args, "tab", "")),
+                              :level => String(get(args, "level", "debug")),
+                              :contains => String(get(args, "contains", "")),
+                              :live => get(args, "live", true) !== false)
+        haskey(args, "limit") && (kw[:limit] = Int(args["limit"]))
+        return dev_call("console"; kw...)
     end;
     available = dev_tools_enabled)
