@@ -65,32 +65,65 @@ Base.hash(c::WorkerCard, h::UInt) = hash(c.worker_id, hash(:WorkerCard, h))
 Base.:(==)(a::WorkerCard, b::WorkerCard) = a.worker_id == b.worker_id
 
 # Compact, persistent feedback for the worker's relationship to this server
-# build. The explanatory note below the card is reserved for states that need
-# action; the badge remains visible after a successful reconnect so an update
-# does not appear to have done nothing.
+# build; the note below the card says what it means and whether to act. The
+# badge stays after a successful reconnect, so an update does not appear to have
+# done nothing. `working` steps run by themselves: they get a spinner and the
+# time they have taken, so a slow install does not look stuck.
 function worker_update_badge(online::Bool, state::Symbol, message::AbstractString = "")
-    online || return (label = "", class = "bt-pill bt-hidden", title = "")
-    state === :current && return (
-        label = "Up to date",
-        class = "bt-pill bt-pill-online bt-worker-update-badge",
-        title = "This worker matches the server build",
-    )
-    state === :updating && return (
-        label = "Updating…",
-        class = "bt-pill bt-pill-syncing bt-worker-update-badge",
-        title = String(message),
-    )
-    state === :reinstall && return (
-        label = "Reinstall needed",
-        class = "bt-pill bt-pill-warn bt-worker-update-badge",
-        title = String(message),
-    )
-    return (
-        label = "Update available",
-        class = "bt-pill bt-pill-warn bt-worker-update-badge",
-        title = String(message),
-    )
+    title = String(message)
+    badge(label, tone; working = false) =
+        (label = label, class = "bt-pill bt-pill-$(tone) bt-worker-update-badge", title = title, working = working)
+    # Restarting is the one step a worker is offline for, and the one that would
+    # otherwise read as a plain "offline".
+    (online || state === :restarting) ||
+        return (label = "", class = "bt-pill bt-hidden", title = "", working = false)
+    state === :current &&
+        return (label = "Up to date", class = "bt-pill bt-pill-online bt-worker-update-badge",
+                title = "This worker matches the server build", working = false)
+    state === :requested  && return badge("Starting update", "syncing"; working = true)
+    state === :installing && return badge("Installing update", "syncing"; working = true)
+    state === :restarting && return badge("Restarting", "syncing"; working = true)
+    state === :waiting    && return badge("Update queued", "warn")
+    state === :failed     && return badge("Update failed", "error")
+    state === :reinstall  && return badge("Reinstall needed", "warn")
+    return badge("Update available", "warn")
 end
+
+# The note's tone: an update running by itself is information, not a warning.
+update_note_class(state::Symbol) =
+    state in (:requested, :installing, :restarting) ? "bt-worker-update-note bt-worker-update-note-info" :
+    state === :failed ? "bt-worker-update-note bt-worker-update-note-error" : "bt-worker-update-note"
+
+# The badge as a node. A working step's timer counts on in the browser
+# (`update_timer_ticker`) from `since`, so it needs no re-render per second.
+function render_update_badge(w::Union{WorkerInfo,Nothing})
+    w === nothing && return DOM.span(""; class = "bt-pill bt-hidden")
+    b = worker_update_badge(isopen(w), w.update_state, w.update_message)
+    b.working || return DOM.span(b.label; class = b.class, title = b.title)
+    return DOM.span(DOM.span(""; class = "bt-spinner bt-spinner-sm"),
+                    DOM.span(b.label),
+                    DOM.span(elapsed_str(time() - w.update_since); class = "bt-update-elapsed",
+                             dataStarted = string(w.update_since));
+                    class = b.class, title = b.title)
+end
+
+# One ticker per card for its update timer; the badge is rebuilt on every step,
+# each time with the step's own start. Stops once the card left the page.
+update_timer_ticker(card) = js"""
+    (card => {
+        const es = sec => sec <= 1 ? "" : sec < 60 ? Math.round(sec) + "s"
+            : (() => { const m = Math.floor(sec / 60), s = Math.round(sec - 60 * m);
+                       return s === 0 ? m + "m" : m + "m" + s + "s"; })();
+        let seen = false;
+        const iv = setInterval(() => {
+            if (!card.isConnected) { if (seen) clearInterval(iv); return; }
+            seen = true;
+            const now = Date.now() / 1000;
+            card.querySelectorAll('.bt-update-elapsed[data-started]').forEach(el => {
+                el.textContent = es(now - parseFloat(el.dataset.started)); });
+        }, 1000);
+    })($(card))
+"""
 
 function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnostics.jl
     state, wid = c.state, c.worker_id
@@ -101,10 +134,12 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
         w === nothing || can_manage(state, w)
     end
 
+    # `:restarting`: offline because it installed an update, and back by itself.
     status_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w === nothing ? :unknown : (!isopen(w) ? :offline :
-                                    (w.update_state !== :current ? :update : :online))
+        w === nothing ? :unknown :
+            !isopen(w) ? (w.update_state === :restarting ? :restarting : :offline) :
+            w.update_state !== :current ? :update : :online
     end
     subtitle_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
@@ -205,14 +240,9 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
     end
 
     status_dot_obs = map(status_obs) do s
-        status_dot(s)
+        status_dot(s === :restarting ? :update : s)
     end
-    update_badge = map(state.workers) do workers
-        w = get(workers, wid, nothing)
-        badge = w === nothing ? worker_update_badge(false, :current) :
-                                worker_update_badge(isopen(w), w.update_state, w.update_message)
-        DOM.span(badge.label; class = badge.class, title = badge.title)
-    end
+    update_badge = map(workers -> render_update_badge(get(workers, wid, nothing)), state.workers)
 
     # The note shows for every non-current state; the button only where the
     # worker can act on it (a `:reinstall` worker does not know `force_update`).
@@ -227,8 +257,7 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
         w = get(workers, wid, nothing)
         quiet = w === nothing || w.update_state === :current
         DOM.span(quiet ? "" : w.update_message;
-                 class = quiet ? "bt-worker-update-note bt-hidden" :
-                                 "bt-worker-update-note")
+                 class = quiet ? "bt-worker-update-note bt-hidden" : update_note_class(w.update_state))
     end
     # The managed agent adapters the worker reports (its harnesses.jl), and why
     # the last install failed. Always a node, for the same reason as above. Not
@@ -246,9 +275,10 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
                      class = isempty(err) ? "bt-hidden" : "bt-worker-adapters-error");
             class = isempty(list) && isempty(err) ? "bt-worker-adapters bt-hidden" : "bt-worker-adapters")
     end
-    # `force_worker_update!` flips the worker to `:updating`, which hides this
-    # button and changes the note and badge. The replacement worker's hello
-    # flips it back to `:current`, leaving the compact success badge visible.
+    # Shown while the update waits for something (`:available`, `:waiting`,
+    # `:failed`). `force_worker_update!` flips the worker to `:requested`, which
+    # hides it while the worker's steps run; the replacement worker's hello
+    # flips it to `:current`, leaving the compact success badge visible.
     update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, update_btn.value) do clicked
         clicked || return
@@ -261,7 +291,7 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
     end
     update_btn_class = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w !== nothing && w.update_state === :available ? "" : "bt-hidden"
+        w !== nothing && w.update_state in (:available, :waiting, :failed) ? "" : "bt-hidden"
     end
 
     # Remove worker. The confirm() lives in JS so we never fire the
@@ -288,8 +318,10 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
 
     # Render both action variants; toggle visibility via class. Keeps the
     # Bonito.Button instances mounted so click handlers don't churn.
-    online_class  = map(o -> o ? "bt-card-actions"            : "bt-card-actions bt-hidden", is_online_obs)
-    offline_class = map(o -> o ? "bt-card-actions bt-hidden"  : "bt-card-actions",            is_online_obs)
+    # A restarting worker shows neither: its badge says where it is.
+    online_class  = map(o -> o ? "bt-card-actions" : "bt-card-actions bt-hidden", is_online_obs)
+    offline_class = map(s -> s in (:offline, :unknown) ? "bt-card-actions" : "bt-card-actions bt-hidden",
+                        status_obs)
     actions_block = DOM.div(
         DOM.div(new_proj_btn, gh_btn, manage ? DOM.div(update_btn; class = update_btn_class) : DOM.div();
                 class = online_class),
@@ -332,7 +364,7 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
                    style = Styles("--bt-worker" => worker_color(state, wid)))
 
     return Bonito.jsrender(session,
-        DOM.div(card, picker_block, gh_block; class = "bt-worker-cell"))
+        DOM.div(card, picker_block, gh_block, update_timer_ticker(card); class = "bt-worker-cell"))
 end
 
 function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::String)

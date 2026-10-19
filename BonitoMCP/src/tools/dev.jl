@@ -325,6 +325,12 @@ How long the server's work took, kept for the last 500 of each kind:
                     projects, workers, discovered): its cost grows with the open
                     tabs, closed-but-kept ones included.
   • scan          — scanning a worker for agent sessions.
+  • ws_upgrade    — a page's live connection (websocket) reaching the login
+                    gate behind a tunnel: `at` is when it arrived, `tab` whose
+                    it is, `seconds` the login check, `status` 101 when let
+                    through. Against the page's `tab opened` and its console's
+                    "connecting", it says whether a slow connect lost its
+                    seconds before the server or in it.
 
 Each kind answers with a `summary` (count, p50, p95, max, total), its 5 `slowest`
 and its `recent` entries (newest first). `kind` picks one, `min_seconds` keeps
@@ -337,7 +343,7 @@ register!("bt_dev_timings", DEV_TIMINGS_DESCRIPTION,
         "type" => "object",
         "properties" => Dict{String,Any}(
             "kind"        => Dict("type" => "string",
-                                  "description" => "One kind: page, browser_load, chat_command, worker_rpc, notify, scan. Omit for all."),
+                                  "description" => "One kind: page, browser_load, chat_command, worker_rpc, notify, scan, ws_upgrade. Omit for all."),
             "min_seconds" => Dict("type" => "number",
                                   "description" => "Only list recent entries at least this slow."),
             "limit"       => Dict("type" => "integer",

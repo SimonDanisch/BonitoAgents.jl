@@ -700,6 +700,75 @@ end
     @test !BW.update_needed(Dict{String,Any}("auto_update" => true), newer)
 end
 
+# The server's worker card shows each step of an update, so nobody has to guess
+# whether to act, wait, or read a log: every step goes out over the control
+# channel served now, a new link hears the current step again (the server rebuilt
+# the card from the hello alone), and the last one ("restarting") is delivered
+# before the process goes. Never runs an install: `update_packages!` would change
+# the real @bonito-agents environment.
+@testset "update steps reach the server" begin
+    WL = BW.WorkerLink
+    w = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:1",
+        worker_id = "update-status-test", name = "upd", mcp_command = "julia",
+        mcp_arguments = String[], projects_root = mktempdir(),
+        update_config = Dict{String,Any}("auto_update" => false)))
+    # No link yet: kept for the next one, and the log says so.
+    @test_logs (:info, r"kept for the next link") BW.report_update!(w, "waiting"; busy = 2)
+    @test (w.update.status, w.update.busy) == ("waiting", 2)
+    since = w.update.since
+
+    ct, st = WL.memory_pair()
+    server_task = Threads.@spawn begin
+        h = WL.read_hello(st)
+        server = WL.Link(:server; id = h.link_id)
+        WL.welcome!(server, st, h, UInt8[]; resumed = false)
+        server
+    end
+    WL.connect!(w.link, ct, UInt8[])
+    server = fetch(server_task)
+    s0 = WL.control_channel(server)
+    next_frame() = BW.MsgPack.unpack(BW.WebSockets.receive(s0))
+    command(d) = BW.WebSockets.send(s0, BW.MsgPack.pack(d))
+
+    # A new link hears the step again, with how long it has been at it.
+    BW.connected!(w, Dict{String,Any}("registered_as" => "upd", "update_spec" => nothing))
+    f = next_frame()
+    @test (f["type"], f["status"], f["busy"]) == ("update_status", "waiting", 2)
+    @test f["elapsed"] >= 0
+    # The same step keeps its start, a new one starts the clock again.
+    BW.report_update!(w, "waiting"; busy = 1)
+    @test w.update.since == since
+    @test next_frame()["busy"] == 1
+    BW.report_update!(w, "installing")
+    @test w.update.since >= since
+    @test next_frame()["status"] == "installing"
+
+    # "Update now" while an install runs: the one under way answers with its step.
+    spec = Dict("repo" => "https://example.test/agents.git", "rev" => "main", "source_id" => "abc123",
+                "bonito_url" => "https://example.test/bonito.git", "bonito_rev" => "master")
+    blocker = Base.Channel{Nothing}(1)
+    lock(w.lock) do
+        w.update.task = @async take!(blocker)
+        w.update.pending = true
+    end
+    command(Dict("type" => "force_update", "immediate" => true, "update_spec" => spec))
+    @test next_frame()["status"] == "installing"
+    put!(blocker, nothing)
+    lock(() -> (w.update.pending = false), w.lock)
+    # A request naming no build says so, instead of leaving the card waiting.
+    command(Dict("type" => "force_update", "immediate" => true, "update_spec" => nothing))
+    f = next_frame()
+    @test f["status"] == "failed"
+    @test occursin("no build", f["error"])
+
+    # The last step before the process goes: delivered, not merely queued.
+    BW.report_update!(w, "restarting")
+    @test flush(w.link; timeout = 5)
+    @test next_frame()["status"] == "restarting"
+    close(w)
+    WL.kill!(server, "done")
+end
+
 # ── file_writer_pids / kill_file_writers (background-shell stop) ────────────
 # The direct stop for a background bash: the shell holds its `>> output`
 # redirect open until it exits, so the file's writers ARE the shell. Linux

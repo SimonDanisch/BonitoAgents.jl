@@ -1701,6 +1701,12 @@ const ChatStyles = Bonito.Styles(
     # No side margin: the card pads its rows, and these line up with the title.
     CSS(".bt-worker-update-note",
         "display" => "block", "font-size" => "12px", "color" => "#92400e"),
+    # An update running by itself: nothing to act on.
+    CSS(".bt-worker-update-note-info", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-worker-update-note-error", "color" => "var(--bt-error)"),
+    # The step's elapsed time in its badge; fixed-width digits so it does not jitter.
+    CSS(".bt-update-elapsed",
+        "font-variant-numeric" => "tabular-nums", "opacity" => "0.8"),
     CSS(".bt-worker-adapters",
         "display" => "block", "font-size" => "12px", "color" => "var(--bt-text-muted)"),
     # npm's reason comes as several lines; keep them apart.
@@ -3647,11 +3653,17 @@ const ChatStyles = Bonito.Styles(
         "opacity" => "0", "pointer-events" => "none"),
 
     # ── Spinner (used by bt_show preview while streaming from worker) ────────
+    # Per-side borders, never the `border` shorthand plus `border-top-color`:
+    # a rule's properties come out in no fixed order, and with the shorthand
+    # last it repainted the top grey. Every spinner in the app was a still grey
+    # ring (this rule loads after the dashboard's, which it overrode).
     CSS(".bt-spinner",
         "width" => "14px", "height" => "14px",
-        "border-radius" => "50%",
-        "border" => "2px solid var(--bt-border)",
-        "border-top-color" => "var(--bt-accent)",
+        "border-radius" => "50%", "box-sizing" => "border-box",
+        "border-top" => "2px solid var(--bt-accent)",
+        "border-right" => "2px solid var(--bt-border)",
+        "border-bottom" => "2px solid var(--bt-border)",
+        "border-left" => "2px solid var(--bt-border)",
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
         "animation" => "bt-spin 0.7s steps(8) infinite",
         "flex-shrink" => "0",

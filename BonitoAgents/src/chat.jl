@@ -466,6 +466,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     on(busy_active) do b
         b == busy_seen[] && return
         busy_seen[] = b
+        b || turn_ended!(model.state, model.project_id)
         notify_turn!(model.state)
     end
     return model

@@ -1055,6 +1055,8 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-pill-syncing",
         "background" => "rgba(59,130,246,0.12)", "color" => "#1d4ed8",
         "gap" => "6px"),
+    CSS(".bt-pill-error",
+        "background" => "rgba(239,68,68,0.12)", "color" => "#b91c1c"),
 
     # (Buttons: `.bt-btn` and its variants live in BASE_CSS, styles.jl.)
 
@@ -1343,7 +1345,8 @@ const DashboardStyles = Bonito.Styles(
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
         "animation" => "bt-spin 0.7s steps(8) infinite",
         "flex-shrink" => "0"),
-    CSS(".bt-spinner-sm",
+    # Two classes, so it wins over `.bt-spinner` wherever that rule loads.
+    CSS(".bt-spinner.bt-spinner-sm",
         "width" => "11px", "height" => "11px", "border-width" => "1.5px"),
     # MUST have an explicit `from`: with only `to { rotate(360deg) }` the
     # browser interpolates from the element's base transform (a matrix) to

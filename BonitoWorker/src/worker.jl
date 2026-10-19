@@ -60,7 +60,19 @@ mutable struct UpdateState
     task::Union{Task,Nothing}
     pending::Bool   # an install runs or is about to: new sessions are refused
     gen::Int        # bumped when an immediate request supersedes a waiting one
+    # Where the update stands, as last told to the server (`report_update!`):
+    # "" (nothing going on), "waiting", "installing", "restarting", "failed" or
+    # "unsupported". A new link hears it again (`connected!`): the server
+    # rebuilt the card from the hello alone, which knows nothing of an install
+    # under way.
+    status::String
+    since::Float64  # when it entered `status`, so the card's timer survives a reconnect
+    busy::Int       # what a waiting update waits out: agent sessions and eval hosts
+    error::String   # why it failed
+    # One report on the wire at a time, so they arrive in the order they happened.
+    const reporting::ReentrantLock
 end
+UpdateState() = UpdateState(nothing, false, 0, "", 0.0, 0, "", ReentrantLock())
 
 """
     Worker(config)
@@ -82,7 +94,7 @@ mutable struct Worker
     link::WorkerLink.Link
     relay::MCPRelay
     function Worker(config::WorkerConfig)
-        w = new(config, ReentrantLock(), UpdateState(nothing, false, 0),
+        w = new(config, ReentrantLock(), UpdateState(),
                 HarnessState(nothing, nothing, false, false, 0),
                 Dict{WorkerLink.LinkChannel,AgentSession}(), Dict{String,Base.Process}(),
                 nothing, false)
@@ -121,8 +133,9 @@ end
 
 updating(w::Worker) = lock(() -> w.update.pending, w.lock)
 
-# Nothing running for the server: no agent, no eval host.
-worker_idle(w::Worker) = lock(() -> isempty(w.sessions) && isempty(w.eval_hosts), w.lock)
+# What runs for the server: agents and eval hosts. A patient update waits for none.
+worker_load(w::Worker) = lock(() -> length(w.sessions) + length(w.eval_hosts), w.lock)
+worker_idle(w::Worker) = worker_load(w) == 0
 
 """
     serve(w::Worker; retry_delay = 5.0, repeat_log_interval = 600.0)
@@ -226,7 +239,10 @@ function connected!(w::Worker, ack::AbstractDict)
         Base.errormonitor(@async serve_control(w, ctrl))
         @info "BonitoWorker: registered with server" name = get(ack, "registered_as", w.config.name)
     end
-    w.config.update_config === nothing || schedule_auto_update!(w, get(ack, "update_spec", nothing))
+    # A new task reports each step itself; one under way already is told again.
+    w.config.update_config === nothing ||
+        schedule_auto_update!(w, get(ack, "update_spec", nothing)) === :started ||
+        report_update!(w)
     spec = harness_spec_from_wire(get(ack, "harnesses", nothing))
     spec === nothing || schedule_harness_sync!(w, spec)
     return nothing
@@ -425,13 +441,15 @@ function dispatch_command(w::Worker, ws, cmd::AbstractDict)
         @async handle_discard_staging(ws, cmd)
     elseif t == "force_update"
         if c.update_config === nothing
-            report_update_status(ws, "unsupported";
-                error = "this worker runs without an update config")
+            report_update!(w, "unsupported"; error = "this worker runs without an update config")
         else
-            report = (status; error = "") -> report_update_status(ws, status; error)
-            schedule_auto_update!(w, get(cmd, "update_spec", nothing);
-                force = true, immediate = get(cmd, "immediate", false) === true, report)
-            report(updating(w) ? "installing" : "waiting")
+            outcome = schedule_auto_update!(w, get(cmd, "update_spec", nothing);
+                force = true, immediate = get(cmd, "immediate", false) === true)
+            # `:started` reports each step itself. An install under way confirms
+            # where it stands, or the card keeps waiting for a confirmation.
+            outcome === :running && report_update!(w)
+            outcome === :none &&
+                report_update!(w, "failed"; error = "the request named no build to install")
         end
     else
         @warn "BonitoWorker: unknown control command" type = t

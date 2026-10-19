@@ -47,4 +47,17 @@
     # The warning was this test's.
     @test any(e -> occursin(marker, e["message"]), TK.js_errors(s))
     TK.clear_js_errors(s)
+
+    # A page that looks frozen while the server is fine waits for something:
+    # everything from the server queues behind the task that holds Bonito's
+    # loading lock, and the page says which once it took 3 s. Its own thread
+    # busy for over a second is noted too. Both as info: a measurement.
+    TK.eval_js(s, "Bonito.lock_loading(() => new Promise(r => setTimeout(r, 3500)), 'a test wait'); true")
+    held = "window.__btConsole.entries().some(e => e.text.includes('a test wait held everything from the server for 3.'))"
+    @test TK.wait_for(s, "the hold reported", held; timeout = 15) == true
+    @test TK.eval_js(s, "window.__btConsole.entries().some(e => e.level === 'info' && e.text.includes('everything from the server waits for a test wait (3 s so far)'))") == true
+    TK.eval_js(s, "setTimeout(() => { const t = Date.now(); while (Date.now() - t < 1200) {} }, 0); true")
+    @test TK.wait_for(s, "the busy page reported",
+        "window.__btConsole.entries().some(e => /the page was busy for 1[0-9]{3} ms/.test(e.text))"; timeout = 15) == true
+    @test isempty(TK.js_errors(s))      # info, not a warning
 end

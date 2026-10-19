@@ -1,8 +1,11 @@
 # Chats with a turn in flight sit together at the top of the sidebar, under
 # "Active", so switching between working chats does not mean searching a list
-# sorted by name. Under the mouse the rows hold still: a chat whose turn starts
-# or ends moves once the pointer leaves the sidebar, never from under a click.
-# Rows move, they are not rebuilt: the same nodes, open file trees and all.
+# sorted by name. The other chats follow, the one whose turn ended last first:
+# a chat that just went quiet stays right below the active ones instead of
+# dropping to its name's place. Under the mouse the rows hold still: a chat
+# whose turn starts or ends moves once the pointer leaves the sidebar, never
+# from under a click. Rows move, they are not rebuilt: the same nodes, open
+# file trees and all.
 @testitem "e2e:sidebar_groups" setup = [SharedServer] tags = [:e2e] begin
     S = SharedServer
     s = S.server()
@@ -11,7 +14,8 @@
 
     s.agent_fn[] = p -> occursin("work", p) ?
         [TK.delay(4000), TK.text("done working"), TK.end_turn()] : [TK.text("ok"), TK.end_turn()]
-    # Rows sort by folder name: these two bracket every other chat's.
+    # Names that would sort these two apart (a first): the order below is the
+    # turns', not the names'.
     root = mktempdir()
     a = TK.new_chat(s; cwd = mkpath(joinpath(root, "aaa-groups")))
     TK.send_message(s, "hello")
@@ -41,27 +45,39 @@
     over = "(() => { const r = $(row(a)).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()"
     mouse_to(away)
 
-    @testset "idle, by name, no labels" begin
+    # The chat that is open in the window, with its composer: `send_message`
+    # writes to that one.
+    function open!(pid)
+        TK.open_chat(s, pid)
+        TK.wait_for(s, "$(pid) open", "!!document.querySelector('.bt-side-item.bt-side-active[data-project-id=\"$(pid)\"]')";
+                    timeout = 10)
+    end
+
+    @testset "idle: the chat that answered last first, no labels" begin
         pa, pz = place(a), place(z)
-        @test pa[1] < pz[1]
+        @test pz[1] < pa[1]                              # z answered after a
         @test pa[2] == "" && pz[2] == ""
     end
 
-    @testset "a working chat goes to the top, under Active" begin
-        TK.send_message(s, "work")                      # z is the open chat
-        @test TK.wait_for(s, "z works", active(z); timeout = 20) == true
-        @test TK.wait_for(s, "z on top", "$(PLACE(z))[0] === 0"; timeout = 10) == true
-        @test place(z)[2] == "Active"
-        @test place(a)[2] == "" || place(a)[2] == "Other chats"
+    @testset "a working chat goes to the top, under Active, and stays there when done" begin
+        open!(a)
+        TK.send_message(s, "work")
+        @test TK.wait_for(s, "a works", active(a); timeout = 20) == true
+        @test TK.wait_for(s, "a on top", "$(PLACE(a))[0] === 0"; timeout = 10) == true
+        @test place(a)[2] == "Active"
+        @test place(z)[2] == "" || place(z)[2] == "Other chats"
         @test TK.eval_js(s, "[...document.querySelectorAll('.bt-sidebar .bt-side-group:not(.bt-hidden)')].map(e => e.textContent)") ==
               ["Active", "Other chats"]
-        # When it is done, back to its place by name, and the labels go.
-        @test TK.wait_for(s, "z done", "!$(active(z))"; timeout = 30) == true
-        @test TK.wait_for(s, "z back below a", "$(PLACE(z))[0] > $(PLACE(a))[0]"; timeout = 10) == true
-        @test TK.eval_js(s, "document.querySelectorAll('.bt-sidebar .bt-side-group:not(.bt-hidden)').length") == 0
+        # Done, it heads the other chats, above z that answered before it, and
+        # the labels go.
+        @test TK.wait_for(s, "a done", "!$(active(a))"; timeout = 30) == true
+        @test TK.wait_for(s, "the labels gone", "document.querySelectorAll('.bt-sidebar .bt-side-group:not(.bt-hidden)').length === 0";
+                          timeout = 10) == true
+        @test place(a)[1] == 0 && place(a)[1] < place(z)[1]
     end
 
     @testset "under the mouse the rows hold still" begin
+        open!(z)
         mouse_to(over)
         before = place(z)[1]
         TK.send_message(s, "work")
@@ -71,7 +87,9 @@
         mouse_to(away)
         @test TK.wait_for(s, "z moves up once the mouse leaves", "$(PLACE(z))[0] === 0"; timeout = 10) == true
         @test TK.wait_for(s, "z done", "!$(active(z))"; timeout = 30) == true
-        @test TK.wait_for(s, "z back below a", "$(PLACE(z))[0] > $(PLACE(a))[0]"; timeout = 10) == true
+        # Done, z stays on top: its turn ended last.
+        sleep(1)
+        @test place(z)[1] == 0 && place(z)[1] < place(a)[1]
     end
 
     # Moved, never rebuilt.

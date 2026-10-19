@@ -138,7 +138,7 @@ function serve(; host::String        = "127.0.0.1",
     # Behind a tunnel every request passes the login gate first (tunnel.jl).
     app = unified_app(state)
     srv = Bonito.Server(context -> timed_page(state, app, context), host, port;
-                        proxy_url = ".", gate = server_gate(auth, state.shares))
+                        proxy_url = ".", gate = server_gate(auth, state.shares, state.timings))
     state.srv = srv
 
     # online_url uses the post-start srv.port — handles port=0 → ephemeral

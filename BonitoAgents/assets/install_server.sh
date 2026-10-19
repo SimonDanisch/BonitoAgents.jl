@@ -471,7 +471,10 @@ if [[ "$TLS" != tunnel ]]; then
     [[ -n "$CADDY_VERSION" ]] || CADDY_VERSION="$(latest_tag caddyserver/caddy || true)"
     CADDY_VERSION="${CADDY_VERSION#v}"
     [[ -n "$CADDY_VERSION" ]] || fail "could not find Caddy's latest release (GitHub API); pass --caddy-version"
-    if [[ -x "$BIN_DIR/caddy" ]] && "$BIN_DIR/caddy" version 2>/dev/null | grep -q "^v$CADDY_VERSION "; then
+    # Asked through sudo, as everything in $BIN_DIR is handled: the installing
+    # user may not be able to reach it, and a check that cannot read the binary
+    # replaced it on every run.
+    if sudo test -x "$BIN_DIR/caddy" && sudo "$BIN_DIR/caddy" version 2>/dev/null | grep -q "^v$CADDY_VERSION "; then
         ok "v$CADDY_VERSION already installed"
     else
         f="caddy_${CADDY_VERSION}_linux_${ARCH}.tar.gz"
@@ -491,9 +494,15 @@ step "Authelia"
 [[ -n "$AUTHELIA_VERSION" ]] || AUTHELIA_VERSION="$(latest_tag authelia/authelia || true)"
 AUTHELIA_VERSION="${AUTHELIA_VERSION#v}"
 [[ -n "$AUTHELIA_VERSION" ]] || fail "could not find Authelia's latest release (GitHub API); pass --authelia-version"
-if [[ -x "$BIN_DIR/authelia" ]] && "$BIN_DIR/authelia" --version 2>/dev/null | grep -q "v$AUTHELIA_VERSION\b"; then
+# Stopping Authelia logs every browser out (its logins live in memory), so it is
+# stopped only for a binary that really is new. The check goes through sudo, as
+# everything in $BIN_DIR does: run as the installing user it could fail to read
+# the binary, and every update stopped Authelia "for its new version".
+installed_authelia="$(sudo test -x "$BIN_DIR/authelia" && sudo "$BIN_DIR/authelia" --version 2>&1 || true)"
+if grep -q "v$AUTHELIA_VERSION\b" <<< "$installed_authelia"; then
     ok "v$AUTHELIA_VERSION already installed"
 else
+    info "installed: ${installed_authelia:-none}; latest: v$AUTHELIA_VERSION"
     f="authelia-v${AUTHELIA_VERSION}-linux-${ARCH}.tar.gz"
     base="https://github.com/authelia/authelia/releases/download/v${AUTHELIA_VERSION}"
     curl -fsSL -o "$TMP/$f" "$base/$f"
@@ -501,14 +510,18 @@ else
     (cd "$TMP" && grep " $f\$" authelia.sums | sha256sum -c --status) ||
         fail "Authelia v$AUTHELIA_VERSION: $f does not match its published checksum"
     tar -xzf "$TMP/$f" -C "$TMP" authelia
-    # A new version needs a restart anyway, and a running binary is not replaced.
-    if sudo systemctl is-active --quiet "$UNIT_AUTHELIA" 2>/dev/null; then
-        sudo systemctl stop "$UNIT_AUTHELIA"
-        ok "stopped $UNIT_AUTHELIA for its new version"
+    if sudo cmp -s "$TMP/authelia" "$BIN_DIR/authelia"; then
+        ok "v$AUTHELIA_VERSION already installed (the same binary): $UNIT_AUTHELIA keeps running"
+    else
+        # A new version needs a restart anyway, and a running binary is not replaced.
+        if sudo systemctl is-active --quiet "$UNIT_AUTHELIA" 2>/dev/null; then
+            sudo systemctl stop "$UNIT_AUTHELIA"
+            ok "stopped $UNIT_AUTHELIA for its new version: every browser logs in again"
+        fi
+        sudo install -d -m 755 "$BIN_DIR"
+        sudo install -m 755 "$TMP/authelia" "$BIN_DIR/authelia"
+        ok "v$AUTHELIA_VERSION installed (checksum verified)"
     fi
-    sudo install -d -m 755 "$BIN_DIR"
-    sudo install -m 755 "$TMP/authelia" "$BIN_DIR/authelia"
-    ok "v$AUTHELIA_VERSION installed (checksum verified)"
 fi
 
 # ── Port 80 answers from outside ──────────────────────────────────────────────

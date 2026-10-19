@@ -15,10 +15,13 @@ Keep how long one piece of `kind` work took, with `detail` (JSON-able values),
 for `bt_dev_timings`. The last `keep` of each kind are kept. Kinds in use:
 `:page` (building a page, `page_phase` parts in `phases`), `:browser_load` (the
 page's own report), `:chat_command`, `:worker_rpc`, `:notify` (a change fanned
-out to every tab), `:scan`.
+out to every tab), `:scan`, `:ws_upgrade` (a page's live connection reaching
+the login gate).
 """
-function record_timing!(state::ServerState, kind::Symbol, seconds::Real; keep::Int = 500, detail...)
-    t = root_state(state).timings
+record_timing!(state::ServerState, kind::Symbol, seconds::Real; kw...) =
+    record_timing!(root_state(state).timings, kind, seconds; kw...)
+
+function record_timing!(t::Timings, kind::Symbol, seconds::Real; keep::Int = 500, detail...)
     entry = TimingEntry(time(), Float64(seconds), Dict{String,Any}(String(k) => v for (k, v) in detail))
     lock(t.lock) do
         list = get!(Vector{TimingEntry}, t.kinds, kind)
@@ -189,7 +192,7 @@ sleep (a phone) still has its last words on the server. A `<script>` in the page
 itself, so it runs while the page is parsed, before the page's own code.
 """
 function console_capture(session::Bonito.Session; keep::Int = 1000, text_max::Int = 2000,
-                         per_beacon::Int = 300)
+                         per_beacon::Int = 300, long_task_ms::Int = 1000)
     tab = JSON.json(Bonito.root_session(session).id)
     route = JSON.json(CONSOLE_ROUTE)
     return DOM.script("""(() => {
@@ -221,6 +224,15 @@ function console_capture(session::Bonito.Session; keep::Int = 1000, text_max::In
     }
     window.addEventListener('error', (e) => push('error', [e.message + ' (' + e.filename + ':' + e.lineno + ')']));
     window.addEventListener('unhandledrejection', (e) => push('error', ['unhandled rejection:', e.reason]));
+    // The page's own thread busy for long (rendering, decoding a big message):
+    // nothing else runs meanwhile, not even the answer to a ping. Kept here
+    // only, not printed: it is a measurement, not a fault.
+    if (window.PerformanceObserver && (PerformanceObserver.supportedEntryTypes || []).includes('longtask')) {
+        new PerformanceObserver((list) => {
+            for (const e of list.getEntries())
+                if (e.duration >= $(long_task_ms)) push('info', ['the page was busy for ' + Math.round(e.duration) + ' ms']);
+        }).observe({entryTypes: ['longtask']});
+    }
     const beacon = (state) => {
         const fresh = entries.slice(sent).slice(-$(per_beacon));
         sent = entries.length;

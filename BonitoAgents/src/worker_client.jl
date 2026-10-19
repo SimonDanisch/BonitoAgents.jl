@@ -357,16 +357,41 @@ end
 # counts as current. Whether auto-update is on only changes the message: an
 # outdated worker is outdated either way.
 function worker_update_state(hello::AbstractDict, update_spec::Union{AbstractDict,Nothing})
-    haskey(hello, "auto_update") || return (:reinstall,
-        "This worker is too old to update itself. Reinstall it on that machine with the install command.")
+    haskey(hello, "auto_update") || return (:reinstall, update_note(:reinstall))
     installed = get(hello, "update_spec", nothing)
     # Nothing to compare: an install that recorded no build, or a server that
     # has not resolved its own yet (`worker_update_spec`).
     (installed === nothing || update_spec === nothing || installed == update_spec) && return (:current, "")
-    get(hello, "auto_update", false) === true && return (:available,
-        "A worker update is available. It installs by itself once no chat runs here; Update now installs it right away and restarts this worker's chats.")
-    return (:available,
-        "A worker update is available. Auto-update is off here: Update now installs it right away and restarts this worker's chats, or reinstall.")
+    return (:available, update_note(:available; auto = get(hello, "auto_update", false) === true))
+end
+
+# The worker card's words for where an update stands (`WorkerInfo.update_state`).
+# Each says whether anything is left to do, and what happens next by itself:
+# without that, an update in progress, one waiting for its chats and a stuck one
+# all look alike. `busy` is what a queued update waits out, `error` why it failed
+# (for `:reinstall`: why the worker cannot update itself), `auto` whether it
+# updates by itself at all.
+function update_note(st::Symbol; busy::Integer = 0, error::AbstractString = "", auto::Bool = true)
+    why = rstrip(error, '.')
+    st === :current && return ""
+    st === :available && return auto ?
+        "A new worker version is available. It installs by itself once no chat runs here, or right away with Update now." :
+        "A new worker version is available. Auto-update is off here: install it with Update now, or reinstall."
+    st === :waiting && return string(
+        "A new worker version is ready. It installs by itself once no chat runs here",
+        busy > 0 ? " ($(busy) running now)" : "",
+        ". Update now installs it right away; its chats restart on their next message.")
+    st === :requested && return "Update requested; waiting for the worker to start it."
+    st === :installing &&
+        return "Installing the new version, which takes a few minutes. Nothing to do: the worker restarts and reconnects by itself."
+    st === :restarting &&
+        return "Installed. The worker restarts and reconnects by itself; if it stays away for more than a few minutes, read its log on that machine."
+    st === :failed &&
+        return "The update failed: $(why). The worker tries again in five minutes; Update now tries right away."
+    st === :reinstall && return isempty(why) ?
+        "This worker is too old to update itself. Reinstall it on that machine with the install command." :
+        "This worker cannot update itself: $(why). Reinstall it on that machine with the install command."
+    throw(ArgumentError("unknown worker update state $(repr(st))"))
 end
 
 """
@@ -1595,9 +1620,10 @@ end
 
 # "Update now" means now. The worker is told to install immediately, cutting its
 # idle agent processes (their chats respawn them on the next message); a turn
-# in flight is the one thing we refuse to cut. The card's state flips to
-# `:updating` here and back to `:current` when the replacement worker's hello
-# arrives, so the button's feedback is the worker's real state, not a banner.
+# in flight is the one thing we refuse to cut. The card shows `:requested` until
+# the worker says it installs, then each step it reports (`apply_update_status!`),
+# and `:current` once the replacement worker's hello arrives: the button's
+# feedback is the worker's real state, not a banner.
 function force_worker_update!(state::ServerState, worker_id::AbstractString)
     wid = String(worker_id)
     reachable(state, wid) ||
@@ -1607,20 +1633,32 @@ function force_worker_update!(state::ServerState, worker_id::AbstractString)
     spec = worker_update_spec(state)
     spec === nothing && throw(ArgumentError(
         "the server has not found out which build to install yet (is GitHub reachable from it?); try again in a minute"))
-    send_command(state, wid, Dict("type" => "force_update", "immediate" => true, "update_spec" => spec))
-    # Interim wording: the worker's own `update_status` frame replaces it within
-    # a moment. A worker predating that frame never sends one, so this stays,
-    # and stays true.
-    set_worker_update!(state, wid, :updating, "Update requested; waiting for the worker to confirm.")
+    before = lock(state.lock) do
+        w = get(state.workers[], wid, nothing)
+        w === nothing ? nothing : (w.update_state, w.update_message, w.update_since)
+    end
+    # Before the command goes out: the worker's answer must land after it, not
+    # be overwritten by it. A worker predating `update_status` never answers,
+    # so this stays, and stays true.
+    set_worker_update!(state, wid, :requested, update_note(:requested))
+    try
+        send_command(state, wid, Dict("type" => "force_update", "immediate" => true, "update_spec" => spec))
+    catch
+        # Not requested after all: the card goes back to what it said.
+        before === nothing || set_worker_update!(state, wid, before[1], before[2]; since = before[3])
+        rethrow()
+    end
     return nothing
 end
 
-function set_worker_update!(state::ServerState, worker_id::AbstractString, st::Symbol, msg::AbstractString)
+function set_worker_update!(state::ServerState, worker_id::AbstractString, st::Symbol,
+                            msg::AbstractString; since::Float64 = time())
     found = lock(state.lock) do
         w = get(state.workers[], String(worker_id), nothing)
         w === nothing && return false
         w.update_state = st
         w.update_message = String(msg)
+        w.update_since = since
         true
     end
     found && notify_workers!(state)
@@ -1647,24 +1685,27 @@ function apply_harness_status!(state::ServerState, worker_id::AbstractString, cm
     return true
 end
 
-# The worker's account of a requested update (`update_status` frame): what the
-# card shows from here on is the worker's state, not our guess.
+# The worker's account of an update, requested or its own (`update_status`
+# frame): what the card shows from here on is the worker's state, not our guess.
+# A worker repeats its step on every new link, since the hello alone reads an
+# install under way as merely "available".
 function apply_update_status!(state::ServerState, worker_id::AbstractString, cmd::AbstractDict)
     status = String(get(cmd, "status", ""))
-    err    = String(get(cmd, "error", ""))
-    st, msg = if status == "installing"
-        (:updating, "Updating: the worker installs the server's build, then restarts and reconnects by itself. Its chats rebind on their next message.")
-    elseif status == "waiting"
-        (:updating, "Update requested; this worker installs it once no chat runs on it.")
-    elseif status == "failed"
-        (:available, "The update failed on the worker: $(rstrip(err, '.')). It retries in five minutes; see the worker's log.")
-    elseif status == "unsupported"
-        (:reinstall, "This worker cannot update itself: $(rstrip(err, '.')). Reinstall it with the install command.")
-    else
+    st = status == "waiting"     ? :waiting :
+         status == "installing"  ? :installing :
+         status == "restarting"  ? :restarting :
+         status == "failed"      ? :failed :
+         status == "unsupported" ? :reinstall : nothing
+    if st === nothing
         @warn "Worker update_status: unknown status" worker_id status
         return false
     end
-    return set_worker_update!(state, worker_id, st, msg)
+    msg = update_note(st; busy = Int(get(cmd, "busy", 0)), error = String(get(cmd, "error", "")))
+    # How long the worker has been at this step (a worker predating it sends
+    # nothing: from now): a card rebuilt by a reconnect keeps counting from
+    # when the step began.
+    since = time() - Float64(get(cmd, "elapsed", 0.0))
+    return set_worker_update!(state, worker_id, st, msg; since)
 end
 
 """

@@ -1071,12 +1071,11 @@ function replace_with_updated_worker!()
     return nothing
 end
 
-# `report(status; error)` tells the server how a requested update is going
-# ("installing" / "failed"), so its card reflects this worker rather than a
-# guess. The default is silent, for updates the worker decided on by itself.
+# Every step is told to the server (`report_update!`), automatic updates as
+# much as requested ones: the card shows what the worker does, so nobody has to
+# guess whether to act, wait, or look at a log.
 function run_auto_update!(w::Worker, target::Dict{String,String};
-                          immediate::Bool = false, gen::Int = lock(() -> w.update.gen, w.lock),
-                          report = (status; error = "") -> nothing)
+                          immediate::Bool = false, gen::Int = lock(() -> w.update.gen, w.lock))
     config = w.config.update_config::Dict{String,Any}
     if immediate
         # "Update now": the server has checked that no turn is running here.
@@ -1092,9 +1091,16 @@ function run_auto_update!(w::Worker, target::Dict{String,String};
         # otherwise be unusable for as long as it stays outdated. The gate goes
         # up only once idle, and comes down again if a session slipped in. A
         # generation bump means an immediate request took over: back off.
+        # The card says what it waits for, again whenever that changes.
+        told = -1
         while true
             lock(() -> w.update.gen, w.lock) == gen || return nothing
-            worker_idle(w) || (sleep(1); continue)
+            busy = worker_load(w)
+            if busy > 0
+                busy == told || (report_update!(w, "waiting"; busy); told = busy)
+                sleep(1)
+                continue
+            end
             superseded = lock(w.lock) do
                 w.update.gen == gen || return true
                 w.update.pending = true
@@ -1107,7 +1113,7 @@ function run_auto_update!(w::Worker, target::Dict{String,String};
         end
     end
     @info "BonitoWorker: updating to the server's worker build" rev=target["rev"] immediate
-    immediate || report("installing")
+    report_update!(w, "installing")
     try
         update_packages!(target)
         write_update_spec!(config, target)
@@ -1115,7 +1121,7 @@ function run_auto_update!(w::Worker, target::Dict{String,String};
         e isa InterruptException && rethrow()
         @error "BonitoWorker: automatic update failed; retrying in five minutes" exception=(e, catch_backtrace())
         lock(() -> (w.update.pending = false), w.lock)
-        report("failed"; error = sprint(showerror, e))
+        report_update!(w, "failed"; error = sprint(showerror, e))
         # A transient network or registry failure must not turn automatic update
         # into "wait for the next reconnect". Clear the admission gate first so
         # the worker remains useful, then make one delayed, coalesced retry.
@@ -1126,6 +1132,10 @@ function run_auto_update!(w::Worker, target::Dict{String,String};
         return nothing
     end
     @info "BonitoWorker: update installed; starting replacement"
+    report_update!(w, "restarting")
+    # This process ends in a moment; the card should still learn why it went.
+    flush(w.link; timeout = 5) ||
+        @info "BonitoWorker: the server did not confirm the restart notice; restarting anyway"
     replace_with_updated_worker!()
     # The replacement claims the pidfile and reconnects before this process
     # exits. Background installs need the detached successor explicitly;
@@ -1136,40 +1146,77 @@ end
 # `force` skips the "is it needed" check; `immediate` also skips waiting for
 # idle (see `run_auto_update!`). An immediate request supersedes a task that is
 # still only waiting, so "Update now" is not ignored because the worker had
-# already queued a patient update at hello time.
+# already queued a patient update at hello time. Returns `:started` (a new task
+# runs and reports its steps), `:running` (one under way already handles it) or
+# `:none` (no build to install, or none needed).
 function schedule_auto_update!(w::Worker, target_wire;
-                               force::Bool = false, immediate::Bool = false,
-                               report = (status; error = "") -> nothing)
+                               force::Bool = false, immediate::Bool = false)
     config = w.config.update_config::Dict{String,Any}
     target = update_spec_from_wire(target_wire)
-    target === nothing && return nothing       # the server has no spec to offer
-    (force || update_needed(config, target)) || return nothing
-    lock(w.lock) do
+    target === nothing && return :none         # the server has no spec to offer
+    (force || update_needed(config, target)) || return :none
+    return lock(w.lock) do
         u = w.update
         if u.task !== nothing && !istaskdone(u.task)
             # Installing already (gate up): leave it. Still waiting for idle
             # (gate down): an immediate request takes over; the generation bump
             # makes the waiting task back off at its next check.
-            (u.pending || !immediate) && return nothing
+            (u.pending || !immediate) && return :running
         end
         gen = (u.gen += 1)
-        # Raised HERE for an immediate install, not in the task: the caller reads
-        # the gate right after this call to tell the server "installing".
+        # Raised HERE for an immediate install, not in the task, so no session
+        # slips in between this request and the task's start.
         immediate && (u.pending = true)
-        u.task = Base.errormonitor(@async run_auto_update!(w, target; immediate, gen, report))
+        u.task = Base.errormonitor(@async run_auto_update!(w, target; immediate, gen))
+        return :started
+    end
+end
+
+# The update's step, for the server's worker card: stored, then sent over the
+# control channel served NOW (an install outlives the link it was asked on).
+# Never call it holding `w.lock`: it takes `reporting` first.
+function report_update!(w::Worker, status::AbstractString;
+                        error::AbstractString = "", busy::Integer = 0)
+    lock(w.update.reporting) do
+        ctrl, frame = lock(w.lock) do
+            u = w.update
+            u.status == status || (u.since = time())
+            u.status, u.error, u.busy = String(status), String(error), Int(busy)
+            w.control, update_status_frame(u)
+        end
+        send_update_status(ctrl, frame)
     end
     return nothing
 end
 
-# The worker's account of a requested update, for the server's worker card.
-# Best effort: the socket may already be gone when a late failure is reported.
-function report_update_status(ws, status::AbstractString; error::AbstractString = "")
+# The step stored last, once more: for a new link, or a request that found an
+# update under way. Nothing when no update ever started.
+function report_update!(w::Worker)
+    lock(w.update.reporting) do
+        ctrl, frame = lock(w.lock) do
+            w.control, isempty(w.update.status) ? nothing : update_status_frame(w.update)
+        end
+        frame === nothing || send_update_status(ctrl, frame)
+    end
+    return nothing
+end
+
+# `elapsed`, not a timestamp: the two machines' clocks need not agree.
+update_status_frame(u::UpdateState) = Dict{String,Any}(
+    "type" => "update_status", "status" => u.status, "error" => u.error,
+    "busy" => u.busy, "elapsed" => time() - u.since)
+
+# No link right now is fine: the next one hears the step from `connected!`.
+function send_update_status(ctrl, frame::AbstractDict)
+    if ctrl === nothing
+        @info "BonitoWorker: update status kept for the next link" status = frame["status"]
+        return nothing
+    end
     try
-        send_control(ws, Dict("type" => "update_status", "status" => String(status),
-                              "error" => String(error)))
+        send_control(ctrl, frame)
     catch e
-        e isa InterruptException && rethrow()
-        @warn "BonitoWorker: could not report update status" status exception=e
+        (e isa WebSockets.WebSocketError || e isa WorkerLink.LinkDead) || rethrow()
+        @info "BonitoWorker: update status kept for the next link" status = frame["status"] exception = e
     end
     return nothing
 end

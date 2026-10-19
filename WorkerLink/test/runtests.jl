@@ -348,6 +348,30 @@ end
     kill!(client, "done"); kill!(server, "done")
 end
 
+# A worker that exits right after its last message ("restarting with the new
+# version") must know the server has it: queued is not delivered.
+@testset "flush waits until the peer has acknowledged everything" begin
+    reg = Dict{Vector{UInt8},Link}()
+    client = Link(:client)
+    ct, st = memory_pair()
+    gate = GateTransport(ct)
+    srv = errormonitor(Threads.@spawn serve!(reg, st))
+    connect!(client, gate, UInt8[])
+    server = fetch(srv)
+    @test flush(client; timeout = 2)                    # nothing sent: delivered
+    hold!(gate, true)
+    WebSockets.send(control_channel(client), "last words")
+    t0 = time()
+    @test !flush(client; timeout = 0.3)                 # still in the queue
+    @test time() - t0 >= 0.3
+    hold!(gate, false)
+    @test flush(client; timeout = 5)
+    @test WebSockets.receive(control_channel(server)) == "last words"
+    kill!(client, "done")
+    @test !flush(client; timeout = 1)                   # a dead link has nothing to wait for
+    kill!(server, "done")
+end
+
 @testset "a server that forgot the link resets the client" begin
     reg = Dict{Vector{UInt8},Link}()
     acc = Acceptor()

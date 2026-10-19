@@ -387,6 +387,13 @@ sidebar_group(p::ProjectInfo, status::Symbol) =
 
 const SIDEBAR_GROUP_RANK = Dict(:app => 0, :active => 1, :other => 2)
 
+# A chat's place in the sidebar: by group, then the chats whose turn ended most
+# recently (a chat that just went quiet stays next to the active ones it left),
+# then the rest by name. `ended` is 0.0 for a chat with no turn since the server
+# started.
+sidebar_rank(group::Symbol, ended::Float64, p::ProjectInfo) =
+    (SIDEBAR_GROUP_RANK[group], -ended, lowercase(p.name))
+
 # Per-PROCESS boot id scoping the sidebar's localStorage last-route memory:
 # a route saved by one server process must not navigate a fresh one. Lazy
 # (Ref filled on first use) — a `const x = uuid4()` would be baked into the
@@ -475,8 +482,10 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     #
     # The apps' chats come first, under "Apps". Then the chats with a turn in
     # flight, under "Active": those are the ones you switch between, and they
-    # used to be scattered through a list sorted by name. The rest follow by
-    # name. While the mouse is over the
+    # used to be scattered through a list sorted by name. The rest follow, the
+    # ones whose turn ended most recently first (`sidebar_rank`): a chat that
+    # just went quiet stays near the top instead of dropping to its name's
+    # place. While the mouse is over the
     # sidebar (`hovering`) the rows keep their places: a chat whose turn starts
     # or ends moves once the pointer leaves, never out from under a click.
     rows = Dict{String,SidebarChat}()
@@ -492,7 +501,8 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             sort!(open_projs; by = p -> place[p.id])
         else
             group = Dict(p.id => sidebar_group(p, status[p.id]) for p in open_projs)
-            sort!(open_projs; by = p -> (SIDEBAR_GROUP_RANK[group[p.id]], lowercase(p.name)))
+            ended = lock(() -> copy(state.turns_ended), state.lock)
+            sort!(open_projs; by = p -> sidebar_rank(group[p.id], get(ended, p.id, 0.0), p))
             shown[] = [p.id => group[p.id] for p in open_projs]
         end
         groups = sidebar_groups(shown[])

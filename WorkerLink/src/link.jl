@@ -442,7 +442,37 @@ function trim_log!(link::Link, upto::UInt64)
     n == 0 && return nothing
     deleteat!(link.log, 1:n)
     link.cursor = max(1, link.cursor - n)
+    notify(link.wake)                    # a `flush` may wait for exactly this
     return nothing
+end
+
+# Nothing left to send and nothing the peer has not acknowledged. Caller holds the lock.
+delivered(link::Link) = isempty(link.log) && isempty(link.ctrl) &&
+    all(ch -> isempty(ch.outq), values(link.channels))
+
+"""
+    flush(link; timeout = 5.0) -> Bool
+
+Wait until the peer has everything sent on `link` so far: nothing queued, and
+every frame acknowledged. For a process about to exit, whose last message would
+otherwise die in the queue. `false` when `timeout` seconds passed first, or the
+link died.
+"""
+function Base.flush(link::Link; timeout::Real = 5.0)
+    deadline = time() + timeout
+    timer = Timer(_ -> lock(() -> notify(link.wake), link.lock), timeout)
+    try
+        return lock(link.lock) do
+            while true
+                link.state === :dead && return false
+                delivered(link) && return true
+                time() >= deadline && return false
+                wait(link.wake)
+            end
+        end
+    finally
+        close(timer)
+    end
 end
 
 # Forget a channel once nothing more can happen on it. Caller holds the lock.

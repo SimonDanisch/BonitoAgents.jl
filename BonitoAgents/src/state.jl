@@ -47,8 +47,12 @@ mutable struct WorkerInfo
     # reconnects (the WorkerInfo is reused, not rebuilt). Query with `isopen(w)`.
     online::Observable{Bool}
     last_check::DateTime
-    update_state::Symbol               # :current | :available | :reinstall (too old to self-update) | :updating
+    # Where this worker's update stands (`update_note` says each in words):
+    # :current, :available, :waiting (for its chats to end), :requested,
+    # :installing, :restarting, :failed, or :reinstall (too old to update itself).
+    update_state::Symbol
     update_message::String
+    update_since::Float64              # `time()` it entered `update_state`: the card's timer
     # The managed agent adapters it reports (the worker's harnesses.jl): Node and
     # each npm package, by version; and why the last attempt to install them failed.
     harnesses::Dict{String,String}
@@ -75,7 +79,7 @@ WorkerInfo(worker_id, name, initials, owner, credential, shared_with, ssh_target
            update_message, harnesses, harness_error, color_slot::Integer) =
     WorkerInfo(worker_id, name, initials, owner, credential, shared_with, ssh_target, hostname,
                home, mcp_path, mcp_args, projects_root, online, last_check, update_state,
-               update_message, harnesses, harness_error, Int(color_slot), String[])
+               update_message, time(), harnesses, harness_error, Int(color_slot), String[])
 
 "Whether worker `w` said it knows the request `capability`."
 can(w::WorkerInfo, capability::AbstractString) = capability in w.capabilities
@@ -528,6 +532,13 @@ mutable struct ServerState
     # here instead and update without rebuilding the chat list.
     turn_signal :: Observable{Int}
 
+    # When each chat's last turn ended (`time()`, by project id), as the server
+    # saw it since it started: the sidebar lists the chats that just went quiet
+    # first among the inactive ones, next to the active chats they came from.
+    # Kept here, not on the chat, because an idle chat's model can be closed.
+    # Guarded by `lock`; runtime only.
+    turns_ended :: Dict{String,Float64}
+
     # One link per worker (worker id → link), connected or waiting out its grace
     # period for a reconnect. Everything to and from a worker is a channel on it.
     worker_links :: Dict{String,WorkerLink.Link}
@@ -711,6 +722,7 @@ function ServerState(; state_dir::String,
         Dict{String,Any}(),                       # review_states
         Observable(0),                            # chat_signal
         Observable(0),                            # turn_signal
+        Dict{String,Float64}(),                   # turns_ended
         Dict{String,WorkerLink.Link}(),           # worker_links
         Dict{String,Channel{Any}}(),              # pending_rpcs
         Dict{String,ChunkAccumulator}(),          # pending_chunks
@@ -787,6 +799,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.review_states,           # shared: the point is surviving a session
             map(identity, session, s.chat_signal),
             map(identity, session, s.turn_signal),
+            s.turns_ended,             # shared: one record per server
             s.worker_links,
             s.pending_rpcs,
             s.pending_chunks,              # shared: one registry per server
@@ -1320,6 +1333,12 @@ notify_chats!(s::ServerState) = timed(() -> safe_notify!(root_state(s).chat_sign
 # cards) or its status (sidebar LEDs). See `turn_signal`'s field doc for why the
 # two are separate.
 notify_turn!(s::ServerState) = timed(() -> safe_notify!(root_state(s).turn_signal), s, :notify; signal = "turn")
+
+# A chat's turn ended now: the sidebar's order among the inactive chats.
+function turn_ended!(s::ServerState, project_id::AbstractString)
+    lock(() -> (s.turns_ended[String(project_id)] = time()), s.lock)
+    return nothing
+end
 
 # The projects / workers tables changed (a title, a bound session, a rename, a
 # worker's status). Same root-routing rule: the table itself is ONE shared Dict,

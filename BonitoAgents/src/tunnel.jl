@@ -41,13 +41,15 @@ struct TunnelGate
     accepted::Dict{String,AcceptedCookie}
     lock::ReentrantLock
     shares::ShareRegistry
+    # The server's (`bt_dev_timings`): when each page's live connection arrived.
+    timings::Timings
 end
-TunnelGate(auth::TunnelAuth, shares::ShareRegistry = ShareRegistry()) =
-    TunnelGate(auth, Dict{String,AcceptedCookie}(), ReentrantLock(), shares)
+TunnelGate(auth::TunnelAuth, shares::ShareRegistry = ShareRegistry(), timings::Timings = Timings()) =
+    TunnelGate(auth, Dict{String,AcceptedCookie}(), ReentrantLock(), shares, timings)
 
 "What stands before every route of the server: behind a tunnel the login gate."
-server_gate(::AuthMode, ::ShareRegistry) = nothing
-server_gate(auth::TunnelAuth, shares::ShareRegistry) = TunnelGate(auth, shares)
+server_gate(::AuthMode, ::ShareRegistry, ::Timings) = nothing
+server_gate(auth::TunnelAuth, shares::ShareRegistry, timings::Timings) = TunnelGate(auth, shares, timings)
 
 # assets/login.js, for Authelia's login page (`with_login_script`), which is
 # shown to whoever is not logged in.
@@ -70,11 +72,23 @@ function Bonito.HTTPServer.gate_request(g::TunnelGate, request::HTTP.Request)
     is_portal_target(target) && return pass_to_authelia(g.auth, request)
     is_open_target(target) && return nothing
     is_share_target(g.shares, target) && return nothing
-    return admit!(g, request)
+    answer = admit!(g, request)
+    # A page's live connection: when it reached the server, and how long the
+    # login check took. A phone waited 6 to 15 s for its socket while its page
+    # loaded fast, and nothing said whether those seconds passed before the
+    # request reached the server or in it.
+    HTTP.WebSockets.isupgrade(request) &&
+        record_timing!(g.timings, :ws_upgrade, time() - request.context[:gate_t0];
+                       tab = first(lstrip(first(split(target, '?'; limit = 2)), '/'), 8),
+                       client = client_address(request), status = answer === nothing ? 101 : answer.status)
+    return answer
 end
 
 function Bonito.HTTPServer.gate_response(::TunnelGate, request, response)
     HTTP.setheader(response, "Cache-Control" => private_cache(HTTP.header(response, "Cache-Control", "")))
+    for cookie in get(request.context, :login_cookies, String[])
+        push!(response.headers, "Set-Cookie" => cookie)
+    end
     log_slow_request(request, response)
     return response
 end
@@ -148,8 +162,17 @@ function admit!(g::TunnelGate, request::HTTP.Request)
         for h in IDENTITY_HEADERS
             HTTP.setheader(request, h => HTTP.header(answer, h, ""))
         end
+        # A login cookie Authelia hands out while letting the request through is
+        # the one it keeps the login under from now on: the browser must get it,
+        # or its next request carries one Authelia no longer knows. The answer
+        # goes out with the route's response (`gate_response`).
+        handed = session_cookies(answer)
+        if !isempty(handed) && handed != cookies
+            request.context[:login_cookies] = [String(v) for (k, v) in answer.headers if lowercase(k) == "set-cookie"]
+            @info "login gate: Authelia renewed the login cookie" client target = first(request.target, 120) cookie = join(cookies, ",") new_cookie = join(handed, ",") user = name
+        end
         lock(g.lock) do
-            g.accepted[client] = AcceptedCookie(join(cookies, ","), name, time())
+            g.accepted[client] = AcceptedCookie(join(isempty(handed) ? cookies : handed, ","), name, time())
             # A long-running server meets many addresses; a day of them is plenty.
             length(g.accepted) > 1000 && filter!(kv -> time() - kv.second.at < 86400, g.accepted)
         end
@@ -170,8 +193,7 @@ function log_refusal(g::TunnelGate, client::AbstractString, request::HTTP.Reques
     last = lock(() -> get(g.accepted, client, nothing), g.lock)
     last === nothing && return nothing
     sent = join(cookies, ",")
-    handed = [cookie_digest(first(split(v, ';'))) for (k, v) in refusal.headers
-              if lowercase(k) == "set-cookie" && startswith(v, SESSION_COOKIE * "=")]
+    handed = session_cookies(refusal)
     @info "login gate: turned away a device that was logged in" client target = request.target status = refusal.status cookie = (isempty(sent) ? "none" : sent) cookies_sent = length(cookies) last_accepted = last.cookie last_user = last.user seconds_since = round(Int, time() - last.at) same_cookie = (sent == last.cookie) new_cookie_to_browser = (isempty(handed) ? "none" : join(handed, ","))
     # Logged once: until it gets through again, the device's next refusals repeat this.
     lock(() -> delete!(g.accepted, client), g.lock)
@@ -195,6 +217,11 @@ function session_cookies(request::HTTP.Request)
     return out
 end
 
+# Short digests of the login cookies a response hands the browser.
+session_cookies(response::HTTP.Response) =
+    [cookie_digest(first(split(v, ';'))) for (k, v) in response.headers
+     if lowercase(k) == "set-cookie" && startswith(v, SESSION_COOKIE * "=")]
+
 cookie_digest(pair::AbstractString) = bytes2hex(sha256(String(pair)))[1:8]
 
 # The browser a request comes from: its address as the tunnel says (Cloudflare
@@ -216,7 +243,21 @@ function pass_to_authelia(auth::TunnelAuth, request::HTTP.Request)
     headers = authelia_headers(auth, request)
     page && filter!(h -> lowercase(first(h)) != "accept-encoding", headers)   # HTML as text, to add to
     answer = relayed(ask_authelia(auth, request.method, request.target, headers, request_bytes(request.body)))
+    log_login_event(request, answer)
     return page ? with_login_script(answer) : answer
+end
+
+# Every login and logout, and whatever else gives the browser another login
+# cookie, with the cookie before and after. Authelia logs none of them, and a
+# login that ended minutes after it was made left nothing to say what ended it.
+function log_login_event(request::HTTP.Request, answer::HTTP.Response)
+    path = first(split(request.target, '?'; limit = 2))
+    sent = session_cookies(request)
+    handed = session_cookies(answer)
+    login_call = request.method != "GET" && occursin(r"^/authelia/api/(firstfactor|secondfactor|logout)", path)
+    (login_call || (!isempty(handed) && handed != sent)) || return nothing
+    @info "login: Authelia" method = request.method path status = answer.status cookie = (isempty(sent) ? "none" : join(sent, ",")) new_cookie = (isempty(handed) ? "none" : join(handed, ",")) client = client_address(request)
+    return nothing
 end
 
 function with_login_script(page::HTTP.Response)
