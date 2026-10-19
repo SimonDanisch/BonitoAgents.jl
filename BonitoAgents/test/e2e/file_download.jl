@@ -72,6 +72,10 @@ function run_suite(server)
         big = joinpath(cwd, "big.bin")
         data = rand(UInt8, 64 * 1024 * 1024)
         write(big, data)
+        # A fresh worker compiles its reply path on the first piece (~0.2 s), a
+        # quarter of the whole 64 MB, which takes under a second: read one first.
+        warm = timed_get(server.h.url * BA.worker_file_url(state, wid, big), ["Range" => "bytes=0-15"])
+        @test warm.body == data[1:16]
         @testset "a big download starts at once" begin
             g = timed_get(download_url(big))
             @test g.response.status == 200

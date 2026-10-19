@@ -113,6 +113,7 @@ into `1`.
 normalize_wire(x::Bool)           = x
 normalize_wire(x::Integer)        = Int64(x)
 normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
+normalize_wire(x::Vector{UInt8})  = x          # a msgpack bin (`BonitoWorker.WireBytes`)
 normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
 normalize_wire(x)                 = x
 

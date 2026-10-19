@@ -68,8 +68,24 @@ widening it would turn `true` into `1`.
 normalize_wire(x::Bool)           = x
 normalize_wire(x::Integer)        = Int64(x)
 normalize_wire(x::AbstractDict)   = Dict{String,Any}(String(k) => normalize_wire(v) for (k, v) in x)
+normalize_wire(x::Vector{UInt8})  = x          # a msgpack bin: bytes, not a list of numbers
 normalize_wire(x::AbstractVector) = Any[normalize_wire(v) for v in x]
 normalize_wire(x)                 = x
+
+"""
+    WireBytes(data)
+
+Bytes for a control message, sent as a msgpack bin (one block) and decoded as a
+`Vector{UInt8}`. A plain `Vector{UInt8}` is packed as an ARRAY of numbers, one
+per byte, unless Bonito is loaded (it packs byte vectors as an extension), and a
+worker does not load Bonito: a 256 KiB file piece took the server 49 ms and
+4.5 MB of garbage to decode, 0.02 ms as a bin.
+"""
+struct WireBytes
+    data::Vector{UInt8}
+end
+MsgPack.msgpack_type(::Type{WireBytes}) = MsgPack.BinaryType()
+MsgPack.to_msgpack(::MsgPack.BinaryType, b::WireBytes) = b.data
 
 # Split a string into pieces of at most `cap` codeunits, backing each cut to a
 # codepoint boundary so every piece is a VALID UTF-8 string. Used to ship big
@@ -1676,10 +1692,10 @@ function handle_read_file_range(ws, cmd::AbstractDict)
         path = String(cmd["path"])
         start, count = Int(cmd["start"]), Int(cmd["count"])
         start >= 0 && 0 <= count <= FILE_RANGE_BYTES || error("invalid file range")
-        response["data"] = open(path) do io
+        response["data"] = WireBytes(open(path) do io
             seek(io, start)
             read(io, count)
-        end
+        end)
     catch e
         e isa InterruptException && rethrow()
         response["error"] = sprint(showerror, e)

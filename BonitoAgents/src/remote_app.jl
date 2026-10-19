@@ -251,10 +251,13 @@ function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, redial_gr
     end
 end
 
-# Bonito's MsgPack packs a `Vector{UInt8}` as a binary Extension, so byte payloads
-# sent over the control channel come back wrapped — unwrap them.
-ctrl_bytes(x) = x === nothing ? nothing :
-                x isa Bonito.MsgPack.Extension ? Vector{UInt8}(x.data) : Vector{UInt8}(x)
+# Byte payloads of a control message. Bonito's MsgPack packs a `Vector{UInt8}` as
+# an extension (an eval process), a worker sends a bin (`BonitoWorker.WireBytes`).
+# A list of numbers is what a worker from before `WireBytes` sends, until it updates.
+ctrl_bytes(::Nothing) = nothing
+ctrl_bytes(x::Bonito.MsgPack.Extension) = x.data
+ctrl_bytes(x::Vector{UInt8}) = x
+ctrl_bytes(x::AbstractVector) = Vector{UInt8}(x)
 
 # Worker→host control frame (runs on the relay loop task).
 function handle_worker_control(eb::EvalBridge, msg::AbstractDict)

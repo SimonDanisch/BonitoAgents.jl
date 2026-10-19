@@ -769,6 +769,33 @@ end
     WL.kill!(server, "done")
 end
 
+# A file piece is one msgpack bin. Without Bonito loaded (as on every worker)
+# a `Vector{UInt8}` packed as an array of 262144 numbers, which the server took
+# 49 ms and 4.5 MB of garbage to decode per piece: images loaded at 5 MB/s.
+struct CaptureWS
+    frames::Vector{Any}
+end
+BonitoWorker.WebSockets.send(ws::CaptureWS, x) = push!(ws.frames, x)
+
+@testset "file pieces are sent as bytes" begin
+    @test all(id -> id.name != "Bonito", keys(Base.loaded_modules))
+    mktempdir() do dir
+        path = joinpath(dir, "photo.jpg")
+        data = rand(UInt8, 2 * BW.FILE_RANGE_BYTES)
+        write(path, data)
+        ws = CaptureWS(Any[])
+        start, count = 1000, BW.FILE_RANGE_BYTES
+        BW.handle_read_file_range(ws, Dict{String,Any}("request_id" => "r1", "path" => path,
+                                                       "start" => start, "count" => count))
+        frame = only(ws.frames)
+        @test length(frame) < count + 100
+        reply = BW.decode_control(frame)
+        @test reply["data"] isa Vector{UInt8}
+        @test reply["data"] == data[(start + 1):(start + count)]
+        @test !haskey(reply, "error")
+    end
+end
+
 # ── file_writer_pids / kill_file_writers (background-shell stop) ────────────
 # The direct stop for a background bash: the shell holds its `>> output`
 # redirect open until it exits, so the file's writers ARE the shell. Linux
