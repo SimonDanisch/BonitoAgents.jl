@@ -60,9 +60,10 @@ function run_suite(server)
 
         @test TK.wait_for(server, "edit card",
             "!!document.querySelector('$CARD')"; timeout = 120) == true
-        # The DIFF renders (Monaco diff editor) — even after the completed snap.
+        # The DIFF renders — even after the completed snap: its removed and
+        # added lines.
         @test TK.wait_for(server, "diff renders",
-            "(() => { const p = document.querySelector('$CARD'); return !!(p && p.querySelector('.monaco-diff-editor, .monaco-diff-editor-div')); })()";
+            "(() => { const p = document.querySelector('$CARD'); return !!(p && p.querySelector('.bt-code-diff .bt-l-del') && p.querySelector('.bt-code-diff .bt-l-add')); })()";
             timeout = 30) == true
         # The success rawOutput text is NOT rendered as the body.
         @test TK.eval_js(server,
@@ -79,7 +80,7 @@ function run_suite(server)
         @test TK.wait_for(server, "edit card",
             "!!document.querySelector('$CARD2')"; timeout = 120) == true
         @test TK.wait_for(server, "diff renders from rawInput",
-            "(() => { const p = document.querySelector('$CARD2'); return !!(p && p.querySelector('.monaco-diff-editor, .monaco-diff-editor-div')); })()";
+            "(() => { const p = document.querySelector('$CARD2'); return !!(p && p.querySelector('.bt-code-diff .bt-l-add')); })()";
             timeout = 30) == true
         # …and does not park on the placeholder that an empty first render ships
         # (the card auto-expands as soon as old/new land, before any content).

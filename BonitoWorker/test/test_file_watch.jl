@@ -97,6 +97,28 @@ done(msgs) = any(m -> get(m, "done", false) === true, msgs)
         @test !any(m -> haskey(m, "chunk"), msgs)       # a transcript's bytes stay on the worker
     end
 
+    # A subagent stopped by the user ends its transcript with an interruption,
+    # never `end_turn`: the watch ends at whichever comes first and says which.
+    # The same words quoted inside a tool result are escaped and end nothing.
+    @testset "a subagent's transcript ends at the first of several markers" begin
+        done_mk = "\"stop_reason\":\"end_turn\""
+        stopped_mk = "\"text\":\"[Request interrupted by user"
+        header(f) = Dict("path" => f, "offset" => 0, "until" => "marker", "markers" => [done_mk, stopped_mk])
+        quoted = "{\"type\":\"user\",\"content\":\"read: {\\\"text\\\":\\\"[Request interrupted by user]\\\"}\"}\n"
+        f = tempname(); write(f, quoted)
+        msgs = watch(header(f); timeout = 1.0)
+        @test !done(msgs)
+        f = tempname(); write(f, quoted)
+        msgs = watch(header(f); on_ready = () -> @async(begin
+            sleep(0.3)
+            open(io -> write(io, "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user]\"}]}}\n"), f, "a")
+        end))
+        @test done(msgs)
+        @test last(msgs)["marker"] == stopped_mk
+        f = tempname(); write(f, "{\"stop_reason\":\"end_turn\"}\n")
+        @test last(watch(header(f); timeout = 5.0))["marker"] == done_mk
+    end
+
     @testset "file_writer_pids: the writer while it runs, nobody after" begin
         Sys.islinux() || return
         f = tempname()

@@ -205,11 +205,14 @@ session's agent is not told about it, it could not collect it.
 function end_chat_session!(model::ChatModel, why::AbstractString)
     chat = shared(model)
     end_chat_processes!(chat.state, chat.project_id)
+    # The new session's agent is told what the old one left running and lost.
+    lost = false
     for r in all_runs(chat.runs)
         r.status == "running" || continue
-        r.notified = true
         lose_run!(chat, r, why)
+        lost = true
     end
+    lost && note_finished_runs!(chat)
     interrupt_background_tasks!(chat; reason = "chat_restarted")
     bar = chat_taskbar(chat)
     foreach(t -> finished!(t; reason = "chat_restarted"), lock(() -> copy(bar.items[]), bar.lock))

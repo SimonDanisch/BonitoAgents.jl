@@ -1392,7 +1392,7 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-loading-text, .bt-loading-msg",
         "display" => "flex", "flex-direction" => "column",
         "align-items" => "center", "gap" => "8px", "text-align" => "center"),
-    CSS(".bt-loading:has(.bt-loading-msg) .bt-loading-spinner", "display" => "none"),
+    CSS(".bt-loading-done .bt-loading-spinner", "display" => "none"),
     CSS(".bt-loading-glyph", "font-size" => "28px", "opacity" => "0.7"),
     CSS(".bt-loading-title",
         "font-size" => "15px", "font-weight" => "600",

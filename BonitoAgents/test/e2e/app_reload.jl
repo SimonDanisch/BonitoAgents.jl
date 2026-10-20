@@ -59,7 +59,7 @@ function agent_script(prompt::AbstractString)
 end
 
 # Expand the replayed Edit pill by clicking its header (the whole header is
-# the expand target while collapsed) and wait for the Monaco diff to arrive.
+# the expand target while collapsed) and wait for the diff to arrive.
 function expand_edit_pill(s)
     clicked = TK.eval_js(s, """(() => {
         const p = [...document.querySelectorAll('.bt-tool-msg')]
@@ -72,7 +72,7 @@ function expand_edit_pill(s)
         """(() => {
             const p = [...document.querySelectorAll('.bt-tool-msg')]
                 .find(e => e.offsetParent && (e.innerText||'').includes('Edit src/thing.jl'));
-            return !!(p && p.querySelector('.monaco-diff-editor-div, .monaco-diff-editor'));
+            return !!(p && p.querySelector('.bt-code-diff .bt-l'));
         })()"""; timeout = 20) == true
 end
 

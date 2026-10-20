@@ -5,10 +5,12 @@
 # for who still held the file open: 0.2 s of CPU per task per second. Here the
 # worker follows the file and says what changed, when it changes:
 #
-#     open {kind:"watch_file", path, offset, until:"closed"|"marker", marker}
+#     open {kind:"watch_file", path, offset, until:"closed"|"marker", markers}
 #     ->   {ok:true}
-#     then {chunk, offset}     bytes appended since `offset` (until = "closed")
-#          {done:true, offset} the writer closed the file / `marker` appeared
+#     then {chunk, offset}             bytes appended since `offset` (until = "closed")
+#          {done:true, offset}         the writer closed the file
+#          {done:true, offset, marker} the first of `markers` to appear (a server
+#                                      from before `markers` sends one `marker`)
 #
 # The watch ends with `done`, or when the server closes the channel.
 #
@@ -191,16 +193,30 @@ function wait_file(path::AbstractString, stop::WatchStop)
     return nothing
 end
 
-function watch_until_marker(ch, path::AbstractString, offset::Int, marker::AbstractString, stop::WatchStop)
+# The marker of `markers` that appears first in `text`, or `nothing`.
+function first_marker(text::AbstractString, markers::Vector{String})
+    found, at = nothing, typemax(Int)
+    for mk in markers
+        r = findfirst(mk, text)
+        r === nothing && continue
+        first(r) < at && ((found, at) = (mk, first(r)))
+    end
+    return found
+end
+
+function watch_until_marker(ch, path::AbstractString, offset::Int, markers::Vector{String}, stop::WatchStop)
     wait_file(path, stop)
-    # Re-read the marker's length before `offset`, so one split across two reads is found.
-    from = max(0, offset - ncodeunits(marker))
+    # Re-read the longest marker's length before `offset`, so one split across
+    # two reads is found.
+    overlap = maximum(ncodeunits, markers)
+    from = max(0, offset - overlap)
     watch_changes(path, stop) do
         bytes = read_from(path, from; max_bytes = typemax(Int))
-        found = occursin(marker, String(copy(bytes)))
-        found && send_watch(ch, Dict("done" => true, "offset" => from + length(bytes)))
-        from = max(from, from + length(bytes) - ncodeunits(marker))
-        found
+        found = first_marker(String(copy(bytes)), markers)
+        found === nothing ||
+            send_watch(ch, Dict("done" => true, "offset" => from + length(bytes), "marker" => found))
+        from = max(from, from + length(bytes) - overlap)
+        found !== nothing
     end
 end
 
@@ -227,7 +243,8 @@ function run_file_watch(ch::WorkerLink.LinkChannel, header::AbstractDict)
     end)
     try
         if until == "marker"
-            watch_until_marker(ch, path, offset, String(header["marker"]), stop)
+            markers = haskey(header, "markers") ? String.(header["markers"]) : [String(header["marker"])]
+            watch_until_marker(ch, path, offset, markers, stop)
         elseif Sys.islinux()
             ino = watching!(Inotify, stop)
             try

@@ -55,6 +55,7 @@ include("agents.jl")           # WorkerAgent (server-side live agent over the wo
 include("styles.jl")
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
+include("code_view.jl")        # CodeView / DiffView: read-only code as static DOM, highlighted by Monaco
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("measured_sizes.jl")   # body heights + media sizes the browser measured, sent with later renders
 include("chat_queue.jl")       # pending submissions and delivery modes

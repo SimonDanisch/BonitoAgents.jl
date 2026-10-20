@@ -68,7 +68,8 @@ try
         @test BT.run_live(m) && BT.in_taskbar(m)
         BT.end_chat_session!(model, "the chat was restarted")
         @test m.run.status == "lost" && m.run.summary == "the chat was restarted"
-        @test m.run.notified            # the new session's agent is not told about it
+        @test !m.run.notified           # the new session's agent is told it was lost
+        @test m.run in BT.due_notes(BT.shared(model).runs)
         @test !BT.in_taskbar(m)
         @test isempty(BT.chat_taskbar(model).items[])
         @test occursin("the chat was restarted", BT.eval_env_summary(m))

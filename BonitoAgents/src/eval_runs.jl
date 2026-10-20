@@ -440,14 +440,25 @@ function deliver_run_notes!(chat::ChatModel)
     return nothing
 end
 
+# Runs that finished are collected with `bt_julia_wait`; a lost one has nothing to
+# collect, which the note says rather than send the agent after it.
 function run_note_text(chat::ChatModel, runs::Vector{ChatRun})
     line(r) = "$(r.id) ($(short_env(r.env_path)) on $(run_worker_name(chat.state, chat, r))): " *
               run_outcome(r)
-    ids = join(("\"$(r.id)\"" for r in runs), ", ")
-    head = length(runs) == 1 ? "Background Julia run finished: " * line(only(runs)) :
-           "Background Julia runs finished:\n" * join(("- " * line(r) for r in runs), "\n")
-    return head * "\nCollect the result$(length(runs) == 1 ? "" : "s") with " *
-           "bt_julia_wait(runs = [$(ids)], seconds = 60)."
+    listed(one, many, rs) = length(rs) == 1 ? one * ": " * line(only(rs)) :
+                                              many * ":\n" * join(("- " * line(r) for r in rs), "\n")
+    finished = [r for r in runs if r.status != "lost"]
+    lost = [r for r in runs if r.status == "lost"]
+    parts = String[]
+    if !isempty(finished)
+        ids = join(("\"$(r.id)\"" for r in finished), ", ")
+        push!(parts, listed("Background Julia run finished", "Background Julia runs finished", finished) *
+              "\nCollect the result$(length(finished) == 1 ? "" : "s") with " *
+              "bt_julia_wait(runs = [$(ids)], seconds = 60).")
+    end
+    isempty(lost) || push!(parts, listed("Background Julia run lost", "Background Julia runs lost", lost) *
+        "\n$(length(lost) == 1 ? "It is" : "They are") not running and there is no result to collect.")
+    return join(parts, "\n\n")
 end
 
 # ── A process that went away ─────────────────────────────────────────────────
@@ -473,6 +484,7 @@ function runs_channel_closed!(state::ServerState, project_id::AbstractString,
                 if r.status == "running" && r.worker_id == host_worker && r.seen < closed_at]
         foreach(r -> lose_run!(chat, r, "the process running it went away"), lost)
         isempty(lost) || @info "runs lost with their process" project_id host_worker runs = [r.id for r in lost]
+        isempty(lost) || note_finished_runs!(chat)
     end)
     return nothing
 end

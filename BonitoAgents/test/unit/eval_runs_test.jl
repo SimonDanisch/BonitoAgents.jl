@@ -215,6 +215,15 @@ try
                                                     "boom", false, false, Any[], nothing)])
         @test occursin("- r10 (temp env on this worker): ✗ failed after 4s — boom", two)
         @test occursin("[\"r9\", \"r10\"]", two)
+        # A lost run has nothing to collect: the note says so instead of sending
+        # the agent to wait on it.
+        lost = BT.ChatRun("r11", "", "", "", "", true, 0.0, "lost", 60.0, "the chat was restarted",
+                          false, false, Any[], nothing)
+        both = BT.run_note_text(model, [r, lost])
+        @test occursin("bt_julia_wait(runs = [\"r9\"], seconds = 60)", both)
+        @test occursin("Background Julia run lost: r11 (temp env on this worker): ✗ lost after 1m — the chat was restarted", both)
+        @test occursin("not running and there is no result to collect", both)
+        @test !occursin("r11\"]", both)
     end
 
     @testset "the live tail never lands on top of the complete output" begin

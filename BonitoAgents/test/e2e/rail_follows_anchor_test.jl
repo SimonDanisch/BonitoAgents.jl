@@ -68,7 +68,10 @@
             // The rail's own ends: the last message at the bottom, the first at the top.
             const f = ch.atTail() && ch.atBottom() ? 1 : ch.plo <= 0 && m.scrollTop <= 1 ? 0 :
                 Math.min(1, (ch.seqPos(ch.order[first]) + into) / Math.max(1, ch.seqLength() - 1));
-            const shown = parseFloat((thumb.style.transform.match(/-?[0-9.]+/) || ['NaN'])[0]);
+            // As drawn: the thumb rides an animation (`placeThumb`), so its
+            // computed transform, not its style attribute.
+            const t = getComputedStyle(thumb).transform;
+            const shown = t === 'none' ? 0 : new DOMMatrixReadOnly(t).m42;
             window.__frames.push([shown, Math.round(f * (rail.clientHeight - thumb.offsetHeight))]);
         };
         // Sampled from an observer made after the transcript's: observers run

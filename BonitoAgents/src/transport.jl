@@ -29,3 +29,17 @@ function system_prompt_meta(text::AbstractString)
             "preset" => "claude_code",
             "append" => String(text))))
 end
+
+# What a session starts with besides its prompt. Claude: the AGENTS.md appendix,
+# and `perTaskStopAffordance`, which says this client stops background tasks one
+# by one (each has its own stop in the task bar). That makes Claude Code's
+# interrupt, the chat's Stop, end the turn and spare the background subagents;
+# without it a Stop took every running subagent down with the turn, and nothing
+# told the agent (2026-10-20). Other agents get nothing extra.
+function session_meta(::ClaudeCodeAgent, state, project_id::AbstractString)
+    meta = system_prompt_meta(agents_prompt_appendix(state, project_id))
+    m = get!(() -> Dict{String,Any}(), meta, "_meta")
+    m["claudeCode"] = Dict{String,Any}("options" => Dict{String,Any}("perTaskStopAffordance" => true))
+    return meta
+end
+session_meta(::Any, state, ::AbstractString) = Dict{String,Any}()

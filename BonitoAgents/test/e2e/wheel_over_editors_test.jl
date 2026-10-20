@@ -1,8 +1,8 @@
-# A wheel over a code editor or a diff scrolls the chat, unless the editor can
-# still scroll that way itself. Monaco cancels every wheel over it, so over an
-# eval card's code or an edit's diff the chat stood still ("I can't scroll up").
-# ElectronCall's wheel scrolls the nearest box that can move unless a handler
-# cancels it, as a browser's own wheel does.
+# A wheel over code or a diff scrolls the chat, unless the code's section can
+# still scroll that way itself. (As Monaco editors they cancelled every wheel,
+# so over an eval card's code or an edit's diff the chat stood still: "I can't
+# scroll up".) ElectronCall's wheel scrolls the nearest box that can move unless
+# a handler cancels it, as a browser's own wheel does.
 @testitem "e2e:wheel_over_editors" setup = [SharedServer] tags = [:e2e] begin
     S = SharedServer
     s = S.server()
@@ -27,9 +27,9 @@
     @test TK.wait_for(s, "the eval card done",
         "($(card("wh-eval"))?.querySelector('.bt-tool-status')?.textContent || '') === 'completed'"; timeout = 180) == true
     @test TK.wait_for(s, "both diffs and the eval code mounted",
-        "!!$(card("wh-short"))?.querySelector('.monaco-diff-editor .view-line') && " *
-        "!!$(card("wh-long"))?.querySelector('.monaco-diff-editor .view-line') && " *
-        "!!$(card("wh-eval"))?.querySelector('.monaco-editor .view-line')"; timeout = 60) == true
+        "!!$(card("wh-short"))?.querySelector('.bt-code-diff .bt-l') && " *
+        "!!$(card("wh-long"))?.querySelector('.bt-code-diff .bt-l') && " *
+        "!!$(card("wh-eval"))?.querySelector('.bt-code .bt-l')"; timeout = 60) == true
     @test TK.wait_for(s, "the agent done", "!document.querySelector('.bt-busy.bt-busy-active')"; timeout = 60) == true
 
     ctx = s.browser[]
@@ -46,27 +46,25 @@
         return scroll_top() - before
     end
 
-    # The editors' own boxes, as they show on screen (not their content, which
-    # a capped diff holds far past its box).
-    # The eval card's code: two lines, so neither the editor nor the box around
-    # it can scroll. The chat does.
-    code = "$(card("wh-eval")).querySelector('.monaco-editor')"
+    # The sections' boxes, as they show on screen (not their content, which a
+    # capped diff holds far past its box).
+    # The eval card's code: two lines, so its section can't scroll. The chat does.
+    code = "$(card("wh-eval")).querySelector('.bt-code').closest('.bt-subsection-body')"
     @test wheel_to(code)
     @test moved_over(code) < -100
 
     # A short diff: the same.
-    short = "$(card("wh-short")).querySelector('.monaco-diff-editor')"
+    short = "$(card("wh-short")).querySelector('.bt-subsection-body')"
     @test wheel_to(short)
     @test moved_over(short) < -100
 
     # A long diff capped below its content scrolls itself first: down over it,
     # its lines move, and the chat, which could move down too, stays.
-    longsel = "$(card("wh-long")).querySelector('.monaco-diff-editor')"
+    longsel = "$(card("wh-long")).querySelector('.bt-subsection-body')"
     @test wheel_to(longsel)
     @test TK.eval_js(s, "(() => { const c = $(chat); return c.scrollHeight - c.clientHeight - c.scrollTop; })()") > 200
-    # How far the diff's modified side is scrolled, read off its lines' offset
-    # (its text is no measure: Monaco keeps stale line nodes around).
-    scrolled() = TK.eval_js(s, "-parseFloat($(longsel).querySelector('.modified-in-monaco-diff-editor .lines-content').style.top || '0')")
+    # How far the diff's section is scrolled.
+    scrolled() = TK.eval_js(s, "$(longsel).scrollTop")
     @test scrolled() == 0
     @test moved_over(longsel; dy = 120) == 0
     @test scrolled() > 20

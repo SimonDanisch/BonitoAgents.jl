@@ -95,6 +95,15 @@ mutable struct RunBook
 end
 RunBook() = RunBook(Dict{String,ChatRun}(), Dict{Tuple{String,Float64},ChatRun}(), ReentrantLock(), nothing)
 
+# What happened to the chat's background tasks that the agent was not told: the
+# lines of the next note (`note_background!`).
+mutable struct BgNotes
+    const lines::Vector{String}
+    const lock::ReentrantLock
+    notifier::Union{Task,Nothing}
+end
+BgNotes() = BgNotes(String[], ReentrantLock(), nothing)
+
 # `state.chat_models[project_id]`; every browser tab viewing the project gets
 # a per-session view via `Base.copy(::ChatModel)`. The shared bits — message
 # store, ACP client, persistent chat session, the user-message queue — are
@@ -334,6 +343,9 @@ mutable struct ChatModel
     # The chat's Julia runs (eval_runs.jl). Shared across session views.
     runs::RunBook
 
+    # Background-task endings the agent has not been told (`note_background!`).
+    bg_notes::BgNotes
+
     # How tall each tool body last rendered, so the next render reserves its
     # space before the body arrives (measured_sizes.jl). Shared across views.
     body_heights::BodyHeights
@@ -428,6 +440,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         TaskBar(),                             # live-task board (owns its poll loop)
         Dict{String, Tuple{ReentrantLock, Ref{Int}}}(),  # tool_renders (serialize + latest-wins)
         RunBook(),                             # runs
+        BgNotes(),                             # bg_notes
         load_body_heights(chat_dir),           # body_heights
     )
     load_pending_sends!(model)
@@ -538,6 +551,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = 
             m.taskbar,                 # shared → one live-task board per chat
             m.tool_renders,            # shared → renders serialize across every tab
             m.runs,                    # shared → one run book per chat
+            m.bg_notes,                # shared → one note to the agent per chat
             m.body_heights,            # shared → one record per chat
         )
     end
@@ -917,10 +931,11 @@ mutable struct BgWatch
     channel::Union{Nothing,WorkerLink.LinkChannel}
     active::Bool          # a watch runs, or is being opened
     done::Bool            # the writer closed the file / the subagent ended its turn
+    ended_by::String      # the marker that ended a subagent's watch; "" otherwise
     ended_on::UInt        # objectid of the worker link a watch could not run on; 0 if none
     write_pending::Bool   # the output reaches disk within a second
 end
-BgWatch() = BgWatch(nothing, false, false, UInt(0), false)
+BgWatch() = BgWatch(nothing, false, false, "", UInt(0), false)
 
 mutable struct BashToolMsg <: ToolMsg
     message::Message
@@ -1501,9 +1516,67 @@ function interrupt_background_tasks!(chat::ChatModel; reason::String = "agent_se
         if m.phase isa Executing
             m.message.status = "failed"
             m.message.summary = "Interrupted: agent session ended"
+            note_background!(chat, "$(bg_note_name(m)) ended with the previous agent session, " *
+                                   "before it finished. It is not running, and no result will come.")
         end
         m.phase = Reported()
         finished!(m; reason)
+    end
+    return nothing
+end
+
+# ── Telling the agent what became of its background work ─────────────────────
+# Claude tells the agent when a background task finishes, fails or is stopped (a
+# task notification), but not when it ends any other way: a subagent an
+# interrupt took down, the tasks of a session that ended. The agent then waits
+# on work that is gone: it waited 17 minutes on such a subagent, then learned
+# from `TaskStop` that it did not exist (2026-10-20). Those endings are said
+# here, in one note per batch once the agent is idle, like finished Julia runs
+# (`deliver_run_notes!`).
+const BG_NOTE_BATCH_S = 3.0
+
+bg_note_name(m::TaskToolMsg) =
+    "Background agent \"$(isempty(m.description) ? tool_title(m) : m.description)\"" *
+    (isempty(m.bg_output_path) ? "" : " ($(splitext(basename(m.bg_output_path))[1]))")
+bg_note_name(m::BashToolMsg) =
+    "Background command \"$(something(m.description, first(m.command, 80)))\""
+
+function note_background!(chat::ChatModel, line::AbstractString)
+    notes = shared(chat).bg_notes
+    lock(notes.lock) do
+        push!(notes.lines, String(line))
+        notes.notifier === nothing &&
+            (notes.notifier = Base.errormonitor(@async deliver_bg_notes!(shared(chat))))
+    end
+    return nothing
+end
+
+function deliver_bg_notes!(chat::ChatModel)
+    notes = chat.bg_notes
+    try
+        sleep(BG_NOTE_BATCH_S)
+        while chat_open(chat)
+            if chat.busy_active[]
+                wait_idle(chat)
+                continue
+            end
+            # Taken with the notifier, so a line added from now on starts the next note.
+            lines = lock(notes.lock) do
+                taken = copy(notes.lines)
+                empty!(notes.lines)
+                notes.notifier = nothing
+                taken
+            end
+            isempty(lines) && return nothing
+            note = UserMsg(chat, join(lines, "\n"))
+            note.auto = true
+            send_message!(chat, note)
+            return nothing
+        end
+    finally
+        lock(notes.lock) do
+            notes.notifier === current_task() && (notes.notifier = nothing)
+        end
     end
     return nothing
 end
@@ -1522,6 +1595,18 @@ function advance!(m::BackgroundMsg)
     end
     m.phase isa Executing || return m.phase
     work_done(m) || return m.phase
+    # Stopped before it finished: nobody tells the agent, so there is no report
+    # to wait for.
+    if interrupted(m)
+        m.message.status = "failed"
+        m.message.summary = "Interrupted before it finished"
+        m.phase = Reported()
+        chat = tool_chat(m)
+        chat === nothing || note_background!(chat, "$(bg_note_name(m)) was interrupted before it " *
+            "finished. It is not running, and no result will come. What it did so far is in its " *
+            "transcript: $(m.bg_output_path)")
+        return m.phase
+    end
     chat = tool_chat(m)
     reporting = chat !== nothing && agent_turn_open(chat)
     m.phase = reporting ? Reporting(time()) : AwaitingReport(time())
@@ -1562,8 +1647,10 @@ work_done(m::BashToolMsg) =
 # its turn with `"stop_reason":"end_turn"` (intermediate tool steps are "tool_use"),
 # and it lands EXACTLY when the subagent finishes (verified: end_turn appeared in
 # the outputFile ~2s before the main agent relayed the subagent's result). A
-# missing / still-streaming file, or a feed mid-tool-loop, has no end_turn ⇒ the
-# pill stays live (until end_turn or ⊗ stop). No `outputFile` at all ⇒ no wire
+# subagent stopped before that ends with an interruption entry instead
+# (`SUBAGENT_STOPPED_MARKER`), as final as `end_turn`. A missing /
+# still-streaming file, or a feed mid-tool-loop, has neither ⇒ the pill stays
+# live (until one appears or ⊗ stop). No `outputFile` at all ⇒ no wire
 # done-signal ⇒ stays until ⊗ stop.
 work_done(m::TaskToolMsg) = !isempty(m.bg_output_path) && output_done(m)
 
@@ -1579,12 +1666,25 @@ end
 # A subagent ends its turn with this on its final message: `end_turn` appears
 # once, so its presence in the transcript is the deterministic "finished".
 const SUBAGENT_DONE_MARKER = "\"stop_reason\":\"end_turn\""
+# A subagent stopped before that (the user's Stop interrupts the background
+# subagents with the turn) ends its transcript with this entry instead, also
+# "…for tool use" mid-tool, and writes nothing after it. claude-agent-acp says
+# nothing about it on the wire, and no completion reaches the agent: with only
+# `end_turn` to go on, its pill ran on for good (2026-10-20, and the 45
+# interrupted transcripts on the desktop all end at this line). Unescaped
+# quotes, so text quoting it inside a tool result cannot match.
+const SUBAGENT_STOPPED_MARKER = "\"text\":\"[Request interrupted by user"
 
 watch_header(m::BashToolMsg) = Dict{String,Any}("kind" => "watch_file", "path" => m.bg_output_path,
                                                 "offset" => m.bg_offset, "until" => "closed")
+# `marker` for a worker from before `markers`, which follows `end_turn` only.
 watch_header(m::TaskToolMsg) = Dict{String,Any}("kind" => "watch_file", "path" => m.bg_output_path,
                                                 "offset" => m.bg_offset, "until" => "marker",
-                                                "marker" => SUBAGENT_DONE_MARKER)
+                                                "marker" => SUBAGENT_DONE_MARKER,
+                                                "markers" => [SUBAGENT_DONE_MARKER, SUBAGENT_STOPPED_MARKER])
+
+interrupted(m::TaskToolMsg) = m.watch.ended_by == SUBAGENT_STOPPED_MARKER
+interrupted(::BashToolMsg) = false
 
 """
     watch_output!(m)
@@ -1630,6 +1730,7 @@ function follow_output!(m::BackgroundMsg, chat::ChatModel, wid::AbstractString, 
             haskey(msg, "chunk") && output_arrived!(m, chat, String(msg["chunk"]), Int(msg["offset"]))
             if get(msg, "done", false) === true
                 m.bg_offset = Int(get(msg, "offset", m.bg_offset))
+                w.ended_by = String(get(msg, "marker", ""))
                 w.done = true
             end
         end
@@ -1844,7 +1945,7 @@ end
 # That type doubles as the "summary kind" tag; each kind that wants a tailored,
 # at-a-glance summary opts in, everything else falls to `content_summary_default`.
 # `content` may be empty (opening tool_call before any result streamed in).
-#   edit:   one file → "name · ±N lines";  many → "K files · ±N lines"
+#   edit:   one file → "name · +A −R";  many → "K files · +A −R" (lines added, removed)
 #   search: count of result rows that look like grep hits
 #   move:   "src → dst" extracted from the content text
 #   fetch:  domain of the URL extracted from the content
@@ -1883,19 +1984,20 @@ end
 
 content_summary(::Type{<:ToolMsg}, content::AbstractVector) = content_summary_default(content)
 
+# The lines an edit adds and removes, from the line diff its body shows (a net
+# count said "0 lines" for a 25-line rewrite).
 function content_summary(::Type{EditToolMsg}, content::AbstractVector)
     diffs = [c for c in content if c isa DiffContent]
     isempty(diffs) && return content_summary_default(content)
-    total_delta = 0
+    removed = added = 0
     for d in diffs
-        total_delta += length(split(d.new_text, '\n')) -
-                       length(split(something(d.old_text, ""), '\n'))
+        r, a = diff_counts(diff_ops(something(d.old_text, ""), d.new_text))
+        removed += r
+        added += a
     end
-    sign_str = total_delta > 0 ? "+$total_delta" : string(total_delta)
-    line_word = abs(total_delta) == 1 ? "line" : "lines"
-    return length(diffs) == 1 ?
-           "$(basename(diffs[1].path)) · $sign_str $line_word" :
-           "$(length(diffs)) files · $sign_str $line_word"
+    counts = "+$(added) −$(removed)"
+    return length(diffs) == 1 ? "$(basename(diffs[1].path)) · $(counts)" :
+                                "$(length(diffs)) files · $(counts)"
 end
 
 function content_summary(::Type{SearchToolMsg}, content::AbstractVector)
@@ -2122,10 +2224,9 @@ end
 # `bt_show` auto-expand is shared across the generic tool variants and depends
 # on persisted on-disk content, so it lives here once. Edit-tool previews used
 # to be HTML strings emitted here too, but that "all `-` then all `+`" view
-# was misleading and divergent from the body's Monaco diff. Edit tools now
-# auto-mount a single compact Monaco DiffEditor as their body (see
-# `auto_expand_body` for the eager-mount, and `render_diff_block` for the
-# capped height); no separate HTML preview.
+# was misleading and divergent from the body's diff. Edit tools now auto-mount
+# their diffs as their body (see `auto_expand_body` for the eager-mount, and
+# `diff_section` for the capped height); no separate HTML preview.
 function augment_generic_header!(d::Dict, chat_dir::AbstractString)
     if !isempty(chat_dir)
         content = load_tool_content(chat_dir, d["id"])
@@ -2351,7 +2452,8 @@ end
 # The meter's class follows how full the context window is, so "nearly out of
 # context" shows as colour before anyone reads the number.
 function usage_class(u)
-    (u === nothing || u.size <= 0) && return "bt-header-usage"
+    u === nothing && return "bt-header-usage bt-header-usage-empty"   # `usage_label` is ""
+    u.size <= 0 && return "bt-header-usage"
     r = u.used / u.size
     r >= 0.9  && return "bt-header-usage bt-header-usage-high"
     r >= 0.75 && return "bt-header-usage bt-header-usage-warn"
@@ -2359,17 +2461,12 @@ function usage_class(u)
 end
 
 # ── Edit-tool body sizing ────────────────────────────────────────────────────
-# Edit-tool bodies render as a Monaco `DiffEditor` (see `render_diff_block`).
-# To keep multi-edit tool calls from flooding the chat with full-height
-# editors, the body is initially rendered with `max_height = EDIT_BODY_COMPACT_PX`.
-# The expand toggle re-renders with `max_height = EDIT_BODY_EXPANDED_PX` (or
-# in the future, swaps the value through the editor's `max_height`
-# Observable so the same Monaco instance resizes without re-mounting). This
-# replaces the prior HTML-string "all − then all +" preview that lived above
-# the body — that view was wrong (it dumped old then new instead of
-# interleaving real hunks) and divergent from the body's Monaco render.
-const EDIT_BODY_COMPACT_PX  = 240
-const EDIT_BODY_EXPANDED_PX = 2000
+# Each diff of an edit is a section (`diff_section`) EDIT_SUMMARY_LINES tall
+# while the card is collapsed and EDIT_FULL_LINES once it is expanded (240 and
+# 2000 px when they were Monaco editors), scrolling past that: a multi-edit call
+# doesn't flood the chat, and a long diff is all there to scroll through.
+const EDIT_SUMMARY_LINES = 13
+const EDIT_FULL_LINES    = 111
 
 # Tool-body rendering (Bonito DOM tree, includes BonitoBook MonacoEditor /
 # DiffEditor instances). Called only when the user clicks expand; output is
@@ -2395,64 +2492,6 @@ function detect_language(path::AbstractString)
     return "plaintext"
 end
 
-# Read-only Monaco sized to CONTENT height and CONTAINER width. `automaticLayout`
-# is off (its rAF polling loop fought this init); instead we `layout()` on the
-# container's real size changes via a ResizeObserver. The one-shot version laid
-# out once at `offsetWidth || 600` — so an editor that mounted while its card was
-# narrow (or measured 0) locked to ~600px forever: the code was boxed into a
-# fraction of a wide card WITH a horizontal scrollbar, and that horizontal
-# overflow made Monaco eat the wheel (for h-scroll) so vertical wheel-scroll of
-# the clamped `.bt-subsection-body` never fired. Re-fitting to the parent width
-# fixes both: full-width editor → no h-overflow → the wheel bubbles to the clamp.
-const MONACO_RESIZE_INIT = js"""(monacoEditor) => {
-    monacoEditor.editor.then(editor => {
-        const div = monacoEditor.editor_div;
-        div.style.width = '100%';
-        let lw = -1, lh = -1;
-        const fit = () => {
-            const p = div.parentElement;
-            const w = (p && p.clientWidth) || div.clientWidth || 600;
-            const h = editor.getContentHeight();
-            if (w === lw && h === lh) return;   // no-op guard (avoids RO feedback loops)
-            lw = w; lh = h;
-            div.style.height = h + 'px';
-            editor.layout({ width: w, height: h });
-        };
-        fit();
-        // `fit` from inside the observer would resize what it observes ("ResizeObserver
-        // loop completed with undelivered notifications"): the next frame instead,
-        // one layout per burst.
-        let pending = false;
-        const ro = new ResizeObserver(() => {
-            if (pending) return;
-            pending = true;
-            requestAnimationFrame(() => { pending = false; if (!monacoEditor.disposed) fit(); });
-        });
-        ro.observe(div.parentElement || div);
-        // Disposed with its session (BonitoBook's `on_free`). The wheel is
-        // BonitoBook's too (`pass_wheel_unless_scrollable`).
-        div.addEventListener('monaco-editor-disposed', () => ro.disconnect(), { once: true });
-    });
-}"""
-
-function monaco_readonly(text::AbstractString, lang::AbstractString)
-    BonitoBook.MonacoEditor(
-        text;
-        language=lang,
-        readOnly=true,
-        automaticLayout=false,
-        scrollBeyondLastLine=false,
-        lineNumbers="off",
-        minimap=Dict(:enabled => false),
-        # Width fit is handled in MONACO_RESIZE_INIT; the wheel by BonitoBook,
-        # which hands it to the page unless the editor can scroll itself.
-        # Force light Monaco. BonitoBook's "default" theme follows the host OS
-        # `prefers-color-scheme` (dark here), which clashed with the light app.
-        theme=Observable("vs"),
-        js_init_func=MONACO_RESIZE_INIT,
-    )
-end
-
 # Console output (captured stdout / stderr / error backtraces) → a
 # `Bonito.RichText` terminal block: ANSI escape codes become styled spans
 # instead of literal `\e[31m` garbage, and the `terminal-output` class gives
@@ -2474,7 +2513,7 @@ function render_text_block(text::AbstractString)
     m = match(r"^\s*```(\w*)\r?\n(.*?)\r?\n```\s*$"s, text)
     if m !== nothing
         lang = isempty(m.captures[1]) ? "plaintext" : String(m.captures[1])
-        return monaco_readonly(String(m.captures[2]), lang)
+        return CodeView(String(m.captures[2]); language = lang)
     end
     Bonito.has_ansi_codes(text) && return console_block(text)
     return DOM.div(Markdown.parse(text), class="bt-tool-md")
@@ -2494,36 +2533,45 @@ end
 # onto the full content, not a truncation. `pin_end` keeps that window
 # pinned to the END (console panes — the newest output is what matters,
 # streaming or done). The cap lives on the SECTION, never on the tool card —
-# every section (and the result embed below them) stays reachable.
+# every section (and the result embed below them) stays reachable. `full_lines`
+# caps the FULL state the same way. `label` is a heading string, or a node (an
+# edit's file link).
 struct Collapsable
-    label::String
+    label::Any
     body::Any
     preview::String
     summary_lines::Int
+    full_lines::Int
     state::Symbol           # initial state: :full | :summary | :collapsed
     pin_end::Bool
+    console::Bool           # the body is a terminal (`console_block`): its surface
 end
-function Collapsable(label::AbstractString, body; preview::AbstractString = "",
-                     summary_lines::Integer = 4, state::Symbol = :summary,
-                     pin_end::Bool = false)
+function Collapsable(label, body; preview::AbstractString = "",
+                     summary_lines::Integer = 4, full_lines::Integer = 26,
+                     state::Symbol = :summary, pin_end::Bool = false, console::Bool = false)
     state in (:full, :summary, :collapsed) ||
         throw(ArgumentError("Collapsable state must be :full, :summary or :collapsed, got $(state)"))
-    return Collapsable(String(label), body, String(preview), Int(summary_lines),
-                       state, pin_end)
+    return Collapsable(label, body, String(preview), Int(summary_lines), Int(full_lines),
+                       state, pin_end, console)
 end
 
+subsection_label(label::AbstractString) = DOM.span(label; class="bt-subsection-label")
+subsection_label(label) = label
+
 function Bonito.jsrender(session::Session, c::Collapsable)
-    summary_kids = Any[DOM.span(c.label; class="bt-subsection-label")]
+    summary_kids = Any[subsection_label(c.label)]
     isempty(c.preview) || push!(summary_kids,
         DOM.span(c.preview; class="bt-subsection-preview"))
-    body = DOM.div(c.body; class="bt-subsection-body")
+    body = DOM.div(c.body; class = c.console ? "bt-subsection-body bt-subsection-console" : "bt-subsection-body")
     # Header click cycles the three states summary → full → collapsed → summary.
     # preventDefault keeps the click from ALSO firing the native <details> toggle
     # — `open` is driven here (open ⇔ not collapsed; `data-state` carries full vs
     # summary while open). Entering summary/full re-pins a `pin_end` body to its
-    # end.
+    # end. A click on a file link in the header opens the file (the chat's
+    # delegated listener) and leaves the section as it is.
     cycle = js"""e => {
         e.preventDefault();
+        if (e.target.closest('.bt-path-link')) return;
         e.stopPropagation();
         const d = e.target.closest('.bt-subsection');
         if (!d.open) { d.open = true; d.dataset.state = 'summary'; }
@@ -2557,7 +2605,8 @@ function Bonito.jsrender(session::Session, c::Collapsable)
         class="bt-subsection",
         dataState=c.state === :collapsed ? "summary" : String(c.state),
         dataPinEnd=c.pin_end ? "1" : nothing,
-        style=Styles("--bt-summary-lines" => string(c.summary_lines)),
+        style=Styles("--bt-summary-lines" => string(c.summary_lines),
+                     "--bt-full-lines" => string(c.full_lines)),
         open=c.state === :collapsed ? nothing : true))
 end
 
@@ -2681,11 +2730,11 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     # "Code" heading helps nobody, so the section only renders when `m.code`
     # is non-empty.
     sections  = Any[]
-    # Code preview: the summary state shows ~4 lines (the Monaco editor sizes
-    # itself to the content; the Collapsable body caps + scrolls). Header
-    # click cycles summary → full → collapsed.
+    # Code preview: the summary state shows ~4 lines (the code is as tall as
+    # it is; the Collapsable body caps + scrolls). Header click cycles
+    # summary → full → collapsed.
     isempty(m.code) || push!(sections,
-        tool_subsection("Code", monaco_readonly(m.code, "julia")))
+        tool_subsection("Code", CodeView(m.code; language = "julia")))
     # Wire contract v3: content is `[output_text?, descriptor?]` — the
     # descriptor (exact decode of our own json, see `result_descriptor`) is
     # the LAST block of a completed call whenever a result ref exists (values
@@ -2716,7 +2765,7 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
     shown = Ref(false)
     show_output!() = shown[] || (shown[] = true;
         out_slot[] = tool_subsection("Output",
-            console_block(session, m.stream_text); pin_end = true))
+            console_block(session, m.stream_text); pin_end = true, console = true))
     isempty(strip(m.stream_text[])) || show_output!()
     on(session, m.stream_text) do t
         isempty(strip(t)) || show_output!()
@@ -2900,24 +2949,15 @@ function cache_tool_content!(chat::Union{ChatModel,Nothing}, tool_id::AbstractSt
     return nothing
 end
 
-# A single DiffContent rendered as path-header + inline Monaco DiffEditor.
-# `max_height` caps Monaco's content-based auto-sizing — pass a small value
-# (`EDIT_BODY_COMPACT_PX`) for the collapsed body, a large one
-# (`EDIT_BODY_EXPANDED_PX`) for the expanded body. The JS `MonacoDiffEditor`
-# also exposes `setMaxHeight` on the container so the Collapsable can flip
-# between the two without re-mounting Monaco (kept here as a fallback for
-# the rare path where the body IS remounted, e.g. tool-update churn).
-function render_diff_block(d::DiffContent; max_height::Int = EDIT_BODY_EXPANDED_PX)
-    DOM.div(
-        # The per-file header doubles as a path link (the chat's delegated
-        # click listener opens it in the plotpane editor).
-        DOM.div(d.path; class="bt-diff-header bt-path-link", dataPath=d.path),
-        BonitoBook.DiffEditor(something(d.old_text, ""), d.new_text;
-            language=detect_language(d.path),
-            renderSideBySide=false,
-            theme=Observable("vs"),   # light, matching the app (see monaco_readonly)
-            max_height=max_height);
-        class="bt-diff-block")
+# One diff of an edit: a section headed by its file (a link that opens it) and
+# how many lines it removes and adds, sized like an eval's code (the card arrow
+# switches it between EDIT_SUMMARY_LINES and EDIT_FULL_LINES, styles.jl).
+function diff_section(d::DiffContent)
+    view = DiffView(d)
+    removed, added = diff_counts(view)
+    return Collapsable(DOM.span(d.path; class = "bt-subsection-path bt-path-link", dataPath = d.path),
+        view; preview = "+$(added) −$(removed)",
+        summary_lines = EDIT_SUMMARY_LINES, full_lines = EDIT_FULL_LINES)
 end
 
 # Render search-tool output as one row per match. Recognises both `path:line:`
@@ -3518,9 +3558,7 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
         # `layout()` — work done inside the delivery cycle on the very element
         # being observed. `e2e:file_view` failed on it deterministically ("
         # ResizeObserver loop completed with undelivered notifications", twice)
-        # once a workspace split resized a file panel. The read-only editors
-        # (`monaco_readonly` + MONACO_RESIZE_INIT) have been off it for the same
-        # reason; this editable one was the last holdout.
+        # once a workspace split resized a file panel.
         automaticLayout = false,
         minimap = Dict(:enabled => false),
         scrollbar = Dict(:vertical => "auto", :horizontal => "auto"),
@@ -3540,9 +3578,7 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
                 // the NEXT frame so the work happens outside the observer's
                 // delivery cycle. The editor fills its panel (the height chain
                 // in styles.jl), so a bare `layout()` — which measures the
-                // container — is the right call; sizing it explicitly is what
-                // MONACO_RESIZE_INIT does instead, because those editors are
-                // sized to CONTENT height. Dropping the observer entirely was
+                // container — is the right call. Dropping the observer entirely was
                 // not an option: the editor would stop following its panel
                 // across a split drag or a window resize.
                 const host = me.editor_div;
@@ -3561,8 +3597,7 @@ function Bonito.jsrender(session::Session, fe::FileEditor)
                 ro.observe(host);
                 // Tear down when the editor leaves the DOM, scoped to the
                 // PARENT's direct children rather than a document-wide subtree
-                // observer — see MONACO_RESIZE_INIT for why that distinction
-                // matters on a page full of editors.
+                // observer, which would run on every change anywhere in the page.
                 const parent = host.parentElement;
                 if (parent) {
                     const mo = new MutationObserver(() => {
@@ -3715,7 +3750,7 @@ function render_tool_parts(state::ServerState, m::ToolMsg, content, project_id::
         if c isa TextContent
             push!(parts, render_text_block(c.text))
         elseif c isa DiffContent
-            push!(parts, render_diff_block(c))
+            push!(parts, diff_section(c))
         elseif c isa ImageContent
             push!(parts, read_image_element(state, project_id, m, c))
         elseif c isa AgentClientProtocol.ResourceLink
@@ -3734,11 +3769,9 @@ render_tool_content(state::ServerState, m::ToolMsg, content, project_id::Abstrac
     render_tool_parts(state, m, content, project_id)
 
 # Edit: render EVERY diff (multi-edit calls used to silently drop all but the
-# first). Stack with file-path headers. Each Monaco editor caps at
-# `EDIT_BODY_COMPACT_PX`; the JS Collapsable's edit-mode swaps to
-# `EDIT_BODY_EXPANDED_PX` in place via `setMaxHeight`, no re-mount. The body also
-# auto-expands on the first snap carrying a `DiffContent` (see `auto_expand_body`)
-# so the compact diff shows under the header without a click.
+# first), one `diff_section` each. The body also auto-expands on the first snap
+# carrying a `DiffContent` (see `auto_expand_body`) so the diff shows under the
+# header without a click.
 function render_tool_content(state::ServerState, m::EditToolMsg, content, project_id::AbstractString)
     diffs = [c for c in content if c isa DiffContent]
     if isempty(diffs)
@@ -3750,10 +3783,7 @@ function render_tool_content(state::ServerState, m::EditToolMsg, content, projec
         d === nothing && return render_tool_parts(state, m, content, project_id)
         diffs = [d]
     end
-    return DOM.div(
-        (render_diff_block(d; max_height = EDIT_BODY_COMPACT_PX) for d in diffs)...;
-        class = length(diffs) > 1 ? "bt-multi-diff bt-edit-tool-body" : "bt-edit-tool-body",
-        dataEditTool = "1")
+    return DOM.div((diff_section(d) for d in diffs)...; class = "bt-edit-tool-body", dataEditTool = "1")
 end
 
 # A DiffContent from an edit's own input — live from the message fields, or on a
@@ -3786,17 +3816,18 @@ function render_tool_content(state::ServerState, m::SearchToolMsg, content, proj
     return render_search_results(text)
 end
 
-# Read → Monaco with the language inferred from the (display) title; Bash
-# ("execute") → Monaco as shell. Both fall back to the default when text-empty.
+# Read → code in the language of the file read (its path, or the display title
+# that names it); Bash ("execute") → code as shell. Both fall back to the
+# default when text-empty.
 function render_tool_content(state::ServerState, m::ReadToolMsg, content, project_id::AbstractString)
     text = join((c.text for c in content if c isa TextContent), "\n")
     isempty(text) && return render_tool_parts(state, m, content, project_id)
-    return monaco_readonly(text, detect_language(tool_title(m)))
+    return CodeView(text; path = isempty(m.file_path) ? tool_title(m) : m.file_path)
 end
 function render_tool_content(state::ServerState, m::BashToolMsg, content, project_id::AbstractString)
     text = join((c.text for c in content if c isa TextContent), "\n")
     isempty(text) && return render_tool_parts(state, m, content, project_id)
-    return monaco_readonly(text, "shell")
+    return CodeView(text; language = "shell")
 end
 
 # ── The message is the streaming target ─────────────────────────────────────
@@ -7572,8 +7603,9 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # Picking an item closes whatever holds it: the popover on wide panes, and
     # on narrow panes the expanded ⋯ panel the items are laid out in.
     close_menu_js = MENU_CLOSE_JS * """
-        const more = event.currentTarget.closest('.bt-header')?.querySelector('.bt-header-more-check');
-        if (more) more.checked = false;"""
+        const header = event.currentTarget.closest('.bt-header');
+        const more = header?.querySelector('.bt-header-more-check');
+        if (more) { more.checked = false; header.classList.remove('bt-header-open'); }"""
     menu_item(text, action; class = "", title = "") = DOM.button(text;
         class = strip("bt-menu-item " * class),
         title = title,
@@ -7937,7 +7969,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # on :checked so the open toggle reads as the close button of the panel it
     # sits on top of.
     more_toggle = DOM.label(
-        DOM.input(; type = "checkbox", class = "bt-header-more-check"),
+        DOM.input(; type = "checkbox", class = "bt-header-more-check",
+            onchange = js"""e => e.target.closest('.bt-header')?.classList.toggle('bt-header-open', e.target.checked)"""),
         DOM.span("⋯"; class = "bt-toggle-closed"),
         DOM.span("✕"; class = "bt-toggle-open");
         class = "bt-header-collapse-toggle bt-header-more-toggle",

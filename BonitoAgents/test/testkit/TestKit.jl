@@ -2321,6 +2321,28 @@ function emulate_phone(f, s::TestServer; width::Integer = 390, height::Integer =
     end
 end
 
+"""
+    record_trace(f, s; categories = ["devtools.timeline"]) -> Vector{Any}
+
+Run `f()` while Chromium records a performance trace, as DevTools' Performance
+panel does, and return its events. `UpdateLayoutTree` events carry
+`args["elementCount"]`, the elements a style recalculation touched.
+"""
+function record_trace(f, s::TestServer; categories = ["devtools.timeline"])
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    path = tempname() * ".json"
+    run(ctx.app, "electron.contentTracing.startRecording({included_categories: $(json(categories))}).then(() => true)")
+    try
+        f()
+    finally
+        run(ctx.app, "electron.contentTracing.stopRecording($(json(path))).then(() => true)")
+    end
+    events = JSON.parsefile(path)["traceEvents"]
+    rm(path)
+    return events
+end
+
 # A touch gesture through the page's debugger (attached by `emulate_phone`).
 touch(s::TestServer, events::AbstractString) = run(s.browser[].app, """(async () => {
     const wc = electron.BrowserWindow.fromId($(s.browser[].window.id)).webContents;

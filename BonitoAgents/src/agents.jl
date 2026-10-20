@@ -153,10 +153,9 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     mcp_list = mcp_list_payload(refresh_injected_env(a.mcp, a.state, project_id))
 
     pname = provider_name(a)
-    # Only Claude honours the `_meta.systemPrompt.preset` append. The appendix
-    # is the BUILT-IN house rules + the user's editable AGENTS.md.
-    prompt_meta = a.provider isa ClaudeCodeAgent ?
-        system_prompt_meta(agents_prompt_appendix(a.state, project_id)) : Dict{String,Any}()
+    # Claude's: the BUILT-IN house rules + the user's editable AGENTS.md as a
+    # system-prompt append, and its session options (`session_meta`).
+    prompt_meta = session_meta(a.provider, a.state, project_id)
 
     # The worker spawns the agent when the channel opens and answers once it
     # runs; a spawn failure comes back as the reason. The transport shares the

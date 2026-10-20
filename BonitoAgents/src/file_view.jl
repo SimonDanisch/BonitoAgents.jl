@@ -478,7 +478,7 @@ function file_viewer(::NotebookFile, c::FileContent, path::AbstractString, mode:
         else
             outs = get(cell, "outputs", [])
             push!(nodes, DOM.div(
-                DOM.div(monaco_readonly(src, String(lang)); class = "bt-fv-nb-source"),
+                DOM.div(CodeView(src; language = String(lang)); class = "bt-fv-nb-source"),
                 (isempty(outs) ? () :
                     (DOM.div((notebook_output_node(o) for o in outs if o isa AbstractDict)...;
                              class = "bt-fv-nb-outputs"),))...;
@@ -631,10 +631,11 @@ frame_element(src::Bonito.Asset, title::AbstractString, sandbox::NamedTuple) =
     DOM.iframe(; src, class = "bt-fv-frame", title, sandbox...)
 
 # ── plain text ──────────────────────────────────────────────────────────────
-# Highlighting follows the worker path, not the mirror's. Inline the editor is
-# as tall as the text; `PanelView` fills the box and scrolls.
+# Highlighting follows the worker path, not the mirror's. Inline (a chat bubble)
+# the text is static code as tall as it is; `PanelView` is one read-only editor
+# that fills the box and scrolls.
 file_viewer(::TextFile, c::FileContent, path::AbstractString, ::InlineView = InlineView()) =
-    looks_binary(c.bytes) ? hexdump_node(c) : monaco_readonly(content_text(c), detect_language(path))
+    looks_binary(c.bytes) ? hexdump_node(c) : CodeView(content_text(c); path)
 
 file_viewer(::TextFile, c::FileContent, path::AbstractString, mode::PanelView) =
     looks_binary(c.bytes) ? hexdump_node(c) :
@@ -643,7 +644,7 @@ file_viewer(::TextFile, c::FileContent, path::AbstractString, mode::PanelView) =
 monaco_readonly(text::AbstractString, lang::AbstractString, ::PanelView) =
     BonitoBook.MonacoEditor(text; language = lang, readOnly = true, automaticLayout = true,
         scrollBeyondLastLine = false, minimap = Dict(:enabled => false),
-        # Light, as everywhere (see `monaco_readonly`).
+        # Light, matching the app.
         theme = Observable("vs"))
 
 # ── binary ──────────────────────────────────────────────────────────────────

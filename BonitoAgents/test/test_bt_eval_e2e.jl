@@ -252,15 +252,15 @@ end
                 return t.textContent !== window.__clk1; })()""";
             timeout = 30, interval = 0.5) == true
         # The Code SECTION starts in SUMMARY state — a ~4-line window onto the
-        # editor, capped by the Collapsable body (which owns the scrollbar),
-        # with real Monaco lines rendered. The card body itself is NOT capped.
+        # code, capped by the Collapsable body (which owns the scrollbar), with
+        # its rows rendered. The card body itself is NOT capped.
         code_sec = """[...document.querySelectorAll('$card .bt-subsection')].find(d =>
             d.querySelector('.bt-subsection-label')?.textContent === 'Code')"""
         @test TK.wait_for(s, "Code section in summary state, ~4 lines",
             """(() => { const d = $code_sec;
                 const b = d && d.querySelector('.bt-subsection-body');
                 return !!(d && b && d.dataset.state === 'summary' &&
-                       b.querySelectorAll('.view-line').length >= 3 &&
+                       b.querySelectorAll('.bt-code .bt-l').length >= 3 &&
                        b.offsetHeight > 0 && b.offsetHeight <= 110); })()""";
             timeout = 30) == true
 
@@ -404,8 +404,8 @@ end
 # its soft timeout (partial output + "still running"); the continue call
 # reattaches through the REAL julia_continue_handler and delivers the rest.
 # The continue card carries NO code argument — its body must NOT render an
-# empty "Code" Monaco box (the source lives in the eval card above): Output
-# and the result only.
+# empty "Code" box (the source lives in the eval card above): Output and the
+# result only.
 @testset "bt_eval e2e — continue: checkpoint reattach, no empty Code box" begin
     project = EVALENV   # result embed asserted → needs the bridge
     code = """

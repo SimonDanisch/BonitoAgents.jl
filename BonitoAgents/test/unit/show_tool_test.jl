@@ -25,7 +25,7 @@ const BT = BonitoAgents
 root_class(node) = node isa Bonito.Hyperscript.Node ? get(Bonito.Hyperscript.attrs(node), "class", "") : ""
 
 function show_kind(node)
-    nameof(typeof(node)) === :MonacoEditor && return :text
+    node isa BT.CodeView && return :text
     node isa BT.MeshViewer && return :mesh
     cls = root_class(node)
     for (c, kind) in ("bt-fv-notebook" => :notebook, "bt-fv-table-wrap" => :table,
@@ -174,7 +174,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
               """{"cell_type":"code","source":["1+1\\n"],"outputs":[]}],""" *
               """"metadata":{"kernelspec":{"language":"julia"}}}""")
         # A `.txt` that is actually binary: the extension says text, the NUL
-        # sniff overrules it and we hex-dump instead of feeding Monaco garbage.
+        # sniff overrules it and we hex-dump instead of showing garbage as code.
         write(joinpath(cwd, "lying.txt"), UInt8[0x41, 0x00, 0x42, 0x43])
 
         kind(p) = show_kind(BT.render_show_file(BT.ShowTool(state, "", cwd, p)))

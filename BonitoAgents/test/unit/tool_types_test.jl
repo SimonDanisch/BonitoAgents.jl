@@ -68,8 +68,10 @@ end
 end
 
 @testset "content_summary dispatches on the message type" begin
-    @test BT.content_summary(BT.EditToolMsg,   [dif("src/a.jl", "x\ny", "x\ny\nz")]) == "a.jl · +1 line"
-    @test BT.content_summary(BT.EditToolMsg,   [dif("a", "1", "1\n2"), dif("b", "1", "")]) == "2 files · +1 line"
+    @test BT.content_summary(BT.EditToolMsg,   [dif("src/a.jl", "x\ny", "x\ny\nz")]) == "a.jl · +1 −0"
+    @test BT.content_summary(BT.EditToolMsg,   [dif("a", "1", "1\n2"), dif("b", "1", "")]) == "2 files · +1 −1"
+    # A rewrite of every line is all of it removed and added, not a net 0.
+    @test BT.content_summary(BT.EditToolMsg,   [dif("c.jl", "a\nb", "x\ny")]) == "c.jl · +2 −2"
     @test BT.content_summary(BT.SearchToolMsg, [txt("src/a.jl:1:hit\nsrc/b.jl:2:hit")]) == "2 matches"
     @test BT.content_summary(BT.MoveToolMsg,   [txt("renamed src/old.jl -> src/new.jl")]) == "old.jl → new.jl"
     @test BT.content_summary(BT.FetchToolMsg,  [txt("Fetched https://example.com/docs ok")]) == "example.com"

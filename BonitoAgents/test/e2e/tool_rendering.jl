@@ -94,9 +94,11 @@ function run_suite(server)
         @testset "multi-edit renders one diff block per file" begin
             TK.eval_js(server, expand("edit-multi"))
             @test TK.wait_for(server, "two diff blocks",
-                "$(body_has("edit-multi")).querySelectorAll('.bt-diff-block').length === 2"; timeout = 8) == true
+                "$(body_has("edit-multi")).querySelectorAll('.bt-code-diff').length === 2"; timeout = 8) == true
+            # Each headed by its file.
             @test TK.eval_js(server,
-                "!!$(body_has("edit-multi")).querySelector('.bt-multi-diff')") == true
+                "[...$(body_has("edit-multi")).querySelectorAll('.bt-subsection-path')].map(e => e.textContent)") ==
+                ["src/a.jl", "src/b.jl"]
         end
 
         @testset "search renders one row per hit" begin

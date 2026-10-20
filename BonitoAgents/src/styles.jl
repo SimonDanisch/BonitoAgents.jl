@@ -919,7 +919,7 @@ const FILE_VIEW_CSS = [
         "overflow" => "auto", "flex" => "1 1 auto", "min-height" => "0"),
     CSS(".bt-tool-body .bt-fv-hex", "max-height" => "360px"),
     # Read-only code that fills its box and scrolls itself (a shared link's page);
-    # in a chat bubble code is sized to its content instead (`monaco_readonly`).
+    # in a chat bubble it is static code as tall as the text (`CodeView`).
     CSS(".bt-fv-code", "flex" => "1 1 auto", "min-height" => "0", "height" => "100%"),
     CSS(".bt-fv-code > div, .bt-fv-code .monaco-editor-div", "height" => "100%", "min-height" => "0"),
 ]
@@ -1063,8 +1063,11 @@ const ChatStyles = Bonito.Styles(
     # `.bt-chatpane`: the dashboard's landing header shares the `.bt-header`
     # class but has none of the collapsible elements.
     CSS(".bt-chatpane .bt-header", "container-type" => "inline-size"),
-    # Collapse toggle (⋯). Checkbox-in-label pattern: no ids, state is
-    # pure CSS via :has(input:checked). Hidden on wide panes.
+    # Collapse toggle (⋯). A checkbox in a label; checking it puts
+    # `bt-header-open` on the header (`more_toggle`, chat.jl), which the rules
+    # below key on. Not `:has(input:checked)`: Chrome checks a `:has()` on every
+    # DOM change under its anchor, and a header rule anchored up there restyled
+    # every button in the chat on each one. Hidden on wide panes.
     CSS(".bt-header-collapse-toggle",
         "display" => "none", "align-items" => "center",
         "justify-content" => "center",
@@ -1079,24 +1082,25 @@ const ChatStyles = Bonito.Styles(
         "padding" => "3px 9px",
         "cursor" => "pointer", "user-select" => "none",
         "flex" => "0 0 auto"),
+    # The checkbox covers its label, invisible but for its own keyboard focus
+    # ring, drawn around the whole toggle.
     CSS(".bt-header-collapse-toggle input",
-        "position" => "absolute", "opacity" => "0",
-        "width" => "0", "height" => "0", "pointer-events" => "none"),
+        "position" => "absolute", "inset" => "0", "margin" => "0",
+        "appearance" => "none", "background" => "transparent",
+        "border-radius" => "inherit", "cursor" => "pointer"),
+    CSS(".bt-header-collapse-toggle input:focus-visible",
+        "outline" => "2px solid var(--bt-accent)", "outline-offset" => "1px"),
     CSS(".bt-header-collapse-toggle:hover",
         "background" => "var(--bt-surface-2)"),
-    # The real checkbox is visually hidden but still keyboard-focusable —
-    # surface its focus on the label so tab + space works with a visible ring.
-    CSS(".bt-header-collapse-toggle:has(input:focus-visible)",
-        "outline" => "2px solid var(--bt-accent)", "outline-offset" => "1px"),
-    CSS(".bt-header-collapse-toggle:has(input:checked)",
+    CSS(".bt-header.bt-header-open .bt-header-collapse-toggle",
         "background" => "var(--bt-surface-2)",
         "border-color" => "var(--bt-accent)"),
     # Glyph swap: ⋯ while closed, ✕ while open — the open toggle IS the
     # close button for the panel it revealed.
     CSS(".bt-header-collapse-toggle .bt-toggle-open", "display" => "none"),
-    CSS(".bt-header-collapse-toggle:has(input:checked) .bt-toggle-open",
+    CSS(".bt-header.bt-header-open .bt-header-collapse-toggle .bt-toggle-open",
         "display" => "inline"),
-    CSS(".bt-header-collapse-toggle:has(input:checked) .bt-toggle-closed",
+    CSS(".bt-header.bt-header-open .bt-header-collapse-toggle .bt-toggle-closed",
         "display" => "none"),
     # Medium panes: the category prefixes ("model:" / "permissions:" /
     # "effort:") go — the values carry the meaning and each pill keeps its
@@ -1123,28 +1127,31 @@ const ChatStyles = Bonito.Styles(
         # `nowrap` + `flex-start` undo the wide strip's wrapping: this is a
         # single vertical stack, and in column direction those two would wrap
         # into extra COLUMNS / bottom-align the stack.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-actions",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-actions",
             "display" => "flex", "flex-direction" => "column",
             "align-items" => "stretch", "gap" => "8px",
             "flex-wrap" => "nowrap", "justify-content" => "flex-start",
             "flex-basis" => "100%", "margin" => "6px 0 0 0"),
         # The session group stacks too: one cell per row, hairlines between them
         # now on top instead of on the left, labels centered.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-session",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-session",
             "flex-direction" => "column", "align-items" => "stretch"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-session > *, " *
-            ".bt-header-row:has(.bt-header-more-check:checked) .bt-header-session .bt-header-meta > *",
+        # The cells by class. (As `:has(...) .bt-header-session > *` this rule
+        # made Chrome restyle the whole chat, 15k elements, 65 ms, on every
+        # timer tick, streamed token and Monaco render, even on wide panes where
+        # the container query does not apply: see e2e:style_invalidation.)
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-session :is(.bt-header-usage, .bt-header-meta-item)",
             "border-left" => "0", "margin-left" => "0",
             "border-top" => "1px solid var(--bt-border)", "margin-top" => "-1px",
             "justify-content" => "center"),
         # No menu inside the menu: the expanded panel IS the ⋯ menu. The
         # actions menu's own ⋯ trigger goes, and its popover list lays out in
         # flow as part of the stack, so every action is one tap away.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-menu",
             "display" => "flex", "flex-direction" => "column"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu > .bt-menu-trigger",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-menu > .bt-menu-trigger",
             "display" => "none"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu > .bt-menu-list",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-menu > .bt-menu-list",
             "display" => "block", "position" => "static", "min-width" => "0",
             "padding" => "0", "border" => "0", "box-shadow" => "none",
             "background" => "transparent"),
@@ -1153,10 +1160,10 @@ const ChatStyles = Bonito.Styles(
         # alignment only make sense in the wide control strip. Descendant
         # selector on purpose: the provider select / meta pills sit inside
         # `display:contents` sub-session fragments, so `> *` can't reach them.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-actions :is(select, button)",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-actions :is(select, button)",
             "max-width" => "none", "text-align" => "center"),
         # Inside the expanded panel the config pills stack like the buttons.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-meta",
             "flex-direction" => "column", "align-items" => "stretch",
             "white-space" => "normal"),
         # Stacked pills center their content (the pick pills are inline-flex,
@@ -1164,13 +1171,13 @@ const ChatStyles = Bonito.Styles(
         # prefixes BACK: the medium-width rule drops "model:"/"permissions:"/
         # "effort:" to save strip space, but in a stacked menu a bare
         # "default" row is ambiguous and there is plenty of width.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta-item",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-meta-item",
             "justify-content" => "center", "text-align" => "center"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta-cat",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-meta-cat",
             "display" => "inline"),
-        CSS(".bt-header:has(.bt-header-more-check:checked) .bt-header-env",
+        CSS(".bt-header.bt-header-open .bt-header-env",
             "display" => "block"),
-        CSS(".bt-header:has(.bt-header-more-check:checked) .bt-lens-bar",
+        CSS(".bt-header.bt-header-open .bt-lens-bar",
             "display" => "flex")),
 
     # ── Lens search bar (header) ─────────────────────────────────────────────
@@ -1478,9 +1485,8 @@ const ChatStyles = Bonito.Styles(
         "color" => "#b45309", "background" => "rgba(245,158,11,0.10)"),
     CSS(".bt-header-actions .bt-header-session .bt-header-usage-high",
         "color" => "#b91c1c", "background" => "rgba(239,68,68,0.10)", "font-weight" => "600"),
-    # The label is a Bonito string-Observable: it renders as an INNER span
-    # (the fast-path swap node), so the outer node is never `:empty` itself.
-    CSS(".bt-header-usage:has(> span:empty)", "display" => "none !important"),
+    # No usage reported yet: an empty label (`usage_class`).
+    CSS(".bt-header-usage-empty", "display" => "none !important"),
     # (The provider switcher's own rules are gone with its native <select>: it
     # is a `dropdown_pill` now, styled by the `.bt-msearch` / `.bt-header-meta`
     # rules above like every other pill in the strip.)
@@ -1992,12 +1998,13 @@ const ChatStyles = Bonito.Styles(
         "transition" => "max-width 160ms ease, align-self 160ms ease"),
     # Live app embeds get a wider default cap than text pills: the visuals ARE
     # the content, and a responsive (resize_to = :parent) canvas will actually
-    # use the room.
-    CSS(".bt-tool-msg:has(.bt-embed)",
+    # use the room. `bt-tool-embed` is put on the card by its embed
+    # (`wrap_for_detach`).
+    CSS(".bt-tool-msg.bt-tool-embed",
         "max-width" => "min(98%, 1100px)"),
     # Full-chat-width toggle (`»` header button): span the ENTIRE message
     # column so wide content — the result embed, a plot, a table, a long diff —
-    # gets all the room. Declared AFTER `:has(.bt-embed)` so it wins at equal
+    # gets all the room. Declared AFTER `.bt-tool-embed` so it wins at equal
     # specificity (source order): an embed card's 1100px cap was exactly why
     # the toggle looked "not functional" — it clicked, but the cap held it.
     # `!important` on the width so it also out-ranks any per-element inline cap.
@@ -2899,13 +2906,13 @@ const ChatStyles = Bonito.Styles(
     # `summary_lines` mean exactly what it says.
     CSS(".bt-subsection-body",
         "padding" => "8px 10px",
-        "overflow-y" => "auto"),
+        "overflow" => "auto"),
     # A console body paints the terminal surface on the BODY, not on the
     # `.bt-console` inside it (see the chrome reset below) — so the padding
     # gutter the scrollbar lives in is the same colour as the text area, and
     # the bar reads as the section's own rather than as a strip floating
     # between two nested boxes.
-    CSS(".bt-subsection-body:has(> .bt-console)",
+    CSS(".bt-subsection-console",
         "background" => "var(--bt-surface-2)"),
     # SUMMARY state: the restricted preview — `summary_lines` tall, scrolls.
     # Sizing is content-box, so `max-height` bounds the CONTENT box and the
@@ -2920,9 +2927,10 @@ const ChatStyles = Bonito.Styles(
         "max-height" => "calc(var(--bt-summary-lines, 4) * 18px)"),
     # FULL state: the whole content, still capped generously so one huge
     # output can't blow up the card — the body scrolls past that. Whole lines
-    # here too (26 × 18px = 468px), so no state ever ends on a half row.
+    # here too (`full_lines`, 26 × 18px = 468px unless the section says), so no
+    # state ever ends on a half row.
     CSS("""details.bt-subsection[data-state="full"] > .bt-subsection-body""",
-        "max-height" => "calc(26 * 18px)"),
+        "max-height" => "calc(var(--bt-full-lines, 26) * 18px)"),
 
     # Console block — wraps a `Bonito.RichText` terminal pane (ANSI → styled
     # HTML). Captured stdout / stderr / error backtraces render here instead
@@ -2964,31 +2972,50 @@ const ChatStyles = Bonito.Styles(
         "white-space" => "pre-wrap", "word-break" => "break-word",
         "margin" => "0"),
 
-    # ── Edit-tool body container ─────────────────────────────────────────────
-    # The body IS the diff preview now — a single (or multi-) Monaco
-    # DiffEditor. Size is driven by Monaco's own height API
-    # (`MonacoDiffEditor.setMaxHeight`), not by an outer CSS clip. The
-    # container just gives it room and a subtle top border so it visually
-    # belongs to its header.
+    # ── Edit-tool body ───────────────────────────────────────────────────────
+    # One section per diff (`diff_section`), headed by its file. Collapsed, the
+    # card shows each at its summary height; expanded, at its full height
+    # (`--bt-full-lines`): the card arrow sizes all of them, every mount path
+    # included, with no script.
     CSS(".bt-edit-tool-body",
-        "border-top" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface)"),
-
-    # ── Diff blocks (multi-edit) ─────────────────────────────────────────────
-    # Single-diff body just shows the editor; multi-edit bodies stack diffs
-    # with subtle separators + monospace path headers so you can tell which
-    # file each chunk belongs to.
-    CSS(".bt-diff-block", "padding-top" => "8px"),
-    CSS(".bt-multi-diff .bt-diff-block + .bt-diff-block",
-        "margin-top" => "12px",
-        "border-top" => "1px solid var(--bt-border)",
-        "padding-top" => "12px"),
-    CSS(".bt-diff-header",
-        "font-family" => "ui-monospace, monospace",
-        "font-size" => "11px",
+        "padding-top" => "8px",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px"),
+    CSS(""".bt-tool-header[data-expanded="true"] ~ .bt-tool-body .bt-edit-tool-body > details.bt-subsection[data-state="summary"] > .bt-subsection-body""",
+        "max-height" => "calc(var(--bt-full-lines, 26) * 18px)"),
+    CSS(".bt-subsection-path",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
         "color" => "var(--bt-text-muted)",
-        "padding" => "2px 0 6px",
-        "word-break" => "break-all"),
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
+        "min-width" => "0"),
+
+    # ── Static code views (code_view.jl) ─────────────────────────────────────
+    # One row per line, built in the browser and highlighted by Monaco's
+    # tokenizer. The 18px line is the console's and the section caps' unit, so
+    # a cap of N lines ends between rows. Rows are as wide as the longest, so a
+    # tint spans it when scrolled sideways.
+    CSS(".bt-code",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "18px",
+        "overflow-x" => "auto"),
+    # In a section the section's body scrolls, both ways, with its own bar.
+    CSS(".bt-subsection-body > .bt-code", "overflow" => "visible"),
+    CSS(".bt-code-src",
+        "margin" => "0", "font" => "inherit", "white-space" => "pre", "tab-size" => "4"),
+    CSS(".bt-code-lines", "width" => "max-content", "min-width" => "100%"),
+    CSS(".bt-l", "white-space" => "pre", "tab-size" => "4", "min-height" => "18px"),
+    # A diff's gutter: both line numbers and the sign, from `data-g`. Not text,
+    # so copying a diff copies code. It scrolls sideways with the code: a sticky
+    # gutter is a compositor layer per row, and layerizing hundreds of them
+    # took 15 ms of every scroll frame.
+    CSS(".bt-code-diff .bt-l::before",
+        "content" => "attr(data-g)",
+        "padding-right" => "10px",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-l-del", "background" => "rgba(255, 0, 0, 0.12)"),
+    CSS(".bt-l-add", "background" => "rgba(155, 185, 85, 0.22)"),
+    # The characters a changed line changed in.
+    CSS(".bt-l-del .bt-ch", "background" => "rgba(255, 0, 0, 0.22)"),
+    CSS(".bt-l-add .bt-ch", "background" => "rgba(156, 204, 44, 0.45)"),
 
     # ── Search results ───────────────────────────────────────────────────────
     CSS(".bt-search-results",

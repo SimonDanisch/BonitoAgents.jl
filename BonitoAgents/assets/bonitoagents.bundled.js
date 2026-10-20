@@ -58,8 +58,6 @@ class Collapsable {
         this.native = opts.native || false;
         this.editMode = opts.editMode || false;
         this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
-        this.compactHeight = opts.compactHeight || 240;
-        this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand = this.editMode ? false : opts.fetchEachExpand || false;
         this.discardOnCollapse = this.editMode ? false : opts.discardOnCollapse || false;
         this.onExpand = opts.onExpand || null;
@@ -67,11 +65,6 @@ class Collapsable {
         this.onToggle = opts.onToggle || null;
         this.lazy = !!this.onExpand;
         this.loaded = !this.lazy;
-        if (this.editMode && !this.hideBodyOnCollapse) {
-            bodyEl.addEventListener('monaco-diff-editor-ready', (e)=>{
-                e.target.__btMonacoDiff.setMaxHeight(this.expanded ? this.expandedHeight : this.compactHeight);
-            });
-        }
         this.expanded = false;
         if (this.native) {
             this.details = headerEl.closest('details') || bodyEl.closest('details');
@@ -100,7 +93,6 @@ class Collapsable {
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
             if (this.editMode && !this.hideBodyOnCollapse) {
                 this.body.style.display = '';
-                this.applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
                 this.body.style.display = expanded ? '' : 'none';
             }
@@ -117,13 +109,6 @@ class Collapsable {
             this.loaded = false;
         }
     }
-    applyEditHeight(h) {
-        const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
-        divs.forEach((div)=>{
-            const monaco = div.__btMonacoDiff;
-            if (monaco && typeof monaco.setMaxHeight === 'function') monaco.setMaxHeight(h);
-        });
-    }
     showPlaceholder() {
         showLoading(this.body, this.reserve ? this.reserve() : null);
     }
@@ -131,6 +116,275 @@ class Collapsable {
         if (html != null) this.body.innerHTML = html;
         this.loaded = true;
     }
+}
+const CODE_STATE = new WeakMap();
+const CODE_OBSERVERS = new WeakMap();
+let CODE_VIEWPORT_OBSERVER = null;
+function codeLines(text) {
+    return text === '' ? [] : text.split('\n');
+}
+function codeRow(kind, text, side, index, gutter) {
+    const el = document.createElement('div');
+    el.className = kind ? `bt-l bt-l-${kind}` : 'bt-l';
+    if (gutter !== null) el.dataset.g = gutter;
+    const shown = text.endsWith('\r') ? text.slice(0, -1) : text;
+    el.textContent = shown;
+    return {
+        el,
+        text: shown,
+        side,
+        index,
+        marks: null
+    };
+}
+function editSteps(a, b, maxD) {
+    const n = a.length, m = b.length, off = n + m + 1;
+    const v = new Int32Array(2 * (n + m) + 3);
+    const trace = [];
+    for(let d = 0; d <= Math.min(n + m, maxD); d++){
+        trace.push(v.slice());
+        for(let k = -d; k <= d; k += 2){
+            let x = k === -d || k !== d && v[k - 1 + off] < v[k + 1 + off] ? v[k + 1 + off] : v[k - 1 + off] + 1;
+            let y = x - k;
+            while(x < n && y < m && a[x] === b[y]){
+                x++;
+                y++;
+            }
+            v[k + off] = x;
+            if (x >= n && y >= m) {
+                const steps = [];
+                for(let dd = d; dd > 0; dd--){
+                    const w = trace[dd], kk = x - y;
+                    const down = kk === -dd || kk !== dd && w[kk - 1 + off] < w[kk + 1 + off];
+                    const pk = down ? kk + 1 : kk - 1, px = w[pk + off], py = px - pk;
+                    while(x > (down ? px : px + 1) && y > (down ? py + 1 : py)){
+                        steps.push('=');
+                        x--;
+                        y--;
+                    }
+                    steps.push(down ? '+' : '-');
+                    x = px;
+                    y = py;
+                }
+                while(x > 0 && y > 0){
+                    steps.push('=');
+                    x--;
+                    y--;
+                }
+                return steps.reverse();
+            }
+        }
+    }
+    return null;
+}
+function changedRanges(a, b) {
+    const ta = a.match(/\w+|\s+|[^\w\s]/g) || [], tb = b.match(/\w+|\s+|[^\w\s]/g) || [];
+    const steps = editSteps(ta, tb, 200);
+    if (!steps) return null;
+    const ra = [], rb = [];
+    let i = 0, j = 0, pa = 0, pb = 0, kept = 0;
+    const add = (ranges, from, to)=>{
+        const last = ranges[ranges.length - 1];
+        if (last && last[1] === from) last[1] = to;
+        else ranges.push([
+            from,
+            to
+        ]);
+    };
+    for (const st of steps){
+        if (st === '=') {
+            pa += ta[i].length;
+            pb += tb[j].length;
+            kept += ta[i].length;
+            i++;
+            j++;
+        } else if (st === '-') {
+            add(ra, pa, pa + ta[i].length);
+            pa += ta[i++].length;
+        } else {
+            add(rb, pb, pb + tb[j].length);
+            pb += tb[j++].length;
+        }
+    }
+    if (kept * 3 < Math.max(a.length, b.length)) return null;
+    return [
+        ra,
+        rb
+    ];
+}
+function codeRows(sources, ops) {
+    if (ops === undefined) {
+        const lines = codeLines(sources[0]);
+        if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+        return lines.map((t, i)=>codeRow('', t, 0, i, null));
+    }
+    const a = codeLines(sources[0]), b = codeLines(sources[1]);
+    const w = String(Math.max(a.length, b.length, 1)).length;
+    const pad = (x)=>(x === null ? '' : String(x)).padStart(w);
+    const gutter = (i, j, sign)=>`${pad(i === null ? null : i + 1)} ${pad(j === null ? null : j + 1)} ${sign}`;
+    const rows = [];
+    let i = 0, j = 0;
+    const runs = ops.split(' ').filter(Boolean).map((op)=>[
+            op[0],
+            parseInt(op.slice(1), 10)
+        ]);
+    for(let r = 0; r < runs.length; r++){
+        const [k, n] = runs[r];
+        if (k === '=') {
+            for(let t = 0; t < n; t++, i++, j++)rows.push(codeRow('', b[j], 1, j, gutter(i, j, ' ')));
+        } else if (k === '-') {
+            const removed = [];
+            for(let t = 0; t < n; t++, i++){
+                const row = codeRow('del', a[i], 0, i, gutter(i, null, '-'));
+                rows.push(row);
+                removed.push(row);
+            }
+            if (r + 1 < runs.length && runs[r + 1][0] === '+') {
+                const [, m] = runs[++r];
+                for(let t = 0; t < m; t++, j++){
+                    const row = codeRow('add', b[j], 1, j, gutter(null, j, '+'));
+                    rows.push(row);
+                    const old = removed[t];
+                    if (!old) continue;
+                    const ranges = changedRanges(old.text, row.text);
+                    if (ranges) {
+                        old.marks = ranges[0];
+                        row.marks = ranges[1];
+                    }
+                }
+            }
+        } else {
+            for(let t = 0; t < n; t++, j++)rows.push(codeRow('add', b[j], 1, j, gutter(null, j, '+')));
+        }
+    }
+    const last = rows[rows.length - 1];
+    if (last && last.el.className === 'bt-l' && last.text === '') {
+        last.el.remove();
+        rows.pop();
+    }
+    return rows;
+}
+function markRange(row, from, to) {
+    if (from >= to) return;
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    for(let n = walker.nextNode(); n; n = walker.nextNode())nodes.push(n);
+    let pos = 0;
+    for (const node of nodes){
+        const start = pos, end = pos + node.data.length;
+        pos = end;
+        const a = Math.max(from, start), b = Math.min(to, end);
+        if (a >= b) continue;
+        let mid = node;
+        if (a > start) mid = mid.splitText(a - start);
+        if (b < end) mid.splitText(b - a);
+        const span = document.createElement('span');
+        span.className = 'bt-ch';
+        mid.replaceWith(span);
+        span.appendChild(mid);
+    }
+}
+function markRanges(row) {
+    if (row.marks) for (const [from, to] of row.marks)markRange(row.el, from, to);
+}
+function resource(line, text) {
+    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+    let i = 0, col = 0, carry = 0;
+    const out = [];
+    for(let node = walker.nextNode(); node; node = walker.nextNode()){
+        let need = node.data.length, s = '';
+        while(need > 0){
+            if (carry > 0) {
+                const k = Math.min(carry, need);
+                carry -= k;
+                need -= k;
+                continue;
+            }
+            if (i >= text.length) return false;
+            const c = text[i++];
+            if (c === '\t') {
+                const w = 4 - col % 4;
+                s += c;
+                col += w;
+                const k = Math.min(w, need);
+                need -= k;
+                carry = w - k;
+            } else {
+                s += c;
+                col += 1;
+                need -= 1;
+            }
+        }
+        out.push([
+            node,
+            s
+        ]);
+    }
+    if (i !== text.length || carry !== 0) return false;
+    for (const [node, s] of out)node.data = s;
+    return true;
+}
+async function highlightCode(el) {
+    const st = CODE_STATE.get(el);
+    CODE_STATE.set(el, null);
+    const lib = await st.lib;
+    const lang = st.lang || (st.path ? await lib.language_for_path(st.path) : 'plaintext');
+    if (lang === 'plaintext') return;
+    const tokenized = await Promise.all(st.sources.map(async (t)=>{
+        const tpl = document.createElement('template');
+        tpl.innerHTML = await lib.colorize(t, lang);
+        return [
+            ...tpl.content.children
+        ].filter((n)=>n.nodeName === 'SPAN');
+    }));
+    for (const row of st.rows){
+        const line = tokenized[row.side][row.index];
+        if (!line || !resource(line, row.text)) continue;
+        row.el.replaceChildren(...line.childNodes);
+        markRanges(row);
+    }
+}
+function observeCode(el) {
+    const root = el.closest('.bt-messages');
+    let io = root ? CODE_OBSERVERS.get(root) : CODE_VIEWPORT_OBSERVER;
+    if (!io) {
+        io = new IntersectionObserver((entries)=>{
+            for (const e of entries){
+                if (!e.isIntersecting) continue;
+                io.unobserve(e.target);
+                highlightCode(e.target);
+            }
+        }, {
+            root,
+            rootMargin: '100% 0px'
+        });
+        if (root) CODE_OBSERVERS.set(root, io);
+        else CODE_VIEWPORT_OBSERVER = io;
+    }
+    io.observe(el);
+}
+function mountCode(el, lib) {
+    if (CODE_STATE.has(el)) return;
+    const sources = [
+        ...el.querySelectorAll(':scope > pre.bt-code-src')
+    ].map((p)=>p.textContent);
+    const rows = codeRows(sources, el.dataset.ops);
+    const lines = document.createElement('div');
+    lines.className = 'bt-code-lines';
+    for (const row of rows){
+        lines.appendChild(row.el);
+        markRanges(row);
+    }
+    el.replaceChildren(lines);
+    CODE_STATE.set(el, {
+        lib,
+        lang: el.dataset.lang || '',
+        path: el.dataset.path || '',
+        sources,
+        rows
+    });
+    observeCode(el);
+    bodyMounted(el);
 }
 const filterKey = (msg)=>msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
 const DEFAULT_HIDDEN = [
@@ -245,10 +499,6 @@ class BonitoChat {
         }, {
             root: container,
             rootMargin: '150% 0px'
-        });
-        container.addEventListener('monaco-diff-editor-ready', (e)=>{
-            const row = e.target.closest && e.target.closest('.bt-tool-msg');
-            if (row) this.onBodyMounted(row);
         });
         this.followMode = true;
         this.unreadCount = 0;
@@ -1246,7 +1496,8 @@ class BonitoChat {
         if (!body || !c.loaded || body.offsetParent === null || body.childElementCount === 0) return;
         if (body.querySelector(':scope > .bt-collapsable-loading')) return;
         if (body.querySelector('img, video, audio')) return;
-        if (!body.querySelector('.monaco-editor') && body.getElementsByTagName('*').length < 300) return;
+        const weight = body.getElementsByTagName('*').length - body.querySelectorAll('.bt-l span').length;
+        if (!body.querySelector('.monaco-editor') && weight < 300) return;
         const h = this.bodyContentHeight(body);
         node.dataset.btFreed = '1';
         body.innerHTML = '<div class="bt-collapsable-loading bt-body-freed">loading…</div>';
@@ -1278,6 +1529,8 @@ class BonitoChat {
         wrap.appendChild(rail);
         this.railEl = rail;
         this.railThumb = thumb;
+        this.thumbMoves = null;
+        this.thumbRange = -1;
         this.railLabel = label;
         const fracAt = (clientY)=>{
             const r = rail.getBoundingClientRect();
@@ -1363,6 +1616,8 @@ class BonitoChat {
         document.removeEventListener('keydown', this.onEndsKey);
         this.railEl?.remove();
         this.railEl = null;
+        this.thumbMoves = null;
+        this.thumbRange = -1;
     }
     railMove(f) {
         const d = this.railDrag;
@@ -1382,9 +1637,31 @@ class BonitoChat {
     }
     placeThumb(f) {
         const range = Math.max(0, this.railEl.clientHeight - this.railThumb.offsetHeight);
-        const y = Math.round(f * range) + 'px';
-        this.railThumb.style.transform = `translateY(${y})`;
-        this.railLabel.style.transform = `translateY(${y})`;
+        if (this.thumbRange !== range) {
+            this.thumbRange = range;
+            for (const a of this.thumbMoves ?? [])a.cancel();
+            this.thumbMoves = [
+                this.railThumb,
+                this.railLabel
+            ].map((el)=>{
+                const a = el.animate([
+                    {
+                        transform: 'translateY(0px)'
+                    },
+                    {
+                        transform: `translateY(${range}px)`
+                    }
+                ], {
+                    duration: 1000,
+                    fill: 'both',
+                    easing: 'linear'
+                });
+                a.pause();
+                return a;
+            });
+        }
+        const t = range > 0 ? Math.round(f * range) / range * 1000 : 0;
+        for (const a of this.thumbMoves)a.currentTime = t;
     }
     updateRail() {
         const rail = this.railEl;
@@ -3673,10 +3950,9 @@ class BonitoChat {
     refreshPillContent() {
         if (!this.pillEl) return;
         const hasUnread = this.unreadCount > 0;
-        this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
-        if (this.pillLabelEl) {
-            this.pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
-        }
+        if (this.pillEl.classList.contains('bt-new-msg-pill-glow') !== hasUnread) this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        const label = hasUnread ? 'New messages' : 'Move to bottom';
+        if (this.pillLabelEl && this.pillLabelEl.textContent !== label) this.pillLabelEl.textContent = label;
     }
     createNewMessagePill() {
         const app = this.container?.closest('.bt-app') || this.container?.parentElement;
@@ -3984,6 +4260,7 @@ function connect(node, comm, init = {}) {
 }
 export { BonitoChat as BonitoChat };
 export { Collapsable as Collapsable };
+export { mountCode as mountCode };
 export { openLightbox as openLightbox };
 export { msearchFilter as msearchFilter };
 export { msearchOpen as msearchOpen };

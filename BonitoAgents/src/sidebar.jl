@@ -1021,8 +1021,9 @@ const SidebarStyles = Bonito.Styles(
             "position" => "fixed", "top" => "0", "bottom" => "0", "left" => "0",
             "width" => "min(300px, 85vw)", "z-index" => "900",
             "box-shadow" => "var(--bt-shadow-lg, 0 8px 32px rgba(0,0,0,0.25))"),
-        # The rail's place: its 56px and its 1px border.
-        CSS(".bt-shell:has(> .bt-sidebar.bt-side-open)", "padding-left" => "57px"),
+        # The rail's place: its 56px and its 1px border, kept by the stage
+        # beside it.
+        CSS(".bt-sidebar.bt-side-open ~ .bt-stage", "margin-left" => "57px"),
         CSS(".bt-sidebar.bt-side-open ~ .bt-side-backdrop",
             "display" => "block", "position" => "fixed", "inset" => "0", "z-index" => "899",
             "background" => "rgba(15,23,42,0.35)"),
@@ -1110,15 +1111,6 @@ const UnifiedShellStyles = Bonito.Styles(
         "display" => "flex", "flex-direction" => "column",
         "overflow" => "hidden",
         "box-shadow" => "inset 1px 0 var(--bt-border), inset -1px 0 var(--bt-border)"),
-    # When the plotpane is OPEN, the chat stops centering and becomes a fixed,
-    # resizable LEFT column — the plotpane (flex:1) then fills ALL the space to
-    # its right with no gap. The divider sets `--bt-chat-width` (clamped to the
-    # chat's sensible reading range). This is what makes "everything right of the
-    # chat is the plotpane/editor/drop zone" true.
-    CSS(".bt-stage:has(.bt-plotpane.bt-plotpane-visible) .bt-main",
-        "flex"   => "0 0 clamp(var(--bt-main-min), var(--bt-chat-width, 820px), var(--bt-main-max))",
-        "margin" => "0"),
-
     # Mobile: drop the 480px desktop floor that keeps the chat readable on
     # split screens. On a 393px-wide phone the floor forces .bt-main to
     # 480px so the chat pane runs ~143px off the right edge of the viewport
@@ -1128,24 +1120,6 @@ const UnifiedShellStyles = Bonito.Styles(
     CSS("@media (max-width: 640px)",
         CSS(":root", "--bt-main-min" => "0px"),
         CSS(".bt-main", "min-width" => "0")),
-
-    # Narrow viewports with the PLOTPANE OPEN: a side-by-side split would
-    # force chat-min + pane-min past the stage and clip the messages. Below
-    # the breakpoint the pane becomes a full-stage OVERLAY instead — the
-    # chat keeps its full width underneath; × / tab-close brings it back.
-    # The divider is meaningless in overlay mode.
-    CSS("@media (max-width: 1100px)",
-        CSS(".bt-plotpane.bt-plotpane-visible",
-            "position" => "absolute", "inset" => "0",
-            "z-index" => "30",
-            "width" => "100%",
-            "border-left" => "none",
-            "box-shadow" => "var(--bt-shadow-lg, 0 8px 32px rgba(0,0,0,0.25))"),
-        CSS(".bt-stage:has(.bt-plotpane.bt-plotpane-visible) .bt-main",
-            "flex" => "0 1 var(--bt-main-max)",
-            "margin" => "0 auto"),
-        CSS(".bt-plotpane-visible .bt-pp-resize",
-            "display" => "none")),
 
     # ── Keep-alive view stack ────────────────────────────────────────────────
     # The dashboard and every opened chat are all mounted at once and stacked on
@@ -1249,28 +1223,28 @@ function Bonito.jsrender(session::Bonito.Session, v::ChatLoadingView)
     # The spinner is a STABLE sibling, rendered once OUTSIDE the reactive `body`
     # below. If it lived inside the `map`, every `state.workers` notify during
     # bring-up would recreate the element and restart its CSS rotation from 0° —
-    # the classic "the spinner doesn't spin". Offline/error branches tag their
-    # content `.bt-loading-msg`, and CSS (`:has`) hides the spinner for them.
+    # the classic "the spinner doesn't spin". Offline/error branches are a
+    # message, which puts `bt-loading-done` on the card to hide the spinner.
     spinner = DOM.div(class = "bt-loading-spinner")
-    body = map(session, state.workers) do workers
+    view = map(session, state.workers) do workers
         p = get(state.projects[], pid, nothing)
-        p === nothing && return DOM.div("Unknown project: $pid";
-                                        class = "bt-empty bt-loading-msg",
-                                        style = Styles("padding" => "40px"))
+        p === nothing && return (DOM.div("Unknown project: $pid";
+                                         class = "bt-empty bt-loading-msg",
+                                         style = Styles("padding" => "40px")), true)
         w      = get(workers, p.worker_id, nothing)
         wname  = w === nothing ? p.worker_id : w.name
         online = w !== nothing && isopen(w)
         if !online
-            return DOM.div(
+            return (DOM.div(
                 DOM.div("⚠"; class = "bt-loading-glyph"),
                 DOM.div("Worker is offline"; class = "bt-loading-title"),
                 DOM.div("$(p.name) lives on $(wname), which isn't connected " *
                         "right now. Start that worker to open this chat.";
                         class = "bt-loading-sub");
-                class = "bt-loading-msg")
+                class = "bt-loading-msg"), true)
         end
         if haskey(ls.errors, pid)
-            return DOM.div(
+            return (DOM.div(
                 DOM.div("⚠"; class = "bt-loading-glyph"),
                 DOM.div("Couldn't open $(p.name)"; class = "bt-loading-title"),
                 DOM.div(ls.errors[pid]; class = "bt-loading-sub"),
@@ -1278,7 +1252,7 @@ function Bonito.jsrender(session::Bonito.Session, v::ChatLoadingView)
                         class   = "bt-btn bt-btn-secondary",
                         style   = Styles("margin-top" => "6px"),
                         onclick = js"() => $(ls.retry).notify($(pid))");
-                class = "bt-loading-msg")
+                class = "bt-loading-msg"), true)
         end
         # Gate the bring-up on the chat still being the one on screen (T5): a
         # worker change can re-run this after the user navigated away (or closed
@@ -1302,14 +1276,16 @@ function Bonito.jsrender(session::Bonito.Session, v::ChatLoadingView)
                 end
             end
         end
-        DOM.div(
+        (DOM.div(
             DOM.div("Opening $(p.name)…"; class = "bt-loading-title"),
             DOM.div("Connecting to $(wname) and restoring the conversation…";
                     class = "bt-loading-sub");
-            class = "bt-loading-text")
+            class = "bt-loading-text"), false)
     end
+    body = map(first, session, view)
+    card_class = map(((_, done),) -> done ? "bt-loading bt-loading-done" : "bt-loading", session, view)
     return Bonito.jsrender(session,
-        DOM.div(DOM.div(spinner, body; class = "bt-loading"); class = "bt-loading-wrap"))
+        DOM.div(DOM.div(spinner, body; class = card_class); class = "bt-loading-wrap"))
 end
 
 # Phase 2 of the load screen: the card for a chat whose ChatModel IS cached

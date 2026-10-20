@@ -87,8 +87,6 @@ export class Collapsable {
         // clamping happens per SUB-SECTION inside the body (see styles.jl
         // .bt-clamped), never on the card body as a whole.
         this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
-        this.compactHeight  = opts.compactHeight  || 240;
-        this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand   = this.editMode ? false : (opts.fetchEachExpand || false);
         this.discardOnCollapse = this.editMode ? false : (opts.discardOnCollapse || false);
         this.onExpand = opts.onExpand || null;
@@ -98,16 +96,9 @@ export class Collapsable {
         this.onToggle = opts.onToggle || null;      // the reader's own clicks
         this.lazy     = !!this.onExpand;
         this.loaded   = !this.lazy;                    // eager bodies start loaded
-        // A diff created after the state was set takes the current height.
-        if (this.editMode && !this.hideBodyOnCollapse) {
-            bodyEl.addEventListener('monaco-diff-editor-ready', (e) => {
-                e.target.__btMonacoDiff.setMaxHeight(
-                    this.expanded ? this.expandedHeight : this.compactHeight);
-            });
-        }
 
-        // Everything starts collapsed: edit diffs compact (240px), compact eval
-        // bodies capped by the CSS clamp (styles.jl).
+        // Everything starts collapsed: edit diffs at their summary height,
+        // compact eval bodies capped by the CSS clamp (styles.jl).
         this.expanded = false;
 
         if (this.native) {
@@ -141,11 +132,10 @@ export class Collapsable {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
             if (this.editMode && !this.hideBodyOnCollapse) {
-                // Edit tools: body stays visible; size via Monaco's own API
-                // so the resize is animated by Monaco itself instead of CSS
-                // clip.
+                // Edit tools: the body stays visible; its diffs take their
+                // full or summary height from the header's `data-expanded`
+                // (styles.jl), whenever they were mounted.
                 this.body.style.display = '';
-                this.applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
                 // Plain lazy bodies AND eval compact bodies hide on collapse;
                 // for the latter the node stays mounted (editMode skips the
@@ -155,13 +145,12 @@ export class Collapsable {
             }
         }
         // Lazy body fetch. editMode pills normally keep their streamed-in
-        // body across toggles and only resize Monaco — but a HISTORY-REPLAYED
-        // edit pill starts with an EMPTY body (its diff lives server-side
-        // until a tool.render round trip), so gating the fetch on
+        // body across toggles and only resize their diffs — but a
+        // HISTORY-REPLAYED edit pill starts with an EMPTY body (its diff lives
+        // server-side until a tool.render round trip), so gating the fetch on
         // `!editMode` alone made replayed Edit pills permanently
-        // unexpandable: the arrow flipped, `applyEditHeight` sized zero
-        // Monaco divs, and nothing ever appeared. Fetch whenever the body
-        // has nothing to show.
+        // unexpandable: the arrow flipped and nothing ever appeared. Fetch
+        // whenever the body has nothing to show.
         const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
         if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
@@ -178,25 +167,6 @@ export class Collapsable {
         }
     }
 
-    // Look up the Monaco DiffEditor inside our body and resize via its API.
-    // Querying every toggle handles both "Monaco wasn't ready on first
-    // construction" (the body has the .monaco-diff-editor-div but no
-    // __btMonacoDiff yet) and multi-diff bodies (just resize the first; the
-    // sibling diffs are sized by the same body wrapper). No-op if the
-    // editor finished tearing down or never mounted — and for compact-body
-    // EVAL tools, whose plain Code editor has no such API: their ~4-line cap
-    // is a pure CSS clamp on the body wrapper keyed off
-    // `[data-compact-body] .bt-tool-header[data-expanded] ~ .bt-tool-body`
-    // (see styles.jl), so it holds for EVERY mount path (eager mount,
-    // terminal re-render, history reload) with no lifecycle hook.
-    applyEditHeight(h) {
-        const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
-        divs.forEach(div => {
-            const monaco = div.__btMonacoDiff;
-            if (monaco && typeof monaco.setMaxHeight === 'function') monaco.setMaxHeight(h);
-        });
-    }
-
     // "loading…" until the body arrives, in the shape the body will have
     // (`reserve`): the row is its final size from the start, and nothing
     // below it moves when the body replaces the placeholder.
@@ -210,6 +180,238 @@ export class Collapsable {
         if (html != null) this.body.innerHTML = html;
         this.loaded = true;
     }
+}
+
+// ── Static code views (code_view.jl) ───────────────────────────────────────
+// Read-only code is plain DOM, one `.bt-l` row per line, built here from the
+// source text the server sent in `pre.bt-code-src`. Monaco highlights it once
+// it comes near the screen (`colorize`, no editor). A diff's rows come from
+// the server's line diff (`data-ops`, "=3 -2 +4"); its gutter (both line
+// numbers and the sign) is an attribute shown by CSS, so copying a diff copies
+// code only.
+
+const CODE_TAB = 4;
+const CODE_STATE = new WeakMap();      // .bt-code -> {lib, lang, path, sources, rows} until highlighted
+const CODE_OBSERVERS = new WeakMap();  // transcript scroller -> IntersectionObserver
+let CODE_VIEWPORT_OBSERVER = null;     // for code outside a transcript
+
+// The browser's lines of a text, as code_view.jl counts them.
+function codeLines(text) { return text === '' ? [] : text.split('\n'); }
+
+function codeRow(kind, text, side, index, gutter) {
+    const el = document.createElement('div');
+    el.className = kind ? `bt-l bt-l-${kind}` : 'bt-l';
+    if (gutter !== null) el.dataset.g = gutter;
+    // A CR the CRLF file brought along shows as nothing; Monaco drops it too.
+    const shown = text.endsWith('\r') ? text.slice(0, -1) : text;
+    el.textContent = shown;
+    return { el, text: shown, side, index, marks: null };
+}
+
+// The shortest edit script between two arrays (Myers 1986), one step per
+// element: '=' keeps one, '-' drops one of `a`, '+' takes one of `b`. Null past
+// `maxD` differences.
+function editSteps(a, b, maxD) {
+    const n = a.length, m = b.length, off = n + m + 1;
+    const v = new Int32Array(2 * (n + m) + 3);
+    const trace = [];
+    for (let d = 0; d <= Math.min(n + m, maxD); d++) {
+        trace.push(v.slice());
+        for (let k = -d; k <= d; k += 2) {
+            let x = (k === -d || (k !== d && v[k - 1 + off] < v[k + 1 + off])) ? v[k + 1 + off] : v[k - 1 + off] + 1;
+            let y = x - k;
+            while (x < n && y < m && a[x] === b[y]) { x++; y++; }
+            v[k + off] = x;
+            if (x >= n && y >= m) {
+                const steps = [];
+                for (let dd = d; dd > 0; dd--) {
+                    const w = trace[dd], kk = x - y;
+                    const down = kk === -dd || (kk !== dd && w[kk - 1 + off] < w[kk + 1 + off]);
+                    const pk = down ? kk + 1 : kk - 1, px = w[pk + off], py = px - pk;
+                    while (x > (down ? px : px + 1) && y > (down ? py + 1 : py)) { steps.push('='); x--; y--; }
+                    steps.push(down ? '+' : '-');
+                    x = px; y = py;
+                }
+                while (x > 0 && y > 0) { steps.push('='); x--; y--; }
+                return steps.reverse();
+            }
+        }
+    }
+    return null;
+}
+
+// What a removed line and the added line it became differ in, word by word
+// (runs of word characters, of spaces, single other characters): the
+// character ranges of each side that the other lacks. Nothing when the lines
+// share too little for marks to say more than the line's own colour does.
+function changedRanges(a, b) {
+    const ta = a.match(/\w+|\s+|[^\w\s]/g) || [], tb = b.match(/\w+|\s+|[^\w\s]/g) || [];
+    const steps = editSteps(ta, tb, 200);
+    if (!steps) return null;
+    const ra = [], rb = [];
+    let i = 0, j = 0, pa = 0, pb = 0, kept = 0;
+    const add = (ranges, from, to) => {
+        const last = ranges[ranges.length - 1];
+        if (last && last[1] === from) last[1] = to; else ranges.push([from, to]);
+    };
+    for (const st of steps) {
+        if (st === '=') { pa += ta[i].length; pb += tb[j].length; kept += ta[i].length; i++; j++; }
+        else if (st === '-') { add(ra, pa, pa + ta[i].length); pa += ta[i++].length; }
+        else { add(rb, pb, pb + tb[j].length); pb += tb[j++].length; }
+    }
+    if (kept * 3 < Math.max(a.length, b.length)) return null;
+    return [ra, rb];
+}
+
+function codeRows(sources, ops) {
+    if (ops === undefined) {
+        const lines = codeLines(sources[0]);
+        if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+        return lines.map((t, i) => codeRow('', t, 0, i, null));
+    }
+    const a = codeLines(sources[0]), b = codeLines(sources[1]);
+    const w = String(Math.max(a.length, b.length, 1)).length;
+    const pad = (x) => (x === null ? '' : String(x)).padStart(w);
+    const gutter = (i, j, sign) => `${pad(i === null ? null : i + 1)} ${pad(j === null ? null : j + 1)} ${sign}`;
+    const rows = [];
+    let i = 0, j = 0;
+    const runs = ops.split(' ').filter(Boolean).map(op => [op[0], parseInt(op.slice(1), 10)]);
+    for (let r = 0; r < runs.length; r++) {
+        const [k, n] = runs[r];
+        if (k === '=') {
+            for (let t = 0; t < n; t++, i++, j++) rows.push(codeRow('', b[j], 1, j, gutter(i, j, ' ')));
+        } else if (k === '-') {
+            const removed = [];
+            for (let t = 0; t < n; t++, i++) { const row = codeRow('del', a[i], 0, i, gutter(i, null, '-')); rows.push(row); removed.push(row); }
+            // The additions right after are what these lines became: mark
+            // the changed characters of each pair.
+            if (r + 1 < runs.length && runs[r + 1][0] === '+') {
+                const [, m] = runs[++r];
+                for (let t = 0; t < m; t++, j++) {
+                    const row = codeRow('add', b[j], 1, j, gutter(null, j, '+'));
+                    rows.push(row);
+                    const old = removed[t];
+                    if (!old) continue;
+                    const ranges = changedRanges(old.text, row.text);
+                    if (ranges) { old.marks = ranges[0]; row.marks = ranges[1]; }
+                }
+            }
+        } else {
+            for (let t = 0; t < n; t++, j++) rows.push(codeRow('add', b[j], 1, j, gutter(null, j, '+')));
+        }
+    }
+    // A text ending in a newline leaves an empty last line, kept by both sides.
+    const last = rows[rows.length - 1];
+    if (last && last.el.className === 'bt-l' && last.text === '') { last.el.remove(); rows.pop(); }
+    return rows;
+}
+
+// Wrap characters [from, to) of a row in a `.bt-ch` span, across token spans.
+function markRange(row, from, to) {
+    if (from >= to) return;
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) nodes.push(n);
+    let pos = 0;
+    for (const node of nodes) {
+        const start = pos, end = pos + node.data.length;
+        pos = end;
+        const a = Math.max(from, start), b = Math.min(to, end);
+        if (a >= b) continue;
+        let mid = node;
+        if (a > start) mid = mid.splitText(a - start);
+        if (b < end) mid.splitText(b - a);
+        const span = document.createElement('span');
+        span.className = 'bt-ch';
+        mid.replaceWith(span);
+        span.appendChild(mid);
+    }
+}
+
+function markRanges(row) {
+    if (row.marks) for (const [from, to] of row.marks) markRange(row.el, from, to);
+}
+
+// Put the source line back into Monaco's token spans: colorize writes spaces
+// as U+00A0 and expands tabs, and code copied from it would be neither. Each
+// text node keeps its width in columns, now spelled with the source's own
+// characters. False when they do not line up, which leaves the row plain.
+function resource(line, text) {
+    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+    let i = 0, col = 0, carry = 0;
+    const out = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        let need = node.data.length, s = '';
+        while (need > 0) {
+            if (carry > 0) { const k = Math.min(carry, need); carry -= k; need -= k; continue; }
+            if (i >= text.length) return false;
+            const c = text[i++];
+            if (c === '\t') {
+                const w = CODE_TAB - (col % CODE_TAB);
+                s += c; col += w;
+                const k = Math.min(w, need); need -= k; carry = w - k;
+            } else { s += c; col += 1; need -= 1; }
+        }
+        out.push([node, s]);
+    }
+    if (i !== text.length || carry !== 0) return false;
+    for (const [node, s] of out) node.data = s;
+    return true;
+}
+
+async function highlightCode(el) {
+    const st = CODE_STATE.get(el);
+    CODE_STATE.set(el, null);          // mounted, and its sources no longer needed
+    const lib = await st.lib;
+    const lang = st.lang || (st.path ? await lib.language_for_path(st.path) : 'plaintext');
+    if (lang === 'plaintext') return;
+    const tokenized = await Promise.all(st.sources.map(async (t) => {
+        const tpl = document.createElement('template');
+        tpl.innerHTML = await lib.colorize(t, lang);
+        return [...tpl.content.children].filter(n => n.nodeName === 'SPAN');
+    }));
+    for (const row of st.rows) {
+        const line = tokenized[row.side][row.index];
+        if (!line || !resource(line, row.text)) continue;
+        row.el.replaceChildren(...line.childNodes);
+        markRanges(row);
+    }
+}
+
+function observeCode(el) {
+    // Rows near the transcript's viewport, so a card is coloured before it
+    // scrolls in; elsewhere (a share page, a file panel) near the window's.
+    const root = el.closest('.bt-messages');
+    let io = root ? CODE_OBSERVERS.get(root) : CODE_VIEWPORT_OBSERVER;
+    if (!io) {
+        io = new IntersectionObserver((entries) => {
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                io.unobserve(e.target);
+                highlightCode(e.target);
+            }
+        }, { root, rootMargin: '100% 0px' });
+        if (root) CODE_OBSERVERS.set(root, io); else CODE_VIEWPORT_OBSERVER = io;
+    }
+    io.observe(el);
+}
+
+export function mountCode(el, lib) {
+    if (CODE_STATE.has(el)) return;
+    const sources = [...el.querySelectorAll(':scope > pre.bt-code-src')].map(p => p.textContent);
+    const rows = codeRows(sources, el.dataset.ops);
+    const lines = document.createElement('div');
+    lines.className = 'bt-code-lines';
+    for (const row of rows) {
+        lines.appendChild(row.el);
+        markRanges(row);
+    }
+    el.replaceChildren(lines);
+    CODE_STATE.set(el, { lib, lang: el.dataset.lang || '', path: el.dataset.path || '', sources, rows });
+    observeCode(el);
+    // A tool body built after its row went far: the transcript looks again
+    // whether to free it.
+    bodyMounted(el);
 }
 
 // Message filter: human labels + a fixed display order so toolbar checkboxes
@@ -317,7 +519,7 @@ class BonitoChat {
                 grew = true;
                 if (node.collapsable && node.classList.contains('bt-tool-msg')) {
                     this.scheduleBodyReport(node);
-                    this.onBodyMounted(node);        // an editor built far away
+                    this.onBodyMounted(node);        // a body built far away
                 }
                 const top = node.offsetTop - shift;
                 shift += h - prev;
@@ -403,11 +605,6 @@ class BonitoChat {
                 }
             }
         }, { root: container, rootMargin: '150% 0px' });
-        // A diff editor finished building: its row may be far by now.
-        container.addEventListener('monaco-diff-editor-ready', (e) => {
-            const row = e.target.closest && e.target.closest('.bt-tool-msg');
-            if (row) this.onBodyMounted(row);
-        });
 
         // ── Scroll UX state ────────────────────────────────────────────
         // followMode: when true, new messages auto-scroll the viewport
@@ -1624,7 +1821,11 @@ class BonitoChat {
         // Not `canvas`: Monaco draws its overview ruler on one. A live app's
         // canvas is excluded by `btApp` above.
         if (body.querySelector('img, video, audio')) return;
-        if (!body.querySelector('.monaco-editor') && body.getElementsByTagName('*').length < 300) return;
+        // A row of code counts once, however many token spans highlighting
+        // gave it: a common diff stays, rather than being built again each
+        // time it scrolls back.
+        const weight = body.getElementsByTagName('*').length - body.querySelectorAll('.bt-l span').length;
+        if (!body.querySelector('.monaco-editor') && weight < 300) return;
         const h = this.bodyContentHeight(body);
         node.dataset.btFreed = '1';
         // Out of the document, the body's session ends and BonitoBook
@@ -1671,6 +1872,8 @@ class BonitoChat {
         wrap.appendChild(rail);
         this.railEl = rail;
         this.railThumb = thumb;
+        this.thumbMoves = null;      // `placeThumb` animates these elements
+        this.thumbRange = -1;
         this.railLabel = label;
         const fracAt = (clientY) => {
             const r = rail.getBoundingClientRect();
@@ -1756,6 +1959,8 @@ class BonitoChat {
         document.removeEventListener('keydown', this.onEndsKey);
         this.railEl?.remove();
         this.railEl = null;
+        this.thumbMoves = null;
+        this.thumbRange = -1;
     }
 
     railMove(f) {
@@ -1775,11 +1980,25 @@ class BonitoChat {
         }, 150);
     }
 
+    // Runs on every scroll step. The thumb and its label ride a paused
+    // animation over the rail's range, moved by its current time: Chrome hands
+    // that to the compositor as it is. Writing their `transform` instead made it
+    // re-layerize the whole page on every step, half the main thread's work
+    // while scrolling a long chat (2026-10-20).
     placeThumb(f) {
         const range = Math.max(0, this.railEl.clientHeight - this.railThumb.offsetHeight);
-        const y = Math.round(f * range) + 'px';
-        this.railThumb.style.transform = `translateY(${y})`;
-        this.railLabel.style.transform = `translateY(${y})`;
+        if (this.thumbRange !== range) {
+            this.thumbRange = range;
+            for (const a of this.thumbMoves ?? []) a.cancel();
+            this.thumbMoves = [this.railThumb, this.railLabel].map(el => {
+                const a = el.animate([{ transform: 'translateY(0px)' }, { transform: `translateY(${range}px)` }],
+                                     { duration: 1000, fill: 'both', easing: 'linear' });
+                a.pause();
+                return a;
+            });
+        }
+        const t = range > 0 ? Math.round(f * range) / range * 1000 : 0;
+        for (const a of this.thumbMoves) a.currentTime = t;
     }
 
     updateRail() {
@@ -4871,13 +5090,17 @@ class BonitoChat {
 
     // Glow + "New messages" only while there's unread content; otherwise the
     // plain "Move to bottom" form (same popup, no glow).
+    // Runs on every scroll event: it writes only what changed. Setting the
+    // same text replaces the text node, and the pill was laid out and painted
+    // again on every scroll step.
     refreshPillContent() {
         if (!this.pillEl) return;
         const hasUnread = this.unreadCount > 0;
-        this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
-        if (this.pillLabelEl) {
-            this.pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
-        }
+        if (this.pillEl.classList.contains('bt-new-msg-pill-glow') !== hasUnread)
+            this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        const label = hasUnread ? 'New messages' : 'Move to bottom';
+        if (this.pillLabelEl && this.pillLabelEl.textContent !== label)
+            this.pillLabelEl.textContent = label;
     }
 
     // Anchor above the composer so queues, attachments and growing drafts

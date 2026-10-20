@@ -4,11 +4,8 @@
 #
 #   • text/plain → render_show_file falls through the media branches (.txt is
 #     neither a SHOW_IMAGE_EXTS nor a SHOW_VIDEO_MIME ext), `editor_openable`
-#     is true and the bytes are non-binary → it renders through `monaco_readonly`
-#     as a read-only Monaco editor. The server-side mount is BonitoBook's
-#     `<div class="monaco-editor-div ...">` (MonacoEditor.jsrender). That is the
-#     deterministic integration boundary; `.monaco-editor` is the inner Monaco
-#     runtime element that mounts asynchronously on top of it.
+#     is true and the bytes are non-binary → it renders as static code
+#     (`CodeView`): a row per line of the file.
 #
 #   • image/png served-asset URL → render_show_file takes the image branch and
 #     `show_media_src` resolves to a stable worker-file URL.
@@ -59,11 +56,9 @@
             if (h && body && (body.innerText||'').trim() === '') h.click();
         }); true""")
 
-    # ── text/plain → read-only Monaco source editor ──────────────────────────
-    # monaco_readonly → BonitoBook.MonacoEditor, whose server-side mount is the
-    # `.monaco-editor-div` (same deterministic selector chat_show_extras uses).
-    @test TK.wait_for(s, "text renders as a Monaco read-only editor",
-        "!!document.querySelector('.bt-tool-body[data-tool-id=\"txt1\"] .monaco-editor-div')";
+    # ── text/plain → static code ─────────────────────────────────────────────
+    @test TK.wait_for(s, "text renders as code",
+        "!!document.querySelector('.bt-tool-body[data-tool-id=\"txt1\"] .bt-code .bt-l')";
         timeout = 30)
 
     # The text preview is a source editor, NOT a media-wrap and NOT an iframe.
@@ -74,14 +69,11 @@
             && slot.querySelector('iframe') === null;
     })()""") === true
 
-    # The Monaco runtime mounts on top of the div and pulls in the file content;
-    # once it lays out, the editor has real height (BonitoBook owns the actual
-    # text-render path; the integration boundary that matters here is "the right
-    # slot mounted a non-empty editor").
-    @test TK.wait_for(s, "Monaco editor body has laid out",
+    # The code holds the file's text and has laid out.
+    @test TK.wait_for(s, "the code has laid out",
         """(() => {
-            const div = document.querySelector('.bt-tool-body[data-tool-id="txt1"] .monaco-editor-div');
-            return !!div && div.getBoundingClientRect().height > 10;
+            const code = document.querySelector('.bt-tool-body[data-tool-id="txt1"] .bt-code');
+            return !!code && code.getBoundingClientRect().height > 10 && code.textContent.trim().length > 0;
         })()""";
         timeout = 15)
 
