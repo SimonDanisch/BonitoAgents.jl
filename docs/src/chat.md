@@ -78,6 +78,17 @@ as one numbered instruction when you press Send.
 Compare against the working tree or any branch, tag or commit, and `⤢` on a
 file header opens the whole file.
 
+## Exporting a chat
+
+**Export as Markdown** in the chat's ⋯ menu downloads the whole conversation as
+one clean, self-contained `.md` file: user and assistant messages, reasoning,
+todo lists, and every tool call with its full output, commands and diffs in
+fenced blocks. Unlike the chat's own `chat.md` on disk (a compact reload
+format with summarized tool bodies), this is meant to be read or shared as is.
+Files and images are referenced by path rather than embedded; each such path
+is marked ⚠️, and the header says why: it is the file as it is *now*, which may
+have changed since that point in the chat.
+
 ![Asking about a line of the agent's refactor, in the change-review tab](assets/screenshot-review.png)
 
 The diff covers the **project's folder**, not the whole repository, so a package

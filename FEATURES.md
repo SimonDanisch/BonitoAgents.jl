@@ -92,6 +92,11 @@ enumerates.
   a hung agent yields.
 - **Compact** button: agent-side conversation summarization with clean
   transcript reconciliation afterwards.
+- **Export as Markdown** (the chat's ⋯ menu): download the whole chat as one
+  clean, self-contained `.md` — messages, reasoning, todo lists, and every tool
+  call with its full output and diffs in fenced blocks. Files and images are
+  referenced by path, never embedded, each marked ⚠️ as "the file as it is
+  now".
 
 ## The transcript
 
