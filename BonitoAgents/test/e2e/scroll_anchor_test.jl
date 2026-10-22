@@ -35,14 +35,20 @@
 
     CH = "[...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent).__bt_chat"
 
-    # First visible message bubble at the viewport top + its offset, by TEXT.
+    # The row read at the viewport top + its offset, by TEXT: the first with MORE
+    # than 4px in view, which is the row the transcript itself keeps in place
+    # (`captureAnchor`). A row showing less is no reading position: its last
+    # pixel comes and goes with the up-to-1px rounding a correction may land
+    # with (whole pixels at CI's devicePixelRatio 1), and counting it made the
+    # probe name the NEXT row while the view had not moved (|Δoff| = one row
+    # step, 53 px, on every CI run since 10-16).
     TOP_PROBE = """(() => {
         const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
         const st = c.scrollTop;
         const nodes = [...c.querySelectorAll('.bt-user-msg,.bt-agent-msg,.bt-tool-msg')]
             .filter(n => n.offsetParent).sort((a,b) => a.offsetTop - b.offsetTop);
         for (const n of nodes) {
-            if (n.offsetTop + n.offsetHeight > st) {
+            if (n.offsetTop + n.offsetHeight > st + 4) {
                 return {text: (n.innerText||'').replace(/\\s+/g,' ').slice(0, 40),
                         off: Math.round(n.offsetTop - st)};
             }
