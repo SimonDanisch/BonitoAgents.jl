@@ -421,10 +421,11 @@ function acp_log_response(state::ServerState, project_id::AbstractString)
         body = read(path, String))
 end
 
-# /export/<pid> — download the chat as a clean, self-contained Markdown file
-# (`export_chat_markdown`). Built on demand from the live ChatModel, so the
-# chat must be open (which it is whenever the Export item is on screen). Like
-# every chat-keyed route, it answers only who may see the chat (`request_sees_chat`).
+# /export/<pid> — download the chat as one Markdown file that is also a
+# BonitoBook notebook (`export_chat_markdown`, chat_export.jl). Built on demand
+# from the live ChatModel, so the chat must be open (which it is whenever the
+# Export item is on screen). Like every chat-keyed route, it answers only who
+# may see the chat (`request_sees_chat`).
 const EXPORT_ROUTE_RE = r"^/export/([A-Za-z0-9_-]+)/?(?:$|\?)"
 
 function add_export_routes!(srv::Bonito.Server, state::ServerState)
@@ -436,9 +437,6 @@ function add_export_routes!(srv::Bonito.Server, state::ServerState)
 end
 
 function export_response(state::ServerState, project_id::AbstractString)
-    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
-        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
-                             body = "invalid project id\n")
     model = lock(() -> get(state.chat_models, String(project_id), nothing), state.lock)
     model === nothing &&
         return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],

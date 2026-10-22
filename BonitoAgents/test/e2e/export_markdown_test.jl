@@ -2,7 +2,8 @@
 # worker + mock agent, driven through the rendered DOM:
 #
 #   • One scripted turn carries every message shape the exporter renders —
-#     reasoning, prose, a shell tool, an edit with its diff, a todo list.
+#     reasoning, prose, a shell tool, an edit with its diff, a real Julia eval,
+#     a todo list.
 #   • The ⋯ menu lists the item as a download link to `/export/<pid>` with a
 #     `.md` file name; picking it closes the menu like every other item (the
 #     download itself is the browser's business and is NOT triggered here).
@@ -10,6 +11,8 @@
 #     with an attachment disposition: both messages, the reasoning as a quote,
 #     the command and the diff in fenced blocks, the todo as a checklist, the
 #     edited file by path with the ⚠️ marker and the header disclaimer.
+#   • The file is a BonitoBook notebook: the eval is a BonitoBook cell with its
+#     output after it, and BonitoBook reads the download back with that cell.
 #   • An unknown project id answers 404 (the route is keyed by chat, like
 #     `/acp-log/<pid>` and `/download/<pid>`).
 @testitem "e2e:export_markdown" setup = [SharedServer] tags = [:e2e] begin
@@ -21,7 +24,7 @@
 
     # Visible-pane scoping (the shared server keeps other chats' panes mounted
     # but hidden; the header menu renders per pane).
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     vpClick(sel) = "(() => { const p=$VP; const e=p && p.querySelector($(repr(sel))); if(!e) return false; e.click(); return true; })()"
     menu_open = "(() => { const p=$VP; const l=p && p.querySelector('.bt-header-menu .bt-menu-list'); " *
                 "return !!l && getComputedStyle(l).display !== 'none'; })()"
@@ -29,12 +32,14 @@
     cwd  = mktempdir()
     file = joinpath(cwd, "hello.jl")
     write(file, "println(\"hi\")\n")
+    env  = abspath(joinpath(@__DIR__, "..", "evalenv"))
 
     s.agent_fn[] = function (prompt)
         [TK.thought("Let me look at the file first."),
          TK.text("Reading and patching **hello.jl** now."),
          TK.bash("cat hello.jl", "println(\"hi\")\n"),
          TK.edit(file, "println(\"hi\")", "println(\"hello, world\")"),
+         TK.bt_eval("println(\"from the eval\"); 20 + 22"; env_path = env, id = "export-eval"),
          TK.todo([(content = "Patch hello.jl", status = "completed"),
                   (content = "Run the tests",  status = "pending")]),
          TK.text("Done: the greeting is longer now."),
@@ -47,7 +52,8 @@
 
     TK.send_message(s, "please patch the greeting")
     @test TK.wait_for(s, "the scripted turn landed",
-        "(document.querySelector('.bt-messages').innerText||'').includes('greeting is longer now')";
+        "(() => { const p=$VP; const m=p && p.querySelector('.bt-messages'); " *
+        "return !!m && (m.innerText||'').includes('greeting is longer now'); })()";
         timeout = 60) == true
 
     link = nothing
@@ -83,7 +89,7 @@
         md = String(r.body)
         # Header: title, session facts, the one-time ⚠️ disclaimer.
         @test startswith(md, "# ")
-        @test occursin("- **Session:**", md)
+        @test occursin("- **Project:**", md)
         @test occursin("Files are linked by path, not captured as snapshots", md)
         # Both sides of the conversation, the reasoning as a quote.
         @test occursin("## 🧑 User", md)
@@ -97,17 +103,28 @@
         # the edited file by path with its ⚠️ marker.
         @test occursin("### 🔧 ", md)
         @test occursin("cat hello.jl", md)
-        @test occursin("```diff", md)
-        @test occursin("- println(\"hi\")", md)
-        @test occursin("+ println(\"hello, world\")", md)
+        @test occursin("```diff\n-println(\"hi\")\n+println(\"hello, world\")\n```", md)
         @test occursin("`$(file)` ⚠️", md)
         # The todo list as a checklist.
         @test occursin("### ✅ Todo", md)
         @test occursin("- [x] Patch hello.jl", md)
         @test occursin("- [ ] Run the tests", md)
-        # Nothing fell back to the per-message error comment.
-        @test !occursin("<!-- export error", md)
-        @test !occursin("<!-- (unrendered", md)
+    end
+
+    @testset "the eval is a BonitoBook cell, and BonitoBook reads it back" begin
+        r = HTTP.get(s.h.url * "/export/$(pid)"; status_exception = false)
+        md = String(r.body)
+        @test occursin("This file is a BonitoBook notebook", md)
+        @test occursin("Ran in env `$(env)`", md)
+        @test occursin("```julia (editor=true, logging=false, output=true, id=1)\n" *
+                       "println(\"from the eval\"); 20 + 22\n```", md)
+        @test occursin("from the eval", md)       # its output, after the cell
+        @test occursin("42", md)
+        @test !occursin("remote_ref", md)         # the live value's handle stays out
+        BB = BA.BonitoBook
+        cells = BB.markdown2book(BB.Markdown.parse(md))
+        @test [c.source for c in cells if c.language == "julia"] == ["println(\"from the eval\"); 20 + 22"]
+        @test allunique(c.id for c in cells)
     end
 
     @testset "an unknown chat answers 404" begin

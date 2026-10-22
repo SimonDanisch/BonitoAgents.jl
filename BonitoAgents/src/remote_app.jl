@@ -925,10 +925,11 @@ end
 
 # Exact decode of the worker's result descriptor json — the ONE place the
 # eval wire format is recognized (`{"remote_ref": "prefix/uuid", "errored":
-# bool}`; the `errored` field marks a parked CapturedException). Returns
-# nothing for anything else: the block is then plain output text. This is
-# boundary decoding of our own versioned format, not content sniffing.
-function result_descriptor(payload::AbstractString)
+# bool, "repr": …, "repr_mime": …}`; the `errored` field marks a parked
+# CapturedException). Returns nothing for anything else: the block is then plain
+# output text. This is boundary decoding of our own versioned format, not
+# content sniffing.
+function descriptor_dict(payload::AbstractString)
     s = String(payload)
     startswith(s, "{") || return nothing
     d = try
@@ -938,12 +939,28 @@ function result_descriptor(payload::AbstractString)
         return nothing
     end
     d isa AbstractDict || return nothing
-    ref = get(d, "remote_ref", nothing)
-    ref isa AbstractString || return nothing
+    get(d, "remote_ref", nothing) isa AbstractString || return nothing
+    return d
+end
+
+function result_descriptor(payload::AbstractString)
+    d = descriptor_dict(payload)
+    d === nothing && return nothing
     # (The descriptor also carries `repr`, the worker's own rendering. It is NOT
-    # decoded here — see the note in `remote_result` for why the static snapshot
-    # stays empty.)
-    return (ref = String(ref), errored = get(d, "errored", false) === true)
+    # used for the live card — see the note in `remote_result` for why the
+    # static snapshot stays empty. `result_repr` decodes it for the chat export.)
+    return (ref = String(d["remote_ref"]), errored = get(d, "errored", false) === true)
+end
+
+# The value as the descriptor echoes it for the agent: `repr` and what it is,
+# `repr_mime` ("text/html" for an app or plot, BonitoMCP's `summary_html`;
+# "text/plain" otherwise, and for descriptors from workers without the field).
+function result_repr(payload::AbstractString)
+    d = descriptor_dict(payload)
+    d === nothing && return nothing
+    r, mime = get(d, "repr", ""), get(d, "repr_mime", "text/plain")
+    return (text = r isa AbstractString ? String(r) : "",
+            mime = mime isa AbstractString ? String(mime) : "text/plain")
 end
 
 # Boundary decode of the eval wire's Bonito-version-mismatch marker, emitted by

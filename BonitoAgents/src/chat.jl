@@ -715,6 +715,9 @@ mutable struct Message
     chat::Union{ChatModel,Nothing}
 end
 
+Base.copy(m::Message) = Message(m.id, m.kind, m.name, m.title, m.status, m.summary,
+                                m.started_at, m.finished_at, m.chat)
+
 # The "built-in" tool family: Claude's native tools (Read/Edit/Grep/Glob/
 # WebFetch/…). One CONCRETE type per ACP `kind` — the axis that decides how the
 # body renders AND how the header summary reads — so all that is DISPATCH, never
@@ -976,6 +979,16 @@ BashToolMsg(message::Message; command = "", description = nothing,
             is_background = false) =
     BashToolMsg(message, command, description, is_background, "", 0, "",
                 nothing, Executing(), BgWatch())
+
+# A bash restored from chat.md comes back without its command; the stored
+# arguments (tools/<id>.json) carry it, as they do every other tool's.
+function apply_input!(m::BashToolMsg, raw::AbstractDict)
+    c = get(raw, "command", nothing)
+    c isa AbstractString && !isempty(c) && (m.command = String(c))
+    d = get(raw, "description", nothing)
+    d isa AbstractString && !isempty(d) && (m.description = String(d))
+    return nothing
+end
 
 # What the pill/taskbar shows for a bash: the human-readable description
 # when claude sent one, else the ACP title (usually the raw command).
@@ -2512,16 +2525,23 @@ console_block(body::AbstractString) = DOM.div(Bonito.RichText(body); class="bt-c
 console_block(session::Session, body::Observable{String}) =
     DOM.div(map(Bonito.RichText, map(identity, session, body)); class="bt-console")
 
+# A text that is exactly one fenced code block, as `(language, body)`; `nothing`
+# for anything else.
+function fenced_code(text::AbstractString)
+    m = match(r"^\s*```(\w*)\r?\n(.*?)\r?\n```\s*$"s, text)
+    return m === nothing ? nothing : (String(m.captures[1]), String(m.captures[2]))
+end
+
 # Render a single GENERIC tool-content text block (third-party tools whose
 # text has no typed contract). This is text PRESENTATION, not protocol
 # decoding: fenced code is standard markdown → Monaco; ANSI-bearing text →
 # terminal pane; everything else → markdown. Our own eval wire carries no
 # in-band shapes to recognize (contract v3: output text + descriptor).
 function render_text_block(text::AbstractString)
-    m = match(r"^\s*```(\w*)\r?\n(.*?)\r?\n```\s*$"s, text)
-    if m !== nothing
-        lang = isempty(m.captures[1]) ? "plaintext" : String(m.captures[1])
-        return CodeView(String(m.captures[2]); language = lang)
+    f = fenced_code(text)
+    if f !== nothing
+        lang, body = f
+        return CodeView(body; language = isempty(lang) ? "plaintext" : lang)
     end
     Bonito.has_ansi_codes(text) && return console_block(text)
     return DOM.div(Markdown.parse(text), class="bt-tool-md")
@@ -6943,130 +6963,6 @@ function build_history_prelude(model::ChatModel)::String
     println(io)
     println(io, "My new message:")
     println(io)
-    return String(take!(io))
-end
-
-# ── Human-readable Markdown export (the "Export" header button) ───────────────
-# A clean, self-contained .md of the WHOLE chat: messages, tool calls (with the
-# full body loaded from tools/<id>.json), code, todo lists. Images and file
-# references are given as PATHS, never base64 — with a caveat marker, because a
-# path points at the file as it is NOW, which may differ from the moment in the
-# chat (overwritten later in the conversation or by another process). Distinct
-# from `chat.md` (the app's compact reload format, tool bodies summarized).
-
-# `⚠️` marks a value that is a path, not a snapshot — explained once in the header.
-file_ref_md(path::AbstractString) = isempty(path) ? "" : string('`', path, "` ⚠️")
-
-# Fence a code/output block, guarding against a stray ``` in the content.
-function fenced(io::IO, body::AbstractString; lang::AbstractString = "")
-    fence = occursin("```", body) ? "````" : "```"
-    println(io, fence, lang)
-    println(io, rstrip(body))
-    println(io, fence)
-end
-
-# The tool's INPUT (command / file / code / query), per subtype. Default: the
-# ACP title (the raw call string) as inline code.
-function tool_input_md(io::IO, m::ToolMsg)
-    t = tool_title(m); isempty(t) || println(io, '`', t, '`')
-end
-function tool_input_md(io::IO, m::BashToolMsg)
-    m.description === nothing || isempty(m.description) || println(io, "_", m.description, "_\n")
-    fenced(io, m.command; lang = "sh")
-end
-tool_input_md(io::IO, m::Union{EditToolMsg,ReadToolMsg}) =
-    isempty(m.file_path) || println(io, "File: ", file_ref_md(m.file_path))
-tool_input_md(io::IO, m::ShowToolMsg) =
-    isempty(m.path) || println(io, "File: ", file_ref_md(m.path))
-tool_input_md(io::IO, m::SearchToolMsg) =
-    isempty(m.path) || println(io, "Path: ", file_ref_md(m.path))
-tool_input_md(io::IO, m::JuliaEvalCall) =
-    isempty(m.code) || fenced(io, m.code; lang = "julia")
-
-# The tool BODY (output / diffs / images), loaded from tools/<id>.json.
-function render_tool_body_md(io::IO, content)
-    isempty(content) && return
-    for c in content
-        if c isa AgentClientProtocol.TextContent
-            t = strip(c.text)
-            # Tool outputs often arrive ALREADY as a fenced markdown block
-            # (```console …```); emit those verbatim so we don't double-fence.
-            isempty(t) ? nothing : startswith(t, "```") ? println(io, t) : fenced(io, t)
-        elseif c isa AgentClientProtocol.DiffContent
-            println(io, "Edited ", file_ref_md(c.path))
-            io2 = IOBuffer()
-            for l in split(something(c.old_text, ""), '\n'); println(io2, "- ", l); end
-            for l in split(c.new_text, '\n'); println(io2, "+ ", l); end
-            fenced(io, String(take!(io2)); lang = "diff")
-        elseif c isa AgentClientProtocol.ImageContent
-            println(io, "🖼️ _[image · ", c.mime_type,
-                " — not embedded; images are referenced by path only (see above) and may have changed since] ⚠️_")
-        end
-        println(io)
-    end
-end
-
-# One message → Markdown. A fallback keeps an unknown/future kind from breaking
-# the export.
-render_md(io::IO, m::ChatMsg, chat_dir) = println(io, "<!-- (unrendered ", typeof(m), ") -->")
-render_md(io::IO, m::UserMsg, chat_dir)    = (println(io, "## 🧑 User\n"); println(io, m.text))
-render_md(io::IO, m::AgentMsg, chat_dir)   = (println(io, "## 🤖 Assistant\n"); println(io, m.text))
-render_md(io::IO, m::SummaryMsg, chat_dir) = (println(io, "## 📝 Summary (/compact)\n"); println(io, m.text))
-function render_md(io::IO, m::ThoughtMsg, chat_dir)
-    println(io, "### 💭 Reasoning\n")
-    for l in split(m.text, '\n'); println(io, "> ", l); end
-end
-function render_md(io::IO, m::TodoListMsg, chat_dir)
-    println(io, "### ✅ Todo\n")
-    for e in m.entries
-        println(io, "- [", e.status == "completed" ? "x" : " ", "] ", e.content)
-    end
-end
-function render_md(io::IO, m::ToolMsg, chat_dir)
-    name   = isempty(m.message.name) ? tool_kind(m) : m.message.name
-    status = tool_status(m)
-    println(io, "### 🔧 ", name, isempty(status) ? "" : string(" · ", status), "\n")
-    tool_input_md(io, m); println(io)
-    render_tool_body_md(io, tool_content_for_render(m, chat_dir))
-end
-
-export_filename(model::ChatModel)::String = begin
-    p = isempty(model.project_id) ? nothing : get(model.state.projects[], model.project_id, nothing)
-    base = p === nothing ? basename(rstrip(model.cwd, '/')) : p.title[]
-    slug = replace(strip(base), r"[^\w .-]+" => "", " " => "-")
-    (isempty(slug) ? "chat" : slug) * "-" * Dates.format(now(UTC), "yyyy-mm-dd") * ".md"
-end
-
-"""
-    export_chat_markdown(model) -> String
-
-Render the whole chat to a clean, self-contained Markdown document.
-"""
-function export_chat_markdown(model::ChatModel)::String
-    s = shared(model)
-    sess = model.chat_session
-    p = isempty(model.project_id) ? nothing : get(model.state.projects[], model.project_id, nothing)
-    title = p === nothing ? basename(rstrip(model.cwd, '/')) : p.title[]
-    io = IOBuffer()
-    println(io, "# ", title, "\n")
-    println(io, "- **Project:** `", sess.cwd, "`")
-    println(io, "- **Session:** `", sess.session_id, "`")
-    println(io, "- **Created:** ", sess.created)
-    println(io, "- **Exported:** ", Dates.format(now(UTC), "yyyy-mm-dd HH:MM"), " UTC\n")
-    println(io, "> ⚠️ **Files are linked by path, not captured as snapshots.** Every value marked ⚠️ ",
-        "below (image results, edited/read files, search roots) is a path on disk — the file may have ",
-        "changed since this point in the chat, whether overwritten later in the conversation or by another ",
-        "process. Read a ⚠️ path as \"the file at this path *now*\", not as it was at the time.\n")
-    println(io, "---\n")
-    msgs = lock(() -> copy(s.msgs_store), model.lock)
-    for m in msgs
-        try
-            render_md(io, m, model.chat_dir)
-        catch e
-            println(io, "<!-- export error on ", typeof(m), ": ", sprint(showerror, e), " -->")
-        end
-        println(io)
-    end
     return String(take!(io))
 end
 

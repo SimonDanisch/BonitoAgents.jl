@@ -209,7 +209,8 @@ function bridge_result(val, repr::AbstractString, max_bytes::Int, full_output::B
         ref = RP.remote_ref(val)
         return (; blocks = Dict{String,Any}[],
                   html = result_descriptor(ref, false,
-                           truncate_text(sm, max_bytes, full_output, "result")),
+                           truncate_text(sm, max_bytes, full_output, "result");
+                           repr_mime = "text/html"),
                   errored = false, echo = nothing)
     end
     # Plain value: park for the embed, keep the short text repr (rendering
@@ -244,13 +245,16 @@ is_display_type(val) = let n = string(nameof(typeof(val)))
 end
 
 # The result descriptor json the chat decodes (BonitoAgents remote_app.jl):
-# `{"remote_ref": "...", "errored": bool, "repr": "..."}`. `repr` is the result
-# echo for the AGENT (the chat renders the live embed instead, and never shows
-# `repr` — the value is already displayed). No JSON dep in the worker env, so
-# escape the string by hand.
-result_descriptor(ref::AbstractString, errored::Bool, repr::AbstractString) =
+# `{"remote_ref": "...", "errored": bool, "repr": "...", "repr_mime": "..."}`.
+# `repr` is the result echo for the AGENT (the chat renders the live embed
+# instead, and never shows `repr` — the value is already displayed); `repr_mime`
+# says what it is: "text/html" for a display value's `summary_html`, plain text
+# otherwise. A chat export writes a text repr as the value and leaves the markup
+# out. No JSON dep in the worker env, so escape the string by hand.
+result_descriptor(ref::AbstractString, errored::Bool, repr::AbstractString;
+                  repr_mime::AbstractString = "text/plain") =
     string("{\"remote_ref\":\"", ref, "\",\"errored\":", errored ? "true" : "false",
-           ",\"repr\":\"", json_escape_string(repr), "\"}")
+           ",\"repr\":\"", json_escape_string(repr), "\",\"repr_mime\":\"", repr_mime, "\"}")
 
 function json_escape_string(s::AbstractString)
     io = IOBuffer()

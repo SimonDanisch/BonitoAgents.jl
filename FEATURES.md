@@ -96,7 +96,8 @@ enumerates.
   clean, self-contained `.md` — messages, reasoning, todo lists, and every tool
   call with its full output and diffs in fenced blocks. Files and images are
   referenced by path, never embedded, each marked ⚠️ as "the file as it is
-  now".
+  now". The file is a BonitoBook notebook: each `bt_julia_eval` is a cell, so
+  `BonitoBook.Book(file)` reopens the agent's Julia code to run again.
 
 ## The transcript
 

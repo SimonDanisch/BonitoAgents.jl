@@ -10,7 +10,7 @@ pieces fit together.
 v0.1.0 was a good chat for Claude Code on your own machines. This release turns
 BonitoAgents into a self-hosted workspace for **any** coding agent, on **every**
 machine you own, for a whole team, with everything the agents make rendered
-live. It collects 65 commits since v0.1.0.
+live.
 
 ### Highlights
 
@@ -128,6 +128,10 @@ live. It collects 65 commits since v0.1.0.
 - A tab whose server session is gone reloads itself, or asks first when a draft
   would be lost.
 - Readable file search hits; colour-matrix eval results as real PNGs.
+- **Export as Markdown** in the chat's ⋯ menu downloads the whole chat as one
+  readable `.md`, every tool call with its full output and diffs. It is also a
+  BonitoBook notebook: each Julia eval is a cell you can run again (thanks
+  @sbordt).
 
 ### Developer tools
 

@@ -78,6 +78,12 @@ as one numbered instruction when you press Send.
 Compare against the working tree or any branch, tag or commit, and `⤢` on a
 file header opens the whole file.
 
+![Asking about a line of the agent's refactor, in the change-review tab](assets/screenshot-review.png)
+
+The diff covers the **project's folder**, not the whole repository, so a package
+that lives inside a larger checkout shows its own changes instead of every
+change in the monorepo.
+
 ## Exporting a chat
 
 **Export as Markdown** in the chat's ⋯ menu downloads the whole conversation as
@@ -89,11 +95,18 @@ Files and images are referenced by path rather than embedded; each such path
 is marked ⚠️, and the header says why: it is the file as it is *now*, which may
 have changed since that point in the chat.
 
-![Asking about a line of the agent's refactor, in the change-review tab](assets/screenshot-review.png)
+The file is also a [BonitoBook](https://github.com/SimonDanisch/BonitoBook.jl)
+notebook. Every `bt_julia_eval` of the chat is written as a BonitoBook cell,
+with the output it printed below it, and the rest of the conversation is the
+prose between the cells. Open the download with BonitoBook and the agent's
+Julia code is there to run again, step by step:
 
-The diff covers the **project's folder**, not the whole repository, so a package
-that lives inside a larger checkout shows its own changes instead of every
-change in the monorepo.
+```julia
+using BonitoBook
+Book("my-chat-2026-10-23.md")
+```
+
+Opening the book runs none of the cells; each one runs when you start it.
 
 ## The workspace
 
