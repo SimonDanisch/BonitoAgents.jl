@@ -1,2 +1,5 @@
 build/
 Manifest.toml
+
+# Copied from ../CHANGELOG.md by make.jl, so the release notes exist once.
+src/release-notes.md

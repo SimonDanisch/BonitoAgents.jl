@@ -20,6 +20,21 @@ from the running agent, so the list always matches the provider. Change them for
 one chat in its header, or set fleet-wide starting points under *Defaults* on
 the Settings page, which every new chat inherits.
 
+## Switching agents
+
+The agent pill in the chat's header switches a chat to another provider at any
+time. The next turn starts a fresh session under the new agent, and because
+that agent has never seen the conversation, BonitoAgents hands it the last 60
+user and agent messages along with your next message. The files, the machine,
+the transcript and the BonitoAgents tools stay the same. The switch is kept only
+once the new agent's session is up; if it cannot start (a binary that is not
+installed, a missing login), the chat goes back to the previous agent and says
+why.
+
+So when one provider runs out of credits, has an outage, or simply gets stuck on
+a problem, the conversation carries on under another one. Nothing about a
+project, a transcript or a tool belongs to the agent that started it.
+
 ## Managed adapters
 
 Claude Code and Codex reach ACP through adapter packages
@@ -51,7 +66,8 @@ Descriptors for [MiMo](https://github.com/XiaomiMiMo),
 expose ACP under an `acp` subcommand). They are not managed: the worker runs
 whichever binary its PATH has, so install them yourself on each worker that
 should run them. Select them per chat from the provider dropdown; switching
-providers mid-project starts the next turn under the new agent.
+providers mid-project starts the next turn under the new agent, which gets the
+conversation so far (see [Switching agents](@ref)).
 
 ## Codex
 
@@ -68,6 +84,13 @@ it at a different one, or `CODEX_AGENT_ACP` to run a different adapter build.
 It reports its model, reasoning effort and approval mode as session-config pills
 like any other provider, and advertises ACP `session/list`, so **Discover** finds
 Codex sessions on the worker too.
+
+Codex ends a turn that failed (an exhausted usage limit, an outage) as a normal
+turn end and reports the failure only in the response's metadata. The chat
+shows it as a **Provider error** notice in Codex's own words and treats the turn
+as failed, which also stops Yolo. Before a turn whose context is nearly full,
+Codex compacts the conversation; that shows as a *Compact conversation* card
+and does not count as the agent doing work.
 
 Kimi Code and Codex both advertise ACP `session/load`. BonitoAgents stores the
 provider together with its session id, so reopening a project routes the id back

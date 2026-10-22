@@ -8,154 +8,198 @@
 <h1 align="center">BonitoAgents</h1>
 
 <p align="center">
-  A self-hosted workspace where coding agents run Julia, return live apps,<br>
-  and work across every machine you own.
+  <strong>Any coding agent. Every machine you own. Everything it makes, live in one workspace.</strong>
 </p>
 
 <p align="center">
-  <a href="https://agents.bonito.sh/"><strong>Documentation</strong></a>
+  <a href="https://agents.bonito.sh/"><strong>Documentation</strong></a> ·
+  <a href="https://agents.bonito.sh/story.html">A day with BonitoAgents</a> ·
+  <a href="#quick-start">Install</a> ·
+  <a href="CHANGELOG.md">What's new</a>
 </p>
 
 > [!WARNING]
 > Use at your own risk: there are no safeguards (yet) preventing an LLM driven
 > through BonitoAgents from wiping your entire PC or leaking all your secrets.
 
-BonitoAgents turns an agent conversation into a visual development workspace.
-The agent can evaluate code in a persistent Julia session, show returned values
-through Julia's MIME display system, mount interactive Bonito apps, open the
-artifacts it creates, and put its git diff in front of you for line-level
-feedback. A worker on each machine keeps the agent, code and computation
-together; one dashboard gives you the live result from any browser.
+BonitoAgents is a self-hosted web workspace for coding agents. Bring Claude
+Code, Codex, Kimi Code, OpenCode, MiMo or any other agent that speaks the
+[Agent Client Protocol](https://agentclientprotocol.com). Run them on your
+laptop, on the desktop with the big GPU, on the server in the closet, and drive
+all of them from one browser tab, including the one on your phone.
+
+What the agents make shows up as the real thing, not as a file path in a wall
+of text: plots, videos, Jupyter notebooks with their outputs, 3D models, PDFs,
+tables, diffs and live interactive apps. Your code stays in ordinary folders on
+your machines, your transcripts stay on your disk, and the agents run on your
+own subscriptions and keys. There is no BonitoAgents cloud and no account with
+us.
+
+Your projects can be in any language: the agents work on them the way they
+always do. BonitoAgents itself is written in Julia, which also powers the live
+apps and the persistent sessions the agents get, and the desktop app ships its
+own Julia.
 
 <p align="center">
-  <img src="BonitoAgents/assets/screenshot-chat.png" alt="Chat with a streamed Monaco diff from a real refactor" width="850">
+  <img src="docs/src/assets/how-it-fits.svg" alt="Any ACP agent runs on any of your machines; one dashboard in any browser drives them all and shows what they make" width="860">
 </p>
 
-## What you can do
+## A day with BonitoAgents
 
-### Run Julia here or on another worker, and see the actual result
+**8:40, laptop, coffee.** The dashboard shows every chat on every machine as a
+live card. Claude Code is refactoring a parser on the laptop, Codex is training
+a model on the desktop with the GPU, Kimi Code is tidying the docs on the home
+server. Each card carries a picture from its chat's latest work, so you can see
+at a glance which one needs you.
 
-`bt_julia_eval` gives every project a persistent Julia session. Packages,
-variables and compiled methods stay warm between calls, stdout streams while
-the code runs, and Revise picks up source edits. Returned values use Julia's
-MIME display system, so plots, images, HTML and other rich results render in the
-conversation instead of being flattened into terminal text.
+**9:15.** You ask the desktop's agent how the training run went. It plots the
+loss curves, renders a short video of the predictions and writes a notebook.
+All three open right in the conversation: the PNG and the MP4 inline, the
+notebook with its outputs. A mesh it exported spins in a 3D viewer, a CSV opens
+as a sortable table, the PDF report as a PDF.
 
-Pass `worker = "desktop"` to any eval-family tool to run the same code on
-another connected machine. The output still streams into the current chat and
-the result still renders there. `bt_sync_folder` moves the required code and
-data first, with subsequent syncs sending only what changed. This makes it
-practical to keep the conversation on a laptop while running the computation
-beside a dataset, a GPU or a long-lived project environment elsewhere. Running
-on other machines is off by default: an admin switches it on per chat with
-**Remote julia** in the chat's ⋯ menu.
+**11:30.** Codex hits its usage limit in the middle of the task. The chat says
+so in plain words and stops, instead of retrying all morning. You pick Claude
+Code in the chat's header and type "carry on": the new agent gets the
+conversation so far and continues on the same files, on the same machine. Your
+work never belonged to a vendor in the first place.
 
-### Put a working Bonito app inside the conversation
+**13:00, phone, queue at lunch.** The agent wants to run a database migration
+and asks first. You approve it from your phone, glance at the newest render,
+and photograph the whiteboard sketch for the afternoon's task straight into the
+chat.
 
-A Bonito `App` or WGLMakie figure returned from `bt_julia_eval` is mounted as a
-live value. Slider moves and button clicks travel back to the Julia object in
-the worker, so an agent can build an interface, run it in the transcript, and
-iterate on it with you. Detach the app into a tab or floating window, dock it
-beside the chat and its source file, and it stays interactive.
+**15:00.** You need a quick GUI to explore one parameter. The agent writes it
+and returns it into the conversation as a live app: drag the slider and the
+computation reruns on the desktop. You detach it into its own panel next to the
+source file and keep iterating together.
+
+**17:00.** You read the agent's git diff line by line, ask about one change on
+the spot, and bundle three review notes into one instruction. Then you send a
+colleague a link to the app. They open it on their phone without an account,
+move the slider, and your desktop does the computing.
+
+**18:30.** On the way out you switch on Yolo mode with a reminder: "render the
+HD version, credits at the end". The agent keeps working through the evening on
+its own and stops when it confirms it is done, when it goes in circles, or when
+its provider fails.
+
+The [long version of this story](https://agents.bonito.sh/story.html) links
+every step to the guide behind it.
+
+## Bring any agent, keep your work
+
+- **Five agents ship as providers.** Claude Code, Codex, Kimi Code, OpenCode
+  and MiMo, picked per chat from a dropdown. Any other ACP agent plugs in with a
+  small descriptor (binary, arguments, environment).
+- **Switch agents mid-conversation.** The next turn runs under the new agent,
+  and BonitoAgents hands it the conversation so far. Out of credits, a better
+  model elsewhere, a second opinion: one click.
+- **The same tools for every agent.** The persistent Julia sessions, showing
+  files, share links and the to-do list are MCP tools, and they render as the
+  same cards whichever agent calls them, even though every agent reports tool
+  calls differently on the wire.
+- **Your files, your history.** Projects are ordinary folders and git checkouts
+  on your machines. Transcripts are markdown files in the server's state
+  directory. **Discover** imports the Claude Code and Codex sessions you already
+  have on a machine, history included.
+- **Your accounts.** Agents log in with your own subscription or API key, on
+  your own machines. The workers install and update the Claude Code and Codex
+  adapters for you, in a private Node install that leaves the system's alone.
+
+<p align="center">
+  <img src="BonitoAgents/assets/screenshot-chat.png" alt="A Claude Code chat with a streamed Monaco diff; the header shows the agent picker next to the model, permission and effort pills" width="850">
+</p>
+
+## See everything the agent makes
+
+The agent puts a file into the chat with `bt_show`, and you can open any file
+from the project tree as a workspace tab. Both use the same viewers:
+
+| | |
+|---|---|
+| **Pictures and sound** | images with a lightbox, video and audio streamed by range |
+| **Data** | CSV and TSV as sortable, filterable tables; Jupyter notebooks with their outputs |
+| **3D** | `.obj`, `.stl`, `.ply`, `.off`, `.glb`, `.gltf` in an interactive viewer, textures included |
+| **Documents** | markdown with its pictures, PDF, HTML |
+| **Code** | Monaco with syntax highlighting for 90 languages, editable and saved back to the worker |
+| **Everything else** | a hex view |
+
+Text formats switch between preview and source. Images and code blocks can be
+copied and downloaded, videos downloaded, on a phone too.
+
+<p align="center">
+  <img src="docs/src/assets/screenshot-media.png" alt="One chat with the agent's loss plot, a prediction video and a 3D model inline, next to the Jupyter notebook and the metrics table it wrote, open as workspace panels" width="850">
+</p>
+
+## Apps and GUIs, not only text
+
+- **A live Julia session per project.** `bt_julia_eval` keeps packages,
+  variables and compiled code warm between calls, streams stdout while the code
+  runs, and renders results through Julia's display system. Long jobs run in
+  the background while the conversation goes on.
+- **Interactive apps in the transcript.** A returned Bonito `App` or WGLMakie
+  figure stays live: sliders and buttons talk to the Julia objects on the
+  worker. Detach it into a tab or a floating window and it keeps running.
+- **A workspace, not a chat log.** Tabs, splits and floating windows hold the
+  chat, the project's files, the change review and detached apps side by side.
+- **Server apps.** An app is a Julia package that lays out its own chat pane
+  and gives every agent new tools. The bundled To-do app keeps one list for the
+  whole server: any agent can add and check off items, and **Start chat** opens
+  a chat for an item in the right project folder.
 
 <p align="center">
   <img src="BonitoAgents/assets/screenshot-workspace.png" alt="A live Bonito app detached from the chat and docked beside it, with the project file open in a tab" width="850">
 </p>
 
-### Inspect what the agent creates
+## Every machine you own, one dashboard
 
-The agent can put a worker-side file into the chat with `bt_show`, and you can
-open the same file from the project tree as a workspace tab. Both routes use
-the same renderers: markdown, images, video and audio, sortable CSVs, notebooks
-with their outputs, interactive 3D geometry, PDF and HTML, source in Monaco,
-and a hex view for opaque bytes. Text-backed formats can switch between preview
-and source and save directly to the worker.
+A small worker runs on each machine that has code or compute on it: Linux,
+macOS or Windows. Workers dial out to one dashboard server, so only the server
+needs a reachable address. The dashboard runs in any browser.
 
-The result is a useful loop for work that produces more than source code: ask
-for an analysis, simulation, visualization, report or small interface, inspect
-the real artifact in place, then continue the conversation with that result in
-view.
+- **Start a chat on any worker** from any device, and **continue a chat on
+  another worker**: the files move, and so does the agent's own memory of the
+  conversation.
+- **Run Julia somewhere else from the same chat.** `bt_julia_eval(worker =
+  "desktop")` runs on another machine while the output and the live result stay
+  in this conversation. `bt_sync_folder` sends code and data first, and
+  `remote_session` moves Julia values between machines.
+- **Built for flaky laptops.** One resumable connection per worker survives
+  sleep and network switches. A worker that crashes mid-turn tells the chat to
+  carry on when it is back.
+- **From your phone.** Chats, permission prompts, attachments from the camera,
+  media and live apps all work on a phone screen.
 
-### Share a report or a live app with a link
+## Review, share, and keep control
 
-Some results are meant for other people. Ask the agent to share one, or use the
-share button on an eval result, on a file the agent showed you or on a file open
-in a tab. You get a link that opens in any browser without an account.
-
-Say you spent the afternoon with the agent on a simulation that runs on your
-desktop. It wrote `report.md` with a few plots and a short clip, and a small
-Bonito app for trying parameters. The report link opens as a plain web page,
-images and video included. The app link opens the app itself: a colleague drags
-the slider on their phone, and the new result is computed on your desktop, in
-the project's own Julia environment. Each visitor gets their own copy of the
-app.
-
-<p align="center">
-  <img src="BonitoAgents/assets/screenshot-share-phone.png" alt="A shared Bonito app on a phone: the Lorenz attractor with a slider, computed on the worker that shared it" width="300">
-</p>
-
-Other files work the same way. A CSV opens as a table, a 3D model in a viewer,
-a PDF in the browser, each with a download button. A link reaches that one file
-and what it embeds, nothing else in the folder. You can put a password on a
-link, and Settings lists your links so you can end any of them.
-
-A link works while its worker is online. A result shared straight from the chat
-also needs its Julia session to stay open. Share the `.jl` file instead and it
-runs again after a restart, and whenever the file changes. Behind a tunnel, the
-default setup, nobody needs to log in. With Caddy in front (`--tls acme`), app
-links need a logged-in viewer.
-
-### Review the git diff with the agent
-
-**Review changes** opens the project's git diff, including newly created files.
-Comment on one line or a selected block: **Ask** sends that question into the
-chat immediately with its code context, while **Feedback** collects several
-comments into one numbered instruction. The review can compare the working
-tree with any branch, tag or commit.
+- **Review the git diff with the agent.** Comment on a line or a block: **Ask**
+  sends the question right away with its code context, **Feedback** collects
+  several notes into one numbered instruction. Compare with any branch, tag or
+  commit.
+- **Share a result with a link.** A markdown report opens as a web page with
+  its pictures and videos; a Julia file that builds an app opens as the running
+  app, computed on your worker, with a separate copy per visitor. Add a
+  password, and end any link from Settings.
+- **Yolo mode, with brakes.** The agent keeps going on its own with your
+  reminders attached to every nudge. It stops when it confirms it is done, when
+  it repeats itself without doing anything, when it stops using tools, and
+  when a turn fails.
+- **Teams.** On a server installed with `install_server.sh`, people sign in
+  with a passkey. Admins invite people and put them in groups; members see
+  their own chats and the workers shared with their groups.
+- **It debugs itself.** **Debug BonitoAgents** opens an agent on a
+  BonitoAgents checkout with tools for the running system: server and worker
+  state, logs from every machine, browser consoles, timings and memory. It can
+  reproduce a problem, fix the source and run the tests.
 
 <p align="center">
   <img src="BonitoAgents/assets/screenshot-review.png" alt="Asking about a line of the agent's refactor in the change-review tab" width="850">
 </p>
 
-### Let BonitoAgents debug and improve itself
-
-**Debug BonitoAgents** opens an agent chat on a BonitoAgents source checkout on
-the worker you choose. In dev mode that chat also gets tools for inspecting the
-running system: server and worker state, projects, chats, eval bridges, logs
-from every machine, memory use and registry growth. It can reproduce a problem
-through the live server controls, trace it into the source, edit the checkout
-and run the tests. Restart that worker and it runs the edited code. The same
-agent workspace is therefore also the environment for diagnosing and improving
-BonitoAgents itself.
-
-### Control every machine from one dashboard
-
-A small worker process runs on every machine that has code or compute on it.
-All workers connect out to one dashboard server, and you control their agent
-sessions from a single web UI, including from your phone. Nothing runs in a
-BonitoAgents cloud; agents work directly on your checkouts with your own agent
-subscription.
-
-```
-   browser / phone ──HTTP/WS──▶  dashboard server (Bonito web app)
-                                      ▲  ▲
-                     control WS +     │  │
-                     file transfer    │  │
-                          ┌───────────┘  └───────────┐
-                     worker (laptop)             worker (desktop)
-                     ├─ claude-code agent (ACP)  ├─ agent per project
-                     ├─ persistent Julia MCP     ├─ …
-                     └─ your project checkouts   └─ your project checkouts
-```
-
-Agents are pluggable [ACP](https://agentclientprotocol.com) providers:
-Claude Code by default, with MiMo, OpenCode, Kimi Code and Codex adapters
-included ([`AgentProviders/`](AgentProviders/)).
-
-Chats persist on disk, existing Claude Code sessions can be imported with their
-history, and browser reconnects resume where you left off. Heartbeats detect
-and heal dropped or half-open worker connections after suspend or a network
-switch. The complete inventory lives in [`FEATURES.md`](FEATURES.md).
+<p align="center">
+  <img src="BonitoAgents/assets/screenshot-share-phone.png" alt="A shared Bonito app on a phone: the Lorenz attractor with a slider, computed on the worker that shared it" width="300">
+</p>
 
 ## Quick start
 
@@ -195,7 +239,9 @@ Useful flags: `bonito-agents --port=8038`, `--no-window`, `--data-dir=PATH`;
 
 Node and the agent adapters (Claude Code's and Codex's) are installed for you,
 in a private Node install. What stays yours is logging in to the agents: for
-Claude Code, run `claude` once and authenticate.
+Claude Code, run `claude` once and authenticate; for Codex, `codex login`. Kimi
+Code, OpenCode and MiMo run whichever binary the worker's PATH has. See
+[Agent Providers](https://agents.bonito.sh/providers.html).
 
 ### From source
 
@@ -237,9 +283,13 @@ mail is involved. The server itself only listens on localhost. Two ways in:
   installer checks that both names point at the machine and port 80 reaches it
   before it asks for a certificate.
 
-Re-running the script updates the install. That restarts Authelia too, which
-keeps logins in memory, so everyone has to log in again. To restart only the
-dashboard, use `sudo systemctl restart bonitoagents-server`.
+The installer also downloads and verifies Valkey and runs a private instance
+for the login sessions, through a Unix socket with no TCP listener. Sessions
+are encrypted and persisted on disk. Re-running the script updates the install:
+the running server keeps serving while the new version precompiles, unchanged
+login services keep running, and logins survive service restarts. An older
+install moving from in-memory sessions requires one fresh login on each device.
+To restart only the dashboard, use `sudo systemctl restart bonitoagents-server`.
 
 Admins invite people with a link (or add accounts directly) and put them in
 groups; members see their own chats and workers, plus the workers shared with
@@ -291,7 +341,9 @@ story against a deterministic mock agent.
 
 Getting started, concepts, deployment and API docs are at
 [agents.bonito.sh](https://agents.bonito.sh/), and their source is
-[`docs/`](docs/):
+[`docs/`](docs/). The complete feature inventory lives in
+[`FEATURES.md`](FEATURES.md), and the changes per release in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ```bash
 julia --project=docs -e 'using Pkg; Pkg.instantiate()'

@@ -3,11 +3,11 @@
 ```
    browser / phone ──HTTP/WS──▶  dashboard server (Bonito web app)
                                       ▲  ▲
-                     control WS +     │  │
-                     file transfer    │  │
+                     one WorkerLink   │  │   control, MCP, evals, files
+                     per worker       │  │
                           ┌───────────┘  └───────────┐
                      worker (laptop)             worker (desktop)
-                     ├─ claude-code agent (ACP)  ├─ agent per project
+                     ├─ an ACP agent per chat    ├─ Claude Code, Codex, Kimi…
                      ├─ persistent Julia MCP     ├─ …
                      └─ your project checkouts   └─ your project checkouts
 ```
@@ -71,8 +71,9 @@ live agent processes in check).
 Agents speak the [Agent Client Protocol](https://agentclientprotocol.com)
 (ACP). The worker spawns the agent binary per project; the server bridges the
 protocol stream into the chat model that drives the UI. Providers are
-pluggable descriptors (see [Agent Providers](@ref)). The same mechanism powers
-the deterministic mock agent used by the test suite; the
+pluggable descriptors (see [Agent Providers](@ref)), and a chat can switch to
+another provider at any time; the new agent gets the conversation so far. The
+same mechanism powers the deterministic mock agent used by the test suite; the
 [dashboard walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_dashboard.jl)
 replays real recorded agent sessions from disk.
 

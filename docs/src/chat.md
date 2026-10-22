@@ -144,7 +144,9 @@ ended · Reconnect** chip appears next to the title.
   prompt, including the confirmation. A turn that fails, gets refused, or
   repeats the same answer three times without running a tool stops the loop and
   switches Yolo off, so a provider that is out of credits cannot spin it
-  overnight.
+  overnight. A failure the provider reports only at the end of the turn, like
+  Codex's usage limit, counts as a failed turn and shows as a **Provider error**
+  notice. A turn that only compacts the conversation does not count as work.
 - **Compact** (⋯ menu) asks the agent to summarize the conversation so far into
   a fresh context, after which the transcript reconciles cleanly.
 - **Continue on** (⋯ menu) opens a new chat on another worker with the project's

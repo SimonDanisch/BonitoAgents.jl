@@ -1,16 +1,44 @@
 # BonitoAgents
 
-BonitoAgents turns an agent conversation into a visual development workspace.
-The agent can run code in a persistent Julia session, return rich values and
-interactive Bonito apps directly into the chat, show the files it creates, and
-put its git diff in front of you for line-level review. Workers keep the agent,
-code and computation together on your own machines; one dashboard gives you
-the live result from your desk or your phone.
+BonitoAgents is a self-hosted web workspace for coding agents. Bring Claude
+Code, Codex, Kimi Code, OpenCode, MiMo or any other agent that speaks the
+[Agent Client Protocol](https://agentclientprotocol.com). Run them on your
+laptop, on the desktop with the big GPU, on the server in the closet, and drive
+all of them from one browser tab, including the one on your phone.
+
+What the agents make shows up as the real thing: plots, videos, Jupyter
+notebooks with their outputs, 3D models, PDFs, tables, diffs, and live
+interactive apps that keep computing on your machine. Your code stays in
+ordinary folders, your transcripts stay on your disk, and the agents run on your
+own subscriptions and keys.
+
+For the whole picture in one go, read [A Day with BonitoAgents](@ref): one
+working day, from the first coffee to the overnight render.
 
 !!! warning
     Use at your own risk: there are no safeguards (yet) preventing an LLM
     driven through BonitoAgents from wiping your entire PC or leaking all your
     secrets.
+
+## Bring any agent, keep your work
+
+Claude Code, Codex, Kimi Code, OpenCode and MiMo ship as providers, and any
+other ACP agent plugs in with a small descriptor. Each chat names its agent, and
+you can switch it in the chat's header at any time: the next turn runs under the
+new agent, which gets the conversation so far. When one provider runs out of
+credits or gets stuck, the work carries on under another.
+
+The BonitoAgents tools behave the same for every agent: the persistent Julia
+sessions, `bt_show`, share links and the to-do list render as the same cards
+whichever agent calls them. Projects are ordinary folders and git checkouts on
+your machines, transcripts are markdown files in your own server's state
+directory, and **Discover** imports the Claude Code and Codex sessions you
+already have, history included. See [Agent Providers](@ref).
+
+```@raw html
+<img src="assets/how-it-fits.svg" alt="Any ACP agent runs on any of your machines; one dashboard in any browser drives them all and shows what they make"
+     style="display: block; width: 100%; margin: 16px auto;">
+```
 
 ## One dashboard for the whole workflow
 
@@ -71,6 +99,11 @@ the worker.
 This supports a complete loop for analyses, simulations, visualizations,
 reports and small interfaces: ask the agent to create the result, inspect the
 real artifact beside the conversation, then refine it without switching tools.
+
+```@raw html
+<img src="assets/screenshot-media.png" alt="One chat with the agent's loss plot, a prediction video and a 3D model inline, next to the Jupyter notebook and the metrics table it wrote, open as workspace panels"
+     style="display: block; width: 100%; margin: 16px auto; border-radius: 10px; border: 1px solid rgba(128,128,128,0.25);">
+```
 
 ## Share a report or a live app with a link
 
