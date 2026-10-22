@@ -8,8 +8,11 @@
     first = TK.new_chat(server; cwd = folder)
     @test TK.wait_for(server, "folder title", "$(title(first)) === 'VideoEdit'") == true
     TK.send_message(server, "Please investigate something with a very different name")
+    # The chat's first reply includes the agent's cold start: a slow CI runner
+    # takes far longer than wait_for's default 8 s.
     @test TK.wait_for(server, "reply",
-        "[...document.querySelectorAll('.bt-agent-msg')].some(e => e.textContent.includes('reply received'))") == true
+        "[...document.querySelectorAll('.bt-agent-msg')].some(e => e.textContent.includes('reply received'))";
+        timeout = 60) == true
     @test TK.eval_js(server, title(first)) == "VideoEdit"
 
     second = TK.new_chat(server; cwd = folder)
