@@ -3396,13 +3396,21 @@ CoreLogging.shouldlog(::TimestampLogger, level, _module, group, id) = true
 # inside logging; report it in place instead.
 CoreLogging.catch_exceptions(::TimestampLogger) = true
 
+# Printing a MethodError as a value prints its arguments, which can include an
+# entire live chat. Use the exception formatter, as ConsoleLogger does, so a
+# render failure reports argument types and a readable stack instead.
+log_value(io::IO, value) = print(IOContext(io, :limit => true), value)
+log_value(io::IO, value::Exception) = showerror(io, value)
+log_value(io::IO, value::Tuple{Exception,Any}) = showerror(io, value[1], value[2])
+
 function CoreLogging.handle_message(l::TimestampLogger, level, message, _module, group,
                                     id, file, line; kwargs...)
     buf = IOBuffer()
     print(buf, Libc.strftime("%Y-%m-%dT%H:%M:%S", time()), ' ',
           uppercase(string(level)), ": ", message)
     for (k, v) in kwargs
-        print(buf, "  ", k, "=", v)
+        print(buf, "  ", k, "=")
+        log_value(buf, v)
     end
     print(buf, "  @ ", _module, ' ', basename(String(something(file, ""))), ':', line)
     # Indent every continuation so one record stays one visual block and the

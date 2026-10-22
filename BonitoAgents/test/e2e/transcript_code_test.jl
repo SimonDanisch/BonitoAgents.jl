@@ -2,7 +2,7 @@
 # an eval's code are rows of the source, highlighted by Monaco's tokenizer. A
 # Monaco editor per card forced layouts on every render and was built anew each
 # time its card scrolled back in (30 per scroll through 30 edits, ~70% of the
-# main thread, 2026-10-20). Asserted: no editor on the page; the highlighted
+# main thread, 2026-10-20). Asserted: no editor in the transcript; the highlighted
 # rows hold the source exactly (tabs, runs of spaces, no U+00A0 from Monaco's
 # HTML), with the changed words marked; an expanded edit the transcript drops
 # comes back expanded, at the height it had.
@@ -36,7 +36,7 @@
     TK.new_chat(s; title = "TranscriptCode")
     TK.send_message(s, "edits")
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     chat = "$VP.querySelector('.bt-messages')"
     card(id) = "$VP.querySelector('.bt-tool-msg[data-msg-id*=\"$(id)\"]')"
     section(id) = "$(card(id))?.querySelector('.bt-subsection-body')"
@@ -73,7 +73,17 @@
             "!!$(card("tc-eval"))?.querySelector('.bt-code .bt-l span[class^=mtk]')"; timeout = 30) == true
         @test rows("$(card("tc-eval")).querySelector('.bt-code')") == ["a = 1", "\tb = \"x  y\""]
         @test TK.eval_js(s, "!/\\u00a0/.test($(VP).querySelector('.bt-messages').textContent)") == true
-        @test TK.eval_js(s, "document.querySelectorAll('.monaco-editor').length") == 0
+        @test TK.eval_js(s, "$VP.querySelectorAll('.monaco-editor').length") == 0
+        @test TK.eval_js(s, """(() => {
+            const code = $(card("tc-tab")).querySelector('.bt-code-lines');
+            const range = document.createRange(); range.selectNodeContents(code);
+            const selection = window.getSelection();
+            selection.removeAllRanges(); selection.addRange(range);
+            const text = selection.toString(); selection.removeAllRanges();
+            return text.includes('\\treturn "a  b c"') && !text.includes('\\u00a0');
+        })()""")
+        @test TK.eval_js(s, "window.find('a  b c', false, false, true)")
+        TK.eval_js(s, "window.getSelection().removeAllRanges(); true")
     end
 
     @testset "an expanded edit the transcript drops comes back expanded" begin
@@ -98,7 +108,7 @@
             "[...($(card("tc-long"))?.querySelectorAll('.bt-l-add') || [])].some(l => l.textContent.includes('fast(20)'))"; timeout = 30) == true
         @test TK.wait_for(s, "still expanded", "Math.abs(($(section("tc-long"))?.getBoundingClientRect().height || 0) - $(h)) < 2"; timeout = 20) == true
         @test TK.eval_js(s, "$(card("tc-long")).querySelector('.bt-tool-header').dataset.expanded") == "true"
-        @test TK.eval_js(s, "document.querySelectorAll('.monaco-editor').length") == 0
+        @test TK.eval_js(s, "$VP.querySelectorAll('.monaco-editor').length") == 0
     end
 
     @test isempty(TK.js_errors(s))

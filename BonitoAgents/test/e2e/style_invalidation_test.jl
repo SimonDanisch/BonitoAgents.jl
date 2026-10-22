@@ -21,10 +21,10 @@
                        TK.edit("/p/block$(i).jl", body(i, ""), body(i, "  # checked"); id = "si-$(i)")]
                       for i in 1:30]),
         [TK.end_turn()])
-    TK.new_chat(s; title = "StyleInvalidation")
+    first_chat = TK.new_chat(s; title = "StyleInvalidation")
     TK.send_message(s, "edit everything")
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     chat = "$VP.querySelector('.bt-messages')"
     @test TK.wait_for(s, "the agent done", "!document.querySelector('.bt-busy.bt-busy-active')"; timeout = 120) == true
     @test TK.wait_for(s, "the last diffs highlighted",
@@ -61,6 +61,36 @@
     @info "style recalculation while scrolling" elements largest_recalc = touched recalcs = length(recalcs)
     @test elements > 2000
     @test touched < elements / 2
+
+    # The desktop trace from 2026-10-20 froze for 7.09 seconds while revealing
+    # an ALREADY loaded chat. Its hidden Monaco editors woke together and each
+    # render forced another chat-wide style recalculation. Scrolling alone
+    # misses that trigger: keep two populated chats and switch between them.
+    second_chat = TK.new_chat(s; title = "StyleInvalidationSwitch")
+    TK.send_message(s, "edit everything again")
+    @test TK.wait_for(s, "the second agent done",
+        "!document.querySelector('.bt-busy.bt-busy-active')"; timeout = 120) == true
+    @test TK.wait_for(s, "the second chat highlighted",
+        "$VP.querySelectorAll('.bt-code-diff .bt-l span[class^=mtk]').length > 50"; timeout = 60) == true
+    # Both panes remain mounted; returning to either must keep its static code.
+    @test TK.eval_js(s, "document.querySelectorAll('.bt-chatpane .monaco-editor').length") == 0
+    switch_trace = TK.record_trace(s) do
+        for pid in (first_chat, second_chat, first_chat, second_chat)
+            TK.open_chat(s, pid)
+            @test TK.wait_for(s, "the selected pane shown",
+                "$VP.dataset.panePid === $(TK.json(pid))"; timeout = 20) == true
+            sleep(0.25)
+        end
+    end
+    switch_recalcs = [e for e in switch_trace if get(e, "name", "") == "UpdateLayoutTree" && get(e, "ph", "") == "X"]
+    @test !isempty(switch_recalcs)
+    # Showing a pane necessarily styles that pane once. It must not repeatedly
+    # restyle the thousands of highlighted rows as each editor used to do.
+    broad = count(e -> get(get(e, "args", Dict()), "elementCount", 0) > 2000, switch_recalcs)
+    style_ms = sum(e -> get(e, "dur", 0), switch_recalcs; init = 0) / 1000
+    @info "style recalculation switching existing chats" recalcs = length(switch_recalcs) broad style_ms
+    @test broad <= 8
+    @test TK.eval_js(s, "document.querySelectorAll('.bt-chatpane .monaco-editor').length") == 0
 
     @test isempty(TK.js_errors(s))
     s.agent_fn[] = S.default_agent

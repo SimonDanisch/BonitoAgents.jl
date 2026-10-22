@@ -20,8 +20,8 @@
 isdefined(@__MODULE__, :tour) || include(joinpath(@__DIR__, "walkthrough.jl"))
 
 # ── view-state gates (READ ONLY) ───────────────────────────────────────────────
-dash_visible_js() = "(document.querySelector('.bt-ov-grid')?.offsetParent ?? null) !== null"
-pane_visible_js(pid) = "(document.querySelector('.bt-chatpane[data-pane-pid=$(repr(pid))]')?.offsetParent ?? null) !== null"
+dash_visible_js() = "document.querySelector('.bt-ov-grid')?.checkVisibility() === true"
+pane_visible_js(pid) = "document.querySelector('.bt-chatpane[data-pane-pid=$(repr(pid))]')?.checkVisibility() === true"
 # A sidebar chat entry, addressed by project id (robust — no title matching).
 side_item_js(pid) = "document.querySelector('.bt-side-item[data-project-id=$(repr(pid))]')"
 

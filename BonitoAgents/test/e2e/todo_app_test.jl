@@ -11,7 +11,7 @@
 @testitem "e2e:todo_app" setup = [SharedServer] tags = [:e2e] begin
     const TK = SharedServer.TestKit
     real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     APP = "document.querySelector('.bt-chatpane .bt-todo')?.closest('.bt-chatpane')"
     item(id) = "$APP?.querySelector('.bt-todo-item[data-todo-id=\"$id\"]')"
     # A tool card in the visible pane that ran to completion.

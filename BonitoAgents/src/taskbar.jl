@@ -189,13 +189,13 @@ function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::Taskba
                       status == "in_progress" ? "bt-taskbar-todo-item bt-todo-active" :
                                                 "bt-taskbar-todo-item"
                 DOM.div(content; class = cls)
-            end for (content, status) in ents)...;
+            end for (content, status) in ents);
                 class = "bt-taskbar-todo-rows")
-        DOM.div(DOM.div(head...; class = "bt-taskbar-todo-head"), rows;
+        DOM.div(DOM.div(head; class = "bt-taskbar-todo-head"), rows;
                 class = "bt-taskbar-slot bt-taskbar-todo",
                 dataTaskId = item.id, dataMsgIndex = string(item.msg_index))
     else
-        DOM.div(head...; class = "bt-taskbar-slot",
+        DOM.div(head; class = "bt-taskbar-slot",
                 dataTaskId = item.id, dataMsgIndex = string(item.msg_index))
     end
 end

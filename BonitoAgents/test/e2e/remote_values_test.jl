@@ -25,7 +25,7 @@
     on_b = "remote_session(\"worker-b\"; env_path = $(repr(evalenv)))"   # code for B's session
     real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     card(id) = "$VP?.querySelector('.bt-tool-msg[data-msg-id*=\"$id\"]')"
     # The tool card for `id` finished (either way) and its body shows `text`;
     # a collapsed card is expanded once, the way a user reads a result.

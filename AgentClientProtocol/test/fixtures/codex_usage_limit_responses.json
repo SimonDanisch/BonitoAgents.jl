@@ -1,0 +1,48 @@
+[
+ {
+  "stopReason": "end_turn",
+  "usage": null,
+  "_meta": {
+   "quota": {
+    "token_count": null,
+    "model_usage": []
+   },
+   "jetbrains": {
+    "air": {
+     "version": 1,
+     "sessionFailure": {
+      "id": "01a16316-4618-77b2-b964-5bcbb20f0836:error",
+      "revision": 1,
+      "category": "limit",
+      "severity": "error",
+      "title": "You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Oct 27th, 2026 2:42 PM.",
+      "actions": []
+     }
+    }
+   }
+  }
+ },
+ {
+  "stopReason": "end_turn",
+  "usage": null,
+  "_meta": {
+   "quota": {
+    "token_count": null,
+    "model_usage": []
+   },
+   "jetbrains": {
+    "air": {
+     "version": 1,
+     "sessionFailure": {
+      "id": "01a16316-4e71-7f90-9d24-fb5d37c82216:error",
+      "revision": 1,
+      "category": "limit",
+      "severity": "error",
+      "title": "Error running remote compact task: You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Oct 27th, 2026 2:42 PM.",
+      "actions": []
+     }
+    }
+   }
+  }
+ }
+]

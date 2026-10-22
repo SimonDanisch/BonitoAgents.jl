@@ -211,7 +211,7 @@ function overview_card_dom(state::ServerState, c::ChatCardData)
                 class = "bt-ov-title-row"),
             DOM.div("$(c.msg_count) message$(c.msg_count == 1 ? "" : "s") · $(relative_time_label(c.last_active))";
                     class = "bt-ov-meta"),
-            DOM.div(snippets...; class = "bt-ov-snippets");
+            DOM.div(snippets; class = "bt-ov-snippets");
             class = "bt-ov-body");
         class = "bt-ov-card",
         dataProjectId = c.pid)
@@ -235,7 +235,7 @@ function recent_chats_dom(session::Bonito.Session, state::ServerState,
         cards = page_phase(() -> recent_chat_cards(state), :overview_cards)
         isempty(cards) && return DOM.div("No chats yet — create a project below.";
                                           class = "bt-ov-empty")
-        DOM.div((overview_card_dom(state, c) for c in cards)...; class = "bt-ov-grid")
+        DOM.div((overview_card_dom(state, c) for c in cards); class = "bt-ov-grid")
     end
     current_view === nothing &&
         return DOM.div(OverviewStyles, grid; class = "bt-overview")

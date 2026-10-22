@@ -53,7 +53,7 @@ install() {
 }
 
 checks() {
-    for unit in server authelia caddy; do
+    for unit in server authelia sessions caddy; do
         check "$NAME-$unit is running" sudo systemctl is-active --quiet "$NAME-$unit"
     done
     check "the dashboard wants a login" in_list "$(status "$DOMAIN" "$ORIGIN/")" 302 303 401
@@ -65,7 +65,7 @@ checks() {
         <(curl -sS --max-time 10 -H "Remote-User: roundtrip" -H "Remote-Groups: admins" "http://127.0.0.1:$PORT/")
     check "Caddy's admin API is off" bash -c "! curl -s --max-time 3 http://127.0.0.1:2019/config/ > /dev/null"
     check "the proxy's files are private" test "$(sudo stat -c %a "/var/lib/$NAME/caddy/Caddyfile")" = 600
-    service_user_checks server authelia caddy
+    service_user_checks server authelia sessions caddy
 }
 
 echo "==> 1. install"
@@ -76,7 +76,9 @@ check "the first install prints the admin's setup link" grep -qE "$ORIGIN/invite
 check "…which the server filed with the invites" sudo test ! -e "$STATE/setup_link.json"
 before="$(secrets_digest)"
 authelia_pid() { systemctl show "$NAME-authelia" -p MainPID --value; }
+server_pid()   { systemctl show "$NAME-server" -p MainPID --value; }
 authelia_before="$(authelia_pid)"
+server_before="$(server_pid)"
 
 echo "==> 2. install again (an update)"
 log2="$(mktemp)"
@@ -84,12 +86,12 @@ if ! install 2>&1 | tee "$log2"; then echo "  FAIL  the second install"; failure
 checks
 check "secrets and accounts are kept" test "$(secrets_digest)" = "$before"
 check "no new setup link" bash -c "! grep -q '/invite/' $log2"
-# Authelia keeps every login in memory: an update that restarted it logged out
-# every browser, and their open tabs could not reconnect.
+# Updating an unchanged login service and session store must not restart them.
 check "Authelia kept running through the update (every login stays)" test "$(authelia_pid)" = "$authelia_before"
+check "the update restarted the server" test "$(server_pid)" != "$server_before"
 
 removed() {
-    for unit in server authelia caddy; do
+    for unit in server authelia sessions caddy; do
         check "$NAME-$unit is gone" bash -c "! systemctl cat $NAME-$unit > /dev/null 2>&1"
     done
     check "its binaries are gone" test ! -e "/usr/local/lib/$NAME"
@@ -119,7 +121,7 @@ check "its user is gone" bash -c "! getent passwd $NAME > /dev/null"
 # What a tunnel sees: the server's plain port on 127.0.0.1, one host name.
 local_status() { curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$@" 2> /dev/null; }
 tunnel_checks() {
-    for unit in server authelia; do
+    for unit in server authelia sessions; do
         check "$NAME-$unit is running" sudo systemctl is-active --quiet "$NAME-$unit"
     done
     check "no Caddy behind a tunnel" bash -c "! systemctl cat $NAME-caddy > /dev/null 2>&1"
@@ -132,7 +134,7 @@ tunnel_checks() {
     check "the worker installer is public, and points at the tunnel" \
         grep -q "https://$DOMAIN" <(curl -sS --max-time 10 "http://127.0.0.1:$PORT/install.sh")
     check "the answers are saved" sudo grep -q '"tls": "tunnel"' "$STATE/proxy.json"
-    service_user_checks server authelia
+    service_user_checks server authelia sessions
 }
 tunnel_install() {
     bash "$ASSETS/install_server.sh" --instance "$INSTANCE" "$@" --no-update --no-prompt
@@ -154,6 +156,19 @@ log5="$(mktemp)"
 if ! tunnel_install 2>&1 | tee "$log5"; then echo "  FAIL  the tunnel install"; failures=$((failures + 1)); fi
 tunnel_checks
 check "the first install prints the admin's setup link" grep -qE "https://$DOMAIN/invite/[0-9a-f]{64}" "$log5"
+
+echo "==> 7b. an update that fails partway leaves everything running"
+# The server serves until its restart near the end, Authelia until it changed:
+# an Authelia release that does not exist stops the run before either.
+server_before="$(server_pid)"
+authelia_before="$(authelia_pid)"
+log6="$(mktemp)"
+if tunnel_install --authelia-version 0.0.0 > "$log6" 2>&1; then
+    echo "  FAIL  an update with a missing Authelia release went through"; failures=$((failures + 1))
+fi
+check "the server is the one from before" test "$(server_pid)" = "$server_before"
+check "Authelia is the one from before" test "$(authelia_pid)" = "$authelia_before"
+tunnel_checks
 
 echo "==> 8. to Caddy and back: Caddy comes and goes with the mode"
 if ! install > /dev/null 2>&1; then echo "  FAIL  the switch to Caddy"; failures=$((failures + 1)); fi

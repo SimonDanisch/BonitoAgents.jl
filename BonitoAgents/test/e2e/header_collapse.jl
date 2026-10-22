@@ -28,7 +28,7 @@ const TK = TestKit
 
 # All queries scope to the VISIBLE chat pane — the shared soak server keeps
 # background panes mounted, so document-wide selectors can read a stale pane.
-const PANE = "[...document.querySelectorAll('.bt-chatpane')].find(x => x.offsetParent !== null)"
+const PANE = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
 
 visible(s, sel) = TK.eval_js(s, """(() => {
     const p = $(PANE);

@@ -12,7 +12,7 @@
     const TK = SharedServer.TestKit
     s = TK.dev_server(agent = p -> [TK.text("reply to: $(p)"), TK.end_turn()])
     PANE(pid) = "document.querySelector('.bt-chatpane[data-pane-pid=\"$(pid)\"]')"
-    shown(pid) = "(p => !!p && p.style.display === 'flex' && p.dataset.btSettled === '1')($(PANE(pid)))"
+    shown(pid) = "(p => !!p && p.getAttribute('aria-hidden') !== 'true' && p.dataset.btSettled === '1')($(PANE(pid)))"
     replied(t, text) = TK.wait_for(t, "the reply to $(text)",
         "($(PANE(TK.eval_js(t, "document.querySelector('.bt-main-views').dataset.activeView")))?.textContent || '').includes('reply to: $(text)')";
         timeout = 60)
@@ -29,7 +29,7 @@
                 const p = document.querySelector('.bt-chatpane[data-pane-pid="' + view + '"]');
                 const card = [...document.querySelectorAll('.bt-view-overlay .bt-loading-wrap')].some(c =>
                     c.offsetParent !== null && getComputedStyle(c).visibility !== 'hidden' && c.style.display !== 'none');
-                const kind = !view ? 'home' : card ? 'card' : (p && p.style.display === 'flex' && p.dataset.btSettled) ? 'pane' : 'blank';
+                const kind = !view ? 'home' : card ? 'card' : (p && p.getAttribute('aria-hidden') !== 'true' && p.dataset.btSettled) ? 'pane' : 'blank';
                 const last = window.__seen[window.__seen.length - 1];
                 if (!last || last[1] !== kind) window.__seen.push([Math.round(performance.now() - t0), kind]);
             }, 50); return true; })()""")

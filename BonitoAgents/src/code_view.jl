@@ -82,10 +82,11 @@ function middle_steps(a::AbstractVector, b::AbstractVector, max_d::Int)
     n, m = length(a), length(b)
     n == 0 && return fill('+', m)
     m == 0 && return fill('-', n)
-    offset = n + m + 2
-    v = zeros(Int, 2 * (n + m) + 3)          # v[k + offset]: furthest x on diagonal k
+    limit = min(n + m, max_d)
+    offset = limit + 2
+    v = zeros(Int, 2 * limit + 3)            # only diagonals within the search budget
     trace = Vector{Vector{Int}}()            # trace[d + 1][k + d + 2]: v as round d began
-    for d in 0:min(n + m, max_d)
+    for d in 0:limit
         push!(trace, v[(offset - d - 1):(offset + d + 1)])
         for k in (-d):2:d
             x = (k == -d || (k != d && v[k - 1 + offset] < v[k + 1 + offset])) ?
@@ -163,19 +164,25 @@ function diff_counts(ops::AbstractString)
 end
 
 function Bonito.jsrender(session::Session, v::CodeView)
-    src = DOM.pre(v.text; class = "bt-code-src")
-    return Bonito.jsrender(session, DOM.div(src, mount_code_js(src);
+    # Source payload, consumed by mountCode, never a second visible code view.
+    # Otherwise Chrome lays out every source line before the module arrives.
+    src = DOM.pre(v.text; class = "bt-code-src", hidden = true)
+    return Bonito.jsrender(session, DOM.div(src, mount_code_js(src, v);
         class = "bt-code", dataLang = v.language, dataPath = v.path))
 end
 
 function Bonito.jsrender(session::Session, v::DiffView)
-    old = DOM.pre(v.old; class = "bt-code-src")
-    new = DOM.pre(v.new; class = "bt-code-src")
-    return Bonito.jsrender(session, DOM.div(old, new, mount_code_js(old);
+    old = DOM.pre(v.old; class = "bt-code-src", hidden = true)
+    new = DOM.pre(v.new; class = "bt-code-src", hidden = true)
+    return Bonito.jsrender(session, DOM.div(old, new, mount_code_js(old, v);
         class = "bt-code bt-code-diff", dataLang = v.language, dataPath = v.path,
         dataOps = v.ops))
 end
 
 # Runs right after its surrounding DOM is parsed (inline JSCode child).
-mount_code_js(src) =
-    js"""$(ChatLib).then(lib => lib.mountCode($(src).parentElement, $(BonitoBook.Monaco)))"""
+function mount_code_js(src, v::Union{CodeView,DiffView})
+    # Plain shell/text output needs no tokenizer download or initialization.
+    plain = v.language == "plaintext" || (isempty(v.language) && isempty(v.path))
+    highlighter = plain ? nothing : BonitoBook.CodeTokenizer
+    return js"""$(ChatLib).then(lib => lib.mountCode($(src).parentElement, $(highlighter)))"""
+end

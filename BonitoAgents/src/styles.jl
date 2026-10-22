@@ -86,7 +86,7 @@ A `⋯` button that opens `items` (`.bt-menu-item` buttons) in a popover.
 action_menu(items...; title::AbstractString = "More actions") = DOM.div(
     DOM.button("⋯"; class = "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger",
                title = title, onclick = MENU_TOGGLE_JS),
-    DOM.div(items...; class = "bt-menu-list");
+    DOM.div(items; class = "bt-menu-list");
     class = "bt-menu")
 
 """
@@ -400,7 +400,12 @@ function page_load_report(session::Bonito.Session; give_up::Real = 60)
             const n = performance.getEntriesByType('navigation')[0];
             const slow = performance.getEntriesByType('resource')
                 .filter(e => e.duration > 1000).sort((a, b) => b.duration - a.duration).slice(0, 5)
-                .map(e => [e.name.replace(location.origin, '').slice(0, 100), Math.round(e.duration), Math.round(e.transferSize / 1024)]);
+                .map(e => [e.name.replace(location.origin, '').slice(0, 100), Math.round(e.duration), Math.round(e.transferSize / 1024), {
+                    before_request_ms: e.requestStart ? Math.round(e.requestStart - e.startTime) : null,
+                    response_wait_ms: e.responseStart ? Math.round(e.responseStart - e.requestStart) : null,
+                    download_ms: e.responseStart ? Math.round(e.responseEnd - e.responseStart) : null,
+                    protocol: e.nextHopProtocol, initiator: e.initiatorType
+                }]);
             navigator.sendBeacon($(PAGE_TIMING_ROUTE), JSON.stringify(Object.assign({
                 why, view: document.querySelector('.bt-main-views')?.dataset.activeView || '',
                 html: Math.round(n ? n.responseEnd : 0), scripts: Math.round(n ? n.domContentLoadedEventEnd : 0),
@@ -887,7 +892,10 @@ const FILE_VIEW_CSS = [
         "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto",
         "padding" => "12px 16px", "display" => "flex", "flex-direction" => "column",
         "gap" => "10px"),
+    # Cells keep their height: the notebook scrolls. Shrinkable cells squeezed
+    # every cell of a notebook taller than its panel and clipped their outputs.
     CSS(".bt-fv-nb-cell",
+        "flex-shrink" => "0",
         "border" => "1px solid var(--bt-border)",
         "border-radius" => "var(--bt-radius-sm)", "overflow" => "hidden"),
     CSS(".bt-fv-nb-md", "padding" => "2px 14px", "background" => "var(--bt-surface)"),
@@ -3001,7 +3009,11 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-subsection-body > .bt-code", "overflow" => "visible"),
     CSS(".bt-code-src",
         "margin" => "0", "font" => "inherit", "white-space" => "pre", "tab-size" => "4"),
-    CSS(".bt-code-lines", "width" => "max-content", "min-width" => "100%"),
+    CSS(".bt-code-lines", "width" => "max-content", "min-width" => "100%",
+        "content-visibility" => "auto",
+        "contain-intrinsic-block-size" => "auto var(--bt-code-height, 0px)"),
+    CSS(".bt-code-chunk", "content-visibility" => "auto",
+        "contain-intrinsic-block-size" => "auto var(--bt-code-height, 0px)"),
     CSS(".bt-l", "white-space" => "pre", "tab-size" => "4", "min-height" => "18px"),
     # A diff's gutter: both line numbers and the sign, from `data-g`. Not text,
     # so copying a diff copies code. It scrolls sideways with the code: a sticky

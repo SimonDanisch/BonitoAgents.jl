@@ -24,8 +24,8 @@
     # state exactly as `continue_yolo!` does, so a testset can drive several
     # turns in a row and watch the protocol move.
     function step!(y, reply; worked = false, produced = true,
-                   errored = false, stop = "end_turn")
-        t = T(reply, produced, worked, errored, stop)
+                   errored = false, stop = "end_turn", failure = "")
+        t = T(reply, produced, worked, errored, stop, failure)
         d = D(y, t)
         BonitoAgents.yolo_apply!(y, d, t)
         return d
@@ -251,6 +251,39 @@
         step!(y2, "working")
         @test step!(y2, S; errored = true).action === :stop
         @test step!(y2, S; errored = true).disarm
+
+        # When the provider said what went wrong, the stop says it too: the loop
+        # runs unattended, and "why did it stop" is read long after the notice.
+        y3 = Y()
+        step!(y3, "working")
+        limit = "You’ve hit your usage limit. Try again at Oct 27th."
+        d = step!(y3, ""; worked = true, errored = true, failure = limit)
+        @test d.action === :stop && d.disarm
+        @test d.reason == "the turn failed ($limit)"
+    end
+
+    # The 2026-10-22 runaway: every Codex turn failed at the compaction step, and
+    # the compaction's tool card counted as work, which reset the idle and repeat
+    # guards each time. Compaction is housekeeping, not the agent doing anything.
+    @testset "a context compaction is not work" begin
+        msg(T, name) = T(BonitoAgents.Message("id", "think", name, "Compact conversation",
+                                              "completed", "", 0.0, nothing, nothing))
+        compaction = msg(BonitoAgents.builtin_msg_type("think",
+            BonitoAgents.AgentClientProtocol.CONTEXT_COMPACTION_TOOL), "ContextCompaction")
+        @test compaction isa BonitoAgents.CompactionToolMsg
+        @test !BonitoAgents.does_work(compaction)
+        @test BonitoAgents.does_work(msg(BonitoAgents.GenericToolMsg, ""))
+        @test BonitoAgents.does_work(msg(BonitoAgents.EditToolMsg, "Edit"))
+
+        # Turns that only compact are idle turns, so the idle guard ends the loop.
+        y = Y()
+        d = step!(y, "working"; worked = true)
+        for n in 1:BonitoAgents.YOLO_IDLE_LIMIT - 1
+            d = step!(y, "pass $n"; worked = false)
+            @test d.action === :continue
+        end
+        d = step!(y, "pass $(BonitoAgents.YOLO_IDLE_LIMIT)"; worked = false)
+        @test d.action === :stop && d.disarm
     end
 
     @testset "a refused turn stops the loop and switches Yolo off" begin

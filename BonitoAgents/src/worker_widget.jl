@@ -589,7 +589,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     errors_obs = map(results_obs, scan_busy) do results, busy
         DOM.div(
             (DOM.div("Error: $(r["error"])"; class = "bt-error")
-             for r in results if haskey(r, "error") && !busy)...;
+             for r in results if haskey(r, "error") && !busy);
             class = "bt-errors-list")
     end
 

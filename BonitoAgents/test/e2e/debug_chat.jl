@@ -32,11 +32,12 @@ import BonitoAgents
 const REPO_ROOT = BonitoAgents.bonitoagents_repo_root()
 
 # The VISIBLE chat pane's header fields. Several panes can be in the DOM at once
-# (the fast-switch design keeps them), so visibility is what picks the live one.
+# (the fast-switch design keeps them), so visibility is what picks the live one:
+# `checkVisibility`, since hidden panes keep their layout and their offsetParent.
 const HEADER_TITLE = """([...document.querySelectorAll('.bt-header-title-edit')]
-    .filter(e => e.offsetParent)[0]?.value || '')"""
+    .filter(e => e.checkVisibility())[0]?.value || '')"""
 const HEADER_ENV = """([...document.querySelectorAll('.bt-header-env')]
-    .filter(e => e.offsetParent)[0]?.textContent || '')"""
+    .filter(e => e.checkVisibility())[0]?.textContent || '')"""
 # Sidebar entries whose label is the debug chat — one, no matter how often the
 # button is pressed.
 const DEBUG_ENTRIES = """[...document.querySelectorAll('.bt-side-item')]
@@ -46,7 +47,7 @@ const DEBUG_ENTRIES = """[...document.querySelectorAll('.bt-side-item')]
 # design keeps them), so visibility is what picks the live one; the header's
 # menu items are queried THROUGH it (they are display:none while the menu is
 # closed, so they cannot be picked by their own visibility).
-const VISIBLE_PANE = """([...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null))"""
+const VISIBLE_PANE = """(document.querySelector('.bt-chatpane[aria-hidden=false]'))"""
 # The visible pane's dev-mode item in the ⋯ menu. Its CLASS is the state the
 # click handler reads, and its LABEL is what the user reads — so the two answer
 # different questions and both are used.

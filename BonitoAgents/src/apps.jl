@@ -512,8 +512,8 @@ function apps_section(session::Bonito.Session, state::ServerState,
     tiles = [app_tile(session, state, app, current_view, busy) for app in apps]
     # The dialogs outside the grid: a tile's hover state must not reach them.
     return DOM.div(AppsStyles,
-                   DOM.div(first.(tiles)...; class = "bt-apps"),
-                   last.(tiles)...)
+                   DOM.div(first.(tiles); class = "bt-apps"),
+                   last.(tiles))
 end
 
 # One app's tile and its setup dialog.
@@ -574,12 +574,12 @@ function app_details(session::Bonito.Session, app::AgentApp, runs_on::Observable
     tools = app_tools(app)
     isempty(tools) || push!(parts,
         DOM.div(DOM.div("Tools for agents"; class = "bt-app-details-label"),
-                DOM.div((DOM.code(String(t.name)) for t in tools)...; class = "bt-app-details-tools")))
+                DOM.div((DOM.code(String(t.name)) for t in tools); class = "bt-app-details-tools")))
     push!(parts, DOM.div(map(session, runs_on) do w
         isempty(w) ? "Not set up yet: a click picks the worker its chat runs on." :
                      "Its chat runs on $w."
     end; class = "bt-app-details-where"))
-    return DOM.div(parts...; class = "bt-app-details", role = "tooltip")
+    return DOM.div(parts; class = "bt-app-details", role = "tooltip")
 end
 
 # The setup dialog: what the app is, and the worker its chat will run on.
@@ -597,7 +597,7 @@ function app_setup(session::Bonito.Session, state::ServerState, app::AgentApp,
                             type = "button", class = k == i ? "bt-app-choice bt-on" : "bt-app-choice",
                             var"aria-pressed" = string(k == i),
                             onclick = js"event => $(chosen).notify($(w.worker_id))")
-                 for (k, w) in enumerate(ws))...;
+                 for (k, w) in enumerate(ws));
                 class = "bt-app-choices", role = "group", var"aria-label" = "Worker")
     end
     none_online = map(ws -> isempty(online(ws)), session, state.workers)
@@ -605,7 +605,7 @@ function app_setup(session::Bonito.Session, state::ServerState, app::AgentApp,
     return DOM.div(
         DOM.div(DOM.img(; src = app_icon_src(app), alt = "", class = "bt-app-logo", draggable = "false"),
                 DOM.div(DOM.div(title; class = "bt-app-setup-title"),
-                        (isempty(desc) ? () : (DOM.p(desc; class = "bt-app-setup-desc"),))...);
+                        (isempty(desc) ? () : (DOM.p(desc; class = "bt-app-setup-desc"),)));
                 class = "bt-app-setup-head"),
         DOM.div("Its chat runs an agent, on the worker you pick:"; class = "bt-app-setup-label"),
         choices,

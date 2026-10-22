@@ -67,6 +67,12 @@ mkpath(joinpath(VIEW_CWD, "docs"))
 write(joinpath(VIEW_CWD, "docs", "pics.md"),
       "# Pics\n\n![a dot](../pixel.png)\n\n<img src=\"../pixel.png\" alt=\"raw\">\n")
 write(joinpath(VIEW_CWD, "table.csv"), "name,score\nada,42\ngrace,7\nalan,13\n")
+# Thirty cells with output: far taller than its panel.
+let cell(i) = """{"cell_type":"code","execution_count":$i,"metadata":{},"source":["x = $i\\n","x + 1"],""" *
+              """"outputs":[{"output_type":"stream","name":"stdout","text":["one\\n","two\\n","three\\n","four"]}]}"""
+    write(joinpath(VIEW_CWD, "long.ipynb"),
+          """{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[$(join(cell.(1:30), ","))]}""")
+end
 # A unit square as two triangles — the mesh viewer must report exactly this.
 write(joinpath(VIEW_CWD, "square.obj"),
       "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n")
@@ -241,6 +247,22 @@ function run_suite(server)
             @test TK.wait_for(server, "preview shows the saved text",
                 "(document.querySelector('$(view_sel("notes.md")) .bt-fv-markdown')?.textContent || '').includes('Edited By The Test')";
                 timeout = 30) == true
+        end
+
+        @testset "a notebook taller than its panel scrolls, its cells whole" begin
+            # The notebook is a fixed-height flex column that scrolls. Its cells
+            # used to be allowed to shrink, so a long notebook squeezed every
+            # cell and its overflow cut the outputs off instead of scrolling.
+            TK.eval_js(server, open_file("long.ipynb"))
+            @test TK.wait_for(server, "the notebook's cells",
+                "document.querySelectorAll('$(view_sel("long.ipynb")) .bt-fv-nb-cell').length === 30";
+                timeout = 40) == true
+            @test TK.eval_js(server, """(() => {
+                const nb = document.querySelector('$(view_sel("long.ipynb")) .bt-fv-notebook');
+                const cells = [...nb.querySelectorAll('.bt-fv-nb-cell')];
+                return nb.scrollHeight > nb.clientHeight + 200 &&
+                    cells.every(c => c.scrollHeight <= c.clientHeight + 1);
+            })()""") === true
         end
 
         @testset "a csv opens as a sortable table" begin

@@ -3,8 +3,8 @@
 #
 #   bash BonitoAgents/assets/uninstall_server.sh [options]
 #
-# Stops, disables and removes the three systemd units (server, Authelia, Caddy)
-# and the Caddy + Authelia binaries in /usr/local/lib/bonitoagents. The data dir
+# Stops, disables and removes the systemd units (server, login, sessions, Caddy)
+# and its Caddy, Authelia and Valkey binaries in /usr/local/lib/bonitoagents. The data dir
 # /var/lib/bonitoagents (projects and chats, workers.json / projects.json,
 # accounts, worker credentials, Authelia's secrets and database, Caddy's
 # certificates) stays: a reinstall, or running the server without the proxy
@@ -43,7 +43,7 @@ CONFIG_DIR=""
 [[ -n "$INSTANCE" ]] || CONFIG_DIR="/etc/bonitoagents"
 BIN_ROOT="/usr/local/lib/$NAME"
 # Reverse start order: the proxy goes first, the server last.
-SERVICES=("$NAME-caddy" "$NAME-authelia" "$NAME-server")
+SERVICES=("$NAME-caddy" "$NAME-authelia" "$NAME-sessions" "$NAME-server")
 
 step() { echo ""; echo "==> $*"; }
 ok()   { echo "    ok   : $*"; }
@@ -89,7 +89,7 @@ done
 [[ $removed_unit -eq 1 ]] && sudo systemctl daemon-reload
 
 # ── Binaries ──────────────────────────────────────────────────────────────────
-step "Remove Caddy + Authelia"
+step "Remove Caddy + Authelia + Valkey"
 if [[ -d "$BIN_ROOT" ]]; then
     sudo rm -rf "$BIN_ROOT"
     ok "removed $BIN_ROOT"

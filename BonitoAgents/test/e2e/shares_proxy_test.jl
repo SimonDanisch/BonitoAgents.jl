@@ -12,7 +12,7 @@
     import BonitoAgents as BT
     using Base64: base64decode
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     card(id) = "$VP?.querySelector('.bt-tool-msg[data-msg-id*=\"$id\"]')"
     card_link(id) = """(() => {
         const c = $(card(id)); if (!c) return false;

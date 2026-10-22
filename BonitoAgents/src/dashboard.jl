@@ -1842,7 +1842,7 @@ function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPic
                 class   = "bt-picker-row",
                 onclick = js"event => $(p.path).notify($(js_path(joinpath(wdir, e.name))));")
              for e in entries]
-        DOM.div(rows...; class = "bt-picker bt-slide-in")
+        DOM.div(rows; class = "bt-picker bt-slide-in")
     end
 
     DOM.div(path_row, list)
@@ -2370,7 +2370,7 @@ function copy_project_controls(session::Bonito.Session, state::ServerState, busy
     # `class` is the stable hook the e2e suite queries by, not the placeholder.
     worker_select(id_obs::Observable, cls::String) = DOM.select(
         (DOM.option(w.name; value = w.worker_id,
-                    selected = w.worker_id == id_obs[]) for w in values(state.workers[]) if visible(state, w))...;
+                    selected = w.worker_id == id_obs[]) for w in values(state.workers[]) if visible(state, w));
         class = cls,
         value = id_obs,
         onchange = js"event => $(id_obs).notify(event.target.value)")
@@ -2397,7 +2397,7 @@ function copy_project_controls(session::Bonito.Session, state::ServerState, busy
                         # when the two differ.
                         (DOM.option(titled(p) ? "$(p.title[]) ($(p.name))" : p.name;
                                     value = p.id,
-                                    selected = p.id == src_project[]) for p in wid_projs)...;
+                                    selected = p.id == src_project[]) for p in wid_projs);
                         class = "bt-cp-src-project",
                         value = src_project,
                         onchange = js"event => $(src_project).notify(event.target.value)")
@@ -2560,7 +2560,7 @@ function debug_section(session::Bonito.Session, state::ServerState,
             return DOM.span("no worker connected"; class = "bt-debug-noworker")
         return DOM.select(
             (DOM.option(w.name; value = w.worker_id, selected = w.worker_id == chosen[])
-             for w in online)...;
+             for w in online);
             class = "bt-debug-worker",
             title = "The worker the debug chat runs on; its checkout is what the agent edits",
             onchange = js"event => $(chosen).notify(event.target.value)")

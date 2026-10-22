@@ -278,6 +278,33 @@ codex_shell(command; output = "", exit_code = 0, status = "completed",
 end
 
 """
+    codex_compaction(; complete, id) -> Dict
+
+Agent event for codex compacting the conversation: a nameless `think` tool
+titled "Compact conversation", tagged only by its AIR `contextCompaction` meta.
+`complete = false` leaves it open, which is what a compaction that FAILED does
+on the real wire.
+"""
+codex_compaction(; complete::Bool = true, id = nothing) = begin
+    d = Dict{String,Any}("type" => "codex_compaction", "complete" => complete)
+    id === nothing || (d["id"] = String(id))
+    d
+end
+
+"""
+    codex_failure(title; category, severity, id) -> Dict
+
+Agent event that ends the turn the way codex does when it FAILED: a plain
+`end_turn` whose response carries the failure record (AIR `sessionFailure`).
+Real ids look like `<turn id>:error`.
+"""
+codex_failure(title::AbstractString; category = "limit", severity = "error",
+              id = "turn-$(rand(UInt32)):error") =
+    Dict{String,Any}("type" => "codex_failure", "record" => Dict{String,Any}(
+        "id" => String(id), "revision" => 1, "category" => String(category),
+        "severity" => String(severity), "title" => String(title), "actions" => Any[]))
+
+"""
     tool(; kind, title, status, content, tool_name, id, complete, open_status,
            raw_input) -> Dict
 
@@ -648,6 +675,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       scan_on_connect::Bool = false,
                       proxy::Bool = false,
                       tunnel::Bool = false,
+                      session_store_bin::AbstractString = "",
                       kwargs...)
     ensure_display!()
     # One stack at a time in this process — see `RELEASE_SHARED` above. A
@@ -734,7 +762,8 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     bins = login ? proxy_binaries() : nothing
     proxy_kw = login ? (; proxy = BT.DevProxy(; caddy_bin = bins.caddy, authelia_bin = bins.authelia,
                                               admin = admin.user, password = admin.password,
-                                              totp_secret = admin.secret, tunnel)) : (;)
+                                              totp_secret = admin.secret, tunnel,
+                                              session_store_bin = String(session_store_bin))) : (;)
     h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, proxy_kw..., kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Clean slate for the in-process MCP (armed lazily on the first MCP call,
@@ -1104,15 +1133,22 @@ const PANE_SCOPE_JS = raw"""(() => {
         // (app_detach moves embeds OUT of the chat pane into workspace panels —
         // scoping those would hide a detached embed), nor sidebar/dashboard/lens
         // header selectors (single, not per-pane).
-        const MSG = /(^|[\s,>])\.bt-(messages|agent-msg|user-msg|tool-msg|tool-title|tool-header|tool-body|tool-status|tool-summary|plan-msg|taskbar|thinking|diff-block|search-row|eval-section|section-label|multi-diff|busy|text-input|send-btn|lens|header-provider)/;
+        const MSG = /(^|[\s,>])\.bt-(messages|agent-msg|user-msg|tool-msg|tool-title|tool-header|tool-body|tool-status|tool-summary|plan-msg|taskbar|new-msg-pill|thinking|diff-block|search-row|eval-section|section-label|multi-diff|busy|text-input|send-btn|lens|header-provider)/;
+        const empty = document.createDocumentFragment().querySelectorAll('*');
+        // The OPEN chat's pane (the one the sidebar selected), also while a tab
+        // of the same workspace group, such as a file or the change review, is in
+        // front of it: tests drive their chat from those tabs. Hidden chats keep
+        // their layout (content-visibility), so `offsetParent` cannot tell them
+        // apart; `aria-hidden` can. With no chat open, nothing matches.
         const visiblePane = () => {
             const panes = [...document.querySelectorAll('.bt-view-chats .bt-chatpane, .bt-chatpane')];
-            return panes.find(p => p.offsetParent !== null) || null;
+            return panes.find(p => p.getAttribute('aria-hidden') !== 'true') || null;
         };
         const wrap = (orig, all) => function(sel) {
-            if (typeof sel === 'string' && MSG.test(sel)) {
+            if (typeof sel === 'string' && MSG.test(sel) && !sel.includes('.bt-chatpane')) {
                 const p = visiblePane();
                 if (p) return all ? p.querySelectorAll(sel) : p.querySelector(sel);
+                if (Document.prototype.querySelector.call(document, '.bt-chatpane')) return all ? empty : null;
             }
             return orig.call(this, sel);
         };
@@ -1345,15 +1381,19 @@ Click the first element matching the CSS selector. Throws if it's missing.
 function click(s::TestServer, selector::AbstractString)
     sel = String(selector)
     # Prefer the VISIBLE match. SharedServer keeps other chats' panes mounted but
-    # hidden (display:none ⇒ offsetParent null), so a bare `querySelector` on a
-    # pane element (`.bt-stop-btn`, `.bt-send-btn`, …) could resolve to a STALE
-    # pane and click the wrong chat. Targeting the visible one auto-scopes every
-    # click to the active pane, so a test can't leak across panes by accident.
-    # Falls back to the first match when nothing is "visible" (e.g. a global
-    # dashboard control), preserving old behaviour for non-pane selectors.
+    # hidden, so a bare `querySelector` on a pane element (`.bt-stop-btn`,
+    # `.bt-yolo-bar`, …) could resolve to a STALE pane and click the wrong chat.
+    # Targeting the visible one auto-scopes every click to the active pane, so a
+    # test can't leak across panes by accident. Falls back to the first match
+    # when nothing is "visible" (e.g. a global dashboard control), preserving old
+    # behaviour for non-pane selectors.
+    #
+    # `VIS`, not `offsetParent`: a hidden pane is `content-visibility: hidden`,
+    # whose elements keep their offsetParent. The offsetParent test picked the
+    # hidden chat's Yolo button and armed the wrong chat.
     ok = eval_js(s, """(() => {
         const els = [...document.querySelectorAll($(json(sel)))];
-        const el = els.find(e => e.offsetParent !== null) || els[0];
+        const el = els.find($VIS) || els[0];
         if (!el) return false;
         el.click();
         return true;
@@ -1371,7 +1411,7 @@ browser itself does on a click, such as selecting text.
 """
 function real_click(s::TestServer, selector::AbstractString)
     point = eval_js(s, """(() => {
-        const el = [...document.querySelectorAll($(json(String(selector))))].find(e => e.offsetParent !== null);
+        const el = [...document.querySelectorAll($(json(String(selector))))].find(e => e.checkVisibility());
         if (!el) return null;
         el.scrollIntoView({block: 'center'});
         const r = el.getBoundingClientRect();
@@ -1410,7 +1450,7 @@ thumb jumps there) and let go. Returns the label the rail showed while held,
 e.g. "Message 150 of 300".
 """
 function drag_rail!(s::TestServer, f::Real; hold::Real = 0.5)
-    pane = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    pane = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     r = eval_js(s, """(() => { const rail = $pane?.querySelector('.bt-rail');
         if (!rail || rail.classList.contains('bt-rail-hidden')) return null;
         const t = rail.querySelector('.bt-rail-thumb').getBoundingClientRect(), b = rail.getBoundingClientRect();
@@ -1744,6 +1784,46 @@ function another_browser(s::TestServer)
     return b
 end
 
+# Fault injection on this fixture's real login process; browsers keep their
+# cookies, as they do through a service restart on an installed server.
+function restart_login!(s::TestServer)
+    rig = s.h.proxy
+    rig === nothing && error("restart_login!: this server has no login service")
+    BT.stop_worker_proc!(rig.authelia)
+    cfg = s.h.state.auth.config
+    logfile = joinpath(rig.dir, "authelia.log")
+    rig.authelia = run(pipeline(`setpriv --pdeathsig KILL -- $(cfg.authelia_bin) --config $(BT.authelia_config_file(cfg))`;
+                               stdout = logfile, stderr = logfile); wait = false)
+    function ready()
+        process_running(rig.authelia) || return false
+        try
+            close(Sockets.connect(Sockets.IPv4(0x7f000001), cfg.authelia_port))
+            return true
+        catch e
+            e isa Base.IOError || rethrow()
+            return false
+        end
+    end
+    timedwait(ready, 30.0; pollint = 0.1) === :ok ||
+        error("restart_login!: the login service did not restart; see $(logfile)")
+    return s
+end
+
+function restart_session_store!(s::TestServer)
+    rig = s.h.proxy
+    (rig === nothing || rig.session_store === nothing) &&
+        error("restart_session_store!: this fixture has no persistent session store")
+    cmd = rig.session_store.cmd
+    BT.stop_worker_proc!(rig.session_store)
+    logfile = joinpath(rig.dir, "sessions.log")
+    rig.session_store = run(pipeline(cmd; stdout = logfile, stderr = logfile); wait = false)
+    socket = s.h.state.auth.config.session_socket
+    ready() = process_running(rig.session_store) && ispath(socket)
+    timedwait(ready, 30.0; pollint = 0.1) === :ok ||
+        error("restart_session_store!: the store did not restart; see $(logfile)")
+    return s
+end
+
 """
     another_tab(s; route = "/") -> TestServer
 
@@ -1758,7 +1838,15 @@ function another_tab(s::TestServer; route::AbstractString = "/")
     win = ElectronCall.Window(ctx.app; show = false, width = s.browser_size[1], height = s.browser_size[2],
                               webPreferences = Dict{String,Any}("offscreen" => true, "disableDialogs" => true,
                                   "backgroundThrottling" => false, "paintWhenInitiallyHidden" => true))
-    ECT.keep_headless!(ctx.app, win)
+    # The CI-pinned ElectronCall predates Testing.keep_headless!. Set these
+    # window options through Electron, which both supported versions expose.
+    run(ctx.app, """(() => {
+        const wc = electron.BrowserWindow.fromId($(win.id)).webContents;
+        wc.setWindowOpenHandler(() => ({action: 'allow',
+            overrideBrowserWindowOptions: {show: false, webPreferences: {offscreen: true}}}));
+        wc.session.on('will-download', (e, item) =>
+            item.setSavePath(electron.app.getPath('temp') + '/' + item.getFilename()));
+        return true; })()""")
     tab = ECT.TestContext(ctx.app, win, false)
     capture_console!(tab)
     follow_pane_scope!(tab)
@@ -1960,9 +2048,23 @@ end
 # Everything below drives the real UI (clicks, typing) instead of poking
 # server-side models, so the tests exercise the same path a user does.
 
-# Visible-only filter: skip elements that are display:none / detached. The
-# dashboard keeps several pickers in the DOM at once; only one is shown.
-const VIS = "el => el && el.offsetParent !== null"
+# Visible-only filter: the dashboard keeps several pickers in the DOM at once and
+# only one is shown; every opened chat keeps its pane. Visible to a test means
+# rendered (`checkVisibility`), or part of the OPEN chat while a
+# tab of its workspace group (a file, the change review) is in front of it, unless
+# something between it and that panel is `display: none` (a closed menu). Tests
+# drive their chat from those tabs, as they could when hidden panels only had
+# `visibility: hidden`. Other chats' panes stay excluded. They keep their layout
+# under `content-visibility: hidden`, so `offsetParent` cannot tell them apart.
+const VIS = """(el => {
+    if (!el) return false;
+    if (el.checkVisibility()) return true;
+    const panel = el.closest('.bw-ws-panel[data-bw-visible=false]');
+    if (!panel || !el.closest('.bt-chatpane[aria-hidden=false]')) return false;
+    for (let n = el; n && n !== panel; n = n.parentElement)
+        if (getComputedStyle(n).display === 'none') return false;
+    return true;
+})"""
 
 "Click the first *visible* button whose trimmed text equals `label`."
 function click_text(s::TestServer, label::AbstractString)
@@ -2127,7 +2229,7 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # Wait for a worker card to be on screen. Its "+ Project" toggle is the only
     # create path now (the dashboard's global "+ New project" form is gone).
     CARD_BTN_JS = """[...document.querySelectorAll('button')].some(b =>
-        b.offsetParent && (b.innerText || '').trim() === '+ Project')"""
+        b.checkVisibility() && (b.innerText || '').trim() === '+ Project')"""
     PICKER_PATH_VISIBLE = "[...document.querySelectorAll('.bt-picker-path')].some($VIS)"
     wait_for(s, "worker card on screen", CARD_BTN_JS; timeout = 30)
     # "+ Project" is a TOGGLE (`picker_state` flips between this worker and ""),
@@ -2148,7 +2250,7 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
         const cards = [...document.querySelectorAll('.bt-card')].filter(c =>
             $(isempty(worker) ? "true" : "(c.querySelector('input.bt-card-name')?.value || '').trim() === $(json(String(worker)))"));
         const b = cards.flatMap(c => [...c.querySelectorAll('button')]).find(b =>
-            b.offsetParent && (b.innerText || '').trim() === '+ Project');
+            b.checkVisibility() && (b.innerText || '').trim() === '+ Project');
         if (!b) return false; b.click(); return true; })()"""
     opened = false
     for _ in 1:5
@@ -2201,7 +2303,7 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     wait_for(s, "new chat selected + input live",
              "(() => { const a=document.querySelector('.bt-side-item.bt-side-active'); " *
              "return !!a && !!(a.getAttribute('data-project-id')) && " *
-             "[...document.querySelectorAll('.bt-text-input')].some(e=>e.offsetParent!==null); })()";
+             "[...document.querySelectorAll('.bt-text-input')].some($VIS); })()";
              timeout = 90)
     sleep(0.5)
     pid = current_chat_id(s)
@@ -2393,7 +2495,7 @@ A chat must be open (see [`new_chat`](@ref) / [`open_chat`](@ref)).
 function send_message(s::TestServer, txt::AbstractString)
     set_input(s, ".bt-text-input", String(txt))   # set_input already visibility-filters
     # Click the VISIBLE send button (the active pane's), never a hidden pane's.
-    ok = eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-send-btn')].find(e=>e.offsetParent!==null); if(!b)return false; b.click(); return true; })()")
+    ok = eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-send-btn')].find($VIS); if(!b)return false; b.click(); return true; })()")
     ok === true || error("send_message: no visible send button (.bt-send-btn) — is a chat open?")
     return s
 end

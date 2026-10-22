@@ -2,7 +2,7 @@
     const TK = SharedServer.TestKit
     using SHA, Random
     real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     function shows(id, text)
         return """(() => {
             const c = $VP?.querySelector('.bt-tool-msg[data-msg-id*="$id"]');

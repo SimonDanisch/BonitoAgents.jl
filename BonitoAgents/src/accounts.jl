@@ -145,6 +145,12 @@ function apply_proxy!(auth::LoginAuth, root::ServerState)
         end
         authelia = render_authelia_config(auth, authelia_secrets(root.state_dir), smtp_settings(root.state_dir))
         atomic_write(io -> write(io, authelia), authelia_config_file(cfg); mode = 0o600)
+        if !isempty(cfg.session_socket)
+            dir = mkpath(dirname(cfg.session_socket))
+            chmod(dir, 0o700)
+            atomic_write(io -> write(io, render_session_store_config(cfg.session_socket)),
+                         joinpath(dir, "server.conf"); mode = 0o600)
+        end
     end
     return nothing
 end
@@ -866,7 +872,7 @@ function group_picker(groups::Vector{String}, current::Vector{String}, commit::B
                        $(Bonito.JSString(GROUP_PICK_JS))
                    }"""),
         DOM.div(
-            DOM.div((item(g) for g in all)...; class = "bt-group-items"),
+            DOM.div((item(g) for g in all); class = "bt-group-items"),
             isempty(all) && !allow_new ? DOM.div("No groups yet: an admin puts accounts in groups.";
                                                   class = "bt-menu-title") : nothing,
             new_row;
@@ -933,7 +939,7 @@ function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Se
                                      onclick = js"event => $(revoke).notify($(c.name))")))
         end
         DOM.table(DOM.tr(DOM.th("Credential"), DOM.th("Worker"), DOM.th("Issued by"),
-                         DOM.th("Issued"), DOM.th("")), rows...; class = "bt-admin-table")
+                         DOM.th("Issued"), DOM.th("")), rows; class = "bt-admin-table")
     end
     body = DOM.div(
         AdminStyles,
@@ -1089,9 +1095,9 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
     add_form = modal(session, adding, "Add account") do
         field(label, obs, placeholder) = (DOM.label(label), text_input(obs, placeholder))
         DOM.div(
-            field("Account", new_name, "login name, e.g. dave")...,
-            field("Full name", new_display, "Dave Doe")...,
-            field("Email", new_email, "optional")...,
+            field("Account", new_name, "login name, e.g. dave"),
+            field("Full name", new_display, "Dave Doe"),
+            field("Email", new_email, "optional"),
             DOM.label("Groups"),
             group_picker(pickable_groups(state),
                          String[strip(g) for g in split(new_groups[], ',') if !isempty(strip(g))],
@@ -1147,7 +1153,7 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
                 class = a.disabled ? "bt-account-off" : "", dataAccount = a.name)
         end
         DOM.table(DOM.tr(DOM.th("Account"), DOM.th("Groups"), DOM.th("Role"), DOM.th("")),
-                  rows...; class = "bt-admin-table bt-accounts-table")
+                  rows; class = "bt-admin-table bt-accounts-table")
     end
     return DOM.div(
         DOM.div(DOM.h2("Accounts"); class = "bt-section"),
@@ -1220,7 +1226,7 @@ function invites_section(::LoginAuth, session::Bonito.Session, state::ServerStat
                                      onclick = js"event => $(revoke).notify($(i.id))")))
         end
         DOM.table(DOM.tr(DOM.th("Invited by"), DOM.th("Groups"), DOM.th("Created (UTC)"),
-                         DOM.th("Expires (UTC)"), DOM.th("")), rows...; class = "bt-admin-table")
+                         DOM.th("Expires (UTC)"), DOM.th("")), rows; class = "bt-admin-table")
     end
     return DOM.div(
         DOM.div(DOM.h2("Invites"); class = "bt-section"),
@@ -1283,7 +1289,7 @@ function adapters_section(session::Bonito.Session, state::ServerState)
                     "while no chat runs. \"latest\" follows the npm registry.";
                     class = "bt-admin-muted"),
             row("Node", node),
-            (row(k, packages[k]) for k in sort!(collect(keys(packages))))...,
+            (row(k, packages[k]) for k in sort!(collect(keys(packages)))),
             DOM.button("Save"; class = "bt-btn bt-btn-sm", onclick = js"event => $(save).notify(true)"),
             admin_line(status, "bt-admin-status");
             class = "bt-card"))

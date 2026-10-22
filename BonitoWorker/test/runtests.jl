@@ -835,6 +835,7 @@ end  # BonitoWorker
 # Stability regressions (M1 clone_repo data-loss guard, M8/M12/M13). Pure unit
 # tests — no subprocess, no network.
 include("test_stability.jl")
+include("test_logging.jl")
 
 # Agent subprocess reaping (process group + startup stray sweep). Spawns
 # short-lived `sleep`/`bash` children only — no agent, no network.

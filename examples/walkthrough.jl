@@ -241,7 +241,7 @@ end
 # Returns whether the app actually docked, so a caller filming it can say so.
 function dock_float!(s, ctx; label = "App", into = "Chat", tries = 3)
     floating() = TK.eval_js(s,
-        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent)") === true
+        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.checkVisibility())") === true
     dock_button = "[...document.querySelectorAll('.bw-ws-float')]" *
         ".find(f => (f.querySelector('.bw-float-title-text')?.textContent || '')" *
         ".startsWith($(repr(label))))?.querySelector('.bw-float-dock')"
@@ -270,7 +270,7 @@ end
 #     which would spend a turn on every re-record. Feedback collects the comment
 #     as a numbered chip and waits for Send, which shows the same mechanic and
 #     costs nothing.
-visible_js(sel) = "[...document.querySelectorAll($(repr(sel)))].find(e => e.offsetParent)"
+visible_js(sel) = "[...document.querySelectorAll($(repr(sel)))].find(e => e.checkVisibility())"
 
 # Does this project have something to review? *Review changes* runs `git diff`
 # on the worker, so a clean tree (or a folder that is not a repo at all, which
@@ -332,7 +332,7 @@ end
 # canvas, which captures wheel events for camera zoom instead of scrolling.
 function cursor_to_transcript!(s, ctx)
     r = TK.eval_js(s, """(() => {
-        const c = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent);
+        const c = [...document.querySelectorAll('.bt-messages')].find(e => e.checkVisibility());
         if (!c) return null;
         const b = c.getBoundingClientRect();
         return [b.x + 30, b.y + b.height / 2];
@@ -362,7 +362,7 @@ end
 # so the chase doesn't snap back to the bottom mid-pan.
 function scroll_by!(s, delta; steps = 12)
     TK.eval_js(s, """(() => {
-        const c = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent);
+        const c = [...document.querySelectorAll('.bt-messages')].find(e => e.checkVisibility());
         if (!c) return; const ch = c.__bt_chat;
         ch && ch.setFollowMode && ch.setFollowMode(false);
         const max = Math.max(0, c.scrollHeight - c.clientHeight);
@@ -411,7 +411,7 @@ side_chat_of(state, name) = side_chat_js(chat_title(state, name))
 
 side_chat_js(title) = """(() => {
     const e = [...document.querySelectorAll('.bt-side-item')]
-        .find(x => x.offsetParent && (x.innerText||'').includes($(repr(title))));
+        .find(x => x.checkVisibility() && (x.innerText||'').includes($(repr(title))));
     if (!e) return null;
     const r = e.getBoundingClientRect();
     return [r.x + r.width / 2, r.y + r.height / 2];
@@ -427,7 +427,7 @@ card_js(pid) = """(() => {
 
 # The LAST matching element's center (page coordinates) — pill buttons etc.
 last_el_js(sel) = """(() => {
-    const es = [...document.querySelectorAll($(repr(sel)))].filter(e => e.offsetParent);
+    const es = [...document.querySelectorAll($(repr(sel)))].filter(e => e.checkVisibility());
     const e = es[es.length - 1];
     if (!e) return null;
     const r = e.getBoundingClientRect();
@@ -440,7 +440,7 @@ last_el_js(sel) = """(() => {
 # an empty float and the canvas beat stalls.
 live_detach_js() = """(() => {
     const pill = [...document.querySelectorAll('.bt-tool-msg')]
-        .filter(e => e.offsetParent && e.querySelector('canvas'))
+        .filter(e => e.checkVisibility() && e.querySelector('canvas'))
         .pop();
     const b = pill && pill.querySelector('.bt-tool-detach');
     if (!b) return null;
@@ -451,7 +451,7 @@ live_detach_js() = """(() => {
 # JS locator for the `nth` visible tool pill containing `needle` (element
 # expression — combine with el_center_js / el_offscreen / wheel_to!).
 pill_js(needle; nth = 1) = """[...document.querySelectorAll('.bt-tool-msg')]
-    .filter(e => e.offsetParent && (e.innerText||'').includes($(repr(needle))))[$(nth - 1)]"""
+    .filter(e => e.checkVisibility() && (e.innerText||'').includes($(repr(needle))))[$(nth - 1)]"""
 
 # Whether the pill's body is still collapsed (so a header click EXPANDS it —
 # clicking an already-open pill would collapse it on camera).
@@ -467,7 +467,7 @@ pill_collapsed(s, needle; nth = 1) = TK.eval_js(s, """(() => {
 # The sidebar Home entry (the tour returns to the dashboard by CLICKING it,
 # like a user — never by poking navigation state).
 home_js() = """[...document.querySelectorAll('.bt-side-item')]
-    .find(x => x.offsetParent && (x.innerText||'').trim() === 'Home')"""
+    .find(x => x.checkVisibility() && (x.innerText||'').trim() === 'Home')"""
 
 # Open lorenz.jl from a chat's sidebar file tree, into a Monaco tab beside the
 # app. The ▾ files hint is HOVER-gated (its pointer-events flip on CSS
@@ -487,10 +487,10 @@ function open_lorenz_file!(s, ctx; chat_title = "Lorenz attractor explorer")
         return !!h;
     })()""")
     TK.wait_for(s, "file tree open",
-        "[...document.querySelectorAll('.bt-tree-row')].some(e => e.offsetParent)"; timeout = 20)
+        "[...document.querySelectorAll('.bt-tree-row')].some(e => e.checkVisibility())"; timeout = 20)
     sleep(0.6)
     ECT.click(ctx, ECT.JS(el_center_js("""[...document.querySelectorAll('.bt-tree-row')]
-        .find(x => x.offsetParent && x.innerText.includes('lorenz.jl'))""")))
+        .find(x => x.checkVisibility() && x.innerText.includes('lorenz.jl'))""")))
     TK.wait_for(s, "editor open",
         "!!document.querySelector('.bt-file-editor .monaco-editor-div')"; timeout = 30)
 end
@@ -503,7 +503,7 @@ function ensure_live_embed!(s, pids; tries = 3)
         TK.open_chat(s, pids["LorenzExplorer"])
         sleep(8)
         ok = TK.eval_js(s, """(() => {
-            const p = [...document.querySelectorAll('.bt-chatpane')].find(x => x.offsetParent !== null);
+            const p = [...document.querySelectorAll('.bt-chatpane')].find(x => x.checkVisibility() !== null);
             return !!(p && p.querySelector('canvas') &&
                       p.querySelector('.bt-embed input[type=range]'));
         })()""")
@@ -521,13 +521,13 @@ end
 # re-records — only the in-flight one matches.
 const DEMO_MARK = "processing batch"
 streaming_eval_js() = """[...document.querySelectorAll('.bt-tool-msg')].filter(c =>
-    c.offsetParent &&
+    c.checkVisibility() &&
     (c.querySelector('.bt-tool-title')?.textContent || '').includes('bt_julia_eval') &&
     (c.querySelector('.bt-tool-status')?.textContent || '') !== 'completed' &&
     /$(DEMO_MARK)/.test(c.innerText)).pop()"""
 # The same eval once it has COMPLETED (the last completed one carrying our mark).
 completed_eval_js() = """[...document.querySelectorAll('.bt-tool-msg')].filter(c =>
-    c.offsetParent &&
+    c.checkVisibility() &&
     c.querySelector('.bt-tool-status')?.textContent === 'completed' &&
     /$(DEMO_MARK)/.test(c.innerText)).pop()"""
 
@@ -606,7 +606,7 @@ function tour(s, ctx, pids)
     # 2 ─ open the Lorenz chat straight from its overview card.
     ECT.click(ctx, ECT.JS(card_js(pids["LorenzExplorer"])))
     TK.wait_for(s, "lorenz chat open",
-        "[...document.querySelectorAll('.bt-text-input')].some(e => e.offsetParent)"; timeout = 30)
+        "[...document.querySelectorAll('.bt-text-input')].some(e => e.checkVisibility())"; timeout = 30)
     sleep(1.4)
 
     # 3 ─ the two headline bt_julia_eval features, run on the STILL-FRESH Lorenz
@@ -650,7 +650,7 @@ function tour(s, ctx, pids)
                 end
                 ECT.click(ctx, ECT.JS(side_chat_of(s.h.state, title)))
                 TK.wait_for(s, "chat visible: $title",
-                    "[...document.querySelectorAll('.bt-text-input')].some(e => e.offsetParent)"; timeout = 20)
+                    "[...document.querySelectorAll('.bt-text-input')].some(e => e.checkVisibility())"; timeout = 20)
                 sleep(1.0)
                 cursor_to_transcript!(s, ctx)
                 # First pass wheels UP through the turn; later passes nudge the
@@ -673,7 +673,7 @@ function tour(s, ctx, pids)
     if has_uncommitted(gol.worker_path)
         ECT.click(ctx, ECT.JS(side_chat_of(s.h.state, "GameOfLife")))
         TK.wait_for(s, "game of life chat",
-            "[...document.querySelectorAll('.bt-text-input')].some(e => e.offsetParent)"; timeout = 20)
+            "[...document.querySelectorAll('.bt-text-input')].some(e => e.checkVisibility())"; timeout = 20)
         sleep(1.0)
         review_beat!(s, ctx)
     else
@@ -690,7 +690,7 @@ function tour(s, ctx, pids)
     wait(revive_task)                    # rethrows if the revive turn failed
     ensure_live_embed!(s, pids)
     TK.wait_for(s, "live slider present",
-        "[...document.querySelectorAll('.bt-embed input[type=range]')].some(e => e.offsetParent)";
+        "[...document.querySelectorAll('.bt-embed input[type=range]')].some(e => e.checkVisibility())";
         timeout = 60)          # a keep-alive re-mount re-boots the WGLMakie embed
     # The embed keeps growing for a moment as the canvas mounts, which shifts
     # the virtual scroll under us — re-aim until the slider HOLDS its spot.
@@ -711,12 +711,12 @@ function tour(s, ctx, pids)
     # 8 ─ detach the app and dock it beside the chat: the plotpane. The detach
     #     button lives in the pill HEADER — wheel it on screen, then click it.
     wheel_to!(s, ctx, """[...document.querySelectorAll('.bt-tool-msg')]
-        .filter(e => e.offsetParent && e.querySelector('canvas'))
+        .filter(e => e.checkVisibility() && e.querySelector('canvas'))
         .pop()?.querySelector('.bt-tool-detach')""")
     sleep(0.8)
     ECT.click(ctx, ECT.JS(live_detach_js()))
     TK.wait_for(s, "floating app window",
-        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent && f.querySelector('canvas'))";
+        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.checkVisibility() && f.querySelector('canvas'))";
         timeout = 30)
     sleep(1.2)
     dock_float!(s, ctx)
@@ -725,7 +725,7 @@ function tour(s, ctx, pids)
     # 9 ─ the docked app is still live: one more steer in the plotpane
     #     (the docked panel is fully visible, no scrolling needed).
     TK.wait_for(s, "docked slider",
-        "[...document.querySelectorAll('input[type=range]')].some(e => e.offsetParent)"; timeout = 15)
+        "[...document.querySelectorAll('input[type=range]')].some(e => e.checkVisibility())"; timeout = 15)
     ECT.steer_slider(ctx, "input[type=range]", 0.45; duration = 1.2)
     sleep(0.8)
 
@@ -843,7 +843,7 @@ function stills(; server = nothing,
         # element's textContent, never `innerText` — that reads as empty for a
         # card the virtual scroller has not laid out yet.
         newest_edit = """[...document.querySelectorAll('.bt-tool-msg')]
-            .filter(e => e.offsetParent &&
+            .filter(e => e.checkVisibility() &&
                 (e.querySelector('.bt-tool-title')?.textContent || '').includes('Edit'))
             .pop()"""
         wheel_to!(s, ctx, newest_edit)
@@ -880,16 +880,16 @@ function stills(; server = nothing,
         sleep(1.0)
         ECT.click(ctx, ECT.JS(side_chat_of(s.h.state, "LorenzExplorer")))
         TK.wait_for(s, "live slider present",
-            "[...document.querySelectorAll('.bt-embed input[type=range]')].some(e => e.offsetParent)";
+            "[...document.querySelectorAll('.bt-embed input[type=range]')].some(e => e.checkVisibility())";
             timeout = 60)
         sleep(1.0)
         wheel_to!(s, ctx, """[...document.querySelectorAll('.bt-tool-msg')]
-            .filter(e => e.offsetParent && e.querySelector('canvas'))
+            .filter(e => e.checkVisibility() && e.querySelector('canvas'))
             .pop()?.querySelector('.bt-tool-detach')""")
         sleep(0.8)
         ECT.click(ctx, ECT.JS(live_detach_js()))
         TK.wait_for(s, "floating app window",
-            "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent && f.querySelector('canvas'))";
+            "[...document.querySelectorAll('.bw-ws-float')].some(f => f.checkVisibility() && f.querySelector('canvas'))";
             timeout = 30)
         sleep(1.2)
         # A float that doesn't dock keeps its slider and its canvas, so the
@@ -897,7 +897,7 @@ function stills(; server = nothing,
         # docked plotpane the caption promises; `dock_float!` verifies.
         dock_float!(s, ctx)
         TK.wait_for(s, "docked slider",
-            "[...document.querySelectorAll('input[type=range]')].some(e => e.offsetParent)"; timeout = 15)
+            "[...document.querySelectorAll('input[type=range]')].some(e => e.checkVisibility())"; timeout = 15)
         open_lorenz_file!(s, ctx)
         sleep(2.0)
         # Opening the file makes IT the active tab in the chat's group, which
@@ -929,7 +929,7 @@ function tour_hook(s, ctx, pids)
     # spiral (ρ≈15) and up through the chaos transition into the molten
     # twin-lobed butterfly (ρ≈50) — recomputed in the worker on every drag.
     TK.wait_for(s, "live slider present",
-        "[...document.querySelectorAll('.bt-embed input[type=range]')].some(e => e.offsetParent)";
+        "[...document.querySelectorAll('.bt-embed input[type=range]')].some(e => e.checkVisibility())";
         timeout = 60)
     for _ in 1:4
         wheel_to!(s, ctx, "document.querySelector('.bt-embed input[type=range]')"; at = 0.16)
@@ -945,12 +945,12 @@ function tour_hook(s, ctx, pids)
     # Detach into the workspace: pop the app out of the transcript and dock it
     # beside the chat (the plotpane) — files, editor and a live app side by side.
     wheel_to!(s, ctx, """[...document.querySelectorAll('.bt-tool-msg')]
-        .filter(e => e.offsetParent && e.querySelector('canvas'))
+        .filter(e => e.checkVisibility() && e.querySelector('canvas'))
         .pop()?.querySelector('.bt-tool-detach')""")
     sleep(0.7)
     ECT.click(ctx, ECT.JS(live_detach_js()))
     TK.wait_for(s, "floating app window",
-        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent && f.querySelector('canvas'))";
+        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.checkVisibility() && f.querySelector('canvas'))";
         timeout = 30)
     sleep(1.1)
     dock_float!(s, ctx)
@@ -958,7 +958,7 @@ function tour_hook(s, ctx, pids)
 
     # Still live, docked: one more steer in the plotpane.
     TK.wait_for(s, "docked slider",
-        "[...document.querySelectorAll('input[type=range]')].some(e => e.offsetParent)"; timeout = 15)
+        "[...document.querySelectorAll('input[type=range]')].some(e => e.checkVisibility())"; timeout = 15)
     ECT.steer_slider(ctx, "input[type=range]", 0.5; duration = 1.3)
     sleep(0.8)
 

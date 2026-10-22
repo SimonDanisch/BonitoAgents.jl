@@ -38,7 +38,7 @@
     agent_script(p) = [TK.text("reply to $(p)\n\n" *
         join(["paragraph $i " * repeat("filler ", 30) for i in 1:6], "\n\n")), TK.end_turn()]
 
-    const C = "document.querySelector('.bt-chatpane[style*=\"flex\"] .bt-messages')"
+    const C = "document.querySelector('.bt-chatpane[aria-hidden=false] .bt-messages')"
 
     metrics_js = """(() => {
         const c = $(C); if (!c) return null;

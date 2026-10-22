@@ -897,7 +897,7 @@ function shares_section(session::Bonito.Session, state::ServerState)
                                      onclick = js"event => $(revoke).notify($(l.id))")))
         end
         DOM.table(DOM.tr(DOM.th("Link"), DOM.th("Made"), DOM.th("Password (empty: none)"), DOM.th("")),
-                  rows...; class = "bt-admin-table bt-shares-table")
+                  rows; class = "bt-admin-table bt-shares-table")
     end
     return DOM.div(
         AdminStyles,

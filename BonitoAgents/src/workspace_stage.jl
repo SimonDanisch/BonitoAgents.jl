@@ -38,8 +38,10 @@ function install_workspace!(session::Bonito.Session,
     # bring this panel to the front — the user may have a file/app tab active —
     # and (2) relabel its tab so "Home" reads as Home, not a stale "Chat".
     # `Panel.label` is an Observable, so the tab updates live.
-    relabel_chat_panel!() = (chat_panel.label[] =
-        isempty(current_view[]) ? "Home" : current_view[] == SETTINGS_VIEW ? "Settings" : "Chat")
+    function relabel_chat_panel!()
+        label = isempty(current_view[]) ? "Home" : current_view[] == SETTINGS_VIEW ? "Settings" : "Chat"
+        chat_panel.label[] == label || (chat_panel.label[] = label)
+    end
     relabel_chat_panel!()
     on(session, current_view) do _
         relabel_chat_panel!()

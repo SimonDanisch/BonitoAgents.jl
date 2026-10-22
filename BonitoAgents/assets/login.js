@@ -1,7 +1,7 @@
 // The login, as the tabs of one browser share it. Behind Authelia a login ends
 // for all of them at once and is back for all of them with one login in any tab.
-// Every login hands out a new session and drops the old one on the spot, so a
-// login the browser does not need throws its other tabs out mid-request. So no
+// A login replaces that browser's previous session. It does not revoke other
+// devices. An unnecessary login can throw that browser's tabs out mid-request. No
 // tab asks for one while the browser has it: a page that loaded behind the login
 // tells the other tabs (`announce`); a tab whose login ended waits for that
 // (`logged_in`) instead of reloading into the login page, and the login page

@@ -57,4 +57,45 @@
     @test BT.diff_ops(join(1:20, "\n"), join(21:40, "\n"); max_d = 3) == "-20 +20"
     @test BT.diff_counts("=3 -2 +4 =1") == (2, 4)
     @test BT.diff_counts(BT.DiffView("a\nb", "a\nc\nd")) == (1, 2)
+
+    # The frontier follows the edit budget, not the number of source lines.
+    # Even a rejected large rewrite must not allocate a full input-sized
+    # frontier before falling back to the same remove/add result.
+    a, b = fill("old", 100_000), fill("new", 100_000)
+    BT.middle_steps(["a"], ["b"], 0)
+    bytes = @allocated steps = BT.middle_steps(a, b, 0)
+    @test bytes < 2_000_000
+    @test length(steps) == 200_000
+    @test all(==('-'), @view steps[1:100_000])
+    @test all(==('+'), @view steps[100_001:end])
+end
+
+@testitem "unit:code_view_sources" tags = [:unit] begin
+    using Test, BonitoAgents, Bonito
+    source = "source < & >\n"^1000
+    for view in (BonitoAgents.CodeView(source), BonitoAgents.DiffView(source, source * "last"))
+        session = Session(Bonito.NoConnection(); asset_server = Bonito.NoServer())
+        try
+            node = Bonito.jsrender(session, view)
+            html = repr(MIME"text/html"(), node)
+            payloads = collect(eachmatch(r"<pre\b[^>]*class=\"bt-code-src\"[^>]*>", html))
+            @test length(payloads) == (view isa BonitoAgents.DiffView ? 2 : 1)
+            @test all(m -> occursin(r"\bhidden(?:=|\s|>)", m.match), payloads)
+            @test occursin("source &#60; &#38; &#62;", html)
+            @test BonitoAgents.BonitoBook.Monaco ∉ session.imports
+        finally
+            close(session)
+        end
+    end
+    for view in (BonitoAgents.CodeView("plain"; language = "plaintext", path = "/p/readme.txt"),
+                 BonitoAgents.CodeView("x=1"; language = "julia"))
+        session = Session(Bonito.NoConnection(); asset_server = Bonito.NoServer())
+        try
+            Bonito.jsrender(session, view)
+            @test BonitoAgents.BonitoBook.Monaco ∉ session.imports
+            @test (BonitoAgents.BonitoBook.CodeTokenizer in session.imports) == (view.language == "julia")
+        finally
+            close(session)
+        end
+    end
 end

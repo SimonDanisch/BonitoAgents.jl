@@ -141,7 +141,7 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
     closeable && push!(kids, DOM.span("✕"; class = "bt-side-close", title = "Close chat"))
     cls = "bt-side-item" * (active ? " bt-side-active" : "")
     isempty(extra_class) || (cls = cls * " " * String(extra_class))
-    DOM.div(kids...;
+    DOM.div(kids;
         class = cls,
         title = title,
         # `data-project-id` is the view the entry opens: "" for Home (the
@@ -1123,9 +1123,9 @@ const UnifiedShellStyles = Bonito.Styles(
 
     # ── Keep-alive view stack ────────────────────────────────────────────────
     # The dashboard and every opened chat are all mounted at once and stacked on
-    # top of each other (absolute inset:0); the nav handler toggles `display` so
-    # exactly one shows. Stacking (not a flow swap) is what lets us preserve each
-    # chat's DOM/embeds while only one is on screen.
+    # top of each other (absolute inset:0). Hidden chats keep their layout tree
+    # behind content-visibility:hidden: display:none discarded it, so returning
+    # to an unchanged chat rebuilt thousands of highlighted spans.
     CSS(".bt-main-views",
         "position" => "relative",
         "flex" => "1 1 auto", "min-height" => "0", "min-width" => "0"),
@@ -1144,6 +1144,10 @@ const UnifiedShellStyles = Bonito.Styles(
         "position" => "absolute", "inset" => "0",
         "display" => "none", "flex-direction" => "column", "min-width" => "0",
         "pointer-events" => "auto"),
+    CSS(".bt-chatpane[aria-hidden=false]", "display" => "flex"),
+    CSS("@supports (content-visibility: hidden)",
+        CSS(".bt-chatpane[aria-hidden=true]", "display" => "flex",
+            "content-visibility" => "hidden", "pointer-events" => "none")),
     # Overlay sits on top (loading / unknown card). Click-through when empty so
     # it never blocks the chat behind it; its card re-enables pointer events.
     CSS(".bt-view-overlay",
@@ -1390,7 +1394,8 @@ function Bonito.jsrender(session::Bonito.Session, r::ChatPaneRef)
         DOM.div(view; style = Styles("flex" => "1 1 auto", "min-height" => "0",
                                      "display" => "flex", "flex-direction" => "column"))
     end
-    pane = DOM.div(inner; class = "bt-chatpane", dataPanePid = r.pid)
+    pane = DOM.div(inner; class = "bt-chatpane", dataPanePid = r.pid,
+                   var"aria-hidden" = "true", inert = true)
     # Self-initialize visibility on mount: a pane the KeyedList adds while its
     # chat is ALREADY the active view must reveal itself (the nav handler ran
     # before this pane existed). We read the active pid from the container's
@@ -1401,7 +1406,11 @@ function Bonito.jsrender(session::Bonito.Session, r::ChatPaneRef)
     Bonito.onload(session, pane, js"""(el) => {
         const root = el.closest('.bt-main-views');
         const active = root ? (root.dataset.activeView || '') : '';
-        el.style.display = (el.dataset.panePid === active) ? 'flex' : 'none';
+        const visible = el.dataset.panePid === active;
+        el.setAttribute('aria-hidden', String(!visible));
+        el.inert = !visible;
+        const chat = el.querySelector('.bt-messages')?.__bt_chat;
+        if (chat) visible ? chat.onShown() : chat.onHidden();
     }""")
     Bonito.jsrender(session, pane)
 end
@@ -1442,7 +1451,10 @@ function unified_main(session::Bonito.Session, state::ServerState,
     panes = Dict{String,ChatPaneRef}()
     ref(pid) = get!(() -> ChatPaneRef(state, pid, pane), panes, pid)
     chatpanes_obs = map(alive) do pids
-        ChatPaneRef[ref(pid) for pid in pids if haskey(state.chat_models, pid)]
+        # LRU order chooses what to evict, not where panes sit in the DOM.
+        # Reordering these absolutely stacked panes on every navigation moves
+        # their fragments, resets scrolling and forces another full layout.
+        ChatPaneRef[ref(pid) for pid in sort(pids) if haskey(state.chat_models, pid)]
     end
     chats_host = DOM.div(KeyedList(chatpanes_obs; key = r -> r.pid);
                          class = "bt-view bt-view-chats")
@@ -1543,24 +1555,29 @@ function unified_main(session::Bonito.Session, state::ServerState,
         // path: followMode defaults true on construction, so first open
         // also lands at the bottom even if the initial mount's scroll
         // attempts raced against late image / virtual-scroll measuring.
-        root.querySelectorAll('.bt-view-chats .bt-chatpane').forEach(p => {
-            const wasVisible = p.style.display === 'flex';
+        const panes = [...root.querySelectorAll('.bt-view-chats .bt-chatpane')];
+        // Read the outgoing pane's anchor before changing any layout state.
+        for (const p of panes) {
+            const wasVisible = p.getAttribute('aria-hidden') !== 'true';
             const visible    = (p.dataset.panePid === pid);
-            // Hiding edge: snapshot the user's scroll state BEFORE we
-            // flip display, so we read the still-valid scrollTop instead
-            // of the post-display:none collapsed one.
+            // Hiding edge: snapshot before skipping the pane's contents.
             if (wasVisible && !visible) {
                 const msgs = p.querySelector('.bt-messages');
                 const chat = msgs && msgs.__bt_chat;
                 if (chat && typeof chat.onHidden === 'function') chat.onHidden();
             }
-            p.style.display = visible ? 'flex' : 'none';
-            if (visible) {
+        }
+        for (const p of panes) {
+            const visible = p.dataset.panePid === pid;
+            const wasVisible = p.getAttribute('aria-hidden') !== 'true';
+            p.setAttribute('aria-hidden', String(!visible));
+            p.inert = !visible;
+            if (visible && !wasVisible) {
                 const msgs = p.querySelector('.bt-messages');
                 const chat = msgs && msgs.__bt_chat;
                 if (chat && typeof chat.onShown === 'function') chat.onShown();
             }
-        });
+        }
     }""")
     return container
 end

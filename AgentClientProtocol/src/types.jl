@@ -133,13 +133,32 @@ end
 session_notice_capability() = Dict("jetbrains" => Dict("air" => Dict(
     "version" => 1, "capabilities" => ["sessionFailure"])))
 
-function session_notice_record(params::AbstractDict)
+# The version-1 AIR envelope (`_meta.jetbrains.air`) a frame carries, or nothing.
+function air_meta(params::AbstractDict)
     value = params
     for key in ("_meta", "jetbrains", "air")
         value = get(value, key, nothing)
         value isa AbstractDict || return nothing
     end
     get(value, "version", nothing) == 1 || return nothing
+    return value
+end
+
+"""
+    session_notice_record(params) -> Union{Dict{String,Any},Nothing}
+
+The session-failure record a frame carries in its AIR envelope, or `nothing`.
+
+Two frames carry one. A `session_info_update` reports a notice while the turn
+runs (a retry warning, a stalled transport). The `session/prompt` RESPONSE
+reports how the turn ended: codex-acp (2.2.2, captured in
+`test/fixtures/codex_usage_limit_responses.json`) resolves a FAILED turn as a
+plain `end_turn` and puts the failure only there, as a record with
+`severity = "error"`. Nothing else on the wire says the turn failed.
+"""
+function session_notice_record(params::AbstractDict)
+    value = air_meta(params)
+    value === nothing && return nothing
     record = get(value, "sessionFailure", nothing)
     record isa AbstractDict || return nothing
     all(k -> get(record, k, nothing) isa AbstractString, ("id", "severity", "title")) || return nothing
@@ -701,6 +720,7 @@ function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
             v isa AbstractString && (name = String(v))
         end
     end
+    isempty(name) && (name = codex_tool_name(params))
     if isempty(name)
         t = get(params, "title", nothing)
         if t isa AbstractString &&
@@ -717,6 +737,32 @@ function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
     cx = codex_mcp_envelope(rinput_d)
     cx === nothing && return (name, rinput_d)
     return cx
+end
+
+"""
+    CONTEXT_COMPACTION_TOOL
+
+The tool name a context compaction gets: the agent's runtime summarising the
+conversation so it fits its context window again.
+
+codex-acp reports one as a nameless `think` tool call titled "Compact
+conversation", tagged only by a `contextCompaction` key in its `_meta`: at the
+top in 1.11.0, inside the AIR envelope (`_meta.jetbrains.air`) in 2.2.2 (both
+captured in `test/fixtures/codex_*compaction.jsonl`). It runs before a turn
+whenever the context is nearly full, so it says nothing about whether the agent
+did anything. Without a name it is indistinguishable from real tool work, and a
+Codex turn that failed at the compaction step looked like a turn that worked.
+"""
+const CONTEXT_COMPACTION_TOOL = "ContextCompaction"
+
+# A tool name only codex-acp's `_meta` tags give, or "".
+function codex_tool_name(params::AbstractDict)
+    meta = get(params, "_meta", nothing)
+    meta isa AbstractDict || return ""
+    air = air_meta(params)
+    compaction = haskey(meta, "contextCompaction") ||
+                 (air !== nothing && haskey(air, "contextCompaction"))
+    return compaction ? CONTEXT_COMPACTION_TOOL : ""
 end
 
 """

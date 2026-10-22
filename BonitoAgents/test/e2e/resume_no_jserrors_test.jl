@@ -98,9 +98,10 @@
         # the exact path the buggy onclick dereferenced a freed Observable on.
         TK.wait_for(s, "resumed chat in sidebar",
             "document.querySelector('.bt-side-item[data-project-id]') !== null"; timeout = 10)
+        # A chat's entry: not Home (""), not Settings, which sits right below it.
         TK.eval_js(s, """(() => {
             const items = [...document.querySelectorAll('.bt-side-item')]
-                .filter(e => (e.getAttribute('data-project-id') || '') !== '');
+                .filter(e => !['', 'settings'].includes(e.getAttribute('data-project-id') || ''));
             if (items[0]) items[0].click();
         })()""")
         @test TK.wait_for(s, "chat re-opened",

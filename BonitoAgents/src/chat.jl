@@ -736,6 +736,13 @@ mutable struct GenericToolMsg <: BuiltinToolMsg   # fallback: think/delete/other
 end
 GenericToolMsg(message::Message) = GenericToolMsg(message, Dict{String,Any}())
 
+# A context compaction (`ACP.CONTEXT_COMPACTION_TOOL`): the agent's runtime
+# summarising the conversation so it fits again. Shown like any generic call,
+# but it is housekeeping rather than the agent doing something (`does_work`).
+mutable struct CompactionToolMsg <: BuiltinToolMsg
+    message::Message
+end
+
 mutable struct EditToolMsg <: BuiltinToolMsg      # kind "edit" (Edit / Write / MultiEdit)
     message::Message
     file_path::String             # the REAL path (titles are display strings) — ✎ affordance
@@ -800,6 +807,7 @@ const BUILTIN_NAME_TYPES = Dict{String,DataType}(
     "Grep"         => SearchToolMsg,
     "Glob"         => SearchToolMsg,
     "WebFetch"     => FetchToolMsg,
+    AgentClientProtocol.CONTEXT_COMPACTION_TOOL => CompactionToolMsg,
 )
 builtin_msg_type(kind::AbstractString, name::AbstractString) =
     get(BUILTIN_NAME_TYPES, name, builtin_msg_type(kind))
@@ -2582,7 +2590,7 @@ function Bonito.jsrender(session::Session, c::Collapsable)
             if (b) b.scrollTop = b.scrollHeight;
         }
     }"""
-    kids = Any[DOM.summary(summary_kids...; class="bt-subsection-summary", onclick=cycle), body]
+    kids = Any[DOM.summary(summary_kids; class="bt-subsection-summary", onclick=cycle), body]
     # Initial end-pin, once the subtree is parsed (inline JSCode children run
     # right after their surrounding DOM — the Bonito idiom for init steps).
     # Pin to the end once the subtree is parsed (inline JSCode children run right
@@ -2601,7 +2609,7 @@ function Bonito.jsrender(session::Session, c::Collapsable)
         new MutationObserver(() => { if (pinned) b.scrollTop = b.scrollHeight; })
             .observe(b, { childList: true, subtree: true, characterData: true });
     })()""")
-    Bonito.jsrender(session, DOM.details(kids...;
+    Bonito.jsrender(session, DOM.details(kids;
         class="bt-subsection",
         dataState=c.state === :collapsed ? "summary" : String(c.state),
         dataPinEnd=c.pin_end ? "1" : nothing,
@@ -2786,7 +2794,7 @@ function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
         fill_result!(v)
     end
     push!(sections, DOM.div(result_slot; class = "bt-eval-result"))
-    return Bonito.jsrender(session, DOM.div(sections...; class = "bt-eval-body"))
+    return Bonito.jsrender(session, DOM.div(sections; class = "bt-eval-body"))
 end
 
 """
@@ -2859,7 +2867,7 @@ function eval_result_node(m::JuliaEvalCall, v)
                       progress = chat.plotpane === nothing ? nothing : chat.plotpane.progress) do
             share_result!(chat.state, chat.project_id, v.payload)
         end,)
-    return wrap_for_detach(tool_id(m), DOM.div(controls...,
+    return wrap_for_detach(tool_id(m), DOM.div(controls,
         remote_result(chat.state, v.payload, chat.project_id)))
 end
 
@@ -2986,7 +2994,7 @@ function render_search_results(text::AbstractString)
             push!(rows, DOM.div(line; class="bt-search-raw"))
         end
     end
-    DOM.div(rows...; class="bt-search-results")
+    DOM.div(rows; class="bt-search-results")
 end
 
 function find_show_reference(content)
@@ -3084,7 +3092,7 @@ function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
                                      "Manage passwords and end links in Settings.") do
             share_project_file!(st.state, st.project_id, st.path)
         end,)
-    return Bonito.jsrender(session, DOM.div(controls..., body))
+    return Bonito.jsrender(session, DOM.div(controls, body))
 end
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
@@ -3370,12 +3378,12 @@ function media_element(src, mime::AbstractString, is_video::Bool;
             title = "Enlarge", onclick = LIGHTBOX_OPEN_JS),
         (is_video ? () :
             (DOM.button("⧉"; class = "bt-media-action bt-media-copy", type = "button",
-                title = "Copy image", onclick = COPY_MEDIA_JS),))...,
+                title = "Copy image", onclick = COPY_MEDIA_JS),)),
         DOM.button("⤓"; class = "bt-media-action bt-media-download", type = "button",
             title = "Download", onclick = DOWNLOAD_MEDIA_JS),
         (!is_video && !isempty(worker_path) ?
             (DOM.button("▣"; class = "bt-media-action bt-media-chat-icon", type = "button",
-                title = "Set as chat icon", var"aria-label" = "Set as chat icon"),) : ())...;
+                title = "Set as chat icon", var"aria-label" = "Set as chat icon"),) : ());
         class = "bt-media-actions")
     # The error can come before its handler is attached: the session that
     # attaches it starts once its payload is fetched, and a missing file's 404
@@ -3761,7 +3769,7 @@ function render_tool_parts(state::ServerState, m::ToolMsg, content, project_id::
         end
     end
     isempty(parts) && return DOM.div("(empty)", class="bt-tool-empty")
-    return DOM.div(parts...)
+    return DOM.div(parts)
 end
 
 # Default / GenericToolMsg / "think" / "other" / "fetch" / "move" / "delete".
@@ -3783,7 +3791,7 @@ function render_tool_content(state::ServerState, m::EditToolMsg, content, projec
         d === nothing && return render_tool_parts(state, m, content, project_id)
         diffs = [d]
     end
-    return DOM.div((diff_section(d) for d in diffs)...; class = "bt-edit-tool-body", dataEditTool = "1")
+    return DOM.div((diff_section(d) for d in diffs); class = "bt-edit-tool-body", dataEditTool = "1")
 end
 
 # A DiffContent from an edit's own input — live from the message fields, or on a
@@ -5991,14 +5999,16 @@ yolo_norm(text::AbstractString) =
 
 # What a finished turn looked like, reduced to the facts the loop decides on.
 # `reply` is the turn's LAST agent message ("" when it ended on a tool call),
-# `worked` whether it ran any tool at all, `stop_reason` the agent's own word
-# for how it ended (ACP: end_turn / max_tokens / refusal / …).
+# `worked` whether it did any work (`does_work`), `stop_reason` the agent's own
+# word for how it ended (ACP: end_turn / max_tokens / refusal / …), `failure`
+# what the provider said went wrong ("" when it said nothing).
 struct YoloTurn
     reply::String
     produced::Bool
     worked::Bool
     errored::Bool
     stop_reason::String
+    failure::String
 end
 
 # What to do next. `reason` is shown to the user on `:stop` — empty means stop
@@ -6046,7 +6056,8 @@ function yolo_decide(y::YoloState, t::YoloTurn)
     # spins for hours without anyone seeing it. Switching off is the part that
     # makes it stay stopped: leaving it armed means the user's next message
     # walks straight back into the same loop.
-    t.errored && return dec(:stop, "the turn failed", true)
+    t.errored && return dec(:stop,
+        isempty(t.failure) ? "the turn failed" : "the turn failed ($(t.failure))", true)
     # The agent's own "I will not do this". Re-asking is not going to change it.
     t.stop_reason == "refusal" && return dec(:stop, "the agent refused the turn", true)
     t.produced || return dec(:stop, "the turn ended without any output")
@@ -6141,9 +6152,12 @@ end
 # resolve having emitted nothing at all (a freshly-switched provider that isn't
 # authenticated returns an empty `end_turn`), and the user should not be left
 # staring at silence.
+#
+# `failure` is what the provider said went wrong, "" when it said nothing.
 struct TurnOutcome
     stop_reason::String
     errored::Bool
+    failure::String
     nstore0::Int
 end
 
@@ -6173,13 +6187,28 @@ function finish_turn!(chat::ChatModel, turn;
     # backlog that no longer exists), which is strictly before we get here — so
     # asking it afterwards always said "not cancelled".
     stop_reason = ""
+    failure = ""
     try
         # The span settling (end_turn / cancelled) says the agent is done
         # talking. It does NOT say we are done showing it — that is the barrier
         # in the `finally`, and both are needed, in that order.
         result = AgentClientProtocol.wait_turn!(turn)
-        result isa AbstractDict &&
-            (stop_reason = String(get(result, "stopReason", "")))
+        if result isa AbstractDict
+            stop_reason = String(get(result, "stopReason", ""))
+            # Codex ends a FAILED turn (out of credits, …) as a plain `end_turn`
+            # and reports the failure only here. Read as a normal ending, a Yolo
+            # loop re-prompted a locked account every second for hours. The
+            # record is the one the chat shows as a notice mid-turn, so it is
+            # shown the same way, and an error ends the turn as failed.
+            record = AgentClientProtocol.session_notice_record(result)
+            if record !== nothing
+                process!(chat, AgentClientProtocol.SessionNotice(record))
+                if record["severity"] == "error"
+                    errored = true
+                    failure = record["title"]
+                end
+            end
+        end
     catch e
         errored = true
         # Show whatever the agent DID say before it failed, then the error —
@@ -6194,7 +6223,7 @@ function finish_turn!(chat::ChatModel, turn;
         # injecting one, so nothing that arrives after it is swept into this
         # turn's last bubble.
         wait_rendered!(chat, turn.flush)
-        outcome = TurnOutcome(stop_reason, errored, nstore0)
+        outcome = TurnOutcome(stop_reason, errored, failure, nstore0)
         # Published on the SHARED model: the per-tab `busy_active` is a
         # session-scoped child (parent→child only), so writing that one left the
         # parent stuck true and every other tab/reload rendering "working"
@@ -6252,6 +6281,16 @@ function report_silent_turn!(chat::ChatModel, o::TurnOutcome)
     return nothing
 end
 
+# Whether a message is the agent DOING something, which is what Yolo's idle and
+# repeat guards count. Every tool call is, except a context compaction: the
+# runtime runs one before a turn whenever the context is nearly full, so it
+# happens with or without progress. Counted as work, a Codex chat whose every
+# turn failed at the compaction step reset both guards each time (10,294
+# auto-continues against a locked account, 2026-10-22).
+does_work(::ChatMsg) = false
+does_work(::ToolMsg) = true
+does_work(::CompactionToolMsg) = false
+
 # Yolo mode: keep the agent going autonomously until it confirms it is done.
 #
 # A cancelled turn is the user taking over by hand, so it neither continues the
@@ -6263,17 +6302,17 @@ function continue_yolo!(chat::ChatModel, o::TurnOutcome)
     (s.yolo[] && !was_cancelled(o)) || return nothing
     y = s.yolo_state
     # This turn's messages are msgs_store[nstore0+1:end]: the LAST AgentMsg among
-    # them is the agent's final reply, and any ToolMsg at all means it did real
-    # work rather than just answering.
+    # them is the agent's final reply, and any message that `does_work` means it
+    # did real work rather than just answering.
     #
     # A missing reply is NOT a bail: a turn ending on a tool call has no closing
     # text, which used to stop Yolo silently.
     reply, worked = lock(s.lock) do
         turn = @view s.msgs_store[(o.nstore0+1):end]
         i = findlast(m -> m isa AgentMsg, turn)
-        (i === nothing ? "" : turn[i].text), any(m -> m isa ToolMsg, turn)
+        (i === nothing ? "" : turn[i].text), any(does_work, turn)
     end
-    t = YoloTurn(reply, said_something(chat, o), worked, o.errored, o.stop_reason)
+    t = YoloTurn(reply, said_something(chat, o), worked, o.errored, o.stop_reason, o.failure)
     d = yolo_decide(y, t)
     yolo_apply!(y, d, t)
     if d.action === :stop
@@ -7078,8 +7117,12 @@ function replayed_to_msg(model::ChatModel, m::AgentClientProtocol.UserMessage)
 end
 function replayed_to_msg(model::ChatModel, m::AgentClientProtocol.ToolCall)
     isempty(m.content) || persist_tool_content!(model.chat_dir, m)
-    # Replay always lands as a finished call (no live updates afterwards).
-    return replayed_tool_msg(m)
+    msg = replayed_tool_msg(m)
+    # The call is finished, but its background run can reconnect later. Adopt
+    # it into the shared chat just like a live tool, so its taskbar and stream
+    # have an owner when the MCP announces that run.
+    msg.message.chat = shared(model)
+    return msg
 end
 replayed_to_msg(model::ChatModel, m::AgentClientProtocol.TodoWriteCall) =
     TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries), time(), time(), nothing)
@@ -7297,7 +7340,7 @@ function dropdown_pill(category::AbstractString, current_label::AbstractString,
         trigger,
         DOM.div(
             search_input,
-            DOM.div(rows...; class = "bt-msearch-items");
+            DOM.div(rows; class = "bt-msearch-items");
             class = "bt-msearch-list");
         class = "bt-msearch")
 end
@@ -7392,7 +7435,7 @@ function session_defaults_bar(session::Bonito.Session, state::ServerState)
                                                  base.category, String(cur), base.choices)
             config_pick_pill(o, pick; lc = o.category == "mode")
         end for base in rows]
-        DOM.div(pills...; class = "bt-header-meta bt-defaults-bar")
+        DOM.div(pills; class = "bt-header-meta bt-defaults-bar")
     end
     DOM.div(DOM.span("Session defaults"; class = "bt-defaults-label"), bar;
             class = "bt-defaults")
@@ -7424,7 +7467,7 @@ function header_meta_line(items, pick::Union{Observable,Nothing} = nothing;
     isempty(shown) && return DOM.div(; class = "bt-header-meta")
     # Each pill is a bordered button (see `.bt-header-meta-pick`); spacing comes
     # from the flex `gap`, so no " · " text separators between them.
-    DOM.div((header_pill(x, pick; lowercase_modes) for x in shown)...; class = "bt-header-meta")
+    DOM.div((header_pill(x, pick; lowercase_modes) for x in shown); class = "bt-header-meta")
 end
 
 # The chat header: status dot, editable title and worker path on the left; on
@@ -7634,7 +7677,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 onclick = js"""event => {
                     $(Bonito.JSString(close_menu_js))
                     $(continue_pick).notify($(w.worker_id));
-                }""") for w in others)...,
+                }""") for w in others),
             DOM.div(; class = "bt-menu-sep");
             class = "bt-menu-group")
     end
@@ -8271,7 +8314,7 @@ function chat_composer(session::Session, model::ChatModel)
                 class="bt-btn bt-btn-ghost bt-send-mode-option",
                 var"data-send-mode"=mode, var"aria-checked"=mode == "done" ? "true" : "false")
              for (mode, label) in (("done", "Queue for when done"),
-                 ("next", "Queue after current message"), ("interrupt", "Interrupt + send"))]...;
+                 ("next", "Queue after current message"), ("interrupt", "Interrupt + send"))];
             class="bt-send-mode-menu", role="menu", hidden=true),
         class="bt-send-mode")
     DOM.div(
@@ -9374,7 +9417,7 @@ function Bonito.jsrender(session::Session, m::ChatModel)
     # the user clicks until the chat module shows its first rows (the
     # `bt-chat-settled` event from `markReady` in bonitoagents.js): one loading
     # surface, gone as soon as there is something to read.
-    Bonito.jsrender(session, DOM.div(pane_nodes(chat_pane(app, model))...;
+    Bonito.jsrender(session, DOM.div(pane_nodes(chat_pane(app, model));
                                      class = "bt-app", dataApp = app === nothing ? "" : app_id(app)))
 end
 

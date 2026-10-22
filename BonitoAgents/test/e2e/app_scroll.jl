@@ -59,8 +59,8 @@ click_dock(s)     = TK.eval_js(s, "(()=>{const p=document.querySelector('.bw-ws-
 click_activate(s) = TK.eval_js(s, "(()=>{const t=[...document.querySelectorAll('.bw-tab')].find(x=>x._panelId==='$P'); if(!t)return false; t.click(); return true;})()")
 click_close(s)    = TK.eval_js(s, "(()=>{const t=[...document.querySelectorAll('.bw-tab')].find(x=>x._panelId==='$P'); const c=t&&t.querySelector('.bw-tab-close'); if(!c)return false; c.click(); return true;})()")
 
-scroll_st(s) = TK.eval_js(s, raw"""(()=>{const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const m=p&&p.querySelector('.bt-messages'); return m?Math.round(m.scrollTop):-1;})()""")
-scroll_to_bottom(s) = TK.eval_js(s, raw"""(()=>{const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const m=p&&p.querySelector('.bt-messages'); if(m)m.scrollTop=m.scrollHeight; return true;})()""")
+scroll_st(s) = TK.eval_js(s, raw"""(()=>{const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const m=p&&p.querySelector('.bt-messages'); return m?Math.round(m.scrollTop):-1;})()""")
+scroll_to_bottom(s) = TK.eval_js(s, raw"""(()=>{const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const m=p&&p.querySelector('.bt-messages'); if(m)m.scrollTop=m.scrollHeight; return true;})()""")
 reload_shown(s) = TK.eval_js(s, "document.body.innerText.includes('Reload live app')")
 app_out(s)      = TK.eval_js(s, raw"""(()=>{const o=document.querySelector('.s-out'); return o?o.innerText:'<none>';})()""")
 bump(s)         = TK.eval_js(s, "(()=>{const b=document.querySelector('.s-btn'); if(b)b.click(); return true;})()")
@@ -124,7 +124,7 @@ function run_suite(server)
         # Force a scroll region regardless of screen size.
         TK.set_window_size(server, 1280, 460); sleep(1.0)
         @test TK.wait_for(server, "chat is scrollable",
-            "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const m=p&&p.querySelector('.bt-messages'); return !!m && (m.scrollHeight - m.clientHeight) > 40; })()";
+            "(() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const m=p&&p.querySelector('.bt-messages'); return !!m && (m.scrollHeight - m.clientHeight) > 40; })()";
             timeout = 10) == true
 
         # Detach into a float. Content shrinks as the embed leaves the chat, so

@@ -535,6 +535,7 @@ function run_dispatcher_prompt(prompt_id)
     flush(sock)
 
     stop_reason = "end_turn"
+    resp_meta = nothing   # the prompt response's `_meta` (`codex_failure`)
     post_blocks = Any[]   # `post_turn` events, emitted AFTER the prompt response
     while !eof(sock)
         # Cancel arriving mid-stream (set by the concurrently-running stdin
@@ -914,6 +915,34 @@ function run_dispatcher_prompt(prompt_id)
                 upd("agent_message_chunk", Dict("content" => Dict("type" => "text",
                     "text" => "Warning: " * ev["record"]["title"])))
             end
+        elseif et == "codex_compaction"
+            # Codex compacting the conversation, in its wire dialect: a nameless
+            # `think` tool tagged only by `_meta.jetbrains.air.contextCompaction`.
+            # Captured from @agentclientprotocol/codex-acp 2.2.2
+            # (AgentClientProtocol/test/fixtures/codex_usage_limit_compaction.jsonl).
+            # A compaction that FAILS never gets a closing update, so
+            # `complete = false` leaves it open exactly like the real one.
+            tid = String(get(ev, "id", "compact-$(take_tool_seq!())"))
+            meta = Dict("jetbrains" => Dict("air" => Dict("version" => 1,
+                "contextCompaction" => Dict("version" => 1))))
+            upd("tool_call", Dict{String,Any}("toolCallId" => tid, "kind" => "think",
+                "title" => "Compact conversation", "status" => "in_progress", "_meta" => meta))
+            Bool(get(ev, "complete", true)) &&
+                upd("tool_call_update", Dict{String,Any}("toolCallId" => tid,
+                    "title" => "Compact conversation", "status" => "completed", "_meta" => meta))
+        elseif et == "codex_failure"
+            # How codex-acp 2.2.2 ends a turn that FAILED (out of credits, …),
+            # captured in AgentClientProtocol/test/fixtures/codex_usage_limit_responses.json.
+            # With the AIR `sessionFailure` capability the turn resolves as a
+            # plain `end_turn` and the failure rides ONLY the response's `_meta`.
+            # Without it codex streams the failure's title as agent text.
+            record = ev["record"]
+            if SESSION_NOTICE_SUPPORTED[]
+                resp_meta = Dict("jetbrains" => Dict("air" => Dict(
+                    "version" => 1, "sessionFailure" => record)))
+            else
+                agent_chunk(String(record["title"]) * "\n\n")
+            end
         elseif et == "usage"
             emit_usage(ev)
         elseif et == "commands"
@@ -969,7 +998,9 @@ function run_dispatcher_prompt(prompt_id)
         # Unknown event types: silently skip. Lets the dispatcher add
         # new event types without churning the binary in lockstep.
     end
-    resp(prompt_id, Dict("stopReason" => stop_reason))
+    result = Dict{String,Any}("stopReason" => stop_reason)
+    resp_meta === nothing || (result["_meta"] = resp_meta)
+    resp(prompt_id, result)
     # Between-turn emission: each post_turn block waits its delay, then streams
     # its frames with NO turn open. Async so the dispatcher loop is free to
     # read the next prompt — same concurrency the real agent has.

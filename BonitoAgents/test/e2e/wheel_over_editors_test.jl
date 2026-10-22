@@ -21,7 +21,7 @@
     TK.new_chat(s; title = "WheelEditors")
     TK.send_message(s, "edit and eval")
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     chat = "$VP.querySelector('.bt-messages')"
     card(id) = "$VP.querySelector('.bt-tool-msg[data-msg-id*=\"$(id)\"]')"
     @test TK.wait_for(s, "the eval card done",

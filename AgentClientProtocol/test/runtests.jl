@@ -1104,6 +1104,58 @@ end
     @test d.new_text == "hello world\nsecond line\n"
 end
 
+# A turn against a Codex account at its usage limit, captured from codex-acp
+# 2.2.2 with the client announcing the AIR `sessionFailure` capability (as
+# BonitoAgents does): a plain prompt, then `/compact`, which fails the same way a
+# real turn does once the context is nearly full. Both turns resolve as an
+# ordinary `end_turn`, the failure ONLY in the response's `_meta`; the compaction
+# is a nameless `think` tool that never closes. Read naively, every such turn
+# looked like a successful one that did work, and Yolo re-prompted a locked
+# account 10,294 times.
+@testset "usage limit from codex (real codex-acp wire)" begin
+    frames = codex_frames("codex_usage_limit_compaction.jsonl")
+    # Genuine capture: no claude meta, no name, nothing but the AIR tag.
+    @test !any(f -> haskey(get(f, "_meta", Dict()), "claudeCode"), frames)
+    @test !any(f -> haskey(f, "rawInput"), frames)
+
+    compaction = only(codex_tools("codex_usage_limit_compaction.jsonl"))
+    @test compaction isa ACP.GenericTool
+    @test compaction.name == ACP.CONTEXT_COMPACTION_TOOL
+    @test compaction.kind == "think"
+    @test compaction.title == "Compact conversation"
+    # It never got a closing update; the end of the turn fails it.
+    @test compaction.status == "failed"
+
+    # codex-acp 1.11.0 (a dev worker's PATH install) tags the same call at the
+    # top of `_meta`, outside the AIR envelope. Captured from a real `/compact`
+    # against the same locked account.
+    old = only(codex_tools("codex_1_11_compaction.jsonl"))
+    @test haskey(codex_frames("codex_1_11_compaction.jsonl")[2]["_meta"], "contextCompaction")
+    @test old isa ACP.GenericTool
+    @test old.name == ACP.CONTEXT_COMPACTION_TOOL
+    @test old.title == "Compact conversation"
+
+    responses = JSON.parse(read(joinpath(@__DIR__, "fixtures",
+        "codex_usage_limit_responses.json"), String))
+    @test all(r -> r["stopReason"] == "end_turn", responses)
+    records = ACP.session_notice_record.(responses)
+    @test all(r -> r !== nothing && r["severity"] == "error" && r["category"] == "limit", records)
+    @test startswith(records[1]["title"], "You’ve hit your usage limit.")
+    @test startswith(records[2]["title"], "Error running remote compact task: You’ve hit your usage limit.")
+    # A response without one is an ordinary ending.
+    @test ACP.session_notice_record(Dict("stopReason" => "end_turn")) === nothing
+
+    # Anything else stays nameless: a `think` tool without the tag is not a
+    # compaction, and an unknown AIR key names nothing.
+    plain = ACP.parse_session_update(Dict("sessionUpdate" => "tool_call",
+        "toolCallId" => "t1", "kind" => "think", "title" => "Compact conversation"))
+    @test plain.tool_name == ""
+    other = ACP.parse_session_update(Dict("sessionUpdate" => "tool_call",
+        "toolCallId" => "t2", "kind" => "think", "title" => "x y",
+        "_meta" => Dict("jetbrains" => Dict("air" => Dict("version" => 1, "other" => Dict())))))
+    @test other.tool_name == ""
+end
+
 # The envelope check keys on SHAPE, so it has to be tight enough that a tool
 # whose own arguments happen to be named that way still round-trips.
 @testset "codex MCP envelope is recognised by shape alone" begin

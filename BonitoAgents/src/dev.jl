@@ -39,14 +39,16 @@ Base.@kwdef struct DevProxy
     admin::String = "admin"
     domain::String = "bonito.localhost"
     tunnel::Bool = false
+    session_store_bin::String = ""
 end
 
 # The proxy processes of a `dev_server(proxy = …)`, and where Caddy keeps its CA.
-struct DevProxyRig
+mutable struct DevProxyRig
     caddy::Base.Process
     authelia::Base.Process
     dir::String
     root_cert::String      # Caddy's own CA: what a browser or worker must trust
+    session_store::Union{Nothing,Base.Process}
 end
 
 mutable struct DevHandle
@@ -346,6 +348,7 @@ function Base.close(h::DevHandle)
     end
     if h.proxy !== nothing
         foreach(stop_worker_proc!, (h.proxy.caddy, h.proxy.authelia))
+        h.proxy.session_store === nothing || stop_worker_proc!(h.proxy.session_store)
         h.ephemeral && rm(h.proxy.dir; recursive = true, force = true)
     end
     # ...and the agents that worker started. It cannot do this itself: it is
@@ -427,6 +430,7 @@ function write_dev_proxy_config!(p::DevProxy, state_dir::AbstractString, server_
         "domain" => p.domain, "admin" => p.admin,
         "port" => server_port, "authelia_port" => free_port(), "https_port" => free_port(),
         "authelia_bin" => p.authelia_bin, "users_file" => joinpath(authelia_dir, "users.yml"))
+    isempty(p.session_store_bin) || (config["session_socket"] = joinpath(authelia_dir, "sessions", "store.sock"))
     p.tunnel ? (config["tls"] = "tunnel") : merge!(config, Dict(
         "auth_domain" => "auth." * p.domain, "http_port" => free_port(),
         "tls" => "internal", "worker_address" => "127.0.0.1",
@@ -449,35 +453,54 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
     cfg = state.auth.config
     dir = dev_proxy_dir(state.state_dir)
     config = authelia_config_file(cfg)
-    # The admin's second factor, as if they had registered an authenticator app
-    # (into a database brought to Authelia's schema first).
-    migrate_authelia_storage(cfg)
-    run(pipeline(`$(p.authelia_bin) storage user totp generate $(p.admin) --secret $(p.totp_secret) --force --config $(config)`;
-                 stdout = devnull))
     log(name) = joinpath(dir, name * ".log")
-    # Both go down with this process, however it ends (the kernel sees to it), like
-    # the dev worker: a crashed test run must not leave them listening.
     with_parent(cmd) = `setpriv --pdeathsig KILL -- $cmd`
-    authelia = run(pipeline(with_parent(`$(p.authelia_bin) --config $(config)`);
-                            stdout = log("authelia"), stderr = log("authelia")); wait = false)
-    caddy_env = merge(ENV, Dict("XDG_DATA_HOME" => mkpath(joinpath(dir, "data")),
-                                "XDG_CONFIG_HOME" => mkpath(joinpath(dir, "config"))))
-    caddyfile = p.tunnel ? write_dev_tunnel(p, cfg, dir) : cfg.caddyfile
-    caddy = run(pipeline(setenv(with_parent(`$(p.caddy_bin) run --config $(caddyfile) --adapter caddyfile --watch`),
-                                caddy_env); stdout = log("caddy"), stderr = log("caddy")); wait = false)
-    root_cert = joinpath(dir, "data", "caddy", "pki", "authorities", "local", "root.crt")
-    listening(port) = try
-        close(Sockets.connect(Sockets.IPv4(0x7f000001), port)); true
-    catch e
-        e isa Base.IOError || rethrow()
-        false
+    session_store = if isempty(p.session_store_bin)
+        nothing
+    else
+        proc = run(pipeline(with_parent(`$(p.session_store_bin) $(joinpath(dirname(cfg.session_socket), "server.conf"))`);
+                            stdout = log("sessions"), stderr = log("sessions")); wait = false)
+        ready() = process_running(proc) && ispath(cfg.session_socket)
+        if timedwait(ready, 30.0; pollint = 0.1) !== :ok
+            stop_worker_proc!(proc)
+            error("dev_server: the login session store did not start; see $(log("sessions"))")
+        end
+        proc
     end
-    up() = isfile(root_cert) && listening(cfg.https_port) && listening(cfg.authelia_port)
-    if timedwait(up, 30.0) !== :ok
-        foreach(stop_worker_proc!, (caddy, authelia))
-        error("dev_server: the proxy did not come up within 30 s; see $(log("caddy")) and $(log("authelia"))")
+    authelia = caddy = nothing
+    try
+        # The admin's second factor, as if they had registered an authenticator app
+        # (into a database brought to Authelia's schema first).
+        migrate_authelia_storage(cfg)
+        run(pipeline(`$(p.authelia_bin) storage user totp generate $(p.admin) --secret $(p.totp_secret) --force --config $(config)`;
+                     stdout = devnull))
+        # Both go down with this process, however it ends (the kernel sees to it), like
+        # the dev worker: a crashed test run must not leave them listening.
+        authelia = run(pipeline(with_parent(`$(p.authelia_bin) --config $(config)`);
+                                stdout = log("authelia"), stderr = log("authelia")); wait = false)
+        caddy_env = merge(ENV, Dict("XDG_DATA_HOME" => mkpath(joinpath(dir, "data")),
+                                    "XDG_CONFIG_HOME" => mkpath(joinpath(dir, "config"))))
+        caddyfile = p.tunnel ? write_dev_tunnel(p, cfg, dir) : cfg.caddyfile
+        caddy = run(pipeline(setenv(with_parent(`$(p.caddy_bin) run --config $(caddyfile) --adapter caddyfile --watch`),
+                                    caddy_env); stdout = log("caddy"), stderr = log("caddy")); wait = false)
+        root_cert = joinpath(dir, "data", "caddy", "pki", "authorities", "local", "root.crt")
+        listening(port) = try
+            close(Sockets.connect(Sockets.IPv4(0x7f000001), port)); true
+        catch e
+            e isa Base.IOError || rethrow()
+            false
+        end
+        up() = isfile(root_cert) && listening(cfg.https_port) && listening(cfg.authelia_port)
+        if timedwait(up, 30.0) !== :ok
+            error("dev_server: the proxy did not come up within 30 s; see $(log("caddy")) and $(log("authelia"))")
+        end
+        return DevProxyRig(caddy, authelia, dir, root_cert, session_store)
+    catch
+        for proc in (caddy, authelia, session_store)
+            proc === nothing || stop_worker_proc!(proc)
+        end
+        rethrow()
     end
-    return DevProxyRig(caddy, authelia, dir, root_cert)
 end
 
 # The tunnel's stand-in: HTTPS for the dashboard's name (browsers) and for

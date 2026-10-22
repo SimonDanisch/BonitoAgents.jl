@@ -23,7 +23,7 @@
     elseif Sys.which("claude-agent-acp") === nothing && isempty(get(ENV, "CLAUDE_AGENT_ACP", ""))
         error("BT_REAL_AGENT=1 but no claude-agent-acp on PATH (or CLAUDE_AGENT_ACP)")
     else
-        VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+        VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
         header_env = "(() => { const p=$VP; const e=p && p.querySelector('.bt-header-env'); return e ? (e.textContent||'').trim() : ''; })()"
         open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bt-menu-trigger'); if(!t) return false; t.click(); return true; })()"
         continue_items = "(() => { const p=$VP; return [...(p ? p.querySelectorAll('.bt-header-menu .bt-menu-continue') : [])].map(b => (b.textContent||'').trim()); })()"

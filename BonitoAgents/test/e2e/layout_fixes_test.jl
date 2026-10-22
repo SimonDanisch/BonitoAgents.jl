@@ -187,7 +187,7 @@
     @testset "composer starts compact and grows for longer drafts" begin
         geo = TK.eval_js(s, """
             (() => {
-                const p  = [...document.querySelectorAll('.bt-chatpane')].find(x => x.offsetParent !== null);
+                const p  = document.querySelector('.bt-chatpane[aria-hidden=false]');
                 if (!p) return null;
                 const ta = p.querySelector('.bt-text-input');
                 const c  = p.querySelector('.bt-input-controls');
@@ -204,14 +204,14 @@
         TK.set_input(s, ".bt-text-input", join(["line $(i)" for i in 1:8], "\n"))
         sleep(0.4)
         grown = TK.eval_js(s, """
-            (() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null);
+            (() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]');
                      return Math.round(p.querySelector('.bt-text-input').getBoundingClientRect().height); })()""")
         @test grown > geo["taH"]                # grew past the floor
         @test grown <= 320                      # …capped at max-height
         TK.set_input(s, ".bt-text-input", "")
         sleep(0.4)
         cleared = TK.eval_js(s, """
-            (() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null);
+            (() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]');
                      return Math.round(p.querySelector('.bt-text-input').getBoundingClientRect().height); })()""")
         @test abs(cleared - geo["taH"]) <= 2   # settles back to the empty editor height
     end

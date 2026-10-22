@@ -22,7 +22,7 @@
     using Base64: base64decode
     include(joinpath(@__DIR__, "..", "fixtures", "textured_models.jl"))
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     card(id) = "$VP?.querySelector('.bt-tool-msg[data-msg-id*=\"$id\"]')"
     # The link a finished bt_share card names (its body expanded once).
     card_link(id) = """(() => {

@@ -17,9 +17,9 @@
     const TK = TestKit
     real_eval(code; kw...) = TK.bt_eval(code; real_process = true, kw...)
     real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
-    remote_item = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)?.querySelector('.bt-header-menu .bt-header-remote')"
+    remote_item = "document.querySelector('.bt-chatpane[aria-hidden=false]')?.querySelector('.bt-header-menu .bt-header-remote')"
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     card(id) = "$VP?.querySelector('.bt-tool-msg[data-msg-id*=\"$id\"]')"
     summary(id) = "($(card(id))?.querySelector('.bt-tool-summary')?.textContent || '')"
     body(id) = "($(card(id))?.querySelector('.bt-tool-body')?.innerText || '')"
@@ -109,7 +109,7 @@ end
     BW = BT.BonitoWorker
     real_eval(code; kw...) = TK.bt_eval(code; real_process = true, kw...)
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     card(id) = "$VP?.querySelector('.bt-tool-msg[data-msg-id*=\"$id\"]')"
     body(id) = "($(card(id))?.querySelector('.bt-tool-body')?.innerText || '')"
     old_pid = Ref(0)

@@ -160,6 +160,11 @@ jobs:
         # take the browser items.
         run: julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl unit
 
+      - name: Chat JS unit tests
+        # The chat's pure-JS pieces (word diffs, body size reservations) under
+        # Node's own test runner; the runner image ships Node.
+        run: node --test BonitoAgents/test/js/*.test.mjs
+
       - name: RemoteSync transfer tests (incl. close-vs-tail stress)
         # RemoteSync is a path [source] of BonitoAgents, so its deps are already
         # in this env — run its suite here rather than spin up a separate project.
@@ -191,7 +196,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xvfb dbus libgtk-3-0 libnss3 libasound2t64 libgbm1 \
+            xvfb dbus libgtk-3-0 libnss3 libasound2t64 libgbm1 redis-server \
             libxss1 libxtst6 libatk-bridge2.0-0 libdrm2
       - uses: actions/download-artifact@v4
         with:

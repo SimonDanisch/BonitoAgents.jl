@@ -1,3 +1,5 @@
+import { changedRanges } from "./code_diff.mjs";
+
 // BonitoAgents.js — client-side chat: virtual scroll, DOM windowing, streaming.
 //
 // All Julia↔JS traffic flows through ONE Bonito Observable: `comm`.
@@ -192,118 +194,57 @@ export class Collapsable {
 
 const CODE_TAB = 4;
 const CODE_STATE = new WeakMap();      // .bt-code -> {lib, lang, path, sources, rows} until highlighted
-const CODE_OBSERVERS = new WeakMap();  // transcript scroller -> IntersectionObserver
-let CODE_VIEWPORT_OBSERVER = null;     // for code outside a transcript
+const CODE_OBSERVERS = new WeakMap();  // transcript scroller/document -> CodeHighlighter
+const CODE_CHUNKS = new WeakMap();
 
 // The browser's lines of a text, as code_view.jl counts them.
 function codeLines(text) { return text === '' ? [] : text.split('\n'); }
 
 function codeRow(kind, text, side, index, gutter) {
-    const el = document.createElement('div');
-    el.className = kind ? `bt-l bt-l-${kind}` : 'bt-l';
-    if (gutter !== null) el.dataset.g = gutter;
     // A CR the CRLF file brought along shows as nothing; Monaco drops it too.
     const shown = text.endsWith('\r') ? text.slice(0, -1) : text;
-    el.textContent = shown;
-    return { el, text: shown, side, index, marks: null };
+    return { el: null, kind, gutter, text: shown, side, index, marks: null };
 }
 
-// The shortest edit script between two arrays (Myers 1986), one step per
-// element: '=' keeps one, '-' drops one of `a`, '+' takes one of `b`. Null past
-// `maxD` differences.
-function editSteps(a, b, maxD) {
-    const n = a.length, m = b.length, off = n + m + 1;
-    const v = new Int32Array(2 * (n + m) + 3);
-    const trace = [];
-    for (let d = 0; d <= Math.min(n + m, maxD); d++) {
-        trace.push(v.slice());
-        for (let k = -d; k <= d; k += 2) {
-            let x = (k === -d || (k !== d && v[k - 1 + off] < v[k + 1 + off])) ? v[k + 1 + off] : v[k - 1 + off] + 1;
-            let y = x - k;
-            while (x < n && y < m && a[x] === b[y]) { x++; y++; }
-            v[k + off] = x;
-            if (x >= n && y >= m) {
-                const steps = [];
-                for (let dd = d; dd > 0; dd--) {
-                    const w = trace[dd], kk = x - y;
-                    const down = kk === -dd || (kk !== dd && w[kk - 1 + off] < w[kk + 1 + off]);
-                    const pk = down ? kk + 1 : kk - 1, px = w[pk + off], py = px - pk;
-                    while (x > (down ? px : px + 1) && y > (down ? py + 1 : py)) { steps.push('='); x--; y--; }
-                    steps.push(down ? '+' : '-');
-                    x = px; y = py;
-                }
-                while (x > 0 && y > 0) { steps.push('='); x--; y--; }
-                return steps.reverse();
-            }
-        }
-    }
-    return null;
-}
 
-// What a removed line and the added line it became differ in, word by word
-// (runs of word characters, of spaces, single other characters): the
-// character ranges of each side that the other lacks. Nothing when the lines
-// share too little for marks to say more than the line's own colour does.
-function changedRanges(a, b) {
-    const ta = a.match(/\w+|\s+|[^\w\s]/g) || [], tb = b.match(/\w+|\s+|[^\w\s]/g) || [];
-    const steps = editSteps(ta, tb, 200);
-    if (!steps) return null;
-    const ra = [], rb = [];
-    let i = 0, j = 0, pa = 0, pb = 0, kept = 0;
-    const add = (ranges, from, to) => {
-        const last = ranges[ranges.length - 1];
-        if (last && last[1] === from) last[1] = to; else ranges.push([from, to]);
-    };
-    for (const st of steps) {
-        if (st === '=') { pa += ta[i].length; pb += tb[j].length; kept += ta[i].length; i++; j++; }
-        else if (st === '-') { add(ra, pa, pa + ta[i].length); pa += ta[i++].length; }
-        else { add(rb, pb, pb + tb[j].length); pb += tb[j++].length; }
-    }
-    if (kept * 3 < Math.max(a.length, b.length)) return null;
-    return [ra, rb];
-}
-
-function codeRows(sources, ops) {
+function* codeRows(sources, ops) {
     if (ops === undefined) {
         const lines = codeLines(sources[0]);
         if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
-        return lines.map((t, i) => codeRow('', t, 0, i, null));
+        for (let i = 0; i < lines.length; i++) yield codeRow('', lines[i], 0, i, null);
+        return;
     }
     const a = codeLines(sources[0]), b = codeLines(sources[1]);
     const w = String(Math.max(a.length, b.length, 1)).length;
     const pad = (x) => (x === null ? '' : String(x)).padStart(w);
     const gutter = (i, j, sign) => `${pad(i === null ? null : i + 1)} ${pad(j === null ? null : j + 1)} ${sign}`;
-    const rows = [];
     let i = 0, j = 0;
     const runs = ops.split(' ').filter(Boolean).map(op => [op[0], parseInt(op.slice(1), 10)]);
     for (let r = 0; r < runs.length; r++) {
         const [k, n] = runs[r];
         if (k === '=') {
-            for (let t = 0; t < n; t++, i++, j++) rows.push(codeRow('', b[j], 1, j, gutter(i, j, ' ')));
+            for (let t = 0; t < n; t++, i++, j++) yield codeRow('', b[j], 1, j, gutter(i, j, ' '));
         } else if (k === '-') {
             const removed = [];
-            for (let t = 0; t < n; t++, i++) { const row = codeRow('del', a[i], 0, i, gutter(i, null, '-')); rows.push(row); removed.push(row); }
+            for (let t = 0; t < n; t++, i++) { const row = codeRow('del', a[i], 0, i, gutter(i, null, '-')); removed.push(row); yield row; }
             // The additions right after are what these lines became: mark
             // the changed characters of each pair.
             if (r + 1 < runs.length && runs[r + 1][0] === '+') {
                 const [, m] = runs[++r];
                 for (let t = 0; t < m; t++, j++) {
                     const row = codeRow('add', b[j], 1, j, gutter(null, j, '+'));
-                    rows.push(row);
                     const old = removed[t];
-                    if (!old) continue;
-                    const ranges = changedRanges(old.text, row.text);
-                    if (ranges) { old.marks = ranges[0]; row.marks = ranges[1]; }
+                    if (old) {
+                        const ranges = changedRanges(old.text, row.text);
+                        if (ranges) { old.marks = ranges[0]; row.marks = ranges[1]; }
+                    }
+                    yield row;
                 }
             }
         } else {
-            for (let t = 0; t < n; t++, j++) rows.push(codeRow('add', b[j], 1, j, gutter(null, j, '+')));
+            for (let t = 0; t < n; t++, j++) yield codeRow('add', b[j], 1, j, gutter(null, j, '+'));
         }
     }
-    // A text ending in a newline leaves an empty last line, kept by both sides.
-    const last = rows[rows.length - 1];
-    if (last && last.el.className === 'bt-l' && last.text === '') { last.el.remove(); rows.pop(); }
-    return rows;
 }
 
 // Wrap characters [from, to) of a row in a `.bt-ch` span, across token spans.
@@ -362,53 +303,217 @@ function resource(line, text) {
 async function highlightCode(el) {
     const st = CODE_STATE.get(el);
     CODE_STATE.set(el, null);          // mounted, and its sources no longer needed
+    if (!st.lib) { el.dataset.btHighlighted = 'true'; return; }
     const lib = await st.lib;
     const lang = st.lang || (st.path ? await lib.language_for_path(st.path) : 'plaintext');
-    if (lang === 'plaintext') return;
-    const tokenized = await Promise.all(st.sources.map(async (t) => {
+    if (lang === 'plaintext') {
+        st.highlighter.forget(el);
+        el.dataset.btHighlighted = 'true';
+        return;
+    }
+    const tpl = document.createElement('template');
+    for (let side = 0; side < st.sources.length; side++) {
+        if (!el.isConnected || st.highlighter.closed) return;
+        const rows = new Map(st.rows.filter(r => r.side === side).map(r => [r.index, r]));
+        if (!rows.size) continue;
+        await lib.colorize_lines(st.sources[side], lang, (index, html) => {
+            if (!el.isConnected || st.highlighter.closed) return false;
+            const row = rows.get(index);
+            if (!row) return;
+            // Only visited groups need token elements. Unvisited source stays
+            // plain text, with its token HTML cached until it enters view.
+            row.html = html;
+            if (row.chunk.wanted) paintCodeRow(row, tpl);
+        });
+    }
+    if (el.isConnected && !st.highlighter.closed) el.dataset.btHighlighted = 'true';
+}
+
+function paintCodeRow(row, tpl) {
+    if (row.html == null) return;
+    tpl.innerHTML = row.html;
+    row.html = null;
+    if (!resource(tpl.content, row.text)) return;
+    // Highlighting must not destroy an in-progress copy or native find result.
+    const selection = window.getSelection();
+    const point = (node, offset) => {
+        if (!node || !row.el.contains(node)) return {node, offset};
+        const range = document.createRange();
+        range.selectNodeContents(row.el); range.setEnd(node, offset);
+        return {index: range.toString().length};
+    };
+    const anchor = point(selection.anchorNode, selection.anchorOffset);
+    const focus = point(selection.focusNode, selection.focusOffset);
+    row.el.replaceChildren(tpl.content);
+    markRanges(row);
+    if (anchor.index === undefined && focus.index === undefined) return;
+    const restore = p => {
+        if (p.index === undefined) return p;
+        const walker = document.createTreeWalker(row.el, NodeFilter.SHOW_TEXT);
+        let left = p.index;
+        for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+            if (left <= n.length) return {node:n, offset:left};
+            left -= n.length;
+        }
+        return {node:row.el, offset:row.el.childNodes.length};
+    };
+    const a = restore(anchor), f = restore(focus);
+    selection.setBaseAndExtent(a.node, a.offset, f.node, f.offset);
+}
+
+class CodeHighlighter {
+    constructor(root) {
+        this.pending = [];
+        this.running = false;
+        this.closed = false;
+        this.paintPending = [];
+        this.painting = false;
+        this.observer = new IntersectionObserver((entries) => {
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                this.observer.unobserve(e.target);
+                this.pending.push(e.target);
+            }
+            this.drain();
+        }, { root, rootMargin: '100% 0px' });
+        this.chunks = new IntersectionObserver(entries => {
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                this.chunks.unobserve(e.target);
+                const chunk = CODE_CHUNKS.get(e.target);
+                chunk.wanted = true;
+                this.paintPending.push(chunk.rows);
+            }
+            this.paint();
+        }, {root, rootMargin:'100% 0px'});
+    }
+    observe(el) {
+        const st = CODE_STATE.get(el);
+        st.highlighter = this;
+        for (const chunk of st.chunks) this.chunks.observe(chunk);
+        this.observer.observe(el);
+    }
+    forget(body) {
+        for (const el of body.querySelectorAll('.bt-code')) this.observer.unobserve(el);
+        for (const el of body.querySelectorAll('.bt-code-chunk')) this.chunks.unobserve(el);
+    }
+    disconnect() {
+        this.closed = true;
+        this.observer.disconnect();
+        this.chunks.disconnect();
+        this.pending.length = 0;
+        this.paintPending.length = 0;
+    }
+    async paint() {
+        if (this.painting) return;
+        this.painting = true;
         const tpl = document.createElement('template');
-        tpl.innerHTML = await lib.colorize(t, lang);
-        return [...tpl.content.children].filter(n => n.nodeName === 'SPAN');
-    }));
-    for (const row of st.rows) {
-        const line = tokenized[row.side][row.index];
-        if (!line || !resource(line, row.text)) continue;
-        row.el.replaceChildren(...line.childNodes);
-        markRanges(row);
+        let until = performance.now() + 3;
+        try {
+            while (!this.closed && this.paintPending.length) {
+                for (const row of this.paintPending.shift()) {
+                    if (!row.el.isConnected) continue;
+                    paintCodeRow(row, tpl);
+                    if (performance.now() >= until) {
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        until = performance.now() + 3;
+                    }
+                }
+            }
+        } finally {
+            this.painting = false;
+        }
+    }
+    async drain() {
+        if (this.running) return;
+        this.running = true;
+        let until = performance.now() + 3;
+        try {
+            while (!this.closed && this.pending.length) {
+                const el = this.pending.shift();
+                if (el.isConnected) await highlightCode(el);
+                // Small cards can each finish before colorize_lines yields.
+                // Their combined work must still yield to input and rendering.
+                if (performance.now() >= until) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                    until = performance.now() + 3;
+                }
+            }
+        } finally {
+            this.running = false;
+        }
     }
 }
 
 function observeCode(el) {
-    // Rows near the transcript's viewport, so a card is coloured before it
-    // scrolls in; elsewhere (a share page, a file panel) near the window's.
+    // One queue per scroller: cards entering together share the work budget.
     const root = el.closest('.bt-messages');
-    let io = root ? CODE_OBSERVERS.get(root) : CODE_VIEWPORT_OBSERVER;
-    if (!io) {
-        io = new IntersectionObserver((entries) => {
-            for (const e of entries) {
-                if (!e.isIntersecting) continue;
-                io.unobserve(e.target);
-                highlightCode(e.target);
-            }
-        }, { root, rootMargin: '100% 0px' });
-        if (root) CODE_OBSERVERS.set(root, io); else CODE_VIEWPORT_OBSERVER = io;
+    const key = root || document;
+    let highlighter = CODE_OBSERVERS.get(key);
+    if (!highlighter) {
+        highlighter = new CodeHighlighter(root);
+        CODE_OBSERVERS.set(key, highlighter);
     }
-    io.observe(el);
+    highlighter.observe(el);
 }
 
-export function mountCode(el, lib) {
+export async function mountCode(el, lib) {
     if (CODE_STATE.has(el)) return;
+    CODE_STATE.set(el, null);
+    el.dataset.btHighlighted = 'false';
     const sources = [...el.querySelectorAll(':scope > pre.bt-code-src')].map(p => p.textContent);
-    const rows = codeRows(sources, el.dataset.ops);
+    const rows = [];
+    let until = performance.now() + 3;
+    // Word comparisons and row creation share the same budget as highlighting.
+    for (const row of codeRows(sources, el.dataset.ops)) {
+        rows.push(row);
+        if (performance.now() >= until) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (!el.isConnected) return;
+            until = performance.now() + 3;
+        }
+    }
+    // A text ending in a newline leaves an empty last line, kept by both sides.
+    const last = rows[rows.length - 1];
+    if (el.dataset.ops !== undefined && last?.kind === '' && last.text === '') rows.pop();
     const lines = document.createElement('div');
+    const chunks = [];
     lines.className = 'bt-code-lines';
-    for (const row of rows) {
-        lines.appendChild(row.el);
-        markRanges(row);
+    lines.style.setProperty('--bt-code-height', (rows.length * 18) + 'px');
+    // A single visible 10k-line block still lays out all 10k lines. Keep every
+    // source row searchable/selectable, but let the browser skip small groups
+    // outside the viewport. Their exact height is known before highlighting.
+    for (let i = 0; i < rows.length; i += 32) {
+        const chunk = document.createElement('div');
+        chunk.className = 'bt-code-chunk';
+        chunk.style.setProperty('--bt-code-height', (Math.min(32, rows.length - i) * 18) + 'px');
+        const state = {rows:rows.slice(i, i + 32), wanted:false};
+        if (lib) CODE_CHUNKS.set(chunk, state);
+        for (const row of state.rows) {
+            row.el = document.createElement('div');
+            row.el.className = row.kind ? `bt-l bt-l-${row.kind}` : 'bt-l';
+            if (row.gutter !== null) row.el.dataset.g = row.gutter;
+            row.el.textContent = row.text;
+            if (lib) row.chunk = state;
+            chunk.appendChild(row.el);
+            markRanges(row);
+        }
+        lines.appendChild(chunk);
+        chunks.push(chunk);
+        if (performance.now() >= until) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (!el.isConnected) return;
+            until = performance.now() + 3;
+        }
     }
     el.replaceChildren(lines);
-    CODE_STATE.set(el, { lib, lang: el.dataset.lang || '', path: el.dataset.path || '', sources, rows });
-    observeCode(el);
+    if (lib) {
+        CODE_STATE.set(el, { lib, lang: el.dataset.lang || '', path: el.dataset.path || '', sources, rows, chunks });
+        observeCode(el);
+    } else {
+        CODE_STATE.set(el, null);
+        el.dataset.btHighlighted = 'true';
+    }
     // A tool body built after its row went far: the transcript looks again
     // whether to free it.
     bodyMounted(el);
@@ -449,6 +554,17 @@ function showLoading(body, shape) {
 class BonitoChat {
     constructor(container, comm, init = {}) {
         this.container = container;
+        this.projectVisible = container.closest('.bt-chatpane')?.getAttribute('aria-hidden') !== 'true';
+        this.workspacePanel = container.closest('.bw-ws-panel');
+        this.workspaceVisible = this.workspacePanel?.dataset.bwVisible !== 'false';
+        this.paneVisible = this.projectVisible && this.workspaceVisible;
+        this.onWorkspaceVisibility = e => {
+            this.workspaceVisible = e.detail;
+            this.updateVisibility();
+        };
+        this.workspacePanel?.addEventListener('bw-panel-visibility', this.onWorkspaceVisibility);
+        this.showRestoreRaf = 0;
+        this.showRestoreTimers = [];
         this.comm      = comm;
         this.destroyed = false;
 
@@ -500,7 +616,7 @@ class BonitoChat {
             // reports those same heights) reads as no change either.
             // `onShown` restores the reading position.
             const c = this.container;
-            if (c.clientHeight === 0) return;
+            if (!this.paneVisible || c.clientHeight === 0) return;
             const st = c.scrollTop;
             const sb = st + c.clientHeight;
             const last = this.cache.get(this.order[this.order.length - 1]);
@@ -586,14 +702,14 @@ class BonitoChat {
         // Back within a screen and a half, it is rendered again. Two
         // distances, so a row at the edge does not flip back and forth.
         this.freeObserver = new IntersectionObserver((entries) => {
-            if (this.destroyed || this.container.clientHeight === 0) return;
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
             for (const e of entries) if (!e.isIntersecting) this.freeBody(e.target);
         }, { root: container, rootMargin: '300% 0px' });
         // The same distance decides when a body is fetched the FIRST time
         // (`requestBody`): a chat opened on 40 edits built 40 diff editors,
         // one after another, before the last one showed.
         this.mountObserver = new IntersectionObserver((entries) => {
-            if (this.destroyed || this.container.clientHeight === 0) return;
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
             for (const e of entries) {
                 if (!e.isIntersecting) continue;
                 const n = e.target;
@@ -733,6 +849,7 @@ class BonitoChat {
             this.lastUserInputT = performance.now();
             this.pendingUserScroll = true;
             this.cancelPendingScroll();
+            this.cancelShowRestore();
         };
         // Capture: BonitoBook stops wheels over editors on the way down.
         container.addEventListener('wheel',      markUserInput, { passive: true, capture: true });
@@ -1026,7 +1143,7 @@ class BonitoChat {
             // followMode back to true and chase the pane to the bottom on the
             // next onShown — the user's read position lost. Ignore it: the pane
             // has no viewport, so there is nothing to classify.
-            if (this.container.clientHeight === 0) return;
+            if (!this.paneVisible || this.container.clientHeight === 0) return;
             // Last position seen with a real layout box. `restoreAfterMove`
             // puts this back when the workspace re-inserts our panel and the
             // browser silently drops scrollTop to 0.
@@ -1079,7 +1196,7 @@ class BonitoChat {
             if (this.destroyed) return;
             // A zero-height (hidden) container has nothing to chase — and the
             // re-show / restore is owned by onShown(), so don't fight it here.
-            if (this.container.clientHeight === 0) return;
+            if (!this.paneVisible || this.container.clientHeight === 0) return;
             this.sizeTail();
             if (this.followMode) this.queueScrollToBottom();
         });
@@ -1118,6 +1235,10 @@ class BonitoChat {
 
     destroy() {
         this.destroyed = true;
+        this.workspacePanel?.removeEventListener('bw-panel-visibility', this.onWorkspaceVisibility);
+        this.cancelShowRestore();
+        CODE_OBSERVERS.get(this.container)?.disconnect();
+        CODE_OBSERVERS.delete(this.container);
         if (this.elapsedTimer) {
             clearInterval(this.elapsedTimer);
             this.elapsedTimer = null;
@@ -1566,7 +1687,7 @@ class BonitoChat {
     ensureWindow() {
         if (this.destroyed) return;
         const c = this.container;
-        if (this.railDrag || c.clientHeight === 0) { this.updateRail(); return; }
+        if (!this.paneVisible || this.railDrag || c.clientHeight === 0) { this.updateRail(); return; }
         const len = this.seqLength();
         if (this.pending.block || len === 0) { this.updateRail(); return; }
         if (this.blockEmpty()) { this.loadTail(); return; }
@@ -1750,9 +1871,14 @@ class BonitoChat {
     bodyReserve(node) {
         if (!node.collapsable) return null;
         const map = node.__btBodyH;
-        const w = this.bodyWidth();
-        if (map) for (const [k, h] of Object.entries(map))
-            if (Math.abs(+k - w) <= 2) return {height: h + 'px'};
+        // Most new rows have no saved size. Reading clientWidth while those
+        // rows are being built would lay out the pane for no reservation.
+        const sizes = map ? Object.entries(map) : [];
+        if (sizes.length) {
+            const w = this.bodyWidth();
+            for (const [k, h] of sizes)
+                if (Math.abs(+k - w) <= 2) return {height: h + 'px'};
+        }
         const m = node.__btMedia;
         if (m && m[0] > 0 && m[1] > 0)
             return {boxSizing: 'content-box', padding: (node.__btMediaExtra || 0) + 'px 0 0',
@@ -1772,7 +1898,7 @@ class BonitoChat {
 
     reportBody(node) {
         node.__btBodyTimer = null;
-        if (this.destroyed || !node.isConnected || this.container.clientHeight === 0) return;
+        if (this.destroyed || !this.paneVisible || !node.isConnected || this.container.clientHeight === 0) return;
         const body = node.collapsable?.body;
         const id = node.dataset.msgId;
         if (!id || !body || body.offsetParent === null || body.childElementCount === 0) return;
@@ -1812,6 +1938,7 @@ class BonitoChat {
     // playing, and a picture or a small body costs less than rendering it
     // again would.
     freeBody(node) {
+        if (!this.paneVisible) return;
         if (!node.isConnected || node.dataset.btFreed || node.dataset.btApp) return;
         if (node.classList.contains('bt-tool-live') || this.holdsFullscreen(node)) return;
         const c = node.collapsable;
@@ -1828,6 +1955,7 @@ class BonitoChat {
         if (!body.querySelector('.monaco-editor') && weight < 300) return;
         const h = this.bodyContentHeight(body);
         node.dataset.btFreed = '1';
+        CODE_OBSERVERS.get(this.container)?.forget(body);
         // Out of the document, the body's session ends and BonitoBook
         // disposes its editors; `bodyDied` leaves a freed row alone.
         body.innerHTML = '<div class="bt-collapsable-loading bt-body-freed">loading…</div>';
@@ -1934,9 +2062,21 @@ class BonitoChat {
         this.keyScope = false;
         this.onScopePointer = (e) => { this.keyScope = wrap.contains(e.target); };
         this.onEndsKey = (e) => {
+            // Native find moves the page without a wheel/touch event. That is
+            // deliberate navigation, not a layout shift to chase back down.
+            const findKey = e.key === 'F3' || ((e.ctrlKey || e.metaKey) &&
+                (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'g'));
+            // Ordinary typing must not read geometry: the previous input can
+            // have changed the composer's size and left layout pending.
+            if (!findKey && e.key !== 'Home' && e.key !== 'End') return;
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
+            if (findKey && !e.defaultPrevented && !e.target.closest?.('.monaco-editor')) {
+                this.markUserInput();
+                this.setFollowMode(false);
+                return;
+            }
             if (e.key !== 'Home' && e.key !== 'End') return;
             if (e.altKey || e.metaKey || e.shiftKey || e.defaultPrevented) return;
-            if (this.destroyed || this.container.clientHeight === 0) return;
             const t = e.target;
             const page = t === document.body || t === document.documentElement;
             if (!(wrap.contains(t) || (page && this.keyScope))) return;
@@ -2002,6 +2142,7 @@ class BonitoChat {
     }
 
     updateRail() {
+        if (!this.paneVisible) return;
         const rail = this.railEl;
         if (!rail || this.railDrag) return;
         const c = this.container;
@@ -3986,6 +4127,7 @@ class BonitoChat {
     }
 
     atBottom() {
+        if (!this.paneVisible) return false;
         const { scrollTop, scrollHeight, clientHeight } = this.container;
         // Tight (AT_BOTTOM_PX = 20) so "user manually scrolled to the
         // very bottom" re-engages follow mode while merely-near doesn't.
@@ -4004,6 +4146,7 @@ class BonitoChat {
     // height of hysteresis makes layout jitter invisible to the pill,
     // while followMode / unread-clearing keep using atBottom().
     lastMessageFullyOutOfView() {
+        if (!this.paneVisible) return true;
         if (this.totalCount === 0) return false;
         const node = this.cache.get(this.totalCount - 1);
         // Virtual scroll detaches nodes far outside the viewport (cache
@@ -4028,7 +4171,7 @@ class BonitoChat {
         // arrivals all funnel through here — any of them would snap the
         // thumb out of the user's hand).
         if (this.scrollbarDrag) return;
-        if (this.scrollQueued || this.destroyed) return;
+        if (this.scrollQueued || this.destroyed || !this.paneVisible) return;
         this.scrollQueued = true;
         this.scrollRafId = requestAnimationFrame(() => {
             this.scrollQueued = false;
@@ -4106,7 +4249,7 @@ class BonitoChat {
     // holds and the jitter guards all regress. A genuine reset is ours to undo;
     // nothing else is.
     restoreAfterMove() {
-        if (this.container.clientHeight === 0) return;   // no box yet; onShown owns it
+        if (!this.paneVisible || this.container.clientHeight === 0) return;   // no box yet; onShown owns it
         if (this.container.scrollTop > 1) return;        // scroll survived the move
         if (this.followMode) {
             if (!this.atBottom()) this.scrollToBottom();
@@ -4120,7 +4263,7 @@ class BonitoChat {
     }
 
     scrollToBottom() {
-        if (this.scrollbarDrag) return;   // the rail drag owns the position
+        if (this.destroyed || !this.paneVisible || this.scrollbarDrag) return;
         // The bottom of the conversation, not just of the block: a block that
         // stops short of the end is replaced by the tail, which lands pinned.
         if (this.blockEmpty() || !this.atTail()) {
@@ -4152,6 +4295,24 @@ class BonitoChat {
     // multi-attempt cascade in `onShown` we treat the browser as opaque
     // and just brute-force the right answer.
     onHidden() {
+        this.projectVisible = false;
+        this.updateVisibility();
+    }
+
+    onShown() {
+        this.projectVisible = true;
+        this.updateVisibility(true);
+    }
+
+    updateVisibility(restore = false) {
+        const visible = this.projectVisible && this.workspaceVisible;
+        if (visible && (restore || !this.paneVisible)) this.showPane();
+        else if (!visible && this.paneVisible) this.hidePane();
+    }
+
+    hidePane() {
+        if (!this.paneVisible) return;
+        this.cancelShowRestore();
         // Freeze all in-flight scroll animation BEFORE snapshotting the position.
         // A pan fling leaves momentum/spring rAFs (and an append chase rAF) that
         // write `scrollTop` every frame; if the pane is hidden mid-fling they keep
@@ -4169,6 +4330,7 @@ class BonitoChat {
         // at; restoring to the anchored MESSAGE is what "keep my read
         // position" actually means.
         this.savedAnchor = this.captureAnchor();
+        this.paneVisible = false;
     }
 
     // Called by the chat-pane visibility toggle whenever this pane goes
@@ -4185,7 +4347,16 @@ class BonitoChat {
     // The 0 / rAF / 50 ms / 200 ms cascade: a single-frame write loses to a
     // still-in-progress flex relayout (clicking the chat TWICE used to land
     // right). The cascade replicates "click again later", just automatically.
-    onShown() {
+    cancelShowRestore() {
+        cancelAnimationFrame(this.showRestoreRaf);
+        this.showRestoreRaf = 0;
+        for (const timer of this.showRestoreTimers) clearTimeout(timer);
+        this.showRestoreTimers = [];
+    }
+
+    showPane() {
+        this.cancelShowRestore();
+        this.paneVisible = true;
         const followNow  = !!this.followMode;
         const followThen = !!this.savedFollowMode;
         const wantBottom = followNow || followThen;
@@ -4193,9 +4364,10 @@ class BonitoChat {
         const anchor     = this.savedAnchor;
 
         const apply = () => {
-            if (this.destroyed) return;
+            if (this.destroyed || !this.paneVisible) return;
             if (wantBottom) {
                 if (this.followMode) this.scrollToBottom();
+                this.updateScrollAffordance(this.atBottom());
                 return;
             }
             const n = anchor ? this.cache.get(anchor.idx) : null;
@@ -4208,11 +4380,11 @@ class BonitoChat {
             // baseline (see prevScrollTop).
             this.prevScrollTop = this.container.scrollTop;
             this.ensureWindow();
+            this.updateScrollAffordance(this.atBottom());
         };
         apply();
-        requestAnimationFrame(apply);
-        setTimeout(apply,  50);
-        setTimeout(apply, 200);
+        this.showRestoreRaf = requestAnimationFrame(apply);
+        this.showRestoreTimers = [setTimeout(apply, 50), setTimeout(apply, 200)];
     }
 
     // ── Image attachments ────────────────────────────────────────────────
@@ -4575,15 +4747,13 @@ class BonitoChat {
         // semantics — skip when the user is editing inside one.
         this.onEscapeKey = (e) => {
             if (e.key !== 'Escape' || e.repeat || e.isComposing || this.inputComposing || e.keyCode === 229) return;
-            // Document-level listener + kept-alive panes (display:none but
-            // connected) = EVERY chat instance hears this. Only the VISIBLE
-            // pane may cancel — one ESC used to cancel the running turn of
-            // every open chat. offsetParent is null while the pane (or any
-            // ancestor) is display:none. A container that left the document
+            // Every kept-alive chat hears this document listener. Hidden panes
+            // retain layout boxes, so their visibility flag must gate cancel.
+            // A container that left the document
             // entirely means the `connect` MutationObserver missed an
             // ancestor-level unmount: self-destroy.
             if (!this.container.isConnected) { this.lazyDestroy(); return; }
-            if (this.container.offsetParent === null) return;
+            if (!this.paneVisible || this.container.offsetParent === null) return;
             if (document.querySelector('.bt-lightbox-overlay')) return;
             const modeMenu = this.app.querySelector('.bt-send-mode-menu');
             if (modeMenu && !modeMenu.hidden) {
@@ -4955,7 +5125,7 @@ class BonitoChat {
         // IME notifications can repeat without a viewport change. Do not
         // re-pin the transcript for every key/selection event. Actual content
         // and composer resizes are already handled by the ResizeObservers.
-        if (this.destroyed || !this.container.offsetParent) return;
+        if (this.destroyed || !this.paneVisible || !this.container.offsetParent) return;
         const h = Math.round(vv.height);
         if (this.lastViewportHeight === h) return;
         this.lastViewportHeight = h;
@@ -5059,6 +5229,7 @@ class BonitoChat {
     // visible but not at the bottom — the pill hides, but unread is NOT
     // cleared: the user hasn't actually reached the bottom.
     updateScrollAffordance(atBot) {
+        if (!this.paneVisible) return;
         if (atBot) {
             this.unreadCount = 0;
             this.hideNewMessagePill();

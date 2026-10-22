@@ -53,7 +53,7 @@
     seeded_dirs = String[]   # transcript dirs this test creates; removed at the end
 
     # Several panes stay mounted: scope to the visible one.
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     header_env = "(() => { const p=$VP; const e=p && p.querySelector('.bt-header-env'); return e ? (e.textContent||'').trim() : ''; })()"
     pane_text = "(() => { const p=$VP; return p ? (p.innerText || '') : ''; })()"
     open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bt-menu-trigger'); if(!t) return false; t.click(); return true; })()"

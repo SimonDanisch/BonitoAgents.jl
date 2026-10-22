@@ -52,6 +52,34 @@ function host_process!(worker, reply)
 end
 
 try
+    @testset "a replayed eval can reconnect to its live run" begin
+        # Codex resumes by replaying tools, not by going through build_tool_msg.
+        # The MCP can subsequently announce that one of those runs is still live.
+        out = Channel{Any}(32)
+        turn = ACP.TurnState()
+        fixture = joinpath(pkgdir(ACP), "test", "fixtures", "codex_mcp_tool_call.jsonl")
+        for line in eachline(fixture)
+            ACP.parse_update!(out, turn, ACP.parse_session_update(JSON.parse(line)))
+        end
+        ACP.close_turn!(out, turn)
+        close(out)
+        tc = only(x for x in collect(out) if x isa ACP.MCPCall)
+        replay = BT.replayed_to_msg(model, tc)
+        push!(model.msgs_store, replay)
+        @test BT.tool_chat(replay) === BT.shared(model)
+        BT.run_update!(state, "proj", "", running("replayed-run", "/tmp/codexprobe";
+            background = true, tool_use_id = tc.id))
+        @test replay.run !== nothing && replay.run.id == "replayed-run"
+        @test BT.in_taskbar(replay)
+        item = BT.taskbar_item_for(replay)
+        @test item.source === replay
+        @test item.msg_index == length(model.msgs_store) - 1
+        # Rendering the actual slot is what threw tool_taskbar_item(::Nothing, ...).
+        session = Bonito.Session()
+        @test Bonito.jsrender(session, BT.TaskbarSlot(BT.chat_taskbar(model), replay)) !== nothing
+        close(session)
+    end
+
     @testset "a run finds its card by the tool id Claude names" begin
         a = card("toolu_A", ("code" => "1", "env_path" => "/tmp/envA", "background" => true))
         b = card("toolu_B", ("code" => "2", "env_path" => "/tmp/envA"))   # same env, newer

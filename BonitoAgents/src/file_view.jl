@@ -402,16 +402,16 @@ function file_viewer(::TableFile, c::FileContent, path::AbstractString, mode::Vi
                 DOM.span("⇅"; class = "bt-fv-sort-arrow");
                 dataCol = string(c),
                 class = numeric[c] ? "bt-fv-num bt-fv-sortable" : "bt-fv-sortable")
-         for c in 1:ncols)...)
+         for c in 1:ncols))
     trs = [DOM.tr(DOM.td(string(i); class = "bt-fv-rownum"),
                   (DOM.td(cell(body[i], c); class = numeric[c] ? "bt-fv-num" : "")
-                   for c in 1:ncols)...)
+                   for c in 1:ncols))
            for i in 1:shown]
 
     note = shown < length(body) ?
         "showing the first $(shown) of $(length(body)) rows" :
         "$(length(body)) rows · $(ncols) columns"
-    table = DOM.table(DOM.thead(head), DOM.tbody(trs...); class = "bt-fv-table")
+    table = DOM.table(DOM.thead(head), DOM.tbody(trs); class = "bt-fv-table")
     filter_box = DOM.input(; type = "text", class = "bt-fv-table-filter",
         placeholder = "Filter rows…", spellcheck = "false")
     # Sort + filter are wired by the file-view driver when this node appears
@@ -480,15 +480,15 @@ function file_viewer(::NotebookFile, c::FileContent, path::AbstractString, mode:
             push!(nodes, DOM.div(
                 DOM.div(CodeView(src; language = String(lang)); class = "bt-fv-nb-source"),
                 (isempty(outs) ? () :
-                    (DOM.div((notebook_output_node(o) for o in outs if o isa AbstractDict)...;
-                             class = "bt-fv-nb-outputs"),))...;
+                    (DOM.div((notebook_output_node(o) for o in outs if o isa AbstractDict);
+                             class = "bt-fv-nb-outputs"),));
                 class = "bt-fv-nb-cell bt-fv-nb-code"))
         end
     end
     limit < length(cells) &&
         push!(nodes, DOM.div("… $(length(cells) - limit) more cells (open the file to see them all)";
                              class = "bt-fv-more"))
-    return DOM.div(FileViewStyles, nodes...; class = "bt-fv-notebook")
+    return DOM.div(FileViewStyles, nodes; class = "bt-fv-notebook")
 end
 
 # ── The window-level driver ─────────────────────────────────────────────────
@@ -850,12 +850,12 @@ function file_panel_header(session::Session, p::FilePanel)
         DOM.span(""; class = "bt-fv-dims"),
         DOM.span(status; class = "bt-file-editor-status bt-fv-status"),
         DOM.div(
-            toggle...,
+            toggle,
             fv_action_btn("copy", "⧉", "Copy the worker path"),
             fv_action_btn("download", "⤓", "Download to this computer"),
             fv_action_btn("reload", "⟳", "Reload from the worker"),
-            share_btn(p)...,
-            save_btn...;
+            share_btn(p),
+            save_btn;
             class = "bt-fv-actions");
         class = "bt-file-editor-header bt-fv-header")
 end
@@ -899,7 +899,7 @@ function Bonito.jsrender(session::Session, p::FilePanel)
         (DOM.div(rendered_dom; class = "bt-fv-rendered"),) : ()
     source = p.editor === nothing ? () : (DOM.div(p.editor; class = "bt-fv-source"),)
 
-    body = DOM.div(rendered..., source...; class = "bt-file-editor-body bt-fv-body")
+    body = DOM.div(rendered, source; class = "bt-file-editor-body bt-fv-body")
     # The panel ROOT is part of this render pass, so its own `onload` is reliable
     # — which makes it the right place to ask for the driver that the panel's
     # asynchronously-delivered body depends on.

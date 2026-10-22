@@ -45,7 +45,7 @@ sidebar_label(s, pid) = TK.eval_js(s, """(() => {
 # Header title of the VISIBLE chat pane (`.bt-header-title` isn't pane-scoped by
 # the harness shim, so resolve it within the on-screen pane ourselves).
 header_title(s) = TK.eval_js(s, """(() => {
-    const p = [...document.querySelectorAll('.bt-chatpane')].find(x => x.offsetParent !== null);
+    const p = document.querySelector('.bt-chatpane[aria-hidden=false]');
     const inp = p && p.querySelector('.bt-header-title-edit');
     return inp ? inp.value : null; })()""")
 
@@ -58,7 +58,7 @@ click_close(s, pid) = TK.eval_js(s, """(() => {
     x.click(); return 'clicked'; })()""")
 
 rename_header(s, newname) = TK.eval_js(s, """(() => {
-    const p = [...document.querySelectorAll('.bt-chatpane')].find(x => x.offsetParent !== null);
+    const p = document.querySelector('.bt-chatpane[aria-hidden=false]');
     const inp = p && p.querySelector('.bt-header-title-edit');
     if (!inp) return 'no-input';
     inp.focus();
@@ -84,10 +84,10 @@ function run_suite(server)
         @testset "header folder line is the worker path" begin
             pid = TK.new_chat(server; title = "PathProbe")
             @test TK.wait_for(server, "header env present",
-                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); return !!(p && p.querySelector('.bt-header-env')); })()";
+                "(() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); return !!(p && p.querySelector('.bt-header-env')); })()";
                 timeout = 10) == true
             shown = TK.eval_js(server,
-                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); return p.querySelector('.bt-header-env').getAttribute('title'); })()")
+                "(() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); return p.querySelector('.bt-header-env').getAttribute('title'); })()")
             proj = server.h.state.projects[][pid]
             @test shown == proj.worker_path
             @test shown != proj.server_path
@@ -198,7 +198,7 @@ function run_suite(server)
             TK.new_chat(server; title = "Other"); TK.send_message(server, "other msg")
             TK.open_chat(server, pid)
             @test TK.wait_for(server, "renamed header after switch-back",
-                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value==='Renamed Chat'; })()";
+                "(() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value==='Renamed Chat'; })()";
                 timeout = 10) == true
             @test sidebar_label(server, pid) == "Renamed Chat"
         end
@@ -218,7 +218,7 @@ function run_suite(server)
             TK.navigate(server, "/")
             TK.open_chat(server, pid)
             @test TK.wait_for(server, "chat reopened after reload",
-                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value===$(repr(folder)); })()";
+                "(() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value===$(repr(folder)); })()";
                 timeout = 30) == true
             @test rename_header(server, "HOTS") == "ok"
             @test TK.wait_for(server, "homebar shows the rename",
@@ -239,7 +239,7 @@ function run_suite(server)
             TK.navigate(server, "/")
             TK.open_chat(server, pid)
             @test TK.wait_for(server, "reopened chat shows the folder name",
-                "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value===$(repr(folder)); })()";
+                "(() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const inp=p&&p.querySelector('.bt-header-title-edit'); return !!inp && inp.value===$(repr(folder)); })()";
                 timeout = 30) == true
             TK.send_message(server, "wie bekomme ich die player daten")
             @test TK.wait_for(server, "reply after the first prompt",

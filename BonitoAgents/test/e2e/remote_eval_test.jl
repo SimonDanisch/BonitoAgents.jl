@@ -23,7 +23,7 @@
     real_call(tool; kw...) = TK.mcp_call(tool; real_process = true, kw...)
     import BonitoAgents as BT
 
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     card(id) = "$VP?.querySelector('.bt-tool-msg[data-msg-id*=\"$id\"]')"
     # The tool card for `id` finished (either way) and its body shows `text`.
     # Bodies render lazily on expand (what a user does to read a result), so a

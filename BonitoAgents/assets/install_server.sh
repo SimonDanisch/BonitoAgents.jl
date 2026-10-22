@@ -24,7 +24,7 @@
 #     http://localhost:8038. That is all it has to do: the server itself asks
 #     Authelia about every request and serves the login page under its own name
 #     (https://<domain>/authelia). No certificates, DNS records or open ports
-#     here; nothing but the server and Authelia runs.
+#     here; the server, Authelia and their local session store run.
 #   * acme: this machine answers on ports 80 and 443 itself. Caddy terminates
 #     HTTPS (Let's Encrypt, renewed by itself) and routes the dashboard through
 #     Authelia's login, which lives on its own name (auth.<domain>). The
@@ -37,9 +37,12 @@
 # Workers join with a credential "Add worker" on the dashboard issues, one per
 # machine: checked by the server behind a tunnel, by Caddy otherwise.
 #
-# Re-run it to update: services are stopped first; secrets, accounts and the
-# mail settings are kept, and binaries are only replaced when their version
-# changed.
+# Re-run it to update: the running server keeps serving while packages update
+# and precompile, then restarts once, near the end; Authelia restarts only when
+# its binary, unit or configuration changed. Logins live in a private, persistent
+# Redis/Valkey store, rather than Authelia's faulty in-memory session backend.
+# Secrets, accounts and the mail settings are kept, and binaries are only
+# replaced when their version changed.
 #
 # Options:
 #   --tls MODE             tunnel (default), acme or internal: see above
@@ -66,6 +69,7 @@
 #   --no-smtp              drop mail settings kept from a previous install
 #   --caddy-version V      default: the latest release
 #   --authelia-version V   default: the latest release
+#   --valkey-version V     default: the latest release (private login session store)
 #   --skip-port-check      acme: for networks where this machine cannot reach its own
 #                          public address (no NAT hairpinning); Let's Encrypt then
 #                          reports a closed port itself.
@@ -99,6 +103,7 @@ SMTP_SENDER=""
 NO_SMTP=0
 CADDY_VERSION=""
 AUTHELIA_VERSION=""
+VALKEY_VERSION=""
 SKIP_PORT_CHECK=0
 INSTANCE=""
 RECONFIGURE=0
@@ -128,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --no-smtp)           NO_SMTP=1;              GIVEN=1; shift ;;
         --caddy-version)     CADDY_VERSION="$2";     shift 2 ;;
         --authelia-version)  AUTHELIA_VERSION="$2";  shift 2 ;;
+        --valkey-version)    VALKEY_VERSION="$2";    shift 2 ;;
         --skip-port-check)   SKIP_PORT_CHECK=1;      shift ;;
         --instance)          INSTANCE="$2";          shift 2 ;;
         --reconfigure)       RECONFIGURE=1;          shift ;;
@@ -162,6 +168,7 @@ NAME="bonitoagents${INSTANCE:+-$INSTANCE}"
 SERVICE_USER="$NAME"
 UNIT_SERVER="$NAME-server"
 UNIT_AUTHELIA="$NAME-authelia"
+UNIT_SESSIONS="$NAME-sessions"
 UNIT_CADDY="$NAME-caddy"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONOREPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -170,6 +177,7 @@ DATA_DIR="/var/lib/$NAME"
 STATE_DIR="$DATA_DIR/state"
 CADDY_DIR="$DATA_DIR/caddy"
 AUTHELIA_DIR="$DATA_DIR/authelia"
+SESSION_DIR="$AUTHELIA_DIR/sessions"
 BIN_DIR="/usr/local/lib/$NAME/bin"
 # The service user's own Julia, installed below at the installer's version.
 SERVICE_JULIA="$DATA_DIR/.juliaup/bin/julia"
@@ -366,6 +374,7 @@ sudo tee "$SAVED" > /dev/null << EOF
   "authelia_port": $AUTHELIA_PORT,
 $front
   "authelia_bin": "$BIN_DIR/authelia",
+  "session_socket": "$SESSION_DIR/store.sock",
   "users_file": "$AUTHELIA_DIR/users.yml"
 }
 EOF
@@ -393,6 +402,7 @@ step "Sanity checks"
 for tool in sudo curl tar sha256sum sha512sum getent ss systemctl timeout; do
     command -v "$tool" > /dev/null || fail "$tool not found"
 done
+SESSION_BIN="$BIN_DIR/valkey-server"
 chmod +x "$MONOREPO_DIR/BonitoAgents/bin/"*
 sudo -u "$SERVICE_USER" test -x "$SERVER_BIN" -a -r "$MONOREPO_DIR/Project.toml" ||
     fail "$SERVICE_USER cannot read $MONOREPO_DIR. Let others through the folders above it (e.g. chmod o+x $INSTALL_HOME: that opens no listing), or clone the monorepo outside your home"
@@ -401,12 +411,48 @@ ok "julia: $("$JULIA_BIN" --version)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# ── Stop the services before any change ───────────────────────────────────────
+# ── Reachability ──────────────────────────────────────────────────────────────
+# Before anything is stopped, so a run that fails here leaves the install as it
+# was. An update finds its own services on these ports: the server serves until
+# its restart below, Authelia keeps running unless what it runs changed.
+step "Reachability"
+if [[ "$TLS" == tunnel ]]; then
+    PORTS=("$PORT" "$AUTHELIA_PORT")
+else
+    PORTS=("$HTTP_PORT" "$HTTPS_PORT" "$PORT" "$AUTHELIA_PORT")
+fi
+OWN_UNITS=("$UNIT_SERVER" "$UNIT_AUTHELIA" "$UNIT_CADDY")
+# The systemd unit a process runs in, from its cgroup ("" outside of a service).
+unit_of() {
+    { sudo cat "/proc/$1/cgroup" 2> /dev/null || true; } |
+        sed -n 's#^.*/\([^/]*\)\.service\(/.*\)\{0,1\}$#\1#p;T;q'
+}
+# Port $1 is free, or one of this install's own services (OWN_UNITS) holds it.
+check_port() {
+    local p="$1" holder pids pid unit
+    holder="$(sudo ss -Hltnp "sport = :$p")"
+    [[ -n "$holder" ]] || return 0
+    pids="$(grep -o 'pid=[0-9]*' <<< "$holder" | cut -d= -f2 | sort -u || true)"
+    [[ -n "$pids" ]] || fail "port $p is already in use on this machine: $holder"
+    for pid in $pids; do
+        unit="$(unit_of "$pid")"
+        [[ -n "$unit" && " ${OWN_UNITS[*]} " == *" $unit "* ]] ||
+            fail "port $p is already in use on this machine: $(head -1 <<< "$holder")"
+    done
+    info "port $p: $unit, this install's own"
+}
+for p in "${PORTS[@]}"; do
+    check_port "$p"
+done
+ok "ports ${PORTS[*]} are free here, or this install's own"
+
+# ── Caddy stops before any change ─────────────────────────────────────────────
+# The port-80 check below needs its port, and a running binary is not replaced.
+# Not the server: it serves until everything new is in place and precompiled.
 # Not Authelia: it keeps every login in memory, so a stop logs every browser out.
 # An open tab carries on over its live connection and cannot get back in once
 # that drops: it looked like a hung server after every update. Authelia is
 # restarted below only when what it runs changed (`authelia_state`).
-step "Stop existing services"
 # Authelia's binary, unit and configuration, as one digest. A first install has
 # none of them yet: that digest is just as good (Authelia isn't running then).
 authelia_state() {
@@ -414,32 +460,25 @@ authelia_state() {
           "$AUTHELIA_DIR/configuration.yml" 2> /dev/null || true; } | sha256sum
 }
 AUTHELIA_BEFORE="$(authelia_state)"
-for svc in "$UNIT_CADDY" "$UNIT_SERVER"; do
-    if sudo systemctl is-active --quiet "$svc" 2>/dev/null; then
-        sudo systemctl stop "$svc"
-        ok "stopped $svc"
+session_state() {
+    { sudo cat "$SESSION_BIN" "/etc/systemd/system/$UNIT_SESSIONS.service" \
+          "$SESSION_DIR/server.conf" 2> /dev/null || true; } | sha256sum
+}
+SESSION_BEFORE="$(session_state)"
+if [[ -f "/etc/systemd/system/$UNIT_CADDY.service" ]]; then
+    step "Stop $UNIT_CADDY"
+    if sudo systemctl is-active --quiet "$UNIT_CADDY" 2>/dev/null; then
+        sudo systemctl stop "$UNIT_CADDY"
+        ok "stopped"
     fi
-done
-# Behind a tunnel there is no Caddy: one left from an install that had it goes.
-if [[ "$TLS" == tunnel && -f "/etc/systemd/system/$UNIT_CADDY.service" ]]; then
-    sudo systemctl disable "$UNIT_CADDY" > /dev/null 2>&1 || true
-    sudo rm -f "/etc/systemd/system/$UNIT_CADDY.service"
-    sudo systemctl daemon-reload
-    ok "removed $UNIT_CADDY (a tunnel needs no Caddy)"
+    # Behind a tunnel there is no Caddy: one left from an install that had it goes.
+    if [[ "$TLS" == tunnel ]]; then
+        sudo systemctl disable "$UNIT_CADDY" > /dev/null 2>&1 || true
+        sudo rm -f "/etc/systemd/system/$UNIT_CADDY.service"
+        sudo systemctl daemon-reload
+        ok "removed $UNIT_CADDY (a tunnel needs no Caddy)"
+    fi
 fi
-
-# ── Reachability ──────────────────────────────────────────────────────────────
-step "Reachability"
-if [[ "$TLS" == tunnel ]]; then
-    PORTS=("$PORT" "$AUTHELIA_PORT")
-else
-    PORTS=("$HTTP_PORT" "$HTTPS_PORT" "$PORT" "$AUTHELIA_PORT")
-fi
-for p in "${PORTS[@]}"; do
-    holder="$(sudo ss -Hltnp "sport = :$p" | head -1 || true)"
-    [[ -z "$holder" ]] || fail "port $p is already in use on this machine: $holder"
-done
-ok "ports ${PORTS[*]} are free here"
 # Before anything asks Let's Encrypt for a certificate: a failed ACME attempt
 # only says "timeout", and repeated failures are rate-limited for an hour.
 # Caddy's own CA needs neither DNS nor open ports, and a tunnel brings its own.
@@ -524,6 +563,34 @@ else
     fi
 fi
 
+# Valkey's official binaries target Ubuntu 22.04's glibc baseline. Keep this
+# instance separate from any system-wide Redis, with its own data and socket.
+step "Valkey (login sessions)"
+[[ -n "$VALKEY_VERSION" ]] || VALKEY_VERSION="$(latest_tag valkey-io/valkey || true)"
+VALKEY_VERSION="${VALKEY_VERSION#v}"
+[[ -n "$VALKEY_VERSION" ]] || fail "could not find Valkey's latest release; pass --valkey-version"
+installed_valkey="$(sudo test -x "$SESSION_BIN" && sudo "$SESSION_BIN" --version 2>&1 || true)"
+if grep -q "v=$VALKEY_VERSION\b" <<< "$installed_valkey"; then
+    ok "v$VALKEY_VERSION already installed"
+else
+    if [[ "$ARCH" == amd64 ]]; then valkey_arch=x86_64; else valkey_arch=arm64; fi
+    f="valkey-${VALKEY_VERSION}-jammy-${valkey_arch}.tar.gz"
+    base="https://download.valkey.io/releases"
+    curl -fsSL -o "$TMP/$f" "$base/$f"
+    curl -fsSL -o "$TMP/valkey.sums" "$base/$f.sha256"
+    (cd "$TMP" && grep " $f\$" valkey.sums | sha256sum -c --status) ||
+        fail "Valkey v$VALKEY_VERSION: $f does not match its published checksum"
+    tar -xzf "$TMP/$f" -C "$TMP" "${f%.tar.gz}/bin/valkey-server"
+    "$TMP/${f%.tar.gz}/bin/valkey-server" --version > /dev/null ||
+        fail "Valkey v$VALKEY_VERSION: the official binary cannot run on this system"
+    sudo install -d -m 755 "$BIN_DIR"
+    # Replace atomically: an old instance serves until the final restart, and
+    # its persisted sessions survive that restart.
+    sudo install -m 755 "$TMP/${f%.tar.gz}/bin/valkey-server" "$SESSION_BIN.new"
+    sudo mv -f "$SESSION_BIN.new" "$SESSION_BIN"
+    ok "v$VALKEY_VERSION installed (checksum verified)"
+fi
+
 # ── Port 80 answers from outside ──────────────────────────────────────────────
 # A throwaway Caddy answers a random token on the HTTP port; fetching it through
 # the domain on port 80 proves DNS, the router and the firewall all lead here.
@@ -574,7 +641,8 @@ fi
 
 # The service user's own Julia, the same version as the installer's, and its own
 # depot: both in its home, the data dir. What the server needs is precompiled
-# here, so its first start is not a long silent wait.
+# here, so its first start is not a long silent wait, and an update's running
+# server keeps serving meanwhile.
 step "Julia for $SERVICE_USER"
 as_service() { sudo -u "$SERVICE_USER" env -C "$DATA_DIR" HOME="$DATA_DIR" "$@"; }
 JULIA_VERSION="$("$JULIA_BIN" --version | awk '{print $3}')"
@@ -704,8 +772,8 @@ EOF
 sudo tee "/etc/systemd/system/$UNIT_AUTHELIA.service" > /dev/null << EOF
 [Unit]
 Description=BonitoAgents login${INSTANCE:+ ($INSTANCE)} (Authelia)
-After=network-online.target $UNIT_SERVER.service
-Wants=network-online.target
+After=network-online.target $UNIT_SERVER.service $UNIT_SESSIONS.service
+Wants=network-online.target $UNIT_SESSIONS.service
 
 [Service]
 Type=simple
@@ -723,7 +791,30 @@ ReadWritePaths=$AUTHELIA_DIR
 WantedBy=multi-user.target
 EOF
 
-UNITS=("$UNIT_SERVER" "$UNIT_AUTHELIA")
+sudo tee "/etc/systemd/system/$UNIT_SESSIONS.service" > /dev/null << EOF
+[Unit]
+Description=BonitoAgents login sessions${INSTANCE:+ ($INSTANCE)} (Valkey/Redis)
+After=$UNIT_SERVER.service
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+ExecStart=$SESSION_BIN $SESSION_DIR/server.conf
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=$SESSION_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+UNITS=("$UNIT_SERVER" "$UNIT_AUTHELIA" "$UNIT_SESSIONS")
 if [[ "$TLS" != tunnel ]]; then
     UNITS+=("$UNIT_CADDY")
     sudo tee "/etc/systemd/system/$UNIT_CADDY.service" > /dev/null << EOF
@@ -762,7 +853,7 @@ ok "installed + enabled: ${UNITS[*]}"
 
 # ── Start: the server first, it renders the login's configuration ─────────────
 step "Start $UNIT_SERVER"
-RENDERED=("$AUTHELIA_DIR/configuration.yml")
+RENDERED=("$AUTHELIA_DIR/configuration.yml" "$SESSION_DIR/server.conf")
 [[ "$TLS" == tunnel ]] || RENDERED+=("$CADDY_DIR/Caddyfile")
 # Set the previous renders aside, so the wait below sees this start's. The
 # server writes them on every start, users.yml only when it changed: that one
@@ -770,7 +861,8 @@ RENDERED=("$AUTHELIA_DIR/configuration.yml")
 for f in "${RENDERED[@]}"; do
     sudo test -f "$f" && sudo mv "$f" "$f.previous"
 done
-sudo systemctl start "$UNIT_SERVER"
+# An update's server served until now: this is its one restart.
+sudo systemctl restart "$UNIT_SERVER"
 printf "    wait : the server renders the login's configuration (a first start precompiles, minutes)"
 rendered() {
     sudo test -s "$AUTHELIA_DIR/users.yml" || return 1
@@ -801,6 +893,19 @@ else
 fi
 
 step "Start ${UNITS[*]:1}"
+# Restart the store only when its binary, unit or configuration changed. Its
+# persisted sessions and encryption key stay; Authelia can then connect at boot.
+if sudo systemctl is-active --quiet "$UNIT_SESSIONS" && [[ "$(session_state)" != "$SESSION_BEFORE" ]]; then
+    sudo systemctl restart "$UNIT_SESSIONS"
+else
+    sudo systemctl start "$UNIT_SESSIONS"
+fi
+for _ in $(seq 1 30); do
+    sudo test -S "$SESSION_DIR/store.sock" && break
+    sudo systemctl is-active --quiet "$UNIT_SESSIONS" || fail "$UNIT_SESSIONS failed: journalctl -u $UNIT_SESSIONS -e"
+    sleep 1
+done
+sudo test -S "$SESSION_DIR/store.sock" || fail "the login session store did not open its socket"
 if sudo systemctl is-active --quiet "$UNIT_AUTHELIA" && [[ "$(authelia_state)" == "$AUTHELIA_BEFORE" ]]; then
     ok "$UNIT_AUTHELIA keeps running (nothing of it changed): every login stays"
 else

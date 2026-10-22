@@ -29,7 +29,7 @@
     TK = S.TK
 
     # Visible-pane scoping helpers (JS expression fragments).
-    VP = "[...document.querySelectorAll('.bt-chatpane')].find(p => p.offsetParent !== null)"
+    VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     vpHas(sel)  = "(() => { const p=$VP; return !!(p && p.querySelector($(repr(sel)))); })()"
     vpText(sel) = "(() => { const p=$VP; const e=p && p.querySelector($(repr(sel))); return e ? (e.innerText||'').trim() : null; })()"
     vpClick(sel) = "(() => { const p=$VP; const e=p && p.querySelector($(repr(sel))); if(!e) return false; e.click(); return true; })()"
