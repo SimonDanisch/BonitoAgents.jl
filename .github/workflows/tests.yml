@@ -59,10 +59,14 @@ jobs:
 
       # Save under a run-scoped key; warm-start from any earlier run via
       # restore-keys so package tarballs and artifacts aren't re-downloaded.
+      # The attempt is part of the key: a cache can't be overwritten, so a rerun
+      # under the first attempt's key handed the jobs that depot, without the
+      # fork commits this attempt resolved ("Bonito ... is required but does not
+      # seem to be installed").
       - uses: actions/cache@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
@@ -147,7 +151,7 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Warm the envs this job loads
         run: |
           for env in BonitoAgents BonitoAgents/test; do
@@ -212,7 +216,7 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Warm the test + eval envs
         # The eval envs matter as much as the test env: an eval item's Malt worker
         # mounts a render inside a 30 s DOM wait, and a worker that compiles
