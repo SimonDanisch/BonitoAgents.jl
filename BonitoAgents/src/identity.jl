@@ -113,15 +113,16 @@ Base.@kwdef struct ProxyConfig
     # Authelia writes that code to a file (`notifications_file`), which admins
     # read on the dashboard.
     smtp::Bool = false
-    # A private Valkey's Unix socket (Authelia's `redis` provider). Installed
-    # servers use this rather than Authelia's memory provider, whose borrowed
-    # keys corrupt sessions.
-    session_socket::String = ""
+    # The Unix socket of the private Valkey that keeps Authelia's sessions (its
+    # `redis` provider), next to the store's `server.conf`. Always one: Authelia's
+    # memory provider lends out keys that corrupt sessions.
+    session_socket::String
     function ProxyConfig(domain, auth_domain, admin, port, authelia_port, caddy_bin, authelia_bin,
                          caddyfile, users_file, acme_email, tls, acme_ca, https_port, http_port,
                          worker_address, smtp, session_socket)
         tls in ("acme", "internal", "tunnel") ||
             error("proxy.json: tls is \"acme\", \"internal\" or \"tunnel\" (got \"$(tls)\")")
+        isempty(session_socket) && error("proxy.json: session_socket is empty")
         return new(domain, auth_domain, admin, port, authelia_port, caddy_bin, authelia_bin,
                    caddyfile, users_file, acme_email, tls, acme_ca, https_port, http_port,
                    worker_address, smtp, session_socket)
@@ -129,6 +130,8 @@ Base.@kwdef struct ProxyConfig
 end
 
 function ProxyConfig(d::AbstractDict)
+    haskey(d, "session_socket") ||
+        error("proxy.json has no session_socket (the login session store): run the installer again")
     kw = Dict{Symbol,Any}()
     for f in fieldnames(ProxyConfig)
         haskey(d, String(f)) && (kw[f] = d[String(f)])
@@ -570,8 +573,6 @@ function render_authelia_config(auth::LoginAuth, secrets, smtp::Union{AbstractDi
     cfg = auth.config
     q = yaml_quote
     dir = dirname(cfg.users_file)
-    session_backend = isempty(cfg.session_socket) ? "" :
-        "  redis:\n    host: $(q(cfg.session_socket))\n    port: 0\n"
     notifier = if smtp === nothing
         """
         notifier:
@@ -656,7 +657,10 @@ function render_authelia_config(auth::LoginAuth, secrets, smtp::Union{AbstractDi
           expiration: '4w'
           # Without an end that short there is nothing to "remember".
           remember_me: -1
-        $(rstrip(session_backend))
+          # In the private Valkey (`session_socket`), which outlives restarts.
+          redis:
+            host: $(q(cfg.session_socket))
+            port: 0
           cookies:
             - domain: $(q(cookie_domain(auth)))
               authelia_url: $(q(portal_url(auth)))
@@ -682,6 +686,17 @@ function render_session_store_config(socket::AbstractString)
         save ""
         daemonize no
         """
+end
+
+# The store's configuration, next to its socket in a directory only the service
+# user enters: the installer's service runs Valkey on it, and so does the dev rig
+# (`start_session_store`).
+function write_session_store_config(socket::AbstractString)
+    dir = mkpath(dirname(socket))
+    chmod(dir, 0o700)
+    file = joinpath(dir, "server.conf")
+    atomic_write(io -> write(io, render_session_store_config(socket)), file; mode = 0o600)
+    return file
 end
 
 # bcrypt, the form Caddy's `basic_auth` checks. The password goes in on stdin,

@@ -20,6 +20,7 @@
     write(joinpath(dir, "proxy.json"), JSON.json(Dict(
         "domain" => "team.example.com", "auth_domain" => "auth.team.example.com", "admin" => "bob",
         "caddyfile" => joinpath(dir, "Caddyfile"), "users_file" => joinpath(dir, "users.yml"),
+        "session_socket" => joinpath(dir, "sessions", "store.sock"),
         "written_by_a_newer_installer" => 1)))
     auth = BT.auth_mode(dir)
     @test auth isa BT.ProxyAuth
@@ -69,7 +70,8 @@ end
     using Test, Dates
 
     cfg = BT.ProxyConfig(; domain = "team.example.com", auth_domain = "auth.team.example.com",
-                         admin = "bob", caddyfile = "/x/Caddyfile", users_file = "/x/users.yml")
+                         admin = "bob", caddyfile = "/x/Caddyfile", users_file = "/x/users.yml",
+                         session_socket = "/x/s.sock")
     creds = [BT.WorkerCredential("w-b", "\$2a\$14\$hb", "bob", now()),
              BT.WorkerCredential("w-a", "\$2a\$14\$ha", "bob", now())]
     auth = BT.ProxyAuth(cfg, "k3y")
@@ -90,7 +92,7 @@ end
     @test !occursin("\temail ", cf)
     @test occursin("\temail ops@example.com\n",
                    BT.render_caddyfile(BT.ProxyAuth(BT.ProxyConfig(; domain = "d", auth_domain = "a", admin = "b",
-                       caddyfile = "c", users_file = "u", acme_email = "ops@example.com"), "k3y"), creds))
+                       caddyfile = "c", users_file = "u", session_socket = "s", acme_email = "ops@example.com"), "k3y"), creds))
     # No credential issued yet: `/w` refuses everyone rather than admitting all.
     cf0 = BT.render_caddyfile(auth, BT.WorkerCredential[])
     @test !occursin("basic_auth", cf0)
@@ -163,6 +165,7 @@ end
         write(joinpath(dir, "proxy.json"), JSON.json(Dict(
             "domain" => "team.example.com", "auth_domain" => "auth.team.example.com", "admin" => "bob",
             "caddyfile" => joinpath(dir, "Caddyfile"), "users_file" => joinpath(dir, "users.yml"),
+            "session_socket" => joinpath(dir, "sessions", "store.sock"),
             "caddy_bin" => joinpath(bin, "caddy"), "authelia_bin" => joinpath(bin, "authelia"))))
         begin
             st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.auth_mode(dir))
@@ -186,6 +189,7 @@ end
             write(joinpath(bdir, "proxy.json"), JSON.json(Dict(
                 "domain" => "team.example.com", "auth_domain" => "auth.team.example.com", "admin" => "bob",
                 "caddyfile" => joinpath(bdir, "Caddyfile"), "users_file" => joinpath(bdir, "users.yml"),
+                "session_socket" => joinpath(bdir, "sessions", "store.sock"),
                 "caddy_bin" => joinpath(bin, "caddy"), "authelia_bin" => broken)))
             bst = BT.ServerState(; state_dir = bdir, working_dir = mktempdir(), auth = BT.auth_mode(bdir))
             failed = try BT.add_account!(bst, "zed"); nothing catch e; e end
@@ -231,7 +235,8 @@ end
             good = read(joinpath(dir, "Caddyfile"), String)
             bad_cfg = BT.ProxyConfig(; domain = "REJECT.example.com", auth_domain = "auth.REJECT.example.com",
                                      admin = "bob", caddyfile = joinpath(dir, "Caddyfile"),
-                                     users_file = joinpath(dir, "users.yml"), caddy_bin = joinpath(bin, "caddy"))
+                                     users_file = joinpath(dir, "users.yml"),
+                                     session_socket = joinpath(dir, "sessions", "store.sock"), caddy_bin = joinpath(bin, "caddy"))
             bad = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(bad_cfg, "k"))
             err = try BT.apply_proxy!(bad); "" catch e; sprint(showerror, e) end
             @test occursin("Caddy rejects the new configuration", err) && occursin("REJECT is no directive", err)
@@ -360,7 +365,8 @@ end
 
     dir = mktempdir()
     cfg = BT.ProxyConfig(; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
-                         caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "users.yml"))
+                         caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "users.yml"),
+                         session_socket = joinpath(dir, "sessions", "store.sock"))
     root = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"),
                             manage_harnesses = true)
     root.base_url[] = "https://team.example.com"
@@ -474,6 +480,7 @@ end
     dir = mktempdir()
     cfg = BT.ProxyConfig(; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
                          caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "users.yml"),
+                         session_socket = joinpath(dir, "sessions", "store.sock"),
                          caddy_bin = joinpath(bin, "caddy"), authelia_bin = joinpath(bin, "authelia"))
     st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
     st.base_url[] = "https://team.example.com"
@@ -561,7 +568,7 @@ end
     using Test, HTTP, Dates
 
     cfg = BT.ProxyConfig(; domain = "d.example.com", auth_domain = "auth.d.example.com", admin = "bob",
-                         caddyfile = "/x/C", users_file = "/x/u")
+                         caddyfile = "/x/C", users_file = "/x/u", session_socket = "/x/s.sock")
     st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
     p = BT.ProjectInfo("p1", "proj", "w1", "/s", "/w", now())
     p.owner = "carol"
@@ -588,7 +595,8 @@ end
     using Test, JSON, Dates
 
     base = (; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
-            caddyfile = "/p/Caddyfile", users_file = "/p/authelia/users.yml")
+            caddyfile = "/p/Caddyfile", users_file = "/p/authelia/users.yml",
+            session_socket = "/p/authelia/sessions/store.sock")
     acme = BT.ProxyConfig(; base...)
     @test_throws ErrorException BT.ProxyConfig(; base..., tls = "self-signed")
     @test BT.public_origin(acme, acme.domain) == "https://team.example.com"
@@ -638,7 +646,8 @@ end
     # Behind a tunnel: no Caddy, and Authelia under the dashboard's own name, so
     # the tunnel carries one host name (tunnel.jl).
     tunnel = BT.TunnelAuth(BT.ProxyConfig(; domain = "team.example.com", admin = "bob", tls = "tunnel",
-                                          users_file = "/p/authelia/users.yml"))
+                                          users_file = "/p/authelia/users.yml",
+                                          session_socket = "/p/authelia/sessions/store.sock"))
     @test BT.dashboard_url(tunnel) == "https://team.example.com"
     @test BT.portal_url(tunnel) == "https://team.example.com/authelia"
     y = BT.render_authelia_config(tunnel, secrets, nothing)
@@ -650,12 +659,13 @@ end
     @test_throws ErrorException BT.TunnelAuth(acme)
     @test_throws ErrorException BT.ProxyAuth(tunnel.config, "k")
     @test_throws ErrorException BT.TunnelAuth(BT.ProxyConfig(; tunnel.config.domain, admin = "bob", tls = "tunnel",
-                                                              users_file = "/u", worker_address = "10.0.0.2"))
+                                                              users_file = "/u", session_socket = "/s", worker_address = "10.0.0.2"))
     # Behind the proxy the portal and the Caddyfile are required.
-    @test_throws ErrorException BT.ProxyAuth(BT.ProxyConfig(; domain = "d", admin = "a", users_file = "/u"), "k")
+    @test_throws ErrorException BT.ProxyAuth(BT.ProxyConfig(; domain = "d", admin = "a", users_file = "/u", session_socket = "/s"), "k")
     tdir = mktempdir()
     write(joinpath(tdir, "proxy.json"), JSON.json(Dict("domain" => "team.example.com", "admin" => "bob",
-                                                       "tls" => "tunnel", "users_file" => "/p/u.yml")))
+                                                       "tls" => "tunnel", "users_file" => "/p/u.yml",
+                                                       "session_socket" => "/p/s.sock")))
     @test BT.auth_mode(tdir) isa BT.TunnelAuth
     # Listening beyond localhost is still the trusted network's way, tunnel or not.
     @test BT.auth_mode(tdir; host = "0.0.0.0") isa BT.NetworkAuth
@@ -688,6 +698,7 @@ end
     dir = mktempdir()
     cfg = BT.ProxyConfig(; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
                          caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "users.yml"),
+                         session_socket = joinpath(dir, "sessions", "store.sock"),
                          caddy_bin = joinpath(bin, "caddy"), authelia_bin = joinpath(bin, "authelia"))
     st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
     st.base_url[] = "https://team.example.com"
@@ -801,7 +812,7 @@ end
 
     # The worker belongs to whoever issued the credential it came in with, and
     # keeps who it is shared with across reconnects.
-    cfg = BT.ProxyConfig(; domain = "d", auth_domain = "auth.d", admin = "root", caddyfile = "/x/C", users_file = "/x/u")
+    cfg = BT.ProxyConfig(; domain = "d", auth_domain = "auth.d", admin = "root", caddyfile = "/x/C", users_file = "/x/u", session_socket = "/x/s.sock")
     st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
     st.worker_credentials[]["w-1"] = BT.WorkerCredential("w-1", "h", "alice", now(UTC))
     link = BT.WorkerLink.Link(:server)
@@ -840,6 +851,7 @@ end
     dir = mktempdir()
     cfg = BT.ProxyConfig(; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
                          caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "users.yml"),
+                         session_socket = joinpath(dir, "sessions", "store.sock"),
                          caddy_bin = joinpath(bin, "caddy"), authelia_bin = joinpath(bin, "authelia"))
     st = BT.ServerState(; state_dir = dir, working_dir = mktempdir(), auth = BT.ProxyAuth(cfg, "k"))
     writer = st.proxy_writer

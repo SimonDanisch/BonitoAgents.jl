@@ -1819,14 +1819,9 @@ end
 function restart_session_store!(s::TestServer)
     rig = s.h.proxy
     rig === nothing && error("restart_session_store!: this fixture has no login proxy")
-    cmd = rig.session_store.cmd
     BT.stop_worker_proc!(rig.session_store)
-    logfile = joinpath(rig.dir, "sessions.log")
-    rig.session_store = run(pipeline(cmd; stdout = logfile, stderr = logfile); wait = false)
-    socket = s.h.state.auth.config.session_socket
-    ready() = process_running(rig.session_store) && ispath(socket)
-    timedwait(ready, 30.0; pollint = 0.1) === :ok ||
-        error("restart_session_store!: the store did not restart; see $(logfile)")
+    rig.session_store = BT.start_session_store(proxy_binaries().valkey, s.h.state.auth.config.session_socket;
+                                               log = joinpath(rig.dir, "sessions.log"))
     return s
 end
 

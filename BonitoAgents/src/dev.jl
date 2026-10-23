@@ -455,13 +455,7 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
     config = authelia_config_file(cfg)
     log(name) = joinpath(dir, name * ".log")
     with_parent(cmd) = `setpriv --pdeathsig KILL -- $cmd`
-    session_store = run(pipeline(with_parent(`$(p.valkey_bin) $(joinpath(dirname(cfg.session_socket), "server.conf"))`);
-                                 stdout = log("sessions"), stderr = log("sessions")); wait = false)
-    ready() = process_running(session_store) && ispath(cfg.session_socket)
-    if timedwait(ready, 30.0; pollint = 0.1) !== :ok
-        stop_worker_proc!(session_store)
-        error("dev_server: the login session store did not start; see $(log("sessions"))")
-    end
+    session_store = start_session_store(p.valkey_bin, cfg.session_socket; log = log("sessions"))
     authelia = caddy = nothing
     try
         # The admin's second factor, as if they had registered an authenticator app
@@ -519,6 +513,25 @@ function write_dev_tunnel(p::DevProxy, cfg::ProxyConfig, dir::AbstractString)
         }
         """)
     return file
+end
+
+"""
+    start_session_store(valkey_bin, socket; log) -> Process
+
+Valkey on the configuration the server wrote next to `socket`
+(`write_session_store_config`), as the installer's service runs it, once its
+socket is there. It goes down with this process, however that ends.
+"""
+function start_session_store(valkey_bin::AbstractString, socket::AbstractString; log::AbstractString)
+    conf = joinpath(dirname(socket), "server.conf")
+    proc = run(pipeline(`setpriv --pdeathsig KILL -- $(valkey_bin) $(conf)`; stdout = log, stderr = log);
+               wait = false)
+    ready() = process_running(proc) && ispath(socket)
+    if timedwait(ready, 30.0; pollint = 0.1) !== :ok
+        stop_worker_proc!(proc)
+        error("the login session store did not start; see $(log)")
+    end
+    return proc
 end
 
 """

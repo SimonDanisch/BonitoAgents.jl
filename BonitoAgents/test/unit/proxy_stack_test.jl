@@ -16,6 +16,7 @@
     mkpath(joinpath(dir, "authelia"))
     base = (; domain = "team.example.com", auth_domain = "auth.team.example.com", admin = "bob",
             caddyfile = joinpath(dir, "Caddyfile"), users_file = joinpath(dir, "authelia", "users.yml"),
+            session_socket = joinpath(dir, "authelia", "sessions", "store.sock"),
             caddy_bin = bins.caddy, authelia_bin = bins.authelia)
     cred = [BT.WorkerCredential("w-a", BT.caddy_hash(BT.ProxyConfig(; base...), "s3cret"), "bob", now())]
 
@@ -56,7 +57,8 @@
     @test authelia_accepts(proxied(BT.ProxyConfig(; base...)), smtp)
     # Behind a tunnel: the portal under the dashboard's own name.
     @test authelia_accepts(BT.TunnelAuth(BT.ProxyConfig(; domain = base.domain, admin = "bob", tls = "tunnel",
-                                                        users_file = base.users_file)), nothing)
+                                                        users_file = base.users_file,
+                                                        session_socket = base.session_socket)), nothing)
 
     # With mail configured, Authelia starts even while the mail server is out
     # (here: nothing listens on its port). It used to exit instead, which left
@@ -65,6 +67,9 @@
     port = Int(Sockets.getsockname(sock)[2])
     close(sock)
     write(config, BT.render_authelia_config(proxied(BT.ProxyConfig(; base..., authelia_port = port)), secrets, smtp))
+    # Its sessions go to the login session store, as on an install.
+    BT.write_session_store_config(base.session_socket)
+    store = BT.start_session_store(bins.valkey, base.session_socket; log = joinpath(dir, "sessions.log"))
     log = joinpath(dir, "authelia.log")
     proc = run(pipeline(`$(bins.authelia) --config $config`; stdout = log, stderr = log); wait = false)
     try
@@ -76,6 +81,7 @@
         @test up
     finally
         process_running(proc) && kill(proc)
+        BT.stop_worker_proc!(store)
     end
 end
 
@@ -93,6 +99,7 @@ end
     write(joinpath(dir, "proxy.json"), JSON.json(Dict(
         "domain" => "team.example.com", "auth_domain" => "auth.team.example.com", "admin" => "bob",
         "caddyfile" => joinpath(dir, "Caddyfile"), "users_file" => joinpath(authelia, "users.yml"),
+        "session_socket" => joinpath(authelia, "sessions", "store.sock"),
         "caddy_bin" => bins.caddy, "authelia_bin" => bins.authelia)))
     auth = BT.auth_mode(dir)
     state = BT.serve(; port = 0, auth, state_dir = dir, working_dir = mktempdir())

@@ -145,12 +145,7 @@ function apply_proxy!(auth::LoginAuth, root::ServerState)
         end
         authelia = render_authelia_config(auth, authelia_secrets(root.state_dir), smtp_settings(root.state_dir))
         atomic_write(io -> write(io, authelia), authelia_config_file(cfg); mode = 0o600)
-        if !isempty(cfg.session_socket)
-            dir = mkpath(dirname(cfg.session_socket))
-            chmod(dir, 0o700)
-            atomic_write(io -> write(io, render_session_store_config(cfg.session_socket)),
-                         joinpath(dir, "server.conf"); mode = 0o600)
-        end
+        write_session_store_config(cfg.session_socket)
     end
     return nothing
 end

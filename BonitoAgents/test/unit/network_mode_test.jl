@@ -17,7 +17,8 @@
     proxied = mktempdir()
     write(joinpath(proxied, "proxy.json"), JSON.json(Dict(
         "domain" => "team.example.com", "auth_domain" => "auth.team.example.com", "admin" => "bob",
-        "caddyfile" => joinpath(proxied, "Caddyfile"), "users_file" => joinpath(proxied, "users.yml"))))
+        "caddyfile" => joinpath(proxied, "Caddyfile"), "users_file" => joinpath(proxied, "users.yml"),
+        "session_socket" => joinpath(proxied, "sessions", "store.sock"))))
     @test BT.auth_mode(proxied) isa BT.ProxyAuth
     # Started for the network, the proxy's settings wait unused (and nothing has
     # to be moved to go back and forth).
@@ -57,7 +58,8 @@
     # A restart finds it; a Caddyfile leaves it out (Caddy has no hash to check).
     again = BT.ServerState(; state_dir = st.state_dir, working_dir = st.working_dir, auth = net)
     @test again.worker_credentials[][name].digest == c.digest
-    cfg = BT.ProxyConfig(; domain = "d", auth_domain = "auth.d", admin = "a", caddyfile = "/x/C", users_file = "/x/u")
+    cfg = BT.ProxyConfig(; domain = "d", auth_domain = "auth.d", admin = "a", caddyfile = "/x/C", users_file = "/x/u",
+                         session_socket = "/x/s.sock")
     @test !occursin(name, BT.render_caddyfile(BT.ProxyAuth(cfg, "k"), values(creds)))
     # On one machine no worker needs one.
     local_st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(), auth = BT.LocalAuth())

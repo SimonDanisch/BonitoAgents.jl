@@ -32,7 +32,8 @@
     port, aport = BT.free_port(), BT.free_port()
     write(joinpath(dir, "proxy.json"), JSON.json(Dict(
         "domain" => "team.example.com", "admin" => "bob", "port" => port, "authelia_port" => aport,
-        "tls" => "tunnel", "authelia_bin" => bins.authelia, "users_file" => users_file)))
+        "tls" => "tunnel", "authelia_bin" => bins.authelia, "users_file" => users_file,
+        "session_socket" => joinpath(dirname(users_file), "sessions", "store.sock"))))
     auth = BT.auth_mode(dir)
     @test auth isa BT.TunnelAuth
     # bob, an admin, with the password Authelia made and an authenticator app.
@@ -48,6 +49,8 @@
     @test startswith(bobs.uri, "otpauth://totp/team.example.com:bob?") && occursin("issuer=team.example.com", bobs.uri)
     @test bobs.qr[1:4] == UInt8[0x89, 0x50, 0x4e, 0x47]     # a PNG
     secret = secret_of(bobs)
+    # Authelia keeps its sessions in the store the server configured, as on an install.
+    store = BT.start_session_store(bins.valkey, auth.config.session_socket; log = joinpath(dir, "sessions.log"))
     log = joinpath(dir, "authelia.log")
     authelia = run(pipeline(`$(bins.authelia) --config $(config)`; stdout = log, stderr = log); wait = false)
     url = "http://127.0.0.1:$(port)"
@@ -299,6 +302,7 @@
         end
     finally
         process_running(authelia) && kill(authelia)
+        BT.stop_worker_proc!(store)
         close(state.srv)
     end
 

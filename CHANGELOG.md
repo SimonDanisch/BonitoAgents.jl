@@ -158,7 +158,8 @@ live.
 
 - **Desktop app:** run the install line again.
 - **Server installed with `install_server.sh`:** run it again. It adds the
-  Valkey session store; each device logs in once more after this update.
+  Valkey session store; each device logs in once more after this update. The
+  server no longer starts without that store, and says to run the installer.
 - **Workers:** they update themselves when no chat runs, or use **Update now** on
   the worker's card. A worker too old to update itself shows **reinstall**: run
   the command from **Add worker** again, without the credential.
