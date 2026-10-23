@@ -1,9 +1,6 @@
 @testitem "e2e:login_devices" setup = [SharedServer] tags = [:e2e] begin
     TK = SharedServer.TK
-    store = get(ENV, "BT_TEST_SESSION_STORE_BIN",
-                something(Sys.which("valkey-server"), Sys.which("redis-server"), ""))
-    isempty(store) && error("login_devices needs valkey-server or redis-server (or BT_TEST_SESSION_STORE_BIN)")
-    z = TK.dev_server(; tunnel = true, session_store_bin = store)
+    z = TK.dev_server(; tunnel = true)
     b = nothing
     try
         TK.open_browser(z)

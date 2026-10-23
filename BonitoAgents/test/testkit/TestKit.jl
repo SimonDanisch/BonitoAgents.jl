@@ -675,7 +675,6 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       scan_on_connect::Bool = false,
                       proxy::Bool = false,
                       tunnel::Bool = false,
-                      session_store_bin::AbstractString = "",
                       kwargs...)
     ensure_display!()
     # One stack at a time in this process — see `RELEASE_SHARED` above. A
@@ -761,9 +760,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     admin = login ? Login("admin", bytes2hex(rand(UInt8, 12)), base32(rand(UInt8, 20))) : nothing
     bins = login ? proxy_binaries() : nothing
     proxy_kw = login ? (; proxy = BT.DevProxy(; caddy_bin = bins.caddy, authelia_bin = bins.authelia,
+                                              valkey_bin = bins.valkey,
                                               admin = admin.user, password = admin.password,
-                                              totp_secret = admin.secret, tunnel,
-                                              session_store_bin = String(session_store_bin))) : (;)
+                                              totp_secret = admin.secret, tunnel)) : (;)
     h = BT.dev_server(; port = port, agent_env = agent_env, scan_on_connect, proxy_kw..., kwargs...)
     sleep(0.8)   # let the worker WS dial in before tests start poking
     # Clean slate for the in-process MCP (armed lazily on the first MCP call,
@@ -1076,14 +1075,13 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     old = s.browser[]
     old === nothing || close_browser(old)
     url = s.h.url * route
-    # Behind the proxy the pages come with a certificate from Caddy's own CA, and
-    # each browser keeps cookies of its own: Electron's default profile is shared
-    # by every window, so a second browser would be logged in as the first.
-    # Without a GPU (CI) WebGL runs on SwiftShader, and Chromium warns about that
-    # fallback unless it was asked for. With a GPU the flag does nothing.
+    # Behind the proxy each browser keeps cookies of its own: Electron's default
+    # profile is shared by every window, so a second browser would be logged in
+    # as the first. Without a GPU (CI) WebGL runs on SwiftShader, and Chromium
+    # warns about that fallback unless it was asked for. With a GPU the flag
+    # does nothing.
     electron_args = String["--enable-unsafe-swiftshader"]
-    s.admin === nothing ||
-        append!(electron_args, ["--ignore-certificate-errors", "--user-data-dir=$(mktempdir())"])
+    s.admin === nothing || push!(electron_args, "--user-data-dir=$(mktempdir())")
     # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
     # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
     # capturePage on the headless (show=false) window stays fresh.
@@ -1105,6 +1103,7 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     end
     capture_console!(ctx)
     follow_pane_scope!(ctx)
+    s.admin === nothing || trust_test_ca!(ctx)
     s.browser[] = ctx
     ElectronCall.load(ctx.window, ElectronCall.URI(url))
     sleep(3.0)                     # let the dashboard mount + the chat session boot
@@ -1550,7 +1549,7 @@ end
 # logs in the way a person does: Authelia's form, then a one-time code from an
 # authenticator app, which `totp` computes from the account's secret.
 
-"Caddy and Authelia for `dev_server(proxy = true)`, downloaded once and checksum-verified."
+"Caddy, Authelia and Valkey for `dev_server(proxy = true)`, downloaded once and checksum-verified."
 proxy_binaries() = BT.fetch_proxy_binaries(joinpath(get(ENV, "XDG_CACHE_HOME", joinpath(homedir(), ".cache")),
                                                     "bonitoagents-test", "proxy-bin"))
 
@@ -1682,23 +1681,31 @@ function invite_login(s::TestServer, user::AbstractString)
     return Login(String(user), password, match(r"[?&]secret=([A-Z2-7]+)", uri)[1])
 end
 
+# Behind the proxy the pages come with a certificate from Caddy's own CA. The
+# browser trusts the test CA's names (`*.localhost`, 127.0.0.1) as a machine that
+# installed the CA would, from before its first request: its pages then have no
+# certificate errors, which a passkey needs (`add_passkey_device!`). Set up only
+# once a page was open, the trust needed every connection closed to take effect,
+# which killed the page's payload fetches in flight ("Failed to fetch").
+function trust_test_ca!(ctx)
+    run(ctx.app, """(() => {
+        BrowserWindow.fromId($(ctx.window.id)).webContents.session.setCertificateVerifyProc((req, cb) =>
+            cb(/(^|\\.)localhost\$|^127\\.0\\.0\\.1\$/.test(req.hostname) ? 0 : -3));
+        return true; })()""")
+    return ctx
+end
+
 """
     add_passkey_device!(s) -> String
 
 Give browser `s` what keeps passkeys, as a password manager (Proton Pass) or a
 security key does: Chrome's virtual authenticator, which holds discoverable
-credentials and verifies its user. A passkey needs a page without certificate
-errors, so this browser also trusts the test CA's names (`*.localhost`,
-127.0.0.1), as a machine that installed the CA would. Returns the device's id.
+credentials and verifies its user. Returns the device's id.
 """
 function add_passkey_device!(s::TestServer)
     ctx = s.browser[]
     return String(run(ctx.app, """(async () => {
-        const w = BrowserWindow.fromId($(ctx.window.id));
-        w.webContents.session.setCertificateVerifyProc((req, cb) =>
-            cb(/(^|\\.)localhost\$|^127\\.0\\.0\\.1\$/.test(req.hostname) ? 0 : -3));
-        await w.webContents.session.closeAllConnections();
-        const d = w.webContents.debugger;
+        const d = BrowserWindow.fromId($(ctx.window.id)).webContents.debugger;
         if (!d.isAttached()) d.attach('1.3');
         await d.sendCommand('WebAuthn.enable', {enableUI: false});
         const r = await d.sendCommand('WebAuthn.addVirtualAuthenticator', {options: {
@@ -1811,8 +1818,7 @@ end
 
 function restart_session_store!(s::TestServer)
     rig = s.h.proxy
-    (rig === nothing || rig.session_store === nothing) &&
-        error("restart_session_store!: this fixture has no persistent session store")
+    rig === nothing && error("restart_session_store!: this fixture has no login proxy")
     cmd = rig.session_store.cmd
     BT.stop_worker_proc!(rig.session_store)
     logfile = joinpath(rig.dir, "sessions.log")

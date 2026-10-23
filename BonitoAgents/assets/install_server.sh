@@ -40,7 +40,7 @@
 # Re-run it to update: the running server keeps serving while packages update
 # and precompile, then restarts once, near the end; Authelia restarts only when
 # its binary, unit or configuration changed. Logins live in a private, persistent
-# Redis/Valkey store, rather than Authelia's faulty in-memory session backend.
+# Valkey store, rather than Authelia's faulty in-memory session backend.
 # Secrets, accounts and the mail settings are kept, and binaries are only
 # replaced when their version changed.
 #
@@ -564,7 +564,7 @@ else
 fi
 
 # Valkey's official binaries target Ubuntu 22.04's glibc baseline. Keep this
-# instance separate from any system-wide Redis, with its own data and socket.
+# instance separate from any system-wide Valkey or Redis, with its own data and socket.
 step "Valkey (login sessions)"
 [[ -n "$VALKEY_VERSION" ]] || VALKEY_VERSION="$(latest_tag valkey-io/valkey || true)"
 VALKEY_VERSION="${VALKEY_VERSION#v}"
@@ -793,7 +793,7 @@ EOF
 
 sudo tee "/etc/systemd/system/$UNIT_SESSIONS.service" > /dev/null << EOF
 [Unit]
-Description=BonitoAgents login sessions${INSTANCE:+ ($INSTANCE)} (Valkey/Redis)
+Description=BonitoAgents login sessions${INSTANCE:+ ($INSTANCE)} (Valkey)
 After=$UNIT_SERVER.service
 
 [Service]

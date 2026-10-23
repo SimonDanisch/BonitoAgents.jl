@@ -113,8 +113,9 @@ Base.@kwdef struct ProxyConfig
     # Authelia writes that code to a file (`notifications_file`), which admins
     # read on the dashboard.
     smtp::Bool = false
-    # A private Redis/Valkey Unix socket. Installed servers use this rather
-    # than Authelia's memory provider, whose borrowed keys corrupt sessions.
+    # A private Valkey's Unix socket (Authelia's `redis` provider). Installed
+    # servers use this rather than Authelia's memory provider, whose borrowed
+    # keys corrupt sessions.
     session_socket::String = ""
     function ProxyConfig(domain, auth_domain, admin, port, authelia_port, caddy_bin, authelia_bin,
                          caddyfile, users_file, acme_email, tls, acme_ca, https_port, http_port,

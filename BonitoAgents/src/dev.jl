@@ -16,15 +16,16 @@
 using Random
 
 """
-    DevProxy(; caddy_bin, authelia_bin, password, totp_secret, admin = "admin",
+    DevProxy(; caddy_bin, authelia_bin, valkey_bin, password, totp_secret, admin = "admin",
                domain = "bonito.localhost", tunnel = false)
 
 Put `dev_server` behind the real login proxy: Caddy with its own certificate
 authority, and Authelia, both on this machine under `domain` and `auth.<domain>`
-(names under `.localhost` need no DNS: browsers resolve them to this machine).
+(names under `.localhost` need no DNS: browsers resolve them to this machine),
+with Authelia's sessions in a private Valkey, as an install keeps them.
 `admin` logs in with `password` and the authenticator secret `totp_secret`
 (base32), which an authenticator app would hold. `fetch_proxy_binaries` gets
-the two binaries.
+the three binaries.
 
 `tunnel = true` sets the server up behind a tunnel instead (`TunnelAuth`): no
 Caddy of ours, Authelia under `domain` itself. The tunnel is played by a Caddy
@@ -34,12 +35,12 @@ that does nothing but what cloudflared does, bring `https://<domain>:<port>`
 Base.@kwdef struct DevProxy
     caddy_bin::String
     authelia_bin::String
+    valkey_bin::String
     password::String
     totp_secret::String
     admin::String = "admin"
     domain::String = "bonito.localhost"
     tunnel::Bool = false
-    session_store_bin::String = ""
 end
 
 # The proxy processes of a `dev_server(proxy = …)`, and where Caddy keeps its CA.
@@ -48,7 +49,7 @@ mutable struct DevProxyRig
     authelia::Base.Process
     dir::String
     root_cert::String      # Caddy's own CA: what a browser or worker must trust
-    session_store::Union{Nothing,Base.Process}
+    session_store::Base.Process
 end
 
 mutable struct DevHandle
@@ -347,8 +348,7 @@ function Base.close(h::DevHandle)
         stop_worker_proc!(h.worker_proc)
     end
     if h.proxy !== nothing
-        foreach(stop_worker_proc!, (h.proxy.caddy, h.proxy.authelia))
-        h.proxy.session_store === nothing || stop_worker_proc!(h.proxy.session_store)
+        foreach(stop_worker_proc!, (h.proxy.caddy, h.proxy.authelia, h.proxy.session_store))
         h.ephemeral && rm(h.proxy.dir; recursive = true, force = true)
     end
     # ...and the agents that worker started. It cannot do this itself: it is
@@ -429,8 +429,8 @@ function write_dev_proxy_config!(p::DevProxy, state_dir::AbstractString, server_
     config = Dict{String,Any}(
         "domain" => p.domain, "admin" => p.admin,
         "port" => server_port, "authelia_port" => free_port(), "https_port" => free_port(),
-        "authelia_bin" => p.authelia_bin, "users_file" => joinpath(authelia_dir, "users.yml"))
-    isempty(p.session_store_bin) || (config["session_socket"] = joinpath(authelia_dir, "sessions", "store.sock"))
+        "authelia_bin" => p.authelia_bin, "users_file" => joinpath(authelia_dir, "users.yml"),
+        "session_socket" => joinpath(authelia_dir, "sessions", "store.sock"))
     p.tunnel ? (config["tls"] = "tunnel") : merge!(config, Dict(
         "auth_domain" => "auth." * p.domain, "http_port" => free_port(),
         "tls" => "internal", "worker_address" => "127.0.0.1",
@@ -455,17 +455,12 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
     config = authelia_config_file(cfg)
     log(name) = joinpath(dir, name * ".log")
     with_parent(cmd) = `setpriv --pdeathsig KILL -- $cmd`
-    session_store = if isempty(p.session_store_bin)
-        nothing
-    else
-        proc = run(pipeline(with_parent(`$(p.session_store_bin) $(joinpath(dirname(cfg.session_socket), "server.conf"))`);
-                            stdout = log("sessions"), stderr = log("sessions")); wait = false)
-        ready() = process_running(proc) && ispath(cfg.session_socket)
-        if timedwait(ready, 30.0; pollint = 0.1) !== :ok
-            stop_worker_proc!(proc)
-            error("dev_server: the login session store did not start; see $(log("sessions"))")
-        end
-        proc
+    session_store = run(pipeline(with_parent(`$(p.valkey_bin) $(joinpath(dirname(cfg.session_socket), "server.conf"))`);
+                                 stdout = log("sessions"), stderr = log("sessions")); wait = false)
+    ready() = process_running(session_store) && ispath(cfg.session_socket)
+    if timedwait(ready, 30.0; pollint = 0.1) !== :ok
+        stop_worker_proc!(session_store)
+        error("dev_server: the login session store did not start; see $(log("sessions"))")
     end
     authelia = caddy = nothing
     try
@@ -496,9 +491,10 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
         end
         return DevProxyRig(caddy, authelia, dir, root_cert, session_store)
     catch
-        for proc in (caddy, authelia, session_store)
+        for proc in (caddy, authelia)
             proc === nothing || stop_worker_proc!(proc)
         end
+        stop_worker_proc!(session_store)
         rethrow()
     end
 end
@@ -526,39 +522,46 @@ function write_dev_tunnel(p::DevProxy, cfg::ProxyConfig, dir::AbstractString)
 end
 
 """
-    fetch_proxy_binaries(dir; caddy = "2.11.4", authelia = "4.39.28") -> (caddy, authelia)
+    fetch_proxy_binaries(dir; caddy = "2.11.4", authelia = "4.39.28", valkey = "9.1.2")
+        -> (caddy, authelia, valkey)
 
-Download Caddy and Authelia for this machine into `dir` (once), each checked
-against the checksums its project publishes, as `install_server.sh` does.
-Returns the two binaries' paths, for `DevProxy`.
+Download Caddy, Authelia and Valkey (Authelia's session store) for this machine
+into `dir` (once), each checked against the checksums its project publishes, as
+`install_server.sh` does. Returns the three binaries' paths, for `DevProxy`.
 """
 function fetch_proxy_binaries(dir::AbstractString; caddy::AbstractString = "2.11.4",
-                              authelia::AbstractString = "4.39.28")
-    Sys.islinux() || error("fetch_proxy_binaries: Linux only (Caddy and Authelia builds for $(Sys.KERNEL) differ)")
+                              authelia::AbstractString = "4.39.28", valkey::AbstractString = "9.1.2")
+    Sys.islinux() || error("fetch_proxy_binaries: Linux only (Caddy, Authelia and Valkey builds for $(Sys.KERNEL) differ)")
     arch = Sys.ARCH === :x86_64 ? "amd64" : Sys.ARCH === :aarch64 ? "arm64" : error("no builds for $(Sys.ARCH)")
     mkpath(dir)
-    function fetch(name, version, file, sums, hashfn)
+    # `member`: the binary's path inside the tarball.
+    function fetch(name, version, base, file, sums, hashfn, member)
         bin = joinpath(dir, "$(name)-$(version)")
         isfile(bin) && return bin
         tarball = joinpath(dir, file)
-        base = name == "caddy" ? "https://github.com/caddyserver/caddy/releases/download/v$(version)" :
-                                 "https://github.com/authelia/authelia/releases/download/v$(version)"
         write(tarball, HTTP.get("$(base)/$(file)").body)
         published = match(Regex("^([0-9a-f]+)\\s+\\Q$(file)\\E\$", "m"), String(HTTP.get("$(base)/$(sums)").body))
         published === nothing && error("$(sums) lists no checksum for $(file)")
         bytes2hex(hashfn(read(tarball))) == published[1] ||
             error("$(file) does not match its published checksum")
         unpacked = mktempdir(dir)
-        run(`tar -xzf $(tarball) -C $(unpacked) $(name)`)
-        mv(joinpath(unpacked, name), bin; force = true)
+        run(`tar -xzf $(tarball) -C $(unpacked) $(member)`)
+        mv(joinpath(unpacked, member), bin; force = true)
         chmod(bin, 0o755)
         rm(unpacked; recursive = true); rm(tarball)
         return bin
     end
-    return (caddy = fetch("caddy", caddy, "caddy_$(caddy)_linux_$(arch).tar.gz",
-                          "caddy_$(caddy)_checksums.txt", SHA.sha512),
-            authelia = fetch("authelia", authelia, "authelia-v$(authelia)-linux-$(arch).tar.gz",
-                             "checksums.sha256", SHA.sha256))
+    # Valkey publishes one build per Ubuntu baseline; `jammy` runs on newer glibcs too.
+    valkey_file = "valkey-$(valkey)-jammy-$(arch == "amd64" ? "x86_64" : "arm64")"
+    return (caddy = fetch("caddy", caddy, "https://github.com/caddyserver/caddy/releases/download/v$(caddy)",
+                          "caddy_$(caddy)_linux_$(arch).tar.gz", "caddy_$(caddy)_checksums.txt",
+                          SHA.sha512, "caddy"),
+            authelia = fetch("authelia", authelia, "https://github.com/authelia/authelia/releases/download/v$(authelia)",
+                             "authelia-v$(authelia)-linux-$(arch).tar.gz", "checksums.sha256",
+                             SHA.sha256, "authelia"),
+            valkey = fetch("valkey-server", valkey, "https://download.valkey.io/releases",
+                           "$(valkey_file).tar.gz", "$(valkey_file).tar.gz.sha256",
+                           SHA.sha256, "$(valkey_file)/bin/valkey-server"))
 end
 
 """

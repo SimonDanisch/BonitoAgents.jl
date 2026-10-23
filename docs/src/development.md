@@ -13,7 +13,9 @@ close(h)                            # everything is wiped
 server and real worker subprocess, but every state directory is a tempdir
 removed on close. `dev_server(proxy = BonitoAgents.DevProxy(...))` puts the
 real Authelia login in front, with Caddy or, with the proxy's `tunnel = true`,
-the server's own login gate. `dev_server(network = true)` runs it the way a
+the server's own login gate, and keeps the logins in Valkey as an install does.
+`BonitoAgents.fetch_proxy_binaries` downloads Caddy, Authelia and Valkey once
+and checks them against their published checksums. `dev_server(network = true)` runs it the way a
 server on a trusted network runs.
 
 The test kit (`BonitoAgents/test/testkit/TestKit.jl`) wraps it for scripted
