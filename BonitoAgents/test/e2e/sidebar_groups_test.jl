@@ -19,6 +19,12 @@
     root = mktempdir()
     a = TK.new_chat(s; cwd = mkpath(joinpath(root, "aaa-groups")))
     TK.send_message(s, "hello")
+    # a's turn ends before z's starts: `send_message` does not wait for the
+    # answer, and each first reply includes its own agent's cold start, so two
+    # chats sent to back to back finished in either order.
+    @test TK.wait_for(s, "a answered",
+        "[...document.querySelectorAll('.bt-chatpane[aria-hidden=false] .bt-agent-msg')].some(m => m.innerText.trim() === 'ok')";
+        timeout = 60) == true
     z = TK.new_chat(s; cwd = mkpath(joinpath(root, "zzz-groups")))
     TK.send_message(s, "hello")
 

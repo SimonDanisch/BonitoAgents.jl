@@ -37,9 +37,9 @@ concurrency:
 
 env:
   JULIA_VERSION: '1.12'
-  # Keyed on the Project.toml set (the Manifests are gitignored and regenerated);
-  # `run_id` pins it to this run, because setup updates the forks to branch HEADs
-  # and the compiled images only match the commits THIS run resolved.
+  # Keyed on the Project.toml set (the Manifests are gitignored and regenerated),
+  # then `run_id` and the hash of the Manifests setup resolved: setup updates the
+  # forks to branch HEADs, and the compiled images only match those commits.
   DEPOT_KEY_PREFIX: julia-depot-v1
   # Resolving never precompiles; the explicit warmup step does, in a fresh process.
   JULIA_PKG_PRECOMPILE_AUTO: '0'
@@ -57,17 +57,15 @@ jobs:
         with:
           version: ${{ env.JULIA_VERSION }}
 
-      # Save under a run-scoped key; warm-start from any earlier run via
-      # restore-keys so package tarballs and artifacts aren't re-downloaded.
-      # The attempt is part of the key: a cache can't be overwritten, so a rerun
-      # under the first attempt's key handed the jobs that depot, without the
-      # fork commits this attempt resolved ("Bonito ... is required but does not
-      # seem to be installed").
-      - uses: actions/cache@v4
+      # Warm-start from the newest depot of this run (an earlier attempt) or of
+      # an earlier run, so package tarballs and artifacts aren't re-downloaded.
+      # The depot is saved once this run has resolved (see the save step below).
+      - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
           restore-keys: |
+            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
 
@@ -124,6 +122,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # Keyed by the Manifests this run resolved, which the other jobs hash after
+      # copying them in: the compiled images only match those fork commits. A
+      # cache can't be overwritten, so under one run-wide key a rerun that
+      # resolved newer fork commits handed its jobs the first attempt's depot
+      # ("Bonito ... is required but does not seem to be installed"). A rerun
+      # that resolves the same commits finds this depot already saved.
+      - uses: actions/cache/save@v4
+        with:
+          path: ~/.julia
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml') }}
+
   # ── Unit tests (headless) ─────────────────────────────────────────────────
   unit:
     name: unit tests
@@ -151,7 +160,8 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml') }}
+          fail-on-cache-miss: true
       - name: Warm the envs this job loads
         run: |
           for env in BonitoAgents BonitoAgents/test; do
@@ -216,7 +226,8 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml') }}
+          fail-on-cache-miss: true
       - name: Warm the test + eval envs
         # The eval envs matter as much as the test env: an eval item's Malt worker
         # mounts a render inside a 30 s DOM wait, and a worker that compiles
