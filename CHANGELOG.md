@@ -146,6 +146,9 @@ live.
   limit. One chat sent 10,294 auto-continues in 2.5 hours before this fix,
   because the failure arrived as a normal turn end and the compaction step
   counted as work.
+- Stop stops. A background run or task that ends after you pressed Stop (or
+  restarted the chat) no longer starts a new turn with its note; the note waits
+  in the queue and goes to the agent with your next message.
 - Logging in on one device no longer logs out another. Authelia's in-memory
   session store could overwrite one browser's session with another's.
 - An error page with a long stack trace no longer stalls the server while it

@@ -5005,6 +5005,7 @@ class BonitoChat {
             const status = document.createElement('div');
             status.className = 'bt-queue-status';
             status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'held' ? 'Goes out with your next message' :
                 item.status === 'offline' ? 'Agent not reachable · sends once it is back' :
                 item.status === 'sending' ? 'Connecting · not sent yet' :
                 item.mode === 'interrupt' ? 'Waiting for interruption to finish' :
@@ -5018,6 +5019,7 @@ class BonitoChat {
             const badge = document.createElement('span');
             badge.className = 'bt-queue-badge';
             badge.textContent = item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'held' ? 'With your next message' :
                 item.status === 'offline' ? 'Agent offline · queued' :
                 item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' :
                 item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
@@ -5029,8 +5031,11 @@ class BonitoChat {
             row.append(summary, detail);
             const actions = document.createElement('div');
             actions.className = 'bt-queue-actions';
+            // Held after a Stop: the chat's own note about something that ended,
+            // which waits for the user's next message unless they send it now.
             for (const [action, label] of item.status === 'paused' ?
                     [['send', 'Queue again'], ['remove', 'Remove']] :
+                    item.status === 'held' ? [['send', 'Send now'], ['remove', 'Remove']] :
                     item.status === 'waiting' || item.status === 'offline' ? [['remove', 'Remove']] : []) {
                 const button = document.createElement('button');
                 button.type = 'button';

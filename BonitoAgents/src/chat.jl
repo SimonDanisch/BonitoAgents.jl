@@ -168,6 +168,12 @@ mutable struct ChatModel
     # it while it winds a cancel down without ever running it.
     cancelled_turns::Ref{Vector{AgentClientProtocol.Turn}}
 
+    # The user pressed Stop and has not sent a message since. What the chat
+    # would tell the agent on its own meanwhile (a background run or task that
+    # ended) is held and goes out with their next message (`enqueue_message!`):
+    # it must not start a turn the user just stopped.
+    stopped::Ref{Bool}
+
     # What `main_consumer!` is rendering right now: `(kind, started_at)`, or
     # `nothing` between messages. Pure diagnostics — the render barrier reports
     # it when it times out, which turns "renderer alive but not draining" from
@@ -406,6 +412,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Any[],                      # pending_sends (outbox)
         Ref{Any}(nothing),          # main_consumer (bound with the ACP session)
         Ref(AgentClientProtocol.Turn[]),  # cancelled_turns
+        Ref(false),                 # stopped
         Ref{Any}(nothing),          # rendering
         Ref(""),                    # pending_history_replay
         Dict{String,Vector{Any}}(), # pending_subagent (activity ahead of its parent Task)
@@ -519,6 +526,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = 
             m.pending_sends,           # shared outbox across tabs
             m.main_consumer,           # shared → one main-thread renderer per chat
             m.cancelled_turns,         # shared → one Stop per chat
+            m.stopped,                 # shared → one Stop per chat
             m.rendering,               # shared → one renderer per chat
             m.pending_history_replay,
             m.pending_subagent,        # shared → one activity buffer per chat
@@ -7628,8 +7636,9 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         sh = shared(model)
         lock(() -> sh.restart_inflight[], sh.restart_lock) === nothing || return
         restart_status[] = "Restarting…"
-        # A restart the user asked for replaces whatever a worker crash cut off.
-        forget_interrupted_turn!(model.state, model.project_id)
+        # A restart the user asked for ends what the chat was doing: neither a
+        # worker crash's cut-off turn nor a note about a run it ended continues it.
+        user_ended!(model)
         @async begin
             try
                 restart_chat_session!(model)
@@ -7894,7 +7903,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             # The restart IS the switch as far as the agent is concerned: the
             # tools ride the MCP process's environment, which is rebuilt on
             # bring-up (`refresh_injected_env`).
-            forget_interrupted_turn!(state, project_id)
+            user_ended!(model)
             restart_chat_session!(model)
             safe_set!(header_status, "")
         end;
@@ -8157,8 +8166,9 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
     # id rather than reopening with (say) Claude's UUID next time.
     project === nothing || (project.resume_session_id = nothing)
 
-    # Another agent now: whatever a worker crash cut off stays cut off.
-    forget_interrupted_turn!(model.state, model.project_id)
+    # Another agent now: whatever a worker crash cut off stays cut off, and
+    # what the old session ran is not reported to the new one unasked.
+    user_ended!(model)
     restart_chat_session!(model)
     if s.session_alive[]
         # Commit only after the worker spawned the provider and ACP completed
@@ -8897,8 +8907,10 @@ function handle_send!(model::ChatModel, cmd::SendCommand, mode::Symbol)
 end
 
 function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
-    # A stop is a stop, also for a turn a worker crash cut off: never continue it.
-    forget_interrupted_turn!(model.state, model.project_id)
+    # A stop is a stop: a turn a worker crash cut off is not continued, and what
+    # ends after it (a background run, a task) waits for the user's next message
+    # instead of starting a turn (`user_ended!`).
+    user_ended!(model)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
     # `client(model.agent)` is a single-field read. (Session arg is unused here —

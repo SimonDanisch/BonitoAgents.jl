@@ -1,13 +1,38 @@
 # Pending text is an outbox, not conversation history. A submission enters
 # chat.md only once prompt! has handed it to the agent connection.
+#
+# `riders`: what the chat would have told the agent on its own while the user
+# had it stopped (`stopped`). They go out with this message, the user's next:
+# shown before it and in the same prompt (`message`), never as a turn of their own.
 mutable struct PendingSend
     id::String
     message::UserMessage
     bubble::UserMsg
+    riders::Vector{UserMsg}
     mode::Symbol
     status::Symbol
     detail::String
     span::Any
+end
+
+const HELD_DETAIL = "You pressed Stop: this goes out with your next message."
+
+# The prompt of a message with riders: theirs first, as they happened before it.
+with_riders(riders::Vector{UserMsg}, text::AbstractString) =
+    isempty(riders) ? String(text) : join([[r.text for r in riders]; String(text)], "\n\n")
+
+"""
+    user_ended!(model)
+
+The user ended what the chat was doing: Stop, a restart, another agent, dev
+mode. Nothing continues it on its own: a turn a worker crash cut off is not
+continued, and what the chat would tell the agent unasked waits for the user's
+next message (`stopped`).
+"""
+function user_ended!(model::ChatModel)
+    forget_interrupted_turn!(model.state, model.project_id)
+    shared(model).stopped[] = true
+    return nothing
 end
 
 send_mode(s) = s == "interrupt" ? :interrupt : s == "next" ? :next : :done
@@ -27,7 +52,8 @@ pending_path(m) = joinpath(m.chat_dir, "pending-messages.json")
 function save_pending_sends!(model)
     s = shared(model)
     lock(s.lock) do
-        rows = [Dict("id" => e.id, "text" => e.message.text, "auto" => e.bubble.auto,
+        rows = [Dict("id" => e.id, "text" => e.bubble.text, "auto" => e.bubble.auto,
+            "riders" => [r.text for r in e.riders],
             "mode" => String(e.mode), "status" => String(e.status), "detail" => e.detail,
             "images" => [Dict("mime" => i.mime, "data" => Base64.base64encode(i.data))
                          for i in e.message.images])
@@ -46,16 +72,24 @@ function load_pending_sends!(model)
     for row in JSON.parsefile(path)
         bubble = UserMsg(model, String(row["text"]))
         bubble.auto = get(row, "auto", false)
+        riders = UserMsg[]
+        for t in get(row, "riders", Any[])
+            r = UserMsg(model, String(t)); r.auto = true
+            push!(riders, r)
+        end
         images = [AgentClientProtocol.ImageAttachment(Base64.base64decode(i["data"]), String(i["mime"]))
                   for i in get(row, "images", Any[])]
-        # Only a message the user paused stays paused. Anything else was never
-        # handed to the agent (a handed-over entry is :sent and not persisted),
-        # so it goes out once this chat's consumer runs.
-        paused = get(row, "status", "waiting") == "paused"
+        # A message the user paused stays paused, and one held after a Stop
+        # stays held (the chat stays stopped). Anything else was never handed
+        # to the agent (a handed-over entry is :sent and not persisted), so it
+        # goes out once this chat's consumer runs.
+        status = get(row, "status", "waiting")
+        kept = status == "paused" ? :paused : status == "held" ? :held : :waiting
+        kept === :held && (model.stopped[] = true)
         push!(model.pending_sends, PendingSend(String(row["id"]),
-            UserMessage(bubble.text, collect(AgentClientProtocol.ImageAttachment, images)), bubble,
-            send_mode(get(row, "mode", "done")), paused ? :paused : :waiting,
-            paused ? String(get(row, "detail", "")) : "", nothing))
+            UserMessage(with_riders(riders, bubble.text), collect(AgentClientProtocol.ImageAttachment, images)),
+            bubble, riders, send_mode(get(row, "mode", "done")), kept,
+            kept === :waiting ? "" : String(get(row, "detail", "")), nothing))
     end
     wake_outbox!(model)
     return nothing
@@ -77,7 +111,7 @@ end
 
 function queue_event(model)
     lock(shared(model).lock) do
-        items = [Dict("id" => e.id, "text" => e.message.text, "mode" => String(e.mode),
+        items = [Dict("id" => e.id, "text" => e.bubble.text, "mode" => String(e.mode),
             "status" => String(e.status), "detail" => e.detail)
             for e in shared(model).pending_sends if e isa PendingSend && e.status != :sent]
         return Dict{String,Any}("type" => "queue.state", "items" => items)
@@ -85,21 +119,35 @@ function queue_event(model)
 end
 emit_queue!(model) = chat_emit(model, queue_event(model))
 
+# What the chat sends on its own (`msg.auto`) while the user has it stopped is
+# held; the user's next message takes everything held along (`riders`) and ends
+# the stop.
 function enqueue_message!(model, msg; images, mode)
     s = shared(model)
     msg.auto || reset!(s.yolo_state)
     mode == :interrupt && handle_command!(s, nothing, CancelCommand())
     bubble = UserMsg(s, msg.text)
     bubble.auto = msg.auto
-    entry = PendingSend(string(uuid4()), UserMessage(msg.text,
-        collect(AgentClientProtocol.ImageAttachment, images)), bubble, mode, :waiting, "", nothing)
-    lock(s.lock) do
-        push!(s.pending_sends, entry)
+    entry = lock(s.lock) do
+        held = msg.auto && s.stopped[]
+        riders = UserMsg[]
+        if !msg.auto
+            for e in s.pending_sends
+                e isa PendingSend && e.status === :held && append!(riders, e.riders, [e.bubble])
+            end
+            filter!(e -> !(e isa PendingSend && e.status === :held), s.pending_sends)
+            s.stopped[] = false
+        end
+        e = PendingSend(string(uuid4()), UserMessage(with_riders(riders, msg.text),
+                collect(AgentClientProtocol.ImageAttachment, images)), bubble, riders, mode,
+            held ? :held : :waiting, held ? HELD_DETAIL : "", nothing)
+        push!(s.pending_sends, e)
         save_pending_sends!(s)
+        e
     end
-    @info "message queued" project_id=s.project_id message_id=entry.id mode
+    @info "message queued" project_id=s.project_id message_id=entry.id mode status=entry.status riders=length(entry.riders)
     emit_queue!(s)
-    wake_outbox!(s)
+    entry.status === :held || wake_outbox!(s)
     return nothing
 end
 
@@ -120,6 +168,7 @@ end
 
 function submission_sent!(model, e, span)
     e.status = :sent
+    foreach(r -> close(send!(model, r)), e.riders)
     close(send!(model, e.bubble))
     # A steering span may finish before the consumer starts awaiting it. Its
     # reply baseline must be the handoff, not that later completion callback.
@@ -128,7 +177,7 @@ function submission_sent!(model, e, span)
     emit_queue!(model)
     emit_lens_vocab(model)
     chat_emit(model, Dict{String,Any}("type" => "queue.delivered", "id" => e.id,
-        "text" => e.message.text, "idx" => length(model.msgs_store) - 1))
+        "text" => e.bubble.text, "idx" => length(model.msgs_store) - 1))
     @info "message sent to agent" project_id=model.project_id message_id=e.id mode=e.mode
     return span
 end
@@ -226,14 +275,21 @@ function settle_submission!(model, entry, failure)
     return go_on
 end
 
+# Stop: what the user queued is paused (they send it again or remove it); what
+# the chat queued on its own is held for the user's next message.
 function drop_queued_sends!(model::ChatModel)
     s = shared(model)
     count = lock(s.lock) do
         n = 0
         for e in s.pending_sends
             e isa PendingSend && e.status in (:waiting, :offline, :sending) || continue
-            e.status = :paused
-            e.detail = "Not sent: paused by Stop. Send it again or remove it."
+            if e.bubble.auto
+                e.status = :held
+                e.detail = HELD_DETAIL
+            else
+                e.status = :paused
+                e.detail = "Not sent: paused by Stop. Send it again or remove it."
+            end
             n += 1
         end
         save_pending_sends!(s)
@@ -283,7 +339,7 @@ end
 function handle_command!(model::ChatModel, ::Any, cmd::QueueActionCommand)
     s = shared(model)
     entry = lock(s.lock) do
-        i = findfirst(e -> e isa PendingSend && e.id == cmd.id && e.status in (:waiting, :offline, :paused), s.pending_sends)
+        i = findfirst(e -> e isa PendingSend && e.id == cmd.id && e.status in (:waiting, :offline, :paused, :held), s.pending_sends)
         i === nothing && return nothing
         e = s.pending_sends[i]
         if cmd.action == "remove"
