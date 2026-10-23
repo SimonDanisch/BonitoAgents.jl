@@ -129,9 +129,11 @@
             })()
         """) == true
 
-        # Turn ends → class clears → height transitions back to 0.
+        # Turn ends → class clears → height transitions back to 0. This is the
+        # chat's first turn, often the first of a fresh server: its end runs code
+        # nothing compiled yet, which took more than 10s on a cold CI runner.
         @test TK.wait_for(s, "busy cleared",
-            "document.querySelector('.bt-busy.bt-busy-active') === null"; timeout = 10) == true
+            "document.querySelector('.bt-busy.bt-busy-active') === null"; timeout = 60) == true
         @test TK.wait_for(s, "busy height collapsed",
             "Math.round(document.querySelector('.bt-busy').getBoundingClientRect().height) <= 1";
             timeout = 5) == true
