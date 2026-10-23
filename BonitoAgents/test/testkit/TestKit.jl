@@ -2316,14 +2316,16 @@ end
 Open an existing chat by clicking its sidebar entry, matched by project id
 (`data-project-id`) or by a substring of its title.
 """
-function open_chat(s::TestServer, key::AbstractString)
+function open_chat(s::TestServer, key::AbstractString; timeout = 30)
     k = json(String(key))
-    ok = eval_js(s, """(() => {
+    entry = """(() => {
         const items = [...document.querySelectorAll('.bt-side-item')];
-        let el = items.find(e => e.getAttribute('data-project-id') === $k);
-        if (!el) el = items.find(e => (e.innerText||'').includes($k));
-        if (!el) return false; el.click(); return true; })()""")
-    ok === true || error("open_chat: no sidebar entry for $(repr(key))")
+        return items.find(e => e.getAttribute('data-project-id') === $k) ||
+               items.find(e => (e.innerText||'').includes($k)) || null; })()"""
+    # The sidebar is a part of its own: after a page load its rows arrive after
+    # the shell `navigate` waits for, and a slow runner was still without them.
+    wait_for(s, "the sidebar entry for $(repr(key))", "!!$(entry)"; timeout)
+    eval_js(s, "$(entry).click(); true")
     wait_for(s, "chat view", "!!document.querySelector('.bt-text-input')"; timeout = 10)
     return s
 end
