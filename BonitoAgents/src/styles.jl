@@ -3493,9 +3493,20 @@ const ChatStyles = Bonito.Styles(
         "border" => "none",
         "box-shadow" => "none",
         "overflow" => "visible"),
-    CSS(".bt-tool-native .bt-tool-header", "display" => "none"),
-    # Native media has no header, so keep the fullwidth toggle hidden even if a
-    # future layout moves it out of the header.
+    # Its header stays as the picture's caption: what it shows (the agent's
+    # title, or the file's name) and the summary beside it, the full path on
+    # hover; the title opens the file. Only the title takes the pointer: a
+    # click anywhere else on the row would fold the picture away.
+    CSS(".bt-tool-native .bt-tool-header",
+        "background" => "none", "border" => "none", "min-height" => "0",
+        "padding" => "0 0 var(--bt-space-1) 0", "pointer-events" => "none"),
+    CSS(".bt-tool-native .bt-tool-header > :not(.bt-tool-title):not(.bt-tool-summary)",
+        "display" => "none"),
+    CSS(".bt-tool-native .bt-tool-title.bt-path-link", "pointer-events" => "auto"),
+    # A caption is prose (often the agent's own words), not a tool name.
+    CSS(".bt-tool-native .bt-tool-title", "font-family" => "inherit", "font-size" => "13px"),
+    # Keep the fullwidth toggle hidden even if a future layout moves it out of
+    # the header.
     CSS(".bt-tool-native .bt-tool-fullwidth, " *
         ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
         "display" => "none"),

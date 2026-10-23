@@ -87,6 +87,9 @@ live.
   buttons that are visible on touch screens.
 - Worker files stream as links; markdown shows its pictures; links to markdown
   files open in the workspace.
+- `bt_show` takes a `title` for what the file shows. The card wears it, with
+  the file's name and size beside it, the full path on hover, and a click on it
+  opens the file. A picture shown bare keeps it as its caption.
 - Code views are static and highlighted in a background worker, with Monaco's
   grammars for 90 languages. A 10,000-line result opens without freezing the
   page and stays searchable and copyable.

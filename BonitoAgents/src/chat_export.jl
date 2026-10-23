@@ -147,8 +147,10 @@ export_input!(::ChatExport, ::EditToolMsg) = nothing
 export_input!(ex::ChatExport, m::ReadToolMsg) =
     isempty(m.file_path) || paragraph(ex, "File: " * file_ref(m.file_path))
 
-export_input!(ex::ChatExport, m::ShowToolMsg) =
+function export_input!(ex::ChatExport, m::ShowToolMsg)
+    isempty(m.caption) || paragraph(ex, "_" * m.caption * "_")
     isempty(m.path) || paragraph(ex, "File: " * file_ref(m.path))
+end
 
 function export_input!(ex::ChatExport, m::SearchToolMsg)
     isempty(m.pattern) || paragraph(ex, "Pattern: " * inline_code(m.pattern))

@@ -2456,6 +2456,7 @@ class BonitoChat {
             if (t) {
                 t.classList.add('bt-path-link');
                 t.dataset.path = msg.edit_path;
+                t.title = msg.edit_path;
             }
         }
     }
@@ -2818,7 +2819,7 @@ class BonitoChat {
         const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini${msg.dismiss_only ? ' bt-task-dismiss' : ''}" type="button"
                      title="${msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop'}"
                      aria-label="${msg.dismiss_only ? 'Dismiss task entry' : 'Stop'}">${msg.dismiss_only ? '×' : ''}</button>` : '';
-        const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
+        const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}" title="${escapeAttr(msg.edit_path)}` : '';
         !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
         const cmdPreview = msg.command ? `
             <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';

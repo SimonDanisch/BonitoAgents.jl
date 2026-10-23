@@ -2463,7 +2463,10 @@ A touch tap on the centre of the first rendered element matching `selector`.
 Inside [`emulate_phone`](@ref).
 """
 function tap(s::TestServer, selector::AbstractString)
-    xy = eval_js(s, """(() => { const e = [...document.querySelectorAll($(json(selector)))].find(e => e.getClientRects().length);
+    # What is drawn: another chat's pane keeps its layout boxes under
+    # `content-visibility: hidden`, so a box alone aimed the finger at a hidden
+    # pane's element, and it landed on whatever the open chat has there.
+    xy = eval_js(s, """(() => { const e = [...document.querySelectorAll($(json(selector)))].find(e => e.checkVisibility());
         if (!e) return null; const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()""")
     xy === nothing && error("tap: nothing rendered matches $(selector)")
     # A finger lands only on what is on the screen.

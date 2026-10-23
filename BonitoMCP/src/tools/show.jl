@@ -77,9 +77,11 @@ end
 const SHOW_DESCRIPTION = """
 Display a file from the worker's disk in the chat as a collapsible preview.
 
-Trivial: just hand it a path. The chat-side renderer fetches the file lazily and
-inlines the best view for it — the same viewer the user gets when they open the
-file in a tab:
+Trivial: just hand it a path, and a `title` saying what it shows ("Loss after
+200 epochs", "Rendered frame 144"): the card wears it, with the file's name and
+path beside it. Without one the card is named after the file. The chat-side
+renderer fetches the file lazily and inlines the best view for it — the same
+viewer the user gets when they open the file in a tab:
 
   • png · jpg · gif · webp · svg · bmp · avif · ico → inline `<img>` (click to enlarge)
   • mp4 · webm · mov · ogv                          → `<video controls>`, range-streamed
@@ -123,6 +125,8 @@ register!(
         "properties" => Dict{String,Any}(
             "path" => Dict("type"=>"string",
                             "description"=>"Path on the worker to a file to display in the chat. Absolute or relative to the worker's cwd."),
+            "title" => Dict("type"=>"string",
+                            "description"=>"What the file shows, in a few words, e.g. \"Loss after 200 epochs\". The card's title; the file name when omitted."),
         ),
         "required" => ["path"],
     ),

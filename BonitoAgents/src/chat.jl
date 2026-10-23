@@ -1101,8 +1101,9 @@ mutable struct ShowToolMsg <: MCPToolMsg        # bt_show
     message::Message
     server::String
     path::String                  # the shown file — feeds the ✎ affordance
+    caption::String               # what the agent says it shows (`title`); "" without one
 end
-ShowToolMsg(message::Message, server) = ShowToolMsg(message, server, "")
+ShowToolMsg(message::Message, server) = ShowToolMsg(message, server, "", "")
 
 mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
     message::Message
@@ -1204,6 +1205,13 @@ end
 function apply_input!(m::ShowToolMsg, raw::AbstractDict)
     p = get(raw, "path", nothing)
     p isa AbstractString && !isempty(p) && (m.path = String(p))
+    # One line without backticks: it becomes the tool's title, which chat.md
+    # keeps on one line between backticks.
+    t = get(raw, "title", nothing)
+    if t isa AbstractString
+        caption = strip(replace(replace(t, '`' => ""), r"\s+" => " "))
+        isempty(caption) || (m.caption = String(caption))
+    end
     return nothing
 end
 apply_input!(m::JuliaEvalCall, raw::AbstractDict) = apply_eval_input!(m, raw)
@@ -1333,6 +1341,12 @@ agent.
 """
 snap_title(::ToolMsg, wire_title::AbstractString) = String(wire_title)
 snap_title(b::MCPToolMsg, ::AbstractString)       = tool_key(b)
+snap_title(b::ShowToolMsg, ::AbstractString)      = show_title(b)
+
+# A shown file is named by what the agent said it shows, else by the file's
+# name; its full path is the title's tooltip and link (bonitoagents.js).
+show_title(m::ShowToolMsg) =
+    !isempty(m.caption) ? m.caption : !isempty(m.path) ? basename(m.path) : tool_key(m)
 
 # ── Shared-header accessors ─────────────────────────────────────────────────
 # Every ToolMsg variant COMPOSES the shared bubble state as `m.message`; these
@@ -2228,7 +2242,7 @@ function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
     # is more authoritative — prefer it. The title is the bare tool name (the
     # TYPE, via tool_key).
     isempty(m.server) || (d["server"] = m.server)
-    d["title"] = tool_key(m)
+    d["title"] = snap_title(m, "")
     mcp_input_extras!(d, m)
     # Same typed auto-expand contract as the live tool_update path: a header
     # rebuilt for a FRESH page (reload, late scroll-in) must render the way
@@ -3050,6 +3064,15 @@ function parse_show_path(text::AbstractString)
     nl = findfirst('\n', text)
     header = nl === nothing ? text : text[1:prevind(text, nl)]
     m = match(r"^shown:\s+(.+?)(?:\s+\([^)]*\))?\s*$", header)
+    m === nothing ? nothing : String(m.captures[1])
+end
+
+# The size out of the `shown: <path> (<mime>, <size>)` reference, e.g. "48.2KB";
+# `nothing` for refs without the parenthesized tail.
+function parse_show_size(text::AbstractString)
+    nl = findfirst('\n', text)
+    header = nl === nothing ? text : text[1:prevind(text, nl)]
+    m = match(r"\([a-z0-9.+-]+/[a-z0-9.+-]+\s*,\s*([^)]+?)\s*\)\s*$", header)
     m === nothing ? nothing : String(m.captures[1])
 end
 
@@ -4569,6 +4592,15 @@ function snap_summary(b::SearchToolMsg, snap)
     return isempty(hits) ? "\"$(b.pattern)\"" : "\"$(b.pattern)\" · $hits"
 end
 snap_summary(b::JuliaEvalCall, snap)  = eval_env_summary(b)
+# The shown file's size from its reference; under the agent's caption, its name too.
+function snap_summary(b::ShowToolMsg, snap)
+    ref = find_show_reference(snap.content)
+    size = ref === nothing ? nothing : parse_show_size(ref)
+    parts = String[]
+    isempty(b.caption) || isempty(b.path) || push!(parts, basename(b.path))
+    size === nothing || push!(parts, size)
+    return join(parts, " · ")
+end
 # The wait says what it waits on, then how that went: its result's first line
 # ("waited 12.3s (until all): 2 of 3 runs finished; still running: r6 …"),
 # from the colon on.
@@ -4649,7 +4681,6 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
         AgentClientProtocol.each_update(m) do snap
             prev_status = h.status
             h.status = snap.status
-            h.title = snap_title(b, snap.title)
             # Stamp `finished_at` on terminal-transition so the live timer freezes.
             prev_status in ("completed", "failed") || !(h.status in ("completed", "failed")) ||
                 (h.finished_at = time())
@@ -4663,6 +4694,8 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
             # while `is_background` was still false). `pin_tool!`/`push!` are
             # idempotent, so this is a no-op for everything already in/out.
             update_from_snap!(b, snap)
+            # After the merge: a title can come from the call's arguments (bt_show's).
+            h.title = snap_title(b, snap.title)
             pin_tool!(h.chat, b)
             # Summary AFTER the snap merge (dispatch on type): an eval shows its
             # env — which only lands once the streamed arguments merged just

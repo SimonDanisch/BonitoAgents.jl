@@ -55,6 +55,9 @@
         [ACP.TextContent("shown: /w/proj/img.png (image/png, 1 KB)"),
          ACP.TextContent("{\"remote_ref\":\"pre/ghi\",\"errored\":false," *
                          "\"repr\":\"4×4 Matrix{RGB{Float64}}\",\"repr_mime\":\"text/plain\"}")])
+    shown = restored("toolu_show", "other", "bt_show", "bt_show",
+        Dict("path" => "/w/proj/loss.png", "title" => "Loss after 200 epochs"),
+        [ACP.TextContent("shown: /w/proj/loss.png (image/png, 48.2KB)")])
     @test eval1 isa BT.GenericToolMsg && bash isa BT.GenericToolMsg   # what chat.md gives back
     @test edit isa BT.EditToolMsg && isempty(edit.old_string)
 
@@ -62,7 +65,7 @@
         BT.UserMsg("please patch the greeting"),
         BT.ThoughtMsg("t1", "Look at the file first.\n\nThen patch it."),
         BT.AgentMsg("a1", "Patching **hello.jl**."),
-        bash, edit, eval1, eval2, eval3,
+        bash, edit, eval1, eval2, eval3, shown,
         BT.TodoListMsg("todo1", [ACP.PlanEntry("Patch hello.jl", "", "completed"),
                                  ACP.PlanEntry("Run the tests", "", "pending")], time(), time(), nothing),
     ])
@@ -105,6 +108,11 @@
         @test occursin("Shown: `/w/proj/img.png` ⚠️\n\n```text\n4×4 Matrix{RGB{Float64}}\n```", md)
         # The stored messages stay as `load_history` made them.
         @test eval1 isa BT.GenericToolMsg && BT.tool_title(eval1) == "bt_julia_eval"
+    end
+
+    @testset "a shown file with the agent's title" begin
+        @test occursin("### 🔧 bt_show · completed\n\n_Loss after 200 epochs_\n\nFile: `/w/proj/loss.png` ⚠️\n", md)
+        @test !occursin("Shown: `/w/proj/loss.png`", md)          # named once, by the input
     end
 
     @testset "BonitoBook opens the export with the evals as cells" begin

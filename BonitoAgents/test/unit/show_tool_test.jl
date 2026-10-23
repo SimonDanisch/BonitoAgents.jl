@@ -54,6 +54,49 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test BT.parse_show_path("")                                     === nothing
     end
 
+    @testset "a shown file's card: the agent's title, the file's name and path" begin
+        @test BT.parse_show_size("shown: /p/loss.png (image/png, 48.2KB)") == "48.2KB"
+        @test BT.parse_show_size("shown: /p/a b.png (image/png, 1.2 MB)\nmore") == "1.2 MB"
+        @test BT.parse_show_size("shown: /p/plain") === nothing
+
+        # The tool takes a title and says so; the reference stays the same.
+        schema = only(t for t in BonitoMCP.TOOLS if t.name == "bt_show").input_schema
+        @test haskey(schema["properties"], "title") && schema["required"] == ["path"]
+        mktempdir() do dir
+            f = joinpath(dir, "loss.png"); write(f, rand(UInt8, 10))
+            res = BonitoMCP.julia_show_handler(Dict("path" => f, "title" => "Loss after 200 epochs"))
+            @test res["isError"] == false && BT.parse_show_path(res["content"][1]["text"]) == f
+        end
+
+        ACP = BonitoAgents.AgentClientProtocol
+        card(id, raw) = (m = BT.build_mcp_msg(BT.ShowToolMsg,
+                             BT.Message(id, "other", "mcp__btworker__bt_show", "", "completed", "", 0.0, 0.0, nothing),
+                             "btworker", "bt_show"); BT.apply_input!(m, raw); m)
+        ref = ACP.ToolContent[ACP.TextContent("shown: /p/out/loss.png (image/png, 48.2KB)")]
+        snap = (; content = ref)
+
+        captioned = card("cap", Dict("path" => "/p/out/loss.png", "title" => "  Loss after\n200 `epochs`  "))
+        @test captioned.caption == "Loss after 200 epochs"      # one line, no backticks: chat.md keeps it
+        @test BT.snap_title(captioned, "mcp__btworker__bt_show") == "Loss after 200 epochs"
+        @test BT.snap_summary(captioned, snap) == "loss.png · 48.2KB"
+
+        plain = card("plain", Dict("path" => "/p/out/loss.png"))
+        @test BT.snap_title(plain, "mcp__btworker__bt_show") == "loss.png"
+        @test BT.snap_summary(plain, snap) == "48.2KB"
+        # Before its arguments arrive the card is the tool.
+        @test BT.snap_title(card("early", Dict{String,Any}()), "") == "bt_show"
+
+        # The header: the title, and the path its tooltip and link carry.
+        chat_dir = mktempdir()
+        BT.persist_tool_content!(chat_dir, ACP.MCPCall("cap", "other", "mcp__btworker__bt_show", "completed",
+            ref, ACP.MessageStream{ACP.ToolCall}(), "btworker", "bt_show",
+            Dict{String,Any}("path" => "/p/out/loss.png", "title" => "Loss after 200 epochs")))
+        d = BT.tool_header_dict(captioned, chat_dir)
+        @test d["title"] == "Loss after 200 epochs"
+        @test d["edit_path"] == "/p/out/loss.png"
+        @test d["tool"] == "bt_show"                             # the filter still knows it
+    end
+
     @testset "bt_show tool handler (BonitoMCP)" begin
         @test BonitoMCP.show_mime_from_path("/x/a.mp4")  == "video/mp4"
         @test BonitoMCP.show_mime_from_path("/x/a.PNG")  == "image/png"   # case-insensitive

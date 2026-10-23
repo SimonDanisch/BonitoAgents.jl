@@ -3025,6 +3025,7 @@ class BonitoChat {
             if (t) {
                 t.classList.add('bt-path-link');
                 t.dataset.path = msg.edit_path;
+                t.title = msg.edit_path;
             }
         }
     }
@@ -3575,8 +3576,10 @@ class BonitoChat {
         // file in the plotpane editor — same affordance as every other path
         // link in the chat (diff headers, search hits, paths in messages).
         // One delegated container listener handles all of them.
+        // The full path is the title's tooltip: the title itself is often a
+        // name (bt_show's caption, a file's basename).
         const titleLink = msg.edit_path
-            ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
+            ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}" title="${escapeAttr(msg.edit_path)}` : '';
         const live = !(msg.status === 'completed' || msg.status === 'failed') &&
                      msg.finished_at == null;
         // (The old <pre> eval code preview is gone: eval cards mount their

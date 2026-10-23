@@ -266,6 +266,12 @@ dump. These are the same renderers you get when
 you open the file as a tab, so a file looks the same whichever way you reached
 it.
 
+`bt_show(path; title = "Loss after 200 epochs")` names what the file shows. The
+card wears that title, with the file's name and size beside it, and is named
+after the file without one. Hovering the title shows the file's full path, and
+clicking it opens the file in a tab. A picture or video shown bare in the chat
+keeps the title as its caption.
+
 `bt_julia_eval` already auto-saves rich values (Makie / Plots figures, color
 matrices) to `<env>/.bonitoAgents/show/` and reports the path, so the usual flow
 is: eval a figure, then `bt_show` its path when the user should see the picture
