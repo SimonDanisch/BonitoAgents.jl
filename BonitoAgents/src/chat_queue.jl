@@ -4,6 +4,15 @@
 # `riders`: what the chat would have told the agent on its own while the user
 # had it stopped (`stopped`). They go out with this message, the user's next:
 # shown before it and in the same prompt (`message`), never as a turn of their own.
+struct PeerMessageOrigin
+    id::String
+    project_id::String
+    title::String
+    worker_id::String
+    worker_name::String
+    sent_at::DateTime
+end
+
 mutable struct PendingSend
     id::String
     message::UserMessage
@@ -13,7 +22,37 @@ mutable struct PendingSend
     status::Symbol
     detail::String
     span::Any
+    origin::Union{PeerMessageOrigin,Nothing}
 end
+PendingSend(id, message, bubble, riders, mode, status, detail, span) =
+    PendingSend(id, message, bubble, riders, mode, status, detail, span, nothing)
+
+message_timestamp(at::DateTime) = Dates.format(at, dateformat"yyyy-mm-dd\THH:MM:SS.sss\Z")
+
+function peer_message_text(origin::PeerMessageOrigin, text; dispatched_at = nothing)
+    header = "Message from chat $(repr(origin.title)) (chat ID: $(origin.project_id))\n" *
+        "Worker: $(repr(origin.worker_name)) (worker ID: $(origin.worker_id))\n" *
+        "Message ID: $(origin.id)\nSent at (server UTC): $(message_timestamp(origin.sent_at))"
+    if dispatched_at !== nothing
+        delay = max(0, Dates.value(dispatched_at - origin.sent_at)) / 1000
+        header *= "\nDispatched at (server UTC): $(message_timestamp(dispatched_at))\nQueued for: $(delay)s"
+    end
+    return header * "\n\n" * text
+end
+
+function submission_payload(entry; dispatched_at = now(UTC))
+    entry.origin === nothing && return (message = entry.message, text = entry.bubble.text)
+    text = peer_message_text(entry.origin, entry.bubble.text; dispatched_at)
+    return (message = UserMessage(with_riders(entry.riders, text), entry.message.images), text = text)
+end
+
+origin_wire(::Nothing) = nothing
+origin_wire(o::PeerMessageOrigin) = Dict("id" => o.id, "project_id" => o.project_id,
+    "title" => o.title, "worker_id" => o.worker_id, "worker_name" => o.worker_name,
+    "sent_at" => string(o.sent_at))
+origin_from_wire(::Nothing) = nothing
+origin_from_wire(o::AbstractDict) = PeerMessageOrigin(String(o["id"]), String(o["project_id"]),
+    String(o["title"]), String(o["worker_id"]), String(o["worker_name"]), DateTime(o["sent_at"]))
 
 const HELD_DETAIL = "You pressed Stop: this goes out with your next message."
 
@@ -53,6 +92,7 @@ function save_pending_sends!(model)
     s = shared(model)
     lock(s.lock) do
         rows = [Dict("id" => e.id, "text" => e.bubble.text, "auto" => e.bubble.auto,
+            "origin" => origin_wire(e.origin),
             "riders" => [r.text for r in e.riders],
             "mode" => String(e.mode), "status" => String(e.status), "detail" => e.detail,
             "images" => [Dict("mime" => i.mime, "data" => Base64.base64encode(i.data))
@@ -89,7 +129,8 @@ function load_pending_sends!(model)
         push!(model.pending_sends, PendingSend(String(row["id"]),
             UserMessage(with_riders(riders, bubble.text), collect(AgentClientProtocol.ImageAttachment, images)),
             bubble, riders, send_mode(get(row, "mode", "done")), kept,
-            kept === :waiting ? "" : String(get(row, "detail", "")), nothing))
+            kept === :waiting ? "" : String(get(row, "detail", "")), nothing,
+            origin_from_wire(get(row, "origin", nothing))))
     end
     wake_outbox!(model)
     return nothing
@@ -111,7 +152,8 @@ end
 
 function queue_event(model)
     lock(shared(model).lock) do
-        items = [Dict("id" => e.id, "text" => e.bubble.text, "mode" => String(e.mode),
+        items = [Dict("id" => e.id,
+            "text" => e.origin === nothing ? e.bubble.text : peer_message_text(e.origin, e.bubble.text), "mode" => String(e.mode),
             "status" => String(e.status), "detail" => e.detail)
             for e in shared(model).pending_sends if e isa PendingSend && e.status != :sent]
         return Dict{String,Any}("type" => "queue.state", "items" => items)
@@ -122,7 +164,7 @@ emit_queue!(model) = chat_emit(model, queue_event(model))
 # What the chat sends on its own (`msg.auto`) while the user has it stopped is
 # held; the user's next message takes everything held along (`riders`) and ends
 # the stop.
-function enqueue_message!(model, msg; images, mode)
+function enqueue_message!(model, msg; images, mode, origin = nothing)
     s = shared(model)
     msg.auto || reset!(s.yolo_state)
     mode == :interrupt && handle_command!(s, nothing, CancelCommand())
@@ -138,9 +180,9 @@ function enqueue_message!(model, msg; images, mode)
             filter!(e -> !(e isa PendingSend && e.status === :held), s.pending_sends)
             s.stopped[] = false
         end
-        e = PendingSend(string(uuid4()), UserMessage(with_riders(riders, msg.text),
+        e = PendingSend(origin === nothing ? string(uuid4()) : origin.id, UserMessage(with_riders(riders, msg.text),
                 collect(AgentClientProtocol.ImageAttachment, images)), bubble, riders, mode,
-            held ? :held : :waiting, held ? HELD_DETAIL : "", nothing)
+            held ? :held : :waiting, held ? HELD_DETAIL : "", nothing, origin)
         push!(s.pending_sends, e)
         save_pending_sends!(s)
         e
@@ -173,8 +215,9 @@ function next_submission(model)
     end
 end
 
-function submission_sent!(model, e, span)
+function submission_sent!(model, e, span; text = e.bubble.text)
     e.status = :sent
+    e.bubble.text = text
     foreach(r -> close(send!(model, r)), e.riders)
     close(send!(model, e.bubble))
     # A steering span may finish before the consumer starts awaiting it. Its
@@ -335,8 +378,9 @@ function deliver_boundary_message!(model)
     end
     entry === nothing && return nothing
     try
+        payload = submission_payload(entry)
         span = if native
-            injected = AgentClientProtocol.steer!(c, with_prelude(s, entry.message.text); images=entry.message.images)
+            injected = AgentClientProtocol.steer!(c, with_prelude(s, payload.message.text); images=payload.message.images)
             if !injected
                 lock(s.lock) do
                     if entry.status === :sending
@@ -354,12 +398,12 @@ function deliver_boundary_message!(model)
         else
             lock(s.lock) do
                 entry.status === :sending || return nothing
-                AgentClientProtocol.prompt!(c, with_prelude(s, entry.message.text); images=entry.message.images)
+                AgentClientProtocol.prompt!(c, with_prelude(s, payload.message.text); images=payload.message.images)
             end
         end
         !native && span === nothing && return nothing
         lock(s.lock) do
-            submission_sent!(s, entry, span)
+            submission_sent!(s, entry, span; text = payload.text)
         end
         native && wake_agent_waits!(s)
     catch err

@@ -32,7 +32,9 @@
         TK.send_message(s, "coordinate")
         @test TK.wait_for(s, "peer sent", says("Peer sent"); timeout = 60)
         TK.open_chat(s, target[])
-        @test TK.wait_for(s, "peer received during YOLO wait", says("Received: peer wakes the wait"); timeout = 15)
+        @test TK.wait_for(s, "stamped peer received during YOLO wait",
+            "[...$pane.querySelectorAll('.bt-agent-msg')].some(e => e.textContent.includes('Received: Message from chat') && " *
+            "e.textContent.includes('Sent at (server UTC):') && e.textContent.includes('peer wakes the wait'))"; timeout = 15)
         @test TK.wait_for(s, "peer releases the minute-long wait", says("Wait released: wait for peer"); timeout = 15)
         @test TK.eval_js(s, "$pane.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')")
         TK.eval_js(s, "$pane.querySelector('.bt-stop-btn').click()")

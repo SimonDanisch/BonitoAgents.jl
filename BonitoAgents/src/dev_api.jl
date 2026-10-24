@@ -769,8 +769,11 @@ function dev_project(state::ServerState, project_id::AbstractString)
 end
 
 dev_op(state::ServerState, ::Val{:control}, args::AbstractDict) =
+    dev_op(state, Val(:control), args, "")
+dev_op(state::ServerState, ::Val{:control}, args::AbstractDict, caller::String) =
     dev_control(state, Val(known_or_throw(Symbol(String(get(args, "op", ""))),
-                                          DEV_CONTROL_OPS, "control op")), args)
+                                          DEV_CONTROL_OPS, "control op")), args, caller)
+dev_control(state::ServerState, op::Val, args::AbstractDict, ::String) = dev_control(state, op, args)
 
 function dev_control(state::ServerState, ::Val{:open_chat}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
@@ -789,13 +792,31 @@ function dev_control(state::ServerState, ::Val{:open_chat}, args::AbstractDict)
 end
 
 function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDict)
+    return dev_control(state, Val(:send_message), args, "")
+end
+
+function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDict, caller::String)
     p = dev_project(state, String(get(args, "project_id", "")))
     text = String(get(args, "text", ""))
     isempty(strip(text)) && error("`text` is empty — nothing to send")
+    # Caller identity comes from the authenticated MCP channel, never tool args.
+    origin = if isempty(caller)
+        nothing
+    else
+        source = dev_project(state, caller)
+        worker = get(state.workers[], source.worker_id, nothing)
+        PeerMessageOrigin(string(uuid4()), source.id, source.title[], source.worker_id,
+            worker === nothing ? source.worker_id : worker.name, now(UTC))
+    end
     model = ensure_project_session!(state, p)
     model === nothing && error("could not bring up a chat session for '$(p.id)'")
-    send_message!(model, UserMsg(text); mode = :next)
-    return Dict{String,Any}("ok" => true, "project_id" => p.id, "sent_chars" => length(text))
+    send_message!(model, UserMsg(text); mode = :next, origin)
+    result = Dict{String,Any}("ok" => true, "project_id" => p.id, "sent_chars" => length(text))
+    if origin !== nothing
+        result["message_id"] = origin.id
+        result["sent_at"] = message_timestamp(origin.sent_at)
+    end
+    return result
 end
 
 function dev_control(state::ServerState, ::Val{:restart_chat}, args::AbstractDict)

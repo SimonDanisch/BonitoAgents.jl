@@ -259,6 +259,8 @@ Operations (`op`):
                       Args: `project_id`.
   • `send_message`  — send a user message into a chat and return immediately;
                       the reply lands in that chat, not here.
+                      Includes the sending chat/worker identity and server UTC
+                      send/dispatch timestamps, so the receiver can judge age.
                       While busy, queue after the current message (when the
                       receiving agent supports it), rather than the whole turn.
                       Args: `project_id`, `text`.

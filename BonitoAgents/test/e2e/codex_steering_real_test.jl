@@ -42,7 +42,7 @@
             @test TK.wait_for(s, "peer tool sent the correction", says("Coordination sent"); timeout = 90)
             TK.open_chat(s, target[])
             @test TK.wait_for(s, "the correction leaves the queue during Codex's original turn",
-                "[...$pane.querySelectorAll('.bt-user-msg')].some(e => e.textContent === $(repr(correction))) && !($idle)"; timeout = 30)
+                "[...$pane.querySelectorAll('.bt-user-msg')].some(e => e.textContent.endsWith($(repr(correction))) && e.textContent.includes('Sent at (server UTC):')) && !($idle)"; timeout = 30)
             @test TK.eval_js(s, "!($(says("CODEX_ORIGINAL_DONE")))")
             TK.screenshot(s, joinpath(tempdir(), "bonitoagents-real-codex-steered.png"))
             @test TK.wait_for(s, "Codex applies the correction and finishes",

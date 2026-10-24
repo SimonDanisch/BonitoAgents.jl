@@ -5936,9 +5936,10 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
                     submission !== nothing && submission.status != :sending && return nothing
                     cancelling(chat) &&
                         error("The agent is still stopping; message has not been sent.")
-                    span = AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
-                        images=user_msg.images)
-                    submission === nothing || submission_sent!(s, submission, span)
+                    payload = submission === nothing ? (message = user_msg, text = "") : submission_payload(submission)
+                    span = AgentClientProtocol.prompt!(cli, with_prelude(chat, payload.message.text);
+                        images=payload.message.images)
+                    submission === nothing || submission_sent!(s, submission, span; text = payload.text)
                     span
                 end
                 break
@@ -6950,8 +6951,8 @@ end
 
 # Pending submissions live outside history; see chat_queue.jl.
 function send_message!(model::ChatModel, msg::UserMsg;
-    images=AgentClientProtocol.ImageAttachment[], mode::Symbol=:done)
-    enqueue_message!(model, msg; images, mode)
+    images=AgentClientProtocol.ImageAttachment[], mode::Symbol=:done, origin = nothing)
+    enqueue_message!(model, msg; images, mode, origin)
 end
 
 """
