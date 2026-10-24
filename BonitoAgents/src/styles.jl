@@ -145,10 +145,11 @@ visible only once the drop has lasted longer than a blink, so the routine
 sub-second reconnect on a healthy link does not flash a modal. Anything typed
 or sent while Bonito is reconnecting is at risk, so a small dot changing colour
 was not a warning, it was a way to lose work. "connecting" is the retry phase,
-shown as reconnecting; "disconnected" is Bonito giving up after its retries,
-shown with a reload button. Before the first successful connection the page
-looks loaded and takes clicks that go nowhere (a chat opened from the sidebar
-shows an empty area: the server renders its loading card), so the card shows
+shown as reconnecting; "disconnected" is Bonito's retries running out, shown
+with a reload button while Bonito goes on trying in the background. Before the
+first successful connection the page looks loaded and takes clicks that go
+nowhere (a chat opened from the sidebar shows an empty area: the server renders
+its loading card), so the card shows
 then too, once the first connection has taken longer than `first_connect`
 seconds or Bonito gave up on it. "expired" is final: the server has no
 session for this page (it restarted, or dropped the page after an hour away), so
@@ -255,7 +256,7 @@ function connection_guard(session::Bonito.Session; first_connect::Real = 4)
             connecting:   ['Reconnecting to the server',
                            'The link to the server dropped. The composer is locked until it is back, so nothing you type is lost.'],
             disconnected: ['Connection lost',
-                           'Reconnecting did not succeed. Reload the page to continue; anything sent since the drop did not reach the server.'],
+                           'Reconnecting has not worked yet. The page keeps trying by itself; reloading it may be quicker.'],
             expired:      ['This page has to be reloaded',
                            'The server restarted, or this page sat unused for over an hour, so it cannot reconnect. Copy what you typed, then reload.'],
         };
@@ -289,7 +290,7 @@ function connection_guard(session::Bonito.Session; first_connect::Real = 4)
             const s = Math.max(0, Math.round((Date.now() - since) / 1000));
             const st = modal.dataset.status;
             elapsed.textContent = st === 'expired' ? ''
-                : st === 'disconnected' ? 'Gave up after ' + s + ' s'
+                : st === 'disconnected' ? 'Offline for ' + s + ' s'
                 : (s < 1 ? 'Trying again…' : 'Trying again for ' + s + ' s');
         }
         // `key` picks the words (the first connection has its own), `status`
@@ -1858,6 +1859,11 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-queue-actions, .bt-send-mode", "display" => "flex",
         "align-items" => "center"),
     CSS(".bt-queue-actions", "gap" => "var(--bt-space-2)"),
+    CSS(".bt-cancel-status", "display" => "flex", "align-self" => "stretch", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "var(--bt-space-2)",
+        "padding" => "var(--bt-space-2)", "color" => "var(--bt-text-muted)",
+        "font-size" => "13px"),
+    CSS(".bt-cancel-status[hidden]", "display" => "none"),
     # Announce delivery to screen readers; the delivered message itself is
     # visible in history. No separate receipt control in the composer.
     CSS(".bt-queue-delivery", "position" => "absolute", "width" => "1px", "height" => "1px",

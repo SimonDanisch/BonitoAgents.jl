@@ -1218,6 +1218,7 @@ class BonitoChat {
         // is in the DOM, on a microtask so .bt-app's children are queryable.
         Promise.resolve().then(() => {
             this.setupInputs();
+            this.setCancelling(this.cancelling ?? false);
             this.setupLiveTicker();
             this.setupLens();
         });
@@ -1366,6 +1367,10 @@ class BonitoChat {
         switch (msg.type) {
             case 'queue.state': return this.renderQueue(msg);
             case 'queue.delivered': return this.queueDelivered(msg);
+            case 'cancel.state':
+                this.turnSeq = msg.seq;
+                this.setCancelling(msg.stopping);
+                return;
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'msgs.reload':  return this.onMsgsReload(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
@@ -1384,6 +1389,7 @@ class BonitoChat {
                 if (this.followMode) this.queueScrollToBottom();
                 return;
             case 'busy_end':
+                this.setCancelling(false);
                 this.busyEl?.classList.remove('bt-busy-active');
                 if (this.followMode) this.queueScrollToBottom();
                 return;
@@ -2790,6 +2796,7 @@ class BonitoChat {
     //     bootstraps the virtual scroll; any final-form HTML changes will
     //     land via the resulting range-refetch path.
     onSessionReset() {
+        this.setCancelling(false);
         this.thinkingEl?.classList.remove('bt-thinking-active');
         this.busyEl?.classList.remove('bt-busy-active');
         this.busyEl?.classList.remove('bt-busy-suppressed');
@@ -4565,6 +4572,10 @@ class BonitoChat {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this.cancel();
+            } else if (e.target.closest('.bt-force-stop-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this.cancel(true);
             } else if (e.target.closest('.bt-attach-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
@@ -4788,8 +4799,18 @@ class BonitoChat {
     // entry points can't drift in what they send.
     // Carries the sequence number of the turn the user is LOOKING AT
     // (`turn_begin`), so a stale click can never cancel a later turn.
-    cancel() {
-        this.comm.notify({type: 'cancel', seq: this.turnSeq ?? -1});
+    cancel(force = false) {
+        this.comm.notify({type: 'cancel', seq: this.turnSeq ?? -1, force});
+    }
+
+    setCancelling(stopping) {
+        this.cancelling = stopping;
+        const status = this.app.querySelector('.bt-cancel-status');
+        if (status) status.hidden = !stopping;
+        const stop = this.app.querySelector('.bt-stop-btn');
+        if (stop) stop.title = stopping ?
+            'Stopping the agent. Use Force stop if it does not respond.' :
+            'Stop generation and pause queued messages';
     }
 
     dragHasFiles(e) {

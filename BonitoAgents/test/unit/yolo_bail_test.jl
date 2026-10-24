@@ -24,8 +24,8 @@
     # state exactly as `continue_yolo!` does, so a testset can drive several
     # turns in a row and watch the protocol move.
     function step!(y, reply; worked = false, produced = true,
-                   errored = false, stop = "end_turn", failure = "")
-        t = T(reply, produced, worked, errored, stop, failure)
+                   errored = false, stop = "end_turn", failure = "", connection_lost = false)
+        t = T(reply, produced, worked, errored, stop, failure, connection_lost)
         d = D(y, t)
         BonitoAgents.yolo_apply!(y, d, t)
         return d
@@ -235,7 +235,7 @@
     end
 
     @testset "a failed turn stops the loop and switches Yolo off" begin
-        # Whatever broke — transport, credits, a model the account cannot use —
+        # A provider failure — credits, a model the account cannot use —
         # the next nudge hits the same wall. Leaving Yolo armed would walk the
         # user's next message straight back into the same loop.
         y = Y()
@@ -260,6 +260,26 @@
         d = step!(y3, ""; worked = true, errored = true, failure = limit)
         @test d.action === :stop && d.disarm
         @test d.reason == "the turn failed ($limit)"
+    end
+
+    @testset "connection loss pauses without changing the user's mode" begin
+        for produced in (false, true), worked in (false, true), reply in ("", S)
+            y = Y()
+            y.streak = 5
+            y.phase = :confirm
+            y.idle = BonitoAgents.YOLO_IDLE_LIMIT
+            y.repeats = BonitoAgents.YOLO_REPEAT_LIMIT
+            d = step!(y, reply; produced, worked, errored = true,
+                failure = "ACP connection closed", connection_lost = true)
+            @test d.action === :stop
+            @test !d.disarm
+            @test occursin("ACP connection closed", d.reason)
+            @test occursin("Yolo remains on", d.reason)
+            @test y.streak == 0 && y.phase === :work && y.idle == 0 && y.repeats == 0
+            # Recovery's next turn starts a fresh loop, rather than confirming
+            # the old interrupted stop request or inheriting its health guards.
+            @test step!(y, "back to work"; worked = true).action === :continue
+        end
     end
 
     # The 2026-10-22 runaway: every Codex turn failed at the compaction step, and

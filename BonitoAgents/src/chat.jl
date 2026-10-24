@@ -5609,7 +5609,18 @@ busy(chat::ChatModel) =
 # an update.
 function publish_busy!(chat::ChatModel)
     shared(chat).busy_active[] = busy(chat)
+    chat_emit(chat, cancel_state(chat))
     return nothing
+end
+
+# The cancel notification has no response of its own. Keep the pending state
+# visible until its turns settle, including in another tab or after a reload.
+function cancel_state(chat::ChatModel)
+    s = shared(chat)
+    c = client(s.agent)
+    requested = c !== nothing && (@atomic c.conn.cancel_at) > 0
+    return Dict{String,Any}("type" => "cancel.state", "seq" => s.turn_seq[],
+        "stopping" => requested && !isempty(AgentClientProtocol.open_turns(c)))
 end
 
 # Block until the chat is not busy, or `timeout` passes; whether it is idle.
@@ -6062,7 +6073,8 @@ yolo_norm(text::AbstractString) =
 # `reply` is the turn's LAST agent message ("" when it ended on a tool call),
 # `worked` whether it did any work (`does_work`), `stop_reason` the agent's own
 # word for how it ended (ACP: end_turn / max_tokens / refusal / …), `failure`
-# what the provider said went wrong ("" when it said nothing).
+# what went wrong ("" when nothing failed). `connection_lost` distinguishes a
+# typed transport error from a provider failure; it must not disarm the mode.
 struct YoloTurn
     reply::String
     produced::Bool
@@ -6070,7 +6082,11 @@ struct YoloTurn
     errored::Bool
     stop_reason::String
     failure::String
+    connection_lost::Bool
 end
+
+YoloTurn(reply, produced, worked, errored, stop_reason, failure) =
+    YoloTurn(reply, produced, worked, errored, stop_reason, failure, false)
 
 # What to do next. `reason` is shown to the user on `:stop` — empty means stop
 # silently (the agent's own answer already said it). `disarm` additionally
@@ -6111,12 +6127,15 @@ function yolo_decide(y::YoloState, t::YoloTurn)
     dec(action, reason = "", disarm = false) =
         YoloDecision(action, reason, disarm, repeated, repeats, idle)
 
-    # Failures end the loop AND switch Yolo off. Whatever broke — transport,
-    # credits, a model the account cannot use — the next nudge hits the same
-    # wall, and an unattended loop retrying a hard failure is the one shape that
-    # spins for hours without anyone seeing it. Switching off is the part that
-    # makes it stay stopped: leaving it armed means the user's next message
-    # walks straight back into the same loop.
+    # A dead connection interrupts the turn; it says nothing about whether the
+    # provider can work. Pause without another nudge or changing the user's mode.
+    # A worker's crash recovery or the next user message can resume the loop.
+    # Disarming here switched both live Bosgame chats off on every worker loss.
+    t.connection_lost && return dec(:stop,
+        isempty(t.failure) ? "the agent connection was lost; Yolo remains on" :
+                            "the agent connection was lost ($(t.failure)); Yolo remains on")
+    # Provider/turn failures still disarm: repeatedly prompting a locked account
+    # caused the runaway this guard prevents.
     t.errored && return dec(:stop,
         isempty(t.failure) ? "the turn failed" : "the turn failed ($(t.failure))", true)
     # The agent's own "I will not do this". Re-asking is not going to change it.
@@ -6214,13 +6233,18 @@ end
 # authenticated returns an empty `end_turn`), and the user should not be left
 # staring at silence.
 #
-# `failure` is what the provider said went wrong, "" when it said nothing.
+# `failure` is the provider/exception detail, "" when nothing failed.
+# `connection_lost` is classified from the exception type, never its text.
 struct TurnOutcome
     stop_reason::String
     errored::Bool
     failure::String
     nstore0::Int
+    connection_lost::Bool
 end
+
+TurnOutcome(stop_reason, errored, failure, nstore0) =
+    TurnOutcome(stop_reason, errored, failure, nstore0, false)
 
 was_cancelled(o::TurnOutcome) = o.stop_reason == "cancelled"
 
@@ -6249,6 +6273,7 @@ function finish_turn!(chat::ChatModel, turn;
     # asking it afterwards always said "not cancelled".
     stop_reason = ""
     failure = ""
+    connection_lost = false
     try
         # The span settling (end_turn / cancelled) says the agent is done
         # talking. It does NOT say we are done showing it — that is the barrier
@@ -6272,6 +6297,9 @@ function finish_turn!(chat::ChatModel, turn;
         end
     catch e
         errored = true
+        cause = innermost_cause(e)
+        connection_lost = is_session_dead_error(cause)
+        failure = sprint(showerror, cause)
         # Show whatever the agent DID say before it failed, then the error —
         # otherwise the error bubble jumps ahead of messages still in the stream.
         # The span's marker still arrives: teardown emits it for every span it
@@ -6284,7 +6312,7 @@ function finish_turn!(chat::ChatModel, turn;
         # injecting one, so nothing that arrives after it is swept into this
         # turn's last bubble.
         wait_rendered!(chat, turn.flush)
-        outcome = TurnOutcome(stop_reason, errored, failure, nstore0)
+        outcome = TurnOutcome(stop_reason, errored, failure, nstore0, connection_lost)
         # Published on the SHARED model: the per-tab `busy_active` is a
         # session-scoped child (parent→child only), so writing that one left the
         # parent stuck true and every other tab/reload rendering "working"
@@ -6373,7 +6401,8 @@ function continue_yolo!(chat::ChatModel, o::TurnOutcome)
         i = findlast(m -> m isa AgentMsg, turn)
         (i === nothing ? "" : turn[i].text), any(does_work, turn)
     end
-    t = YoloTurn(reply, said_something(chat, o), worked, o.errored, o.stop_reason, o.failure)
+    t = YoloTurn(reply, said_something(chat, o), worked, o.errored, o.stop_reason,
+                 o.failure, o.connection_lost)
     d = yolo_decide(y, t)
     yolo_apply!(y, d, t)
     if d.action === :stop
@@ -6384,8 +6413,9 @@ function continue_yolo!(chat::ChatModel, o::TurnOutcome)
         # saying why is the difference between "it finished" and "it gave up".
         # Confirming the sentinel is the one silent case — the agent's own last
         # message already says it.
+        label = o.connection_lost ? "paused" : "stopped"
         isempty(d.reason) || close(send!(chat, AgentMsg(chat,
-            "_Yolo stopped: $(d.reason)$(d.disarm ? " — Yolo switched off" : "")._")))
+            "_Yolo $label: $(d.reason)$(d.disarm ? " — Yolo switched off" : "")._")))
         # Logged too: the loop runs unattended for hours, and "why did it stop"
         # is asked long after the bubble has scrolled away.
         @info "yolo loop stopped" project_id = chat.project_id disarmed = d.disarm reason =
@@ -8337,6 +8367,12 @@ function chat_composer(session::Session, model::ChatModel)
         title = map(y -> y ? "Lock in reminders" : "Send", model.yolo))
     stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
         class="bt-stop-btn", title="Stop generation and pause queued messages")
+    cancel_status = DOM.div(
+        DOM.span("Stopping the agent…"),
+        DOM.button("Force stop"; type="button",
+            class="bt-btn bt-btn-danger bt-btn-sm bt-force-stop-btn",
+            title="End an unresponsive agent connection. Your next message reconnects.");
+        class="bt-cancel-status", role="status", var"aria-live"="polite", hidden=true)
     # Attaching had exactly two ways in: paste and drag-drop. Neither exists on
     # a phone, so the feature was desktop-only by accident. A file input is the
     # affordance a mobile browser turns into its camera/gallery/files sheet.
@@ -8399,6 +8435,7 @@ function chat_composer(session::Session, model::ChatModel)
     DOM.div(
         DOM.div(; class="bt-message-queue", role="region", var"aria-label"="Pending messages"),
         DOM.div(; class="bt-queue-delivery", role="status", var"aria-live"="polite"),
+        cancel_status,
         DOM.div(
             attach_btn, attach_input,
             text_input,
@@ -8594,7 +8631,9 @@ end
 # three consecutive fresh prompts within one frame each). `-1` ⇒ unscoped.
 struct CancelCommand <: ChatCommand
     seq::Int
+    force::Bool
 end
+CancelCommand(seq::Int) = CancelCommand(seq, false)
 CancelCommand() = CancelCommand(-1)
 
 # Wire `{type: "stop_tool", id: "<tool_id>"}` — user clicked the ⊗ on a
@@ -8677,7 +8716,7 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
     elseif type == "queue.action"
         return QueueActionCommand(String(get(msg, "id", "")), String(get(msg, "action", "")))
     elseif type == "cancel"
-        return CancelCommand(Int(get(msg, "seq", -1)))
+        return CancelCommand(Int(get(msg, "seq", -1)), get(msg, "force", false) === true)
     elseif type == "stop_tool"
         id = String(get(msg, "id", ""))
         return isempty(id) ? UnknownCommand() : StopToolCommand(id)
@@ -8750,6 +8789,7 @@ function handle_command!(model::ChatModel, ::Session, ::InitCommand)
     emit_lens_vocab(model)
     emit_queue!(model)
     emit_saved_lenses(model, load_saved_lenses())
+    reply!(model, cancel_state(model))
     return nothing
 end
 
@@ -8940,10 +8980,6 @@ function handle_send!(model::ChatModel, cmd::SendCommand, mode::Symbol)
 end
 
 function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
-    # A stop is a stop: a turn a worker crash cut off is not continued, and what
-    # ends after it (a background run, a task) waits for the user's next message
-    # instead of starting a turn (`user_ended!`).
-    user_ended!(model)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
     # `client(model.agent)` is a single-field read. (Session arg is unused here —
@@ -8956,6 +8992,10 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
         @debug "dropping stale cancel" clicked_turn = cmd.seq current = s.turn_seq[]
         return nothing
     end
+
+    # A stop is a stop, but a stale click must not stop the newer turn's
+    # background notifications or crash recovery either.
+    user_ended!(model)
 
     # Stop pauses the outbox even during lazy connection setup or while
     # offline. A stale turn-scoped click above is the only exception.
@@ -8970,34 +9010,35 @@ function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # `busy_active`, and the partial bubble is sealed. We do NOT force-close on a
     # timer: the agent's honor latency is large + unbounded on a cold/resumed turn,
     # so a timer races it, and a premature mid-turn teardown leaves an orphaned
-    # tool_use that wedges every future resume (a doom loop). A clean cancel always
-    # honors eventually.
+    # tool_use that wedges a future resume. An unresponsive agent may never honor
+    # the notification, so the pending state offers an explicit Force stop.
     #
     # The hammer is reserved for a genuinely-wedged agent (resumed onto an
     # already-orphaned tool call, ignores cancel, connection still alive so no
-    # `ConnectionClosed` fires) — and it's the USER's call: cancel AGAIN, after the
-    # agent's had a real chance (≥ 20 s) and it's STILL busy. That distinguishes a
-    # deliberate "force it" from both an impatient double-click (< the wait →
-    # graceful re-send) and a slow-but-honoring cold cancel.
+    # `ConnectionClosed` fires). The explicit Force stop is the user's call;
+    # repeated ordinary Stop clicks retain the older 20 s escalation window so
+    # a double-click never force-closes a slow-but-honoring cancel.
     now      = time()
     first_at = (@atomic c.conn.cancel_at)              # 0.0 ⇒ first cancel this turn
     # 20 s is well past the worst observed cold-start honor latency (warm ≈ 0.1s,
     # cold-fresh ≈ 3.9s, cold-resumed ≈ 6–18s), so an impatient double-click never
     # force-closes a turn that's about to honor.
-    escalate = first_at > 0 && (now - first_at) ≥ 20.0
-    # Graceful, an idempotent re-send. The turns it reaches are recorded first:
+    escalate = first_at > 0 && (cmd.force || (now - first_at) ≥ 20.0)
+    # The turns it reaches are recorded first:
     # a prompt sent in between must see them winding down (`await_cancel_settled!`).
     lock(() -> (s.cancelled_turns[] = AgentClientProtocol.open_turns(c)), s.lock)
-    AgentClientProtocol.cancel!(c)
     if escalate
         @warn "deliberate re-cancel: agent not honoring — force-closing" project_id = model.project_id
-        s.last_error[] = "The agent didn't respond to cancel; session stopped. Click Restart to reconnect."
+        s.last_error[] = "The agent connection was force-stopped. Your next message reconnects."
         try
             close(c)
         catch e
             @warn "force-close after cancel failed" exception = e
         end
+    else
+        AgentClientProtocol.cancel!(c)
     end
+    chat_emit(model, cancel_state(model))
     return nothing
 end
 
@@ -9618,4 +9659,3 @@ function chat_transcript(session::Session, model::ChatModel)
     # header instead of on top of it. The rail positions itself in it too.
     return DOM.div(messages_container, taskbar, init_script; class = "bt-messages-wrap")
 end
-

@@ -52,9 +52,12 @@ live.
   example) show as a **Provider error** notice in the provider's own words.
 - **Yolo mode** leaves only on purpose: the agent says it is done, then confirms
   it. A failed, refused or repeating turn, or several turns without a tool, stop
-  the loop and switch Yolo off.
+  the loop and switch Yolo off. Losing the agent connection pauses the loop and
+  keeps Yolo on, with the connection error shown in the chat.
 - **Stop** spares background subagents, and the agent is told about tasks a
-  stop interrupted.
+  stop interrupted. Pending cancellation is visible after reload too, with a
+  **Force stop** action for an agent that does not respond. The next message
+  reconnects without needing the chat's Restart action.
 - Message queues are explicit: queue for when the agent is done, after the
   current message, or interrupt and send.
 
@@ -145,6 +148,9 @@ live.
 
 ### Fixed
 
+- Queuing a message during a reply no longer leaves the chat permanently busy
+  when an agent advertises a separate steering API. Overlapping prompts require
+  explicit prompt-queueing support; otherwise messages wait for the current turn.
 - A Codex chat in Yolo mode no longer re-prompts an account that hit its usage
   limit. One chat sent 10,294 auto-continues in 2.5 hours before this fix,
   because the failure arrived as a normal turn end and the compaction step

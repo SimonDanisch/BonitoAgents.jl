@@ -374,6 +374,7 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "client_alive"   => client(agent) !== nothing,
         "turn_in_flight" => sh.turn_in_flight[],
         "turn_seq"       => sh.turn_seq[],
+        "cancel_pending" => cancel_state(sh)["stopping"],
         "taskbar_items"  => length(sh.taskbar.items[]),
         # What the chat runs, on every worker, as recorded (processes.jl).
         "processes"      => [Dict{String,Any}("worker" => p.worker_id, "pid" => p.pid, "kind" => p.kind,

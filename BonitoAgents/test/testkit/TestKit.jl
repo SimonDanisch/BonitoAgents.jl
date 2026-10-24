@@ -667,6 +667,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       browser_width::Int  = 1280,
                       browser_height::Int = 820,
                       ignore_cancel::Bool = false,
+                      prompt_queueing::Bool = true,
                       scenario::Union{String,Nothing} = nothing,
                       cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
@@ -732,6 +733,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # Opt-in: make the mock IGNORE `session/cancel` (wedged-agent simulation) so a
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
+    agent_env["BT_MOCK_ACP_PROMPT_QUEUEING"] = string(prompt_queueing)
     # Opt-in: run a BUILT-IN MockACP scenario instead of the dispatcher. The
     # dispatcher is scripted from the test process and is therefore always a
     # well-behaved agent — it answers when the script says to. The badly-behaved

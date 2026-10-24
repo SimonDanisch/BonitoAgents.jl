@@ -36,6 +36,29 @@
         return pid
     end
 
+    @testset "a lost connection preserves Yolo without retrying a dead agent" begin
+        next[] = _ -> [TK.crash()]
+        start_loop(s, "YoloConnectionLost", [TK.text("rendering frames"), TK.delay(5000),
+                                             TK.crash()])
+        @test TK.wait_for(s, "the interrupted loop says why it paused",
+            agent_says("the agent connection was lost"); timeout = 30)
+        @test TK.wait_for(s, "Yolo remains armed", yolo_on_js; timeout = 10)
+        @test TK.eval_js(s, auto_prompts_js) == 0
+        sleep(3.0)
+        @test TK.eval_js(s, auto_prompts_js) == 0
+
+        # A reload cannot turn this into an off toggle, and reconnecting the
+        # session must preserve the mode too. Both are normal recovery actions.
+        TK.reload!(s)
+        @test TK.wait_for(s, "Yolo remains on after reload", yolo_on_js; timeout = 30)
+        TK.click(s, ".bt-header-reconnect")
+        @test TK.wait_for(s, "the agent reconnected",
+            "!![...document.querySelectorAll('.bt-chatpane')].find(e => e.checkVisibility())" *
+            "?.querySelector('.bt-header-reconnect.bt-hidden')"; timeout = 60)
+        @test TK.eval_js(s, yolo_on_js)
+        @test TK.eval_js(s, auto_prompts_js) == 0
+    end
+
     @testset "a usage limit stops the loop at the failed turn" begin
         limit = "You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage " *
                 "to purchase more credits or try again at Oct 27th, 2026 2:42 PM."

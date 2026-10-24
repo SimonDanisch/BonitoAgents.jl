@@ -1073,7 +1073,9 @@ function dispatch_loop()
             # `loadSession` must match reality (we answer session/load below):
             # the server reads it to decide whether to persist the session id.
             resp(id, Dict("protocolVersion" => 1,
-                          "agentCapabilities" => Dict("loadSession" => true),
+                          "agentCapabilities" => Dict("loadSession" => true,
+                              "_meta" => Dict("claudeCode" => Dict("promptQueueing" =>
+                                  get(ENV, "BT_MOCK_ACP_PROMPT_QUEUEING", "true") == "true"))),
                           "_meta" => Dict("steering" => Dict("supported" => true))))
         elseif method == "session/new" && id !== nothing
             set_mcp_config!(get(msg, "params", Dict()))
