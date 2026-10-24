@@ -565,7 +565,8 @@ function scrub_mock_env!()
     for k in ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
               "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
               "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_CANCEL_DELAY_MS",
-              "BT_MOCK_ACP_STRICT_LOAD", "BT_MOCK_ACP_MANY_CHOICES")
+              "BT_MOCK_ACP_STRICT_LOAD", "BT_MOCK_ACP_MANY_CHOICES",
+              "BT_MOCK_ACP_SESSION_CONFIG", "BT_MOCK_ACP_VARIANT")
         delete!(ENV, k)
     end
     get(ENV, "BT_DEFAULT_PROVIDER", "") in ("MockCode", "MockCode2") &&
@@ -672,6 +673,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
                       many_choices::Bool = false,
+                      session_config::Bool = false,
                       strict_load::Bool = false,
                       scan_on_connect::Bool = false,
                       proxy::Bool = false,
@@ -749,6 +751,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # Make the agent advertise a 12-choice `model` config option, so the header
     # renders the SEARCHABLE picker (`.bt-msearch`) rather than a native select.
     many_choices && (agent_env["BT_MOCK_ACP_MANY_CHOICES"] = "1")
+    session_config && (agent_env["BT_MOCK_ACP_SESSION_CONFIG"] = "1")
     # Make the mock as strict as Claude Code about WHERE a session lives:
     # `session/load` fails unless the transcript sits under the encoded cwd it
     # is loaded in. What "continue this chat on another worker" has to satisfy.

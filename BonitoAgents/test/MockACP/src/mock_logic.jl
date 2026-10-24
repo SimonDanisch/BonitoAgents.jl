@@ -91,9 +91,24 @@ STRICT_LOAD::Bool       = false
 # delivered the second card's body into the first card (e2e:sidebar, now and
 # then).
 TOOL_SEQ::Int           = 1
+const CONFIG_OPTIONS = Ref{Vector{Any}}(Any[])
 take_tool_seq!() = (global TOOL_SEQ += 1; TOOL_SEQ - 1)
 
 function _configure!()
+    CONFIG_OPTIONS[] = if get(ENV, "BT_MOCK_ACP_SESSION_CONFIG", "") == "1"
+        second = get(ENV, "BT_MOCK_ACP_VARIANT", "") == "second"
+        names = second ? ("Gamma", "Delta") : ("Alpha", "Beta")
+        Any[Dict("id" => "model", "name" => "Model", "category" => "model", "type" => "select",
+            "currentValue" => lowercase(first(names)),
+            "options" => [Dict("value" => lowercase(n), "name" => n) for n in names]),
+            Dict("id" => "mode", "name" => "Permissions", "category" => "mode", "type" => "select",
+            "currentValue" => "review", "options" => [Dict("value" => "review", "name" => "Auto review"),
+                Dict("value" => "full", "name" => "Full access")])]
+    elseif get(ENV, "BT_MOCK_ACP_MANY_CHOICES", "") == "1"
+        Any[many_choice_model_option()]
+    else
+        Any[]
+    end
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
     global N_CHUNKS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNKS",  "3")))
     global SESSION         = String(get(ENV, "BT_MOCK_ACP_SESSION", "s"))
@@ -525,6 +540,10 @@ function run_dispatcher_prompt(prompt_id)
     # test process keys its agent fn on whatever the user typed; carry
     # the last seen prompt text in this Ref. Set by the dispatcher loop.
     prompt_text = LAST_PROMPT[]
+    if get(ENV, "BT_MOCK_ACP_SESSION_CONFIG", "") == "1"
+        mode = only(o["currentValue"] for o in CONFIG_OPTIONS[] if o["id"] == "mode")
+        prompt_text *= " (effective permissions: $mode)"
+    end
     # The environment our MCP server's launch entry carries (the worker relay's
     # grant for this chat): the test process runs the MCP tools in-process, as
     # this chat's MCP server would.
@@ -1083,9 +1102,7 @@ function dispatch_loop()
             # and writing one for every mock chat would litter `~/.mockacp`
             # with a folder per temp cwd of every suite.
             STRICT_LOAD && write_transcript!(String(get(get(msg, "params", Dict()), "cwd", "")))
-            resp(id, MANY_CHOICES ?
-                Dict("sessionId" => SESSION, "configOptions" => [many_choice_model_option()]) :
-                Dict("sessionId" => SESSION))
+            resp(id, Dict("sessionId" => SESSION, "configOptions" => deepcopy(CONFIG_OPTIONS[])))
             # Real agents push their slash commands right after session/new
             # (verified on claude-agent-acp and kimi), which is what makes `/`
             # autocomplete work on a chat you haven't typed in yet. Emitting
@@ -1111,7 +1128,23 @@ function dispatch_loop()
             # replays a resumed session's jsonl. Other scenarios keep the bare
             # ack (no replay), which resume tests rely on.
             SCENARIO == "dispatcher" && run_dispatcher_replay()
-            resp(id, Dict("sessionId" => SESSION))
+            resp(id, Dict("sessionId" => SESSION, "configOptions" => deepcopy(CONFIG_OPTIONS[])))
+        elseif method == "session/set_config_option" && id !== nothing
+            params = get(msg, "params", Dict())
+            option = findfirst(o -> o["id"] == params["configId"], CONFIG_OPTIONS[])
+            if option === nothing || !any(c -> c["value"] == params["value"], CONFIG_OPTIONS[][option]["options"])
+                resp_error(id, -32602, "Unsupported config choice")
+                continue
+            end
+            # Let a prompt overtake the request unless the client waits for the
+            # acknowledgement, just as a real adapter can during bring-up.
+            let request_id = id, option = option, value = params["value"]
+                @async begin
+                    get(ENV, "BT_MOCK_ACP_SESSION_CONFIG", "") == "1" && sleep(1.5)
+                    CONFIG_OPTIONS[][option]["currentValue"] = value
+                    resp(request_id, Dict("configOptions" => deepcopy(CONFIG_OPTIONS[])))
+                end
+            end
         elseif method == "session/prompt" && id !== nothing
             cancelled[] = false
             # Capture the user's prompt text for dispatcher mode. claude's

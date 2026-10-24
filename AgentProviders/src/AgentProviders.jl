@@ -170,7 +170,7 @@ struct MockAgent2 <: BinAgent
 end
 function MockAgent2()
     bin, args = mock_bin_args()
-    MockAgent2(bin, args, Dict{String,String}(), Dict{String,Any}("form" => Dict{String,Any}()))
+    MockAgent2(bin, args, Dict("BT_MOCK_ACP_VARIANT" => "second"), Dict{String,Any}("form" => Dict{String,Any}()))
 end
 
 # ── Per-provider display + protocol identity (dispatch, NOT predicate chains) ─

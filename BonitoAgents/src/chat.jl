@@ -238,6 +238,10 @@ mutable struct ChatModel
     # `header_pill` method — the header skeleton never changes. Reset on every
     # bring-up (`start_chat_client!`); ephemeral, never persisted.
     session_meta::Observable{Vector{Any}}
+    # Serialize settings RPCs and the first prompt's permission restoration.
+    # Separate from the agent's bind lock: Stop must still close a connection
+    # whose settings request is unresponsive.
+    config_lock::ReentrantLock
 
     # Live context/cost telemetry off `usage_update` (sent after every
     # assistant message): `nothing` until the first turn, then a NamedTuple
@@ -425,6 +429,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(""),             # yolo_reminders (appended to each continue-prompt)
         YoloState(),                # yolo_state (auto-continue loop state)
         Observable(Any[]),          # session_meta
+        ReentrantLock(),            # config_lock
         Observable{Any}(nothing),   # usage (context/cost telemetry)
         Observable(AgentClientProtocol.CommandInfo[]),  # available_commands
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
@@ -539,6 +544,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = 
             map(identity, session, m.yolo_reminders),
             m.yolo_state,              # shared: the loop runs on the parent
             map(identity, session, m.session_meta),
+            m.config_lock,
             any_bridge(session, m.usage),   # Any-typed: nothing → NamedTuple
             map(identity, session, m.available_commands),
             m.consumer_task,           # shared → only the parent runs the loop
@@ -4402,7 +4408,7 @@ function adopt_config_options!(model::ChatModel, result)
     return true
 end
 
-# Optimistic single-field patch: swap `current_value` on one ConfigOption.
+# Swap `current_value` when a successful legacy setter returns no option list.
 function patch_config_value!(s, cfg_id::AbstractString, value::AbstractString)
     s.session_meta[] = Any[map(s.session_meta[]) do x
         x isa AgentClientProtocol.ConfigOption && x.id == cfg_id ?
@@ -4413,31 +4419,29 @@ function patch_config_value!(s, cfg_id::AbstractString, value::AbstractString)
 end
 
 # User clicked a config option (model / mode / effort) in the header pill.
-# Patch `session_meta` OPTIMISTICALLY so the pill reflects the choice at once,
-# then send `session/set_config_option` off-task (a slow agent mustn't freeze the
-# click handler) and reconcile to the AUTHORITATIVE state in the set response;
-# a failure logs and reverts to the previous value.
+# Apply off-task, serially with bring-up and other picks. Only a confirmed
+# response from the current connection may update the header.
 function apply_config_pick!(model::ChatModel, cfg_id::AbstractString,
                             value::AbstractString)
     cli = client(model.agent)
-    cli === nothing && return nothing
+    cli === nothing && return false
 
     s = shared(model)
-    prev = nothing
-    for x in s.session_meta[]
-        x isa AgentClientProtocol.ConfigOption && x.id == cfg_id && (prev = x.current_value)
-    end
-    patch_config_value!(s, cfg_id, value)
-
+    any(o -> o isa AgentClientProtocol.ConfigOption && o.id == cfg_id &&
+        any(c -> c.value == value, o.choices), s.session_meta[]) || return false
     @async try
-        result = AgentClientProtocol.set_config_option!(cli, cfg_id, value)
-        adopt_config_options!(model, result)   # authoritative; falls back to the patch above
+        lock(s.config_lock) do
+            client(s.agent) === cli || return
+            result = AgentClientProtocol.set_config_option!(cli, cfg_id, value)
+            client(s.agent) === cli || return
+            adopt_config_options!(s, result) || patch_config_value!(s, cfg_id, value)
+        end
     catch e
-        @warn "set_config_option failed; reverting" cfg_id value exception = e
-        prev === nothing && return
-        patch_config_value!(s, cfg_id, prev)
+        @warn "set_config_option failed" cfg_id value exception = e
+        client(s.agent) === cli || return
+        s.last_error[] = "Could not apply $cfg_id: $(sprint(showerror, e))"
     end
-    return nothing
+    return true
 end
 
 # ── Desired session config (permission mode / effort / model) ─────────────────
@@ -4469,35 +4473,54 @@ function effective_session_config(model::ChatModel)
     return cfg
 end
 
-# Assert the desired config on the live session SYNCHRONOUSLY (so the turn's
-# first prompt runs under it) and optimistically patch `session_meta` so the
-# header pills show the asserted values at once. Only options the agent actually
-# advertises are set (a provider without `effort`/`mode` is skipped); a per-option
-# failure logs and continues — it must not abort bring-up.
-function apply_session_config!(model::ChatModel)
+# Bring-up schedules this off-task so opening a chat stays responsive. The
+# prompt path waits for it before sending: an optimistic permission label must
+# never stand in for the agent actually accepting that permission mode.
+function apply_session_config!(model::ChatModel; wait::Bool = false, submission = nothing)
     cli = client(model.agent); cli === nothing && return nothing
-    # Only set options the agent advertises, and skip ones already at the desired
-    # value (so e.g. mode default→default fires no RPC). `current` is keyed by id.
-    current = Dict(o.id => o.current_value
-                   for o in AgentClientProtocol.parse_config_options(cli.session_result))
     s = shared(model)
-    for (id, val) in effective_session_config(model)
-        (isempty(val) || !haskey(current, id) || current[id] == val) && continue
-        # Patch the display NOW (so the pill shows the desired value immediately),
-        # but drive the agent OFF-TASK: `set_config_option` is a blocking RPC and
-        # bring-up runs in the chat-open path — a slow/large resume (where the
-        # response queues behind the history replay) would otherwise hang the chat
-        # from ever opening. The async task reconciles to the authoritative set
-        # response when it lands.
-        patch_config_value!(s, id, val)
-        @async try
-            result = AgentClientProtocol.set_config_option!(cli, id, val)
-            adopt_config_options!(model, result)
-        catch e
-            @warn "apply_session_config: set_config_option failed" id val exception = e
+    apply = function ()
+        lock(s.config_lock) do
+            client(s.agent) === cli || return
+            for (id, val) in effective_session_config(s)
+                current = findfirst(o -> o isa AgentClientProtocol.ConfigOption && o.id == id,
+                                    s.session_meta[])
+                current === nothing && continue
+                option = s.session_meta[][current]
+                # Model and permission ids belong to the provider that advertised
+                # them. A saved Claude choice must not be asserted on Codex.
+                any(c -> c.value == val, option.choices) || continue
+                option.current_value == val && continue
+                result = AgentClientProtocol.set_config_option!(cli, id, val)
+                client(s.agent) === cli || return
+                adopt_config_options!(s, result) || patch_config_value!(s, id, val)
+                if id == "mode"
+                    confirmed = only(o.current_value for o in s.session_meta[]
+                        if o isa AgentClientProtocol.ConfigOption && o.id == id)
+                    confirmed == val || error("The agent did not accept the saved permission mode '$val' (reported '$confirmed').")
+                end
+            end
         end
     end
-    return nothing
+    task = @async try
+        apply()
+        nothing
+    catch e
+        @warn "apply_session_config failed" exception = e
+        client(s.agent) === cli &&
+            (s.last_error[] = "Could not restore agent settings: $(sprint(showerror, e))")
+        e
+    end
+    wait || return nothing
+    if submission !== nothing
+        # Stop pauses the outbox entry even before a prompt exists. Release the
+        # consumer immediately; the bounded settings RPC may finish on its own.
+        timedwait(() -> istaskdone(task) || submission.status != :sending, Inf; pollint = 0.01)
+        submission.status == :sending || return false
+    end
+    result = fetch(task)
+    result === nothing || throw(result)
+    return true
 end
 
 # Remember a user's header-pill pick on the thread so resume restores it.
@@ -5579,6 +5602,8 @@ function start_main_consumer!(chat::ChatModel, cli)
             @warn "previous main-thread renderer ended badly" project_id = chat.project_id exception = (e, catch_backtrace())
         end
     end
+    s.available_commands[] = AgentClientProtocol.CommandInfo[]
+    chat_emit(s, commands_event(s.available_commands[]))
     task = Base.errormonitor(@async main_consumer!(chat, cli.messages))
     lock(s.lock) do
         s.main_consumer[] = (; task, client = cli)
@@ -5897,6 +5922,8 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
         for attempt in 1:2
             cli = live_client!(chat, submission)
             cli === nothing && return nothing
+            apply_session_config!(chat; wait = true, submission) === false && return nothing
+            client(chat.agent) === cli || error("The agent changed while restoring its settings; message has not been sent.")
             # Ship the turn's sequence number — a stop-click echoes it back so the
             # cancel can be scoped to THIS turn (see CancelCommand).
             seq = (s.turn_seq[] += 1)
@@ -6749,8 +6776,8 @@ function start_chat_client!(model::ChatModel)
     shared(model).session_meta[] =
         Any[AgentClientProtocol.parse_config_options(cli.session_result)...]
     # Assert this thread's permission mode / effort / model on the live session —
-    # fresh OR resume — since claude doesn't remember them across resume. Synchronous
-    # so the first prompt of the turn runs under the asserted config.
+    # fresh OR resume — since claude doesn't remember them across resume. The
+    # first prompt waits for restoration before reaching the agent.
     apply_session_config!(model)
     new_session_id = cli.session_id
     if isempty(replay_msgs)
@@ -7638,7 +7665,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
         cfg_id, value = String(pick[1]), String(pick[2])
         isempty(cfg_id) && return
-        apply_config_pick!(model, cfg_id, value)
+        apply_config_pick!(model, cfg_id, value) || return
         # Remember the pick on the thread so resume restores it (claude won't).
         persist_desired_config!(model, cfg_id, value)
     end
@@ -8207,6 +8234,8 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
     # up MiMo, which reads as "switched, but the model picker is still Claude's".
     # `start_chat_client!` repopulates it from the new session's config.
     s.session_meta[] = Any[]
+    s.available_commands[] = AgentClientProtocol.CommandInfo[]
+    chat_emit(s, commands_event(s.available_commands[]))
     # The context meter too: those numbers were the OLD provider's session (a
     # codex window of 258.4k kept showing under "Opus (1M context)"). The new
     # session reports its own on its first turn; until then, or for an agent

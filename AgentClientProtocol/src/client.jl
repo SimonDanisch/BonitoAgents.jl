@@ -386,11 +386,11 @@ end
 # request). So the response is the authoritative post-set state; callers should
 # read it back rather than assume the value took. Throws on rpc error.
 function set_config_option!(client::Client, config_id::AbstractString,
-                            value::AbstractString)
+                            value::AbstractString; timeout::Real = 30.0)
     return send_request(client.conn, "session/set_config_option",
         Dict("sessionId" => client.session_id,
              "configId"  => String(config_id),
-             "value"     => String(value)))
+             "value"     => String(value)), timeout)
 end
 
 # Close the connection FIRST (the dispatcher stops, so no further update can be
