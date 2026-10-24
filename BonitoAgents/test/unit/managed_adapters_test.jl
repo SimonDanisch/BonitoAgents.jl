@@ -33,9 +33,30 @@
         @test read(`$(managed.bin)`, String) == "$(claude) 1.0.0\n"
         @test managed.path == BW.node_bin_dir(release_dir("24.9.0"))
 
+        # A pull can add an adapter fix without changing the npm version.
+        # Sync must apply it to an already-installed Codex, once.
+        codex_file = joinpath(BW.package_dir(root, codex), "dist", "index.js")
+        mkpath(dirname(codex_file))
+        write(codex_file, raw"""
+        const capabilities = { steering: { supported: true } };
+        class Adapter {
+          parseSessionSteerParams(params) {
+            const sessionId = params.sessionId, prompt = params.prompt;
+            return { sessionId, prompt };
+          }
+          async performSteeringRequest(params) {
+            return await this.startNewTurnFromSteering(params);
+          }
+        }
+        """)
+
         # Met already: nothing is downloaded or installed again.
         @test sync(spec)[claude] == "1.0.0"
         @test length(installs(dist)) == 2
+        @test count(BW.ACTIVE_STEERING_PATCH_MARK, read(codex_file, String)) == 1
+        once = read(codex_file, String)
+        sync(spec)
+        @test read(codex_file, String) == once
         # "latest" follows the registry.
         publish!(dist, claude, "1.1.0")
         @test sync(spec)[claude] == "1.1.0"

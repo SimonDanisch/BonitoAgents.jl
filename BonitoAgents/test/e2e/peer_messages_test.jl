@@ -12,7 +12,7 @@
     else
         [TK.text("Received: " * prompt)]
     end
-    s = TK.dev_server(; agent)
+    s = TK.dev_server(; agent, prompt_queueing = false, active_steering = true)
     try
         TK.open_browser(s)
         sender = TK.new_chat(s; title = "Sending agent")

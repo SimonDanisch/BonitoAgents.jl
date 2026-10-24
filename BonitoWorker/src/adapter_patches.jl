@@ -5,7 +5,7 @@
 # (its `thinking_tokens` messages, about every second); the adapter drops them,
 # with a "Todo". This makes it forward the estimate as a `usage_update` carrying
 # `_meta["_claude/thinkingTokens"]`: the same change as the pull request on
-# claude-agent-acp (branch feat/thinking-token-usage). Delete this file once a
+# claude-agent-acp (branch feat/thinking-token-usage). Remove this patch once a
 # release has it.
 #
 # It patches whatever version is installed, on every sync, at one exact spot. A
@@ -78,6 +78,39 @@ function patch_thinking_tokens!(root::AbstractString = harness_root())
     src = read(file, String)
     occursin(THINKING_PATCH_MARK, src) && return :patched
     patched = patch_thinking_tokens(src)
+    patched === nothing && return :unchanged
+    tmp = file * ".partial"
+    write(tmp, patched)
+    mv(tmp, file; force = true)
+    return :patched
+end
+
+# codex-acp's steering fallback starts a new turn without reporting its end on
+# ACP v1. Until upstream offers active-only steering, add that optional guard
+# at its existing fallback. The original prompt still owns turn completion.
+const ACTIVE_STEERING_PATCH_MARK = "/* bonitoworker: active-only steering */"
+
+function patch_active_steering(src::AbstractString)
+    capability = r"steering:\s*\{\s*supported:\s*true\s*\}"
+    parser = r"(?s)(parseSessionSteerParams\(params\)\s*\{.*?return\s*\{\s*sessionId,\s*prompt)(\s*\};\s*\})"
+    fallback = "return await this.startNewTurnFromSteering(params);"
+    all(pattern -> length(collect(eachmatch(pattern, src))) == 1, (capability, parser)) || return nothing
+    count(fallback, src) == 1 || return nothing
+    parsed = match(parser, src)
+    patched = replace(src, parsed.match => parsed.captures[1] *
+        ", activeOnly: params.activeOnly === true" * parsed.captures[2]; count = 1)
+    patched = replace(patched, capability => "steering: { supported: true, activeOnly: true }"; count = 1)
+    return replace(patched, fallback =>
+        "$ACTIVE_STEERING_PATCH_MARK\n    if (params.activeOnly === true) return { outcome: \"notInjected\" };\n    $fallback";
+        count = 1)
+end
+
+function patch_active_steering!(root::AbstractString = harness_root())
+    file = joinpath(package_dir(root, "@agentclientprotocol/codex-acp"), "dist", "index.js")
+    isfile(file) || return :absent
+    src = read(file, String)
+    occursin(ACTIVE_STEERING_PATCH_MARK, src) && return :patched
+    patched = patch_active_steering(src)
     patched === nothing && return :unchanged
     tmp = file * ".partial"
     write(tmp, patched)

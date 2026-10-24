@@ -273,6 +273,23 @@ function prompt!(client::Client, text::String;
     return prompt_request(client.conn, params)
 end
 
+# Requires the advertised activeOnly steering extension. A rejection leaves
+# delivery to an ordinary prompt; it must never start an untracked turn.
+function steer!(client::Client, text::String;
+                images::Vector{ImageAttachment} = ImageAttachment[])
+    get(client.session_result, "bonitoActiveSteering", false) ||
+        error("The agent does not advertise active-only steering.")
+    blocks = Any[Dict("type" => "text", "text" => text)]
+    append!(blocks, [Dict("type" => "image", "data" => Base64.base64encode(img.data),
+                         "mimeType" => img.mime) for img in images])
+    result = send_request(client.conn, "_session/steering",
+        Dict("sessionId" => client.session_id, "prompt" => blocks, "activeOnly" => true), 30.0)
+    outcome = get(result, "outcome", "")
+    outcome == "injected" && return true
+    outcome in ("notInjected", "failed") && return false
+    error("The agent did not accept the steering message (outcome: $outcome).")
+end
+
 # Block until the turn settles; returns the stopReason result, throws on an rpc
 # error or a torn-down connection.
 function wait_turn!(span::PromptTurn)

@@ -207,6 +207,10 @@ function sync_harnesses!(spec::HarnessSpec; root::AbstractString = harness_root(
         patch_thinking_tokens!(root) == :unchanged &&
             @warn "BonitoWorker: this claude-agent-acp has no spot for the thinking-progress patch; its chats show no thinking estimate" version = installed_version(root, "@agentclientprotocol/claude-agent-acp")
     end
+    if haskey(spec.packages, "@agentclientprotocol/codex-acp")
+        patch_active_steering!(root) == :unchanged &&
+            @warn "BonitoWorker: this codex-acp cannot accept the active-only steering patch; mid-turn messages wait until completion" version = installed_version(root, "@agentclientprotocol/codex-acp")
+    end
     return installed_harnesses(root, keys(spec.packages))
 end
 

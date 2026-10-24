@@ -92,6 +92,7 @@ STRICT_LOAD::Bool       = false
 # then).
 TOOL_SEQ::Int           = 1
 const CONFIG_OPTIONS = Ref{Vector{Any}}(Any[])
+const ACTIVE_PROMPTS = Ref(0)
 take_tool_seq!() = (global TOOL_SEQ += 1; TOOL_SEQ - 1)
 
 function _configure!()
@@ -216,7 +217,7 @@ sub_meta(ev::AbstractDict) =
         Dict{String,Any}("parentToolUseId" => String(ev["parent"])))
 
 resp(id, result) =
-    emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
+    id === nothing ? nothing : emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
 
 resp_error(id, code, message) =
     emit(Dict("jsonrpc" => "2.0", "id" => id,
@@ -244,7 +245,7 @@ const INTERRUPTED = Ref(false)
 
 # Drive ONE `session/prompt`. The dispatcher catches throws so a scenario
 # can `exit(1)` to simulate a crash without crashing the dispatcher first.
-function handle_prompt(prompt_id, scenario::AbstractString)
+function handle_prompt(prompt_id, scenario::AbstractString; prompt_text = LAST_PROMPT[])
     if scenario == "normal"
         for i in 1:N_CHUNKS
             cancelled[] && break
@@ -416,7 +417,7 @@ function handle_prompt(prompt_id, scenario::AbstractString)
         # event to one ACP frame. This is the path real e2e tests take
         # to swap claude-agent-acp with a test-process responder while
         # keeping the entire LocalTransport spawn/wire path real.
-        run_dispatcher_prompt(prompt_id)
+        run_dispatcher_prompt(prompt_id; prompt_text)
     else
         error("unknown BT_MOCK_ACP_SCENARIO: $(scenario)")
     end
@@ -529,7 +530,7 @@ function run_dispatcher_replay()
     return nothing
 end
 
-function run_dispatcher_prompt(prompt_id)
+function run_dispatcher_prompt(prompt_id; prompt_text = LAST_PROMPT[])
     # Steering opens overlapping prompts. Each must read its own script;
     # concurrent readers on the shared replay socket steal each other's events.
     host, port = rsplit(DISPATCHER_ADDR, ":"; limit=2)
@@ -539,7 +540,6 @@ function run_dispatcher_prompt(prompt_id)
     # dispatcher loop already parsed it, but we don't have it here. The
     # test process keys its agent fn on whatever the user typed; carry
     # the last seen prompt text in this Ref. Set by the dispatcher loop.
-    prompt_text = LAST_PROMPT[]
     if get(ENV, "BT_MOCK_ACP_SESSION_CONFIG", "") == "1"
         mode = only(o["currentValue"] for o in CONFIG_OPTIONS[] if o["id"] == "mode")
         prompt_text *= " (effective permissions: $mode)"
@@ -1095,7 +1095,8 @@ function dispatch_loop()
                           "agentCapabilities" => Dict("loadSession" => true,
                               "_meta" => Dict("claudeCode" => Dict("promptQueueing" =>
                                   get(ENV, "BT_MOCK_ACP_PROMPT_QUEUEING", "true") == "true"))),
-                          "_meta" => Dict("steering" => Dict("supported" => true))))
+                          "_meta" => Dict("steering" => Dict("supported" => true,
+                              "activeOnly" => get(ENV, "BT_MOCK_ACP_ACTIVE_STEERING", "false") == "true"))))
         elseif method == "session/new" && id !== nothing
             set_mcp_config!(get(msg, "params", Dict()))
             # Only under strict_load: the transcript is what that mode checks,
@@ -1145,7 +1146,24 @@ function dispatch_loop()
                     resp(request_id, Dict("configOptions" => deepcopy(CONFIG_OPTIONS[])))
                 end
             end
+        elseif method == "_session/steering" && id !== nothing
+            params = get(msg, "params", Dict())
+            if ACTIVE_PROMPTS[] == 0
+                resp(id, Dict("outcome" => "notInjected"))
+                continue
+            end
+            @assert get(params, "activeOnly", false) === true
+            LAST_PROMPT[] = join(String(get(b, "text", "")) for b in get(params, "prompt", Any[])
+                if get(b, "type", "") == "text")
+            resp(id, Dict("outcome" => "injected"))
+            let prompt_text = LAST_PROMPT[]
+                Base.errormonitor(@async handle_prompt(nothing, SCENARIO; prompt_text))
+            end
         elseif method == "session/prompt" && id !== nothing
+            if ACTIVE_PROMPTS[] > 0 && get(ENV, "BT_MOCK_ACP_ACTIVE_STEERING", "false") == "true"
+                resp_error(id, -32600, "Overlapping session/prompt is unsupported; use steering")
+                continue
+            end
             cancelled[] = false
             # Capture the user's prompt text for dispatcher mode. claude's
             # session/prompt carries `params.prompt` as a Vector of content
@@ -1161,14 +1179,19 @@ function dispatch_loop()
             # so a mid-stream cancel could never be honored. A turn that hangs
             # (the `hang_*` scenarios) still parks in its own task, leaving the
             # loop free to read the eventual stdin EOF / cancel.
-            @async try
-                handle_prompt(id, SCENARIO)
-            catch e
-                # A scenario-side throw shouldn't kill the dispatcher; the
-                # real agent would either respond or not. We respond with
-                # a synthetic error so the chat side surfaces it.
-                resp(id, Dict("stopReason" => "error",
-                              "message"    => sprint(showerror, e)))
+            ACTIVE_PROMPTS[] += 1
+            let prompt_text = LAST_PROMPT[], prompt_id = id
+                @async try
+                    handle_prompt(prompt_id, SCENARIO; prompt_text)
+                catch e
+                    # A scenario-side throw shouldn't kill the dispatcher; the
+                    # real agent would either respond or not. We respond with
+                    # a synthetic error so the chat side surfaces it.
+                    resp(prompt_id, Dict("stopReason" => "error",
+                                  "message"    => sprint(showerror, e)))
+                finally
+                    ACTIVE_PROMPTS[] -= 1
+                end
             end
         elseif method == "session/cancel"
             # Notification — no response. Flip the flag so the current

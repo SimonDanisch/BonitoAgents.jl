@@ -172,7 +172,12 @@ function submission_sent!(model, e, span)
     close(send!(model, e.bubble))
     # A steering span may finish before the consumer starts awaiting it. Its
     # reply baseline must be the handoff, not that later completion callback.
-    e.span = (turn=span, nstore0=length(model.msgs_store))
+    e.span = span === nothing ? nothing : (turn=span, nstore0=length(model.msgs_store))
+    # Native steering joins an existing turn, whose original prompt already
+    # owns completion. It creates no second span to await or finalize.
+    span === nothing && lock(model.lock) do
+        filter!(x -> x !== e, model.pending_sends)
+    end
     save_pending_sends!(model)
     emit_queue!(model)
     emit_lens_vocab(model)
@@ -306,11 +311,12 @@ function deliver_boundary_message!(model)
     c === nothing && return nothing
     isempty(AgentClientProtocol.open_turns(c)) && return nothing
     cancelling(s) && return nothing
-    lock(s.lock) do
+    native = get(c.session_result, "bonitoActiveSteering", false)
+    entry = lock(s.lock) do
         i = findfirst(e -> e isa PendingSend && e.status == :waiting && e.mode == :next, s.pending_sends)
         i === nothing && return nothing
         e = s.pending_sends[i]
-        if !get(c.session_result, "bonitoPromptQueueing", false)
+        if !native && !get(c.session_result, "bonitoPromptQueueing", false)
             e.mode = :done
             e.detail = "This agent does not advertise steering; waiting until the turn finishes."
             save_pending_sends!(s)
@@ -318,20 +324,51 @@ function deliver_boundary_message!(model)
             return nothing
         end
         e.status = :sending
-        try
-            span = AgentClientProtocol.prompt!(c, with_prelude(s, e.message.text); images=e.message.images)
-            submission_sent!(s, e, span)
-        catch err
-            # prompt! threw, so the agent did not take it. Fall back to the
-            # ordinary delivery when the turn ends, which also restarts a
-            # session that died under the steer.
-            e.status = :waiting
-            e.mode = :done
-            e.detail = "Could not reach the running turn; sends when it finishes."
-            save_pending_sends!(s)
-            emit_queue!(s)
-            @error "message steering failed" project_id=s.project_id message_id=e.id exception=(err, catch_backtrace())
+        e
+    end
+    entry === nothing && return nothing
+    try
+        span = if native
+            injected = AgentClientProtocol.steer!(c, with_prelude(s, entry.message.text); images=entry.message.images)
+            if !injected
+                lock(s.lock) do
+                    if entry.status === :sending
+                        entry.status = :waiting
+                        entry.mode = :done
+                        entry.detail = "The running turn finished; sending as the next prompt."
+                    end
+                    save_pending_sends!(s)
+                end
+                emit_queue!(s)
+                wake_outbox!(s)
+                return nothing
+            end
+            nothing
+        else
+            lock(s.lock) do
+                entry.status === :sending || return nothing
+                AgentClientProtocol.prompt!(c, with_prelude(s, entry.message.text); images=entry.message.images)
+            end
         end
+        !native && span === nothing && return nothing
+        lock(s.lock) do
+            submission_sent!(s, entry, span)
+        end
+    catch err
+        lock(s.lock) do
+            # A rejected steer was not delivered. Preserve a concurrent Stop
+            # rather than rearming its paused entry when the response arrives.
+            if entry.status === :sending
+                entry.status = native ? :paused : :waiting
+                entry.mode = :done
+                entry.detail = native ? "Delivery was not confirmed: $(sprint(showerror, err)). Send again or remove it." :
+                    "Could not reach the running turn; sends when it finishes."
+            end
+            save_pending_sends!(s)
+        end
+        emit_queue!(s)
+        wake_outbox!(s)
+        @error "message steering failed" project_id=s.project_id message_id=entry.id exception=(err, catch_backtrace())
     end
     return nothing
 end

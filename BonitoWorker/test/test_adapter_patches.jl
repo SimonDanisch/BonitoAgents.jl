@@ -8,6 +8,59 @@ using Test, BonitoWorker
 import JSON
 const BW = BonitoWorker
 
+const STEERING_FIXTURE = raw"""
+class Agent {
+  started = 0;
+  initialize() { return { steering: { supported: true } }; }
+  parseSessionSteerParams(params) {
+    const sessionId = params["sessionId"];
+    const prompt = params["prompt"];
+    return { sessionId, prompt };
+  }
+  async performSteeringRequest(params) {
+    if (this.active && this.injected) return { outcome: "injected" };
+    return await this.startNewTurnFromSteering(params);
+  }
+  async startNewTurnFromSteering(params) {
+    this.started++;
+    return { outcome: "startedNewTurn" };
+  }
+}
+const agent = new Agent();
+const request = agent.parseSessionSteerParams({ sessionId: "s", prompt: [], activeOnly: true });
+const outcomes = [];
+agent.active = true; agent.injected = true;
+outcomes.push(await agent.performSteeringRequest(request));
+agent.active = false;
+outcomes.push(await agent.performSteeringRequest(request));
+agent.active = true; agent.injected = false; // turn ended during injection
+outcomes.push(await agent.performSteeringRequest(request));
+console.log(JSON.stringify({ capabilities: agent.initialize(), outcomes, started: agent.started }));
+"""
+
+@testset "codex-acp: active-only steering" begin
+    patched = BW.patch_active_steering(STEERING_FIXTURE)
+    @test patched !== nothing
+    @test count(BW.ACTIVE_STEERING_PATCH_MARK, patched) == 1
+    @test BW.patch_active_steering(patched) === nothing
+    @test BW.patch_active_steering(replace(STEERING_FIXTURE, "parseSessionSteerParams" => "parseOther")) === nothing
+    mktempdir() do root
+        @test BW.patch_active_steering!(root) === :absent
+        file = joinpath(root, "npm", "node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js")
+        mkpath(dirname(file)); write(file, STEERING_FIXTURE)
+        @test BW.patch_active_steering!(root) === :patched
+        @test BW.patch_active_steering!(root) === :patched
+        @test count(BW.ACTIVE_STEERING_PATCH_MARK, read(file, String)) == 1
+        node = Sys.which("node")
+        if node !== nothing
+            result = JSON.parse(read(`$node --input-type=module -e $(read(file, String))`, String))
+            @test result["capabilities"]["steering"]["activeOnly"] === true
+            @test [x["outcome"] for x in result["outcomes"]] == ["injected", "notInjected", "notInjected"]
+            @test result["started"] == 0
+        end
+    end
+end
+
 const ADAPTER_FIXTURE = raw"""
 const sent = [];
 class Agent {
