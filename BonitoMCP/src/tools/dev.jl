@@ -259,6 +259,8 @@ Operations (`op`):
                       Args: `project_id`.
   • `send_message`  — send a user message into a chat and return immediately;
                       the reply lands in that chat, not here.
+                      While busy, queue after the current message (when the
+                      receiving agent supports it), rather than the whole turn.
                       Args: `project_id`, `text`.
   • `restart_chat`  — stop and respawn a chat's agent process. Args: `project_id`.
   • `close_chat`    — drop a chat from the open list (the thread is kept on disk).

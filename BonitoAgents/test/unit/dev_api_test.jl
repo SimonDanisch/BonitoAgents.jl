@@ -286,6 +286,11 @@ end
             @test chat["restart_inflight"] === false
             @test chat["rendering"] === nothing
 
+            BT.dev_request(st, "control", Dict("op" => "send_message", "project_id" => pid,
+                                                "text" => "Coordination while working"))
+            @test only(BT.queue_event(model)["items"])["mode"] == "next"
+            @test only(BT.queue_event(model)["items"])["text"] == "Coordination while working"
+
             r2 = BT.dev_request(st, "control", Dict("op" => "close_chat", "project_id" => pid))
             @test r2["dismissed"] === true
             @test r2["session_closed"] === true

@@ -794,7 +794,7 @@ function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDic
     isempty(strip(text)) && error("`text` is empty — nothing to send")
     model = ensure_project_session!(state, p)
     model === nothing && error("could not bring up a chat session for '$(p.id)'")
-    send_message!(model, UserMsg(text))
+    send_message!(model, UserMsg(text); mode = :next)
     return Dict{String,Any}("ok" => true, "project_id" => p.id, "sent_chars" => length(text))
 end
 
