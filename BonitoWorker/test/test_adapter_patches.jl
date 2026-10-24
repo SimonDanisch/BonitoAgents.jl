@@ -47,9 +47,18 @@ console.log(JSON.stringify({ capabilities: agent.initialize(), outcomes, started
     mktempdir() do root
         @test BW.patch_active_steering!(root) === :absent
         file = joinpath(root, "npm", "node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js")
-        mkpath(dirname(file)); write(file, STEERING_FIXTURE)
+        # Reproduce npm's actual launch path, rather than running the source
+        # through `node -e` (which cannot detect a missing executable bit).
+        source = "#!/usr/bin/env node\n" * STEERING_FIXTURE
+        mkpath(dirname(file)); write(file, source)
+        package = dirname(dirname(file))
+        write(joinpath(package, "package.json"), JSON.json(Dict("type" => "module",
+            "bin" => Dict("codex-acp" => "dist/index.js"))))
+        Sys.iswindows() || chmod(file, 0o751)
         @test BW.patch_active_steering!(root) === :patched
+        Sys.iswindows() || @test filemode(file) & 0o777 == 0o751
         @test BW.patch_active_steering!(root) === :patched
+        Sys.iswindows() || @test filemode(file) & 0o777 == 0o751
         @test count(BW.ACTIVE_STEERING_PATCH_MARK, read(file, String)) == 1
         node = Sys.which("node")
         if node !== nothing
@@ -57,6 +66,23 @@ console.log(JSON.stringify({ capabilities: agent.initialize(), outcomes, started
             @test result["capabilities"]["steering"]["activeOnly"] === true
             @test [x["outcome"] for x in result["outcomes"]] == ["injected", "notInjected", "notInjected"]
             @test result["started"] == 0
+            if Sys.isunix()
+                launcher = joinpath(root, "npm", "node_modules", ".bin", "codex-acp")
+                mkpath(dirname(launcher))
+                symlink(relpath(file, dirname(launcher)), launcher)
+                command() = addenv(Cmd([launcher]), "PATH" => dirname(node) * ":" * get(ENV, "PATH", ""))
+                @test JSON.parse(read(command(), String))["started"] == 0
+                # Already-patched installs still need repair: skipping npm and
+                # skipping the JS patch must not leave their launcher broken.
+                chmod(file, 0o644)
+                @test BW.patch_active_steering!(root) === :patched
+                @test_throws Base.IOError read(command(), String)
+                BW.repair_package_bins!(root, "@agentclientprotocol/codex-acp")
+                @test filemode(file) & 0o777 == 0o755
+                @test JSON.parse(read(command(), String))["started"] == 0
+                BW.repair_package_bins!(root, "@agentclientprotocol/codex-acp")
+                @test filemode(file) & 0o777 == 0o755
+            end
         end
     end
 end
@@ -122,7 +148,9 @@ console.log(JSON.stringify(sent));
         dist = mkpath(joinpath(root, "npm", "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist"))
         @test BW.patch_thinking_tokens!(root) == :absent
         write(joinpath(dist, "acp-agent.js"), fixture)
+        Sys.iswindows() || chmod(joinpath(dist, "acp-agent.js"), 0o640)
         @test BW.patch_thinking_tokens!(root) == :patched
+        Sys.iswindows() || @test filemode(joinpath(dist, "acp-agent.js")) & 0o777 == 0o640
         once = read(joinpath(dist, "acp-agent.js"), String)
         @test BW.patch_thinking_tokens!(root) == :patched
         @test read(joinpath(dist, "acp-agent.js"), String) == once

@@ -49,13 +49,24 @@
           }
         }
         """)
+        metadata_file = joinpath(BW.package_dir(root, codex), "package.json")
+        metadata = JSON.parsefile(metadata_file)
+        metadata["bin"] = Dict("codex-acp" => "dist/index.js")
+        open(io -> JSON.print(io, metadata), metadata_file, "w")
+        chmod(codex_file, 0o751)
 
         # Met already: nothing is downloaded or installed again.
         @test sync(spec)[claude] == "1.0.0"
         @test length(installs(dist)) == 2
         @test count(BW.ACTIVE_STEERING_PATCH_MARK, read(codex_file, String)) == 1
+        @test filemode(codex_file) & 0o777 == 0o751
         once = read(codex_file, String)
+        # Updating a worker which already applied the broken patch must heal
+        # the executable even though both npm and the JS patch skip their work.
+        chmod(codex_file, 0o644)
         sync(spec)
+        @test filemode(codex_file) & 0o777 == 0o755
+        @test length(installs(dist)) == 2
         @test read(codex_file, String) == once
         # "latest" follows the registry.
         publish!(dist, claude, "1.1.0")

@@ -8197,6 +8197,11 @@ function provider_startup_detail(model::ChatModel, provider::BinAgent,
     agent = shared(model).agent::WorkerAgent
     worker = get(model.state.workers[], agent.worker_id, nothing)
     worker_name = worker === nothing ? agent.worker_id : worker.name
+    if occursin("failed to spawn agent", failure) && occursin("permission denied", lowercase(failure))
+        return """$(failure)
+
+Worker "$(worker_name)" is connected, but the operating system refused to execute the agent launcher. Check its file permissions; updated managed adapter sync repairs missing executable permissions. This failure happens before Codex authentication."""
+    end
     return """$(failure)
 
 Codex setup for worker "$(worker_name)" (run as the same user that runs btworker):

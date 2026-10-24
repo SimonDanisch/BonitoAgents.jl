@@ -29,4 +29,11 @@
     @test occursin("npm install -g @agentclientprotocol/codex-acp", detail)
     @test occursin("codex login", detail)
     @test occursin("CODEX_API_KEY or OPENAI_API_KEY", detail)
+    denied = "failed to spawn agent (/managed/.bin/codex-acp): permission denied"
+    detail = BT.provider_startup_detail(model, codex, denied)
+    @test startswith(detail, denied)
+    @test occursin("Worker \"w1\" is connected", detail)
+    @test occursin("file permissions", detail)
+    @test !occursin("npm install", detail)
+    @test !occursin("codex login", detail)
 end

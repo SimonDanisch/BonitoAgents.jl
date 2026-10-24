@@ -81,6 +81,7 @@ function patch_thinking_tokens!(root::AbstractString = harness_root())
     patched === nothing && return :unchanged
     tmp = file * ".partial"
     write(tmp, patched)
+    chmod(tmp, filemode(file) & 0o777)
     mv(tmp, file; force = true)
     return :patched
 end
@@ -114,6 +115,8 @@ function patch_active_steering!(root::AbstractString = harness_root())
     patched === nothing && return :unchanged
     tmp = file * ".partial"
     write(tmp, patched)
+    # index.js is also npm's executable entry point; replacing it must keep +x.
+    chmod(tmp, filemode(file) & 0o777)
     mv(tmp, file; force = true)
     return :patched
 end

@@ -165,6 +165,27 @@ function package_dir(root::AbstractString, pkg::AbstractString)
     return joinpath(root, "npm", "node_modules", split(pkg, '/')...)
 end
 
+# npm marks its declared entry points executable. An older adapter patch
+# replaced them with plain files; repair those installs even when npm skips an
+# already-current version. Modules which are not entry points keep their mode.
+function repair_package_bins!(root::AbstractString, pkg::AbstractString)
+    Sys.iswindows() && return nothing
+    dir = package_dir(root, pkg)
+    metadata = joinpath(dir, "package.json")
+    isfile(metadata) || return nothing
+    bins = get(JSON.parsefile(metadata), "bin", Dict{String,Any}())
+    paths = bins isa AbstractString ? (bins,) : bins isa AbstractDict ? values(bins) : ()
+    for path in paths
+        file = joinpath(dir, path)
+        isfile(file) || continue
+        mode = filemode(file) & 0o777
+        mode & 0o111 == 0 || continue
+        chmod(file, mode | ((mode & 0o444) >> 2))
+        @info "BonitoWorker: restored executable permission on an adapter entry point" package=pkg path=file
+    end
+    return nothing
+end
+
 function installed_version(root::AbstractString, pkg::AbstractString)
     f = joinpath(package_dir(root, pkg), "package.json")
     isfile(f) || return nothing
@@ -211,6 +232,7 @@ function sync_harnesses!(spec::HarnessSpec; root::AbstractString = harness_root(
         patch_active_steering!(root) == :unchanged &&
             @warn "BonitoWorker: this codex-acp cannot accept the active-only steering patch; mid-turn messages wait until completion" version = installed_version(root, "@agentclientprotocol/codex-acp")
     end
+    foreach(pkg -> repair_package_bins!(root, pkg), keys(spec.packages))
     return installed_harnesses(root, keys(spec.packages))
 end
 
