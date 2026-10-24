@@ -85,6 +85,28 @@ txt(r) = r["content"][1]["text"]
         @test occursin("still running", txt(r))
     end
 
+    @testset "incoming messages release current waits, not future waits" begin
+        tasks = [@async(M.wait_handler(Dict{String,Any}("seconds" => 60))),
+                 @async(M.wait_handler(Dict{String,Any}("seconds" => 60,
+                     "until" => "false", "poll" => 30)))]
+        @test timedwait(() -> length(M.SERVER.waits.active) == 2, 5) === :ok
+        M.wake_agent_waits!()
+        @test timedwait(() -> all(istaskdone, tasks), 2) === :ok
+        for task in tasks
+            r = fetch(task)
+            @test r["isError"] === false
+            @test occursin("new message", txt(r))
+            @test occursin("was not stopped", txt(r))
+        end
+        @test isempty(M.SERVER.waits.active)
+        M.wake_agent_waits!() # no stale signal for the next call
+        t0 = time()
+        r = M.wait_handler(Dict{String,Any}("seconds" => 0.2))
+        @test time() - t0 >= 0.2
+        @test !occursin("new message", txt(r))
+        @test isempty(M.SERVER.waits.active)
+    end
+
     @testset "it is registered and visible" begin
         t = only([x for x in M.available_tools() if x.name == "bt_wait"])
         @test "seconds" in t.input_schema["required"]

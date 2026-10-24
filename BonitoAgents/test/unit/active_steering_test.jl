@@ -32,6 +32,7 @@
         @test steer["params"]["activeOnly"] === true
         respond(transport, steer["id"], Dict("outcome" => "injected"))
         wait(delivery)
+        @test timedwait(() -> isempty(m.pending_sends), 5) === :ok
         @test isempty(m.pending_sends)
         @test count(x -> x isa BT.UserMsg && x.text == "injected correction", m.msgs_store) == 1
         @test only(ACP.open_turns(cli)) === original
@@ -45,6 +46,7 @@
         respond(transport, original.id, Dict("stopReason" => "end_turn"))
         respond(transport, steer["id"], Dict("outcome" => "notInjected"))
         wait(delivery)
+        @test timedwait(() -> only(m.pending_sends).status === :waiting, 5) === :ok
         @test ACP.wait_turn!(original)["stopReason"] == "end_turn"
         entry = only(m.pending_sends)
         @test entry.mode === :done && entry.status === :waiting

@@ -979,6 +979,8 @@ and fires no notification:
 `seconds` is required and capped at an hour; hitting the bound is a normal \
 result, so for longer work just call it again. Waiting in ONE long call is \
 cheaper than many short turns, so do not shrink it to poll faster.
+An incoming message delivered to the active turn ends `bt_wait` early. Read \
+that message before continuing; the work you were waiting for keeps running.
 
 For Julia runs, `bt_julia_wait(runs: ["r4", "r5"], seconds: 600)` is the wait: \
 one call for several runs (on any worker), returning each finished run's result.

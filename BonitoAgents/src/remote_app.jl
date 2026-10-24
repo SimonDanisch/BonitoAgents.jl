@@ -561,6 +561,47 @@ mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
         get(state.mcp_ctrl, String(project_id), nothing)
     end
 
+# A confirmed message in the active turn should release voluntary waits,
+# without cancelling the turn or interrupting the work it is waiting for.
+function wake_agent_waits!(model)
+    ws = mcp_ctrl_for(model.state, model.project_id)
+    ws === nothing && return nothing
+    try
+        HTTP.WebSockets.send(ws, JSON.json(Dict("op" => "wake_waits")))
+    catch e
+        (e isa HTTP.WebSockets.WebSocketError || e isa Base.IOError ||
+         e isa EOFError || e isa WorkerLink.LinkDead ||
+         (e isa ErrorException && !isopen(ws))) || rethrow()
+        @warn "Could not wake agent waits after message delivery" project_id=model.project_id exception=(e, catch_backtrace())
+    end
+    return nothing
+end
+
+# The tool card may open before its MCP process connects or enters the wait.
+# Query after registering the waiter to cover input delivered in that gap.
+function dev_op(state::ServerState, ::Val{:wait_input}, args::AbstractDict, caller::String)
+    model = lock(() -> get(state.chat_models, caller, nothing), state.lock)
+    model === nothing && return false
+    s = shared(model)
+    id = String(get(args, "tool_id", ""))
+    return lock(s.lock) do
+        # An older turn's wait cannot consume this turn's initial prompt as
+        # new input if its tool card has not been rendered yet.
+        baseline = maximum((e.span.nstore0 for e in s.pending_sends
+            if e isa PendingSend && e.status === :sent && e.span !== nothing); init = 0)
+        input = false
+        for i in length(s.msgs_store):-1:(baseline + 1)
+            msg = s.msgs_store[i]
+            if msg isa MCPToolMsg && tool_key(msg) == "bt_wait" &&
+                    (isempty(id) || tool_id(msg) == id)
+                return input
+            end
+            msg isa UserMsg && (input = true)
+        end
+        return false
+    end
+end
+
 function handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
     if get(d, "type", "") == "run_update"
         # A run started, ended or was collected (eval_runs.jl). Unsolicited,

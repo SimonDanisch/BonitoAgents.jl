@@ -22,6 +22,7 @@ mutable struct MCPServer
     remote_inflight::Set{Tuple{String,String}}
     inflight_lock::ReentrantLock                # guards `inflight` and `remote_inflight`
     out_lock::ReentrantLock                     # serialises one-line-per-frame stdout writes
+    waits::AgentWaits                           # voluntary waits released by incoming messages
 end
 
 const SERVER = MCPServer(
@@ -32,6 +33,7 @@ const SERVER = MCPServer(
     Set{Tuple{String,String}}(),
     ReentrantLock(),
     ReentrantLock(),
+    AgentWaits(),
 )
 
 # The eval-session manager. An accessor, not a bare field read: it's the one part

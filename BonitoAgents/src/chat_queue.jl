@@ -148,6 +148,13 @@ function enqueue_message!(model, msg; images, mode)
     @info "message queued" project_id=s.project_id message_id=entry.id mode status=entry.status riders=length(entry.riders)
     emit_queue!(s)
     entry.status === :held || wake_outbox!(s)
+    # Native steering is safe during a quiet tool call too. Waiting for the
+    # next output/tool boundary can otherwise strand input behind bt_wait.
+    c = client(s.agent)
+    if entry.status === :waiting && mode === :next && c !== nothing &&
+            get(c.session_result, "bonitoActiveSteering", false)
+        Base.errormonitor(@async deliver_boundary_message!(s))
+    end
     return nothing
 end
 
@@ -354,6 +361,7 @@ function deliver_boundary_message!(model)
         lock(s.lock) do
             submission_sent!(s, entry, span)
         end
+        native && wake_agent_waits!(s)
     catch err
         lock(s.lock) do
             # A rejected steer was not delivered. Preserve a concurrent Stop

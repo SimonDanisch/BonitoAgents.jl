@@ -36,6 +36,20 @@
 
 using HTTP.WebSockets: WebSockets
 
+mutable struct AgentWaits
+    lock::ReentrantLock
+    active::Set{Channel{Nothing}}
+end
+AgentWaits() = AgentWaits(ReentrantLock(), Set{Channel{Nothing}}())
+
+function wake_agent_waits!()
+    lock(SERVER.waits.lock) do
+        foreach(close, SERVER.waits.active)
+        empty!(SERVER.waits.active)
+    end
+    return nothing
+end
+
 # The worker relay's address and the two tokens it handed this process: `token`
 # opens the control channel, `eval_token` the eval workers' live-render bridges
 # and value exchanges. `values_addr` is the relay's TCP address for the latter
@@ -283,6 +297,8 @@ function handle_ctrl_frame!(ws, msg::AbstractDict)
         put!(ch, get(msg, "ok", false) ? get(msg, "result", nothing) :
                  ErrorException(String(get(msg, "error", "unknown server error"))))
         return nothing
+    elseif op == "wake_waits"
+        wake_agent_waits!()
     elseif op == "interrupt_eval"
         # The user's ⊗ on one card: that RUN when the chat knows it, else the
         # env's eval (a card from before runs). A user's stop reaches background

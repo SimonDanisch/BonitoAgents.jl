@@ -59,6 +59,39 @@
             TK.send_message(s, "Reply with exactly CODEX_FOLLOW_UP_OK. Do not use any tools.")
             @test TK.wait_for(s, "the real session answers after Stop",
                 "$(says("CODEX_FOLLOW_UP_OK")) && $idle"; timeout = 120)
+
+            # A quiet MCP call has no stream/tool completion boundary at which
+            # to deliver. Both input sources must wake it before its minute ends.
+            TK.send_message(s, "Call the bt_wait MCP tool with seconds=60 and reason=CODEX_WAIT_USER. " *
+                "After it returns reply exactly CODEX_WAIT_USER_ORIGINAL. Do not use other tools.")
+            @test TK.wait_for(s, "real Codex enters bt_wait for user input",
+                "[...$pane.querySelectorAll('.bt-tool-msg')].some(e => e.textContent.includes('bt_wait')) && !($idle)"; timeout = 120)
+            TK.eval_js(s, "$pane.querySelector('.bt-send-mode-trigger').click(); " *
+                "$pane.querySelector(\"[data-send-mode='next']\").click()")
+            TK.send_message(s, "End the wait and reply exactly CODEX_WAIT_USER_OK instead. Do not call further tools.")
+            @test TK.wait_for(s, "real Codex acts on user input before the wait expires",
+                "$(says("CODEX_WAIT_USER_OK")) && $idle"; timeout = 20)
+            @test TK.eval_js(s, "!($(says("CODEX_WAIT_USER_ORIGINAL")))")
+
+            TK.send_message(s, "Call the bt_wait MCP tool with seconds=60 and reason=CODEX_WAIT_PEER. " *
+                "After it returns reply exactly CODEX_WAIT_PEER_ORIGINAL. Do not use other tools.")
+            @test TK.wait_for(s, "real Codex enters bt_wait for peer input",
+                "[...$pane.querySelectorAll('.bt-tool-msg')].filter(e => e.textContent.includes('bt_wait')).length === 2 && !($idle)"; timeout = 120)
+            TK.eval_js(s, "$pane.querySelector('.bt-yolo-bar').click()")
+            @test TK.wait_for(s, "real receiver has YOLO enabled",
+                "$pane.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')"; timeout = 10)
+            correction = "End the wait and reply exactly CODEX_WAIT_PEER_OK instead. Do not call further tools."
+            TK.open_chat(s, sender)
+            TK.send_message(s, "wake the waiting peer")
+            @test TK.wait_for(s, "second peer correction sent",
+                "[...$pane.querySelectorAll('.bt-agent-msg')].filter(e => e.textContent.includes('Coordination sent')).length === 2"; timeout = 90)
+            TK.open_chat(s, target[])
+            @test TK.wait_for(s, "real Codex in YOLO acts on peer input before the wait expires",
+                says("CODEX_WAIT_PEER_OK"); timeout = 20)
+            @test TK.eval_js(s, "!($(says("CODEX_WAIT_PEER_ORIGINAL")))")
+            @test TK.eval_js(s, "$pane.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')")
+            TK.eval_js(s, "$pane.querySelector('.bt-stop-btn').click()")
+            @test TK.wait_for(s, "Stop after waking the YOLO wait", idle; timeout = 30)
             @test isempty(TK.js_errors(s))
         finally
             close(s)

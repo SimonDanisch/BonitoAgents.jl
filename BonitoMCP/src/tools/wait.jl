@@ -53,7 +53,8 @@ end
 const WAIT_DESCRIPTION = """
 Pause the current turn for a bounded time. This is the ONLY way to wait: it
 blocks until it returns, so no further tool calls and no new turn happen in the
-meantime.
+meantime. In BonitoAgents, a message delivered to the active turn ends this wait
+early so you can respond. The work being waited for keeps running.
 
 Use it when you have started long work (a render, a build, a game export) and
 need to be idle until it is done. Do NOT start a background `sleep` to poll
@@ -75,6 +76,33 @@ you get back IS the completion.
 """
 
 function wait_handler(args::AbstractDict)
+    wake = Channel{Nothing}(0)
+    lock(SERVER.waits.lock) do
+        push!(SERVER.waits.active, wake)
+    end
+    try
+        if relay_grant() !== nothing && call_server("wait_input";
+                tool_id = String(get(args, "_tool_use_id", ""))) === true
+            isopen(wake) && close(wake)
+        end
+        return wait_handler(args, wake)
+    finally
+        lock(SERVER.waits.lock) do
+            delete!(SERVER.waits.active, wake)
+        end
+        isopen(wake) && close(wake)
+    end
+end
+
+# Only currently registered waits are signalled. A message received before a
+# later wait must not make that later wait return immediately.
+function wait_sleep(wake, seconds)
+    seconds <= 0 && return nothing
+    timedwait(() -> !isopen(wake), seconds; pollint = 0.02)
+    return nothing
+end
+
+function wait_handler(args::AbstractDict, wake)
     secs = get(args, "seconds", nothing)
     secs === nothing && return wait_result(
         "error: `seconds` is required — an unbounded wait is a latch, not a wait.";
@@ -94,8 +122,11 @@ function wait_handler(args::AbstractDict)
     tail   = isempty(reason) ? "" : " ($reason)"
 
     t0 = time()
+    interrupted() = wait_result("wait ended after $(round(time() - t0; digits = 1))s$tail: " *
+        "a new message was delivered to this turn. Read it before continuing; the work being waited for was not stopped.")
     if cond === nothing
-        sleep(secs)
+        wait_sleep(wake, secs)
+        isopen(wake) || return interrupted()
         return wait_result("waited $(round(time() - t0; digits = 1))s$tail")
     end
 
@@ -108,7 +139,8 @@ function wait_handler(args::AbstractDict)
         end
         deadline = t0 + secs
         while time() < deadline
-            sleep(min(poll, deadline - time()))
+            wait_sleep(wake, min(poll, deadline - time()))
+            isopen(wake) || return interrupted()
             if wait_condition_met(cmd)
                 return wait_result("condition met after " *
                                    "$(round(time() - t0; digits = 1))s$tail: `$cmd`")
