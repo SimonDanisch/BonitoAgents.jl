@@ -38,8 +38,9 @@ end
 
 n_models(state) = length(state.chat_models)
 # `--` stops pgrep option parsing so the `-m …` pattern isn't read as a flag.
-mock_count() = try parse(Int, strip(read(`pgrep -fc -- "-m MockACP"`, String))) catch; 0 end
-rss_mb() = try parse(Int, split(read("/proc/self/statm", String))[2]) * 4096 / 1e6 catch; -1.0 end
+# pgrep exits 1 when nothing matches, still printing the count.
+mock_count() = parse(Int, strip(read(ignorestatus(`pgrep -fc -- "-m MockACP"`), String)))
+rss_mb() = isfile("/proc/self/statm") ? parse(Int, split(read("/proc/self/statm", String))[2]) * 4096 / 1e6 : -1.0
 
 close_from_homebar(server, pid) = TK.eval_js(server, """(() => {
     const e = [...document.querySelectorAll('.bt-side-item')]

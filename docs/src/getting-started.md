@@ -35,13 +35,9 @@ restarts and updates under the platform data directory
 Support/BonitoAgents` on macOS, `%LOCALAPPDATA%\BonitoAgents` on Windows) and
 are never touched by install/update/uninstall.
 
-For Claude Code agents you also need Node 20+, the two npm packages
-
-```bash
-npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
-```
-
-and a logged-in `claude` CLI (run `claude` once and authenticate).
+Node and the agent adapters (Claude Code's and Codex's) are installed for you,
+in a private Node install, and kept up to date. What stays yours is logging in
+to the agents: for Claude Code, install it and run `claude` once to log in.
 
 ## From source
 
@@ -58,32 +54,92 @@ julia --project=BonitoAgentsApp -m BonitoAgentsApp
 
 ## One server, many machines
 
-Run the server somewhere always reachable, like a home server or a VPS. After
-the installer above, this is the `server` mode of the same command:
+Run the server somewhere always reachable, like a home server or a VPS, with a
+domain name. The setup script
+[`BonitoAgents/assets/install_server.sh`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/BonitoAgents/assets/install_server.sh)
+installs it on Linux:
 
 ```bash
-bonito-agents server --host=0.0.0.0 --port=8038
+bash BonitoAgents/assets/install_server.sh
 ```
 
-(from a source checkout, use
-`julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038`.)
-For a permanent install there is a systemd setup script,
-[`BonitoAgents/assets/install_server.sh`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/BonitoAgents/assets/install_server.sh),
-which installs the server as a service, generates the worker secret, and
-prints the worker one-liner.
+It asks how people reach the server, its domain and the admin account, and
+saves the answers before anything can go wrong: a second run offers them again
+(`--reconfigure` asks anew). The server only listens on localhost; people sign in
+through Authelia, which runs next to it as a systemd service. At the end the
+script prints a setup link for the admin account: opening it makes your passkey
+(Proton Pass, your phone or computer, a security key), which signs you in from
+then on. A password and an authenticator code are on the same page, folded away,
+for when a passkey is not an option. Lost access? `install_server.sh
+--setup-link` makes a new link.
 
-Then, on each machine that should run agents, paste the one-liner from the
-dashboard's home screen:
+Re-running the script updates the install. It stops and starts every service,
+Authelia included, and Authelia keeps logins in memory, so everyone has to log
+in again afterwards. To restart only the dashboard, use
+`sudo systemctl restart bonitoagents-server`.
+
+**Behind a tunnel** (the default): something in front of the machine brings
+HTTPS, e.g. a Cloudflare Tunnel with the public hostname `team.example.com`
+pointing at `http://localhost:8038`. Nothing else is needed from the tunnel: the
+server asks Authelia about every request itself, serves the login page under the
+same name (`https://team.example.com/authelia`), and marks its responses private
+so the tunnel's cache keeps nothing. No certificates, DNS records or open ports
+on the machine.
+
+**Directly** (`--tls acme`): the script sets up Caddy in front for HTTPS (a
+Let's Encrypt certificate), with the login on `auth.team.example.com`. Before it
+asks for a certificate it checks that both names resolve to the machine and that
+port 80 reaches it, and stops with a message saying what is missing.
+
+To try a direct install out first, `--acme-staging` takes certificates from Let's
+Encrypt's staging CA (no rate limits; browsers warn about them), and
+`BonitoAgents/test/deploy/smoke.sh https://team.example.com --staging` checks
+the result from any machine: the certificate, the login redirect, the public
+installer, and that `/w` refuses workers without a credential. On a LAN without
+a public domain, `--tls internal` uses Caddy's own certificate authority
+instead; every browser and worker machine then has to trust its root
+certificate, whose path the installer prints.
+
+Admins manage people on the Settings page (the gear in the sidebar, or the
+Settings button on the dashboard): an invite link lets one person create their
+own account and its passkey in one step (behind a tunnel; behind Caddy the page
+shows a password and authenticator instead), and the Accounts section adds
+accounts directly, puts them in groups and disables them from each row's ⋯
+menu. Members see only their
+own chats and workers, plus the workers an owner shared with one of their
+groups. Everyone lists, adds and removes passkeys on their account card, and gets
+a new password or authenticator there; admins can do the latter from the
+Accounts table. No mail is involved anywhere.
+
+A login ends after a week without use and after four weeks at most; an open
+tab counts as use. When a login ends, every tab of that browser says so with a
+"Your login has ended" card and waits instead of sending you to the login page.
+Log in again in any one tab and the others carry on by themselves, a chat
+opened in the meantime included. Each login replaces the browser's session and
+would throw its other tabs out mid-request, so no tab asks for a login the
+browser already has. Behind a tunnel that includes a login page left open from
+a logged-out moment: it moves on to the dashboard as soon as another tab is
+logged in.
+
+Then, for each machine that should run agents, click **Add worker** on the
+dashboard and run the command it shows on that machine. The machine needs
+`julia` on its PATH; the installer stops with a message if it is missing.
 
 ```bash
-curl -fsSL http://<your-server>:8038/install.sh | sh
+# Linux / macOS
+curl -fsSL https://team.example.com/install.sh | sh -s w-...
+
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://team.example.com/install.ps1))) w-...
 ```
 
-It installs the worker packages into a shared `@bonito-agents` Julia
+Each worker has its own credential; revoking it on the dashboard disconnects
+that machine. The installer puts the worker packages into a shared `@bonito-agents` Julia
 environment, registers the machine under a stable identity, and (on Linux)
 sets up a systemd user service so the worker survives reboots. The machine
-appears in the dashboard seconds later. Re-run the same one-liner to update;
-it always installs the code revision the server is running.
+appears in the dashboard seconds later. To update, re-run the command without
+the credential: the machine keeps the one it has, and the installer always
+installs the code revision the server is running.
 
 ## Your first project
 
@@ -97,7 +153,7 @@ From the dashboard home:
 - **From GitHub**: clone a repository straight onto a worker.
 
 Discover, folder picking and cloning live on each worker's own card, so the
-machine is chosen before the folder is. **Copy project** (Settings card) is the
+machine is chosen before the folder is. **Copy project** (on the Settings page) is the
 one that crosses machines: it snapshots a project's files onto another worker as
 a new project. To carry an existing chat elsewhere instead, with its files *and*
 the agent's memory, use that chat's ⋯ menu → *Continue on*.

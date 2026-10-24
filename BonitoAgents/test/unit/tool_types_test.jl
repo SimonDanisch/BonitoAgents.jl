@@ -68,8 +68,10 @@ end
 end
 
 @testset "content_summary dispatches on the message type" begin
-    @test BT.content_summary(BT.EditToolMsg,   [dif("src/a.jl", "x\ny", "x\ny\nz")]) == "a.jl · +1 line"
-    @test BT.content_summary(BT.EditToolMsg,   [dif("a", "1", "1\n2"), dif("b", "1", "")]) == "2 files · +1 line"
+    @test BT.content_summary(BT.EditToolMsg,   [dif("src/a.jl", "x\ny", "x\ny\nz")]) == "a.jl · +1 −0"
+    @test BT.content_summary(BT.EditToolMsg,   [dif("a", "1", "1\n2"), dif("b", "1", "")]) == "2 files · +1 −1"
+    # A rewrite of every line is all of it removed and added, not a net 0.
+    @test BT.content_summary(BT.EditToolMsg,   [dif("c.jl", "a\nb", "x\ny")]) == "c.jl · +2 −2"
     @test BT.content_summary(BT.SearchToolMsg, [txt("src/a.jl:1:hit\nsrc/b.jl:2:hit")]) == "2 matches"
     @test BT.content_summary(BT.MoveToolMsg,   [txt("renamed src/old.jl -> src/new.jl")]) == "old.jl → new.jl"
     @test BT.content_summary(BT.FetchToolMsg,  [txt("Fetched https://example.com/docs ok")]) == "example.com"
@@ -133,6 +135,16 @@ end
     # Every other tool still shows the placeholder when it has no content.
     @test BT.renders_from_input(gt("read", "Read", "read a.jl")) === false
     @test BT.renders_from_input(mcp("bt_julia_eval")) === false
+end
+
+@testset "an eval first seen finished opens like a running one" begin
+    # A quick call can be "completed" by the time the chat first sees it (CI,
+    # e2e:codex_wire): it opens. One shown running opened then and stays as left.
+    ev = mcp("bt_julia_eval"; raw = Dict{String,Any}("code" => "1+1"))
+    @test BT.opens_as_finished_run(ev, false)
+    @test !BT.opens_as_finished_run(ev, true)
+    @test !BT.opens_as_finished_run(mcp("bt_julia_eval"), false)   # no code yet
+    @test !BT.opens_as_finished_run(gt("read", "Read", "x"), false)
 end
 
 @testset "the real interrupt is JuliaEvalCall-only; others no-op" begin

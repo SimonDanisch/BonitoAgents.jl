@@ -1,0 +1,3 @@
+{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"active","activeFlags":[]}}}}
+{"sessionUpdate":"tool_call","toolCallId":"01a16316-4e76-7e41-bf23-4ab1c123f099","kind":"think","title":"Compact conversation","status":"in_progress","_meta":{"jetbrains":{"air":{"version":1,"contextCompaction":{"version":1}}}}}
+{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"systemError"}}}}

@@ -27,8 +27,8 @@
 # depends on no timing, no chat length beyond "taller than the viewport", and no
 # BonitoWidgets internals staying put. Refactor the scroll code and drop the
 # recovery, and this goes red immediately.
-@testitem "e2e:panel_move_scroll" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:panel_move_scroll" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
     using Test
@@ -38,7 +38,7 @@
     agent_script(p) = [TK.text("reply to $(p)\n\n" *
         join(["paragraph $i " * repeat("filler ", 30) for i in 1:6], "\n\n")), TK.end_turn()]
 
-    const C = "document.querySelector('.bt-chatpane[style*=\"flex\"] .bt-messages')"
+    const C = "document.querySelector('.bt-chatpane[aria-hidden=false] .bt-messages')"
 
     metrics_js = """(() => {
         const c = $(C); if (!c) return null;

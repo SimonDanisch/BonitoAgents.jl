@@ -5,8 +5,8 @@
     # Run against the ONE per-worker shared dev_server (like the rest of the e2e
     # suite) instead of a throwaway server — so opening a chat per run soaks the
     # server's cleanup/leak paths. The included file uses SharedServer.server()
-    # + swaps agent_fn[]; it shares this TestKit so the dispatcher/SERVER_CONTEXT
-    # is the live one.
+    # + swaps agent_fn[]; it shares this TestKit so the dispatcher and the
+    # in-process MCP are the live ones.
     const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit

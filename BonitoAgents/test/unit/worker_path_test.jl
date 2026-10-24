@@ -11,6 +11,7 @@
 # Forward slashes work everywhere on Windows and survive JS, JSON and HTML
 # untouched, so paths are normalized once on the way in.
 @testitem "unit:worker_path" tags = [:unit] begin
+    import BonitoAgents
     N = BonitoAgents.normalize_worker_path
     W = BonitoAgents.windows_path
     M = BonitoAgents.mangled_windows_path
@@ -53,8 +54,7 @@
     @testset "project creation refuses a mangled worker path" begin
         dir = mktempdir()
         state = BonitoAgents.ServerState(; state_dir = joinpath(dir, "state"),
-                                           working_dir = joinpath(dir, "work"),
-                                           worker_secret = "test-secret")
+                                           working_dir = joinpath(dir, "work"))
         # Fails on the PATH, not on "unknown worker" — the guard runs first, so
         # the operator gets an actionable message instead of a broken project.
         err = try

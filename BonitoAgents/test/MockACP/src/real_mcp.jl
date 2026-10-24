@@ -27,7 +27,7 @@ function real_mcp_request(method, params)
     end
 end
 
-function real_mcp_call(tool, args)
+function real_mcp_call(tool, args; meta = nothing)
     if MCP_PROCESS[] === nothing
         cfg = MCP_CONFIG[]
         cfg === nothing && error("ACP did not supply btworker MCP configuration")
@@ -42,19 +42,26 @@ function real_mcp_call(tool, args)
         println(MCP_PROCESS[], JSON.json(Dict("jsonrpc" => "2.0", "method" => "notifications/initialized")))
         flush(MCP_PROCESS[])
     end
-    return real_mcp_request("tools/call", Dict("name" => tool, "arguments" => args))
+    params = Dict{String,Any}("name" => tool, "arguments" => args)
+    meta === nothing || (params["_meta"] = meta)
+    return real_mcp_request("tools/call", params)
 end
 
 function emit_real_mcp_call(ev)
     tool = String(ev["tool"])
     tid = String(get(ev, "id", "real-mcp"))
-    args = Dict(k => v for (k, v) in ev if k ∉ ("type", "tool", "id"))
+    # Claude Code names the tool call on every `tools/call` (its tool_use id, the
+    # same id claude-agent-acp gives the ACP tool call); `anonymous = true` plays
+    # an agent that sends nothing of the kind.
+    anonymous = get(ev, "anonymous", false) === true
+    args = Dict(k => v for (k, v) in ev if k ∉ ("type", "tool", "id", "anonymous"))
     meta = Dict("claudeCode" => Dict("toolName" => "mcp__btworker__" * tool))
     upd("tool_call", Dict("toolCallId" => tid, "kind" => "other",
         "title" => "mcp__btworker__" * tool, "status" => "pending",
         "rawInput" => args, "content" => Any[], "_meta" => meta))
     result = try
-        real_mcp_call(tool, args)
+        real_mcp_call(tool, args; meta = anonymous ? nothing :
+                                        Dict("claudecode/toolUseId" => tid))
     catch e
         Dict("isError" => true, "content" => [Dict("type" => "text",
             "text" => "MCP launch/call failed: " * sprint(showerror, e))])

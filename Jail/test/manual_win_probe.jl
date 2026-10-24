@@ -29,10 +29,8 @@ println("inside-whitelist write landed on host?  ", inside_ok, inside_ok ? "  (P
 
 # Write OUTSIDE the whitelist — Sandboxie should redirect it into the box, so
 # the host path stays absent.
-try
-    run(jail(Cmd(["cmd", "/c", "copy \"$src\" \"$evil\""]); whitelist = [work]))
-catch
-end
+copied = success(jail(Cmd(["cmd", "/c", "copy \"$src\" \"$evil\""]); whitelist = [work]))
+println("copy outside the whitelist reported success? ", copied)
 outside_blocked = !isfile(evil)
 println("outside-whitelist write blocked on host? ", outside_blocked, outside_blocked ? "  (PASS)" : "  (FAIL)")
 

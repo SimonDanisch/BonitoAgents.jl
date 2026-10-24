@@ -1,7 +1,7 @@
 # file_open (open-in-editor + worker file fetch) is worker/filesystem-stateful
 # like file_tree, so it runs on its own clean dev_server, not the shared soak one.
-@testitem "e2e:file_open" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:file_open" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     include(joinpath(@__DIR__, "file_open.jl"))
     server = TestKit.dev_server(agent = agent_script)
     try

@@ -10,13 +10,12 @@
     using Dates
     const BT = BonitoAgents
 
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                          worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     # An "online" worker with no control socket: the bring-up registers the
     # chat model for real and its session start fails fast (swallowed by
     # `restart_chat_session!`, which keeps the chat object), so the loading
     # view's completion path runs without any worker.
-    st.workers[]["wid-a"] = BT.WorkerInfo("wid-a", "Desktop", "ws://x", "x", nothing,
+    st.workers[]["wid-a"] = BT.WorkerInfo("wid-a", "Desktop", nothing,
                                           "Desktop-host", "/home/u", "julia", String[],
                                           "/home/u/projects/Desktop", :online, now())
     st.projects[]["p1"] = BT.ProjectInfo("p1", "proj", "wid-a",
@@ -28,7 +27,9 @@
     ls = BT.LoadingState()
     seen = String[]
     on(v -> push!(seen, v), current_view)
-    BT.unified_main(session, st, current_view, ls)
+    # Rendered, as a page does: the loading card (`ChatLoadingView`) starts the
+    # bring-up when the overlay renders it.
+    Bonito.jsrender(session, BT.unified_main(session, st, current_view, ls))
 
     current_view[] = "p1"    # the loading overlay spawns the bring-up
     current_view[] = ""      # …and the user goes Home while it runs

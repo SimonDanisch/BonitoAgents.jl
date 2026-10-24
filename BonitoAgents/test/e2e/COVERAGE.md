@@ -42,9 +42,9 @@ one landed, plus the few that can't be reproduced in a headless window.
   process that meant the SECOND chat to eval in a given env inherited the first
   chat's dial: no bridge was ever registered for it, so its live embeds rendered
   from their snapshot but had no browser↔worker route — they looked right and
-  were dead. `new_chat` now re-points the dial-back when the project id changes
-  (the worker stays warm), which is what production gets for free by giving each
-  chat its own MCP process. Symptom if this regresses: an eval-embed suite
+  were dead. TestKit's `with_mcp_env` now re-arms the in-process MCP whenever a
+  call carries another chat's relay grant (the worker stays warm), which is what
+  production gets for free by giving each chat its own MCP process. Symptom if this regresses: an eval-embed suite
   passes ALONE and fails when another eval suite ran first, its liveness
   assertions timing out while the embed's DOM is present. Reproducer:
   `test_args=["e2e:app_reload", "e2e:app_scroll"]`.
@@ -57,10 +57,10 @@ one landed, plus the few that can't be reproduced in a headless window.
   soft-scope transform failed to resolve and fell back to `identity`; a
   top-level `for` assigning a global then died with "UndefVarError: acc not
   defined in local scope", which reads as a bug in the test's own code.
-  Fixed at the source in `BonitoMCP.worker_env()` (a spawned worker gets Julia's
-  DEFAULT load path when one was inherited) plus `Base.require` for REPL, and
-  `TestKit.__init__` clears the variable so the whole spawned tree is clean.
-  `unit:eval_worker_env` pins all of it headlessly. Symptom if this regresses:
+  Nothing in production sets the variable, so the fix is on the test side:
+  `TestKit.__init__` (and BonitoMCP's and BonitoWorker's runtests) delete it, so
+  the whole spawned tree is clean; plus `Base.require` for REPL in the helper.
+  `unit:eval_worker_env` pins the worker side headlessly. Symptom if this regresses:
   an eval case fails on `using <any stdlib>`, or a REPL-semantics case fails,
   under `Pkg.test` while the same env works from a shell.
 - **Eval projects are COMMITTED, never built at runtime** (`test/evalenv`,
@@ -249,13 +249,16 @@ it, so it covers the working path; the inactive-close fix is still open.
 | `app_tabs.jl`         | THREE apps docked into ONE window as TABS (via the float's ⤢ dock button): switch between tabs (active app visible, others hidden), each stays LIVE as a tab (Julia round-trip), then close the tabs (active-tab close → embed back to its bubble). KNOWN BUG (see below): closing an INACTIVE app tab loses the embed — the suite always activates a tab before closing it (the working + natural path) |
 | `scroll_persist.jl`   | new content follows to bottom (followMode), overflow, history survives a browser reconnect |
 | `file_tree.jl`        | per-chat sidebar file tree: ▸ toggle reveals + lazy-loads the worker project root (dirs first), expanding a dir lazy-loads children, the search box fuzzy-filters the project file index (`.git/` excluded), clicking a file opens a Monaco panel, clicking a BINARY file opens a hex view; the open-guard toasts (and opens NO panel) only for what no viewer can show (oversize / folder / missing / unreachable worker) |
-| `file_view.jl`        | the rich file viewer: png (image stage + reported pixel size, no editor), md (rendered by default, Source toggle holding the real text, Save writes the WORKER file and the preview follows), csv (sortable table of the right shape), obj (server-side parse → BTMESH1 blob → WebGL viewer reporting the decoded triangle/vertex counts, in singular for one triangle), .bin (hex dump, never Monaco), mp4 (video stage, centred, a 1600px-tall clip FITTED so its controls stay on screen) and a tall png held to the same rule, pdf (the frame is pointed at its file from inside the document — see Headless limitations); every panel header names the WORKER path, and renders it in reading order rather than letting `direction: rtl` move the leading `/` to the end; and the editor re-lays-out when its panel changes width (Monaco's own `automaticLayout` is off — it calls `layout()` from inside its ResizeObserver's delivery cycle, which is what made this suite's no-JS-errors gate fail on "ResizeObserver loop completed with undelivered notifications"; the replacement defers to the next frame, and the test pins that it still follows the panel in BOTH directions) |
+| `file_view.jl`        | the rich file viewer: png (image stage + reported pixel size, no editor), md (rendered by default, Source toggle holding the real text, Save writes the WORKER file and the preview follows), csv (sortable table of the right shape), 3D through three.js's own loaders reading the worker's files via a signed folder URL: obj (the triangle/vertex counts, in singular for one triangle, and coming back after a forced WebGL context loss), glTF as .glb and as .gltf with sibling .bin/.png and an OBJ whose .mtl names a texture in ../textures (the texture's red on screen each time), a PLY point cloud, OFF, and the wireframe overlay drawn over the textured surface, .bin (hex dump, never Monaco), mp4 (video stage, centred, a 1600px-tall clip FITTED so its controls stay on screen) and a tall png held to the same rule, pdf (the frame is pointed at its file from inside the document — see Headless limitations); every panel header names the WORKER path, and renders it in reading order rather than letting `direction: rtl` move the leading `/` to the end; and the editor re-lays-out when its panel changes width (Monaco's own `automaticLayout` is off — it calls `layout()` from inside its ResizeObserver's delivery cycle, which is what made this suite's no-JS-errors gate fail on "ResizeObserver loop completed with undelivered notifications"; the replacement defers to the next frame, and the test pins that it still follows the panel in BOTH directions) |
 | `review.jl`           | change-review tab: the Review button opens the project's git diff incl. UNTRACKED files (marked added) with both sides' line numbers; Ask sends the question to the chat immediately with its code context; Feedback batches into the tray (counted on the Send button), sends ONE numbered instruction and only then clears; shift-click covers a BLOCK and the range + every line in it reach the agent; chips drop; ⟳ re-reads the tree; ⤢ opens the file itself |
 | `review_scope.jl`     | the review diff is SCOPED to the project's folder: a package inside a bigger checkout lists its own change and its own untracked file, NOT a sibling's; rows drop the shared prefix while `data-file` stays relative to the PROJECT (the agent's cwd — a root-relative path would send it to `pkg/pkg/…`); the header names the folder, not the repository above it. Its own dev_server AND its own single chat: two review panels in one window cannot be told apart by `querySelector` (answers about the first) nor by "which is visible" (an inactive panel still has an `offsetParent`) |
 | `debug_chat.jl`       | "Debug BonitoAgents": the dashboard's worker picker lists the connected worker and its button opens the chat AND navigates to it, rooted at the checkout that WORKER provides (the suite's worker runs from the monorepo, so the server's own checkout, and nothing is cloned); the same item in a chat header's ⋯ menu goes to the same place; pressing it again reuses the one chat; the menu's Dev mode item reflects the persisted flag (and the ⋯ trigger turns red while it is on), stays off when the confirm is declined, and restarts the session when accepted |
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |
 | `remote_eval_test.jl` | `bt_julia_eval(worker = …)`: refused while the chat's "remote julia" switch is off (the card still wears the ⇢ worker badge and the result says where the switch is); the header pill turns it on and the same call runs on worker B through an eval host the server spawns there (the result reports B's own worker id); `bt_julia_list_sessions` names B and its live host; `bt_sync_folder` copies a folder A → B; switching it off shuts the host down and the refusal is back |
+| `remote_values_test.jl` | `remote_session("worker-b")` in the chat's own session: refused while the switch is off (the error says where it is); on, a 24 MB value goes A → B (over the 16 MiB message limit) and a remote eval reads it; a value made on B comes back, an anonymous function runs on B, an error there comes back as a `RemoteSessionError`; switched off, the next request is refused |
+| `shares_test.jl` | Behind a tunnel: `bt_share` of a markdown file and a password-protected app file; a browser that is not logged in opens the page (its image from the worker, `![](clip.mp4)` as a video, a `<script>` that does not run), cannot reach the unreferenced file next to it nor the dashboard; the app asks for its password, then renders live from the worker's share host and reacts to a click; unknown sessions/assets still meet the login; ending a link in Settings makes it "Link not found" |
+| `worker_crash_test.jl` | A worker SIGKILLed mid-turn and started again: the busy chat gets the one automatic "carry on" message and the agent's answer, an idle chat gets nothing; a worker stopped on purpose (SIGTERM path, pidfile removed) mid-turn continues nothing; a stop clicked while the worker is down means no continuation; a dropped connection resumes the turn and adds nothing; a crash during the continuation is not continued again |
 | `todo_taskbar.jl`     | live todo as a pinned panel, plan update mutates it in place (done/active), turn end finalizes to one bubble + drops the pin |
 | `bt_wait.jl`          | `bt_wait` through the real chat: the turn is WALL-CLOCK blocked for the requested seconds (the whole contract — a unit test on the handler cannot see it), the real handler ran (its `reason` is echoed in the card), and the task bar did NOT grow (no pill, no notification — the difference from a background sleeper) |
 | `todo_worker_death.jl` | a plan the agent NEVER finishes, then SIGKILL of the chat's own worker: the pin drops and the list lands in history with the statuses it had (`▶○`, not a forged `✓`). Own dev_server — it kills the main worker. The gap that let todo pills count for 35 h: `todo_taskbar` covers the turn-end path, which always worked; nothing covered the machine going away |
@@ -298,8 +301,9 @@ unit test stays — it is headless, not a UI test).
   header's ⋯ → *Continue on* item and also pinning that the agent's transcript
   travels (the mock keeps a Claude-shaped transcript and, under `strict_load`,
   refuses `session/load` unless it sits under the new cwd). The cross-worker
-  *sync* UI (`⇄`, the compare modal, `sync_across_workers!`) was removed with it:
-  there is one operation for a chat on another machine, the move.
+  *sync* UI (`⇄`, the compare modal, `sync_across_workers!`) was removed with it.
+  Since 2026-09-30 *Continue on* opens a NEW chat on the other worker and leaves
+  the original alone; the test pins both halves.
 - `test_remotesync.jl` → headless `../unit/remotesync_test.jl`.
 - `test_chat_stress.jl` → the real-`serve()` render path is exercised by every
   dev_server suite (`smoke_test.jl`, `chat_features.jl`, `workflows.jl`).

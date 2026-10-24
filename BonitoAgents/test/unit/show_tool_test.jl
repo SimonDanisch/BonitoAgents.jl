@@ -19,29 +19,29 @@ using BonitoMCP
 using Bonito
 const BT = BonitoAgents
 
-# Classify what `render_show_file` produced without needing a live session.
-# Ordered most-specific first: a notebook contains a rendered markdown cell, so
-# the notebook wrapper has to be recognised before the markdown class.
+# Classify what `render_show_file` produced without needing a live session, by
+# the class of its root: printed without a session, a viewer's style sheet
+# (`FileViewStyles`) comes out as text naming every viewer's classes.
+root_class(node) = node isa Bonito.Hyperscript.Node ? get(Bonito.Hyperscript.attrs(node), "class", "") : ""
+
 function show_kind(node)
-    nameof(typeof(node)) === :MonacoEditor && return :text
+    node isa BT.CodeView && return :text
+    node isa BT.MeshViewer && return :mesh
+    cls = root_class(node)
+    for (c, kind) in ("bt-fv-notebook" => :notebook, "bt-fv-table-wrap" => :table,
+                      "bt-fv-markdown" => :markdown, "bt-fv-hex-wrap" => :binary,
+                      "bt-fv-frame-wrap" => :frame, "bt-fv-audio-wrap" => :audio,
+                      "bt-tool-empty" => :caption, "bt-tool-error" => :error)
+        occursin(c, cls) && return kind
+    end
     s = sprint(show, node)
-    occursin("bt-fv-notebook", s) && return :notebook
-    occursin("bt-mesh-view", s)   && return :mesh
-    occursin("bt-fv-table", s)    && return :table
-    occursin("bt-fv-markdown", s) && return :markdown
-    occursin("bt-fv-hex", s)      && return :binary
-    occursin("bt-fv-frame", s)    && return :frame
     occursin("<img", s)   && return :image
     occursin("<video", s) && return :video
-    occursin("<audio", s) && return :audio
-    occursin("bt-tool-empty", s) && return :caption
-    occursin("bt-tool-error", s) && return :error
     return :unknown
 end
 
 newstate() = BT.ServerState(; state_dir = mktempdir(),
-                              working_dir = mktempdir(),
-                              worker_secret = "x")
+                              working_dir = mktempdir())
 
 @testset "bt_show / ShowTool" begin
 
@@ -52,6 +52,49 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test BT.parse_show_path("shown: /a.png (image/png, 1KB)\nmore") == "/a.png"
         @test BT.parse_show_path("not a show reference")                 === nothing
         @test BT.parse_show_path("")                                     === nothing
+    end
+
+    @testset "a shown file's card: the agent's title, the file's name and path" begin
+        @test BT.parse_show_size("shown: /p/loss.png (image/png, 48.2KB)") == "48.2KB"
+        @test BT.parse_show_size("shown: /p/a b.png (image/png, 1.2 MB)\nmore") == "1.2 MB"
+        @test BT.parse_show_size("shown: /p/plain") === nothing
+
+        # The tool takes a title and says so; the reference stays the same.
+        schema = only(t for t in BonitoMCP.TOOLS if t.name == "bt_show").input_schema
+        @test haskey(schema["properties"], "title") && schema["required"] == ["path"]
+        mktempdir() do dir
+            f = joinpath(dir, "loss.png"); write(f, rand(UInt8, 10))
+            res = BonitoMCP.julia_show_handler(Dict("path" => f, "title" => "Loss after 200 epochs"))
+            @test res["isError"] == false && BT.parse_show_path(res["content"][1]["text"]) == f
+        end
+
+        ACP = BonitoAgents.AgentClientProtocol
+        card(id, raw) = (m = BT.build_mcp_msg(BT.ShowToolMsg,
+                             BT.Message(id, "other", "mcp__btworker__bt_show", "", "completed", "", 0.0, 0.0, nothing),
+                             "btworker", "bt_show"); BT.apply_input!(m, raw); m)
+        ref = ACP.ToolContent[ACP.TextContent("shown: /p/out/loss.png (image/png, 48.2KB)")]
+        snap = (; content = ref)
+
+        captioned = card("cap", Dict("path" => "/p/out/loss.png", "title" => "  Loss after\n200 `epochs`  "))
+        @test captioned.caption == "Loss after 200 epochs"      # one line, no backticks: chat.md keeps it
+        @test BT.snap_title(captioned, "mcp__btworker__bt_show") == "Loss after 200 epochs"
+        @test BT.snap_summary(captioned, snap) == "loss.png · 48.2KB"
+
+        plain = card("plain", Dict("path" => "/p/out/loss.png"))
+        @test BT.snap_title(plain, "mcp__btworker__bt_show") == "loss.png"
+        @test BT.snap_summary(plain, snap) == "48.2KB"
+        # Before its arguments arrive the card is the tool.
+        @test BT.snap_title(card("early", Dict{String,Any}()), "") == "bt_show"
+
+        # The header: the title, and the path its tooltip and link carry.
+        chat_dir = mktempdir()
+        BT.persist_tool_content!(chat_dir, ACP.MCPCall("cap", "other", "mcp__btworker__bt_show", "completed",
+            ref, ACP.MessageStream{ACP.ToolCall}(), "btworker", "bt_show",
+            Dict{String,Any}("path" => "/p/out/loss.png", "title" => "Loss after 200 epochs")))
+        d = BT.tool_header_dict(captioned, chat_dir)
+        @test d["title"] == "Loss after 200 epochs"
+        @test d["edit_path"] == "/p/out/loss.png"
+        @test d["tool"] == "bt_show"                             # the filter still knows it
     end
 
     @testset "bt_show tool handler (BonitoMCP)" begin
@@ -99,6 +142,22 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test_throws Exception BT.fetch_show_file(st_missing)
     end
 
+    @testset "media is a link to the worker's file, never a copy" begin
+        # A video whose worker does not answer: the card gets its link at once,
+        # without asking the worker or copying anything. It used to stat first
+        # and, when the worker was slow to answer, copy the whole file to the
+        # server; the video sat blank until that was done.
+        state = newstate()
+        cwd = mktempdir()
+        state.projects[]["p1"] = BT.ProjectInfo("p1", "media", "w-gone", cwd, "/home/w/proj", BT.now(BT.UTC))
+        st = BT.ShowTool(state, "p1", cwd, "renders/clip.mp4")
+        t0 = time()
+        src = BT.show_media_src(st)
+        @test time() - t0 < 1.0
+        @test src == BT.worker_file_url(state, "w-gone", "/home/w/proj/renders/clip.mp4")
+        @test !ispath(BT.show_server_path(st))            # nothing on the server
+    end
+
     # `file_kind` is the single decision point every renderer dispatches on —
     # pure, so it's worth pinning exactly. The interesting cases are the ones
     # that used to be lumped together as "not text": .ogg is AUDIO (not a video
@@ -119,7 +178,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test k("data.tsv") == :TableFile
         @test k("nb.ipynb") == :NotebookFile
         @test k("m.obj") == :MeshFile
-        @test k("m.glb") == :MeshFile
+        @test k("m.glb") == :MeshFile && k("m.gltf") == :MeshFile
         @test k("doc.pdf") == :PDFFile
         @test k("page.html") == :HTMLFile
         @test k("a.jl") == :TextFile
@@ -158,7 +217,7 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
               """{"cell_type":"code","source":["1+1\\n"],"outputs":[]}],""" *
               """"metadata":{"kernelspec":{"language":"julia"}}}""")
         # A `.txt` that is actually binary: the extension says text, the NUL
-        # sniff overrules it and we hex-dump instead of feeding Monaco garbage.
+        # sniff overrules it and we hex-dump instead of showing garbage as code.
         write(joinpath(cwd, "lying.txt"), UInt8[0x41, 0x00, 0x42, 0x43])
 
         kind(p) = show_kind(BT.render_show_file(BT.ShowTool(state, "", cwd, p)))

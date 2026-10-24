@@ -11,7 +11,7 @@
     const BT = BonitoAgents
 
     fresh_state() = BT.ServerState(; state_dir = mktempdir(),
-                                   working_dir = mktempdir(), worker_secret = "x")
+                                   working_dir = mktempdir())
 
     setup(id) = begin
         st   = fresh_state()
@@ -91,7 +91,7 @@
             BT.record_bound_session!(model, "sess-2")
 
             st2 = BT.ServerState(; state_dir = st.state_dir,
-                                 working_dir = mktempdir(), worker_secret = "x")
+                                 working_dir = mktempdir())
             loaded = st2.projects[]["rg2"]
             @test loaded.resume_session_id == "sess-2"
             @test loaded.provider == BT.provider_name(prov)

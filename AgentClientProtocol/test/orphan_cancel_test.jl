@@ -54,7 +54,7 @@ end
 
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
         put!(ws_ch, ws)
-        try take!(hold) catch end
+        try take!(hold) catch e; e isa InvalidStateException || rethrow() end   # closed at teardown
     end
 
     agent = @async try
@@ -91,7 +91,8 @@ end
     end
 
     server_ws = take!(ws_ch)
-    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), ACP.DiscardHandler())
+    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), ACP.DiscardHandler();
+                          agent_turns = true)
     rendered = Channel{Any}(64)
 
     try
@@ -101,16 +102,17 @@ end
 
         ACP.wait_turn!(ACP.prompt!(client, "go"))   # settles on the recorded end_turn
 
-        # Now in the window: no prompt open, agent still working.
+        # Now in the window: no prompt open, the agent on a turn of its own.
         take!(working)
-        @test timedwait(() -> ACP.session_activity(conn) isa ACP.Unprompted, 5.0) === :ok
-        @test isempty(conn.active_prompts)          # ...and nothing is registered
+        @test timedwait(() -> !isempty(ACP.open_turns(conn)), 5.0) === :ok
+        @test only(ACP.open_turns(conn)) isa ACP.AgentTurn
+        @test isempty(conn.active_prompts)          # ...and no prompt of ours
 
         # The un-prompted work is RENDERED, not dropped: it is the main thread
-        # talking, and the same stream carries it.
-        @test timedwait(() -> Base.n_avail(rendered) >= 2, 5.0) === :ok
+        # talking, and the same stream carries it, announced as a turn.
+        @test timedwait(() -> Base.n_avail(rendered) >= 3, 5.0) === :ok
 
-        ACP.cancel!(client)
+        @test only(ACP.cancel!(client)) isa ACP.AgentTurn
 
         # THE ASSERTION: the user pressed stop, so session/cancel must be on the
         # wire. Asking "is a prompt open" instead of "is the agent working" made
@@ -140,8 +142,9 @@ end
 #   26  in   RESPONSE stopReason=end_turn          the span closes
 #   27  in   session/update session_info_update    metadata — must NOT count
 #   28  in   session/update usage_update           metadata — must NOT count
-#   29  in   session/update tool_call              REAL WORK — goes Unprompted
+#   29  in   session/update tool_call              REAL WORK — the agent's own turn
 #   30  out  session/cancel                        fires, and only now
+#   31  in   usage_update origin=task-notification the agent's turn is over
 #
 # Both halves matter. An earlier capture had the cancel firing on frame 27's
 # metadata alone, which is what 05c12b8 removed: a session that has merely
@@ -182,13 +185,21 @@ end
     @test "tool_call" in tail                       # real work after end_turn
     @test findfirst(==("session_info_update"), tail) <
           findfirst(==("tool_call"), tail)          # metadata first, and does not count
+    # What the agent sent before the cancel reached it, and after: the result
+    # tagged with its origin, which ends its turn.
+    origin(m) = get(get(get(get(m, "params", Dict()), "update", Dict()), "_meta", Dict()),
+                    "_claude/origin", Dict())
+    marker = findfirst(m -> get(origin(m), "kind", "") == "task-notification", tail_notifs)
+    @test marker !== nothing && marker == length(tail_notifs)
+    before_cancel = tail_notifs[1:(marker - 1)]
+    after_cancel  = tail_notifs[marker:end]
 
     port  = freeport()
     ws_ch = Channel{Any}(1); hold = Channel{Nothing}(0)
     seen  = Channel{String}(64); ready = Channel{Nothing}(1)
 
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
-        put!(ws_ch, ws); try take!(hold) catch end
+        put!(ws_ch, ws); try take!(hold) catch e; e isa InvalidStateException || rethrow() end   # closed at teardown
     end
 
     agent = @async try
@@ -207,9 +218,10 @@ end
                 emit(cws, result_frame(id, JSON.json(body)))
                 m == "session/prompt" && break
             end
-            # Everything the agent streamed AFTER end_turn, in recorded order:
-            # metadata first (must not count), then the tool_call (must).
-            for n in tail_notifs
+            # Everything the agent streamed AFTER end_turn and before the cancel,
+            # in recorded order: metadata first (must not count), then the
+            # tool_call (must).
+            for n in before_cancel
                 emit(cws, JSON.json(n))
                 sleep(0.05)
             end
@@ -219,6 +231,8 @@ end
                 isempty(line) && continue
                 mm = req_method(line)
                 mm === nothing || (isopen(seen) && put!(seen, mm))
+                # ... and the rest once the cancel is in, as recorded.
+                mm == "session/cancel" && foreach(n -> emit(cws, JSON.json(n)), after_cancel)
             end
         end
     catch e
@@ -227,7 +241,8 @@ end
     end
 
     server_ws = take!(ws_ch)
-    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), ACP.DiscardHandler())
+    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), ACP.DiscardHandler();
+                          agent_turns = true)
     rendered = Channel{Any}(64)
 
     try
@@ -236,10 +251,12 @@ end
         collect_main!(rendered, client)
         ACP.wait_turn!(ACP.prompt!(client, "replayed"))   # the RECORDED end_turn
         take!(ready)
-        @test timedwait(() -> ACP.session_activity(conn) isa ACP.Unprompted, 10.0) === :ok
+        @test timedwait(() -> !isempty(ACP.open_turns(conn)), 10.0) === :ok
         @test isempty(conn.active_prompts)
+        own = only(ACP.open_turns(conn))
+        @test own isa ACP.AgentTurn
 
-        ACP.cancel!(client)
+        @test ACP.cancel!(client) == [own]
         got = String[]
         ok = timedwait(10.0; pollint = 0.05) do
             while isready(seen); push!(got, take!(seen)); end
@@ -247,6 +264,9 @@ end
         end
         @test ok === :ok
         @test "session/cancel" in got
+        # The recorded result tagged `task-notification` ends the agent's turn.
+        @test ACP.wait_over([own]; timeout = 10.0)
+        @test isempty(ACP.open_turns(conn))
     finally
         close(rendered); close(seen); close(conn)
         close(hold); close(server)
@@ -266,15 +286,15 @@ end
 #      it could skip a cancelled turn's backlog and reach its `cancelled`
 #      response. The mute was cleared only by that response, so cancelling
 #      un-prompted work (which has no response coming) silenced the session
-#      until the user reloaded. Nothing is dropped now; `Cancelling` is a state,
-#      not a gate.
+#      until the user reloaded. Nothing is dropped now: a cancel asks the agent
+#      to end its turns, and they end when it does.
 @testset "cancel does not silence later background work" begin
     port  = freeport()
     ws_ch = Channel{Any}(1); hold = Channel{Nothing}(0)
     settled = Channel{Nothing}(1)
 
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
-        put!(ws_ch, ws); try take!(hold) catch end
+        put!(ws_ch, ws); try take!(hold) catch e; e isa InvalidStateException || rethrow() end   # closed at teardown
     end
 
     agent = @async try
@@ -318,8 +338,8 @@ end
         client = ACP.Client(conn, session_id, pwd(), Dict{String,Any}())
         collect_main!(rendered, client)
         turn = ACP.prompt!(client, "go")
-        ACP.cancel!(client)
-        @test ACP.session_activity(conn) isa ACP.Cancelling
+        @test ACP.cancel!(client) == [turn]
+        @test !ACP.isover(turn)                   # over when the agent says so
 
         # (1) The subagent streamed WHILE the cancel was in flight, and arrived.
         @test timedwait(() -> isready(owned), 5.0) === :ok
@@ -328,11 +348,11 @@ end
         take!(settled)
         @test ACP.wait_turn!(turn)["stopReason"] == "cancelled"
 
-        # (2) Settled: `Cancelling` ends with the turn it cancelled, so the main
-        # thread's next burst lands. Measured as GROWTH past whatever the
-        # cancelled turn had already rendered — the point is that the stream did
-        # not go dead, not how much got through before the stop.
-        @test timedwait(() -> !(ACP.session_activity(conn) isa ACP.Cancelling), 5.0) === :ok
+        # (2) Settled: the turn is over with its answer, and the main thread's
+        # next burst lands. Measured as GROWTH past whatever the cancelled turn
+        # had already rendered — the point is that the stream did not go dead,
+        # not how much got through before the stop.
+        @test ACP.isover(turn)
         base = Base.n_avail(rendered)
         @test timedwait(() -> Base.n_avail(rendered) > base, 5.0) === :ok
     finally

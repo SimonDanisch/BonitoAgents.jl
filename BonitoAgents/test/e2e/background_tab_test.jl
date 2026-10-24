@@ -139,7 +139,8 @@
         document.dispatchEvent(new Event('visibilitychange'));
         // Flush whatever was parked while hidden, on a real frame.
         const parked = window.__bgPaused.splice(0);
-        window.__rafReal(() => { for (const e of parked) { if (e && e.cb) try { e.cb(performance.now()); } catch (_) {} } });
+        // A callback that throws is reported and the rest still run, as with a real frame.
+        window.__rafReal(() => { for (const e of parked) { if (e && e.cb) try { e.cb(performance.now()); } catch (error) { console.error(error); } } });
         return true;
     })()""")
     sleep(0.5)

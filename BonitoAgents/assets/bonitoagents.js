@@ -1,3 +1,5 @@
+import { changedRanges } from "./code_diff.mjs";
+
 // BonitoAgents.js — client-side chat: virtual scroll, DOM windowing, streaming.
 //
 // All Julia↔JS traffic flows through ONE Bonito Observable: `comm`.
@@ -42,6 +44,31 @@ if (typeof document !== 'undefined') {
 //     grows it. No re-fetch, no display:none. The eager body mount itself is
 //     triggered from `createNode` so the user sees the compact diff under the
 //     header immediately. Implies !fetchEachExpand && !discardOnCollapse.
+// A token count the way a reader takes it in: 950, 1.2k, 48k, 1.3M.
+// localStorage for what the page only keeps for convenience (drafts, the todo
+// card's state). Storage can be off (SecurityError) or full
+// (QuotaExceededError): those warn and act as "nothing stored", anything else
+// throws. styles.jl's STORAGE_JS is the same for the server-rendered pieces.
+const storage = (() => {
+    const refused = (error, key) => {
+        if (!(error instanceof DOMException) ||
+            !['SecurityError', 'QuotaExceededError'].includes(error.name)) throw error;
+        console.warn(`browser storage refused (${key}):`, error.message);
+    };
+    return {
+        get(key) { try { return localStorage.getItem(key); } catch (e) { refused(e, key); return null; } },
+        set(key, value) { try { localStorage.setItem(key, value); } catch (e) { refused(e, key); } },
+        remove(key) { try { localStorage.removeItem(key); } catch (e) { refused(e, key); } },
+    };
+})();
+
+function formatTokens(n) {
+    if (n < 1000) return String(Math.round(n));
+    if (n < 10000) return (n / 1000).toFixed(1) + 'k';
+    if (n < 1000000) return Math.round(n / 1000) + 'k';
+    return (n / 1000000).toFixed(1) + 'M';
+}
+
 // Badge text for a queued bubble: position when known, plain "queued" when not
 // (an older wire dict, or a bubble restored from history).
 function queueLabel(pos) {
@@ -62,20 +89,18 @@ export class Collapsable {
         // clamping happens per SUB-SECTION inside the body (see styles.jl
         // .bt-clamped), never on the card body as a whole.
         this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
-        this.compactHeight  = opts.compactHeight  || 240;
-        this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand   = this.editMode ? false : (opts.fetchEachExpand || false);
         this.discardOnCollapse = this.editMode ? false : (opts.discardOnCollapse || false);
         this.onExpand = opts.onExpand || null;
+        // The height the body last rendered at (px, 0 when unknown); the
+        // loading placeholder holds it until the body replaces it.
+        this.reserve  = opts.reserve || null;
+        this.onToggle = opts.onToggle || null;      // the reader's own clicks
         this.lazy     = !!this.onExpand;
         this.loaded   = !this.lazy;                    // eager bodies start loaded
 
-        // Everything (edit tools included) starts collapsed. Edit tools are
-        // in COMPACT visual state (Monaco capped to 240px) but their body
-        // element is rendered/visible from the start; the initial
-        // `setMaxHeight` lookup is deferred to the first toggle (Monaco may
-        // not have finished its async init when createNode runs). Compact
-        // EVAL bodies are capped by the CSS clamp instead (styles.jl).
+        // Everything starts collapsed: edit diffs at their summary height,
+        // compact eval bodies capped by the CSS clamp (styles.jl).
         this.expanded = false;
 
         if (this.native) {
@@ -92,6 +117,7 @@ export class Collapsable {
                 if (this.expanded && this.toggle && e.target !== this.toggle &&
                     !this.toggle.contains(e.target)) return;
                 this.applyExpanded(!this.expanded);
+                this.onToggle && this.onToggle(this.expanded);
             });
         }
     }
@@ -108,11 +134,10 @@ export class Collapsable {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
             if (this.editMode && !this.hideBodyOnCollapse) {
-                // Edit tools: body stays visible; size via Monaco's own API
-                // so the resize is animated by Monaco itself instead of CSS
-                // clip.
+                // Edit tools: the body stays visible; its diffs take their
+                // full or summary height from the header's `data-expanded`
+                // (styles.jl), whenever they were mounted.
                 this.body.style.display = '';
-                this.applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
                 // Plain lazy bodies AND eval compact bodies hide on collapse;
                 // for the latter the node stays mounted (editMode skips the
@@ -122,13 +147,12 @@ export class Collapsable {
             }
         }
         // Lazy body fetch. editMode pills normally keep their streamed-in
-        // body across toggles and only resize Monaco — but a HISTORY-REPLAYED
-        // edit pill starts with an EMPTY body (its diff lives server-side
-        // until a tool.render round trip), so gating the fetch on
+        // body across toggles and only resize their diffs — but a
+        // HISTORY-REPLAYED edit pill starts with an EMPTY body (its diff lives
+        // server-side until a tool.render round trip), so gating the fetch on
         // `!editMode` alone made replayed Edit pills permanently
-        // unexpandable: the arrow flipped, `applyEditHeight` sized zero
-        // Monaco divs, and nothing ever appeared. Fetch whenever the body
-        // has nothing to show.
+        // unexpandable: the arrow flipped and nothing ever appeared. Fetch
+        // whenever the body has nothing to show.
         const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
         if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
@@ -136,7 +160,7 @@ export class Collapsable {
                 // and completion updates can arrive before the body does;
                 // a second render would replace an initializing editor.
                 this.loaded = true;
-                this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+                this.showPlaceholder();
                 this.onExpand && this.onExpand();
             }
         } else if (!expanded && this.discardOnCollapse) {
@@ -145,23 +169,11 @@ export class Collapsable {
         }
     }
 
-    // Look up the Monaco DiffEditor inside our body and resize via its API.
-    // Querying every toggle handles both "Monaco wasn't ready on first
-    // construction" (the body has the .monaco-diff-editor-div but no
-    // __btMonacoDiff yet) and multi-diff bodies (just resize the first; the
-    // sibling diffs are sized by the same body wrapper). No-op if the
-    // editor finished tearing down or never mounted — and for compact-body
-    // EVAL tools, whose plain Code editor has no such API: their ~4-line cap
-    // is a pure CSS clamp on the body wrapper keyed off
-    // `[data-compact-body] .bt-tool-header[data-expanded] ~ .bt-tool-body`
-    // (see styles.jl), so it holds for EVERY mount path (eager mount,
-    // terminal re-render, history reload) with no lifecycle hook.
-    applyEditHeight(h) {
-        const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
-        divs.forEach(div => {
-            const monaco = div.__btMonacoDiff;
-            if (monaco && typeof monaco.setMaxHeight === 'function') monaco.setMaxHeight(h);
-        });
+    // "loading…" until the body arrives, in the shape the body will have
+    // (`reserve`): the row is its final size from the start, and nothing
+    // below it moves when the body replaces the placeholder.
+    showPlaceholder() {
+        showLoading(this.body, this.reserve ? this.reserve() : null);
     }
 
     // Owner finished loading the lazy body: set its html + mark loaded so a
@@ -170,6 +182,341 @@ export class Collapsable {
         if (html != null) this.body.innerHTML = html;
         this.loaded = true;
     }
+}
+
+// ── Static code views (code_view.jl) ───────────────────────────────────────
+// Read-only code is plain DOM, one `.bt-l` row per line, built here from the
+// source text the server sent in `pre.bt-code-src`. Monaco highlights it once
+// it comes near the screen (`colorize`, no editor). A diff's rows come from
+// the server's line diff (`data-ops`, "=3 -2 +4"); its gutter (both line
+// numbers and the sign) is an attribute shown by CSS, so copying a diff copies
+// code only.
+
+const CODE_TAB = 4;
+const CODE_STATE = new WeakMap();      // .bt-code -> {lib, lang, path, sources, rows} until highlighted
+const CODE_OBSERVERS = new WeakMap();  // transcript scroller/document -> CodeHighlighter
+const CODE_CHUNKS = new WeakMap();
+
+// The browser's lines of a text, as code_view.jl counts them.
+function codeLines(text) { return text === '' ? [] : text.split('\n'); }
+
+function codeRow(kind, text, side, index, gutter) {
+    // A CR the CRLF file brought along shows as nothing; Monaco drops it too.
+    const shown = text.endsWith('\r') ? text.slice(0, -1) : text;
+    return { el: null, kind, gutter, text: shown, side, index, marks: null };
+}
+
+
+function* codeRows(sources, ops) {
+    if (ops === undefined) {
+        const lines = codeLines(sources[0]);
+        if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+        for (let i = 0; i < lines.length; i++) yield codeRow('', lines[i], 0, i, null);
+        return;
+    }
+    const a = codeLines(sources[0]), b = codeLines(sources[1]);
+    const w = String(Math.max(a.length, b.length, 1)).length;
+    const pad = (x) => (x === null ? '' : String(x)).padStart(w);
+    const gutter = (i, j, sign) => `${pad(i === null ? null : i + 1)} ${pad(j === null ? null : j + 1)} ${sign}`;
+    let i = 0, j = 0;
+    const runs = ops.split(' ').filter(Boolean).map(op => [op[0], parseInt(op.slice(1), 10)]);
+    for (let r = 0; r < runs.length; r++) {
+        const [k, n] = runs[r];
+        if (k === '=') {
+            for (let t = 0; t < n; t++, i++, j++) yield codeRow('', b[j], 1, j, gutter(i, j, ' '));
+        } else if (k === '-') {
+            const removed = [];
+            for (let t = 0; t < n; t++, i++) { const row = codeRow('del', a[i], 0, i, gutter(i, null, '-')); removed.push(row); yield row; }
+            // The additions right after are what these lines became: mark
+            // the changed characters of each pair.
+            if (r + 1 < runs.length && runs[r + 1][0] === '+') {
+                const [, m] = runs[++r];
+                for (let t = 0; t < m; t++, j++) {
+                    const row = codeRow('add', b[j], 1, j, gutter(null, j, '+'));
+                    const old = removed[t];
+                    if (old) {
+                        const ranges = changedRanges(old.text, row.text);
+                        if (ranges) { old.marks = ranges[0]; row.marks = ranges[1]; }
+                    }
+                    yield row;
+                }
+            }
+        } else {
+            for (let t = 0; t < n; t++, j++) yield codeRow('add', b[j], 1, j, gutter(null, j, '+'));
+        }
+    }
+}
+
+// Wrap characters [from, to) of a row in a `.bt-ch` span, across token spans.
+function markRange(row, from, to) {
+    if (from >= to) return;
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) nodes.push(n);
+    let pos = 0;
+    for (const node of nodes) {
+        const start = pos, end = pos + node.data.length;
+        pos = end;
+        const a = Math.max(from, start), b = Math.min(to, end);
+        if (a >= b) continue;
+        let mid = node;
+        if (a > start) mid = mid.splitText(a - start);
+        if (b < end) mid.splitText(b - a);
+        const span = document.createElement('span');
+        span.className = 'bt-ch';
+        mid.replaceWith(span);
+        span.appendChild(mid);
+    }
+}
+
+function markRanges(row) {
+    if (row.marks) for (const [from, to] of row.marks) markRange(row.el, from, to);
+}
+
+// Put the source line back into Monaco's token spans: colorize writes spaces
+// as U+00A0 and expands tabs, and code copied from it would be neither. Each
+// text node keeps its width in columns, now spelled with the source's own
+// characters. False when they do not line up, which leaves the row plain.
+function resource(line, text) {
+    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+    let i = 0, col = 0, carry = 0;
+    const out = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        let need = node.data.length, s = '';
+        while (need > 0) {
+            if (carry > 0) { const k = Math.min(carry, need); carry -= k; need -= k; continue; }
+            if (i >= text.length) return false;
+            const c = text[i++];
+            if (c === '\t') {
+                const w = CODE_TAB - (col % CODE_TAB);
+                s += c; col += w;
+                const k = Math.min(w, need); need -= k; carry = w - k;
+            } else { s += c; col += 1; need -= 1; }
+        }
+        out.push([node, s]);
+    }
+    if (i !== text.length || carry !== 0) return false;
+    for (const [node, s] of out) node.data = s;
+    return true;
+}
+
+async function highlightCode(el) {
+    const st = CODE_STATE.get(el);
+    CODE_STATE.set(el, null);          // mounted, and its sources no longer needed
+    if (!st.lib) { el.dataset.btHighlighted = 'true'; return; }
+    const lib = await st.lib;
+    const lang = st.lang || (st.path ? await lib.language_for_path(st.path) : 'plaintext');
+    if (lang === 'plaintext') {
+        st.highlighter.forget(el);
+        el.dataset.btHighlighted = 'true';
+        return;
+    }
+    const tpl = document.createElement('template');
+    for (let side = 0; side < st.sources.length; side++) {
+        if (!el.isConnected || st.highlighter.closed) return;
+        const rows = new Map(st.rows.filter(r => r.side === side).map(r => [r.index, r]));
+        if (!rows.size) continue;
+        await lib.colorize_lines(st.sources[side], lang, (index, html) => {
+            if (!el.isConnected || st.highlighter.closed) return false;
+            const row = rows.get(index);
+            if (!row) return;
+            // Only visited groups need token elements. Unvisited source stays
+            // plain text, with its token HTML cached until it enters view.
+            row.html = html;
+            if (row.chunk.wanted) paintCodeRow(row, tpl);
+        });
+    }
+    if (el.isConnected && !st.highlighter.closed) el.dataset.btHighlighted = 'true';
+}
+
+function paintCodeRow(row, tpl) {
+    if (row.html == null) return;
+    tpl.innerHTML = row.html;
+    row.html = null;
+    if (!resource(tpl.content, row.text)) return;
+    // Highlighting must not destroy an in-progress copy or native find result.
+    const selection = window.getSelection();
+    const point = (node, offset) => {
+        if (!node || !row.el.contains(node)) return {node, offset};
+        const range = document.createRange();
+        range.selectNodeContents(row.el); range.setEnd(node, offset);
+        return {index: range.toString().length};
+    };
+    const anchor = point(selection.anchorNode, selection.anchorOffset);
+    const focus = point(selection.focusNode, selection.focusOffset);
+    row.el.replaceChildren(tpl.content);
+    markRanges(row);
+    if (anchor.index === undefined && focus.index === undefined) return;
+    const restore = p => {
+        if (p.index === undefined) return p;
+        const walker = document.createTreeWalker(row.el, NodeFilter.SHOW_TEXT);
+        let left = p.index;
+        for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+            if (left <= n.length) return {node:n, offset:left};
+            left -= n.length;
+        }
+        return {node:row.el, offset:row.el.childNodes.length};
+    };
+    const a = restore(anchor), f = restore(focus);
+    selection.setBaseAndExtent(a.node, a.offset, f.node, f.offset);
+}
+
+class CodeHighlighter {
+    constructor(root) {
+        this.pending = [];
+        this.running = false;
+        this.closed = false;
+        this.paintPending = [];
+        this.painting = false;
+        this.observer = new IntersectionObserver((entries) => {
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                this.observer.unobserve(e.target);
+                this.pending.push(e.target);
+            }
+            this.drain();
+        }, { root, rootMargin: '100% 0px' });
+        this.chunks = new IntersectionObserver(entries => {
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                this.chunks.unobserve(e.target);
+                const chunk = CODE_CHUNKS.get(e.target);
+                chunk.wanted = true;
+                this.paintPending.push(chunk.rows);
+            }
+            this.paint();
+        }, {root, rootMargin:'100% 0px'});
+    }
+    observe(el) {
+        const st = CODE_STATE.get(el);
+        st.highlighter = this;
+        for (const chunk of st.chunks) this.chunks.observe(chunk);
+        this.observer.observe(el);
+    }
+    forget(body) {
+        for (const el of body.querySelectorAll('.bt-code')) this.observer.unobserve(el);
+        for (const el of body.querySelectorAll('.bt-code-chunk')) this.chunks.unobserve(el);
+    }
+    disconnect() {
+        this.closed = true;
+        this.observer.disconnect();
+        this.chunks.disconnect();
+        this.pending.length = 0;
+        this.paintPending.length = 0;
+    }
+    async paint() {
+        if (this.painting) return;
+        this.painting = true;
+        const tpl = document.createElement('template');
+        let until = performance.now() + 3;
+        try {
+            while (!this.closed && this.paintPending.length) {
+                for (const row of this.paintPending.shift()) {
+                    if (!row.el.isConnected) continue;
+                    paintCodeRow(row, tpl);
+                    if (performance.now() >= until) {
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        until = performance.now() + 3;
+                    }
+                }
+            }
+        } finally {
+            this.painting = false;
+        }
+    }
+    async drain() {
+        if (this.running) return;
+        this.running = true;
+        let until = performance.now() + 3;
+        try {
+            while (!this.closed && this.pending.length) {
+                const el = this.pending.shift();
+                if (el.isConnected) await highlightCode(el);
+                // Small cards can each finish before colorize_lines yields.
+                // Their combined work must still yield to input and rendering.
+                if (performance.now() >= until) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                    until = performance.now() + 3;
+                }
+            }
+        } finally {
+            this.running = false;
+        }
+    }
+}
+
+function observeCode(el) {
+    // One queue per scroller: cards entering together share the work budget.
+    const root = el.closest('.bt-messages');
+    const key = root || document;
+    let highlighter = CODE_OBSERVERS.get(key);
+    if (!highlighter) {
+        highlighter = new CodeHighlighter(root);
+        CODE_OBSERVERS.set(key, highlighter);
+    }
+    highlighter.observe(el);
+}
+
+export async function mountCode(el, lib) {
+    if (CODE_STATE.has(el)) return;
+    CODE_STATE.set(el, null);
+    el.dataset.btHighlighted = 'false';
+    const sources = [...el.querySelectorAll(':scope > pre.bt-code-src')].map(p => p.textContent);
+    const rows = [];
+    let until = performance.now() + 3;
+    // Word comparisons and row creation share the same budget as highlighting.
+    for (const row of codeRows(sources, el.dataset.ops)) {
+        rows.push(row);
+        if (performance.now() >= until) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (!el.isConnected) return;
+            until = performance.now() + 3;
+        }
+    }
+    // A text ending in a newline leaves an empty last line, kept by both sides.
+    const last = rows[rows.length - 1];
+    if (el.dataset.ops !== undefined && last?.kind === '' && last.text === '') rows.pop();
+    const lines = document.createElement('div');
+    const chunks = [];
+    lines.className = 'bt-code-lines';
+    lines.style.setProperty('--bt-code-height', (rows.length * 18) + 'px');
+    // A single visible 10k-line block still lays out all 10k lines. Keep every
+    // source row searchable/selectable, but let the browser skip small groups
+    // outside the viewport. Their exact height is known before highlighting.
+    for (let i = 0; i < rows.length; i += 32) {
+        const chunk = document.createElement('div');
+        chunk.className = 'bt-code-chunk';
+        chunk.style.setProperty('--bt-code-height', (Math.min(32, rows.length - i) * 18) + 'px');
+        const state = {rows:rows.slice(i, i + 32), wanted:false};
+        if (lib) CODE_CHUNKS.set(chunk, state);
+        for (const row of state.rows) {
+            row.el = document.createElement('div');
+            row.el.className = row.kind ? `bt-l bt-l-${row.kind}` : 'bt-l';
+            if (row.gutter !== null) row.el.dataset.g = row.gutter;
+            row.el.textContent = row.text;
+            if (lib) row.chunk = state;
+            chunk.appendChild(row.el);
+            markRanges(row);
+        }
+        lines.appendChild(chunk);
+        chunks.push(chunk);
+        if (performance.now() >= until) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (!el.isConnected) return;
+            until = performance.now() + 3;
+        }
+    }
+    el.replaceChildren(lines);
+    if (lib) {
+        CODE_STATE.set(el, { lib, lang: el.dataset.lang || '', path: el.dataset.path || '', sources, rows, chunks });
+        observeCode(el);
+    } else {
+        CODE_STATE.set(el, null);
+        el.dataset.btHighlighted = 'true';
+    }
+    // A tool body built after its row went far: the transcript looks again
+    // whether to free it.
+    bodyMounted(el);
 }
 
 // Message filter: human labels + a fixed display order so toolbar checkboxes
@@ -190,122 +537,190 @@ const DEFAULT_HIDDEN = ['tool:ToolSearch'];
 // subagent's full history lives on the server either way.
 const TASK_FEED_ROWS = 300;
 
+// "512 KB", "3.4 MB", "1.2 GB": a file's size in the composer and its errors.
+function formatBytes(n) {
+    if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+// A body waiting for its render: "loading…", in `shape` (styles for the
+// placeholder) when the body's size is known. The reply empties the slot.
+function showLoading(body, shape) {
+    body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+    if (shape) Object.assign(body.firstElementChild.style, {boxSizing: 'border-box'}, shape);
+}
+
 class BonitoChat {
-    constructor(container, comm) {
+    constructor(container, comm, init = {}) {
         this.container = container;
+        this.projectVisible = container.closest('.bt-chatpane')?.getAttribute('aria-hidden') !== 'true';
+        this.workspacePanel = container.closest('.bw-ws-panel');
+        this.workspaceVisible = this.workspacePanel?.dataset.bwVisible !== 'false';
+        this.paneVisible = this.projectVisible && this.workspaceVisible;
+        this.onWorkspaceVisibility = e => {
+            this.workspaceVisible = e.detail;
+            this.updateVisibility();
+        };
+        this.workspacePanel?.addEventListener('bw-panel-visibility', this.onWorkspaceVisibility);
+        this.showRestoreRaf = 0;
+        this.showRestoreTimers = [];
         this.comm      = comm;
         this.destroyed = false;
 
-        this.cache    = new Map();  // idx (0-based) → DOMNode
-        this.heights  = new Map();
-        this.rendered = new Set();
+        // ── The loaded block ─────────────────────────────────────────────
+        // The transcript holds ONE contiguous block of messages: positions
+        // [plo, phi] of the current sequence (every store index, or the lens
+        // matches under a lens, `seq`), all of them in the DOM in order
+        // between the two marker divs. Nothing outside the block is in the
+        // page, and nothing is estimated: the scroll container is exactly as
+        // tall as what it shows. Scrolling near an end of the block loads the
+        // next CHUNK on that side (`ensureWindow`), a block grown past
+        // MAX_WINDOW drops rows on the side away from the viewport, and the
+        // rail (`setupRail`) shows where the block sits in the conversation.
+        this.cache    = new Map();  // idx (0-based) → DOMNode, the block's rows only
+        // Tool id → expanded, as the reader last left it. A row the block
+        // drops is built again from its data when the reader comes back, and
+        // comes back the way they left it.
+        this.expandState = new Map();
+        this.order    = [];         // the block's store indices, ascending (= DOM order)
         this.nodeById = new Map();  // msg_id → DOMNode  (for streaming updates)
-        this.observed = new Set();  // idx currently watched by the shared RO
-
-        this.totalCount    = 0;
-        this.EST_HEIGHT    = 80;    // adapted to the measured average, see measureNodes
-        this.OVERSCAN      = 8;
-        this.initialLoad   = false;
-        this.pendingAnchor = null; // evicted reading position awaiting remount
-        this.bootstrapped = false; // first msgs.count seen (guards initialLoad re-arm)
-        this.measuredHeightSum      = 0;     // running mean of measured heights → EST_HEIGHT
-        this.measuredHeightCount    = 0;
-        this.spacerTopHeight   = -1;    // last written spacer px (skip no-op style writes)
-        this.spacerBottomHeight   = -1;
-        this.requestedAt  = new Map(); // idx → time of in-flight msgs.request
-        // Bumped on msgs.reload (the server SPLICED history — all indices
-        // shifted). Every msgs.request carries it and the server echoes it
-        // back on msgs.range; a reply from before the reload is dropped in
-        // onRange instead of caching old-world nodes at new-world indices.
+        this.totalCount = 0;
+        this.seq      = null;       // lens matches (store indices, ascending); null = all
+        this.plo      = 0;          // block = sequence positions [plo, phi]
+        this.phi      = -1;
+        this.CHUNK      = 40;       // rows per load at an end of the block
+        this.MAX_WINDOW = 160;      // rows kept before the far side is dropped
+        this.reqSeq   = 0;
+        this.pending  = {};         // kind ('older' | 'newer' | 'block') → in-flight request
+        // Bumped whenever the block is replaced or the server SPLICED history
+        // (msgs.reload: every index shifted). Every msgs.request carries it
+        // and the server echoes it on msgs.range, so a reply for a block that
+        // is gone is dropped instead of placed among the wrong rows.
         this.epoch        = 0;
         this.STREAM_APPLY_MS = 100; // min interval between streaming innerHTML applies
 
-        // ONE shared ResizeObserver for every node in the render window.
-        // (A fresh observer per node made every window enter/exit allocate +
-        // tear down an observer — churn on each scroll tick.)
-        //
-        // Heights are recorded as the BORDER BOX so they agree with the
-        // offsetHeight that `measureNodes` records: `contentRect` is the
-        // CONTENT box and undercounts every bubble by its padding + border
-        // (~22px for a text bubble). That undercount accumulated across the
-        // render window to MORE than the overscan, so the computed window
-        // start landed inside the viewport — visible bubbles were evicted
-        // ("bubbles hide before they leave the screen") and every eviction
-        // shrank scrollHeight mid-scroll (stutter).
-        this.messageHeightObserver = new ResizeObserver((entries) => {
+        // ONE ResizeObserver over the block's rows, for two jobs. A row ABOVE
+        // the viewport that changes height (an image or editor reaching its
+        // real size, a body mounting) would move everything the reader sees
+        // by the difference: the scroll position absorbs it here, before the
+        // frame paints. And in follow mode any growth chases the bottom: an
+        // image reaching its height after the last message has no chunk
+        // coming to chase it. Heights are the fractional BORDER BOX,
+        // recorded at adoption (`adoptRows`).
+        this.rowObserver = new ResizeObserver((entries) => {
             if (this.destroyed) return;
-            let changed = false;
-            for (const e of entries) {
-                const idx = e.target.__btIdx;
-                if (idx === undefined) continue;
-                const h = (e.borderBoxSize && e.borderBoxSize.length)
-                    ? e.borderBoxSize[0].blockSize
-                    : e.target.offsetHeight;
-                // h>0 guard keeps the last measured height through a
-                // hide/show cycle, so re-showing restores exact sizes.
-                if (h > 0 && this.heights.get(idx) !== h) {
-                    // Only pin a height the node has finished growing into.
-                    //
-                    // In follow mode EVERY message is briefly rendered as it
-                    // arrives, and a `bt_show` bubble is still unsized then —
-                    // its media url is a worker round-trip. So this fires with
-                    // the bare 24.5px bubble of a message that ends up at
-                    // 154px, and it then scrolls out of the window, where the
-                    // node is detached, has no layout, and can never be
-                    // corrected. `effHeight` hands that to every spacer and to
-                    // `indexAt`, so one frozen row mis-places every index past
-                    // it — which is what makes scrolling up land somewhere
-                    // else. Skipping leaves the row on EST_HEIGHT until the
-                    // media lands and this fires again with the real size.
-                    if (!this.heightIsFinal(e.target)) continue;
-                    this.heights.set(idx, h);
-                    changed = true;
+            // A hidden pane (display:none on a chat switch) reports every row
+            // at 0. That is no change of the content: skip it, keeping the
+            // heights the rows really have, so showing the pane again (which
+            // reports those same heights) reads as no change either.
+            // `onShown` restores the reading position.
+            const c = this.container;
+            if (!this.paneVisible || c.clientHeight === 0) return;
+            const st = c.scrollTop;
+            const sb = st + c.clientHeight;
+            const last = this.cache.get(this.order[this.order.length - 1]);
+            // In page order, so each row's place BEFORE this batch is its place
+            // now minus what the changed rows above it grew by (`shift`).
+            const rows = entries.map(e => [e.target, (e.borderBoxSize && e.borderBoxSize.length)
+                    ? e.borderBoxSize[0].blockSize : e.target.offsetHeight])
+                .sort(([a], [b]) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
+            let above = 0;
+            let shift = 0;
+            let grew = false;
+            for (const [node, h] of rows) {
+                const prev = node.__btH;
+                node.__btH = h;
+                if (prev === undefined || prev === h) continue;
+                grew = true;
+                if (node.collapsable && node.classList.contains('bt-tool-msg')) {
+                    this.scheduleBodyReport(node);
+                    this.onBodyMounted(node);        // a body built far away
+                }
+                const top = node.offsetTop - shift;
+                shift += h - prev;
+                if (node.offsetParent === null) continue;   // no box, no place
+                // The reader keeps the first row that STARTS in the viewport
+                // where it is, so every row starting above it absorbs its
+                // change: one entirely above, and one reaching in from above
+                // (the sliver of a video row over the message being read).
+                // A row covering the whole viewport, or the last one, is
+                // what is read, and keeps its own top instead.
+                if (top < st - 1 && (top + prev <= st + 1 || (top + prev < sb && node !== last))) {
+                    above += h - prev;
                 }
             }
-            // Apply corrections NOW (rAF-batched) instead of letting them
-            // ambush the next scroll tick. EXCEPT mid-scrollbar-drag:
-            // corrections then wait for release — re-spacing under a held
-            // thumb is exactly the flicker.
-            if (changed && !this.scrollbarDrag) this.queueRefresh();
+            if (above !== 0 && !this.followMode && !this.railDrag) {
+                c.scrollTop = st + above;
+                this.prevScrollTop = c.scrollTop;
+            }
+            if (grew && this.followMode) this.queueScrollToBottom();
+            // The thumb follows what is painted. This frame's scroll handler
+            // placed it with the new heights laid out but not yet corrected for
+            // (a row above the reader), or with the read row's old height, and
+            // the next scroll event comes a frame late: placed only then, the
+            // thumb jumped back and forth for a frame at every row that changed.
+            // Observers run before paint, so placing it here shows it right.
+            if (grew) this.updateRail();
         });
 
-        // ── Live-app keep-alive LRU ──────────────────────────────────────
-        // App embeds (msg.kind === 'bonito_app', marked data-bt-app) host a
-        // live Bonito sub-session + WGLMakie WebGL context. Plain removal on
-        // scroll-off closes the sub-session and disposes the context, so the
-        // app comes back dead. Instead we PARK such nodes in place via
-        // `display:none`: the node never leaves its parent, so Bonito's
-        // delete-observer never fires (session stays open) and the canvas
-        // stays under document.body (WGLMakie keeps the context); on-demand
-        // rendering means a hidden app costs ~0. `parked` holds the idxs that
-        // are display:none-parked (still in `rendered` so insertSorted/spacer
-        // math is unchanged). The browser hard-caps live WebGL contexts (~16,
-        // varies) and DESTROYS the oldest beyond that, so we keep at most
-        // APP_KEEPALIVE parked alive and clamp it well under that ceiling;
-        // the LRU-oldest beyond it spills to a snapshot+reload (Stage 2).
-        // Clamp hard: the browser destroys the oldest WebGL context past its
-        // ceiling (~16, varies), so keep this well under it. An optional
-        // window.BT_APP_KEEPALIVE override (set before connect) is clamped too —
-        // asking for 100 silently gives 10, never the danger zone.
+        // ── Live-app keep-alive ──────────────────────────────────────────
+        // App embeds (msg.kind === 'bonito_app' or a live eval result, marked
+        // data-bt-app) host a live Bonito sub-session + WGLMakie WebGL context.
+        // While their row is in the block they stay in the page and alive;
+        // on-demand rendering means an off-screen app costs ~0. But the
+        // browser hard-caps live WebGL contexts (~16, varies) and DESTROYS the
+        // oldest beyond that, so at most APP_KEEPALIVE apps outside the
+        // viewport stay live: the least-recently-visible one beyond that
+        // SPILLS to a snapshot + Reload button (`spillApp`). An optional
+        // window.BT_APP_KEEPALIVE override (set before connect) is clamped
+        // too: asking for 100 silently gives 10, never the danger zone.
         const wantKeepalive = (typeof window !== 'undefined' && Number.isFinite(window.BT_APP_KEEPALIVE))
             ? window.BT_APP_KEEPALIVE : 6;
         this.APP_KEEPALIVE = Math.min(10, Math.max(0, wantKeepalive));
-        this.parked = new Set();   // idx → parked (display:none, alive, off-screen)
-        this.appLru = [];          // app idxs, least-recently-visible first
-        // The .bt-messages flex column separates children with a row gap.
-        // The virtual height math must count it per item or the virtual
-        // geometry drifts ~gap px per message from the real scrollHeight —
-        // in long chats that drift exceeds the overscan and the bottom
-        // "bounces" away while scrolling down. Read it from the computed
-        // style so a CSS change can't silently re-introduce the drift.
-        this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
-        // A rendered node's real offsetTop = cumHeight(0, idx) + PAD_TOP + one
-        // ITEM_GAP: the container's top padding, plus the flex row-gap between the
-        // (always-present) top spacer and the first node — every OTHER gap is
-        // already folded into effHeight, and they telescope so this constant is
-        // window-position-independent. `restoreAnchor`'s virtual fallback needs
-        // it to convert a cumHeight() position into a real scrollTop.
-        this.PAD_TOP = parseFloat(getComputedStyle(container).paddingTop) || 0;
+        this.appLru = [];             // live app idxs, least-recently-visible first
+        this.visibleApps = new Set(); // app idxs intersecting the viewport
+        this.appObserver = new IntersectionObserver((entries) => {
+            if (this.destroyed) return;
+            for (const e of entries) {
+                const idx = e.target.__btIdx;
+                if (idx === undefined) continue;
+                if (e.isIntersecting) this.visibleApps.add(idx);
+                else this.visibleApps.delete(idx);
+                this.touchApp(idx);
+            }
+            this.enforceAppLru();
+        }, { root: container });
+
+        // ── Far bodies ───────────────────────────────────────────────────
+        // A tool body is the heavy part of a row: one Monaco diff is some 450
+        // elements and its editors' memory, and the block keeps up to
+        // MAX_WINDOW rows, so a turn of 60 edits held 60 live diffs (69 MB of
+        // heap, 27k elements). A heavy body more than three screens from the
+        // view is freed: a placeholder at its exact height takes its place,
+        // nothing moves, and Bonito frees its session (the editors with it).
+        // Back within a screen and a half, it is rendered again. Two
+        // distances, so a row at the edge does not flip back and forth.
+        this.freeObserver = new IntersectionObserver((entries) => {
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
+            for (const e of entries) if (!e.isIntersecting) this.freeBody(e.target);
+        }, { root: container, rootMargin: '300% 0px' });
+        // The same distance decides when a body is fetched the FIRST time
+        // (`requestBody`): a chat opened on 40 edits built 40 diff editors,
+        // one after another, before the last one showed.
+        this.mountObserver = new IntersectionObserver((entries) => {
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                const n = e.target;
+                if (n.dataset.btFreed) {
+                    this.unfreeBody(n);
+                } else if (n.dataset.btWantsBody) {
+                    delete n.dataset.btWantsBody;
+                    this.comm.notify({type: 'tool.render', id: n.dataset.msgId});
+                }
+            }
+        }, { root: container, rootMargin: '150% 0px' });
 
         // ── Scroll UX state ────────────────────────────────────────────
         // followMode: when true, new messages auto-scroll the viewport
@@ -341,37 +756,34 @@ class BonitoChat {
         // onShown's restore, the lens reset, and the pan/momentum writes.
         this.prevScrollTop = container.scrollTop;
 
-        this.spacerTop    = container.querySelector('.bt-spacer-top');
-        this.spacerBottom = container.querySelector('.bt-spacer-bottom');
+        this.rowsEnd = container.querySelector('.bt-rows-end');   // rows go before it
         // ── Filter / lens state ────────────────────────────────────────
         // The per-tool filter toolbar is GONE — the header lens bar
-        // (`setupLens`) replaces it. `keyByIdx` still drives effHeight, and
-        // the lens hides messages by a server-computed visible-index set
-        // (`lensVisible`). Native-media toggles live in the lens bar now.
+        // (`setupLens`) replaces it. `keyByIdx` drives the type filter; the
+        // lens narrows the sequence the block is loaded from to the indices
+        // the server matched (`seq`). Native-media toggles live in the lens
+        // bar now.
         this.toolbarEl   = (container.closest('.bt-app') || container.parentElement)
             .querySelector('.bt-chat-toolbar');
         if (this.toolbarEl) this.toolbarEl.style.display = 'none';
         this.hiddenTypes = new Set(DEFAULT_HIDDEN);   // kept for DEFAULT_HIDDEN
         this.seenTypes   = new Set();   // keys seen (drives the waiting line)
-        this.keyByIdx    = new Map();   // idx → filter key (drives effHeight)
+        this.keyByIdx    = new Map();   // idx → filter key, for the block's rows
         this.filterRow   = null;        // no per-tool checkboxes anymore
         this.nativeImages = true;       // bt_show image results: bare by default
         this.nativeVideos = true;       // bt_show video results: ditto
-        // Lens: server returns the set of VISIBLE 0-based indices for the
-        // current query (+ per-index actions). `lensActive=false` shows all.
+        // Lens: server returns the VISIBLE 0-based indices for the current
+        // query (+ per-index actions). `lensActive=false` shows all.
         this.lensActive  = false;
-        this.lensVisible = null;        // Set<idx> when active
         this.lensActions = null;        // Map<idx, action>
         this.lensQuery   = '';          // the query this tab currently applies
         this.lensVocab   = [];          // autocomplete keys (from the server)
         this.savedLenses = [];          // global favorites (from the server)
         this.lensClauses = [];          // committed pills: [{sign:'+'|'-', text}]
         this.lensPendingSign = '+';     // sign for the clause being composed
-        // Busy dots + thinking indicator are scroll CONTENT — they sit
-        // between the bottom spacer and the overscroll tail so they appear
-        // directly under the last message (not below the tail, down by the
-        // composer). Plain content like the tail: the virtual-scroll
-        // geometry never tracks them.
+        // Busy dots + thinking indicator are scroll CONTENT: they sit after
+        // the rows and before the overscroll tail, so they appear directly
+        // under the last message (not below the tail, down by the composer).
         this.busyEl       = container.querySelector('.bt-busy');
         // Idle "waiting for your next instruction" text: pure CSS — visible
         // exactly when .bt-busy is NOT active (adjacent-sibling rule). The
@@ -384,22 +796,12 @@ class BonitoChat {
         // Live chunk counter rendered next to the reasoning indicator — ticks
         // per streamed (redacted) thought chunk so a long think visibly moves.
         this.thinkingCountEl = container.querySelector('.bt-thinking-count');
+        // A thinking-token estimate is on the reasoning line (`onThinkingTokens`).
+        this.thinkingEstimate = false;
         // Overscroll tail: empty space below the last message the user can
         // scroll into (~30% of the pane; sized in the container RO).
         this.tailEl       = container.querySelector('.bt-messages-tail');
         this.sizeTail();
-        // Off-screen measuring host: prefetched nodes get REAL heights here
-        // before they're ever rendered, so the virtual geometry is exact
-        // everywhere and scrollbar drags see a stable scrollHeight (see
-        // `measureNodes`). Width is synced to the messages content box so
-        // text wrapping (and thus heights) match the live layout.
-        this.measureEl = document.createElement('div');
-        this.measureEl.className = 'bt-measure';
-        container.parentElement.appendChild(this.measureEl);
-        // Start the settle watch immediately: its hard cap must dismiss the
-        // load overlay (sidebar.jl chat_waiting_view) even if the comm
-        // bootstrap stalls.
-        this.startSettle();
 
         // Single subscription. `comm` is a Bonito Observable bridged via
         // WS; every message Julia sets via `model.comm[] = {...}` arrives here.
@@ -409,22 +811,6 @@ class BonitoChat {
             if (this.destroyed) return false;
             if (msg && typeof msg === 'object') this.dispatch(msg);
         });
-
-        // Ask Julia for the current message count. The reply arrives as
-        // `{type: "msgs.count", n}` and triggers the initial range fetch.
-        // If Julia already pushed a count (e.g., on a re-mount the
-        // observable still holds the latest dict), bootstrap from that
-        // immediately so we don't double-render.
-        const cur = comm.value;
-        if (cur && cur.type === 'msgs.count' && cur.n > 0) {
-            this.applyCount(cur.n);
-        } else if (cur && cur.type === 'msgs.range') {
-            // Re-mount of a chat that already has messages cached.
-            this.startSettle();
-            this.onRange(cur);
-            this.startPrefetch();
-        }
-        comm.notify({type: 'init'});
 
         // Track the last user input on the container. A scroll event
         // within ~400ms of a wheel/touch/keydown is treated as
@@ -453,19 +839,45 @@ class BonitoChat {
         // intervening frame took. Consumed on use; wall-clock can't
         // expire it because a blocked main thread can't deliver an
         // unrelated scroll event in between anyway.
-        this.lastUserInputT = 0;
+        // No input yet. Not 0: `performance.now()` counts from navigation
+        // start, so with 0 every scroll in the page's first 400ms looked like
+        // the user's, and a fast reload opened the chat off the bottom with
+        // follow mode off.
+        this.lastUserInputT = -Infinity;
         this.pendingUserScroll = false;
         const markUserInput = () => {
             this.lastUserInputT = performance.now();
             this.pendingUserScroll = true;
-            this.pendingAnchor = null;
             this.cancelPendingScroll();
+            this.cancelShowRestore();
         };
-        container.addEventListener('wheel',      markUserInput, { passive: true });
+        // Capture: BonitoBook stops wheels over editors on the way down.
+        container.addEventListener('wheel',      markUserInput, { passive: true, capture: true });
         container.addEventListener('touchstart', markUserInput, { passive: true });
         container.addEventListener('touchmove',  markUserInput, { passive: true });
         container.addEventListener('keydown',    markUserInput, { passive: true });
         this.markUserInput = markUserInput;
+
+        // A picture or a clip reports its natural size once its bytes are in.
+        // The server sends it back as the element's width/height with later
+        // renders (measured_sizes.jl), so the element has its size before the
+        // bytes arrive. Capture: neither event bubbles.
+        this.onMediaSized = (e) => {
+            const el = e.target;
+            if (!(el instanceof HTMLElement) || !el.classList.contains('bt-media')) return;
+            const path = el.closest('.bt-media-wrap')?.dataset.workerPath;
+            const video = el.tagName === 'VIDEO';
+            const w = video ? el.videoWidth : el.naturalWidth;
+            const h = video ? el.videoHeight : el.naturalHeight;
+            if (!path || !w || !h) return;
+            if (+el.getAttribute('width') === w && +el.getAttribute('height') === h) return;
+            // Unknown, or the file changed since: right now, and next time.
+            el.setAttribute('width', w);
+            el.setAttribute('height', h);
+            this.comm.notify({type: 'media.size', path, w, h});
+        };
+        container.addEventListener('load', this.onMediaSized, true);
+        container.addEventListener('loadedmetadata', this.onMediaSized, true);
 
         // File-path links: ONE delegated listener for every `.bt-path-link`
         // in the chat (tool titles, diff headers, search hits, linkified
@@ -473,6 +885,17 @@ class BonitoChat {
         // Capture phase, so a click on a linked TOOL TITLE opens the editor
         // instead of toggling the pill's expand state (the Collapsable
         // listener sits on the header, below us on the capture path).
+        // ↑ chips on a card that waits on an eval (bt_julia_continue /
+        // bt_julia_wait): bring that eval's card into view. Capture phase for
+        // the same reason as path links: the chip sits in a header whose
+        // click toggles the card.
+        container.addEventListener('click', (e) => {
+            const chip = e.target.closest('.bt-tool-jump');
+            if (!chip || !container.contains(chip)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.jumpToMessage(parseInt(chip.dataset.jumpIndex ?? '-1', 10), chip.dataset.jumpId);
+        }, { capture: true });
         container.addEventListener('click', (e) => {
             const link = e.target.closest('.bt-path-link');
             if (!link || !container.contains(link)) return;
@@ -483,41 +906,24 @@ class BonitoChat {
             this.comm.notify({ type: 'edit_file', path });
         }, { capture: true });
 
-        // Scrollbar drags emit NO wheel/touch/key events — only mousedown on
-        // the container (the scrollbar is part of its hit area) and then
-        // scroll events while the button is held, possibly for much longer
-        // than the 400ms recency window. Track the held state explicitly so
-        // a drag is always classified as user-driven; otherwise the chase
-        // treats it as a layout shift and yanks the thumb back to the
-        // bottom ("scrollbar feels stuck"). mouseup lands on window — the
-        // pointer often leaves the container before release.
+        container.addEventListener('click', e => {
+            const img = e.target.closest('.bt-agent-msg img, .bt-tool-md img');
+            if (!img || img.closest('a, .bt-media-wrap')) return;
+            e.stopPropagation();
+            openLightbox(img);
+        });
+
+        // A rail drag (`setupRail`) owns the position outright: chases and
+        // anchor corrections stand down while it is held. The native
+        // scrollbar is hidden, so nothing else can be a scrollbar drag.
         this.scrollbarDrag = false;
-        this.onContainerMouseDown = () => {
-            this.scrollbarDrag = true;
-            markUserInput();
+        this.railDrag = null;
+        // Window-level listener: a pane whose subtree was unmounted above the
+        // direct parent (the MutationObserver in `connect` can't see that)
+        // self-destroys lazily here.
+        this.onWindowMouseUp = () => {
+            if (!this.container.isConnected) this.lazyDestroy();
         };
-        this.onWindowMouseUp      = () => {
-            // Window-level listener: a pane whose subtree was unmounted above
-            // the direct parent (MutationObserver in `connect` can't see
-            // that) self-destroys lazily here.
-            if (!this.container.isConnected) { this.lazyDestroy(); return; }
-            if (!this.scrollbarDrag) return;
-            this.scrollbarDrag = false;
-            markUserInput();   // the release tick still counts as user input
-            // Auto-expands deferred during the drag (image bodies inflate
-            // scrollHeight — poison for a held thumb): mount them now. Only
-            // rendered nodes can carry a deferred flag from a mid-drag
-            // insert; detached flagged nodes expand on their insertSorted.
-            for (const idx of this.rendered) {
-                const node = this.cache.get(idx);
-                if (node && node.isConnected && node.dataset.btAutoExpand) {
-                    delete node.dataset.btAutoExpand;
-                    node.collapsable?.setExpanded(true);
-                }
-            }
-            this.queueRefresh();   // re-true spacers to the corrected heights
-        };
-        container.addEventListener('mousedown', this.onContainerMouseDown, { passive: true });
         window.addEventListener('mouseup', this.onWindowMouseUp, { passive: true });
 
         // ── Grab-to-pan with fling momentum + rubberband ──────────────
@@ -658,7 +1064,9 @@ class BonitoChat {
                 p.engaged = true;
                 p.lastY = e.clientY;
                 p.lastT = performance.now();
-                try { this.container.setPointerCapture(e.pointerId); } catch (_) {}
+                // A pointer that is not live (a scripted event) can't be captured.
+                try { this.container.setPointerCapture(e.pointerId); }
+                catch (error) { if (error.name !== 'NotFoundError') throw error; }
                 this.container.classList.add('bt-messages-grabbing');
                 // Pan acts like a wheel: cancels pending chase + marks
                 // user input so the scroll handler treats subsequent
@@ -709,7 +1117,7 @@ class BonitoChat {
             const vel     = p.velocity;
             this.panState = null;
             if (!engaged) return;
-            try { this.container.releasePointerCapture(e.pointerId); } catch (_) {}
+            if (this.container.hasPointerCapture(e.pointerId)) this.container.releasePointerCapture(e.pointerId);
             this.container.classList.remove('bt-messages-grabbing');
             if (Math.abs(vel) > PAN_FLING_THRESHOLD) {
                 this.momentumRaf = requestAnimationFrame(() => momentumStep(vel));
@@ -735,7 +1143,7 @@ class BonitoChat {
             // followMode back to true and chase the pane to the bottom on the
             // next onShown — the user's read position lost. Ignore it: the pane
             // has no viewport, so there is nothing to classify.
-            if (this.container.clientHeight === 0) return;
+            if (!this.paneVisible || this.container.clientHeight === 0) return;
             // Last position seen with a real layout box. `restoreAfterMove`
             // puts this back when the workspace re-inserts our panel and the
             // browser silently drops scrollTop to 0.
@@ -769,7 +1177,7 @@ class BonitoChat {
             // once the last message is completely out of view (plain), glowing
             // only when unread. atBot still owns the unread-clear.
             this.updateScrollAffordance(atBot);
-            this.refresh();
+            this.ensureWindow();
         };
         container.addEventListener('scroll', this.onScroll, { passive: true });
 
@@ -788,7 +1196,7 @@ class BonitoChat {
             if (this.destroyed) return;
             // A zero-height (hidden) container has nothing to chase — and the
             // re-show / restore is owned by onShown(), so don't fight it here.
-            if (this.container.clientHeight === 0) return;
+            if (!this.paneVisible || this.container.clientHeight === 0) return;
             this.sizeTail();
             if (this.followMode) this.queueScrollToBottom();
         });
@@ -810,13 +1218,28 @@ class BonitoChat {
         // is in the DOM, on a microtask so .bt-app's children are queryable.
         Promise.resolve().then(() => {
             this.setupInputs();
+            this.setCancelling(this.cancelling ?? false);
             this.setupLiveTicker();
             this.setupLens();
         });
+        this.setupRail();
+
+        // The pane arrives with the newest messages (`transcript_tail` on the
+        // server): they show now, with no round trip. `init` still asks for
+        // the count, which may have moved on since the pane was rendered, and
+        // for the lens and queue state. Without a tail (a server that sends
+        // none) the count's reply loads it.
+        const tail = init.tail;
+        if (tail && Number.isInteger(tail.n)) this.applyTail(tail);
+        comm.notify({type: 'init'});
     }
 
     destroy() {
         this.destroyed = true;
+        this.workspacePanel?.removeEventListener('bw-panel-visibility', this.onWorkspaceVisibility);
+        this.cancelShowRestore();
+        CODE_OBSERVERS.get(this.container)?.disconnect();
+        CODE_OBSERVERS.delete(this.container);
         if (this.elapsedTimer) {
             clearInterval(this.elapsedTimer);
             this.elapsedTimer = null;
@@ -825,13 +1248,14 @@ class BonitoChat {
             this.container.removeEventListener('scroll', this.onScroll);
         }
         if (this.markUserInput) {
-            this.container.removeEventListener('wheel',    this.markUserInput);
+            this.container.removeEventListener('wheel',    this.markUserInput, { capture: true });
             this.container.removeEventListener('touchstart', this.markUserInput);
             this.container.removeEventListener('touchmove',  this.markUserInput);
             this.container.removeEventListener('keydown',  this.markUserInput);
         }
-        if (this.onContainerMouseDown) {
-            this.container.removeEventListener('mousedown', this.onContainerMouseDown);
+        if (this.onMediaSized) {
+            this.container.removeEventListener('load', this.onMediaSized, true);
+            this.container.removeEventListener('loadedmetadata', this.onMediaSized, true);
         }
         if (this.onWindowMouseUp) {
             window.removeEventListener('mouseup', this.onWindowMouseUp);
@@ -852,9 +1276,12 @@ class BonitoChat {
         if (this.viewportObserver) {
             this.viewportObserver.disconnect();
         }
-        if (this.messageHeightObserver) this.messageHeightObserver.disconnect();
+        if (this.rowObserver) this.rowObserver.disconnect();
+        if (this.appObserver) this.appObserver.disconnect();
+        if (this.freeObserver) this.freeObserver.disconnect();
+        if (this.mountObserver) this.mountObserver.disconnect();
         if (this.moveObserver) this.moveObserver.disconnect();
-        this.observed.clear();
+        this.teardownRail();
         if (this.onPaste && this.textInput) {
             this.textInput.removeEventListener('paste', this.onPaste);
         }
@@ -869,6 +1296,24 @@ class BonitoChat {
         if (this.onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this.onAppClickCapture, true);
         }
+        if (this.onDraftInput && this.textInput) {
+            this.flushDraft();
+            this.textInput.removeEventListener('input', this.onDraftInput);
+            this.textInput.removeEventListener('blur', this.flushDraft);
+            window.removeEventListener('pagehide', this.flushDraft);
+            document.removeEventListener('visibilitychange', this.onDraftVisibility);
+        }
+        if (this.textInput) {
+            this.textInput.removeEventListener('compositionstart', this.onCompositionStart);
+            this.textInput.removeEventListener('compositionend', this.onCompositionEnd);
+            if (this.onInputResize) {
+                this.textInput.removeEventListener('input', this.onInputResize);
+                this.textInput.removeEventListener('bt-composer-resize', this.onInputResize);
+            }
+        }
+        if (this.inputResizeFrame) cancelAnimationFrame(this.inputResizeFrame);
+        this.inputWidthObserver?.disconnect();
+        this.inputMeasure?.remove();
         if (this.onAppChange && this.app) {
             this.app.removeEventListener('change', this.onAppChange);
         }
@@ -881,12 +1326,6 @@ class BonitoChat {
             this.onDrop      && this.app.removeEventListener('drop',      this.onDrop);
         }
         clearTimeout(this.attachErrorTimer);
-        clearTimeout(this.prefetchTimer);
-        // Torn down mid-settle: clear the in-progress flag so a successor
-        // overlay doesn't read a stale "settling" state off the pane (the
-        // overlay's own timeout failsafe covers the never-settled case).
-        if (!this.settleDone && this.paneEl) delete this.paneEl.dataset.btSettling;
-        if (this.measureEl) { this.measureEl.remove(); this.measureEl = null; }
         if (this.tickerId) {
             clearInterval(this.tickerId);
             this.tickerId = null;
@@ -907,8 +1346,7 @@ class BonitoChat {
     // next global event instead of reacting forever.
     lazyDestroy() {
         if (this.destroyed) return;
-        try { this.destroy(); } catch (_) { /* already half-gone */ }
-        CHAT_INSTANCES.delete(this);
+        try { this.destroy(); } finally { CHAT_INSTANCES.delete(this); }
     }
 
     // Single dispatch table. Julia sends `{type, ...}`; we route here.
@@ -919,8 +1357,20 @@ class BonitoChat {
         if (typeof msg.n === 'number' && msg.n > this.totalCount) {
             this.totalCount = msg.n;
         }
+        // The model's output, or the turn's end, ends a thinking estimate
+        // (`onThinkingTokens`).
+        if (this.thinkingEstimate && ['chunk', 'agent', 'thought', 'tool', 'tool_update',
+                'plan', 'summary', 'agent_final', 'thinking', 'busy_end', 'session_reset']
+                .includes(msg.type))
+            this.endThinkingEstimate();
 
         switch (msg.type) {
+            case 'queue.state': return this.renderQueue(msg);
+            case 'queue.delivered': return this.queueDelivered(msg);
+            case 'cancel.state':
+                this.turnSeq = msg.seq;
+                this.setCancelling(msg.stopping);
+                return;
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'msgs.reload':  return this.onMsgsReload(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
@@ -939,11 +1389,13 @@ class BonitoChat {
                 if (this.followMode) this.queueScrollToBottom();
                 return;
             case 'busy_end':
+                this.setCancelling(false);
                 this.busyEl?.classList.remove('bt-busy-active');
                 if (this.followMode) this.queueScrollToBottom();
                 return;
             case 'agent_final':  return this.onAgentFinal(msg);
             case 'thinking':     return this.onThinking(msg);
+            case 'thinking_tokens': return this.onThinkingTokens(msg.tokens);
             case 'permission':      return this.onPermission(msg);
             case 'permission_done': return this.onPermissionDone(msg);
             case 'question':        return this.onQuestion(msg);
@@ -972,144 +1424,386 @@ class BonitoChat {
         }
     }
 
-    // ── Range / virtual scroll ────────────────────────────────────────────
+    // ── The loaded block ──────────────────────────────────────────────────
+    // (The model is described in the constructor.)
 
-    // Full re-sync: the server SPLICED or rebuilt the history (a resumed
-    // session's reconcile inserted messages mid-store), so every cached
-    // index → node mapping is invalid. Tear the rendered window down and
-    // re-run the initial mount cascade against the new total, pinned to the
-    // bottom — the newest messages are what a sync is for.
-    onMsgsReload(n) {
-        for (const node of this.cache.values()) node.remove();
-        this.cache.clear();
-        this.heights.clear();
-        this.pendingAnchor = null;
-        this.rendered.clear();
-        this.nodeById.clear();
-        this.observed.clear();
-        this.requestedAt.clear();
-        this.cancelPendingScroll();
-        // Indices shifted: invalidate every in-flight range reply (onRange
-        // drops mismatching epochs) and restart the history backfill against
-        // the new indices.
-        this.epoch++;
-        this.prefetchStarted = false;
-        this.prefetchCursor  = null;
-        this.prefetchPending = null;
-        clearTimeout(this.prefetchTimer);
-        this.totalCount    = 0;      // applyCount below re-sets it
-        this.bootstrapped = false;  // re-arm the initial bottom-pin cascade
-        this.followMode    = true;
-        this.unreadCount   = 0;
-        this.applyCount(n);
+    // Positions run over every store index, or over the lens matches while a
+    // lens is on (`seq`).
+    seqLength() { return this.seq ? this.seq.length : this.totalCount; }
+    seqIndex(p) { return this.seq ? this.seq[p] : p; }
+    // Position of store index `idx` in the sequence, or -1.
+    seqPos(idx) {
+        if (!this.seq) return (idx >= 0 && idx < this.totalCount) ? idx : -1;
+        let lo = 0, hi = this.seq.length - 1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const v = this.seq[mid];
+            if (v === idx) return mid;
+            if (v < idx) lo = mid + 1; else hi = mid - 1;
+        }
+        return -1;
+    }
+    blockEmpty() { return this.phi < this.plo; }
+    // Does the block end at the last message of the sequence?
+    atTail() { return this.phi === this.seqLength() - 1; }
+
+    // The tail the pane was rendered with ({n, start, msgs}, see the
+    // server's `transcript_tail`).
+    applyTail(tail) {
+        this.totalCount = Math.max(this.totalCount, tail.n);
+        if (tail.n === 0) { this.markReady(); this.updateRail(); return; }
+        const items = (tail.msgs || []).map((m, i) => [tail.start + i, m]);
+        this.replaceBlock(items, { kind: 'tail' });
     }
 
+    // The count, as `init` and the server's resyncs report it. Growth means
+    // more at the end: fetched when the block reaches the end. A count that
+    // SHRANK means the indices moved: start over.
     applyCount(n) {
-        if (n <= 0) {
-            // Empty chat: nothing to settle — dismiss the load overlay
-            // right away.
-            this.startSettle();
-            this.settle();
+        if (n < this.totalCount) { this.onMsgsReload(n); return; }
+        this.totalCount = n;
+        if (n === 0) { this.markReady(); this.updateRail(); return; }
+        if (this.blockEmpty()) {
+            if (!this.pending.block) this.loadTail();
             return;
         }
-        this.totalCount  = n;
-        // Only the FIRST count arms initial-mount behavior. `msgs.count` is
-        // re-broadcast on a shared channel (another tab's init handshake, a
-        // session restart), and re-arming `initialLoad` here made the NEXT
-        // msgs.range — including ranges OTHER tabs requested — run the
-        // initial scroll cascade: follow mode force-enabled and the pane
-        // yanked to the bottom while the user was reading scrollback.
-        if (!this.bootstrapped) {
-            this.bootstrapped = true;
-            this.initialLoad = true;
-        }
-        this.startSettle();
-        this.refresh();
-        // `refresh()` requests only rows it does not already have. When the
-        // window is fully cached — the streaming case, where this turn appended
-        // its own bubbles before the count landed — no request goes out, so
-        // `onRange` never runs and never clears `initialLoad`. Run the cascade
-        // here instead of waiting for a range that is not coming.
-        if (this.initialLoad && !this.rangeMissing()) this.runInitialMountCascade();
-        this.startPrefetch();
+        this.ensureWindow();
     }
 
-    // ── Settle watch (drives the load overlay) ────────────────────────────
-    // The first second after mount is geometry soup: the visible window
-    // renders, estimate heights correct to measurements, bt_show images
-    // mount and resize their nodes — the scrollbar visibly pumps. The
-    // dashboard's load overlay (sidebar.jl chat_waiting_view) covers the
-    // pane through all of it; this module owns settle DETECTION and tells
-    // the overlay when to move on:
-    //   bt-chat-settling  (watch started — overlay flips to "Rendering
-    //                      messages…")
-    //   bt-chat-settled   (geometry quiet — overlay fades out)
-    // Both are window events carrying the pane pid, mirrored as
-    // data-bt-settling / data-bt-settled flags on the .bt-chatpane so an
-    // overlay that mounts AFTER an event fired (kept-alive revisit) reads
-    // the state synchronously. Settle = scrollHeight unchanged for ~10
-    // frames once the initial scroll passes are done; image loads reset
-    // the quiet counter via their height changes, so image-heavy chats
-    // simply hold the overlay a little longer. Hard cap so a broken image
-    // can never strand it.
-    startSettle() {
-        if (this.settleWatch || this.settleDone) return;
-        this.settleWatch  = true;
-        this.settleStartedAt     = performance.now();
-        this.settleLastHeight  = -1;
-        this.settleStable = 0;
+    // Full re-sync: the server SPLICED or rebuilt the history (a resumed
+    // session's reconcile inserted messages mid-store), so every index the
+    // block holds is invalid. Start over from the tail, pinned to the bottom:
+    // the newest messages are what a sync is for. A lens's matches are
+    // indices too, so its query runs again.
+    onMsgsReload(n) {
+        this.totalCount = n;
+        this.seq = null;
+        if (this.lensActive) this.runLens(this.lensQuery);
+        this.clearBlock();
+        this.setFollowMode(true);
+        this.unreadCount = 0;
+        this.loadTail();
+    }
+
+    loadTail() {
+        const len = this.seqLength();
+        if (len === 0) {
+            this.clearBlock();
+            this.markReady();
+            this.updateRail();
+            return;
+        }
+        this.requestBlock(Math.max(0, len - this.CHUNK), len - 1, { kind: 'tail' });
+    }
+
+    // Ask for a whole new block, positions [pa, pb]. `opts.kind` says where
+    // the view goes when it lands: 'tail' the bottom; 'jump' position
+    // `opts.target` near the top; 'lens' the top; 'restore' store index
+    // `opts.idx` back at viewport offset `opts.off`.
+    requestBlock(pa, pb, opts) {
+        this.epoch++;            // replies for the old block are dead
+        this.pending = {};
+        this.request('block', pa, pb, opts);
+    }
+
+    request(slot, pa, pb, opts = {}) {
+        if (pa > pb) return;
+        const id = ++this.reqSeq;
+        this.pending[slot] = { ...opts, id, slot, pa, pb };
+        const msg = { type: 'msgs.request', epoch: this.epoch, req: id };
+        if (this.seq) msg.indices = this.seq.slice(pa, pb + 1);
+        else msg.range = [pa, pb];
+        this.comm.notify(msg);
+    }
+
+    onRange(msg) {
+        if (msg.epoch !== undefined && msg.epoch !== null && msg.epoch !== this.epoch) return;
+        const req = Object.values(this.pending).find(r => r.id === msg.req);
+        if (!req) return;                     // superseded
+        delete this.pending[req.slot];
+        const msgs = msg.msgs ?? [];
+        const items = Array.isArray(msg.indices)
+            ? msg.indices.map((idx, i) => [idx, msgs[i]])
+            : msgs.map((m, i) => [msg.start + i, m]);
+        if (req.slot === 'older') this.prependItems(items);
+        else if (req.slot === 'newer') this.appendItems(items);
+        else this.replaceBlock(items, req);
+        this.ensureWindow();
+    }
+
+    // A row for store index `idx` from its wire dict. Not yet in the page.
+    makeRow(idx, data) {
+        const node = this.createNode(data);
+        node.__btIdx = idx;
+        node.__btId = data.id;
+        this.cache.set(idx, node);
+        this.keyByIdx.set(idx, filterKey(data));
+        if (data.id) this.nodeById.set(data.id, node);
+        this.applyVisibility(idx, node);
+        // A lens can ask for its matches expanded: done once the row is in
+        // the page, so the body has a slot to mount into (`mountDeferred`).
+        if (this.lensActions?.get(idx) === 'expand') node.dataset.btAutoExpand = '1';
+        return node;
+    }
+
+    // New rows are in the page: mount what waited for a document, then
+    // record the height each row has now and watch it. Recording here, not
+    // on the observer's first report, matters: a body arriving before the
+    // next frame (a bt_show video expanding) would otherwise be that first
+    // report, recorded as the start and never compensated. A row without a
+    // box (hidden pane, filtered type) records on its first report instead.
+    adoptRows(nodes) {
+        for (const node of nodes) {
+            this.mountDeferred(node);
+            if (this.lensActions?.get(node.__btIdx) === 'collapse') {
+                node.collapsable?.setExpanded(false);
+            }
+        }
+        for (const node of nodes) {
+            if (node.offsetParent !== null) node.__btH = node.getBoundingClientRect().height;
+            this.rowObserver.observe(node);
+            if (node.classList.contains('bt-tool-msg')) {
+                this.freeObserver.observe(node);
+                this.mountObserver.observe(node);
+            }
+            if (node.dataset.btApp) {
+                this.appObserver.observe(node);
+                this.touchApp(node.__btIdx);
+            }
+        }
+    }
+
+    removeRow(idx) {
+        const node = this.cache.get(idx);
+        if (!node) return;
+        this.rowObserver.unobserve(node);
+        this.freeObserver.unobserve(node);
+        this.mountObserver.unobserve(node);
+        clearTimeout(node.__btBodyTimer);
+        if (node.dataset.btApp) {
+            this.appObserver.unobserve(node);
+            this.visibleApps.delete(idx);
+            const li = this.appLru.indexOf(idx);
+            if (li !== -1) this.appLru.splice(li, 1);
+        }
+        if (node.__btId && this.nodeById.get(node.__btId) === node) this.nodeById.delete(node.__btId);
+        this.cache.delete(idx);
+        this.keyByIdx.delete(idx);
+        this.clearPendingStream(node);
+        node.remove();
+    }
+
+    clearBlock() {
+        for (const idx of this.order) this.removeRow(idx);
+        this.order = [];
+        this.plo = 0;
+        this.phi = -1;
+    }
+
+    // Insert `items` ([[idx, dict], ...], ascending) as rows before `before`.
+    insertRows(items, before) {
+        const frag = document.createDocumentFragment();
+        const nodes = [];
+        for (const [idx, data] of items) {
+            const node = this.makeRow(idx, data);
+            frag.appendChild(node);
+            nodes.push(node);
+        }
+        this.container.insertBefore(frag, before);
+        return nodes;
+    }
+
+    replaceBlock(items, req) {
+        this.clearBlock();
+        const rows = items.filter(([, d]) => d != null);
+        const nodes = this.insertRows(rows, this.rowsEnd);
+        this.order = rows.map(([idx]) => idx);
+        if (this.order.length) {
+            this.plo = this.seqPos(this.order[0]);
+            this.phi = this.seqPos(this.order[this.order.length - 1]);
+        }
+        this.adoptRows(nodes);
+        this.placeView(req);
+        this.markReady();
+    }
+
+    // Older rows, above the block. Everything new is above the reader, so
+    // the scroll position grows by exactly what was inserted.
+    prependItems(items) {
+        const rows = items.filter(([idx, d]) => d != null && !this.cache.has(idx));
+        if (rows.length === 0) return;
+        if (this.seqPos(rows[rows.length - 1][0]) !== this.plo - 1) return;   // block moved on
+        const c = this.container;
+        const before = c.scrollHeight;
+        const top = c.scrollTop;
+        const first = this.cache.get(this.order[0]) || this.rowsEnd;
+        const nodes = this.insertRows(rows, first);
+        this.order = rows.map(([idx]) => idx).concat(this.order);
+        this.plo = this.seqPos(rows[0][0]);
+        // Adopted first: what mounting expands is part of what was inserted.
+        this.adoptRows(nodes);
+        const grown = c.scrollHeight - before;
+        if (grown !== 0 && !this.railDrag) {
+            c.scrollTop = top + grown;
+            this.prevScrollTop = c.scrollTop;
+        }
+    }
+
+    // Newer rows, below the block. Rows that streamed in meanwhile are
+    // already there and skipped.
+    appendItems(items) {
+        const rows = items.filter(([idx, d]) => d != null && !this.cache.has(idx));
+        if (rows.length === 0) return;
+        if (this.seqPos(rows[0][0]) !== this.phi + 1) return;   // block moved on
+        const nodes = this.insertRows(rows, this.rowsEnd);
+        this.order = this.order.concat(rows.map(([idx]) => idx));
+        this.phi = this.seqPos(rows[rows.length - 1][0]);
+        this.adoptRows(nodes);
+        if (this.followMode) this.queueScrollToBottom();
+    }
+
+    // Where the view goes once a new block is in (see `requestBlock`).
+    placeView(req) {
+        const c = this.container;
+        const kind = req.kind || 'tail';
+        if (kind === 'tail') {
+            this.setFollowMode(true);
+            c.scrollTop = c.scrollHeight;
+        } else if (kind === 'lens') {
+            this.setFollowMode(false);
+            c.scrollTop = 0;
+        } else if (kind === 'restore') {
+            this.setFollowMode(false);
+            this.restoreAnchor({ idx: req.idx, off: req.off });
+        } else if (kind === 'jump') {
+            this.setFollowMode(false);
+            const node = this.cache.get(this.seqIndex(req.target));
+            if (node && node.offsetParent !== null) {
+                c.scrollTop = Math.max(0, node.offsetTop - (req.offset ?? 8));
+            }
+            if (req.flashId) this.flash(req.flashId);
+        }
+        this.prevScrollTop = c.scrollTop;
+        this.updateScrollAffordance(this.atBottom());
+    }
+
+    // Load more at whichever end of the block the viewport is near, and
+    // keep the block bounded. Runs on every scroll and after every insert,
+    // so it stops by itself once the viewport is a margin away from both ends.
+    ensureWindow() {
+        if (this.destroyed) return;
+        const c = this.container;
+        if (!this.paneVisible || this.railDrag || c.clientHeight === 0) { this.updateRail(); return; }
+        const len = this.seqLength();
+        if (this.pending.block || len === 0) { this.updateRail(); return; }
+        if (this.blockEmpty()) { this.loadTail(); return; }
+        const margin = Math.max(800, 2 * c.clientHeight);
+        if (this.plo > 0 && !this.pending.older && c.scrollTop < margin) {
+            this.request('older', Math.max(0, this.plo - this.CHUNK), this.plo - 1);
+        }
+        if (this.phi < len - 1 && !this.pending.newer &&
+            c.scrollHeight - c.scrollTop - c.clientHeight < margin) {
+            this.request('newer', this.phi + 1, Math.min(len - 1, this.phi + this.CHUNK));
+        }
+        this.trimBlock();
+        this.updateRail();
+    }
+
+    // Rows of the block whose box meets the viewport, as positions in
+    // `order`: [first, last], or [-1, -1]. Hidden rows have no box.
+    visibleSpan() {
+        const st = this.container.scrollTop;
+        const sb = st + this.container.clientHeight;
+        let first = -1, last = -1;
+        for (let i = 0; i < this.order.length; i++) {
+            const node = this.cache.get(this.order[i]);
+            if (!node || node.offsetParent === null) continue;
+            const top = node.offsetTop;
+            if (top + node.offsetHeight <= st + 1) continue;
+            if (top >= sb) break;
+            if (first < 0) first = i;
+            last = i;
+        }
+        return [first, last];
+    }
+
+    // Keep the block at MAX_WINDOW rows: past that, drop rows on the side
+    // farther from the viewport, down to MAX_WINDOW - CHUNK, leaving half a
+    // chunk beyond the viewport on that side. Rows dropped above the reader
+    // take the scroll position down with them. A row held fullscreen stays.
+    trimBlock() {
+        const n = this.order.length;
+        if (n <= this.MAX_WINDOW) return;
+        const [first, last] = this.visibleSpan();
+        if (first < 0) return;
+        const c = this.container;
+        const excess = n - (this.MAX_WINDOW - this.CHUNK);
+        const keepBeyond = Math.floor(this.CHUNK / 2);
+        const above = first, below = n - 1 - last;
+        const holds = (ids) => ids.some(idx => this.holdsFullscreen(this.cache.get(idx)));
+        if (above >= below) {
+            const d = Math.min(excess, above - keepBeyond);
+            if (d <= 0 || holds(this.order.slice(0, d))) return;
+            const before = c.scrollHeight;
+            const top = c.scrollTop;
+            for (const idx of this.order.splice(0, d)) this.removeRow(idx);
+            this.plo = this.seqPos(this.order[0]);
+            const shrunk = before - c.scrollHeight;
+            if (shrunk !== 0) {
+                c.scrollTop = top - shrunk;
+                this.prevScrollTop = c.scrollTop;
+            }
+        } else {
+            const d = Math.min(excess, below - keepBeyond);
+            if (d <= 0 || holds(this.order.slice(n - d))) return;
+            for (const idx of this.order.splice(n - d)) this.removeRow(idx);
+            this.phi = this.seqPos(this.order[this.order.length - 1]);
+        }
+    }
+
+    // Go to sequence position `p`: scrolled into view when the block has
+    // it, else a new block around it. The last position is the bottom, in
+    // follow mode. `offset` is the gap above the target row.
+    jumpToPosition(p, { flashId = null, offset = 8 } = {}) {
+        const len = this.seqLength();
+        if (len === 0) return;
+        p = Math.max(0, Math.min(len - 1, p));
+        if (p === len - 1) {
+            this.setFollowMode(true);
+            this.scrollToBottom();
+            if (flashId) this.flash(flashId);
+            return;
+        }
+        this.setFollowMode(false);
+        const node = this.cache.get(this.seqIndex(p));
+        if (node && p >= this.plo && p <= this.phi && node.offsetParent !== null) {
+            this.container.scrollTop = Math.max(0, node.offsetTop - offset);
+            this.prevScrollTop = this.container.scrollTop;
+            if (flashId) this.flash(flashId);
+            this.ensureWindow();
+            return;
+        }
+        const back = Math.floor(this.CHUNK / 2);
+        this.requestBlock(Math.max(0, p - back), Math.min(len - 1, p + this.CHUNK),
+                          { kind: 'jump', target: p, offset, flashId });
+    }
+
+    flash(id) {
+        const node = this.nodeById.get(id);
+        if (!node) return;
+        node.classList.remove('bt-jump-flash');
+        void node.offsetWidth;            // restart the animation on a repeat click
+        node.classList.add('bt-jump-flash');
+        setTimeout(() => node.classList.remove('bt-jump-flash'), 1800);
+    }
+
+    // The load card (sidebar.jl ChatWaitingView) waits for this: the
+    // transcript shows its rows. Once per instance.
+    markReady() {
+        if (this.ready) return;
+        this.ready = true;
         this.paneEl = this.container.closest('.bt-chatpane');
-        if (this.paneEl) {
-            delete this.paneEl.dataset.btSettled;
-            this.paneEl.dataset.btSettling = '1';
-        }
-        this.announceSettle('bt-chat-settling');
-        const watch = () => {
-            if (this.destroyed || this.settleDone) return;
-            const h = this.container.scrollHeight;
-            if (h === this.settleLastHeight) this.settleStable++;
-            else { this.settleStable = 0; this.settleLastHeight = h; }
-            const elapsed = performance.now() - this.settleStartedAt;
-            // Quiet geometry alone isn't enough: a tool body still being
-            // fetched (native bt_show images come from the worker) shows a
-            // "loading…" placeholder with STABLE height, and a mounted
-            // <img> may not have decoded yet — both would pop in right
-            // after an early reveal ("saw the box flash"). Hold for them
-            // too; the hard cap still guarantees the overlay lifts.
-            // EXCEPT video bodies: a multi-GB bt_show fetch takes minutes,
-            // not frames — the overlay must not ride out its hard cap on
-            // every reload. Videos pop in when ready; the follow chase
-            // absorbs the height jump.
-            const pendingBody = [...this.container.querySelectorAll('.bt-collapsable-loading')]
-                .some(el => !(el.closest('.bt-tool-msg')?.dataset.showMime || '')
-                    .startsWith('video/'));
-            const pendingImg  = [...this.container.querySelectorAll('img')]
-                .some(img => !img.complete);
-            const settled = this.settleStable >= 10 &&
-                            elapsed > 400 && !this.initialLoad &&
-                            !pendingBody && !pendingImg;
-            if (settled || elapsed > 5000) this.settle();
-            else requestAnimationFrame(watch);
-        };
-        requestAnimationFrame(watch);
-    }
-
-    settle() {
-        if (this.settleDone) return;
-        this.settleDone  = true;
-        this.settleWatch = false;
-        // Land exactly at the bottom of the SETTLED layout before the
-        // overlay reveals it — but ONLY if follow mode is still on.
-        // followMode starts true on construction, so it's false here only
-        // because the user actively scrolled away while the watch was
-        // running (slow image chats can ride out the 5s hard cap with the
-        // pane fully interactive). Forcing it back on would yank them to
-        // the bottom mid-read.
-        if (this.followMode) this.scrollToBottom();
-        if (this.paneEl) {
-            delete this.paneEl.dataset.btSettling;
-            this.paneEl.dataset.btSettled = '1';
-        }
+        if (this.paneEl) this.paneEl.dataset.btSettled = '1';
         this.announceSettle('bt-chat-settled');
     }
 
@@ -1118,508 +1812,366 @@ class BonitoChat {
         window.dispatchEvent(new CustomEvent(name, { detail: pid }));
     }
 
-    // ── Background history prefetch ──────────────────────────────────────
-    // Trickle-load the ENTIRE history into the node cache after mount, so
-    // scrolling/seeking never lands on blank spacer. Bottom-up (the
-    // direction users scroll into), 64 messages per request, each chunk
-    // paced on the previous response — user-driven fetches and streaming
-    // always win the wire. Cached-only during scrollbar drags by design
-    // (onRange skips DOM work mid-drag), so blanks fill in on release.
-    startPrefetch() {
-        if (this.prefetchStarted) return;
-        this.prefetchStarted = true;
-        this.prefetchTimer = setTimeout(() => this.prefetchTick(), 600);
-    }
-
-    prefetchTick() {
-        if (this.destroyed) return;
-        if (this.prefetchPaused) return;   // hidden pane — onShown resumes
-        // Highest missing index at or below the cursor.
-        let e = -1;
-        for (let i = Math.min(this.prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
-            if (!this.cache.has(i)) { e = i; break; }
-        }
-        if (e < 0) return;                       // fully cached — done
-        let s = e;
-        while (s > 0 && !this.cache.has(s - 1) && (e - s) < 63) s--;
-        this.prefetchCursor = s - 1;
-        // Marks the in-flight chunk so onRange can treat its arrival as
-        // SILENT (cache-only): prefetch must not re-window/scroll per chunk
-        // — that's a visible flicker storm right after mount.
-        this.prefetchPending = [s, e];
-        this.comm.notify({type: 'msgs.request', range: [s, e], epoch: this.epoch});
-        // onRange reschedules the next tick when the response lands; this
-        // timer is only the safety net for a lost/empty response.
-        clearTimeout(this.prefetchTimer);
-        this.prefetchTimer = setTimeout(() => this.prefetchTick(), 2000);
-    }
-
-    visibleRange() {
-        if (this.totalCount === 0) return [0, -1];
-        const { scrollTop, clientHeight } = this.container;
-        const over = this.OVERSCAN * this.EST_HEIGHT;
-        const s = this.indexAt(Math.max(0, scrollTop - over));
-        const e = this.indexAt(scrollTop + clientHeight + over);
-        return [s, Math.min(this.totalCount - 1, e)];
-    }
-
-    // Effective height: 0 for filtered-out keys (display:none flex items
-    // produce no gap either), else the measured height (or the estimate)
-    // PLUS the flex row gap that follows each rendered item. The ONLY way
-    // spacer/offset math may read heights — keeping it gap-aware makes a
-    // measured node's virtual contribution match its real pixels exactly.
-    // `observe`'s h>0 guard keeps the last measured height through a
-    // hide/show cycle, so re-showing restores exact sizes.
-    effHeight(i) {
-        // Lens-hidden indices contribute 0 height (their nodes are
-        // display:none), so the spacer/scroll geometry matches the visible
-        // subset exactly.
-        if (this.lensActive && !this.lensVisible.has(i)) return 0;
-        if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
-        return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
-    }
-
-    // Is index `i` hidden by the active lens?
-    lensHides(i) { return this.lensActive && !this.lensVisible.has(i); }
-
-    // THE one owner of a cached node's `display`. Three mechanisms hide
-    // nodes — parking (live-app keep-alive), the type filter (hiddenTypes)
-    // and the lens — and they used to write style.display independently:
-    // clearing a lens could un-hide a PARKED live app far outside the
-    // viewport (updateDOM never re-hides an already-parked idx), and could
-    // reveal filter-hidden nodes whose effHeight stays 0, desyncing the
-    // virtual geometry from the real pixels. Every writer routes here so
-    // the decision is always the conjunction of all three.
+    // THE one owner of a row's `display`: the type filter (hiddenTypes)
+    // hides rows in place. The lens does not hide rows; it chooses which
+    // rows the block holds.
     applyVisibility(idx, node = this.cache.get(idx)) {
         if (!node) return;
-        const hidden = this.parked.has(idx) ||
-            this.lensHides(idx) ||
-            this.hiddenTypes.has(this.keyByIdx.get(idx));
-        node.style.display = hidden ? 'none' : '';
+        node.style.display = this.hiddenTypes.has(this.keyByIdx.get(idx)) ? 'none' : '';
     }
 
-    // Linear scan — profiled at 0.23ms for N=6000, far under a frame, so the
-    // O(N) here is not a scroll-smoothness factor (an O(log n) prefix sum was
-    // tried and dropped: it optimized something already imperceptible).
-    indexAt(offset) {
-        let h = 0;
-        for (let i = 0; i < this.totalCount; i++) {
-            h += this.effHeight(i);
-            if (h > offset) return i;
-        }
-        return Math.max(0, this.totalCount - 1);
-    }
-
-    cumHeight(from, to) {
-        let h = 0;
-        for (let i = from; i < to; i++) h += this.effHeight(i);
-        return h;
-    }
-
-    refresh() {
-        if (this.totalCount === 0) return;
-        // Bottom anchoring: updateDOM resizes the spacers, which moves
-        // scrollHeight under a scrollTop pinned at the bottom — without
-        // compensation the bottom edge "bounces" away from the user
-        // (scrollHeight changes fire no scroll event, and overflow-anchor
-        // is off on the spacers). If we were at the bottom before the
-        // re-window and the geometry shifted, re-pin. Within-AT_BOTTOM_PX
-        // already means "at the bottom" everywhere else (followMode), so
-        // pinning here matches the existing semantics.
-        const wasAtBottom = this.atBottom();
-        const preHeight   = this.container.scrollHeight;
-        const [s, e] = this.visibleRange();
-
-        // While the scrollbar is held, do NOT fetch: every arriving range
-        // inserts + measures new nodes mid-drag and the resulting geometry
-        // churn makes the thumb flicker. A drag navigates CACHED content
-        // only (uncached regions show as spacer); the release handler's
-        // refresh fetches whatever the thumb landed on.
-        if (!this.scrollbarDrag) {
-            // Dedup in-flight requests: refresh() runs on EVERY scroll event,
-            // so without this each tick re-sent the same range until the
-            // response landed — dozens of identical server renders (each
-            // broadcast to every tab) while scrolling through an uncached
-            // region. The 2s expiry is the lost-response retry.
-            const now = performance.now();
-            const missing = [];
-            for (let i = s; i <= e; i++) {
-                if (this.cache.has(i)) continue;
-                const t = this.requestedAt.get(i);
-                if (t !== undefined && (now - t) < 2000) continue;
-                missing.push(i);
-            }
-            if (missing.length > 0) {
-                for (const i of missing) this.requestedAt.set(i, now);
-                this.comm.notify({type: 'msgs.request',
-                                  range: [missing[0], missing[missing.length - 1]],
-                                  epoch: this.epoch});
-            }
-        }
-        this.updateDOM(s, e);
-        // Re-pin the bottom only for CONTENT-driven geometry changes (height
-        // corrections, streaming growth). Never while the user is driving
-        // scrollTop: a held scrollbar owns the position outright, and a slow
-        // upward wheel/trackpad gesture starting inside AT_BOTTOM_PX used to
-        // coincide with a respacing here and get yanked straight back down
-        // ("wheel did nothing" at the bottom edge).
-        const userDriving = this.scrollbarDrag || this.pendingUserScroll ||
-            (performance.now() - this.lastUserInputT) < 400;
-        // An evicted anchor can temporarily clamp scrollTop to the bottom.
-        // That is a geometry artifact, not a request to leave reading mode.
-        if (this.followMode && wasAtBottom && !userDriving &&
-            this.container.scrollHeight !== preHeight) {
-            this.container.scrollTop = this.container.scrollHeight;
-            // Programmatic write, possibly event-less (offscreen): keep the
-            // direction baseline fresh so the next user scroll classifies
-            // against the real position (see prevScrollTop).
-            this.prevScrollTop = this.container.scrollTop;
-        }
-    }
-
-    onRange({ start, msgs, epoch }) {
-        // A reply computed BEFORE a msgs.reload carries the old epoch — its
-        // indices belong to the pre-splice world; caching them would put the
-        // wrong messages at the wrong positions. Drop it (the dedup expiry
-        // re-requests anything still missing). Servers that don't echo the
-        // epoch (older builds) send undefined → accepted, old behavior.
-        if (epoch !== undefined && epoch !== null && epoch !== this.epoch) return;
-        const messages = msgs ?? [];          // tolerate the legacy `messages` field
-        const fresh = [];
-        messages.forEach((data, i) => {
-            const idx = start + i;
-            this.requestedAt.delete(idx);   // no longer in flight
-            if (this.cache.has(idx)) return;
-            const node = this.createNode(data);
-            this.cache.set(idx, node);
-            node.__btIdx = idx;
-            this.keyByIdx.set(idx, filterKey(data));
-            if (data.id) this.nodeById.set(data.id, node);
-            // Do NOT observe at creation — a node is observed only while it's
-            // in the render window (updateDOM), so the live ResizeObserver set
-            // stays bounded to ~the viewport instead of accumulating one per
-            // message for the whole session (which grows per-layout cost
-            // without bound). Off-screen heights come from `measureNodes`.
-            fresh.push([idx, node]);
-        });
-        this.measureNodes(fresh);
-        // Any arriving range advances the background prefetch (pacing: one
-        // chunk in flight at a time, ~30ms apart). Runs through drags too —
-        // caching is the drag-safe part.
-        if (this.prefetchStarted && !this.prefetchPaused) {
-            clearTimeout(this.prefetchTimer);
-            this.prefetchTimer = setTimeout(() => this.prefetchTick(), 30);
-        }
-        // Prefetch chunks are SILENT: cache-only, no scroll, and a DOM
-        // re-window only when the chunk actually overlaps the visible
-        // window. Per-chunk updateDOM + scroll-to-bottom was a visible
-        // flicker storm (scrollbar resizing, content shifting) right after
-        // mount while ~15 chunks streamed in.
-        const pf = this.prefetchPending;
-        if (pf && start === pf[0]) {
-            this.prefetchPending = null;
-            const [vs, ve] = this.visibleRange();
-            const end = start + messages.length - 1;
-            if (end >= vs && start <= ve && !this.scrollbarDrag) {
-                this.updateDOM(vs, ve);
-            }
-            return;
-        }
-        // Ranges still in flight when a scrollbar drag started: cache the
-        // nodes (above) but don't touch the DOM/geometry until release —
-        // mid-drag insertion is the thumb flicker.
-        if (this.scrollbarDrag) return;
-        this.updateDOM(...this.visibleRange());
-        if (this.initialLoad) this.runInitialMountCascade();
-        else if (this.followMode) this.queueScrollToBottom();
-    }
-
-    // Initial mount: scroll to bottom and lock follow mode on. The repeated
-    // attempts cover the period during which child Monaco editors / images are
-    // still laying out and pushing scrollHeight around.
-    //
-    // This also owns the ONLY clear of `initialLoad`, which is why it must run
-    // on every path that arms the flag rather than just on an arriving range —
-    // see the call in `applyCount`. While the flag is set, `updateDOM` skips
-    // `captureAnchor`, so a latched flag silently disables anchor
-    // compensation for the chat's whole life.
-    runInitialMountCascade() {
-        this.setFollowMode(true);
-        this.scrollToBottom();
-        requestAnimationFrame(() => {
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-        });
-        setTimeout(() => {
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-        }, 100);
-        setTimeout(() => {
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-            this.initialLoad = false;
-        }, 300);
-    }
-
-    // Is any row the current window needs absent from the cache? If so a
-    // `msgs.request` is in flight and `onRange` will run; if not, nothing is
-    // coming and the caller must not wait for it.
-    rangeMissing() {
-        const [s, e] = this.visibleRange();
-        for (let i = s; i <= e; i++) if (!this.cache.has(i)) return true;
-        return false;
-    }
-
-    // Has this node finished filling in, or is its height still provisional?
-    // Running tools may not have announced their media yet. Deferred bodies
-    // and loading placeholders also precede the actual content. Media needs
-    // a layout box; merely having a <video> in the DOM does not establish size.
-    heightIsFinal(node) {
-        if (!node || !node.querySelector) return true;
-        if (node.classList.contains('bt-tool-live')) return false;
-        if (node.dataset.btAutoExpand || node.dataset.btAutoMount) return false;
-        if (node.querySelector('.bt-collapsable-loading')) return false;
-        for (const m of node.querySelectorAll('img, video')) {
-            if (m.tagName === 'IMG' && !m.complete) return false;
-            if (m.offsetHeight === 0) return false;
-        }
-        return true;
-    }
-
-    // Batch-measure prefetched nodes at the column width. Cache completed
-    // static rows; asynchronous rows stay on the estimate until ready.
-    measureNodes(pairs) {
-        if (!this.measureEl || pairs.length === 0) return;
-        const cs = getComputedStyle(this.container);
-        const w = this.container.clientWidth -
-            (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
-        if (w <= 0) return;   // hidden pane — measuring would record garbage
-        this.measureEl.style.width = w + 'px';
-        const toMeasure = pairs.filter(([idx, node]) =>
-            !node.isConnected && !this.heights.has(idx));
-        for (const [, node] of toMeasure) this.measureEl.appendChild(node);
-        for (const [idx, node] of toMeasure) {
-            const h = node.offsetHeight;
-            if (h > 0) {
-                if (this.heightIsFinal(node)) this.heights.set(idx, h);
-                this.measuredHeightSum += h;
-                this.measuredHeightCount++;
-            }
-        }
-        for (const [, node] of toMeasure) {
-            if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
-        }
-        // Adapt the estimate to this chat's real average so the pre-measure
-        // spacer geometry (and the pixel overscan derived from EST_HEIGHT)
-        // tracks tall-message chats instead of the fixed 80px guess.
-        if (this.measuredHeightCount >= 20) {
-            this.EST_HEIGHT = Math.min(400, Math.max(24,
-                this.measuredHeightSum / this.measuredHeightCount));
-        }
-    }
-
-    // Register `node` (at store index `idx`) with the shared ResizeObserver
-    // (constructed once in the constructor — see there for the border-box
-    // rationale). The reverse mapping rides on the node itself.
-    observe(idx, node) {
-        node.__btIdx = idx;
-        this.observed.add(idx);
-        this.messageHeightObserver.observe(node);
-    }
-
-    // rAF-batched refresh: many ResizeObserver measurements land in the
-    // same frame (initial range render, streaming reflows) — coalesce them
-    // into one re-window + respace.
-    queueRefresh() {
-        if (this.refreshQueued || this.destroyed) return;
-        this.refreshQueued = true;
-        requestAnimationFrame(() => {
-            this.refreshQueued = false;
-            if (!this.destroyed) this.refresh();
-        });
-    }
-
-    // The topmost rendered, visible node at/under the current scrollTop and
-    // its offset from the viewport top. This is THE scroll anchor: geometry
-    // changes ABOVE the viewport (height corrections, prefetch measurements,
-    // EST_HEIGHT adaptation re-spacing the top spacer) must not move what the
-    // user is looking at — without it, every prefetch/retry tick snapped the
-    // view back while scrolling through unmeasured history ("scrolling is
-    // stuck: it resets to an earlier position every second").
-    // The top-visible rendered node + its offset from scrollTop. `excludeKey`
-    // skips rows of a filter type that's about to be hidden — they won't survive
-    // the toggle, so anchoring on one would lose the read position (setKeyHidden).
+    // The reading position: the first visible row (not of `excludeKey`, a
+    // type about to be hidden) at or below the viewport top, and its offset
+    // from it. A row hanging only a few pixels into the viewport is not
+    // what anyone is reading.
     captureAnchor(excludeKey = null) {
         const st = this.container.scrollTop;
-        // Same 4px bottom-overhang tolerance as the key anchor and the
-        // top-marker probes: a row with a couple of pixels hanging into the
-        // viewport is not the reading position, and pinning such a sliver is
-        // how one-row drifts are born (see captureKeyAnchor).
-        for (const i of [...this.rendered].sort((a, b) => a - b)) {
-            const n = this.cache.get(i);
-            if (!n || !n.isConnected || n.style.display === 'none') continue;
+        for (const idx of this.order) {
+            const n = this.cache.get(idx);
+            if (!n || n.offsetParent === null) continue;
             if (excludeKey && n.dataset.filterKey === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st + 4) {
-                this.anchorDebugGeneric = { st, idx: i, off: n.offsetTop - st };
-                return { idx: i, off: n.offsetTop - st };
-            }
+            if (n.offsetTop + n.offsetHeight > st + 4) return { idx, off: n.offsetTop - st };
         }
-        this.anchorDebugGeneric = { st, idx: -1, off: 0 };
         return null;
     }
 
-    // Re-pin the anchor after DOM/spacer mutations. No-op when nothing above
-    // the viewport changed (|delta| ≤ 1px), so plain scroll ticks never write.
     restoreAnchor(a) {
         if (!a) return;
-        // `rendered` is NOT "has a layout box". A live-app embed (an eval card
-        // holding a result embed, a bt_show app) that leaves the window is
-        // PARKED rather than removed — display:none, still in `rendered`, so
-        // its Bonito sub-session and WebGL context survive (see the parking
-        // branch in updateDOM and e2e:eval_embed_park). A lens-/filter-hidden
-        // row is display:none in place too, and a hidden pane hides all of
-        // them at once.
-        //
-        // `offsetTop` on a boxless node reads 0, so pinning on one asked for
-        // scrollTop ≈ 0: the transcript jumped to the very FIRST message. It
-        // needs an eviction and a parked row in the same pass, which is rare in
-        // a text chat and constant in an eval-heavy one — reported as "scroll
-        // slowly up and you suddenly land at the top, 100% of the time" in a
-        // chat whose history is mostly live eval embeds.
-        //
-        // Boxless → treat it as evicted: hold the VIRTUAL position and let the
-        // queued refresh un-park it, which is the branch below. `captureAnchor`
-        // and `restoreKeyAnchor` both skip display:none rows already; this is
-        // the same guard on the one path that was missing it.
-        const cached = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
-        const n = (cached && cached.offsetParent !== null) ? cached : null;
-        let want;
-        if (n && n.isConnected) {
-            want = n.offsetTop - a.off;
-            this.pendingAnchor = null;
-        } else {
-            // The re-window EVICTED the anchor: a large estimate shift (e.g. a
-            // background prefetch re-measuring unrendered rows ABOVE the viewport
-            // taller) remaps scrollTop to different indices and the anchor falls
-            // outside the newly computed range. Restore to its VIRTUAL position
-            // and queue a refresh so the window re-materialises around it.
-            //
-            // cumHeight() lives in a padding-less coordinate; a rendered node's
-            // real offsetTop is cumHeight(0, idx) + PAD_TOP + one ITEM_GAP (see
-            // the constructor). Omitting that constant left `want` ~a row short,
-            // so the queued refresh's captureAnchor picked the NEIGHBOURING row
-            // and the view jumped ~1 row — a stuck drift on above-viewport churn.
-            want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
-            // Keep the original row until it is mounted again. The virtual
-            // position can still contain estimates; capturing a new DOM anchor
-            // on the correction pass would pin whichever neighbour they reach.
-            this.pendingAnchor = a;
-            this.queueRefresh();
-        }
+        const n = this.cache.get(a.idx);
+        if (!n || n.offsetParent === null) return;
+        const want = Math.max(0, n.offsetTop - a.off);
         if (Math.abs(this.container.scrollTop - want) > 1) {
             this.container.scrollTop = want;
-            // Programmatic, possibly event-less write: keep the direction
-            // baseline fresh (see prevScrollTop).
             this.prevScrollTop = this.container.scrollTop;
         }
     }
 
-    // ── Key-toggle anchor (setKeyHidden) — VIRTUAL and STICKY ───────────────
+    // Record the heights rows have now, so the row observer sees a
+    // deliberate reflow (a filter toggle, already anchored) as no change.
+    // The observer's own measure: the fractional border box. `offsetHeight`
+    // rounds, and the rounding read as growth, half a pixel per row.
+    syncRowHeights() {
+        for (const idx of this.order) {
+            const node = this.cache.get(idx);
+            if (node) node.__btH = node.getBoundingClientRect().height;
+        }
+    }
+
+    // The shape of this row's body placeholder (`showLoading`), or null. The
+    // height the body rendered at, at the transcript's width now (within
+    // 2 px): what the server sent with the row (`body_h`) and what the row
+    // reported since. Keyed by the transcript's width, not the body's: a body
+    // can shrink to fit its content (native media), so its own width before
+    // the content arrives says nothing.
     //
-    // The DOM-based `captureAnchor` is wrong for a type toggle, twice over:
-    //   1. The rendered window can have HOLES around the viewport (rows still
-    //      being fetched after a scroll), so the first *rendered* surviving row
-    //      may sit far below the top — and every to-be-hidden row between the
-    //      real top and that anchor collapses, so pinning it cannot hold the
-    //      view (observed: anchor picked ~1000px below, view landed a row off).
-    //   2. A single restore doesn't survive the ASYNC settle that follows the
-    //      reflow (range fetches + ResizeObserver re-measures): each subsequent
-    //      `updateDOM` re-anchored on the CURRENT top row, faithfully
-    //      preserving the drift the collapse just caused.
-    // So the toggle anchor is (a) computed in the VIRTUAL coordinate
-    // (indexAt/cumHeight — immune to holes), and (b) kept STICKY: `updateDOM`
-    // re-pins IT for the settle window instead of re-capturing, until it
-    // expires or the user scrolls.
-    captureKeyAnchor(excludeKey) {
-        const st = this.container.scrollTop;
-        // The row to hold is the FIRST surviving row at/below the viewport top
-        // in VIRTUAL order — anchoring any row further down cannot preserve
-        // the reading position when toggled rows above it collapse/expand.
-        let vi = this.indexAt(st);
-        while (vi < this.totalCount &&
-               (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0)) vi++;
-        if (vi >= this.totalCount) return null;
-        // Two candidates, because both sources can lie in different ways:
-        //  * vi (above) — the first survivor in VIRTUAL order. The right row
-        //    inside a rendered HOLE (previously-rendered rows keep measured
-        //    heights), but `indexAt` runs on height ESTIMATES, which drift
-        //    under load and can land one row too far DOWN.
-        //  * di — the first RENDERED, visible survivor whose REAL bottom
-        //    hangs below the viewport top. Ground truth where it exists, but
-        //    blind to evicted rows: on a SHOW toggle the true first survivor
-        //    may not be rendered, and di would sit BELOW re-appearing rows.
-        // Rule: a DOM candidate at/above the virtual pick means the virtual
-        // pick was estimate-drifted — trust the DOM. All rendered survivors
-        // BELOW vi means vi is in a hole — anchor it virtually; the sticky
-        // re-pins converge as the re-window materializes it.
-        // A row whose last couple of pixels hang into the viewport is NOT the
-        // reading position — anchoring such a sliver (observed: a row at
-        // st-41 with 3px overhang) pins the view one row above what the user
-        // sees, and the sliver's own reflow arithmetic then drifts the view
-        // by a full row. Same 4px tolerance the top-marker probes use.
-        const OVERHANG = 4;
-        let di = -1, doff = 0;
-        for (const i of [...this.rendered].sort((a, b) => a - b)) {
-            const n = this.cache.get(i);
-            if (!n || !n.isConnected || n.style.display === 'none') continue;
-            if (this.keyByIdx.get(i) === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st + OVERHANG) {
-                di = i; doff = n.offsetTop - st;
-                break;
+    // Not measured at this width, but one picture of known size (`media`):
+    // the picture's shape, laid out like `media_element` lays out the picture
+    // (its width, at most the body's, and its aspect ratio), so even a chat
+    // opened for the first time holds the row's size when the picture
+    // arrives. Not a height computed here: a native row shrinks to fit its
+    // body, so before the picture is in it nothing here knows the width it
+    // will get. Above it, as padding, what the body holds besides the picture
+    // (`media_extra`, a bt_show's Share row), as measured at another width.
+    // `overflow: hidden` drops the automatic minimum height, so "loading…"
+    // can't stretch a small picture's placeholder.
+    bodyReserve(node) {
+        if (!node.collapsable) return null;
+        const map = node.__btBodyH;
+        // Most new rows have no saved size. Reading clientWidth while those
+        // rows are being built would lay out the pane for no reservation.
+        const sizes = map ? Object.entries(map) : [];
+        if (sizes.length) {
+            const w = this.bodyWidth();
+            for (const [k, h] of sizes)
+                if (Math.abs(+k - w) <= 2) return {height: h + 'px'};
+        }
+        const m = node.__btMedia;
+        if (m && m[0] > 0 && m[1] > 0)
+            return {boxSizing: 'content-box', padding: (node.__btMediaExtra || 0) + 'px 0 0',
+                    width: m[0] + 'px', maxWidth: '100%', aspectRatio: m[0] + ' / ' + m[1], overflow: 'hidden'};
+        return null;
+    }
+
+    bodyWidth() { return Math.round(this.container.clientWidth); }
+
+    // A tool row changed size: once it holds still, its body reports the
+    // height it settled at, for the placeholder of the next render. An exact
+    // reservation changes nothing, so a known body never reports again.
+    scheduleBodyReport(node) {
+        clearTimeout(node.__btBodyTimer);
+        node.__btBodyTimer = setTimeout(() => this.reportBody(node), 800);
+    }
+
+    reportBody(node) {
+        node.__btBodyTimer = null;
+        if (this.destroyed || !this.paneVisible || !node.isConnected || this.container.clientHeight === 0) return;
+        const body = node.collapsable?.body;
+        const id = node.dataset.msgId;
+        if (!id || !body || body.offsetParent === null || body.childElementCount === 0) return;
+        if (body.querySelector(':scope > .bt-collapsable-loading')) return;
+        const content = this.bodyContentHeight(body);
+        const h = Math.round(content);
+        const w = this.bodyWidth();
+        if (w < 1 || h < 1) return;
+        const map = node.__btBodyH || {};
+        for (const k of Object.keys(map)) {
+            if (Math.abs(+k - w) > 2) continue;
+            if (Math.abs(map[k] - h) <= 1) return;
+            delete map[k];
+        }
+        map[w] = h;
+        node.__btBodyH = map;
+        // Of that, what is not its one picture (`bodyReserve`).
+        const pics = body.querySelectorAll('.bt-media-wrap');
+        const extra = pics.length === 1
+            ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
+        node.__btMediaExtra = extra;
+        this.comm.notify({type: 'tool.size', id, w, h, extra});
+    }
+
+    // A body's CONTENT box height: what a placeholder inside it has to fill
+    // for the body to keep its size. Fractional, like the row heights.
+    bodyContentHeight(body) {
+        const cs = getComputedStyle(body);
+        return body.getBoundingClientRect().height -
+            parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) -
+            parseFloat(cs.borderTopWidth) - parseFloat(cs.borderBottomWidth);
+    }
+
+    // Free a row's body far from the view (see `freeObserver`). Only a heavy
+    // one: editors, or a big tree of elements. A live app has its own
+    // keep-alive, a running tool streams into its body, a clip may be
+    // playing, and a picture or a small body costs less than rendering it
+    // again would.
+    freeBody(node) {
+        if (!this.paneVisible) return;
+        if (!node.isConnected || node.dataset.btFreed || node.dataset.btApp) return;
+        if (node.classList.contains('bt-tool-live') || this.holdsFullscreen(node)) return;
+        const c = node.collapsable;
+        const body = c?.body;
+        if (!body || !c.loaded || body.offsetParent === null || body.childElementCount === 0) return;
+        if (body.querySelector(':scope > .bt-collapsable-loading')) return;
+        // Not `canvas`: Monaco draws its overview ruler on one. A live app's
+        // canvas is excluded by `btApp` above.
+        if (body.querySelector('img, video, audio')) return;
+        // A row of code counts once, however many token spans highlighting
+        // gave it: a common diff stays, rather than being built again each
+        // time it scrolls back.
+        const weight = body.getElementsByTagName('*').length - body.querySelectorAll('.bt-l span').length;
+        if (!body.querySelector('.monaco-editor') && weight < 300) return;
+        const h = this.bodyContentHeight(body);
+        node.dataset.btFreed = '1';
+        CODE_OBSERVERS.get(this.container)?.forget(body);
+        // Out of the document, the body's session ends and BonitoBook
+        // disposes its editors; `bodyDied` leaves a freed row alone.
+        body.innerHTML = '<div class="bt-collapsable-loading bt-body-freed">loading…</div>';
+        const ph = body.firstElementChild;
+        ph.style.boxSizing = 'border-box';
+        ph.style.height = h + 'px';
+    }
+
+    // Back within reach: render the body again. The reply replaces the
+    // placeholder, which held the body's height in the meantime.
+    unfreeBody(node) {
+        delete node.dataset.btFreed;
+        this.comm.notify({type: 'tool.render', id: node.dataset.msgId});
+    }
+
+    // A body arrived from the server (the tool.render reply, `bodyMounted`
+    // below). Its row may be far from the view by now: a burst of edits
+    // streams faster than their bodies render. Observing it again makes the
+    // observer report where the row is now.
+    onBodyMounted(node) {
+        this.freeObserver.unobserve(node);
+        this.freeObserver.observe(node);
+    }
+
+    // ── The rail ─────────────────────────────────────────────────────────
+    // A scrollbar by message count, since the native one knows only the
+    // loaded block. The thumb sits at the position of the top visible
+    // message (plus how far it has scrolled past) in the whole sequence, so
+    // wheel and swipe move it too. Dragging it names the message it would
+    // land on and jumps there when the pointer rests or lets go; a click on
+    // the track jumps straight there.
+    setupRail() {
+        const wrap = this.container.parentElement;
+        if (!wrap) return;
+        const rail = document.createElement('div');
+        rail.className = 'bt-rail bt-rail-hidden';
+        const thumb = document.createElement('div');
+        thumb.className = 'bt-rail-thumb';
+        const label = document.createElement('div');
+        label.className = 'bt-rail-label';
+        rail.append(thumb, label);
+        wrap.appendChild(rail);
+        this.railEl = rail;
+        this.railThumb = thumb;
+        this.thumbMoves = null;      // `placeThumb` animates these elements
+        this.thumbRange = -1;
+        this.railLabel = label;
+        const fracAt = (clientY) => {
+            const r = rail.getBoundingClientRect();
+            const th = thumb.offsetHeight;
+            return Math.min(1, Math.max(0, (clientY - r.top - th / 2) / Math.max(1, r.height - th)));
+        };
+        this.onRailDown = (e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            rail.setPointerCapture(e.pointerId);
+            this.markUserInput();
+            this.cancelMomentum();
+            // Grabbing the thumb keeps it under the pointer where it was
+            // grabbed; a press on the track centers it there.
+            const tr = thumb.getBoundingClientRect();
+            const grab = e.target === thumb ? e.clientY - (tr.top + tr.height / 2) : 0;
+            this.railDrag = { pointerId: e.pointerId, grab, pos: null, timer: null };
+            this.scrollbarDrag = true;
+            rail.classList.add('bt-rail-active');
+            this.railMove(fracAt(e.clientY - grab));
+        };
+        this.onRailMove = (e) => {
+            const d = this.railDrag;
+            if (!d || e.pointerId !== d.pointerId) return;
+            e.preventDefault();
+            this.railMove(fracAt(e.clientY - d.grab));
+        };
+        this.onRailUp = (e) => {
+            const d = this.railDrag;
+            if (!d || e.pointerId !== d.pointerId) return;
+            if (rail.hasPointerCapture(e.pointerId)) rail.releasePointerCapture(e.pointerId);
+            clearTimeout(d.timer);
+            this.railDrag = null;
+            this.scrollbarDrag = false;
+            rail.classList.remove('bt-rail-active');
+            if (d.pos !== null && d.pos !== d.jumped) this.jumpToPosition(d.pos);
+            this.updateRail();
+        };
+        // The rail sits over the transcript's edge: a wheel there scrolls the
+        // transcript, as it would over a native scrollbar.
+        this.onRailWheel = (e) => {
+            e.preventDefault();
+            this.markUserInput();
+            const line = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this.container.clientHeight : 1;
+            this.container.scrollTop += e.deltaY * line;
+        };
+        rail.addEventListener('pointerdown', this.onRailDown);
+        rail.addEventListener('pointermove', this.onRailMove);
+        rail.addEventListener('pointerup', this.onRailUp);
+        rail.addEventListener('pointercancel', this.onRailUp);
+        rail.addEventListener('wheel', this.onRailWheel, { passive: false });
+
+        // Home and End go to the ends of the conversation; the browser's own
+        // keys stop at the ends of the loaded block. For the transcript the
+        // pointer last pressed in, as the browser's keyboard scrolling does
+        // (a split shows several), and never while typing.
+        this.keyScope = false;
+        this.onScopePointer = (e) => { this.keyScope = wrap.contains(e.target); };
+        this.onEndsKey = (e) => {
+            // Native find moves the page without a wheel/touch event. That is
+            // deliberate navigation, not a layout shift to chase back down.
+            const findKey = e.key === 'F3' || ((e.ctrlKey || e.metaKey) &&
+                (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'g'));
+            // Ordinary typing must not read geometry: the previous input can
+            // have changed the composer's size and left layout pending.
+            if (!findKey && e.key !== 'Home' && e.key !== 'End') return;
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
+            if (findKey && !e.defaultPrevented && !e.target.closest?.('.monaco-editor')) {
+                this.markUserInput();
+                this.setFollowMode(false);
+                return;
             }
-        }
-        // Stash the decision for post-mortems (the filter_scroll e2e dumps it
-        // on failure): a tiny overwritten object, no rolling log.
-        this.anchorDebug = { st, vi, di, doff,
-                              pickedDom: di >= 0 && di <= vi };
-        if (di >= 0 && di <= vi) {
-            return { idx: di, off: doff, dom: true };
-        }
-        return { idx: vi, dom: false,
-                 off: this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, vi) - st };
+            if (e.key !== 'Home' && e.key !== 'End') return;
+            if (e.altKey || e.metaKey || e.shiftKey || e.defaultPrevented) return;
+            const t = e.target;
+            const page = t === document.body || t === document.documentElement;
+            if (!(wrap.contains(t) || (page && this.keyScope))) return;
+            if (t.isContentEditable || (t.closest && t.closest('input, textarea, select, .monaco-editor'))) return;
+            const len = this.seqLength();
+            if (len === 0) return;
+            e.preventDefault();
+            this.markUserInput();
+            // Home: up to the very top, the padding above the first row too.
+            if (e.key === 'Home') this.jumpToPosition(0, { offset: Infinity });
+            else this.jumpToPosition(len - 1);
+        };
+        document.addEventListener('pointerdown', this.onScopePointer, true);
+        document.addEventListener('keydown', this.onEndsKey);
     }
 
-    // Re-pin the sticky anchor at its captured viewport offset. A DOM-captured
-    // anchor restores against the row's REAL offset whenever it is rendered
-    // (exact); the virtual fallback covers an evicted/unmaterialized anchor
-    // (effHeight already reflects the toggled hiddenTypes).
-    restoreKeyAnchor(a) {
-        if (!a) return;
-        let want;
-        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
-        if (a.dom && n && n.isConnected && n.style.display !== 'none') {
-            want = n.offsetTop - a.off;
-        } else if (a.dom) {
-            // DOM anchor currently evicted: hold its virtual position until the
-            // re-window brings it back (the next sticky re-pin is exact again).
-            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+    teardownRail() {
+        if (this.railDrag) clearTimeout(this.railDrag.timer);
+        document.removeEventListener('pointerdown', this.onScopePointer, true);
+        document.removeEventListener('keydown', this.onEndsKey);
+        this.railEl?.remove();
+        this.railEl = null;
+        this.thumbMoves = null;
+        this.thumbRange = -1;
+    }
+
+    railMove(f) {
+        const d = this.railDrag;
+        const len = this.seqLength();
+        if (!d || len === 0) return;
+        const p = Math.round(f * (len - 1));
+        this.placeThumb(f);
+        this.railLabel.textContent = `${this.lensActive ? 'Match' : 'Message'} ${p + 1} of ${len}`;
+        if (p === d.pos) return;
+        d.pos = p;
+        clearTimeout(d.timer);
+        d.timer = setTimeout(() => {
+            if (this.railDrag !== d) return;
+            d.jumped = p;
+            this.jumpToPosition(p);
+        }, 150);
+    }
+
+    // Runs on every scroll step. The thumb and its label ride a paused
+    // animation over the rail's range, moved by its current time: Chrome hands
+    // that to the compositor as it is. Writing their `transform` instead made it
+    // re-layerize the whole page on every step, half the main thread's work
+    // while scrolling a long chat (2026-10-20).
+    placeThumb(f) {
+        const range = Math.max(0, this.railEl.clientHeight - this.railThumb.offsetHeight);
+        if (this.thumbRange !== range) {
+            this.thumbRange = range;
+            for (const a of this.thumbMoves ?? []) a.cancel();
+            this.thumbMoves = [this.railThumb, this.railLabel].map(el => {
+                const a = el.animate([{ transform: 'translateY(0px)' }, { transform: `translateY(${range}px)` }],
+                                     { duration: 1000, fill: 'both', easing: 'linear' });
+                a.pause();
+                return a;
+            });
+        }
+        const t = range > 0 ? Math.round(f * range) / range * 1000 : 0;
+        for (const a of this.thumbMoves) a.currentTime = t;
+    }
+
+    updateRail() {
+        if (!this.paneVisible) return;
+        const rail = this.railEl;
+        if (!rail || this.railDrag) return;
+        const c = this.container;
+        const len = this.seqLength();
+        const fits = len === 0 ||
+            (this.plo <= 0 && this.atTail() && c.scrollHeight <= c.clientHeight + 1);
+        rail.classList.toggle('bt-rail-hidden', fits);
+        if (fits) return;
+        let f;
+        if (this.atTail() && this.atBottom()) {
+            f = 1;
+        } else if (this.plo <= 0 && c.scrollTop <= 1) {
+            f = 0;
         } else {
-            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+            const [first] = this.visibleSpan();
+            if (first < 0) return;
+            const idx = this.order[first];
+            const node = this.cache.get(idx);
+            const into = node.offsetHeight > 0
+                ? Math.min(1, Math.max(0, (c.scrollTop - node.offsetTop) / node.offsetHeight)) : 0;
+            f = Math.min(1, (this.seqPos(idx) + into) / Math.max(1, len - 1));
         }
-        want = Math.max(0, want);
-        if (Math.abs(this.container.scrollTop - want) > 1) {
-            this.container.scrollTop = want;
-            this.prevScrollTop = this.container.scrollTop;
-        }
-    }
-
-    // The live sticky anchor, or null. Expires by time, and immediately on any
-    // user scroll input AFTER the toggle (the user owns the position again).
-    activeKeyAnchor() {
-        const a = this.keyAnchor;
-        if (!a) return null;
-        if (performance.now() > a.until || this.lastUserInputT > a.setAt) {
-            this.keyAnchor = null;
-            return null;
-        }
-        return a;
+        this.placeThumb(f);
     }
 
     // Is this node the one currently held fullscreen (or does it contain it)?
@@ -1648,151 +2200,83 @@ class BonitoChat {
                !!(document.fullscreenElement || document.webkitFullscreenElement);
     }
 
-    updateDOM(s, e) {
-        if (s > e) return;
-        // Anchor BEFORE any mutation; restored after the spacer writes below.
-        // Skipped during the initial mount cascade (scrollToBottom owns it).
-        // While a key-toggle sticky anchor is live, use IT instead of a fresh
-        // DOM capture — re-capturing mid-settle would faithfully preserve the
-        // drift the toggle reflow just caused (see captureKeyAnchor).
-        const sticky = this.activeKeyAnchor();
-        const anchor = (this.initialLoad || sticky) ? null :
-            (this.pendingAnchor || this.captureAnchor());
-        for (const idx of [...this.rendered]) {
-            if (idx < s || idx > e) {
-                const node = this.cache.get(idx);
-                // Live app embeds: PARK in place (display:none) to keep the
-                // sub-session + WebGL context alive, rather than removing
-                // (which closes the session and disposes the canvas → it comes
-                // back dead). The node stays in `rendered`, so insertSorted's
-                // ordering and the spacer math are unchanged (a display:none
-                // node is 0px). Spilled nodes (Stage 2) are plain again.
-                if (node && node.dataset && node.dataset.btApp && !node.dataset.btSpilled) {
-                    if (!this.parked.has(idx)) {
-                        this.parked.add(idx);
-                        this.applyVisibility(idx, node);
-                        this.touchApp(idx);   // just left the viewport
-                    }
-                } else if (this.holdsFullscreen(node)) {
-                    // Whatever the user is watching FULLSCREEN stays mounted and
-                    // visible. Detaching it drops the browser out of fullscreen
-                    // instantly, and parking it (display:none, the app branch
-                    // above) does the same — so this one is left alone entirely
-                    // and trimmed on the next range update after fullscreen ends.
-                    //
-                    // This is not a corner case on mobile, it is the NORMAL path:
-                    // entering a video's native fullscreen resizes the visual
-                    // viewport, `onViewportResize` chases the tail, the chat
-                    // scrolls away from the video, and the very node the user is
-                    // watching is the one this loop would drop. Symptom: fullscreen
-                    // opens and closes again immediately.
-                } else {
-                    // Leaving the window: unobserve so the live observer set
-                    // stays bounded to the rendered window. A detached node
-                    // doesn't resize anyway; on re-entry the insert branch
-                    // re-observes it.
-                    if (this.observed.delete(idx) && node) this.messageHeightObserver.unobserve(node);
-                    node?.remove();
-                    this.rendered.delete(idx);
-                    this.parked.delete(idx);
-                }
-            }
-        }
-        for (let i = s; i <= e; i++) {
-            if (this.parked.has(i)) {
-                // Re-entering the viewport: un-park the kept-alive app
-                // (visibility still honors lens/filter state).
-                const node = this.cache.get(i);
-                this.parked.delete(i);
-                this.applyVisibility(i, node);
-                this.touchApp(i);
-            } else if (this.cache.has(i) && !this.rendered.has(i)) {
-                const node = this.cache.get(i);
-                this.insertSorted(i, node);
-                this.rendered.add(i);
-                // Entering the window: (re-)observe for live height
-                // corrections. Bounded to the window (see the remove branch).
-                if (!this.observed.has(i)) this.observe(i, node);
-                // A lens-/filter-hidden index scrolled into the window stays
-                // hidden (one display owner — see applyVisibility).
-                this.applyVisibility(i, node);
-                if (node?.dataset?.btApp) this.touchApp(i);
-            }
-        }
-        this.enforceAppLru();
-        // Skip no-op spacer writes: this runs on every scroll event, and an
-        // unconditional style write per tick invalidates style/layout even
-        // when the window didn't move.
-        const topH = this.cumHeight(0, s);
-        const botH = this.cumHeight(e + 1, this.totalCount);
-        if (topH !== this.spacerTopHeight) {
-            this.spacerTop.style.height = topH + 'px';
-            this.spacerTopHeight = topH;
-        }
-        if (botH !== this.spacerBottomHeight) {
-            this.spacerBottom.style.height = botH + 'px';
-            this.spacerBottomHeight = botH;
-        }
-        if (sticky) this.restoreKeyAnchor(sticky);
-        else this.restoreAnchor(anchor);
-        // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
-        // (pin total at drag-start, absorb deltas in the spacers) turned
-        // estimate-vs-real drift into PHANTOM BLANK at the end of the
-        // scroll range — "the view hits bottom while the bar still has
-        // track left". The real fix is upstream: prefetched nodes are
-        // measured off-screen (`measureNodes`), so heights are real
-        // everywhere and drags see a stable scrollHeight to begin with.
-    }
-
-    // Mark an app idx as most-recently-relevant in the keep-alive LRU
-    // (called when it enters the viewport or just left it).
+    // Mark a live app as most-recently-relevant in the keep-alive LRU (it
+    // entered or left the viewport).
     touchApp(idx) {
+        const node = this.cache.get(idx);
+        if (!node || node.dataset.btSpilled) return;
         const i = this.appLru.indexOf(idx);
         if (i !== -1) this.appLru.splice(i, 1);
         this.appLru.push(idx);
     }
 
-    // Keep at most APP_KEEPALIVE parked (off-screen, alive) app sub-sessions,
-    // evicting the least-recently-visible parked ones. Visible apps are never
-    // evicted. The evicted node is SPILLED: its last frame is snapshotted to a
-    // static <img> + Reload button (which tears down the live sub-session and
-    // frees the WebGL context). The browser hard-caps live contexts (~16) and
-    // destroys the oldest beyond that, so this keeps us deterministically below
-    // the ceiling — our snapshot fires first, instead of the browser blanking a
-    // canvas out from under us.
+    // Keep at most APP_KEEPALIVE live apps outside the viewport, spilling the
+    // least-recently-visible ones beyond that. Visible apps are never
+    // spilled. A spilled app shows its last frame as a static <img> + Reload
+    // button and has given back its WebGL context; the browser hard-caps live
+    // contexts (~16) and destroys the oldest beyond that, so this keeps us
+    // deterministically below the ceiling: our snapshot fires first, instead
+    // of the browser blanking a canvas out from under us.
     enforceAppLru() {
-        if (this.parked.size <= this.APP_KEEPALIVE) return;
-        for (const idx of [...this.appLru]) {
-            if (this.parked.size <= this.APP_KEEPALIVE) break;
-            if (!this.parked.has(idx)) continue;   // only parked nodes are evictable
-            this.spillApp(idx, this.cache.get(idx));
+        const offscreen = this.appLru.filter(idx => !this.visibleApps.has(idx));
+        let extra = offscreen.length - this.APP_KEEPALIVE;
+        for (const idx of offscreen) {          // least recent first
+            if (extra <= 0) break;
+            const node = this.cache.get(idx);
+            if (!node || this.holdsFullscreen(node)) continue;
+            this.spillApp(idx, node);
+            extra--;
         }
     }
 
-    // Freeze a parked app to a snapshot + Reload button and tear down its live
-    // embed. The node stays in `cache` showing the snapshot; on scroll-back it
-    // behaves like any normal node (no WebGL context), and Reload re-mounts a
-    // fresh sub-session via the standard tool.render path.
+    // Freeze an app to a snapshot + Reload button and tear down its live
+    // embed. The row stays in place; Reload re-mounts a fresh sub-session
+    // via the standard tool.render path.
     spillApp(idx, node) {
-        if (!node) { this.parked.delete(idx); return; }
         const slot = node.querySelector('.bt-slot') || node.querySelector('.bt-tool-body');
+        const li0 = this.appLru.indexOf(idx);
+        // Nothing mounted (a collapsed app, a body not rendered yet) holds no
+        // live app to freeze: it only leaves the keep-alive list. Freezing it
+        // put a snapshot box into the empty body and grew the row.
+        if (!slot || slot.childElementCount === 0) {
+            if (li0 !== -1) this.appLru.splice(li0, 1);
+            return;
+        }
         const canvas = node.querySelector('canvas');
         let dataUrl = null;
         // preserveDrawingBuffer is on, so toDataURL returns the last rendered
-        // frame even though the node is parked (display:none).
-        if (canvas) { try { dataUrl = canvas.toDataURL('image/png'); } catch (_) {} }
+        // frame even when the app is off-screen.
+        if (canvas) {
+            // A canvas that drew a cross-origin picture is tainted and can't be
+            // read: the app is then frozen without a snapshot.
+            try { dataUrl = canvas.toDataURL('image/png'); }
+            catch (error) {
+                if (error.name !== 'SecurityError') throw error;
+                console.warn('app snapshot refused:', error.message);
+            }
+        }
         if (slot) {
+            // The snapshot takes the app's place at the app's size: the row
+            // keeps its height, so nothing around it moves when an app out of
+            // view is frozen. Measured before emptying: the canvas at its size
+            // on screen (its pixels are devicePixelRatio times more, which as an
+            // <img> came out twice the size on a HiDPI screen).
+            // (A floor for an app whose body never rendered: the Reload button
+            // has to fit.)
+            const h = Math.max(40, slot.offsetHeight);
+            const cssW = canvas ? canvas.clientWidth : 0, cssH = canvas ? canvas.clientHeight : 0;
             // Emptying the slot removes the sub-session root → Bonito closes the
             // sub-session and WGLMakie disposes the WebGL context.
             slot.innerHTML = '';
             const wrap = document.createElement('div');
             wrap.className = 'bt-app-snapshot';
-            wrap.style.cssText = 'position:relative;display:inline-block;max-width:100%';
+            wrap.style.cssText = `position:relative;max-width:100%;height:${h}px;overflow:hidden`;
             if (dataUrl) {
                 const img = document.createElement('img');
                 img.src = dataUrl;
                 img.alt = 'app snapshot';
-                img.style.cssText = 'max-width:100%;display:block;border-radius:6px;filter:saturate(.85) brightness(.97)';
+                img.style.cssText = `width:${cssW}px;height:${cssH}px;max-width:100%;object-fit:contain;display:block;` +
+                    'border-radius:6px;filter:saturate(.85) brightness(.97)';
                 wrap.appendChild(img);
             }
             const btn = document.createElement('button');
@@ -1807,12 +2291,6 @@ class BonitoChat {
             slot.appendChild(wrap);
         }
         node.dataset.btSpilled = '1';
-        node.remove();             // off-screen → leaves the DOM like any normal node
-        this.rendered.delete(idx);
-        this.parked.delete(idx);
-        // A spilled node is a plain <img> — visible again unless the lens /
-        // filter hides it (applyVisibility owns the decision).
-        this.applyVisibility(idx, node);
         const li = this.appLru.indexOf(idx);
         if (li !== -1) this.appLru.splice(li, 1);
     }
@@ -1821,34 +2299,74 @@ class BonitoChat {
     // (fresh worker sub-session) through the existing tool.render path.
     reloadApp(node) {
         delete node.dataset.btSpilled;
+        this.touchApp(node.__btIdx);
         const id = node.dataset.msgId;
         const body = node.querySelector('.bt-tool-body');
-        if (body) body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+        if (body) {
+            // At the snapshot's height until the app is back, like any body
+            // waiting for its render (`showPlaceholder`).
+            showLoading(body, {height: body.offsetHeight + 'px'});
+        }
         if (id) this.comm.notify({ type: 'tool.render', id });
     }
 
-    insertSorted(idx, node) {
-        const sorted = [...this.rendered].filter(i => i > idx).sort((a,b) => a-b);
-        const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
-        this.container.insertBefore(node, before);
-        // Deferred auto-expand (bt_show / native images): the node is now in
-        // the document, so the tool.render reply has a live slot to mount
-        // into. One-shot — clear the flag before expanding. NOT during a
-        // scrollbar drag: bodies mounting mid-drag inflate scrollHeight and
-        // the thumb's mapping stretches out from under the pointer ("bar
-        // gets stuck before the bottom") — the release sweep handles them.
-        if (node.dataset && node.dataset.btAutoExpand && !this.scrollbarDrag) {
+    // An editor in this row's body died with its session: the row left the
+    // document, or the body was mounted while it was out. Render the body again
+    // now if on the page, else on return (mountDeferred). A replaced or
+    // collapsed body leaves the row first. A spilled eval card keeps its code
+    // editor outside the emptied slot, and its Reload: no live remount.
+    bodyDied(row) {
+        if (this.destroyed || row.dataset.btSpilled || row.dataset.btFreed) return;
+        row.dataset.btRemount = '1';
+        // Several editors in one body die at once: one render, since
+        // mountDeferred clears the flag.
+        if (row.isConnected) queueMicrotask(() => this.mountDeferred(row));
+    }
+
+    // Fetch a tool row's body once the row is near the view (`mountObserver`).
+    // Expanding, and the placeholder that holds the body's height, happen at
+    // once; only the request waits. Observing again makes the observer report
+    // where the row is now, after whatever placed it.
+    requestBody(node) {
+        node.dataset.btWantsBody = '1';
+        this.mountObserver.unobserve(node);
+        this.mountObserver.observe(node);
+    }
+
+    // Bodies that wait for their node to be in the document, so the
+    // tool.render reply has a live slot to mount into. One-shot flags,
+    // cleared before acting.
+    mountDeferred(node) {
+        // Auto-expand (bt_show / native images, a completed eval).
+        if (node.dataset.btAutoExpand) {
             delete node.dataset.btAutoExpand;
-            node.collapsable?.setExpanded(true);
+            const c = node.collapsable;
+            c?.setExpanded(true);
+            // Already expanded, with no body yet (`setExpanded` only fetches
+            // on the way in): fetch it.
+            if (c && c.lazy && !c.loaded) {
+                c.loaded = true;
+                c.showPlaceholder();
+                this.requestBody(node);
+            }
         }
-        // Deferred eager-mount for edit tools (Monaco body without flipping
-        // the Collapsable to expanded). Same scrollbar-drag guard as above.
-        if (node.dataset && node.dataset.btAutoMount && !this.scrollbarDrag) {
+        // Eager mount for edit tools (Monaco body without flipping the
+        // Collapsable to expanded).
+        if (node.dataset.btAutoMount) {
             delete node.dataset.btAutoMount;
             if (node.collapsable && !node.collapsable.loaded) {
                 node.collapsable.loaded = true;
-                this.comm.notify({type: 'tool.render', id: node.dataset.msgId});
+                const body = node.collapsable.body;
+                if (body.childElementCount === 0 && this.bodyReserve(node))
+                    node.collapsable.showPlaceholder();
+                this.requestBody(node);
             }
+        }
+        // Its body's editors died (bodyDied): render it again. The reply
+        // replaces the old body in place.
+        if (node.dataset.btRemount) {
+            delete node.dataset.btRemount;
+            this.requestBody(node);
         }
     }
 
@@ -1858,18 +2376,18 @@ class BonitoChat {
         // `n` already pushed totalCount above; the new message lives at idx n-1.
         const idx = this.totalCount - 1;
         if (!this.cache.has(idx)) {
-            const node = this.createNode(msg);
-            this.cache.set(idx, node);
-            node.__btIdx = idx;
-            this.keyByIdx.set(idx, filterKey(msg));
-            if (msg.id) this.nodeById.set(msg.id, node);
-            this.observe(idx, node);
-            // A lens result is a STATIC index set computed when the query
-            // ran — new indices can't be in it, which used to hide every
-            // message arriving while a lens was active (matches included).
-            // Default new messages to visible; re-running the query
-            // re-evaluates them properly.
-            if (this.lensActive) this.lensVisible.add(idx);
+            // A lens's matches are a STATIC set computed when its query ran:
+            // a new message can't be in it. It shows anyway (re-running the
+            // query re-evaluates it), so it joins the sequence at the end.
+            if (this.seq) this.seq.push(idx);
+            // Into the page only when the block reaches the end; otherwise it
+            // loads with the rest when the reader gets there.
+            if (this.seqPos(idx) === this.phi + 1) {
+                const nodes = this.insertRows([[idx, msg]], this.rowsEnd);
+                this.order.push(idx);
+                this.phi += 1;
+                this.adoptRows(nodes);
+            }
         }
         // Strict no-yank semantics: any new message (including the
         // user's own) auto-scrolls ONLY while followMode is on.
@@ -1879,25 +2397,18 @@ class BonitoChat {
         // scroll to the bottom to come back. This matches the spec
         // "always stay at the position the user scrolls to".
         if (this.followMode) {
-            // Scroll synchronously — `scrollToBottom` does the scroll +
-            // calls `refresh()` (which re-computes `visibleRange()` from
-            // the new scrollTop and calls `updateDOM`), so the new bubble
-            // lands in the DOM in one synchronous call. We deliberately
-            // do NOT route through `queueScrollToBottom` here: rAF is
-            // paused in backgrounded tabs/windows, which means new
-            // messages would land in `cache` but never make it into the
-            // DOM until the user re-focuses the tab. That manifests as
-            // "I sent a message and 5 old messages appeared instantly" —
-            // they were already cached, the auto-scroll just couldn't
-            // fire while the tab was in the background. Synchronous
-            // scrollTop writes and DOM updates work regardless of tab
-            // visibility, so we land the bubble immediately. rAF batching
-            // is still used for `appendChunk` (50 chunks/s, batching is
-            // a real perf win; the streaming bubble itself is already in
-            // the DOM, only the scroll lags).
+            // Scroll synchronously. We deliberately do NOT route through
+            // `queueScrollToBottom` here: rAF is paused in backgrounded
+            // tabs/windows, so the bubble would only show once the user
+            // re-focuses the tab. Synchronous scrollTop writes work
+            // regardless of tab visibility. rAF batching is still used for
+            // `appendChunk` (50 chunks/s, batching is a real perf win; the
+            // streaming bubble itself is already in the DOM, only the
+            // scroll lags).
             this.scrollToBottom();
         } else {
             this.registerUnread();
+            this.updateRail();
         }
     }
 
@@ -1905,13 +2416,13 @@ class BonitoChat {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
         // A finalized node has already been painted with the authoritative html
-        // by `onAgentFinal` (which cleared the pending stream). Nodes are never
-        // removed from `nodeById`/`cache` (virtual scroll only detaches them
-        // from the DOM), so a finalized node lives forever — and message ids
-        // are unique per message, so a finalized id never legitimately gets
-        // more chunks. A LATE or duplicate `chunk` for it would repaint the
-        // older, shorter cumulative html; drop it. A NEW message uses a fresh
-        // node (fresh id), so this per-node flag never blocks live streaming.
+        // by `onAgentFinal` (which cleared the pending stream). Message ids are
+        // unique per message, so a finalized id never legitimately gets more
+        // chunks: a LATE or duplicate `chunk` for it would repaint the older,
+        // shorter cumulative html; drop it. A NEW message uses a fresh node
+        // (fresh id), so this per-node flag never blocks live streaming. (A
+        // row dropped from the block has no node: its chunks are ignored, and
+        // it comes back from the server with its final text.)
         if (node.__btFinal) return;
         // Server ships the FULL rendered html of the message-so-far each
         // chunk (CommonMark-rendered, so intraword `_`s don't italicize and
@@ -2003,15 +2514,18 @@ class BonitoChat {
             node.__btFinal = true;
             return;
         }
-        // Node evicted / id mismatch: mirror `onSummaryFinal`'s DOM fallback so
-        // the authoritative final isn't silently dropped. Prefer a precise
-        // by-id lookup (agent nodes carry `data-msg-id`); fall back to the last
-        // agent bubble in the DOM.
+        // Id mismatch: mirror `onSummaryFinal`'s DOM fallback so the
+        // authoritative final isn't silently dropped. Prefer a precise by-id
+        // lookup (agent nodes carry `data-msg-id`); fall back to the last
+        // agent bubble in the DOM, but only when the block ends at the newest
+        // message. Otherwise the last bubble in the page is an OLD message,
+        // and the final belongs to a row the block doesn't hold: it arrives
+        // with its final text when the reader gets there.
         let tgt = msg.id
             ? this.container.querySelector(
                 `.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`)
             : null;
-        if (!tgt) {
+        if (!tgt && this.atTail()) {
             const nodes = this.container.querySelectorAll('.bt-agent-msg');
             tgt = nodes[nodes.length - 1];
         }
@@ -2054,12 +2568,32 @@ class BonitoChat {
         if (active && this.followMode) this.queueScrollToBottom();
     }
 
+    // Claude Code's estimate of the tokens thought so far, while the model
+    // thinks without streaming its thoughts (the usage updates that carry
+    // `_claude/thinkingTokens`, about one a second). The reasoning line shows
+    // it in place of the busy dots, so a long think reads as progress and
+    // not as a stalled agent. The model's next output ends it (`dispatch`).
+    onThinkingTokens(n) {
+        if (!this.thinkingEl || !Number.isFinite(n)) return;
+        this.thinkingEstimate = true;
+        this.thinkingEl.classList.add('bt-thinking-active');
+        this.busyEl?.classList.add('bt-busy-suppressed');
+        if (this.thinkingCountEl) this.thinkingCountEl.textContent = `${formatTokens(n)} tokens`;
+        if (this.followMode) this.queueScrollToBottom();
+    }
+
+    endThinkingEstimate() {
+        this.thinkingEstimate = false;
+        this.thinkingEl?.classList.remove('bt-thinking-active');
+        this.busyEl?.classList.remove('bt-busy-suppressed');
+        if (this.thinkingCountEl) this.thinkingCountEl.textContent = '';
+    }
+
     // ── Permission / question cards ──────────────────────────────────────
     // A `session/request_permission` (AskUserQuestion, plan approval, …)
     // renders as an interactive card with one button per option. The card is
-    // PLAIN scroll content (like the busy/thinking indicators — inserted
-    // after the bottom spacer, never tracked by the virtual-scroll
-    // geometry): it lives exactly under the last message for the lifetime
+    // PLAIN scroll content (like the busy/thinking indicators, inserted
+    // after the rows, never one of them): it lives exactly under the last message for the lifetime
     // of the request and is dropped via `permission_done` once the answer
     // (from ANY tab, or the server-side timeout) resolves the RPC.
     onPermission(msg) {
@@ -2094,7 +2628,7 @@ class BonitoChat {
         }
         card.append(q, row);
         // Under the last message: before the busy indicator (which follows
-        // the bottom spacer).
+        // the rows).
         this.container.insertBefore(card, this.busyEl || null);
         if (this.followMode) this.queueScrollToBottom();
     }
@@ -2262,6 +2796,7 @@ class BonitoChat {
     //     bootstraps the virtual scroll; any final-form HTML changes will
     //     land via the resulting range-refetch path.
     onSessionReset() {
+        this.setCancelling(false);
         this.thinkingEl?.classList.remove('bt-thinking-active');
         this.busyEl?.classList.remove('bt-busy-active');
         this.busyEl?.classList.remove('bt-busy-suppressed');
@@ -2274,12 +2809,6 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
-        // Content metadata can arrive AFTER the terminal status. A measured
-        // collapsed header is then obsolete even if it has left the window.
-        // Invalidate on the representation change, not on ordinary eviction.
-        const bodyWillChange = ((msg.expand || msg.expand_full) && !node.collapsable?.expanded) ||
-            (msg.show_mime && msg.show_mime !== node.dataset.showMime);
-        if (bodyWillChange && this.heights.delete(node.__btIdx)) this.queueRefresh();
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
@@ -2295,6 +2824,20 @@ class BonitoChat {
             // used to detach the Code section's Monaco container while its
             // async `create` was still resolving — an unhandled "Cannot read
             // properties of null (reading 'parentNode')".
+        }
+        // A body expanded before the tool had any content holds the server's
+        // "(loading…)" placeholder (`render_tool_body`), and nothing replaces it
+        // by itself: a long call — bt_julia_wait, bt_wait — expanded while it
+        // ran stayed "(loading…)" after it finished. Ask again on each update
+        // until the real body is in.
+        if (node.collapsable?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading'))
+            this.requestBody(node);
+        // A Julia run outlived the call that ended this card: it is live again,
+        // and its elapsed clock runs on from the start instead of the call's end.
+        if (msg.reopen) {
+            delete node.dataset.toolFinished;
+            node.classList.add('bt-tool-live');
+            this.ensureElapsedTicker();
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -2345,8 +2888,8 @@ class BonitoChat {
         // bt_show: the completion update is when we learn it's a "show me
         // this" tool (and its mime). Native-media mode takes precedence:
         // chrome off + body mounted; otherwise auto-expand the pill
-        // (idempotent; user can still collapse). Detached nodes defer the
-        // expand to insertion (see insertSorted).
+        // (idempotent; user can still collapse). A row not in the document
+        // yet defers the expand to insertion (see mountDeferred).
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
         if (this.wantsNative(node)) {
             this.applyNative(node);
@@ -2361,10 +2904,14 @@ class BonitoChat {
                 // Eval compact bodies (hideBodyOnCollapse) DO flip expanded:
                 // their visible-body state IS the expanded state (sections
                 // self-clamp), so the arrow must read ▼ while the body shows.
+                // The body is fetched once the row is near the view
+                // (`requestBody`): a burst of edits streams faster than the
+                // reader scrolls, and each diff built far away was only freed
+                // again.
                 if (node.isConnected) {
                     if (!node.collapsable.loaded) {
                         node.collapsable.loaded = true;
-                        this.comm.notify({type: 'tool.render', id: msg.id});
+                        this.requestBody(node);
                     }
                     if (node.collapsable.hideBodyOnCollapse)
                         node.collapsable.setExpanded(true);
@@ -2387,7 +2934,7 @@ class BonitoChat {
             if (node.isConnected) {
                 if (!node.collapsable.loaded) {
                     node.collapsable.loaded = true;
-                    this.comm.notify({ type: 'tool.render', id: msg.id });
+                    this.requestBody(node);
                 }
                 node.collapsable.setExpanded(true);
             } else {
@@ -2419,11 +2966,21 @@ class BonitoChat {
             const title = headerEl.querySelector('.bt-tool-title');
             headerEl.insertBefore(wb, title ? title.nextSibling : null);
         }
+        // What a continue / wait waits on can resolve after the card opened
+        // (its arguments stream in, its run is announced later): replace the
+        // chips whenever an update carries them.
+        if (Array.isArray(msg.jumps) && headerEl) {
+            headerEl.querySelectorAll('.bt-tool-jump').forEach(b => b.remove());
+            const anchor = headerEl.querySelector('.bt-tool-summary');
+            anchor?.insertAdjacentHTML('beforebegin', jumpChipsHTML(msg.jumps));
+        }
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
             sb.type = 'button';
-            sb.className = 'bt-tool-stop bt-stop-mini';
-            sb.title = 'Stop';
+            sb.className = 'bt-tool-stop bt-stop-mini' + (msg.dismiss_only ? ' bt-task-dismiss' : '');
+            sb.title = msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop';
+            sb.setAttribute('aria-label', msg.dismiss_only ? 'Dismiss task entry' : 'Stop');
+            if (msg.dismiss_only) sb.textContent = '×';
             sb.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.comm.notify({ type: 'stop_tool', id: msg.id });
@@ -2438,7 +2995,17 @@ class BonitoChat {
         // WGLMakie canvas) and the ⤢ detach button (embed adopted into its
         // own workspace panel; same wiring as createNode's).
         if (msg.live_embed) {
+            const became = !node.dataset.btApp;
             node.dataset.btApp = '1';
+            // A card already in the page becomes an app here (an eval's result
+            // arrives after its card): watched for the keep-alive limit from now
+            // on, as `adoptRows` watches a row that came in as one. Before, the
+            // apps made in a session were never counted, so the limit that keeps
+            // WebGL contexts below the browser's cap held only after a reload.
+            if (became && node.__btIdx !== undefined && this.cache.get(node.__btIdx) === node) {
+                this.appObserver.observe(node);
+                this.touchApp(node.__btIdx);
+            }
             if (headerEl && !headerEl.querySelector('.bt-tool-detach')) {
                 const db = document.createElement('button');
                 db.type = 'button';
@@ -2465,6 +3032,7 @@ class BonitoChat {
             if (t) {
                 t.classList.add('bt-path-link');
                 t.dataset.path = msg.edit_path;
+                t.title = msg.edit_path;
             }
         }
     }
@@ -2583,9 +3151,8 @@ class BonitoChat {
         if (node.isConnected) {
             node.collapsable?.setExpanded(true);
         } else {
-            // Cached but not in the document (virtual-scroll window /
-            // prefetch): defer the expand to insertion so the tool.render
-            // reply has a slot to mount into.
+            // Not in the document yet (a row being built): defer the expand
+            // to insertion so the tool.render reply has a slot to mount into.
             node.dataset.btAutoExpand = '1';
         }
     }
@@ -2605,45 +3172,29 @@ class BonitoChat {
             if (!(node.dataset.showMime || '').startsWith(prefix)) continue;
             on ? this.applyNative(node) : this.removeNative(node);
         }
-        this.refresh();
+        this.ensureWindow();
     }
 
-    // Toggle a key's visibility: inline display on every matching node (an
-    // open key-set — per-tool keys — rules out static CSS classes), while
-    // effHeight zeroes the hidden indices so the spacer/scroll math matches
-    // the real (collapsed) layout exactly. Nodes created later pick up the
-    // current state in createNode.
+    // Toggle a key's visibility: inline display on every matching row (an
+    // open key-set, per-tool keys, rules out static CSS classes). Rows
+    // created later pick up the current state in `makeRow`.
     setKeyHidden(key, hidden) {
-        this.pendingAnchor = null;
-        // Hold the read position across the toggle. Applying visibility reflows
-        // the transcript (matching rows collapse to / expand from 0px), which
-        // moves the viewport BEFORE refresh's own anchor runs — refresh then
-        // faithfully preserves the ALREADY-jumped spot, throwing the reader to a
-        // different message. So capture the top-visible SURVIVING row now (before
-        // the reflow, excluding the type being toggled) and re-pin it after
-        // refresh has trued up the spacers/window.
-        const anchor = this.followMode ? null : this.captureKeyAnchor(key);
+        // Hold the read position across the toggle: matching rows collapse to
+        // or expand from 0px, which would move what the reader sees. The
+        // anchor is the top-visible row that SURVIVES the toggle.
+        const anchor = this.followMode ? null : this.captureAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache) {
-            // applyVisibility, not a raw display write: un-hiding a key must
-            // not reveal nodes the lens hides or un-park live apps.
             if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
         }
         // Hiding the agent stream also hides the idle "waiting" line that
         // would otherwise dangle under messages that aren't there.
         if (key === 'agent') this.updateWaiting();
-        if (anchor) {
-            // Sticky through the async settle (range fetches, re-measures) that
-            // follows the reflow — updateDOM keeps re-pinning THIS anchor
-            // instead of re-capturing the already-drifted top (see
-            // captureKeyAnchor). Set BEFORE refresh so the refresh's own
-            // updateDOM already honors it.
-            this.keyAnchor = { ...anchor, setAt: performance.now(),
-                                until: performance.now() + 1500 };
-        }
-        this.refresh();
         if (this.followMode) this.queueScrollToBottom();
-        else if (anchor) this.restoreKeyAnchor(anchor);
+        else this.restoreAnchor(anchor);
+        // Already anchored: the row observer must not correct for it again.
+        this.syncRowHeights();
+        this.ensureWindow();
     }
 
     // The idle "waiting for your next instruction" line only makes sense
@@ -2685,20 +3236,53 @@ class BonitoChat {
                     const gallery = document.createElement('div');
                     gallery.className = 'bt-user-attachments';
                     for (const a of msg.attachments) {
+                        if (a.kind === 'file') {
+                            // Not an image: its name, opening the file (a PDF
+                            // in the browser, anything else as a download).
+                            const link = document.createElement('a');
+                            link.className = 'bt-user-att-file';
+                            link.href = a.url;
+                            link.target = '_blank';
+                            link.rel = 'noopener';
+                            link.textContent = a.name.replace(/^\d{4}-\d{2}-\d{2}_\d{6}_[0-9a-f]{8}_/, '');
+                            link.title = a.name;
+                            link.addEventListener('click', e => e.stopPropagation());
+                            gallery.appendChild(link);
+                            continue;
+                        }
                         const img = document.createElement('img');
                         img.className = 'bt-user-att-img';
                         img.src = a.url;
                         img.alt = a.name || 'attachment';
                         img.dataset.attachmentName = a.name;
                         img.loading = 'lazy';
-                        img.addEventListener('click', () => openLightbox(img));
+                        img.addEventListener('click', e => { e.stopPropagation(); openLightbox(img); });
                         img.addEventListener('error', () => {
+                            // In the thumbnail's box (same height, see the CSS),
+                            // so a picture that is gone does not resize the row.
                             const miss = document.createElement('span');
                             miss.className = 'bt-user-att-missing';
                             miss.textContent = a.name || 'attachment';
                             img.replaceWith(miss);
                         }, { once: true });
-                        gallery.appendChild(img);
+                        const wrap = document.createElement('div');
+                        wrap.className = 'bt-media-wrap';
+                        wrap.appendChild(img);
+                        const actions = document.createElement('div');
+                        actions.className = 'bt-media-actions';
+                        const enlarge = document.createElement('button');
+                        enlarge.type = 'button';
+                        enlarge.className = 'bt-media-action bt-media-enlarge';
+                        enlarge.title = 'Enlarge'; enlarge.textContent = '⤢';
+                        enlarge.addEventListener('click', e => { e.stopPropagation(); openLightbox(img); });
+                        const choose = document.createElement('button');
+                        choose.type = 'button';
+                        choose.className = 'bt-media-action bt-media-chat-icon';
+                        choose.title = 'Set as chat icon'; choose.textContent = '▣';
+                        choose.setAttribute('aria-label', choose.title);
+                        actions.append(enlarge, choose);
+                        wrap.appendChild(actions);
+                        gallery.appendChild(wrap);
                     }
                     div.appendChild(gallery);
                 }
@@ -2776,6 +3360,16 @@ class BonitoChat {
                 // header toggle plainly hides/shows the mounted body.
                 const compactBody = msg.kind === 'edit' || msg.compact_body === true;
                 if (msg.compact_body === true) div.dataset.compactBody = '1';
+                // An editor in the body died with its Bonito session while
+                // still in this row: render the body again (bodyDied).
+                div.addEventListener('monaco-editor-disposed', () => this.bodyDied(div));
+                // The heights its body rendered at, by width (`body_h`,
+                // measured_sizes.jl), updated as it reports new ones.
+                div.__btBodyH = msg.body_h || null;
+                // A body that is one picture of known size (`media`, [w, h]):
+                // what its placeholder reserves until a height is measured.
+                div.__btMedia = msg.media || null;
+                div.__btMediaExtra = msg.media_extra || 0;
                 div.collapsable = new Collapsable(
                     div.querySelector('.bt-tool-header'),
                     div.querySelector('.bt-tool-body'),
@@ -2783,7 +3377,9 @@ class BonitoChat {
                       editMode: compactBody,
                       hideBodyOnCollapse: msg.compact_body === true,
                       fetchEachExpand: !compactBody, discardOnCollapse: !compactBody,
-                      onExpand: () => this.comm.notify({type: 'tool.render', id}) });
+                      reserve: () => this.bodyReserve(div),
+                      onToggle: (expanded) => this.expandState.set(id, expanded),
+                      onExpand: () => this.requestBody(div) });
                 // Subagent Task: rebuild the live activity feed from the
                 // header's snapshot (live growth rides task_activity events).
                 if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
@@ -2832,12 +3428,10 @@ class BonitoChat {
                 } else if (msg.expand || msg.expand_full) {
                     // Auto-expand (bt_show refs, eval eager-mount /
                     // expand_full) — DEFERRED until the node first enters the
-                    // document (insertSorted). The history prefetcher creates
-                    // nodes detached; expanding those immediately fired
-                    // tool.render whose dom_in_js reply found no slot in the
-                    // document — the body stayed on "loading…" forever (and
-                    // every off-screen auto-expand in history cost a render
-                    // round-trip up front). Same split as onToolUpdate's
+                    // document (mountDeferred). Rows are built before they
+                    // are inserted; expanding then fired tool.render whose
+                    // dom_in_js reply found no slot in the document — the
+                    // body stayed on "loading…" forever. Same split as onToolUpdate's
                     // detached fallback: editMode bodies need the explicit
                     // MOUNT flag (their applyExpanded never lazy-fetches),
                     // plus the expanded flip for expand_full / evals whose
@@ -2849,6 +3443,14 @@ class BonitoChat {
                     } else {
                         div.dataset.btAutoExpand = '1';
                     }
+                }
+                // What the reader did to it last wins over the default.
+                const mine = this.expandState.get(id);
+                if (mine === true) {
+                    if (div.collapsable.editMode) div.dataset.btAutoMount = '1';
+                    div.dataset.btAutoExpand = '1';
+                } else if (mine === false) {
+                    delete div.dataset.btAutoExpand;
                 }
                 break;
             }
@@ -2932,7 +3534,9 @@ class BonitoChat {
             if (body) { body.innerHTML = msg.html || ''; return; }
         }
         // Fallback (id-less event from an older server): last summary node
-        // in the DOM.
+        // in the DOM, when the block ends at the newest message (else the
+        // last one in the page is an old one).
+        if (!this.atTail()) return;
         const nodes = this.container.querySelectorAll('.bt-summary-msg .bt-summary-body');
         const tgt = nodes[nodes.length - 1];
         if (tgt) tgt.innerHTML = msg.html || '';
@@ -2967,16 +3571,22 @@ class BonitoChat {
         //     running on a different machine is visible without reading the card.
         const workerBadge = msg.worker ?
             `<span class="bt-tool-worker" title="This runs on another worker">⇢ ${escapeHTML(String(msg.worker))}</span>` : '';
+        //   • `jumps` — the evals a continue / wait waits on, as ↑ chips that
+        //     bring each one's card into view (see jumpToMessage).
+        const jumpChips = jumpChipsHTML(msg.jumps);
         const stopBtn = msg.stoppable ?
-            `<button class="bt-tool-stop bt-stop-mini" type="button"
-                     title="Stop"></button>` : '';
+            `<button class="bt-tool-stop bt-stop-mini${msg.dismiss_only ? ' bt-task-dismiss' : ''}" type="button"
+                     title="${msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop'}"
+                     aria-label="${msg.dismiss_only ? 'Dismiss task entry' : 'Stop'}">${msg.dismiss_only ? '×' : ''}</button>` : '';
         // File-path link: when the tool identifies a file (the server ships
         // `edit_path`), its TITLE becomes a clickable link that opens the
         // file in the plotpane editor — same affordance as every other path
         // link in the chat (diff headers, search hits, paths in messages).
         // One delegated container listener handles all of them.
+        // The full path is the title's tooltip: the title itself is often a
+        // name (bt_show's caption, a file's basename).
         const titleLink = msg.edit_path
-            ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
+            ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}" title="${escapeAttr(msg.edit_path)}` : '';
         const live = !(msg.status === 'completed' || msg.status === 'failed') &&
                      msg.finished_at == null;
         // (The old <pre> eval code preview is gone: eval cards mount their
@@ -3005,6 +3615,7 @@ class BonitoChat {
                 ${server}
                 <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
                 ${workerBadge}
+                ${jumpChips}
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 ${timeoutBadge}
                 <span class="bt-tool-timer"></span>
@@ -3059,7 +3670,7 @@ class BonitoChat {
             // every tick. Default: collapsed on narrow panes (a long plan
             // card buried the whole chat on phones), expanded elsewhere; the
             // ▾ toggle persists the user's choice browser-wide.
-            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const storedTodo = storage.get('bt-todo-collapsed');
             const paneW = this.container.closest('.bt-chatpane')?.clientWidth
                        ?? window.innerWidth;
             this.taskbarEl.classList.toggle('bt-todo-collapsed',
@@ -3067,32 +3678,35 @@ class BonitoChat {
             this.onTaskbarClick = (ev) => {
                 if (ev.target.closest('.bt-taskbar-todo-toggle')) {
                     const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
-                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    storage.set('bt-todo-collapsed', c ? '1' : '0');
                     return;
                 }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;
-                const idx = parseInt(slot.dataset.msgIndex ?? '-1', 10);
-                if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
-                // Jump via the scroller's own geometry — works whether or
-                // not the pill is currently rendered (scrollIntoView on a
-                // recycled node silently does nothing). Two passes: the
-                // first render swaps estimated heights for real ones, the
-                // second corrects the target with the settled geometry.
-                const jump = () => {
-                    this.container.scrollTop =
-                        Math.max(0, this.cumHeight(0, idx) - 60);
-                };
-                this.followMode = false;
-                jump();
-                requestAnimationFrame(() => requestAnimationFrame(jump));
+                this.jumpToMessage(parseInt(slot.dataset.msgIndex ?? '-1', 10),
+                                   slot.dataset.taskId);
             };
             this.taskbarEl.addEventListener('click', this.onTaskbarClick);
         }
         // The in-chat elapsed ticker lives in `ensureElapsedTicker` below —
         // started on demand when a live pill appears, self-stopping when the
         // last one finishes. (The taskbar keeps its own Julia clock.)
+    }
+
+    // Bring message `idx` (its 0-based store index) into view and light up its
+    // node (`id`), so the eye lands on it: from the block when it holds the
+    // row, else with a new block around it. Used by the task bar's rows and
+    // by the ↑ chips of cards that wait on an eval. A message a lens filters
+    // out is not in the sequence, so the lens goes first.
+    jumpToMessage(idx, id) {
+        if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
+        if (this.seqPos(idx) < 0) {
+            this.lensClearAll();
+            this.pendingJump = { idx, id };     // applied once the lens result lands
+            return;
+        }
+        this.jumpToPosition(this.seqPos(idx), { flashId: id || null, offset: 60 });
     }
 
     // One shared 1Hz interval ticks the inline `.bt-tool-timer` of every
@@ -3438,43 +4052,42 @@ class BonitoChat {
     }
 
     onLensResult(msg) {
-        // Only apply results for the query THIS tab currently has pending
-        // (the channel is shared across tabs — see the server handler).
+        // Only the result for the query THIS tab currently has pending.
         if (msg.q !== this.lensQuery) return;
-        // Clearing an active lens un-hides rows (a reflow that would jump the
-        // view before refresh's anchor runs) — hold the read position like
-        // setKeyHidden. Activating scrolls to the first match below, so no anchor.
-        const holdAnchor = (this.lensActive && !msg.active && !this.followMode)
+        // The message being read, to come back to when a lens is cleared.
+        const anchor = (this.lensActive && !msg.active && !this.followMode)
             ? this.captureAnchor() : null;
         if (!msg.active) {
-            this.lensActive = false; this.lensVisible = null; this.lensActions = null;
+            this.lensActive = false; this.seq = null; this.lensActions = null;
         } else {
             this.lensActive  = true;
-            this.lensVisible = new Set(msg.visible || []);
+            this.seq = (msg.visible || []).slice().sort((a, b) => a - b);
             this.lensActions = new Map(Object.entries(msg.actions || {}).map(([k, v]) => [+k, v]));
         }
         if (this.lensClearBtn) this.lensClearBtn.hidden = !this.lensActive;
         this.lensBarEl?.classList.toggle('bt-lens-on', this.lensActive);
-        // Re-apply visibility to every rendered node, then re-window (heights
-        // of hidden indices are now 0) and run any actions (expand).
-        // applyVisibility (not a raw display write) keeps parked live apps
-        // parked and filter-hidden nodes hidden when a lens is cleared.
-        for (const [idx, node] of this.cache) {
-            if (this.rendered.has(idx)) this.applyVisibility(idx, node);
+        // The block holds sequence positions, and the sequence just changed:
+        // a new block. A lens opens on its first match; clearing one goes back
+        // to the message that was being read (or the bottom when following).
+        const len = this.seqLength();
+        const jump = this.pendingJump;
+        this.pendingJump = null;
+        if (jump && this.seqPos(jump.idx) >= 0) {
+            this.clearBlock();
+            this.jumpToPosition(this.seqPos(jump.idx), { flashId: jump.id || null, offset: 60 });
+        } else if (this.lensActive) {
+            this.clearBlock();
+            if (len === 0) { this.updateRail(); return; }
+            this.requestBlock(0, Math.min(len - 1, this.CHUNK - 1), { kind: 'lens' });
+        } else if (anchor && this.seqPos(anchor.idx) >= 0) {
+            const p = anchor.idx;
+            this.clearBlock();
+            this.requestBlock(Math.max(0, p - this.CHUNK), Math.min(len - 1, p + this.CHUNK),
+                              { kind: 'restore', idx: anchor.idx, off: anchor.off });
+        } else {
+            this.clearBlock();
+            this.loadTail();
         }
-        this.refresh();
-        if (this.lensActions) {
-            for (const [idx, action] of this.lensActions) {
-                const node = this.cache.get(idx);
-                if (!node) continue;
-                if (action === 'expand')        node.collapsable?.setExpanded(true);
-                else if (action === 'collapse') node.collapsable?.setExpanded(false);
-            }
-        }
-        // Jump to the top of the filtered view so the first match is visible.
-        // (scrollTop write syncs prevScrollTop: programmatic, possibly event-less.)
-        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this.prevScrollTop = 0; this.refresh(); }
-        else if (holdAnchor) this.restoreAnchor(holdAnchor);   // clearing: hold the read position
     }
 
     onLensSaved(msg) {
@@ -3524,6 +4137,7 @@ class BonitoChat {
     }
 
     atBottom() {
+        if (!this.paneVisible) return false;
         const { scrollTop, scrollHeight, clientHeight } = this.container;
         // Tight (AT_BOTTOM_PX = 20) so "user manually scrolled to the
         // very bottom" re-engages follow mode while merely-near doesn't.
@@ -3542,6 +4156,7 @@ class BonitoChat {
     // height of hysteresis makes layout jitter invisible to the pill,
     // while followMode / unread-clearing keep using atBottom().
     lastMessageFullyOutOfView() {
+        if (!this.paneVisible) return true;
         if (this.totalCount === 0) return false;
         const node = this.cache.get(this.totalCount - 1);
         // Virtual scroll detaches nodes far outside the viewport (cache
@@ -3566,7 +4181,7 @@ class BonitoChat {
         // arrivals all funnel through here — any of them would snap the
         // thumb out of the user's hand).
         if (this.scrollbarDrag) return;
-        if (this.scrollQueued || this.destroyed) return;
+        if (this.scrollQueued || this.destroyed || !this.paneVisible) return;
         this.scrollQueued = true;
         this.scrollRafId = requestAnimationFrame(() => {
             this.scrollQueued = false;
@@ -3581,9 +4196,9 @@ class BonitoChat {
             // delay (typically one task ≪ 50 ms, generous for slow
             // devices) without locking out chase for the steady-state
             // stream-while-at-bottom case. But follow mode SURVIVING to
-            // this point means nothing disengaged or cancelled us (a
-            // scroll-away lands in applyUserScroll's disengage, which
-            // cancels through cancelPendingScroll) — the chase must still
+            // this point means nothing disengaged or cancelled us (every
+            // disengage goes through setFollowMode(false), which cancels
+            // the pending chase) — the chase must still
             // land, e.g. after a downward re-engage mid-gesture. Re-arm
             // until the input window lapses instead of dropping.
             if ((performance.now() - this.lastUserInputT) < 100) {
@@ -3644,7 +4259,7 @@ class BonitoChat {
     // holds and the jitter guards all regress. A genuine reset is ours to undo;
     // nothing else is.
     restoreAfterMove() {
-        if (this.container.clientHeight === 0) return;   // no box yet; onShown owns it
+        if (!this.paneVisible || this.container.clientHeight === 0) return;   // no box yet; onShown owns it
         if (this.container.scrollTop > 1) return;        // scroll survived the move
         if (this.followMode) {
             if (!this.atBottom()) this.scrollToBottom();
@@ -3658,30 +4273,26 @@ class BonitoChat {
     }
 
     scrollToBottom() {
-        if (this.scrollbarDrag) return;   // the drag owns scrollTop
-        // Belt + suspenders: set scrollTop AND scrollIntoView on the LAST
-        // child (the overscroll tail — plain content, see sizeTail).
-        // scrollTop alone uses the container's reported scrollHeight which
-        // can be stale during streaming; scrollIntoView tells the browser
-        // "make this element's bottom edge visible" and lets it compute
-        // the right position from current layout.
-        this.container.scrollTop = this.container.scrollHeight;
-        const anchor = this.tailEl || this.spacerBottom;
-        if (anchor) {
-            anchor.scrollIntoView({ block: 'end', behavior: 'auto' });
+        if (this.destroyed || !this.paneVisible || this.scrollbarDrag) return;
+        // The bottom of the conversation, not just of the block: a block that
+        // stops short of the end is replaced by the tail, which lands pinned.
+        if (this.blockEmpty() || !this.atTail()) {
+            if (this.pending.block?.kind !== 'tail') this.loadTail();
+            return;
         }
+        // Use the scroll container's layout coordinates only. scrollIntoView
+        // uses the tail's transformed box during rubberbanding and moves us
+        // back UP immediately after this write (also dropping bottom padding).
+        // One owner prevents opposing corrections on each viewport/stream tick.
+        this.container.scrollTop = this.container.scrollHeight;
         // Keep the direction baseline honest where no scroll event may fire
-        // (see the offscreen note below): a chase leaving a stale, SMALLER
-        // prevScrollTop would make the next upward peek read as "moving
-        // down" and wrongly re-engage.
+        // (offscreen renderers fire none for programmatic writes): a chase
+        // leaving a stale, SMALLER prevScrollTop would make the next upward
+        // peek read as "moving down" and wrongly re-engage.
         this.prevScrollTop = this.container.scrollTop;
-        // Don't rely on the `scroll` event to drive the post-scroll range
-        // fetch — Electron's offscreen renderer (and a few other headless
-        // browser configs) doesn't fire scroll events for programmatic
-        // scrollTop changes, which leaves the chasing-bottom loop fetching
-        // nothing past the initial range. `refresh()` is idempotent and
-        // cheap, so call it explicitly.
-        this.refresh();
+        // For the same reason, keep the block in shape here rather than wait
+        // for a scroll event that may not come.
+        this.ensureWindow();
     }
 
     // Save the user-visible scroll state at the instant the pane is
@@ -3694,6 +4305,24 @@ class BonitoChat {
     // multi-attempt cascade in `onShown` we treat the browser as opaque
     // and just brute-force the right answer.
     onHidden() {
+        this.projectVisible = false;
+        this.updateVisibility();
+    }
+
+    onShown() {
+        this.projectVisible = true;
+        this.updateVisibility(true);
+    }
+
+    updateVisibility(restore = false) {
+        const visible = this.projectVisible && this.workspaceVisible;
+        if (visible && (restore || !this.paneVisible)) this.showPane();
+        else if (!visible && this.paneVisible) this.hidePane();
+    }
+
+    hidePane() {
+        if (!this.paneVisible) return;
+        this.cancelShowRestore();
         // Freeze all in-flight scroll animation BEFORE snapshotting the position.
         // A pan fling leaves momentum/spring rAFs (and an append chase rAF) that
         // write `scrollTop` every frame; if the pane is hidden mid-fling they keep
@@ -3706,15 +4335,12 @@ class BonitoChat {
         if (this.setOverscroll) this.setOverscroll(0);
         this.savedScrollTop  = this.container.scrollTop;
         this.savedFollowMode = this.followMode;
-        // CONTENT anchor besides the pixel position: heights re-measured
-        // while hidden (or the backfill running meanwhile) change what a raw
-        // scrollTop points at — restoring to the anchored MESSAGE is what
-        // "keep my read position" actually means.
+        // CONTENT anchor besides the pixel position: rows that change height
+        // while hidden (images, editors) change what a raw scrollTop points
+        // at; restoring to the anchored MESSAGE is what "keep my read
+        // position" actually means.
         this.savedAnchor = this.captureAnchor();
-        // Hidden panes stop backfilling: every prefetch chunk is a server-side
-        // render broadcast to every tab — deferred until the user returns.
-        this.prefetchPaused = true;
-        clearTimeout(this.prefetchTimer);
+        this.paneVisible = false;
     }
 
     // Called by the chat-pane visibility toggle whenever this pane goes
@@ -3725,40 +4351,37 @@ class BonitoChat {
     //     hid the pane): re-anchor to the bottom on every retry so any
     //     bubbles that streamed in while we were hidden land in view.
     //   • Was scrolled up to read history (followMode false on both
-    //     sides): restore the SAVED scrollTop on every retry so a
+    //     sides): restore the anchored message on every retry so a
     //     mid-layout clamp can be undone on the next frame.
     //
-    // Both branches use the same 0 / rAF / 50 ms / 200 ms cascade as the
-    // initial-mount path. The user observed that clicking the chat
-    // button TWICE landed on the right position — that's the symptom of
-    // a single-frame write losing to a still-in-progress flex relayout.
-    // The cascade replicates "click again later", just automatically.
-    onShown() {
+    // The 0 / rAF / 50 ms / 200 ms cascade: a single-frame write loses to a
+    // still-in-progress flex relayout (clicking the chat TWICE used to land
+    // right). The cascade replicates "click again later", just automatically.
+    cancelShowRestore() {
+        cancelAnimationFrame(this.showRestoreRaf);
+        this.showRestoreRaf = 0;
+        for (const timer of this.showRestoreTimers) clearTimeout(timer);
+        this.showRestoreTimers = [];
+    }
+
+    showPane() {
+        this.cancelShowRestore();
+        this.paneVisible = true;
         const followNow  = !!this.followMode;
         const followThen = !!this.savedFollowMode;
         const wantBottom = followNow || followThen;
         const savedTop   = this.savedScrollTop;
         const anchor     = this.savedAnchor;
 
-        // Resume the paused history backfill (see onHidden).
-        this.prefetchPaused = false;
-        if (this.prefetchStarted) {
-            clearTimeout(this.prefetchTimer);
-            this.prefetchTimer = setTimeout(() => this.prefetchTick(), 600);
-        }
-
         const apply = () => {
-            if (this.destroyed) return;
+            if (this.destroyed || !this.paneVisible) return;
             if (wantBottom) {
                 if (this.followMode) this.scrollToBottom();
+                this.updateScrollAffordance(this.atBottom());
                 return;
             }
-            // Prefer the CONTENT anchor: land on the message the user was
-            // reading, not on whatever pixel offset the re-measured heights
-            // now map to. Falls back to the raw scrollTop while the anchor
-            // node isn't rendered yet (a later cascade retry snaps it true).
-            const n = anchor && this.rendered.has(anchor.idx) ? this.cache.get(anchor.idx) : null;
-            if (n && n.isConnected) {
+            const n = anchor ? this.cache.get(anchor.idx) : null;
+            if (n && n.isConnected && n.offsetParent !== null) {
                 this.container.scrollTop = n.offsetTop - anchor.off;
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
@@ -3766,11 +4389,12 @@ class BonitoChat {
             // Programmatic, possibly event-less write: sync the direction
             // baseline (see prevScrollTop).
             this.prevScrollTop = this.container.scrollTop;
+            this.ensureWindow();
+            this.updateScrollAffordance(this.atBottom());
         };
         apply();
-        requestAnimationFrame(apply);
-        setTimeout(apply,  50);
-        setTimeout(apply, 200);
+        this.showRestoreRaf = requestAnimationFrame(apply);
+        this.showRestoreTimers = [setTimeout(apply, 50), setTimeout(apply, 200)];
     }
 
     // ── Image attachments ────────────────────────────────────────────────
@@ -3809,6 +4433,41 @@ class BonitoChat {
         // at click time.
         if (!this.inputArea || !this.textInput) return;
 
+        // Native sizing avoids synchronous textarea collapse/reflow during
+        // Android IME edits and preserves selection/scroll within long drafts.
+        // Older engines measure an unfocused, isolated copy once per frame.
+        if (!CSS.supports('field-sizing', 'content')) {
+            this.textInput.dataset.btSizingFallback = '';
+            const mirror = document.createElement('textarea');
+            mirror.className = 'bt-input-measure';
+            mirror.tabIndex = -1;
+            mirror.setAttribute('aria-hidden', 'true');
+            this.inputArea.appendChild(mirror);
+            this.inputMeasure = mirror;
+            this.onInputResize = () => {
+                if (this.inputResizeFrame) return;
+                this.inputResizeFrame = requestAnimationFrame(() => {
+                    this.inputResizeFrame = null;
+                    if (this.destroyed || !this.textInput.clientWidth) return;
+                    mirror.style.width = this.textInput.clientWidth + 'px';
+                    mirror.value = this.textInput.value;
+                    const height = (mirror.scrollHeight + 2) + 'px';
+                    if (this.textInput.style.height !== height) this.textInput.style.height = height;
+                });
+            };
+            this.textInput.addEventListener('input', this.onInputResize);
+            this.textInput.addEventListener('bt-composer-resize', this.onInputResize);
+            let width = 0;
+            this.inputWidthObserver = new ResizeObserver(entries => {
+                const next = entries[0].contentRect.width;
+                if (width === next) return;
+                width = next;
+                this.onInputResize();
+            });
+            this.inputWidthObserver.observe(this.textInput);
+            this.onInputResize();
+        }
+
         // Thumbnail strip lives ABOVE the input row inside .bt-input-area.
         this.attachBar = document.createElement('div');
         this.attachBar.className = 'bt-attachments';
@@ -3816,7 +4475,16 @@ class BonitoChat {
 
         this.attachments = new Map();
         this.attachIdCounter = 0;
+        // An image up to this size goes inline, for the agent to see; anything
+        // bigger, and any other file, is uploaded for the agent to open.
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        // The image types the server stores inline (ATTACHMENT_EXTENSIONS).
+        // Any other image (HEIC off a phone) travels as a file.
+        this.INLINE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg',
+            'image/gif', 'image/webp', 'image/svg+xml']);
+        this.FILE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+        // One upload request: well under any proxy's default body limit (1 MB).
+        this.UPLOAD_CHUNK_BYTES = 512 * 1024;
         // Queue length cap. The file picker makes "select all" in a phone
         // gallery a single tap, so an unbounded queue is one gesture away from
         // dozens of multi-MB data URLs in memory and one enormous message.
@@ -3831,11 +4499,9 @@ class BonitoChat {
             const items = e.clipboardData?.items;
             if (!items) return;
             for (const it of items) {
-                if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
-                    const blob = it.getAsFile();
-                    if (blob) this.attachAddBlob(blob, blob.type || it.type,
-                                                  blob.name || `pasted-${Date.now()}.png`);
-                }
+                if (it.kind !== 'file') continue;
+                const blob = it.getAsFile();
+                if (blob) this.attachAdd(blob, `pasted-${Date.now()}`);
             }
         };
         this.textInput.addEventListener('paste', this.onPaste);
@@ -3843,7 +4509,7 @@ class BonitoChat {
         // Drag-drop — listen on the whole .bt-app so a drop anywhere in
         // the chat counts. dragover MUST preventDefault to enable drop.
         this.onDragOver = (e) => {
-            if (!this.dragHasImage(e)) return;
+            if (!this.dragHasFiles(e)) return;
             e.preventDefault();
             this.app.classList.add('bt-drag-over');
         };
@@ -3858,11 +4524,7 @@ class BonitoChat {
             this.app.classList.remove('bt-drag-over');
             const files = e.dataTransfer?.files;
             if (!files) return;
-            for (const f of files) {
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
-                }
-            }
+            for (const f of files) this.attachAdd(f, `dropped-${Date.now()}`);
         };
         this.app.addEventListener('dragover',  this.onDragOver);
         this.app.addEventListener('dragleave', this.onDragLeave);
@@ -3874,7 +4536,35 @@ class BonitoChat {
         // and works regardless of when the buttons are added.
         this.onAppClickCapture = (e) => {
             if (this.destroyed) return;
-            if (e.target.closest('.bt-send-btn')) {
+            const modeOption = e.target.closest('.bt-send-mode-option');
+            const queueAction = e.target.closest('[data-queue-action]');
+            const modeMenu = this.app.querySelector('.bt-send-mode-menu');
+            if (modeMenu && !e.target.closest('.bt-send-mode')) {
+                modeMenu.hidden = true;
+                this.app.querySelector('.bt-send-mode-trigger')?.setAttribute('aria-expanded', 'false');
+            }
+            if (modeOption) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                this.sendMode = modeOption.dataset.sendMode;
+                const trigger = this.app.querySelector('.bt-send-mode-trigger');
+                trigger.querySelector('.bt-send-mode-label').textContent =
+                    {done: 'Queue when done', next: 'Queue after message', interrupt: 'Interrupt + send'}[this.sendMode];
+                trigger.title = modeOption.textContent;
+                trigger.setAttribute('aria-label', trigger.title);
+                trigger.setAttribute('aria-expanded', 'false');
+                modeMenu.hidden = true;
+                for (const option of modeMenu.children)
+                    option.setAttribute('aria-checked', String(option === modeOption));
+            } else if (e.target.closest('.bt-send-mode-trigger')) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                modeMenu.hidden = !modeMenu.hidden;
+                e.target.closest('button').setAttribute('aria-expanded', String(!modeMenu.hidden));
+            } else if (queueAction) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                this.comm.notify({type: 'queue.action', id: queueAction.dataset.queueId,
+                    action: queueAction.dataset.queueAction});
+
+            } else if (e.target.closest('.bt-send-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this.submit();
@@ -3882,6 +4572,10 @@ class BonitoChat {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this.cancel();
+            } else if (e.target.closest('.bt-force-stop-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this.cancel(true);
             } else if (e.target.closest('.bt-attach-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
@@ -3902,16 +4596,7 @@ class BonitoChat {
             if (this.destroyed) return;
             const input = e.target.closest('.bt-attach-input');
             if (!input || !input.files) return;
-            for (const f of input.files) {
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `picked-${Date.now()}.png`);
-                } else {
-                    // `accept` is a hint, not a rule — most pickers still offer
-                    // "all files". Say so instead of dropping it on the floor.
-                    this.showAttachError(
-                        `${f.name || 'That file'} is not an image; only images can be attached`);
-                }
-            }
+            for (const f of input.files) this.attachAdd(f, `picked-${Date.now()}`);
             // Clear, or picking the SAME file twice fires no `change` at all
             // and the second attempt looks broken.
             input.value = '';
@@ -3922,10 +4607,58 @@ class BonitoChat {
         };
         this.app.addEventListener('change', this.onAppChange);
 
-        // Enter-to-send on the textarea (Shift+Enter newline as usual).
+        // Unsent text outlives the page. A reload (a login that ended, a server
+        // restart) used to take a half-written message with it; now it is kept
+        // per chat in localStorage and put back here. `submit` clears the field
+        // with an `input` event, which drops the saved copy. Yolo reminders are
+        // not a draft: the server keeps those.
+        const pid = app.closest('.bt-chatpane')?.dataset.panePid;
+        if (pid) {
+            const key = 'bt-draft:' + pid;
+            const yolo = () => this.textInput.classList.contains('bt-text-input-yolo');
+            const saved = storage.get(key);
+            if (saved && !this.textInput.value && !yolo()) {
+                this.textInput.value = saved;
+                this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
+            }
+            // Storage is synchronous. Coalesce typing bursts; flush on
+            // background/blur/pagehide so navigating away still keeps the draft.
+            this.flushDraft = () => {
+                clearTimeout(this.draftTimer);
+                if (this.pendingDraft === undefined) return;
+                const text = this.pendingDraft;
+                this.pendingDraft = undefined;
+                text.trim() ? storage.set(key, text) : storage.remove(key);
+            };
+            this.onDraftInput = () => {
+                if (yolo()) return;
+                this.pendingDraft = this.textInput.value;
+                clearTimeout(this.draftTimer);
+                if (!this.pendingDraft.trim()) this.flushDraft();
+                else this.draftTimer = setTimeout(this.flushDraft, 250);
+            };
+            this.onDraftVisibility = () => {
+                if (document.visibilityState === 'hidden') this.flushDraft();
+            };
+            this.textInput.addEventListener('input', this.onDraftInput);
+            this.textInput.addEventListener('blur', this.flushDraft);
+            window.addEventListener('pagehide', this.flushDraft);
+            document.addEventListener('visibilitychange', this.onDraftVisibility);
+        }
+
+        // Mobile Enter belongs to the editor, including autocomplete. IME
+        // confirmation is never Send, even on a desktop keyboard.
+        this.onCompositionStart = () => { this.inputComposing = true; };
+        this.onCompositionEnd = () => { this.inputComposing = false; };
+        this.textInput.addEventListener('compositionstart', this.onCompositionStart);
+        this.textInput.addEventListener('compositionend', this.onCompositionEnd);
         this.onTextInputKeyCapture = (e) => {
-            if (this.cmdAcHandleKey(e)) return;   // autocomplete owns the key
-            if (e.key !== 'Enter' || e.shiftKey) return;
+            if (e.isComposing || this.inputComposing || e.keyCode === 229) return;
+            const mobile = matchMedia('(pointer: coarse)').matches ||
+                navigator.userAgentData?.mobile || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+            if (e.key === 'Enter' && (mobile || e.shiftKey)) return;
+            if (this.cmdAcHandleKey(e)) return;
+            if (e.key !== 'Enter') return;
             e.preventDefault();
             e.stopImmediatePropagation();
             this.submit();
@@ -3953,6 +4686,7 @@ class BonitoChat {
         const acAccept = (cmd) => {
             this.textInput.value = '/' + cmd.name + ' ';
             this.textInput.focus();
+            this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
             acClose();
         };
         const acRender = () => {
@@ -4026,16 +4760,24 @@ class BonitoChat {
         // suppress it. The Monaco tool-body editor owns ESC for its own
         // semantics — skip when the user is editing inside one.
         this.onEscapeKey = (e) => {
-            if (e.key !== 'Escape' || e.repeat) return;
-            // Document-level listener + kept-alive panes (display:none but
-            // connected) = EVERY chat instance hears this. Only the VISIBLE
-            // pane may cancel — one ESC used to cancel the running turn of
-            // every open chat. offsetParent is null while the pane (or any
-            // ancestor) is display:none. A container that left the document
+            if (e.key !== 'Escape' || e.repeat || e.isComposing || this.inputComposing || e.keyCode === 229) return;
+            // Every kept-alive chat hears this document listener. Hidden panes
+            // retain layout boxes, so their visibility flag must gate cancel.
+            // A container that left the document
             // entirely means the `connect` MutationObserver missed an
             // ancestor-level unmount: self-destroy.
             if (!this.container.isConnected) { this.lazyDestroy(); return; }
-            if (this.container.offsetParent === null) return;
+            if (!this.paneVisible || this.container.offsetParent === null) return;
+            if (document.querySelector('.bt-lightbox-overlay')) return;
+            const modeMenu = this.app.querySelector('.bt-send-mode-menu');
+            if (modeMenu && !modeMenu.hidden) {
+                e.preventDefault();
+                modeMenu.hidden = true;
+                const trigger = this.app.querySelector('.bt-send-mode-trigger');
+                trigger.setAttribute('aria-expanded', 'false');
+                trigger.focus();
+                return;
+            }
             // The slash-command popup owns ESC while open (this document-level
             // capture fires BEFORE the textarea's own capture handler, so the
             // popup must be dismissed here or ESC would cancel the turn).
@@ -4057,20 +4799,90 @@ class BonitoChat {
     // entry points can't drift in what they send.
     // Carries the sequence number of the turn the user is LOOKING AT
     // (`turn_begin`), so a stale click can never cancel a later turn.
-    cancel() {
-        this.comm.notify({type: 'cancel', seq: this.turnSeq ?? -1});
+    cancel(force = false) {
+        this.comm.notify({type: 'cancel', seq: this.turnSeq ?? -1, force});
     }
 
-    dragHasImage(e) {
+    setCancelling(stopping) {
+        this.cancelling = stopping;
+        const status = this.app.querySelector('.bt-cancel-status');
+        if (status) status.hidden = !stopping;
+        const stop = this.app.querySelector('.bt-stop-btn');
+        if (stop) stop.title = stopping ?
+            'Stopping the agent. Use Force stop if it does not respond.' :
+            'Stop generation and pause queued messages';
+    }
+
+    dragHasFiles(e) {
         const dt = e.dataTransfer;
         if (!dt) return false;
         if (dt.types) {
             // 'Files' is the type when the user drags from the OS file picker.
-            // Browsers don't expose individual MIME types during dragover, so
-            // we accept any Files drag here and filter image/* on drop.
             for (const t of dt.types) if (t === 'Files') return true;
         }
         return false;
+    }
+
+    // Any file the user attaches. An image the server stores inline, small
+    // enough, goes into the message for the agent to see; everything else is
+    // uploaded and copied to the worker, and the message names its path.
+    attachAdd(file, fallbackName) {
+        const mime = file.type || '';
+        if (this.INLINE_IMAGE_TYPES.has(mime) && file.size <= this.ATTACH_MAX_BYTES) {
+            this.attachAddBlob(file, mime, file.name || `${fallbackName}.png`);
+        } else {
+            this.attachAddFile(file, file.name || fallbackName);
+        }
+    }
+
+    attachAddFile(file, filename) {
+        if (this.attachments.size + this.attachPending >= this.ATTACH_MAX_COUNT) {
+            this.showAttachError(`At most ${this.ATTACH_MAX_COUNT} attachments per message`);
+            return;
+        }
+        if (file.size > this.FILE_MAX_BYTES) {
+            this.showAttachError(`${filename} is too large (${formatBytes(file.size)}, ` +
+                `at most ${formatBytes(this.FILE_MAX_BYTES)})`);
+            return;
+        }
+        const pid = this.app.closest('.bt-chatpane')?.dataset.panePid;
+        if (!pid) { this.showAttachError('Files can only be attached in a chat'); return; }
+        const id = `att-${++this.attachIdCounter}`;
+        const bytes = crypto.getRandomValues(new Uint8Array(12));
+        const item = {
+            kind: 'file', file, filename, mime: file.type || '', size: file.size,
+            pid, uploadId: Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(''),
+            sent: 0, path: null, onWorker: false, error: null, removed: false,
+        };
+        item.done = this.uploadFile(item);
+        this.attachments.set(id, item);
+        this.renderAttachments();
+    }
+
+    // Chunk after chunk, each one request; the last one's answer says where
+    // the file landed. Resolves either way: `item.error` says what went wrong.
+    async uploadFile(item) {
+        const url = (offset) => `/attachment-upload/${encodeURIComponent(item.pid)}` +
+            `?upload=${item.uploadId}&offset=${offset}&total=${item.size}` +
+            `&name=${encodeURIComponent(item.filename)}`;
+        try {
+            let offset = 0;
+            do {
+                if (item.removed) return;
+                const chunk = item.file.slice(offset, offset + this.UPLOAD_CHUNK_BYTES);
+                const resp = await fetch(url(offset), {
+                    method: 'POST', body: chunk, headers: {'X-BT-Upload': '1'}});
+                if (!resp.ok) throw new Error((await resp.text()).trim() || `HTTP ${resp.status}`);
+                const answer = await resp.json();
+                offset = answer.received;
+                item.sent = offset;
+                if (answer.path) { item.path = answer.path; item.onWorker = answer.on_worker; }
+                if (!this.destroyed) this.renderAttachments();
+            } while (offset < item.size);
+        } catch (error) {
+            item.error = `Upload failed: ${error.message}`;
+            if (!this.destroyed) this.renderAttachments();
+        }
     }
 
     attachAddBlob(blob, mime, filename) {
@@ -4105,7 +4917,15 @@ class BonitoChat {
     }
 
     attachRemove(id) {
+        const item = this.attachments.get(id);
         this.attachments.delete(id);
+        // An upload still running stops, and what arrived of it goes.
+        if (item?.kind === 'file' && !item.path) {
+            item.removed = true;
+            fetch(`/attachment-upload/${encodeURIComponent(item.pid)}?upload=${item.uploadId}`,
+                {method: 'DELETE', headers: {'X-BT-Upload': '1'}})
+                .catch(e => console.warn('could not drop the partial upload', e));
+        }
         this.renderAttachments();
     }
 
@@ -4125,13 +4945,32 @@ class BonitoChat {
             this.attachBar.classList.add('bt-attachments-active');
             for (const [id, item] of this.attachments) {
                 const wrap = document.createElement('div');
-                wrap.className = 'bt-attachment-thumb';
                 wrap.dataset.attachId = id;
-                const img = document.createElement('img');
-                img.src   = item.dataUrl;
-                img.alt   = item.filename || 'image';
-                img.title = item.filename || 'image';
-                wrap.appendChild(img);
+                if (item.kind === 'file') {
+                    // Name, size, and how far the upload got.
+                    wrap.className = 'bt-attachment-file';
+                    wrap.dataset.state = item.error ? 'error' : item.path ? 'done' : 'uploading';
+                    const name = document.createElement('div');
+                    name.className = 'bt-attachment-file-name';
+                    name.textContent = item.filename;
+                    name.title = item.filename;
+                    const status = document.createElement('div');
+                    status.className = 'bt-attachment-file-status';
+                    status.textContent = item.error ? item.error :
+                        item.path ? formatBytes(item.size) :
+                        `Uploading ${Math.floor(100 * item.sent / Math.max(1, item.size))}% of ${formatBytes(item.size)}`;
+                    const bar = document.createElement('div');
+                    bar.className = 'bt-attachment-file-bar';
+                    bar.style.width = `${item.path ? 100 : Math.floor(100 * item.sent / Math.max(1, item.size))}%`;
+                    wrap.append(name, status, bar);
+                } else {
+                    wrap.className = 'bt-attachment-thumb';
+                    const img = document.createElement('img');
+                    img.src   = item.dataUrl;
+                    img.alt   = item.filename || 'image';
+                    img.title = item.filename || 'image';
+                    wrap.appendChild(img);
+                }
                 const rm = document.createElement('button');
                 rm.type = 'button';
                 rm.className = 'bt-attachment-remove';
@@ -4168,6 +5007,80 @@ class BonitoChat {
         }, 4500);
     }
 
+    renderQueue(msg) {
+        const box = this.app.querySelector('.bt-message-queue');
+        if (!box) return;
+        const expanded = new Set([...box.querySelectorAll('details[open]')].map(e => e.dataset.queueId));
+        box.replaceChildren();
+        const items = msg.items || [];
+        box.hidden = items.length === 0;
+        if (!items.length) return;
+        box.setAttribute('aria-label', `Pending messages (${items.length})`);
+        for (const item of items) {
+            const row = document.createElement('details');
+            row.className = 'bt-queue-item';
+            row.open = expanded.has(item.id);
+            row.dataset.queueId = item.id;
+            row.dataset.status = item.status;
+            row.dataset.mode = item.mode;
+            const text = document.createElement('div');
+            text.className = 'bt-queue-text';
+            text.textContent = item.text;
+            const status = document.createElement('div');
+            status.className = 'bt-queue-status';
+            status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'held' ? 'Goes out with your next message' :
+                item.status === 'offline' ? 'Agent not reachable · sends once it is back' :
+                item.status === 'sending' ? 'Connecting · not sent yet' :
+                item.mode === 'interrupt' ? 'Waiting for interruption to finish' :
+                item.mode === 'next' ? 'Waiting for the next message boundary' :
+                'Waiting until the agent finishes');
+            const summary = document.createElement('summary');
+            summary.className = 'bt-queue-summary';
+            const preview = document.createElement('span');
+            preview.className = 'bt-queue-preview';
+            preview.textContent = item.text;
+            const badge = document.createElement('span');
+            badge.className = 'bt-queue-badge';
+            badge.textContent = item.status === 'paused' ? 'Paused · not sent' :
+                item.status === 'held' ? 'With your next message' :
+                item.status === 'offline' ? 'Agent offline · queued' :
+                item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' :
+                item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
+            summary.title = status.textContent;
+            summary.append(preview, badge);
+            const detail = document.createElement('div');
+            detail.className = 'bt-queue-detail';
+            detail.append(text, status);
+            row.append(summary, detail);
+            const actions = document.createElement('div');
+            actions.className = 'bt-queue-actions';
+            // Held after a Stop: the chat's own note about something that ended,
+            // which waits for the user's next message unless they send it now.
+            for (const [action, label] of item.status === 'paused' ?
+                    [['send', 'Queue again'], ['remove', 'Remove']] :
+                    item.status === 'held' ? [['send', 'Send now'], ['remove', 'Remove']] :
+                    item.status === 'waiting' || item.status === 'offline' ? [['remove', 'Remove']] : []) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
+                button.dataset.queueAction = action;
+                button.dataset.queueId = item.id;
+                button.textContent = label;
+                actions.append(button);
+            }
+            detail.append(actions);
+            box.append(row);
+        }
+    }
+
+    queueDelivered(msg) {
+        const box = this.app.querySelector('.bt-queue-delivery');
+        if (!box) return;
+        box.textContent = 'Sent to agent: ' + msg.text.replace(/\s+/g, ' ').slice(0, 100);
+        box.hidden = false;
+    }
+
     async submit() {
         const text = this.textInput.value;
         // Nothing to send → noop. (Pressing Enter on an empty textarea
@@ -4179,8 +5092,27 @@ class BonitoChat {
         // lock-in is meaningful there: it clears the reminders.
         const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
         if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
+        // Files still uploading: the message waits for them (the chips show how
+        // far they are). A second click meanwhile does nothing.
+        if (this.submitting) return;
+        const files = [...this.attachments.values()].filter(item => item.kind === 'file');
+        if (files.some(item => !item.path && !item.error)) {
+            this.submitting = true;
+            try { await Promise.all(files.map(item => item.done)); }
+            finally { this.submitting = false; }
+        }
+        const failed = files.find(item => item.error);
+        if (failed) {
+            this.showAttachError(`${failed.filename}: ${failed.error}. Remove it to send.`);
+            return;
+        }
         const payload = [];
         for (const item of this.attachments.values()) {
+            if (item.kind === 'file') {
+                payload.push({kind: 'file', path: item.path, filename: item.filename,
+                              on_worker: item.onWorker});
+                continue;
+            }
             const buf = await item.blob.arrayBuffer();
             payload.push({
                 mime:     item.mime,
@@ -4188,7 +5120,9 @@ class BonitoChat {
                 data:     arrayBufferToBase64(buf),
             });
         }
-        this.comm.notify({type: 'send', text, attachments: payload});
+        // What is in the composer now: typing went on while files uploaded.
+        this.comm.notify({type: 'send', text: this.textInput.value, attachments: payload,
+                          mode: this.sendMode || 'done'});
         // Clear the local input immediately. We don't wait for any
         // server ack — the textarea content is already encoded on the
         // wire, Julia will surface errors (e.g. attachment rejection)
@@ -4213,36 +5147,19 @@ class BonitoChat {
         // resizes the visual viewport too, and chasing the tail then scrolls the
         // chat away from the very video being watched — which used to end the
         // fullscreen outright (the node left the render window and was detached).
-        // `updateDOM` now refuses to drop it, but the scroll is still wrong: the
+        // `trimBlock` refuses to drop it, but the scroll is still wrong: the
         // user asked for fullscreen, not for the conversation to move.
         if (this.fullscreenActive()) return;
         const vv = window.visualViewport;
-        // Do NOTHING when the geometry is what we already wrote.
-        //
-        // `visualViewport.resize` is not one event per keyboard slide: a phone
-        // fires it for the IME candidate bar appearing and disappearing, for
-        // keyboard height changes, and for address-bar nudges — several times
-        // per typed character. Each one used to write `.bt-app`'s height
-        // unconditionally, which re-lays-out `.bt-messages`, which runs the
-        // container's ResizeObserver, which calls `sizeTail()` and chases the
-        // tail: a full layout + scroll cycle per event. And since the write
-        // changes layout, it can provoke the next resize event itself — so the
-        // cycle feeds back, which is what a wobble IS.
-        //
-        // Rounded, because the fractional jitter is exactly the noise to drop.
-        //
-        // ONLY the style write is skipped, never the chase. The write is the
-        // half that feeds back (it changes layout, which can provoke the next
-        // resize event); the chase only moves scrollTop and cannot. Skipping
-        // BOTH was measurably worse: the repeated write was also acting as a
-        // periodic re-pin, and without it `e2e:composer_wobble` picked up a 2px
-        // drift on a keystroke that resized nothing.
+        // IME notifications can repeat without a viewport change. Do not
+        // re-pin the transcript for every key/selection event. Actual content
+        // and composer resizes are already handled by the ResizeObservers.
+        if (this.destroyed || !this.paneVisible || !this.container.offsetParent) return;
         const h = Math.round(vv.height);
-        if (this.lastViewportHeight !== h) {
-            this.lastViewportHeight = h;
-            const app = this.app || this.container.closest('.bt-app');
-            if (app) app.style.height = h + 'px';
-        }
+        if (this.lastViewportHeight === h) return;
+        this.lastViewportHeight = h;
+        const app = this.app || this.container.closest('.bt-app');
+        if (app) app.style.height = h + 'px';
         if (this.followMode) this.queueScrollToBottom();
     }
 
@@ -4267,10 +5184,7 @@ class BonitoChat {
     applyUserScroll(prevTop) {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
         const atBot = this.atBottom();
-        if (this.followMode && !atBot) {
-            this.setFollowMode(false);
-            this.cancelPendingScroll();
-        }
+        if (this.followMode && !atBot) this.setFollowMode(false);
         if (this.followMode) return;
         if (atBot || (scrollTop > prevTop &&
                       scrollHeight - scrollTop - clientHeight < clientHeight &&
@@ -4298,12 +5212,16 @@ class BonitoChat {
     // zone (any pixel visible, less than a viewport to go) → true. Layout
     // shifts never toggle it.
     setFollowMode(on) {
-        if (on) this.pendingAnchor = null;
         if (this.followMode === on) return;
         this.followMode = on;
         if (on) {
             this.unreadCount = 0;
             this.hideNewMessagePill();
+        } else {
+            // A chase queued while following has nothing left to follow: a
+            // jump, a lens or a restore that ends following must not be
+            // pulled back to the bottom on the next frame.
+            this.cancelPendingScroll();
         }
     }
 
@@ -4340,6 +5258,7 @@ class BonitoChat {
     // visible but not at the bottom — the pill hides, but unread is NOT
     // cleared: the user hasn't actually reached the bottom.
     updateScrollAffordance(atBot) {
+        if (!this.paneVisible) return;
         if (atBot) {
             this.unreadCount = 0;
             this.hideNewMessagePill();
@@ -4371,17 +5290,21 @@ class BonitoChat {
 
     // Glow + "New messages" only while there's unread content; otherwise the
     // plain "Move to bottom" form (same popup, no glow).
+    // Runs on every scroll event: it writes only what changed. Setting the
+    // same text replaces the text node, and the pill was laid out and painted
+    // again on every scroll step.
     refreshPillContent() {
         if (!this.pillEl) return;
         const hasUnread = this.unreadCount > 0;
-        this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
-        if (this.pillLabelEl) {
-            this.pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
-        }
+        if (this.pillEl.classList.contains('bt-new-msg-pill-glow') !== hasUnread)
+            this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        const label = hasUnread ? 'New messages' : 'Move to bottom';
+        if (this.pillLabelEl && this.pillLabelEl.textContent !== label)
+            this.pillLabelEl.textContent = label;
     }
 
-    // Pill lives inside .bt-app, absolutely positioned above the input
-    // area. We append it once and toggle its visibility class. Click →
+    // Anchor above the composer so queues, attachments and growing drafts
+    // cannot overlap it. Append once and toggle visibility. Click →
     // re-engage follow mode and scroll to the bottom.
     createNewMessagePill() {
         const app = this.container?.closest('.bt-app') ||
@@ -4403,7 +5326,9 @@ class BonitoChat {
             this.setFollowMode(true);
             this.scrollToBottom();
         });
-        app.appendChild(pill);
+        const inputArea = app.querySelector('.bt-input-area');
+        if (!inputArea) return;
+        inputArea.appendChild(pill);
         this.pillEl = pill;
         this.pillLabelEl = label;
     }
@@ -4414,6 +5339,26 @@ class BonitoChat {
 // and not a URL. Bare names like `foo.jl` stay unlinked on purpose (too many
 // false positives: package names, "Project.toml" as a concept, …).
 const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+
+// `text` onto the clipboard; rejects when it did not get there. The same as
+// COPY_TEXT_JS (styles.jl), which the Julia-rendered Copy buttons use.
+function copyText(text) {
+    const legacy = () => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+    };
+    return navigator.clipboard && window.isSecureContext ?
+        navigator.clipboard.writeText(text).catch(legacy) : legacy();
+}
 
 // Give every fenced code block (<pre>) in a rendered message a hover action row
 // (copy · download), Signal-style. The <pre> is wrapped in a positioned
@@ -4438,25 +5383,8 @@ function decorateCodeBlocks(rootEl) {
             return b;
         };
         const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b) => {
-            const done = () => {
-                b.textContent = '✓';
-                setTimeout(() => { b.textContent = '⧉'; }, 1200);
-            };
-            const fallback = () => {
-                const ta = document.createElement('textarea');
-                ta.value = codeText();
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.select();
-                try { document.execCommand('copy'); done(); }
-                finally { ta.remove(); }
-            };
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(codeText()).then(done, fallback);
-            } else {
-                fallback();
-            }
+            const say = t => { b.textContent = t; setTimeout(() => { b.textContent = '⧉'; }, 1200); };
+            copyText(codeText()).then(() => say('✓'), () => say('✕'));
         });
         const dlBtn = mk('bt-code-download', '⤓', 'Download', () => {
             const blob = new Blob([codeText()], { type: 'text/plain' });
@@ -4483,37 +5411,41 @@ function decorateCodeBlocks(rootEl) {
 // cannot serve. Same-origin absolute URLs are the same failure after the
 // browser has resolved the href, so accept those too. Real web links remain
 // ordinary anchors.
+// A malformed percent escape is still a valid Unix filename: keep it as written.
+function decodePath(text) {
+    try { return decodeURIComponent(text); }
+    catch (error) { if (!(error instanceof URIError)) throw error; return text; }
+}
+
 function markdownWorkerPath(anchor) {
     const raw = (anchor.getAttribute('href') || '').trim();
     if (!raw || raw.startsWith('#') || raw.startsWith('?')) return null;
     if (/^(mailto|tel|data|blob|javascript):/i.test(raw)) return null;
 
     let path = raw;
-    try {
-        const url = new URL(raw, window.location.href);
-        if (url.protocol === 'file:') {
-            path = decodeURIComponent(url.pathname);
-        } else if (url.protocol === 'http:' || url.protocol === 'https:') {
-            // An explicitly external URL is a web link. A same-dashboard URL
-            // is what a leading worker path becomes in the browser.
-            if (url.origin !== window.location.origin) return null;
-            path = decodeURIComponent(url.pathname);
-        } else {
-            return null;
-        }
-    } catch (_) {
-        // Keep the raw relative path; the server resolves it against the
-        // project's worker cwd. A malformed percent escape is still a valid
-        // Unix filename and should not disable the opener.
-        try { path = decodeURIComponent(raw); } catch (_) { path = raw; }
+    let url = null;
+    try { url = new URL(raw, window.location.href); }
+    catch (error) { if (!(error instanceof TypeError)) throw error; }
+    if (url === null) {
+        // Not a URL: keep the raw relative path; the server resolves it
+        // against the project's worker cwd.
+        path = decodePath(raw);
+    } else if (url.protocol === 'file:') {
+        path = decodePath(url.pathname);
+    } else if (url.protocol === 'http:' || url.protocol === 'https:') {
+        // An explicitly external URL is a web link. A same-dashboard URL
+        // is what a leading worker path becomes in the browser.
+        if (url.origin !== window.location.origin) return null;
+        path = decodePath(url.pathname);
+    } else {
+        return null;
     }
 
     // For relative hrefs URL() above resolves against the dashboard origin;
     // preserve the relative spelling so media/clip.mp4 resolves against the
     // PROJECT rather than becoming /media/clip.mp4 on the worker.
     if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(raw)) {
-        const clean = raw.split(/[?#]/, 1)[0];
-        try { path = decodeURIComponent(clean); } catch (_) { path = clean; }
+        path = decodePath(raw.split(/[?#]/, 1)[0]);
     }
     return path || null;
 }
@@ -4535,20 +5467,39 @@ function linkifyPaths(rootEl) {
     });
 }
 
-// Click-to-enlarge for JS-created media (user-bubble attachment images).
-// Mirrors the Julia-side LIGHTBOX_OPEN_JS (chat.jl) used by bt_show / Read
-// previews: clone into a fullscreen overlay, Esc or backdrop click closes.
-function openLightbox(media) {
+// Shared image viewer: only the source is reused, never thumbnail classes,
+// inline sizing, lazy-loading or tool-body ids/handlers.
+export function openLightbox(media) {
+    document.querySelector('.bt-lightbox-overlay')?.closeLightbox();
     const overlay = document.createElement('div');
     overlay.className = 'bt-lightbox-overlay';
-    const big = media.cloneNode(true);
-    big.classList.add('bt-lightbox-media');
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'Enlarged image');
+    const big = document.createElement('img');
+    big.src = media.currentSrc || media.src;
+    big.alt = media.alt || '';
+    big.className = 'bt-lightbox-media';
     overlay.appendChild(big);
-    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey); };
-    const onkey = e => { if (e.key === 'Escape') close(); };
-    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
-    document.addEventListener('keydown', onkey);
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onkey, true); };
+    overlay.closeLightbox = close;
+    const onkey = e => {
+        if (e.key !== 'Escape') return;
+        e.preventDefault(); e.stopImmediatePropagation(); close();
+    };
+    overlay.addEventListener('click', close);
+    document.addEventListener('keydown', onkey, true);
     document.body.appendChild(overlay);
+}
+
+// ↑ chips for the evals a card waits on (`msg.jumps`: label, store index, id,
+// title). A click brings that card into view (delegated, see jumpToMessage).
+function jumpChipsHTML(jumps) {
+    if (!Array.isArray(jumps)) return '';
+    return jumps.map(j =>
+        `<button type="button" class="bt-tool-jump" data-jump-index="${Number(j.index)}"` +
+        ` data-jump-id="${escapeAttr(String(j.id))}" title="${escapeAttr(String(j.title || ''))}">` +
+        `↑ ${escapeHTML(String(j.label))}</button>`).join('');
 }
 
 function escapeHTML(str) {
@@ -4701,6 +5652,15 @@ const CHAT_INSTANCES = new Set();
 // virtual-scroll window currently holds detached. A module export (Julia's
 // dom_in_js callbacks resolve it via `$(ChatLib).then(lib => lib.toolSlot(...))`)
 // instead of the former `window._btToolSlot` global.
+// The tool.render reply put a body into `slot`: tell the chat that owns it.
+export function bodyMounted(slot) {
+    const row = slot.closest('.bt-tool-msg');
+    if (!row) return;
+    for (const chat of CHAT_INSTANCES) {
+        if (chat.container.contains(row)) { chat.onBodyMounted(row); return; }
+    }
+}
+
 export function toolSlot(id) {
     const direct = document.querySelector(
         `.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
@@ -4713,8 +5673,15 @@ export function toolSlot(id) {
     return null;
 }
 
+// Write every chat's pending draft to storage now. A draft is written 250ms
+// after the last keystroke; the connection guard reloads a page only when no
+// typed text would be lost, and text from the last 250ms was not saved yet.
+export function flushDrafts() {
+    for (const chat of CHAT_INSTANCES) chat.flushDraft?.();
+}
+
 export function connect(node, comm, init = {}) {
-    const chat = new BonitoChat(node, comm);
+    const chat = new BonitoChat(node, comm, init);
     // Late-mount snapshot: comm events fired before this tab connected are
     // gone, so the server bakes the current slash-command set into the init
     // call; live changes keep flowing via the 'commands' comm event.
@@ -4726,9 +5693,9 @@ export function connect(node, comm, init = {}) {
     if (parent) {
         const mo = new MutationObserver(() => {
             if (!node.isConnected) {
-                try { chat.destroy(); } catch (_) {}
-                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
+                CHAT_INSTANCES.delete(chat);
+                if (!chat.destroyed) chat.destroy();
             }
         });
         mo.observe(parent, { childList: true });

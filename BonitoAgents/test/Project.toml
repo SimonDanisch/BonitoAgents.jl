@@ -27,6 +27,7 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+WorkerLink = "03840273-e5e6-4e74-9050-e95881fcd827"
 
 [sources]
 BonitoAgents = {path = ".."}
@@ -40,3 +41,5 @@ Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.
 ElectronCall = {url = "https://github.com/IanButterworth/ElectronCall.jl.git", rev = "sd/testsuite"}
 BonitoBook = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}
 BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
+
+WorkerLink = {path = "../../WorkerLink"}

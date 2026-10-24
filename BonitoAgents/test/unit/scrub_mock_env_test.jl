@@ -9,7 +9,8 @@
 
     mock_keys = ("BT_ENABLE_MOCK_AGENT", "BT_MOCK_ACP_SCENARIO",
                  "BT_MOCK_ACP_DISPATCHER", "BT_MOCK_PROJECT",
-                 "BT_MOCK_ACP_IGNORE_CANCEL")
+                 "BT_MOCK_ACP_IGNORE_CANCEL", "BT_MOCK_ACP_SESSION_CONFIG",
+                 "BT_MOCK_ACP_VARIANT")
     saved = Dict(k => get(ENV, k, nothing) for k in (mock_keys..., "BT_DEFAULT_PROVIDER"))
     try
         # Simulate the leak of a closed mock dev_server.
@@ -18,6 +19,8 @@
         ENV["BT_MOCK_ACP_SCENARIO"]   = "dispatcher"
         ENV["BT_MOCK_ACP_DISPATCHER"] = "127.0.0.1:41975"
         ENV["BT_MOCK_PROJECT"]        = "/tmp/somewhere"
+        ENV["BT_MOCK_ACP_SESSION_CONFIG"] = "1"
+        ENV["BT_MOCK_ACP_VARIANT"] = "second"
         TK.scrub_mock_env!()
         for k in mock_keys
             @test !haskey(ENV, k)

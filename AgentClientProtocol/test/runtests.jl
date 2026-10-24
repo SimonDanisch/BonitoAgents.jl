@@ -30,13 +30,13 @@ struct Mock
 end
 
 peer_alive(m::Mock) = !istaskdone(m.task)
-kill_peer!(m::Mock) = (w = m.peer_ws[]; w === nothing || (try close(w) catch end); nothing)
+kill_peer!(m::Mock) = (w = m.peer_ws[]; w === nothing || close(w); nothing)   # close is idempotent
 # Release the loopback server handler + close the server. Idempotent. Every test
 # calls this once it's done with the mock (the old subprocess mock had no server
 # to reap; the WS relay does).
 function relay_close!(m::Mock)
     isopen(m.hold) && close(m.hold)
-    try close(m.server) catch end
+    close(m.server)   # idempotent
     return nothing
 end
 
@@ -51,14 +51,15 @@ freeport() = (s = Sockets.listen(Sockets.localhost, 0);
 # closes the server socket, so the agent's `recv` hits EOF and its task ends;
 # `relay_close!` frees the loopback server.
 function spawn_mock(scenario::AbstractString; n::Integer = 0,
-                    handler::ACP.Handler = ACP.DiscardHandler())
+                    handler::ACP.Handler = ACP.DiscardHandler(), agent_turns::Bool = false)
     port    = freeport()
     ws_ch   = Channel{Any}(1)         # delivers the server-side socket
     hold    = Channel{Nothing}(0)     # closed at teardown to release the handler
     peer_ws = Ref{Any}(nothing)
     server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
         put!(ws_ch, ws)
-        try take!(hold) catch end     # keep the handler (and ws) alive until teardown
+        # keep the handler (and ws) alive until teardown closes `hold`
+        try take!(hold) catch e; e isa InvalidStateException || rethrow() end
     end
     task = @async try
         HTTP.WebSockets.open("ws://127.0.0.1:$port") do cws
@@ -72,7 +73,7 @@ function spawn_mock(scenario::AbstractString; n::Integer = 0,
             @warn "mock scenario failed" scenario exception = (e, catch_backtrace())
     end
     server_ws = take!(ws_ch)
-    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), handler)
+    conn = ACP.Connection(ACP.WorkerTransport(Ref{Any}(server_ws)), handler; agent_turns)
     return Mock(conn, task, peer_ws, server, hold)
 end
 
@@ -580,8 +581,8 @@ end
         try
             sid = do_setup(conn)
             client = ACP.Client(conn, sid, pwd())
-            @test ACP.cancel!(client) == false            # nothing to cancel
-            @test ACP.session_activity(conn) isa ACP.Idle # ...and it stays idle
+            @test isempty(ACP.cancel!(client))           # nothing to cancel, nothing sent
+            @test isempty(ACP.open_turns(conn))          # ...and nothing opened
         finally
             close(conn)
         end
@@ -594,7 +595,7 @@ end
     # There used to be a `cancelling` flag that made the dispatcher DROP
     # main-thread updates, so it could skip a cancelled prompt's backlog and
     # reach that prompt's `cancelled` response. It was cleared only by that
-    # response — so cancelling UN-PROMPTED work (an auto-wake episode, a
+    # response — so cancelling UN-PROMPTED work (the agent's own turn, a
     # background subagent), which has no response of ours coming, latched it
     # forever and every later frame was discarded unparsed. The agent kept
     # working and streaming while the client binned all of it; the chat looked
@@ -605,15 +606,11 @@ end
             sid    = do_setup(conn)
             client = ACP.Client(conn, sid, pwd())
 
-            # No prompt of ours is open; the agent is working on its own.
-            @atomic conn.last_work_at = time()
-            @atomic conn.activity = ACP.Unprompted()
-            @test ACP.session_live(client) == true
-            @test ACP.cancel!(client) == true            # the cancel DOES go out
-            # No prompt to settle, so it does not sit in `Cancelling`; and the
-            # cancel consumes the work recency it acted on, so it lands on
-            # `Idle` rather than re-reporting itself live for the quiet window.
-            @test ACP.session_activity(conn) isa ACP.Idle
+            # No prompt of ours is open; the agent is on a turn of its own.
+            own = ACP.AgentTurn()
+            lock(() -> (conn.agent_turn = own), conn.lock)
+            @test ACP.cancel!(client) == [own]          # the cancel DOES go out
+            @test !ACP.isover(own)                      # over when the agent says so
 
             put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("still working")))
             @test timedwait(() -> Base.n_avail(client.messages) >= 1, 5.0) === :ok
@@ -624,10 +621,9 @@ end
             # behind it still arrive — that is the whole change. Asserted on the
             # DELIVERED TEXT: consecutive chunks coalesce onto the open bubble,
             # so the message count would not grow even when nothing is dropped.
-            span = ACP.PromptSpan(9992)
+            span = ACP.PromptTurn(9992)
             lock(() -> push!(conn.active_prompts, span), conn.lock)
-            @test ACP.cancel!(client) == true
-            @test ACP.session_activity(conn) isa ACP.Cancelling
+            @test ACP.cancel!(client) == [span, own]
             put!(client.updates, ACP.AgentMessageChunk(ACP.TextContent("backlog")))
             # The delta lands in the message's STATE (its pump folds it), so the
             # assertion is about what the message now says, not what is queued.
@@ -638,6 +634,108 @@ end
         end
         @test timedwait(() -> !peer_alive(m), 5.0) === :ok
         relay_close!(m)
+    end
+
+    # ── Turns the agent starts on its own ───────────────────────────────────
+    @testset "the agent's own turns are opened and ended by the wire" begin
+        m = spawn_mock("setup_then_idle"; agent_turns = true); conn = m.conn
+        do_setup(conn)                             # the mock sends no updates of its own
+        stream = Channel{Any}(64)
+        conn.main_stream = stream
+        got() = [take!(stream) for _ in 1:Base.n_avail(stream)]
+        plain(inner) = Dict{String,Any}("jsonrpc" => "2.0", "method" => "session/update",
+            "params" => Dict{String,Any}("update" => inner))
+        chunk(t) = Dict{String,Any}("sessionUpdate" => "agent_message_chunk",
+            "content" => Dict("type" => "text", "text" => t))
+        usage(origin) = Dict{String,Any}("sessionUpdate" => "usage_update", "used" => 1, "size" => 2,
+            "_meta" => Dict("_claude/origin" => Dict("kind" => origin)))
+        answer(id, stop) = Dict{String,Any}("jsonrpc" => "2.0", "id" => id,
+            "result" => Dict("stopReason" => stop))
+        try
+            # The agent telling us about the session is not a turn.
+            ACP.dispatch_message(conn, plain(Dict{String,Any}(
+                "sessionUpdate" => "available_commands_update", "availableCommands" => [])))
+            ACP.dispatch_message(conn, plain(Dict{String,Any}(
+                "sessionUpdate" => "usage_update", "used" => 1, "size" => 2)))
+            @test isempty(ACP.open_turns(conn))
+            got()
+
+            # Work with no turn open: a turn of its own, announced ahead of it.
+            ACP.dispatch_message(conn, plain(chunk("reporting back")))
+            own = only(ACP.open_turns(conn))
+            @test own isa ACP.AgentTurn && !ACP.isover(own)
+            g = got()
+            @test length(g) == 2 && g[1] isa ACP.TurnStarted && g[1].turn === own &&
+                  g[2] isa ACP.AgentMessageChunk
+            # More work is the same turn; a result tagged `human` ends nothing.
+            ACP.dispatch_message(conn, plain(chunk(" more")))
+            ACP.dispatch_message(conn, plain(usage("human")))
+            @test ACP.open_turns(conn) == [own]
+            # Its result, tagged with an autonomous origin, ends it, with its
+            # boundary on the stream right behind the result.
+            ACP.dispatch_message(conn, plain(usage("task-notification")))
+            @test ACP.isover(own) && isempty(ACP.open_turns(conn))
+            @test last(got()) === own.flush
+
+            # The answer to a prompt of ours ends an open one: the agent runs one
+            # model turn at a time.
+            ACP.dispatch_message(conn, plain(chunk("again")))
+            second = only(ACP.open_turns(conn))
+            p = ACP.PromptTurn(77)
+            ACP.register_prompt!(conn, p)
+            ACP.dispatch_message(conn, plain(chunk("inside the prompt")))   # opens nothing new
+            @test length(ACP.open_turns(conn)) == 2
+            ACP.dispatch_message(conn, answer(77, "end_turn"))
+            @test ACP.isover(second) && ACP.isover(p)
+            @test ACP.wait_turn!(p)["stopReason"] == "end_turn"
+            got()
+
+            # ... but not a cancelled answer: a prompt still queued behind the
+            # agent's turn is answered `cancelled` at once, the turn still running.
+            ACP.dispatch_message(conn, plain(chunk("third")))
+            third = only(ACP.open_turns(conn))
+            q = ACP.PromptTurn(78)
+            ACP.register_prompt!(conn, q)
+            ACP.dispatch_message(conn, answer(78, "cancelled"))
+            @test ACP.isover(q) && !ACP.isover(third)
+
+            # Teardown ends whatever is open.
+            close(conn)
+            @test ACP.wait_over([third]; timeout = 5.0)
+        finally
+            close(conn)
+        end
+        @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
+    end
+
+    @testset "an agent without turns of its own never has one" begin
+        m = spawn_mock("setup_then_idle"); conn = m.conn
+        do_setup(conn)
+        conn.main_stream = Channel{Any}(64)
+        ACP.dispatch_message(conn, Dict{String,Any}("jsonrpc" => "2.0", "method" => "session/update",
+            "params" => Dict{String,Any}("update" => Dict{String,Any}(
+                "sessionUpdate" => "agent_message_chunk",
+                "content" => Dict("type" => "text", "text" => "after the answer")))))
+        @test isempty(ACP.open_turns(conn))
+        close(conn)
+        @test timedwait(() -> !peer_alive(m), 5.0) === :ok
+        relay_close!(m)
+    end
+
+    @testset "waiting on a latch, bounded or not" begin
+        latch = Channel{Nothing}(0)
+        @test !ACP.wait_closed(latch; timeout = 0.05)
+        waiter = @async ACP.wait_closed(latch; timeout = 5.0)
+        close(latch)
+        @test fetch(waiter)
+        @test ACP.wait_closed(latch)                # closed already: at once
+        turns = [ACP.AgentTurn(), ACP.AgentTurn()]
+        @test !ACP.wait_over(turns; timeout = 0.05)
+        foreach(ACP.end_turn!, turns)
+        @test ACP.wait_over(turns; timeout = 0.05)
+        @test all(ACP.isover, turns)
+        wait(first(turns))                          # a turn that is over: returns
     end
 
     # ── Subagent tagging: `_meta.claudeCode.parentToolUseId` ─────────────────
@@ -781,11 +879,10 @@ end
         @test last(owned)[1] == "task-1"               # the terminal frame still lands
         @test !haskey(conn.tool_owners, "sub-t2")      # ... and then it is dropped
 
-        # A cancel in flight silences NEITHER stream. The main thread's frames
-        # are output the agent already produced, and the subagent was never
-        # cancelled at all — it is addressed by `parentToolUseId` and reaches
-        # its owner without consulting session state.
-        @atomic conn.activity = ACP.Cancelling()
+        # Nothing about the session's state gates either stream. The main
+        # thread's frames are output the agent already produced, and the
+        # subagent is addressed by `parentToolUseId` and reaches its owner
+        # directly.
         ACP.dispatch_message(conn, plain(chunk("still rendered")))
         ACP.dispatch_message(conn, tagged(chunk("still mine")))
         @test length(main())  == 4
@@ -1007,6 +1104,58 @@ end
     @test d.new_text == "hello world\nsecond line\n"
 end
 
+# A turn against a Codex account at its usage limit, captured from codex-acp
+# 2.2.2 with the client announcing the AIR `sessionFailure` capability (as
+# BonitoAgents does): a plain prompt, then `/compact`, which fails the same way a
+# real turn does once the context is nearly full. Both turns resolve as an
+# ordinary `end_turn`, the failure ONLY in the response's `_meta`; the compaction
+# is a nameless `think` tool that never closes. Read naively, every such turn
+# looked like a successful one that did work, and Yolo re-prompted a locked
+# account 10,294 times.
+@testset "usage limit from codex (real codex-acp wire)" begin
+    frames = codex_frames("codex_usage_limit_compaction.jsonl")
+    # Genuine capture: no claude meta, no name, nothing but the AIR tag.
+    @test !any(f -> haskey(get(f, "_meta", Dict()), "claudeCode"), frames)
+    @test !any(f -> haskey(f, "rawInput"), frames)
+
+    compaction = only(codex_tools("codex_usage_limit_compaction.jsonl"))
+    @test compaction isa ACP.GenericTool
+    @test compaction.name == ACP.CONTEXT_COMPACTION_TOOL
+    @test compaction.kind == "think"
+    @test compaction.title == "Compact conversation"
+    # It never got a closing update; the end of the turn fails it.
+    @test compaction.status == "failed"
+
+    # codex-acp 1.11.0 (a dev worker's PATH install) tags the same call at the
+    # top of `_meta`, outside the AIR envelope. Captured from a real `/compact`
+    # against the same locked account.
+    old = only(codex_tools("codex_1_11_compaction.jsonl"))
+    @test haskey(codex_frames("codex_1_11_compaction.jsonl")[2]["_meta"], "contextCompaction")
+    @test old isa ACP.GenericTool
+    @test old.name == ACP.CONTEXT_COMPACTION_TOOL
+    @test old.title == "Compact conversation"
+
+    responses = JSON.parse(read(joinpath(@__DIR__, "fixtures",
+        "codex_usage_limit_responses.json"), String))
+    @test all(r -> r["stopReason"] == "end_turn", responses)
+    records = ACP.session_notice_record.(responses)
+    @test all(r -> r !== nothing && r["severity"] == "error" && r["category"] == "limit", records)
+    @test startswith(records[1]["title"], "You’ve hit your usage limit.")
+    @test startswith(records[2]["title"], "Error running remote compact task: You’ve hit your usage limit.")
+    # A response without one is an ordinary ending.
+    @test ACP.session_notice_record(Dict("stopReason" => "end_turn")) === nothing
+
+    # Anything else stays nameless: a `think` tool without the tag is not a
+    # compaction, and an unknown AIR key names nothing.
+    plain = ACP.parse_session_update(Dict("sessionUpdate" => "tool_call",
+        "toolCallId" => "t1", "kind" => "think", "title" => "Compact conversation"))
+    @test plain.tool_name == ""
+    other = ACP.parse_session_update(Dict("sessionUpdate" => "tool_call",
+        "toolCallId" => "t2", "kind" => "think", "title" => "x y",
+        "_meta" => Dict("jetbrains" => Dict("air" => Dict("version" => 1, "other" => Dict())))))
+    @test other.tool_name == ""
+end
+
 # The envelope check keys on SHAPE, so it has to be tight enough that a tool
 # whose own arguments happen to be named that way still round-trips.
 @testset "codex MCP envelope is recognised by shape alone" begin
@@ -1160,6 +1309,23 @@ end
                       "content" => [])
     @test ACP.parse_session_update(open_frame).tool_name == "Bash"
     @test ACP.parse_session_update(later).tool_name === nothing
+end
+
+# While the model thinks, claude-agent-acp (patched by BonitoWorker until a
+# release has it) sends usage updates carrying Claude Code's estimate of the
+# tokens thought so far. Read it, and only on those updates.
+@testset "usage_update carries the thinking-token estimate" begin
+    u(meta) = ACP.parse_session_update(Dict{String,Any}("sessionUpdate" => "usage_update",
+        "used" => 24361, "size" => 1000000, "_meta" => meta))
+    thinking = u(Dict("_claude/thinkingTokens" => 1100, "_claude/model" => "claude-opus-5-5"))
+    @test thinking isa ACP.UsageUpdateNotif
+    @test thinking.thinking_tokens == 1100 && thinking.used == 24361
+    @test thinking.origin_kind === nothing          # not a cycle's end
+    @test u(Dict("_claude/model" => "claude-opus-5-5")).thinking_tokens === nothing
+    @test u(Dict("_claude/thinkingTokens" => "many")).thinking_tokens === nothing
+    out = Channel{Any}(4)
+    ACP.parse_update!(out, ACP.TurnState(), thinking)
+    @test take!(out).thinking_tokens == 1100
 end
 
 # Cancelling work the agent streams outside any request (the counterpart to

@@ -38,6 +38,12 @@ function chat_icon_candidates(state, p, msgs, chat_dir)
             path === nothing && continue
             lowercase(splitext(path)[2]) in SHOW_IMAGE_EXTS || continue
             push!(candidates, (true, show_worker_path(ShowTool(state, p.id, p.server_path, path))))
+        elseif m isa ReadToolMsg
+            # A picture the agent opened with Read: the file it names.
+            path = tool_file_path(m)
+            isempty(path) && continue
+            lowercase(splitext(path)[2]) in SHOW_IMAGE_EXTS || continue
+            push!(candidates, (true, show_worker_path(ShowTool(state, p.id, p.server_path, path))))
         end
     end
     return unique(candidates)
@@ -61,7 +67,7 @@ function select_chat_icon!(state, p, candidates::Vector{Tuple{Bool,String}}; for
                 if worker
                     # Snapshot directly from the worker. The normal bt_show
                     # route no longer populates a server mirror as a side effect.
-                    if haskey(state.worker_control_ws, p.worker_id)
+                    if reachable(state, p.worker_id)
                         fetch_file_from_worker(state, p.worker_id, source, tmp)
                     else
                         local_path = show_server_path(ShowTool(state, p.id, p.server_path, source))
@@ -114,7 +120,7 @@ function request_chat_icon!(state::ServerState, p::ProjectInfo)
         icon.path !== nothing && return
         history = joinpath(state.state_dir, "chats", p.id, "chat.md")
         info = stat(history)
-        stamp = (info.mtime, info.size, haskey(state.worker_control_ws, p.worker_id))
+        stamp = (info.mtime, info.size, worker_connected(state, p.worker_id))
         icon.stamp == stamp && return
         icon.stamp = stamp
         icon.task = @async begin
@@ -167,18 +173,21 @@ function set_chat_icon!(state::ServerState, p::ProjectInfo, worker::Bool, path::
     end
 end
 
-function chat_icon_image(state::ServerState, p::ProjectInfo)
+# An app's chat wears the app's logo: the chat is the app.
+chat_icon_image(state::ServerState, p::ProjectInfo) =
+    page_phase(() -> chat_icon_asset(state, p), :chat_icons)
+
+function chat_icon_asset(state::ServerState, p::ProjectInfo)
+    app = app_of(state, p)
+    app === nothing || return app_icon_src(app)
     icon = chat_icon_state(state, p)
     request_chat_icon!(state, p)
     path = lock(() -> icon.path, state.lock)
     return path === nothing ? nothing : Bonito.Asset(path)
 end
 
-# Right-click on a picture in the chat. bt_show and Read results carry their
-# worker path on the media wrap, user attachments their file name (see
-# msg_to_dict(::UserMsg) and the gallery in bonitoagents.js). Opening the menu
-# changes nothing; only its one action does.
-function chat_icon_contextmenu(session, model::ChatModel)
+# Delegated toolbar action; right-click keeps the browser's image menu.
+function chat_icon_click(session, model::ChatModel)
     choose = Observable(Dict{String,Any}())
     on(session, choose) do pick
         p = get(model.state.projects[], model.project_id, nothing)
@@ -186,32 +195,15 @@ function chat_icon_contextmenu(session, model::ChatModel)
         set_chat_icon!(model.state, p, pick["worker"]::Bool, String(pick["path"]))
     end
     return js"""event => {
-        const img = event.target.closest('img.bt-media, img.bt-user-att-img');
-        if (!img) return;
-        const wrap = img.closest('[data-worker-path]');
-        const pick = wrap ? {worker: true, path: wrap.dataset.workerPath}
-                          : {worker: false, path: img.dataset.attachmentName};
+        const button = event.target.closest('.bt-media-chat-icon');
+        if (!button) return;
+        const wrap = button.closest('.bt-media-wrap');
+        const img = wrap?.querySelector('img');
+        const pick = wrap?.dataset.workerPath
+            ? {worker: true, path: wrap.dataset.workerPath}
+            : {worker: false, path: img?.dataset.attachmentName};
         if (!pick.path) return;
         event.preventDefault(); event.stopPropagation();
-        document.querySelector('.bt-chat-icon-menu')?.closeMenu();
-        const menu = document.createElement('div');
-        menu.className = 'bt-menu-list bt-chat-icon-menu'; menu.setAttribute('role', 'menu');
-        const button = document.createElement('button');
-        button.textContent = 'Set as chat icon'; button.setAttribute('role', 'menuitem');
-        button.className = 'bt-menu-item';
-        menu.appendChild(button);
-        (img.closest('.bt-shell, .bt-app, .bt-dash') || document.body).appendChild(menu);
-        menu.style.left = Math.min(event.clientX, innerWidth - menu.offsetWidth) + 'px';
-        menu.style.top = Math.min(event.clientY, innerHeight - menu.offsetHeight) + 'px';
-        const listeners = new AbortController();
-        menu.closeMenu = () => { listeners.abort(); menu.remove(); };
-        document.addEventListener('pointerdown', e => {
-            if (!menu.contains(e.target)) menu.closeMenu();
-        }, {capture:true, signal:listeners.signal});
-        document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') menu.closeMenu();
-        }, {signal:listeners.signal});
-        button.onclick = () => { $(choose).notify(pick); menu.closeMenu(); };
-        button.focus();
+        $(choose).notify(pick);
     }"""
 end

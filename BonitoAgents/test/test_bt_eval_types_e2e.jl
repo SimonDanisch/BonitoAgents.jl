@@ -23,7 +23,7 @@
 
 using Test, JSON
 # TestKit / TK come from the enclosing @testitem (setup=[SharedServer]) so the
-# dispatcher + SERVER_CONTEXT are the shared, live ones. Only the DSL names are
+# dispatcher and the in-process MCP are the shared, live ones. Only the DSL names are
 # pulled in here.
 using .TestKit: text, bt_eval, end_turn
 
@@ -233,7 +233,8 @@ geo_probe(id) =
             # actually runs (an exception would skip straight past it).
             ok = try
                 TK.wait_for(s, "$id rendered", predicate; timeout = 40) == true
-            catch
+            catch e
+                @info "case wait failed" id exception = e
                 false
             end
             ok || @info "case body dump" id body = TK.eval_js(s,

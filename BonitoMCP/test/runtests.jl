@@ -1,6 +1,12 @@
 # BonitoMCP test suite.
 using Test
 
+# `Pkg.test` runs this process with `JULIA_LOAD_PATH="@:<testdir>"` (no
+# `@stdlib`), and the eval workers the tests start would inherit it. Nothing
+# sets it in production; removing it restores those conditions. Our own
+# `LOAD_PATH` was read at startup and stays.
+delete!(ENV, "JULIA_LOAD_PATH")
+
 @testset "BonitoMCP" begin
     # Stability regressions (M2–M7, M9–M11, M14): output caps, kill-session
     # races, dial bootstrap, requestId-scoped cancel. Pure unit tests.
@@ -11,7 +17,10 @@ using Test
     include("test_eval_cancel.jl")
     include("test_process_reaping.jl")
     include("test_wait.jl")
+    include("test_runs.jl")
+    include("test_processes.jl")
     include("test_eval_host.jl")
+    include("test_remote_values.jl")
     # ⚠ LAST on purpose: this one needs `Bonito`, which is not in the test
     # target, so it errors and takes the rest of the file with it. That was
     # invisible while `Pkg.test` could not resolve `Test` at all and the suite

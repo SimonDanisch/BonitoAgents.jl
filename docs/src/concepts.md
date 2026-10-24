@@ -3,11 +3,11 @@
 ```
    browser / phone ──HTTP/WS──▶  dashboard server (Bonito web app)
                                       ▲  ▲
-                     control WS +     │  │
-                     file transfer    │  │
+                     one WorkerLink   │  │   control, MCP, evals, files
+                     per worker       │  │
                           ┌───────────┘  └───────────┐
                      worker (laptop)             worker (desktop)
-                     ├─ claude-code agent (ACP)  ├─ agent per project
+                     ├─ an ACP agent per chat    ├─ Claude Code, Codex, Kimi…
                      ├─ persistent Julia MCP     ├─ …
                      └─ your project checkouts   └─ your project checkouts
 ```
@@ -71,16 +71,27 @@ live agent processes in check).
 Agents speak the [Agent Client Protocol](https://agentclientprotocol.com)
 (ACP). The worker spawns the agent binary per project; the server bridges the
 protocol stream into the chat model that drives the UI. Providers are
-pluggable descriptors (see [Agent Providers](@ref)). The same mechanism powers
-the deterministic mock agent used by the test suite; the
+pluggable descriptors (see [Agent Providers](@ref)), and a chat can switch to
+another provider at any time; the new agent gets the conversation so far. The
+same mechanism powers the deterministic mock agent used by the test suite; the
 [dashboard walkthrough](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_dashboard.jl)
 replays real recorded agent sessions from disk.
 
 ## Security
 
-Workers authenticate with a shared secret, generated at install time and
-embedded in the worker one-liner. The dashboard has no user accounts, so treat
-it like any internal tool: keep it on localhost, a VPN/Tailscale network, or
-behind reverse-proxy auth. Agents run with the OS permissions of the worker
-process; the chat's permission prompts and the Yolo toggle decide how much
-they may do unattended.
+A server set up with `install_server.sh` listens on localhost only. Everyone
+reaches it through a login: behind a tunnel the server asks Authelia about
+every request itself, and with `--tls acme` Caddy does. An account in the
+`admins` group is an admin; everyone else is a member. Members see only their
+own chats and workers, plus the workers an owner shared with one of their
+groups.
+
+A server started without a login (`bonito-agents server` on localhost, or
+`--host 0.0.0.0` on a network you trust) treats whoever reaches it as its
+admin. Keep such a server on localhost, a VPN or a Tailscale network.
+
+Each worker joins with its own credential from **Add worker**, and revoking
+the credential disconnects that machine. Agents run with the operating-system
+permissions of the worker process; the chat's permission prompts and the Yolo
+toggle decide how much they may do unattended. A `bt_share` link needs no
+account: the link is the permission, with an optional password on top.

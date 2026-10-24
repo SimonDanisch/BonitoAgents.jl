@@ -11,7 +11,9 @@
         TK.text("Warning: ordinary assistant prose"), TK.end_turn()]
     pid = TK.new_chat(s; title="Typed provider notice")
     TK.send_message(s, "exercise typed notices")
-    visible = "[...document.querySelectorAll('.bt-session-notice')].find(e => e.offsetParent !== null)"
+    # Other chats' panes stay mounted under `content-visibility: hidden`, where
+    # `offsetParent` is still set: a notice left in an earlier chat was "visible".
+    visible = "[...document.querySelectorAll('.bt-session-notice')].find(e => e.checkVisibility())"
     @test TK.wait_for(s, "typed warning is visible while provider waits",
         "($visible)?.textContent.includes('Switching transport <probe>') === true"; timeout=30)
     @test TK.eval_js(s, "($visible).querySelector('probe') === null") === true

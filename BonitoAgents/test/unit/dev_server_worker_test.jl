@@ -64,8 +64,9 @@ const BT = BonitoAgents
     for d in dirs
         @test !isdir(d)
     end
-    # (3 cont.) env restored to "unset" (close deletes the keys it set).
-    @test !haskey(ENV, "BONITOAGENTS_CONFIG_DIR")
+    # (3 cont.) env restored to what it was before (unset on a fresh process;
+    # another test server alive in the same process keeps its own value).
+    @test get(ENV, "BONITOAGENTS_CONFIG_DIR", nothing) == saved["BONITOAGENTS_CONFIG_DIR"]
 
     # Idempotent: a second close is a silent no-op (no throw, no double-kill).
     @test (close(h); true)

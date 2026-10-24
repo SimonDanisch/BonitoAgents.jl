@@ -85,10 +85,10 @@ best.deg"""
 
 const CV_MARK = "CV-RMSE"
 mock_streaming_js() = """[...document.querySelectorAll('.bt-tool-msg')].filter(c =>
-    c.offsetParent && (c.querySelector('.bt-tool-status')?.textContent || '') !== 'completed' &&
+    c.checkVisibility() && (c.querySelector('.bt-tool-status')?.textContent || '') !== 'completed' &&
     /$(CV_MARK)/.test(c.innerText)).pop()"""
 mock_completed_js() = """[...document.querySelectorAll('.bt-tool-msg')].filter(c =>
-    c.offsetParent && c.querySelector('.bt-tool-status')?.textContent === 'completed' &&
+    c.checkVisibility() && c.querySelector('.bt-tool-status')?.textContent === 'completed' &&
     /$(CV_MARK)/.test(c.innerText)).pop()"""
 
 function make_agent()
@@ -115,7 +115,7 @@ embed_slider() = "document.querySelector('.bt-embed input[type=range]')"
 # (that was the "detaches an App that just shows 11" bug). Requiring the slider
 # pins it to the plot.
 fit_pill_js() = """[...document.querySelectorAll('.bt-tool-msg')].filter(e =>
-    e.offsetParent && e.querySelector('canvas') && e.querySelector('input[type=range]'))[0]"""
+    e.checkVisibility() && e.querySelector('canvas') && e.querySelector('input[type=range]'))[0]"""
 fit_detach_js() = """(() => {
     const pill = $(fit_pill_js());
     const b = pill && pill.querySelector('.bt-tool-detach');
@@ -159,7 +159,7 @@ function tour_mock(s, ctx)
     # 1 ─ OPEN ON THE DASHBOARD. Wheel it so the DEGREE SLIDER sits just below the
     #     composer — the slider AND the whole plot are then in frame, so the
     #     viewer sees the control that drives the fit and the fit itself.
-    TK.wait_for(s, "live slider", "$(embed_slider()) && $(embed_slider()).offsetParent"; timeout = 30)
+    TK.wait_for(s, "live slider", "$(embed_slider()) && $(embed_slider()).checkVisibility()"; timeout = 30)
     wheel_into_view!(s, ctx, embed_slider(); at = 0.16)
     sleep(1.4); mark("1 framed")
 
@@ -200,7 +200,7 @@ function tour_mock(s, ctx)
     sleep(0.6); mark("4 detach-framed")
     ECT.real_click(ctx, ECT.JS(fit_detach_js()))
     TK.wait_for(s, "floating app window",
-        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.offsetParent && f.querySelector('canvas'))";
+        "[...document.querySelectorAll('.bw-ws-float')].some(f => f.checkVisibility() && f.querySelector('canvas'))";
         timeout = 20)
     sleep(1.0); mark("4 floating")
     ECT.drag(ctx, ECT.JS(floattitle("App")),
@@ -211,7 +211,7 @@ function tour_mock(s, ctx)
 
     # 5 ─ docked + live: one more drag in the plotpane.
     TK.wait_for(s, "docked slider",
-        "[...document.querySelectorAll('input[type=range]')].some(e => e.offsetParent)"; timeout = 15)
+        "[...document.querySelectorAll('input[type=range]')].some(e => e.checkVisibility())"; timeout = 15)
     ECT.steer_slider(ctx, "input[type=range]", 0.85; duration = 1.2)
     sleep(1.0)
     ECT.steer_slider(ctx, "input[type=range]", 0.2; duration = 1.2)

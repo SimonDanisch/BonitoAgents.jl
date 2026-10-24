@@ -85,8 +85,31 @@ CANCEL_DELAY_MS::Int    = 1500
 # Refuse `session/load` unless the transcript sits under the cwd it is loaded
 # in (see `transcript_path`). Declared here, before `_configure!` assigns it.
 STRICT_LOAD::Bool       = false
+# The number of the next tool call this session opens. ACP tool call ids are
+# unique within a session (Claude's are `toolu_…`); counted from 1 in every
+# prompt, a chat's second turn reused the first one's `tool-1`, and the chat
+# delivered the second card's body into the first card (e2e:sidebar, now and
+# then).
+TOOL_SEQ::Int           = 1
+const CONFIG_OPTIONS = Ref{Vector{Any}}(Any[])
+const ACTIVE_PROMPTS = Ref(0)
+take_tool_seq!() = (global TOOL_SEQ += 1; TOOL_SEQ - 1)
 
 function _configure!()
+    CONFIG_OPTIONS[] = if get(ENV, "BT_MOCK_ACP_SESSION_CONFIG", "") == "1"
+        second = get(ENV, "BT_MOCK_ACP_VARIANT", "") == "second"
+        names = second ? ("Gamma", "Delta") : ("Alpha", "Beta")
+        Any[Dict("id" => "model", "name" => "Model", "category" => "model", "type" => "select",
+            "currentValue" => lowercase(first(names)),
+            "options" => [Dict("value" => lowercase(n), "name" => n) for n in names]),
+            Dict("id" => "mode", "name" => "Permissions", "category" => "mode", "type" => "select",
+            "currentValue" => "review", "options" => [Dict("value" => "review", "name" => "Auto review"),
+                Dict("value" => "full", "name" => "Full access")])]
+    elseif get(ENV, "BT_MOCK_ACP_MANY_CHOICES", "") == "1"
+        Any[many_choice_model_option()]
+    else
+        Any[]
+    end
     global SCENARIO        = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
     global N_CHUNKS        = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNKS",  "3")))
     global SESSION         = String(get(ENV, "BT_MOCK_ACP_SESSION", "s"))
@@ -168,18 +191,23 @@ todo_write(entries::Vector; id = "todo1", status = "completed") = upd("tool_call
          "content"    => todo_write_content(entries)))
 
 # Pack the dispatcher's content specs into ACP content blocks. A `diff` spec
-# becomes a DiffContent; everything else a text block in the `type:"content"`
-# envelope (TextContent). Used by the generic `tool` / `tool_update` events.
-pack_tool_content(items) = Any[
-    let t = String(get(c, "type", "text"))
-        t == "diff" ?
-            Dict{String,Any}("type" => "diff", "path" => String(c["path"]),
-                             "oldText" => String(get(c, "old", "")),
-                             "newText" => String(get(c, "new", ""))) :
-            Dict{String,Any}("type" => "content",
-                             "content" => Dict("type" => "text",
-                                               "text" => String(c["text"])))
-    end for c in items]
+# becomes a DiffContent, an `image` one an ImageContent (base64 bytes, the shape
+# claude-agent-acp ships for a Read of a picture), everything else a text block
+# in the `type:"content"` envelope (TextContent). Used by the generic `tool` /
+# `tool_update` events.
+pack_tool_content(items) = Any[pack_block(Val(Symbol(get(c, "type", "text"))), c) for c in items]
+
+pack_block(::Val{:diff}, c) =
+    Dict{String,Any}("type" => "diff", "path" => String(c["path"]),
+                     "oldText" => String(get(c, "old", "")),
+                     "newText" => String(get(c, "new", "")))
+pack_block(::Val{:image}, c) =
+    Dict{String,Any}("type" => "content",
+                     "content" => Dict("type" => "image", "data" => String(c["data"]),
+                                       "mimeType" => String(c["mimeType"])))
+pack_block(::Val, c) =
+    Dict{String,Any}("type" => "content",
+                     "content" => Dict("type" => "text", "text" => String(c["text"])))
 
 # The `_meta` envelope claude-agent-acp stamps on every forwarded SUBAGENT
 # update: the parent Task's tool_use id. Used by the sub_text / sub_tool
@@ -189,7 +217,7 @@ sub_meta(ev::AbstractDict) =
         Dict{String,Any}("parentToolUseId" => String(ev["parent"])))
 
 resp(id, result) =
-    emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
+    id === nothing ? nothing : emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
 
 resp_error(id, code, message) =
     emit(Dict("jsonrpc" => "2.0", "id" => id,
@@ -217,7 +245,7 @@ const INTERRUPTED = Ref(false)
 
 # Drive ONE `session/prompt`. The dispatcher catches throws so a scenario
 # can `exit(1)` to simulate a crash without crashing the dispatcher first.
-function handle_prompt(prompt_id, scenario::AbstractString)
+function handle_prompt(prompt_id, scenario::AbstractString; prompt_text = LAST_PROMPT[])
     if scenario == "normal"
         for i in 1:N_CHUNKS
             cancelled[] && break
@@ -389,7 +417,7 @@ function handle_prompt(prompt_id, scenario::AbstractString)
         # event to one ACP frame. This is the path real e2e tests take
         # to swap claude-agent-acp with a test-process responder while
         # keeping the entire LocalTransport spawn/wire path real.
-        run_dispatcher_prompt(prompt_id)
+        run_dispatcher_prompt(prompt_id; prompt_text)
     else
         error("unknown BT_MOCK_ACP_SCENARIO: $(scenario)")
     end
@@ -417,15 +445,34 @@ function ensure_dispatcher!()
     return DISPATCHER_SOCK[]
 end
 
+# Context/cost telemetry — the shape claude-agent-acp ≥ 0.44 emits after every
+# assistant message, tagged with the cycle's origin at a cycle's result.
+function emit_usage(ev::AbstractDict)
+    fields = Dict{String,Any}("used" => get(ev, "used", 0),
+                              "size" => get(ev, "size", 0))
+    haskey(ev, "cost") && (fields["cost"] =
+        Dict("amount" => ev["cost"], "currency" => "USD"))
+    meta = Dict{String,Any}()
+    haskey(ev, "origin") && (meta["_claude/origin"] = Dict("kind" => String(ev["origin"])))
+    # claude-agent-acp's estimate while the model thinks (patched, or upstream).
+    haskey(ev, "thinking_tokens") && (meta["_claude/thinkingTokens"] = ev["thinking_tokens"])
+    isempty(meta) || (fields["_meta"] = meta)
+    upd("usage_update", fields)
+    return nothing
+end
+
 # One BETWEEN-TURN frame (the `post_turn` event's payload, emitted after the
 # prompt response — like the real agent streaming a bg subagent's activity and
 # its auto-wake announcement after end_turn). Supports the shapes the
 # between-turn wire actually carries (fixtures/bg_subagent_wire.jsonl):
-# untagged text, tagged sub_text/sub_tool.
+# untagged text, tagged sub_text/sub_tool, and the usage that ends the agent's
+# own turn.
 function emit_post_event(ev::AbstractDict)
     et = String(get(ev, "type", ""))
     if et == "text"
         agent_chunk(String(ev["text"]))
+    elseif et == "usage"
+        emit_usage(ev)
     elseif et == "sub_text"
         upd("agent_message_chunk", Dict{String,Any}(
             "content" => Dict("type" => "text", "text" => String(ev["text"])),
@@ -460,9 +507,9 @@ function run_dispatcher_replay()
     flush(sock)
     next_tool_id = 1
     while !eof(sock)
-        line = try readline(sock) catch; break end
+        line = try readline(sock) catch e; e isa Base.IOError || rethrow(); break end   # TestKit hung up
         isempty(line) && continue
-        ev = try JSON.parse(line) catch; continue end
+        ev = JSON.parse(line)
         et = String(get(ev, "type", ""))
         if et == "user"
             user_chunk(String(ev["text"]))
@@ -483,18 +530,31 @@ function run_dispatcher_replay()
     return nothing
 end
 
-function run_dispatcher_prompt(prompt_id)
-    sock = ensure_dispatcher!()
+function run_dispatcher_prompt(prompt_id; prompt_text = LAST_PROMPT[])
+    # Steering opens overlapping prompts. Each must read its own script;
+    # concurrent readers on the shared replay socket steal each other's events.
+    host, port = rsplit(DISPATCHER_ADDR, ":"; limit=2)
+    sock = Sockets.connect(host, parse(Int, port))
+    try
     # Pull the user's prompt text out of the original message — the
     # dispatcher loop already parsed it, but we don't have it here. The
     # test process keys its agent fn on whatever the user typed; carry
     # the last seen prompt text in this Ref. Set by the dispatcher loop.
-    prompt_text = LAST_PROMPT[]
-    println(sock, JSON.json(Dict("prompt" => prompt_text)))
+    if get(ENV, "BT_MOCK_ACP_SESSION_CONFIG", "") == "1"
+        mode = only(o["currentValue"] for o in CONFIG_OPTIONS[] if o["id"] == "mode")
+        prompt_text *= " (effective permissions: $mode)"
+    end
+    # The environment our MCP server's launch entry carries (the worker relay's
+    # grant for this chat): the test process runs the MCP tools in-process, as
+    # this chat's MCP server would.
+    cfg = MCP_CONFIG[]
+    mcp_env = cfg === nothing ? nothing :
+        Dict(String(e["name"]) => String(e["value"]) for e in cfg["env"])
+    println(sock, JSON.json(Dict("prompt" => prompt_text, "mcp_env" => mcp_env)))
     flush(sock)
 
     stop_reason = "end_turn"
-    next_tool_id = 1
+    resp_meta = nothing   # the prompt response's `_meta` (`codex_failure`)
     post_blocks = Any[]   # `post_turn` events, emitted AFTER the prompt response
     while !eof(sock)
         # Cancel arriving mid-stream (set by the concurrently-running stdin
@@ -514,16 +574,16 @@ function run_dispatcher_prompt(prompt_id)
         if cancelled[] && !IGNORE_CANCEL
             stop_reason = "cancelled"
             while !eof(sock)
-                tail = try readline(sock) catch; break end
+                tail = try readline(sock) catch e; e isa Base.IOError || rethrow(); break end
                 isempty(tail) && continue
-                tev = try JSON.parse(tail) catch; continue end
+                tev = JSON.parse(tail)
                 String(get(tev, "type", "")) == "end" && break
             end
             break
         end
-        line = try readline(sock) catch; break end
+        line = try readline(sock) catch e; e isa Base.IOError || rethrow(); break end   # TestKit hung up
         isempty(line) && continue
-        ev = try JSON.parse(line) catch; continue end
+        ev = JSON.parse(line)
         et = String(get(ev, "type", ""))
         if et == "text"
             agent_chunk(String(ev["text"]))
@@ -542,7 +602,7 @@ function run_dispatcher_prompt(prompt_id)
             # A SUBAGENT's tool use: tool_call (announcement) or
             # tool_call_update (status flip on the announced id), tagged
             # like sub_text above.
-            tid = String(get(ev, "id", "subtool-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "subtool-$(take_tool_seq!())"))
             if Bool(get(ev, "update", false))
                 upd("tool_call_update", Dict{String,Any}(
                     "toolCallId" => tid,
@@ -565,7 +625,7 @@ function run_dispatcher_prompt(prompt_id)
             #      and the diff content rides along. ACP merges the rawInput → the
             #      ✎ editable path-link affordance materialises here, not upfront.
             #   3. tool_call_update: status "completed".
-            tid = String(get(ev, "id", "edit-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "edit-$(take_tool_seq!())"))
             path = String(get(ev, "path", "/unknown"))
             old_text = String(get(ev, "old", ""))
             new_text = String(get(ev, "new", ""))
@@ -591,7 +651,7 @@ function run_dispatcher_prompt(prompt_id)
             # status "pending", GENERIC title "Terminal", kind "execute"; a
             # tool_call_update streams rawInput {command,description}, the title
             # becomes the COMMAND, and the output content rides along; then complete.
-            tid = String(get(ev, "id", "bash-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "bash-$(take_tool_seq!())"))
             command = String(get(ev, "command", ""))
             meta = Dict("claudeCode" => Dict("toolName" => "Bash"))
             upd("tool_call", Dict{String,Any}(
@@ -628,6 +688,11 @@ function run_dispatcher_prompt(prompt_id)
                 (raw_input["env_path"] = String(ev["env_path"]))
             haskey(ev, "timeout") && (raw_input["timeout"] = ev["timeout"])
             haskey(ev, "worker")  && (raw_input["worker"]  = String(ev["worker"]))
+            # Every other argument of the call (background, run, runs, …), as
+            # claude streams the full argument dict into rawInput.
+            for (k, v) in get(ev, "args", Dict{String,Any}())
+                haskey(raw_input, k) || v === nothing || (raw_input[String(k)] = v)
+            end
             toolname = String(get(ev, "tool", "mcp__btworker__bt_julia_eval"))
             meta = Dict("claudeCode" => Dict("toolName" => toolname))
             upd("tool_call", Dict{String,Any}(
@@ -706,7 +771,7 @@ function run_dispatcher_prompt(prompt_id)
             #
             # Claude's shape is emitted by every other event here, so both live
             # side by side and the chat has to handle each.
-            tid  = String(get(ev, "id", "ktool-$(next_tool_id)")); next_tool_id += 1
+            tid  = String(get(ev, "id", "ktool-$(take_tool_seq!())"))
             name = String(ev["name"])
             kind = String(get(ev, "kind", "other"))
             args = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
@@ -753,7 +818,7 @@ function run_dispatcher_prompt(prompt_id)
             #     `rawOutput.error`, a shell call `rawOutput.formatted_output`,
             #     and a shell call's opening content is a bare `terminal`
             #     pointer we never subscribe to.
-            tid    = String(get(ev, "id", "cxtool-$(next_tool_id)")); next_tool_id += 1
+            tid    = String(get(ev, "id", "cxtool-$(take_tool_seq!())"))
             args   = Dict{String,Any}(get(ev, "args", Dict{String,Any}()))
             status = String(get(ev, "status", "completed"))
             server = get(ev, "server", nothing)
@@ -812,7 +877,7 @@ function run_dispatcher_prompt(prompt_id)
             # AgentClientProtocol/test/fixtures/codex_image_view.jsonl —
             # claude/kimi send `ImageContent` instead, so this is the only
             # dialect that makes the chat go and fetch the file.
-            tid  = String(get(ev, "id", "cximg-$(next_tool_id)")); next_tool_id += 1
+            tid  = String(get(ev, "id", "cximg-$(take_tool_seq!())"))
             path = String(ev["path"])
             upd("tool_call", Dict{String,Any}(
                 "toolCallId" => tid, "kind" => "read",
@@ -826,7 +891,7 @@ function run_dispatcher_prompt(prompt_id)
             # Generic tool call of any kind (edit/search/execute/other). Opens
             # the bubble, then (unless complete=false) ships content + a final
             # status. Set complete=false to leave it live for `tool_update`s.
-            tid = String(get(ev, "id", "tool-$(next_tool_id)")); next_tool_id += 1
+            tid = String(get(ev, "id", "tool-$(take_tool_seq!())"))
             open = Dict{String,Any}(
                 "toolCallId" => tid, "kind" => String(get(ev, "kind", "other")),
                 "title" => String(get(ev, "title", "tool")),
@@ -869,14 +934,36 @@ function run_dispatcher_prompt(prompt_id)
                 upd("agent_message_chunk", Dict("content" => Dict("type" => "text",
                     "text" => "Warning: " * ev["record"]["title"])))
             end
+        elseif et == "codex_compaction"
+            # Codex compacting the conversation, in its wire dialect: a nameless
+            # `think` tool tagged only by `_meta.jetbrains.air.contextCompaction`.
+            # Captured from @agentclientprotocol/codex-acp 2.2.2
+            # (AgentClientProtocol/test/fixtures/codex_usage_limit_compaction.jsonl).
+            # A compaction that FAILS never gets a closing update, so
+            # `complete = false` leaves it open exactly like the real one.
+            tid = String(get(ev, "id", "compact-$(take_tool_seq!())"))
+            meta = Dict("jetbrains" => Dict("air" => Dict("version" => 1,
+                "contextCompaction" => Dict("version" => 1))))
+            upd("tool_call", Dict{String,Any}("toolCallId" => tid, "kind" => "think",
+                "title" => "Compact conversation", "status" => "in_progress", "_meta" => meta))
+            Bool(get(ev, "complete", true)) &&
+                upd("tool_call_update", Dict{String,Any}("toolCallId" => tid,
+                    "title" => "Compact conversation", "status" => "completed", "_meta" => meta))
+        elseif et == "codex_failure"
+            # How codex-acp 2.2.2 ends a turn that FAILED (out of credits, …),
+            # captured in AgentClientProtocol/test/fixtures/codex_usage_limit_responses.json.
+            # With the AIR `sessionFailure` capability the turn resolves as a
+            # plain `end_turn` and the failure rides ONLY the response's `_meta`.
+            # Without it codex streams the failure's title as agent text.
+            record = ev["record"]
+            if SESSION_NOTICE_SUPPORTED[]
+                resp_meta = Dict("jetbrains" => Dict("air" => Dict(
+                    "version" => 1, "sessionFailure" => record)))
+            else
+                agent_chunk(String(record["title"]) * "\n\n")
+            end
         elseif et == "usage"
-            # Context/cost telemetry — the shape claude-agent-acp ≥ 0.44 emits
-            # after every assistant message.
-            fields = Dict{String,Any}("used" => get(ev, "used", 0),
-                                      "size" => get(ev, "size", 0))
-            haskey(ev, "cost") && (fields["cost"] =
-                Dict("amount" => ev["cost"], "currency" => "USD"))
-            upd("usage_update", fields)
+            emit_usage(ev)
         elseif et == "commands"
             # The agent's slash-command set (complete state).
             upd("available_commands_update",
@@ -930,7 +1017,9 @@ function run_dispatcher_prompt(prompt_id)
         # Unknown event types: silently skip. Lets the dispatcher add
         # new event types without churning the binary in lockstep.
     end
-    resp(prompt_id, Dict("stopReason" => stop_reason))
+    result = Dict{String,Any}("stopReason" => stop_reason)
+    resp_meta === nothing || (result["_meta"] = resp_meta)
+    resp(prompt_id, result)
     # Between-turn emission: each post_turn block waits its delay, then streams
     # its frames with NO turn open. Async so the dispatcher loop is free to
     # read the next prompt — same concurrency the real agent has.
@@ -943,6 +1032,9 @@ function run_dispatcher_prompt(prompt_id)
         catch e
             @warn "post_turn emission failed" exception = e
         end
+    end
+    finally
+        close(sock)
     end
 end
 
@@ -980,9 +1072,16 @@ end
 # when stdin EOFs (parent closed our stdin → time to die).
 function dispatch_loop()
     while !eof(stdin)
-        line = try readline(stdin) catch; break end
+        line = readline(stdin)
         isempty(line) && continue
-        msg = try JSON.parse(line) catch; continue end
+        msg = try
+            JSON.parse(line)
+        catch e
+            # Not JSON: ArgumentError from JSON 1, ErrorException from 0.21.
+            e isa ArgumentError || e isa ErrorException || rethrow()
+            @warn "MockACP: a frame from the client is not JSON" line exception = e
+            continue
+        end
         method = String(get(msg, "method", ""))
         id     = get(msg, "id", nothing)
         if method == "initialize" && id !== nothing
@@ -993,16 +1092,18 @@ function dispatch_loop()
             # `loadSession` must match reality (we answer session/load below):
             # the server reads it to decide whether to persist the session id.
             resp(id, Dict("protocolVersion" => 1,
-                          "agentCapabilities" => Dict("loadSession" => true)))
+                          "agentCapabilities" => Dict("loadSession" => true,
+                              "_meta" => Dict("claudeCode" => Dict("promptQueueing" =>
+                                  get(ENV, "BT_MOCK_ACP_PROMPT_QUEUEING", "true") == "true"))),
+                          "_meta" => Dict("steering" => Dict("supported" => true,
+                              "activeOnly" => get(ENV, "BT_MOCK_ACP_ACTIVE_STEERING", "false") == "true"))))
         elseif method == "session/new" && id !== nothing
             set_mcp_config!(get(msg, "params", Dict()))
             # Only under strict_load: the transcript is what that mode checks,
             # and writing one for every mock chat would litter `~/.mockacp`
             # with a folder per temp cwd of every suite.
             STRICT_LOAD && write_transcript!(String(get(get(msg, "params", Dict()), "cwd", "")))
-            resp(id, MANY_CHOICES ?
-                Dict("sessionId" => SESSION, "configOptions" => [many_choice_model_option()]) :
-                Dict("sessionId" => SESSION))
+            resp(id, Dict("sessionId" => SESSION, "configOptions" => deepcopy(CONFIG_OPTIONS[])))
             # Real agents push their slash commands right after session/new
             # (verified on claude-agent-acp and kimi), which is what makes `/`
             # autocomplete work on a chat you haven't typed in yet. Emitting
@@ -1028,8 +1129,41 @@ function dispatch_loop()
             # replays a resumed session's jsonl. Other scenarios keep the bare
             # ack (no replay), which resume tests rely on.
             SCENARIO == "dispatcher" && run_dispatcher_replay()
-            resp(id, Dict("sessionId" => SESSION))
+            resp(id, Dict("sessionId" => SESSION, "configOptions" => deepcopy(CONFIG_OPTIONS[])))
+        elseif method == "session/set_config_option" && id !== nothing
+            params = get(msg, "params", Dict())
+            option = findfirst(o -> o["id"] == params["configId"], CONFIG_OPTIONS[])
+            if option === nothing || !any(c -> c["value"] == params["value"], CONFIG_OPTIONS[][option]["options"])
+                resp_error(id, -32602, "Unsupported config choice")
+                continue
+            end
+            # Let a prompt overtake the request unless the client waits for the
+            # acknowledgement, just as a real adapter can during bring-up.
+            let request_id = id, option = option, value = params["value"]
+                @async begin
+                    get(ENV, "BT_MOCK_ACP_SESSION_CONFIG", "") == "1" && sleep(1.5)
+                    CONFIG_OPTIONS[][option]["currentValue"] = value
+                    resp(request_id, Dict("configOptions" => deepcopy(CONFIG_OPTIONS[])))
+                end
+            end
+        elseif method == "_session/steering" && id !== nothing
+            params = get(msg, "params", Dict())
+            if ACTIVE_PROMPTS[] == 0
+                resp(id, Dict("outcome" => "notInjected"))
+                continue
+            end
+            @assert get(params, "activeOnly", false) === true
+            LAST_PROMPT[] = join(String(get(b, "text", "")) for b in get(params, "prompt", Any[])
+                if get(b, "type", "") == "text")
+            resp(id, Dict("outcome" => "injected"))
+            let prompt_text = LAST_PROMPT[]
+                Base.errormonitor(@async handle_prompt(nothing, SCENARIO; prompt_text))
+            end
         elseif method == "session/prompt" && id !== nothing
+            if ACTIVE_PROMPTS[] > 0 && get(ENV, "BT_MOCK_ACP_ACTIVE_STEERING", "false") == "true"
+                resp_error(id, -32600, "Overlapping session/prompt is unsupported; use steering")
+                continue
+            end
             cancelled[] = false
             # Capture the user's prompt text for dispatcher mode. claude's
             # session/prompt carries `params.prompt` as a Vector of content
@@ -1045,14 +1179,19 @@ function dispatch_loop()
             # so a mid-stream cancel could never be honored. A turn that hangs
             # (the `hang_*` scenarios) still parks in its own task, leaving the
             # loop free to read the eventual stdin EOF / cancel.
-            @async try
-                handle_prompt(id, SCENARIO)
-            catch e
-                # A scenario-side throw shouldn't kill the dispatcher; the
-                # real agent would either respond or not. We respond with
-                # a synthetic error so the chat side surfaces it.
-                resp(id, Dict("stopReason" => "error",
-                              "message"    => sprint(showerror, e)))
+            ACTIVE_PROMPTS[] += 1
+            let prompt_text = LAST_PROMPT[], prompt_id = id
+                @async try
+                    handle_prompt(prompt_id, SCENARIO; prompt_text)
+                catch e
+                    # A scenario-side throw shouldn't kill the dispatcher; the
+                    # real agent would either respond or not. We respond with
+                    # a synthetic error so the chat side surfaces it.
+                    resp(prompt_id, Dict("stopReason" => "error",
+                                  "message"    => sprint(showerror, e)))
+                finally
+                    ACTIVE_PROMPTS[] -= 1
+                end
             end
         elseif method == "session/cancel"
             # Notification — no response. Flip the flag so the current

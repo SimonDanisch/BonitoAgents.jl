@@ -18,7 +18,7 @@ const BT  = BonitoAgents
 const ACP = BonitoAgents.AgentClientProtocol
 
 function headless_model()
-    state = BT.serve(; host = "127.0.0.1", port = 0, worker_secret = "x",
+    state = BT.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mktempdir(), working_dir = mktempdir())
     return BT.ChatModel(state, mktempdir(); project_id = "proj",
                         agent = BT.WorkerAgent(state, "w1", "/p"))
@@ -146,6 +146,63 @@ end
     close(upd.stream)
     BT.process_update!(b, upd)
     @test b.is_background == true && BT.in_taskbar(b) == true
+end
+
+# A subagent the user's Stop interrupted writes an interruption where its
+# end_turn would be, and claude sends no completion: the watch ends at that
+# marker, and the pill leaves the bar as failed at once, with no report to wait
+# for. Before, only end_turn counted and such a pill ran on for good.
+@testset "an interrupted subagent leaves the bar, failed; a finished one waits for its report" begin
+    model = headless_model()
+    sub(id) = (t = BT.TaskToolMsg(BT.Message(id, "other", "", "Investigate", "in_progress", "",
+                                             time(), nothing, model);
+                                  description = "desc", is_background = true);
+               t.bg_output_path = "/tmp/$(id).output"; t)
+    h = BT.watch_header(sub("t0"))
+    @test h["markers"] == [BT.SUBAGENT_DONE_MARKER, BT.SUBAGENT_STOPPED_MARKER]
+    @test h["marker"] == BT.SUBAGENT_DONE_MARKER          # a worker from before `markers`
+
+    stopped = sub("t3")
+    stopped.watch.done = true
+    stopped.watch.ended_by = BT.SUBAGENT_STOPPED_MARKER
+    @test BT.isdone(stopped)
+    @test BT.tool_status(stopped) == "failed"
+    @test stopped.message.summary == "Interrupted before it finished"
+    # Claude sends no notification for it: the agent is told by a note.
+    notes = BT.shared(model).bg_notes
+    @test any(l -> occursin("Background agent \"desc\" (t3) was interrupted before it finished", l) &&
+                   occursin("/tmp/t3.output", l), notes.lines)
+
+    finished = sub("t4")
+    finished.watch.done = true
+    finished.watch.ended_by = BT.SUBAGENT_DONE_MARKER
+    @test !BT.isdone(finished)
+    @test finished.phase isa BT.AwaitingReport
+    @test BT.tool_status(finished) != "failed"
+end
+
+# The session ended under a running background task: Claude can no longer tell
+# the agent, so the note does (the resumed session's agent would wait on it).
+@testset "a background task the session ended is noted for the agent" begin
+    model = headless_model()
+    task = BT.TaskToolMsg(BT.Message("t5", "other", "", "Investigate", "in_progress", "",
+                                     time(), nothing, model);
+                          description = "survey", is_background = true)
+    task.bg_output_path = "/tmp/t5.output"
+    push!(BT.chat_taskbar(model), task)
+    BT.interrupt_background_tasks!(model)
+    @test BT.tool_status(task) == "failed"
+    @test any(l -> occursin("Background agent \"survey\" (t5) ended with the previous agent session", l),
+              BT.shared(model).bg_notes.lines)
+end
+
+# Claude's interrupt (the chat's Stop) spares background subagents only when the
+# client says it stops them one by one; a Claude session always says so.
+@testset "a Claude session starts with per-task stops" begin
+    model = headless_model()
+    meta = BT.session_meta(BT.ClaudeCodeAgent(), BT.shared(model).state, "proj")
+    @test meta["_meta"]["claudeCode"]["options"]["perTaskStopAffordance"] === true
+    @test BT.session_meta(nothing, BT.shared(model).state, "proj") == Dict{String,Any}()
 end
 
 @testset "finished! is the deterministic end (bar's loop off the file's fd-close)" begin

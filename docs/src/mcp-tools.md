@@ -11,7 +11,7 @@ that produced it.
 ## `bt_julia_eval`, a shared live REPL
 
 ```
-bt_julia_eval(code; env_path?, timeout?, full_output?, max_response_bytes?, julia_cmd?)
+bt_julia_eval(code; env_path?, timeout?, background?, worker?, full_output?, max_response_bytes?, julia_cmd?)
 ```
 
 Each `env_path` runs in its own Julia subprocess (managed via
@@ -41,13 +41,41 @@ than freezing the pill. When a call is still running the agent (or you) can:
 
 | next | effect |
 |---|---|
-| `bt_julia_continue` | wait another `timeout` seconds |
-| `bt_julia_interrupt` | `SIGINT`; captures the partial output plus the `InterruptException`, session state preserved |
+| `bt_julia_wait(runs = ["r4"])` | block until the run finishes (see below) |
+| `bt_julia_continue(run = "r4")` | wait another `timeout` seconds |
+| `bt_julia_interrupt(run = "r4")` | `SIGINT`; captures the partial output plus the `InterruptException`, session state preserved |
 | `bt_julia_restart` | `SIGKILL`; a fresh process, loses all session state |
 
-`bt_julia_list_sessions` lists the live sessions. `timeout` auto-disables for
-`Pkg.*` (installs are routinely multi-minute); pass `timeout=0` to disable the
-checkpoint entirely.
+`bt_julia_list_sessions` lists the live sessions and the chat's runs. `timeout`
+auto-disables for `Pkg.*` (installs are routinely multi-minute); pass
+`timeout=0` to disable the checkpoint entirely.
+
+### Runs: background evals and `bt_julia_wait`
+
+```
+bt_julia_eval(code; background = true, env_path?, worker?)
+bt_julia_wait(seconds; runs?, until = "all" | "any", max_response_bytes?)
+```
+
+Every eval is a **run** with a short id (`r4`), named in its result. A run can
+outlive the call that started it: `background = true` returns the id at once,
+and a foreground eval that passes its checkpoint is the same run. That is how
+one chat runs a test suite on several workers at once: start one background run
+per worker (or env), then block on all of them with a single `bt_julia_wait`,
+which returns each finished run's output and result (the tail; the whole log
+stays on its worker and the result names its path).
+
+The chat follows the run, not the call. Its card stays live, with its output
+streaming in, until the run ends. Then it shows ✓ or ✗ with how long the run
+took and, for a failure, the error's first line.
+While the call is over and the run is not, the run has a row in the task bar
+(`r4 · MacBook · BonitoAgents/test`) whose ⊗ stops that run and nothing else.
+When a run the agent has not collected finishes and the agent is idle, the chat
+tells it in a short app message, so it never needs to poll.
+
+One run per env on a worker at a time: a second eval there is refused and
+names the running one. A cancelled turn stops its foreground eval and leaves
+background runs running.
 
 ### The result is the live value
 
@@ -113,17 +141,17 @@ Every eval-family tool takes a `worker`: the display name of another online
 worker. The call then runs there instead of on the chat's own worker, in that
 machine's own sessions (its own `env_path`s and state; `bt_julia_continue`,
 `bt_julia_interrupt` and `bt_julia_restart` address them with the same
-argument). Under the hood the chat's MCP asks the server, the server spawns a
+argument, and a run id reaches its run wherever it runs). Under the hood the chat's MCP asks the server, the server spawns a
 BonitoMCP *eval host* on the other worker for this chat (once; it lives as long
 as the chat's session), and relays the call. The card in the chat wears a filled
 **⇢ MacBook** badge next to the tool name, its live stdout streams in as usual,
-and a returned plot or app renders live over the same bridge. One caveat there:
-a chat holds one live-render bridge, so alternating live values between two
-machines retires the older embed each time (text results, streaming and the rest
-are unaffected).
+and a returned plot or app renders live over that machine's own bridge into the
+chat, so live results from both machines stay live side by side. (Two `env_path`s
+on the SAME worker still share one bridge: there the newer session's embeds
+retire the older one's.)
 
-This is **off by default**. The chat header has a *remote julia* pill next to
-the permissions pill; the server enforces it at relay time, so switching it on
+This is **off by default**. An admin switches it on per chat with *Remote julia*
+in the chat's ⋯ menu. The server enforces it at relay time, so switching it on
 needs no restart, and switching it off ends the chat's evals on other machines.
 While it is off a call with `worker` fails and tells the agent where the switch
 is. `bt_julia_list_sessions` lists the other workers (and their live sessions)
@@ -133,6 +161,72 @@ The other machine has its own filesystem: `bt_sync_folder` copies a folder from
 the chat's worker to the target (through the server's mirror, so a second call
 only moves what changed): the project, its `Project.toml`/`Manifest.toml`, the
 data. It needs the same switch.
+
+### Julia values between machines
+
+```julia
+r = remote_session("MacBook"; env_path = "/Users/me/proj")
+r[:data] = data            # `data` is set in the session there
+model = r[:model]          # its `model`, here
+y = r(f, x; k = 1)         # f(x; k = 1) runs there, the value comes back
+```
+
+Inside the chat's own session, `remote_session` (defined in every session)
+reaches the session that `bt_julia_eval(worker = "MacBook", env_path = …)` runs
+in, starting it if needed. The chat's session is the one that asks; the other
+only answers. Values travel with `Serialization`, streamed in 1 MiB pieces, so
+their size is not limited by the websocket layers in between. That also means
+both sessions need the same Julia version (checked first; a mismatch is an
+error naming both) and the packages that define a value's types loaded. A
+function passed to `r(…)` runs there: an anonymous one travels with its code (it
+cannot take keyword arguments: Serialization does not carry the hidden function
+those compile to), a named one (or `r(:name, …)`) must exist there, and the
+globals it reads are the other session's. A failure on the other side comes back as a
+`RemoteSessionError` with its message and backtrace, and the connection stays
+usable. Needs the chat's *remote julia* switch, like everything above.
+
+The route: the session connects to its worker's relay over loopback TCP, the
+server checks the switch, has the chat's eval host on the other worker connect
+the session asked for, and pipes the two together; it never reads the values.
+
+## `bt_share`, a link for anyone
+
+```
+bt_share(path; title?, password?, env_path?)
+```
+
+A link to a file on the chat's worker that anyone can open without an account,
+for as long as the worker is online (`https://<server>/s/<token>/`):
+
+- **A markdown file** becomes a page, rendered like the chat renders. The images
+  and videos it embeds by relative path come along (`![](clip.mp4)` becomes a
+  video); nothing else in its folder is reachable through the link, and scripts
+  in its raw HTML do not run.
+- **A Julia file whose value is a Bonito app** (or anything `bt_julia_eval`
+  would show live) becomes a live page. A *share host* on the worker, one per
+  worker, evaluates the file in its project's environment (`env_path`, by
+  default the nearest folder above it with a `Project.toml`) and every viewer
+  gets their own render, as with a chat's eval result. The file is evaluated
+  again when it changes, and once when it is shared, so an error in it reaches
+  the agent. Interactive markdown is such an app:
+  `using Bonito, Markdown; App() do; s = Bonito.Slider(1:10); DOM.div(md"Pick: $(s)"); end`
+  (a plain Julia file: it loads what it uses).
+- **Other files** are served directly, including images, videos and documents.
+  Only that file is reachable; HTML and SVG are sandboxed without scripts.
+
+You can also click **Share** on a `bt_show` preview or a successful
+`bt_julia_eval` result, then open or copy the generated link. A live result is
+shared as the value already displayed: its eval code is not run again, and
+viewers can interact with the app. That link needs the original Julia session
+and result to stay open. Closing the result or restarting its Julia session
+ends its availability. To make an app restartable, save it as a Julia file and
+share that file with `bt_share`.
+
+The token is the permission; a password can be set on top. Settings lists your
+links (an admin sees all): open, copy, set or remove the password, end. Behind a
+tunnel the login gate lets a link's page, its websocket and its assets through
+and nothing else; behind the Caddy login proxy only the pages are open, so an
+app link there needs a logged-in viewer.
 
 ## `bt_wait`, pausing a turn
 
@@ -165,11 +259,18 @@ instead of one per eight seconds.
 `bt_show(path)` renders a worker-side file into the transcript, as whatever the
 file is: images and video inline (click for a lightbox), audio with a player,
 markdown rendered, CSV as a sortable table, notebooks with their outputs, 3D
-geometry (`.obj`/`.stl`/`.ply`/`.glb`/`.gltf`) in an interactive view, PDF in the
-browser's own viewer, HTML in a sandboxed frame, source as syntax-highlighted
-code, and opaque bytes as a hex dump. These are the same renderers you get when
+models (`.obj`/`.stl`/`.ply`/`.off`/`.glb`/`.gltf`) in an interactive view
+(glTF and OBJ with their textures and materials), PDF in the browser's own viewer, HTML in
+a sandboxed frame, source as syntax-highlighted code, and opaque bytes as a hex
+dump. These are the same renderers you get when
 you open the file as a tab, so a file looks the same whichever way you reached
 it.
+
+`bt_show(path; title = "Loss after 200 epochs")` names what the file shows. The
+card wears that title, with the file's name and size beside it, and is named
+after the file without one. Hovering the title shows the file's full path, and
+clicking it opens the file in a tab. A picture or video shown bare in the chat
+keeps the title as its caption.
 
 `bt_julia_eval` already auto-saves rich values (Makie / Plots figures, color
 matrices) to `<env>/.bonitoAgents/show/` and reports the path, so the usual flow

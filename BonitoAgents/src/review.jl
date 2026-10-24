@@ -566,8 +566,8 @@ function review_file_section(f::DiffFile, prefix::AbstractString = "",
     else
         DOM.div((DOM.div(
                     DOM.div(h.header; class = "bt-rv-hunk-head"),
-                    (review_line_row(target_path, l) for l in h.lines)...;
-                    class = "bt-rv-hunk") for h in f.hunks)...;
+                    (review_line_row(target_path, l) for l in h.lines);
+                    class = "bt-rv-hunk") for h in f.hunks);
                 class = "bt-rv-hunks")
     end
     return DOM.details(head, body;
@@ -588,7 +588,7 @@ function review_pending_tray(comments::Vector{ReviewComment})
                    title = "Remove this comment", dataIndex = string(i));
         class = "bt-rv-chip", dataFile = c.file, dataLine = string(c.line))
         for (i, c) in enumerate(comments)]
-    return DOM.div(chips...; class = "bt-rv-tray")
+    return DOM.div(chips; class = "bt-rv-tray")
 end
 
 function Bonito.jsrender(session::Session, rp::ReviewPanel)
@@ -687,7 +687,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         # reviewing the project folder itself, which is the case that already
         # worked and must keep behaving identically.
         add = folder_rel_to_project(folder, review_worker_path(model))
-        return DOM.div((review_file_section(f, prefix, add) for f in shown)...;
+        return DOM.div((review_file_section(f, prefix, add) for f in shown);
                        class = "bt-rv-files")
     end
 
@@ -793,7 +793,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         # outside any `map`. This one goes through the delegated `change` listener
         # in the `onload` block instead, which is wired once with the observables
         # resolved once — the same reason the mode buttons and ⟳ are delegated.
-        DOM.select(nodes...; class = "bt-rv-folder",
+        DOM.select(nodes; class = "bt-rv-folder",
             title = "Which folder's repository to review. " *
                     "Found by scanning the project for checkouts.")
     end

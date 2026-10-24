@@ -49,8 +49,42 @@
             @test occursin("RemoteSync end-to-end test marker", String(dst_bytes))
         end
     finally
-        try close(server) catch end
-        try rm(src) catch end
-        try rm(dst) catch end
+        close(server)   # idempotent
+        rm(src; force = true)
+        rm(dst; force = true)
     end
+end
+
+# librsync reads the basis through a Julia callback, which cannot throw across C:
+# it returned librsync's IO error and the reason was gone ("patch job failed: IO
+# error"). The callback now keeps the exception and `apply_patch` throws it.
+@testitem "unit:remotesync_patch_basis_error" tags = [:unit] begin
+    import BonitoAgents
+    using Test
+    const RS = BonitoAgents.RemoteSync
+
+    struct VanishedBasis <: IO end
+    Base.seek(::VanishedBasis, ::Integer) = error("the basis went away")
+    Base.eof(::VanishedBasis) = false
+
+    basis = rand(UInt8, 200_000)
+    sig = IOBuffer()
+    RS.compute_signature(IOBuffer(basis), sig)
+    changed = vcat(basis[1:100_000], rand(UInt8, 5_000))
+    delta = IOBuffer()
+    RS.compute_delta(seekstart(sig), IOBuffer(changed), delta)
+
+    err = try
+        RS.apply_patch(VanishedBasis(), seekstart(delta), IOBuffer())
+        nothing
+    catch e
+        e
+    end
+    @test err isa CapturedException
+    @test occursin("the basis went away", sprint(showerror, err))
+
+    # The working path is unchanged.
+    rebuilt = IOBuffer()
+    RS.apply_patch(IOBuffer(basis), seekstart(delta), rebuilt)
+    @test take!(rebuilt) == changed
 end

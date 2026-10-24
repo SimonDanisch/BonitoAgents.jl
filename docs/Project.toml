@@ -18,6 +18,7 @@ Deno_jll = "04572ae6-984a-583e-9378-9577a1c2574d"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
+WorkerLink = "03840273-e5e6-4e74-9050-e95881fcd827"
 [sources]
 BonitoAgents = {path = "../BonitoAgents"}
 AgentClientProtocol = {path = "../AgentClientProtocol"}
@@ -25,6 +26,7 @@ AgentProviders = {path = "../AgentProviders"}
 BonitoMCP = {path = "../BonitoMCP"}
 BonitoWorker = {path = "../BonitoWorker"}
 RemoteSync = {path = "../RemoteSync"}
+WorkerLink = {path = "../WorkerLink"}
 Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}

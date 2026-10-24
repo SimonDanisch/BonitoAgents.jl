@@ -181,11 +181,13 @@ jsonable(x) = string(x)
 # `remote_eval` / `remote_workers` / `sync_folder` are not dev tools: every
 # chat's MCP may ask them (remote_eval.jl). They share this channel and this
 # allow-list because it is the one request/reply path an MCP process has.
-const DEV_OPS          = (:inspect, :logs, :memory, :control,
-                          :remote_eval, :remote_workers, :sync_folder)
-const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings)
+# `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl).
+const DEV_OPS          = (:inspect, :logs, :memory, :control, :timings, :console, :wait_input,
+                          :remote_eval, :remote_workers, :sync_folder, :share,
+                          :app_tools, :app_call)
+const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings, :tabs)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
-                          :rescan_worker, :move_project, :set_title)
+                          :rescan_worker, :continue_project, :set_title)
 
 known_or_throw(name::Symbol, known, what) =
     name in known ? name :
@@ -215,8 +217,9 @@ function dev_op(state::ServerState, ::Val{:inspect}, args::AbstractDict)
     section = known_or_throw(Symbol(String(get(args, "section", "overview"))),
                              DEV_SECTIONS, "section")
     # One narrowing argument, whose meaning is the section's: a project id for
-    # the per-chat sections, a worker id for `:worker`.
+    # the per-chat sections, a worker id for `:worker`, a tab for `:tabs`.
     target = section === :worker ? String(get(args, "worker_id", "")) :
+             section === :tabs   ? String(get(args, "tab", "")) :
                                    String(get(args, "project_id", ""))
     return dev_section(state, Val(section), target)
 end
@@ -231,6 +234,8 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
     chat_ids, bound = lock(state.lock) do
         (collect(keys(state.chat_models)), copy(state.bound_lru))
     end
+    tabs = root_state(state).tabs
+    open_tabs = lock(() -> [r.session for r in values(tabs.open) if r.session !== nothing], tabs.lock)
     return Dict{String,Any}(
         "pid"          => getpid(),
         "julia"        => string(VERSION),
@@ -251,25 +256,40 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
             "mcp_channels"    => lock(() -> length(state.mcp_ctrl), state.lock),
             "pending_rpcs"    => lock(() -> length(state.pending_rpcs), state.lock),
             "pending_chunks"  => lock(() -> length(state.pending_chunks), state.lock),
+            # Browser tabs the server serves, and those whose socket is gone but
+            # which are still served (and queue what they're sent).
+            "tabs"            => length(open_tabs),
+            "tabs_dropped"    => count(s -> s.status == Bonito.SOFT_CLOSED, open_tabs),
+            "queued_messages" => sum((length(s.message_queue) for s in open_tabs); init = 0),
         ),
         "bound_lru"    => bound,
         "chat_models"  => chat_ids,
     )
 end
 
+jsonable_rtt(rtt::Float64) = isnan(rtt) ? nothing : round(rtt; digits = 3)
+
 function dev_section(state::ServerState, ::Val{:workers}, ::String)
-    connected = lock(() -> Set(keys(state.worker_control_ws)), state.lock)
+    links     = lock(() -> copy(state.worker_links), state.lock)
     last_scan = lock(() -> copy(state.last_scan), state.lock)
     return [Dict{String,Any}(
         "worker_id"     => w.worker_id,
         "name"          => w.name,
         "initials"      => jsonable(w.initials),
         "online"        => isopen(w),
-        "control_ws"    => w.worker_id in connected,
+        # connected / detached (waiting for the worker to come back) / none
+        "link"          => haskey(links, w.worker_id) ?
+            String(WorkerLink.state(links[w.worker_id])) : "none",
+        # What a request to it waits behind right now (WorkerLink.ping_rtt).
+        "ping_s"        => haskey(links, w.worker_id) ?
+            jsonable_rtt(WorkerLink.ping_rtt(links[w.worker_id])) : nothing,
         "hostname"      => w.hostname,
         "home"          => w.home,
         "projects_root" => w.projects_root,
-        "url"           => w.url,
+        "owner"         => w.owner,
+        "credential"    => w.credential,
+        "harnesses"     => w.harnesses,
+        "harness_error" => w.harness_error,
         "ssh_target"    => jsonable(w.ssh_target),
         "update_state"  => String(w.update_state),
         "update_message" => w.update_message,
@@ -287,6 +307,7 @@ function project_report(p::ProjectInfo)
     return Dict{String,Any}(
         "id"                => p.id,
         "name"              => p.name,
+        "owner"             => p.owner,
         "title"             => p.title[],
         "worker_id"         => p.worker_id,
         "worker_path"       => p.worker_path,
@@ -309,6 +330,8 @@ function project_report(p::ProjectInfo)
         # to read back.
         "dev_mode"          => p.dev_mode,
         "remote_eval"       => p.remote_eval,
+        # The app this chat belongs to (apps.jl), "" for an ordinary chat.
+        "app"               => p.app,
         "locked_by"         => jsonable(p.locked_by),
         "desired_config"    => jsonable(p.desired_config),
         "file_index"        => Dict{String,Any}("files" => nfiles,
@@ -347,18 +370,23 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
         "yolo_idle"      => sh.yolo_state.idle,
         "provider"       => string(sh.provider[]),
         "agent_provider" => provider_name(agent),
-        "session_activity" => string(nameof(typeof(session_activity(sh)))),
+        "open_turns"     => [string(nameof(typeof(t))) for t in AgentClientProtocol.open_turns(sh)],
         "client_alive"   => client(agent) !== nothing,
         "turn_in_flight" => sh.turn_in_flight[],
         "turn_seq"       => sh.turn_seq[],
+        "cancel_pending" => cancel_state(sh)["stopping"],
         "taskbar_items"  => length(sh.taskbar.items[]),
+        # What the chat runs, on every worker, as recorded (processes.jl).
+        "processes"      => [Dict{String,Any}("worker" => p.worker_id, "pid" => p.pid, "kind" => p.kind,
+                                              "label" => p.label, "recorded_at" => p.recorded_at)
+                             for p in chat_processes(m.state, project_id)],
         "pending_sends"  => lock(() -> length(sh.pending_sends), sh.lock),
         "pending_asks"   => length(sh.pending_asks),
         "tool_cache"     => length(sh.tool_content_cache),
         "consumer_alive" => sh.consumer_task[] !== nothing && !istaskdone(sh.consumer_task[]),
         "poller_alive"   => sh.poller_task[] !== nothing && !istaskdone(sh.poller_task[]),
         "restart_gen"    => sh.restart_gen[],
-        "restart_inflight" => restarting,
+        "restart_inflight" => restarting !== nothing,
         "rendering"      => rendering === nothing ? nothing : Dict{String,Any}(
             "kind" => string(first(rendering)),
             "for_seconds" => max(0.0, round(time() - last(rendering), digits = 1))),
@@ -465,6 +493,8 @@ log_level_rank(s::AbstractString) = get(LOG_LEVEL_ORDER, lowercase(s), 1)
 
 # Which name means "the server's own log" rather than a worker's.
 const SERVER_LOG_SOURCE = "server"
+# Authelia's log, on the server's machine: the login (behind the proxy or a tunnel).
+const AUTHELIA_LOG_SOURCE = "authelia"
 # Fan out to the server AND every connected worker.
 const ALL_LOG_SOURCES   = "all"
 
@@ -482,7 +512,7 @@ function resolve_log_worker(state::ServerState, source::AbstractString)
     hit = findfirst(w -> lowercase(w.name) == lowercase(source), workers)
     hit === nothing || return hit
     known = sort([w.name for w in values(workers)])
-    error("unknown log source '$source' — expected \"$(SERVER_LOG_SOURCE)\", " *
+    error("unknown log source '$source' — expected \"$(SERVER_LOG_SOURCE)\", \"$(AUTHELIA_LOG_SOURCE)\", " *
           "\"$(ALL_LOG_SOURCES)\", or one of: " * join(known, ", "))
 end
 
@@ -493,6 +523,7 @@ function log_of(state::ServerState, source::AbstractString; lines, since, until,
         r = BonitoWorker.read_log_file(; lines, since, until, grep)
         return merge(Dict{String,Any}("source" => SERVER_LOG_SOURCE, "role" => "server"), r)
     end
+    source == AUTHELIA_LOG_SOURCE && return authelia_log_of(state.auth; lines, since, until, grep)
     wid = resolve_log_worker(state, source)
     name = state.workers[][wid].name
     r = try
@@ -507,6 +538,18 @@ function log_of(state::ServerState, source::AbstractString; lines, since, until,
     return merge(Dict{String,Any}("source" => name, "role" => "worker", "worker_id" => wid), r)
 end
 
+authelia_log_of(auth::LoginAuth; kw...) =
+    merge(Dict{String,Any}("source" => AUTHELIA_LOG_SOURCE, "role" => "login"),
+          BonitoWorker.read_log_file(; path = authelia_log_file(auth.config), kw...))
+authelia_log_of(::OpenAuth; kw...) =
+    Dict{String,Any}("source" => AUTHELIA_LOG_SOURCE, "role" => "login", "ok" => false,
+                     "error" => "this server has no login (no Authelia): it runs without proxy.json")
+
+# Every log there is: the server's, its login's when it has one, each connected worker's.
+all_log_sources(state::ServerState) =
+    vcat([SERVER_LOG_SOURCE], state.auth isa LoginAuth ? [AUTHELIA_LOG_SOURCE] : String[],
+         sort([w.name for w in values(state.workers[]) if isopen(w)]))
+
 function dev_op(state::ServerState, ::Val{:logs}, args::AbstractDict)
     source = String(get(args, "source", ""))
     if !isempty(source) && source != "ring"
@@ -517,12 +560,11 @@ function dev_op(state::ServerState, ::Val{:logs}, args::AbstractDict)
               until = String(get(args, "until", "")),
               grep  = String(get(args, "contains", "")))
         if source == ALL_LOG_SOURCES
-            # Server first, then workers by name: a cross-machine incident is
-            # read in one pass, and a stable order makes two readings comparable.
-            srcs = vcat([SERVER_LOG_SOURCE],
-                        sort([w.name for w in values(state.workers[]) if isopen(w)]))
+            # Server first, then its login, then workers by name: a cross-machine
+            # incident is read in one pass, and a stable order makes two
+            # readings comparable.
             return Dict{String,Any}(
-                "sources" => [log_of(state, x; kw...) for x in srcs])
+                "sources" => [log_of(state, x; kw...) for x in all_log_sources(state)])
         end
         return log_of(state, source; kw...)
     end
@@ -596,7 +638,7 @@ function registry_counts(state::ServerState)
         "mcp_channels"         => lock(() -> length(state.mcp_ctrl), state.lock),
         "pending_rpcs"         => lock(() -> length(state.pending_rpcs), state.lock),
         "pending_chunks"       => lock(() -> length(state.pending_chunks), state.lock),
-        "worker_control_ws"    => lock(() -> length(state.worker_control_ws), state.lock),
+        "worker_links"         => lock(() -> length(state.worker_links), state.lock),
         "session_inflight"     => lock(() -> length(state.session_inflight), state.lock),
         "show_fetch_locks"     => lock(() -> length(state.show_fetch_inflight), state.lock),
         "show_mirror_stamps"   => lock(() -> length(state.show_mirror_stamps), state.lock),
@@ -727,8 +769,11 @@ function dev_project(state::ServerState, project_id::AbstractString)
 end
 
 dev_op(state::ServerState, ::Val{:control}, args::AbstractDict) =
+    dev_op(state, Val(:control), args, "")
+dev_op(state::ServerState, ::Val{:control}, args::AbstractDict, caller::String) =
     dev_control(state, Val(known_or_throw(Symbol(String(get(args, "op", ""))),
-                                          DEV_CONTROL_OPS, "control op")), args)
+                                          DEV_CONTROL_OPS, "control op")), args, caller)
+dev_control(state::ServerState, op::Val, args::AbstractDict, ::String) = dev_control(state, op, args)
 
 function dev_control(state::ServerState, ::Val{:open_chat}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
@@ -747,13 +792,31 @@ function dev_control(state::ServerState, ::Val{:open_chat}, args::AbstractDict)
 end
 
 function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDict)
+    return dev_control(state, Val(:send_message), args, "")
+end
+
+function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDict, caller::String)
     p = dev_project(state, String(get(args, "project_id", "")))
     text = String(get(args, "text", ""))
     isempty(strip(text)) && error("`text` is empty — nothing to send")
+    # Caller identity comes from the authenticated MCP channel, never tool args.
+    origin = if isempty(caller)
+        nothing
+    else
+        source = dev_project(state, caller)
+        worker = get(state.workers[], source.worker_id, nothing)
+        PeerMessageOrigin(string(uuid4()), source.id, source.title[], source.worker_id,
+            worker === nothing ? source.worker_id : worker.name, now(UTC))
+    end
     model = ensure_project_session!(state, p)
     model === nothing && error("could not bring up a chat session for '$(p.id)'")
-    send_message!(model, UserMsg(text))
-    return Dict{String,Any}("ok" => true, "project_id" => p.id, "sent_chars" => length(text))
+    send_message!(model, UserMsg(text); mode = :next, origin)
+    result = Dict{String,Any}("ok" => true, "project_id" => p.id, "sent_chars" => length(text))
+    if origin !== nothing
+        result["message_id"] = origin.id
+        result["sent_at"] = message_timestamp(origin.sent_at)
+    end
+    return result
 end
 
 function dev_control(state::ServerState, ::Val{:restart_chat}, args::AbstractDict)
@@ -797,32 +860,26 @@ function dev_control(state::ServerState, ::Val{:set_title}, args::AbstractDict)
 end
 
 # Continue a chat on another worker. The SAME operation as the chat header's
-# "Continue on <worker>" (`start!`): the project's files and the agent's own
-# record of the conversation move through the server, the project is re-bound to
-# the new worker, and its session is brought up there — so there is one
-# implementation of "move a chat between machines" and this can't drift from it.
-function dev_control(state::ServerState, ::Val{:move_project}, args::AbstractDict)
+# "Continue on <worker>" (`continue_on!`): a new chat there, with the project's
+# files and the agent's own record of the conversation; the original chat is
+# left as it is. One implementation, so this can't drift from what users get.
+function dev_control(state::ServerState, ::Val{:continue_project}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
     dst_worker = String(get(args, "worker_id", ""))
     haskey(state.workers[], dst_worker) || error("no worker '$dst_worker'")
-    p.worker_id == dst_worker &&
-        error("project '$(p.id)' is already on worker '$dst_worker'")
-    w = state.workers[][dst_worker]
-    isopen(w) || error("worker '$dst_worker' is offline — can't continue there")
-    source_worker = p.worker_id
-    start!(state, p, dst_worker)
+    new_p = continue_on!(state, p, dst_worker)
     return Dict{String,Any}("ok" => true, "project_id" => p.id,
-                            "source_worker" => source_worker,
-                            "dest_worker" => p.worker_id, "dest_path" => p.worker_path,
-                            # Whether the agent resumes with its memory (the
-                            # transcript travelled) or starts fresh there.
-                            "conversation_carried" => p.resume_session_id !== nothing)
+                            "new_project_id" => new_p.id,
+                            "dest_worker" => new_p.worker_id, "dest_path" => new_p.worker_path,
+                            # Whether the new chat resumes with the agent's memory
+                            # (the transcript travelled) or starts fresh.
+                            "conversation_carried" => new_p.resume_session_id !== nothing)
 end
 
 # ── the "Debug BonitoAgents" chat ───────────────────────────────────────────
 # A normal project, pointed at a BonitoAgents source checkout ON THE WORKER it
 # runs on, with `dev_mode` set. `dev_mode` is what attaches the `bt_dev_*` tools
-# (via `eval_dialback_env`) and the briefing in the system prompt (via
+# (via `mcp_env`) and the briefing in the system prompt (via
 # `agents_prompt_appendix`); the cwd is what lets the agent read, edit and `git`
 # the code. Nothing else is special about it — it uses the same bring-up, the
 # same worker, the same everything.
@@ -897,7 +954,7 @@ Writes only on an actual change, so a toggle can be clicked repeatedly without
 rewriting `projects.json` each time.
 
 The caller is responsible for RESTARTING the chat afterwards. `dev_mode` is read
-at session bring-up and nowhere else: `eval_dialback_env` bakes
+at session bring-up and nowhere else: `mcp_env` bakes
 `BONITOAGENTS_DEV_TOOLS` into the MCP process's environment when it is spawned,
 and `agents_prompt_appendix` composes the briefing into the system prompt at
 `open_session`. A live session keeps whatever it started with, so flipping the
@@ -914,16 +971,17 @@ function set_dev_mode!(state::ServerState, project_id::AbstractString, on::Bool)
 end
 
 """
-    debug_project_worker(state, preferred = "") -> worker_id
+    chat_worker(state, preferred = ""; needed_by = "a debug chat") -> worker_id
 
-Which worker the debug chat runs on: `preferred` (the dashboard picker's choice,
-or the worker of the chat the button was pressed in) when it is connected, else
-the first connected worker by name. Errors — naming the worker — when the
+Which worker a chat the server sets up runs on (the debug chat, an app's chat):
+`preferred` (the dashboard picker's choice, or the worker of the chat the button
+was pressed in) when it is connected, else the first connected worker by name. Errors — naming the worker — when the
 preferred one is unknown or offline, and when there is none at all: the chat
 has to run somewhere, and quietly picking another machine than the one the user
 chose is worse than saying so.
 """
-function debug_project_worker(state::ServerState, preferred::AbstractString = "")
+function chat_worker(state::ServerState, preferred::AbstractString = "";
+                     needed_by::AbstractString = "a debug chat")
     workers = state.workers[]
     if !isempty(preferred)
         w = get(workers, String(preferred), nothing)
@@ -932,7 +990,7 @@ function debug_project_worker(state::ServerState, preferred::AbstractString = ""
         return String(preferred)
     end
     online = sort([w for w in values(workers) if isopen(w)]; by = w -> w.name)
-    isempty(online) && error("no worker is connected — a debug chat needs one to run on")
+    isempty(online) && error("no worker is connected — $needed_by needs one to run on")
     return first(online).worker_id
 end
 
@@ -950,7 +1008,7 @@ sized for that. Throws — with a message meant for the user — when no worker 
 connected or the worker could not set the checkout up.
 """
 function ensure_debug_project!(state::ServerState; worker_id::AbstractString = "")
-    wid  = debug_project_worker(state, worker_id)
+    wid  = chat_worker(state, worker_id)
     root = debug_checkout_on_worker(state, wid; repo = WORKER_REPO_URL,
                                     rev = current_repo_rev(),
                                     packages = WORKER_REPO_PACKAGES)

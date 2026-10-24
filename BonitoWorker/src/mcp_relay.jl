@@ -1,72 +1,182 @@
-# Local MCP control sockets terminate at the daemon. Only the daemon's existing
-# authenticated control connection talks to the server. Grants bind a local
-# client to a chat and role; client payloads cannot select either identity.
-mutable struct MCPRelay
-    control::Any
-    server::Any
-    grants::Dict{String,NamedTuple}
-    peers::Dict{String,Any}
-    lock::ReentrantLock
-    closed::Bool
-end
+# The worker's local relay: how processes this worker runs for a chat reach the
+# server. Its MCP server (control: interrupts, live stdout, dev requests) and that
+# MCP's eval workers (the live-render bridge, value exchanges) connect over
+# loopback with a token the worker handed out for one chat and role. Each
+# connection becomes a channel on the worker's link, opened with the chat it
+# speaks for, so none of them needs the server's address or the worker's secret,
+# and a client can't choose which chat or role it speaks for.
+#
+# Handshake, the first message on the local connection:
+#   "<control token>"                 the MCP process's control channel
+#   "<eval token> eval <prefix>"      an eval worker's bridge, `prefix` naming it
+#   "<eval token> values"             an eval worker asking for a session on
+#                                     another worker, to move Julia values
+#   "<eval token> values <pair>"      an eval worker answering such a request
+#                                     (`pair` names it, the server chose it)
+# The relay answers "ok" once the server accepted the channel, or hangs up with
+# the server's reason. After "ok" the connection and the channel carry the same
+# messages both ways.
+#
+# Two local transports, one set of rules: a websocket (the MCP process and the
+# bridge, which have HTTP loaded) and a plain TCP socket for value exchanges.
+# Those run in the eval worker, i.e. in the USER's project, where no websocket
+# client can be assumed; a TCP message is `[flags u8][length u32 LE][bytes]`,
+# flags 1 for text. A refusal there is the text "refused\n<reason>".
 
-mutable struct MCPRelayPeer
-    ws::Any
+# What a token was handed out for. `kind`: the channels it may open ("mcp", or
+# "eval" for the bridge and value exchanges). `host`: an eval host serving the chat from this worker, not the chat's
+# own MCP. `owner` groups grants to revoke them together (an agent session, or
+# one chat's eval host).
+struct RelayGrant
+    kind::String
+    project_id::String
+    host::Bool
     owner::String
-    queue::Vector{Union{String,Nothing}}
-    bytes::Int
-    condition::Threads.Condition
+end
+
+const LocalConnection = Union{WebSockets.WebSocket,Sockets.TCPSocket}
+
+# A live local connection and the channel it was given.
+struct RelayPeer
+    conn::LocalConnection
+    channel::WorkerLink.LinkChannel
+    owner::String
+end
+
+mutable struct MCPRelay
+    const link::WorkerLink.Link
+    const grants::Dict{String,RelayGrant}     # by token
+    const peers::Dict{String,RelayPeer}
+    const lock::ReentrantLock
     closed::Bool
-end
-
-function write_mcp_peer(peer::MCPRelayPeer)
-    try
-        while true
-            frame = lock(peer.condition) do
-                while isempty(peer.queue) && !peer.closed
-                    wait(peer.condition)
-                end
-                isempty(peer.queue) && return nothing
-                frame = popfirst!(peer.queue)
-                frame === nothing || (peer.bytes -= sizeof(frame))
-                frame
-            end
-            frame === nothing && break
-            WebSockets.send(peer.ws, frame)
-        end
-    finally
-        stop_mcp_peer!(peer)
+    # The loopback listeners, websocket and TCP; last, see below.
+    server::WebSockets.Server
+    tcp_server::Sockets.TCPServer
+    function MCPRelay(link::WorkerLink.Link)
+        # The listeners are set right after: their handlers need the relay.
+        return new(link, Dict{String,RelayGrant}(), Dict{String,RelayPeer}(), ReentrantLock(), false)
     end
 end
 
-function stop_mcp_peer!(peer::MCPRelayPeer)
-    lock(peer.condition) do
-        peer.closed = true
-        empty!(peer.queue)
-        peer.bytes = 0
-        notify(peer.condition)
-    end
-    close_transport_quietly!(peer.ws)
-end
-
-function start_mcp_relay(control)
-    relay = MCPRelay(control, nothing, Dict{String,NamedTuple}(), Dict{String,Any}(),
-                     ReentrantLock(), false)
+function start_mcp_relay(link::WorkerLink.Link)
+    relay = MCPRelay(link)
     relay.server = WebSockets.listen!("127.0.0.1", 0) do ws
         serve_mcp_relay(relay, ws)
     end
+    relay.tcp_server = Sockets.listen(Sockets.localhost, 0)
+    Base.errormonitor(@async accept_tcp(relay))
     return relay
 end
 
+# Serve every TCP client until the relay closes its listener.
+function accept_tcp(relay::MCPRelay)
+    while true
+        sock = try
+            Sockets.accept(relay.tcp_server)
+        catch e
+            # Closing the relay closes the listener: that is how this loop ends.
+            (e isa Base.IOError && !isopen(relay.tcp_server)) || rethrow()
+            return nothing
+        end
+        Sockets.nagle(sock, false)
+        Base.errormonitor(@async serve_mcp_relay(relay, sock))
+    end
+end
+
+tcp_address(relay::MCPRelay) = "127.0.0.1:" * string(Sockets.getsockname(relay.tcp_server)[2])
+
+new_relay_token() = bytes2hex(rand(Random.RandomDevice(), UInt8, 32))
+
+# The environment an MCP process needs to reach the server for `project_id`: the
+# relay's address, a control token for itself, and an eval token for its eval
+# workers' bridges. The eval workers run user code, which must not be able to
+# speak as the MCP's control channel.
 function mcp_relay_env(relay::MCPRelay, project_id::AbstractString;
                        host::Bool = false, owner::AbstractString = project_id)
-    token = bytes2hex(rand(Random.RandomDevice(), UInt8, 32))
+    control, eval = new_relay_token(), new_relay_token()
     lock(relay.lock) do
         relay.closed && error("worker control connection is closed")
-        relay.grants[token] = (; project_id = String(project_id), host, owner = String(owner))
+        relay.grants[control] = RelayGrant("mcp", project_id, host, owner)
+        relay.grants[eval] = RelayGrant("eval", project_id, host, owner)
     end
     return Dict("BONITOAGENTS_CONTROL_URL" => "ws://" * WebSockets.server_addr(relay.server),
-                "BONITOAGENTS_CONTROL_TOKEN" => token)
+                "BONITOAGENTS_VALUES_ADDR" => tcp_address(relay),
+                "BONITOAGENTS_CONTROL_TOKEN" => control,
+                "BONITOAGENTS_EVAL_TOKEN" => eval)
+end
+
+# ── The local connection, either transport ──────────────────────────────────
+# Past this block the relay does not care which one a client used.
+
+receive_local(ws::WebSockets.WebSocket) = WebSockets.receive(ws)
+send_local(ws::WebSockets.WebSocket, msg) = WebSockets.send(ws, msg)
+close_local(ws::WebSockets.WebSocket) = close_transport_quietly!(ws)
+function each_local(f, ws::WebSockets.WebSocket)
+    for msg in ws
+        f(msg)
+    end
+end
+
+# No local client needs more per message: value exchanges send 1 MiB pieces.
+# Checked before anything is allocated, since this is read before the handshake.
+const MAX_TCP_MESSAGE = 16 * 1024 * 1024
+
+function receive_local(s::Sockets.TCPSocket)
+    flags = read(s, UInt8)
+    n = Int(ltoh(read(s, UInt32)))
+    n <= MAX_TCP_MESSAGE || error("local message of $(n) bytes is over the $(MAX_TCP_MESSAGE) limit")
+    bytes = read(s, n)
+    length(bytes) == n || throw(EOFError())
+    return flags & 0x01 == 0x01 ? String(bytes) : bytes
+end
+
+function send_local(s::Sockets.TCPSocket, msg::Union{AbstractString,AbstractVector{UInt8}})
+    header = Vector{UInt8}(undef, 5)
+    header[1] = msg isa AbstractString ? 0x01 : 0x00
+    header[2:5] .= reinterpret(UInt8, [htol(UInt32(msg isa AbstractString ? ncodeunits(msg) : length(msg)))])
+    write(s, header)
+    write(s, msg)
+    return nothing
+end
+
+close_local(s::Sockets.TCPSocket) = close(s)
+
+# When the relay is done with a connection: HTTP closes a websocket once its
+# handler returns, a TCP socket is ours to close.
+finish_local(::WebSockets.WebSocket) = nothing
+finish_local(s::Sockets.TCPSocket) = close(s)
+
+function each_local(f, s::Sockets.TCPSocket)
+    while !eof(s)
+        f(receive_local(s))
+    end
+end
+
+# Hang up on a local client, telling it why.
+function refuse_local(ws::WebSockets.WebSocket, reason::AbstractString)
+    try
+        WebSockets.close(ws, WebSockets.CloseFrameBody(1008, reason))
+    catch e
+        (e isa WebSockets.WebSocketError || e isa Base.IOError) || rethrow()
+    end
+    return nothing
+end
+
+function refuse_local(s::Sockets.TCPSocket, reason::AbstractString)
+    try
+        send_local(s, "refused\n" * reason)
+    catch e
+        e isa Base.IOError || rethrow()     # the client is gone already
+    end
+    close(s)
+    return nothing
+end
+
+# End a connection both ways: the local socket, and the channel to the server.
+function Base.close(peer::RelayPeer)
+    close_local(peer.conn)
+    WorkerLink.abort(peer.channel, "relay connection closed")
+    return nothing
 end
 
 function revoke_mcp_grants!(relay::MCPRelay, owner::AbstractString)
@@ -74,92 +184,121 @@ function revoke_mcp_grants!(relay::MCPRelay, owner::AbstractString)
         filter!(p -> p.second.owner != owner, relay.grants)
         [p for p in values(relay.peers) if p.owner == owner]
     end
-    foreach(stop_mcp_peer!, peers)
+    foreach(close, peers)
     return nothing
 end
 
-function serve_mcp_relay(relay::MCPRelay, ws)
-    id = bytes2hex(rand(Random.RandomDevice(), UInt8, 16))
-    registered = false
-    peer = MCPRelayPeer(ws, "", Union{String,Nothing}[], 0, Threads.Condition(), false)
-    writer = nothing
-    # A local client must authenticate promptly; never retain idle unauthenticated sockets.
-    authenticated = Ref(false)
-    timer = Timer(10.0) do _
-        authenticated[] || close_transport_quietly!(ws)
+# What a handshake asks for: its token and the channel header to open, or
+# `nothing` when the token is not one we handed out (or no longer valid), or is
+# not one for the channel asked for.
+function relay_request(relay::MCPRelay, handshake::AbstractString)
+    token, rest... = split(handshake, ' ')
+    grant = lock(() -> relay.closed ? nothing : get(relay.grants, token, nothing), relay.lock)
+    grant === nothing && return nothing
+    header = Dict{String,Any}("kind" => grant.kind, "project_id" => grant.project_id, "host" => grant.host)
+    if grant.kind == "mcp"
+        isempty(rest) || return nothing
+    elseif length(rest) == 2 && rest[1] == "eval" && !isempty(rest[2])
+        header["prefix"] = String(rest[2])
+    elseif length(rest) in (1, 2) && rest[1] == "values" && all(!isempty, rest)
+        header["kind"] = "values"
+        length(rest) == 2 && (header["pair"] = String(rest[2]))
+    else
+        return nothing
     end
-    try
-        token = String(WebSockets.receive(ws))
-        grant = lock(relay.lock) do
-            grant = relay.closed ? nothing : get(relay.grants, token, nothing)
-            grant === nothing && return nothing
-            peer.owner = grant.owner
-            relay.peers[id] = peer
-            grant
-        end
-        grant === nothing && return
-        authenticated[] = true
-        registered = true
-        writer = @async try
-            write_mcp_peer(peer)
-        catch e
-            e isa InterruptException && rethrow()
-        end
-        send_control(relay.control, Dict("type" => "mcp_open", "channel" => id,
-            "project_id" => grant.project_id, "host" => grant.host))
-        for frame in ws
-            send_control(relay.control, Dict("type" => "mcp_frame", "channel" => id,
-                                            "frame" => String(frame)))
-        end
-    catch e
-        (e isa EOFError || e isa Base.IOError || e isa WebSockets.WebSocketError) ||
-            @warn "local MCP relay ended" exception = e
-    finally
-        close(timer)
-        stop_mcp_peer!(peer)
-        writer === nothing || wait(writer)
-        lock(relay.lock) do; delete!(relay.peers, id); end
-        if registered && !relay.closed
-            try
-                send_control(relay.control, Dict("type" => "mcp_close", "channel" => id))
-            catch e
-                e isa InterruptException && rethrow()
-            end
-        end
-    end
+    return String(token), grant.owner, header
 end
 
-function handle_mcp_relay_frame!(relay::MCPRelay, cmd::AbstractDict)
-    peer = lock(relay.lock) do
-        get(relay.peers, String(get(cmd, "channel", "")), nothing)
+# The server's answer to a channel we opened: `nothing` once it accepted, or the
+# reason it refused.
+function server_verdict(channel::WorkerLink.LinkChannel)
+    reply = try
+        decode_control(WebSockets.receive(channel))
+    catch e
+        e isa WebSockets.WebSocketError || rethrow()
+        return e.message isa WebSockets.CloseFrameBody ? e.message.reason : sprint(showerror, e)
     end
-    peer === nothing && return
-    frame = get(cmd, "type", "") == "mcp_close" ? nothing : String(cmd["frame"])
-    # Preserve frame order (particularly shutdown reply → close), but never
-    # hold heartbeat/cancel delivery behind a slow local reader. Disconnect that
-    # client if it exceeds the bounded queue; it cannot consume unbounded RAM.
-    accepted = lock(peer.condition) do
-        peer.closed && return false
-        bytes = frame === nothing ? 0 : sizeof(frame)
-        (length(peer.queue) >= 128 || peer.bytes + bytes > 16 * 1024 * 1024) && return false
-        push!(peer.queue, frame)
-        peer.bytes += bytes
-        notify(peer.condition)
-        true
+    get(reply, "ok", false) === true && return nothing
+    return "unexpected answer: $(reply)"
+end
+
+function serve_mcp_relay(relay::MCPRelay, conn::LocalConnection)
+    # A local client must authenticate promptly; never keep idle unauthenticated sockets.
+    authenticated = Ref(false)
+    timer = Timer(10.0) do _
+        authenticated[] || close_local(conn)
     end
-    accepted || stop_mcp_peer!(peer)
+    id = bytes2hex(rand(Random.RandomDevice(), UInt8, 16))
+    try
+        request = relay_request(relay, String(receive_local(conn)))
+        if request === nothing
+            @warn "BonitoWorker relay: refused a local connection with an unknown token or handshake"
+            return refuse_local(conn, "unknown token")
+        end
+        token, owner, header = request
+        authenticated[] = true
+        # Live-render frames and values can be large; the MCP's control messages
+        # are small and should not wait behind them.
+        channel = WorkerLink.open_channel(relay.link, MsgPack.pack(header);
+                                          priority = header["kind"] == "mcp" ? 1 : 2)
+        # Registered before the server answers, so a revoke or close reaches a
+        # connection still waiting; and only while its grant stands, since a
+        # revoke that ran since the handshake has closed every peer it knew of.
+        registered = lock(relay.lock) do
+            (relay.closed || !haskey(relay.grants, token)) && return false
+            relay.peers[id] = RelayPeer(conn, channel, owner)
+            true
+        end
+        if !registered
+            WorkerLink.abort(channel, "relay grant revoked")
+            return refuse_local(conn, "grant revoked")
+        end
+        refused = server_verdict(channel)
+        if refused !== nothing
+            ours = lock(() -> relay.closed || !haskey(relay.grants, token), relay.lock)
+            ours || @warn "BonitoWorker relay: the server refused a channel" kind = header["kind"] project_id = header["project_id"] reason = refused
+            return refuse_local(conn, refused)
+        end
+        send_local(conn, "ok")
+        # Server → local client, while this task pumps the other way.
+        down = @async try
+            for msg in channel
+                send_local(conn, msg)
+            end
+        catch e
+            (e isa WebSockets.WebSocketError || e isa Base.IOError) || rethrow()
+        finally
+            close_local(conn)
+        end
+        try
+            each_local(msg -> WebSockets.send(channel, msg), conn)
+        finally
+            # The local client is gone: so is its channel. Clean when it closed
+            # cleanly, which lets the server read what was already sent.
+            close(channel)
+            wait(down)
+        end
+    catch e
+        (e isa EOFError || e isa Base.IOError || e isa WebSockets.WebSocketError ||
+         e isa WorkerLink.LinkDead) || @warn "local MCP relay connection ended" exception = e
+    finally
+        close(timer)
+        lock(() -> delete!(relay.peers, id), relay.lock)
+        finish_local(conn)
+    end
     return nothing
 end
 
 function Base.close(relay::MCPRelay)
     peers = lock(relay.lock) do
+        relay.closed && return nothing
         relay.closed = true
         empty!(relay.grants)
-        result = collect(values(relay.peers))
-        empty!(relay.peers)
-        result
+        collect(values(relay.peers))
     end
-    foreach(stop_mcp_peer!, peers)
+    peers === nothing && return nothing
+    foreach(close, peers)
     close(relay.server)
+    close(relay.tcp_server)
     return nothing
 end

@@ -74,11 +74,9 @@ past work, and opening a dismissed chat un-dismisses it.
 function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
     candidates = Tuple{Float64,ProjectInfo}[]
     for (_, p) in state.projects[]
-        # New-style storage only (state_dir/chats/<pid>); computed directly so
-        # listing the dashboard never mkpaths a dir for chat-less projects.
-        f = joinpath(state.state_dir, "chats", p.id, "chat.md")
-        isfile(f) || continue
-        push!(candidates, (mtime(f), p))
+        visible(state, p) || continue
+        t = last_active(state, p)
+        t == 0 || push!(candidates, (t, p))
     end
     sort!(candidates; by = first, rev = true)
     cards = ChatCardData[]
@@ -96,6 +94,25 @@ function recent_chat_cards(state::ServerState; limit::Int = OVERVIEW_LIMIT)
     return cards
 end
 
+"""
+    last_active(state, p) -> Float64
+
+When chat `p` was last active, as unix time: its transcript's mtime, bumped on
+every persisted message, live or not. 0 for a chat with no messages yet.
+"""
+function last_active(state::ServerState, p::ProjectInfo)
+    # New-style storage only (state_dir/chats/<pid>); computed directly so
+    # listing never mkpaths a dir for chat-less projects.
+    f = joinpath(state.state_dir, "chats", p.id, "chat.md")
+    return isfile(f) ? mtime(f) : 0.0
+end
+
+"""
+    relative_time_label(t) -> String
+
+How long ago unix time `t` was, for a label: "just now", "5m ago", "3h ago",
+"2d ago".
+"""
 function relative_time_label(t::Float64)
     d = max(0.0, time() - t)
     d < 90      && return "just now"
@@ -135,6 +152,8 @@ const OverviewStyles = Bonito.Styles(
     CSS(".bt-ov-thumb img.bt-ov-img",
         "width" => "100%", "height" => "100%", "object-fit" => "cover",
         "display" => "block"),
+    CSS(".bt-ov-thumb img.bt-ov-logo",
+        "width" => "56px", "height" => "56px", "border-radius" => "12px", "display" => "block"),
     CSS(".bt-ov-body",
         "padding" => "9px 11px 10px",
         "display" => "flex", "flex-direction" => "column", "gap" => "5px",
@@ -171,7 +190,11 @@ const OverviewStyles = Bonito.Styles(
 
 function overview_card_dom(state::ServerState, c::ChatCardData)
     p = get(state.projects[], c.pid, nothing)
-    thumb = if c.image !== nothing
+    app = p === nothing ? nothing : app_of(state, p)
+    thumb = if app !== nothing
+        # An app's chat shows the app's logo whole, not cropped to the strip.
+        DOM.img(; src = app_icon_src(app), alt = "", class = "bt-ov-logo")
+    elseif c.image !== nothing
         DOM.img(; src = c.image, alt = "", class = "bt-ov-img", loading = "lazy")
     elseif p !== nothing
         project_icon(state, p)                # identicon placeholder
@@ -188,7 +211,7 @@ function overview_card_dom(state::ServerState, c::ChatCardData)
                 class = "bt-ov-title-row"),
             DOM.div("$(c.msg_count) message$(c.msg_count == 1 ? "" : "s") · $(relative_time_label(c.last_active))";
                     class = "bt-ov-meta"),
-            DOM.div(snippets...; class = "bt-ov-snippets");
+            DOM.div(snippets; class = "bt-ov-snippets");
             class = "bt-ov-body");
         class = "bt-ov-card",
         dataProjectId = c.pid)
@@ -209,10 +232,10 @@ end
 function recent_chats_dom(session::Bonito.Session, state::ServerState,
                           current_view::Union{Observable{String},Nothing})
     grid = map(state.chat_signal, state.turn_signal, state.projects) do _, _turn, _projects
-        cards = recent_chat_cards(state)
+        cards = page_phase(() -> recent_chat_cards(state), :overview_cards)
         isempty(cards) && return DOM.div("No chats yet — create a project below.";
                                           class = "bt-ov-empty")
-        DOM.div((overview_card_dom(state, c) for c in cards)...; class = "bt-ov-grid")
+        DOM.div((overview_card_dom(state, c) for c in cards); class = "bt-ov-grid")
     end
     current_view === nothing &&
         return DOM.div(OverviewStyles, grid; class = "bt-overview")

@@ -9,8 +9,8 @@
 #       the adopted flood splices in ABOVE it ("my message is gone" fix);
 #   (d) the count invariant: the store length always matches what the plan
 #       produced — nothing lost, nothing doubled.
-@testitem "e2e:session_sync" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:session_sync" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     TK = TestKit
     BA = TestKit.BT
 
